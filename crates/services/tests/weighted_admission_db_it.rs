@@ -376,12 +376,47 @@ async fn aggregate_totals_preserve_values_above_i64_max() {
             panic!("aggregate total above the configured global budget was truncated");
         }
     };
-    assert!(matches!(
-        error,
-        DistributedAdmissionError::Capacity(
-            astra_services::WeightedAdmissionError::GlobalExhausted
+    assert!(
+        matches!(
+            error,
+            DistributedAdmissionError::Capacity(
+                astra_services::WeightedAdmissionError::GlobalExhausted
+            )
+        ),
+        "expected exact aggregate capacity rejection, got {error:?}"
+    );
+
+    // Rebuild per-owner totals above i64::MAX too, not only the global sum.
+    insert_reservation_row(
+        &pool,
+        &key("large-owner-a"),
+        "large-row-c",
+        StoredAdmissionWork {
+            resident_bytes: huge_row,
+            context_tokens: 1,
+            provider_slots: 1,
+            cpu_units: 1,
+            io_bytes: 1,
+        },
+    )
+    .await;
+    let result = controller
+        .try_reserve(
+            &key("large-owner-a"),
+            work(),
+            Duration::from_secs(30),
+            "large-owner-next-turn",
         )
-    ));
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(DistributedAdmissionError::Capacity(
+                astra_services::WeightedAdmissionError::GlobalExhausted
+            ))
+        ),
+        "owner aggregate must rebuild without int64 overflow"
+    );
     reset_admission_scope(&pool).await;
 }
 

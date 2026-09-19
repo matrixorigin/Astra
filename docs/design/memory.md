@@ -64,6 +64,14 @@ Trusted self-hosted deployments may explicitly enable `MEMORIA_SELF_HOSTED_MASTE
 
 The background coordinator may launch a lightweight admission task, but it checks consent before loading snapshots, resolving an LLM, generating memory, or scheduling persistence. See [authentication](authentication.md) for issuer, credential replacement and retention.
 
+MOI native UC uses the same resolver and consumers with an explicitly enabled
+product-owned authority, not the local-password fallback or a second Memoria
+login. Current UC status and canonical issuer mapping are checked for every
+operation. Its bounded owner namespace and server-only credential are described
+in [MOI native login](../guides/moi-native-login.md#built-in-memory). Automatic
+prompt recall budgets both authorization and retrieval together; one successful
+session-start lane remains usable if the other lane times out.
+
 ## Learning boundary
 
 Memory is not training data by default. Learning artifacts require consent, redaction, quality gate, lineage, and deletion propagation.

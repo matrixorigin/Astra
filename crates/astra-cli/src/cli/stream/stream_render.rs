@@ -4006,7 +4006,9 @@ impl CliSseStreamHost<'_> {
                 tool,
                 detail,
                 approval_kind,
-                self.render_policy.is_silent(),
+                // Silent is the normal TUI renderer policy. Only absence of
+                // the native approval sink makes this a headless preflight.
+                self.approval_request_tx.is_none(),
             )
         }) {
             return Ok(decision);
@@ -11174,61 +11176,83 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn cloud_approval_uses_tui_sink_in_prompt_mode() {
-        let server = MockServer::start().await;
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let temp = tempdir().expect("tempdir");
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
-        let mut pm =
-            crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
-        let (approval_tx, mut approval_rx) =
-            tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(
-                chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
-            );
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            EdgeSseContext {
-                api: &api,
-                token: "tok",
-                executor_id: "edge-test",
-                executor,
-                render_policy: RenderPolicy::Stream,
-                perm_manager: Some(&mut pm),
-                cancel_token: None,
-                stream_event_tx: None,
-                stream_event_sink: None,
-                approval_request_tx: Some(approval_tx),
-                ask_user_request_tx: None,
-                skill_resolver: None,
-                skill_continuation: false,
-                turn_rollback_on_failure: false,
-                tool_cache: &mut tool_cache,
-                observability_hub: None,
-                incremental_state: None,
-                request_session_execution_lease: None,
-            },
-            80,
-            false,
-        );
+        for render_policy in [RenderPolicy::Silent, RenderPolicy::Stream] {
+            for response in [
+                chat_stream::ApprovalResponse::AllowOnce,
+                chat_stream::ApprovalResponse::Deny,
+            ] {
+                let server = MockServer::start().await;
+                let api =
+                    astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+                let temp = tempdir().expect("tempdir");
+                let executor =
+                    std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+                let mut tool_cache = EdgeToolCache::new(8);
+                let mut pm = crate::cli::permission_manager::PermissionManager::with_project(
+                    false,
+                    temp.path(),
+                );
+                let (approval_tx, mut approval_rx) =
+                    tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(
+                        chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
+                    );
+                let mut host = CliSseStreamHost::from_edge_ctx(
+                    EdgeSseContext {
+                        api: &api,
+                        token: "tok",
+                        executor_id: "edge-test",
+                        executor,
+                        render_policy,
+                        perm_manager: Some(&mut pm),
+                        cancel_token: None,
+                        stream_event_tx: None,
+                        stream_event_sink: None,
+                        approval_request_tx: Some(approval_tx),
+                        ask_user_request_tx: None,
+                        skill_resolver: None,
+                        skill_continuation: false,
+                        turn_rollback_on_failure: false,
+                        tool_cache: &mut tool_cache,
+                        observability_hub: None,
+                        incremental_state: None,
+                        request_session_execution_lease: None,
+                    },
+                    80,
+                    false,
+                );
 
-        let decision_fut = host.resolve_cloud_approval_via_tui(
-            "write_file",
-            Some("src/main.rs"),
-            None,
-            astra_thin_client::ApprovalKind::Standard,
-        );
-        let responder = async {
-            let request = approval_rx.recv().await.expect("approval request");
-            assert_eq!(request.tool, "write_file");
-            assert!(request.header.contains("Cloud approval required"));
-            request
-                .response_tx
-                .send(chat_stream::ApprovalResponse::AllowOnce)
-                .expect("send response");
-        };
+                let decision_fut = host.resolve_cloud_approval_via_tui(
+                    "write_file",
+                    Some("src/main.rs"),
+                    None,
+                    astra_thin_client::ApprovalKind::Standard,
+                );
+                let responder = async {
+                    let request =
+                        tokio::time::timeout(std::time::Duration::from_secs(1), approval_rx.recv())
+                            .await
+                            .expect("native TUI approval must not be suppressed by Silent")
+                            .expect("approval request");
+                    assert_eq!(request.tool, "write_file");
+                    assert!(request.header.contains("Cloud approval required"));
+                    request
+                        .response_tx
+                        .send(response.clone())
+                        .expect("send response");
+                };
 
-        let (decision, ()) = tokio::join!(decision_fut, responder);
+                let (decision, ()) = tokio::join!(decision_fut, responder);
 
-        assert_eq!(decision, Ok(astra_thin_client::ApprovalDecision::Allow));
+                assert_eq!(
+                    decision,
+                    Ok(if response.is_approved() {
+                        astra_thin_client::ApprovalDecision::Allow
+                    } else {
+                        astra_thin_client::ApprovalDecision::Deny
+                    })
+                );
+            }
+        }
     }
 
     #[serial_test::serial]

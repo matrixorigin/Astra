@@ -482,26 +482,13 @@ fn derive_turn_interaction_mode(
                 TurnInteractionMode::Deny
             }
         }
-        // AcceptEdits still needs the native ask_user sink for clarifications.
-        // The old stdin/raw-mode path was removed because it corrupts the TUI
-        // and has no product parity with the overlay flow.
-        PermissionMode::AcceptEdits => {
-            if render_is_silent || !stdin_is_terminal {
-                TurnInteractionMode::NonInteractive
-            } else if has_ask_user_request_tx {
-                TurnInteractionMode::Prompt
-            } else {
-                TurnInteractionMode::NonInteractive
-            }
-        }
-        // Prompt also requires the native ask_user sink. Approval routing is
-        // orthogonal here: if the session can surface questionnaire prompts,
-        // keep ask_user available even when tool approvals are handled through
-        // a separate channel.
-        PermissionMode::Prompt => {
-            if render_is_silent || !stdin_is_terminal {
-                TurnInteractionMode::NonInteractive
-            } else if has_ask_user_request_tx {
+        // Native prompt channels, not the stream renderer, establish TUI
+        // interaction capability. The TUI intentionally uses Silent while it
+        // renders approval/ask_user overlays itself. Headless callers and
+        // callers without a native prompt sink remain noninteractive.
+        // Actual tool approvals still pass through the permission engine.
+        PermissionMode::Prompt | PermissionMode::AcceptEdits => {
+            if stdin_is_terminal && has_ask_user_request_tx {
                 TurnInteractionMode::Prompt
             } else {
                 TurnInteractionMode::NonInteractive
@@ -3161,6 +3148,41 @@ mod tests {
             derive_turn_interaction_mode(PermissionMode::Deny, false, false, false, false, true),
             TurnInteractionMode::Deny
         );
+    }
+
+    #[test]
+    fn derive_turn_interaction_mode_keeps_silent_tui_interactive() {
+        // The TUI owns rendering and provides native interaction channels;
+        // Silent only disables the lower-level stream renderer.
+        for mode in [PermissionMode::Prompt, PermissionMode::AcceptEdits] {
+            assert_eq!(
+                derive_turn_interaction_mode(mode, false, true, true, true, true),
+                TurnInteractionMode::Prompt,
+                "native TUI must remain interactive in {mode:?}",
+            );
+            assert_eq!(
+                derive_turn_interaction_mode(mode, true, true, true, true, true),
+                TurnInteractionMode::NonInteractive,
+                "delegated subtasks must not inherit the TUI prompt sink",
+            );
+            assert_eq!(
+                derive_turn_interaction_mode(mode, false, true, false, true, true),
+                TurnInteractionMode::NonInteractive,
+                "an approval channel alone cannot display ask_user",
+            );
+            assert_eq!(
+                derive_turn_interaction_mode(mode, false, true, true, true, false),
+                TurnInteractionMode::NonInteractive,
+                "headless execution must remain noninteractive",
+            );
+        }
+        for mode in [PermissionMode::Deny, PermissionMode::Plan] {
+            assert_eq!(
+                derive_turn_interaction_mode(mode, false, true, true, true, true),
+                TurnInteractionMode::NonInteractive,
+                "native channels must not bypass deny-like permission modes",
+            );
+        }
     }
 
     #[test]

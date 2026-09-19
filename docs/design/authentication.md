@@ -18,6 +18,16 @@ Trusted self-hosted deployments may explicitly set `MEMORIA_SELF_HOSTED_MASTER_A
 
 The provider verifies the scoped-key API contract through `/auth/whoami`: active non-master personal key, exact owner, nonempty key ID, API version 1, scopes capability and memory-filter capability. HTTP redirects are not followed. Identity, model-provider and Memoria secrets must not be logged.
 
+MOI native UC deployments may explicitly enable built-in memory with
+`ASTRA_UC_MEMORY_ENABLED=1`. This is a product authority, not an expansion of the
+local-password fallback. The same resolver accepts only the configured UC
+issuer's persisted identity, an active Astra account and a fresh active UC
+account-status response. It uses the owner-scoped deployment transport, a
+64-byte-compatible issuer/subject namespace, and no client-held memory key.
+Retained Memoria identities/credentials prevent a disconnected scoped account
+from acquiring this authority. Existing scoped consent remains authoritative.
+See [MOI native login](../guides/moi-native-login.md#built-in-memory).
+
 Memory proxy denials include additive `error_code` values without changing
 authorization policy: `memory_consent_denied` for a scoped permission denial,
 `memory_self_hosted_access_disabled` for an eligible unbound local account in a
@@ -100,6 +110,40 @@ shared signing secret.
 ## Client/deployment contract
 
 `GET /auth/methods` advertises the Server's website and issuer. An unset website retains interactive password login, including all-in-one deployments. The CLI falls back to the older password journey only on discovery 404, not on outages or malformed configuration. Explicit username/password and manual scoped-key login remain available.
+
+`astra login` and the workbench `/login` share one discovery decision: UC when
+advertised without an explicit legacy profile, otherwise Memoria browser login,
+otherwise an explicitly enabled password form. `/register` in the workbench
+uses the same decision; hosted registration belongs to the discovered website,
+not a local password form. Discovery errors never select password authentication.
+The workbench remains responsive during discovery and browser waiting. Escape
+can cancel before credential exchange starts; once exchange starts it awaits
+the bounded result instead of claiming cancellation after a possible commit.
+Browser authentication closes the previous local conversation before credentials
+are replaced. Successful login binds the identity and refreshing transport,
+resynchronizes capabilities and resolves the server default model in the current
+workbench, without requiring a manual restart. Browser waiting and cancellation
+retain the previous identity-pinned Edge heartbeat. On completion, the workbench
+stops and joins it before rebinding local execution. Login completion registers
+the current checkout with the new identity before reporting chat readiness,
+then starts its heartbeat; registration failure is reported explicitly and does
+not initialize a ready runtime. Existing transports retain their old generation
+binding; they cannot silently adopt another account. Authentication
+changes are refused while local background tasks are running.
+
+At browser re-login the CLI drains and retires its old session-memory service
+before credential publication. Successful completion rebuilds that service with
+the authenticated identity, including when the process started signed out. It
+also replaces the remote skill registry and its private cache, restarts external
+discovery, and attaches both the workbench and runtime to the new registry.
+Same-account re-login still replaces these clients because the credential
+generation changed; previously created transports remain generation-pinned.
+Cancelling browser waiting restores the previous identity's memory service and
+external discovery through the same completion path as an unsuccessful login.
+Native CLI memory proxy operations use the selected environment's endpoint and
+refreshing generation-bound credential together, ignoring conflicting legacy
+URL configuration and refusing HTTP redirects. Legacy memory proxy routing is
+unchanged when no native identity is bound.
 
 Browser login URLs require HTTPS except for explicit loopback development addresses. Windows passes the URL as child-process environment data, not shell source.
 

@@ -1726,6 +1726,18 @@ pub struct CancelRunResponse {
 }
 
 #[cfg(feature = "server")]
+#[derive(Serialize, PartialEq)]
+pub struct CancelSessionResponse {
+    #[serde(flatten)]
+    pub session: SessionResponse,
+    pub execution_settled: bool,
+    pub runs: Vec<CancelRunResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_blocker:
+        Option<astra_services::session_context_coordinator::WorkspaceReuseBlocker>,
+}
+
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct RunMutationResponse {
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -112,6 +112,28 @@ mod trace_overlay_tests {
     }
 }
 
+fn validate_native_directory_source(
+    before: Option<std::ffi::OsString>,
+    after: Option<std::ffi::OsString>,
+) -> Result<(), &'static str> {
+    if before != after {
+        return Err(
+            "MOI_AUTH_DIR cannot be supplied by a workspace .env; set it explicitly in your shell",
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn workspace_dotenv_cannot_select_native_auth_directory() {
+    assert!(validate_native_directory_source(None, Some("/untrusted".into())).is_err());
+    assert!(validate_native_directory_source(None, Some("".into())).is_err());
+    assert!(validate_native_directory_source(None, None).is_ok());
+    assert!(
+        validate_native_directory_source(Some("/trusted".into()), Some("/trusted".into())).is_ok()
+    );
+}
+
 pub fn run() -> i32 {
     match astra_core::process_runtime::build_process_runtime() {
         Ok(runtime) => runtime.block_on(run_async()),
@@ -130,9 +152,6 @@ async fn run_async() -> i32 {
             return 2;
         }
     };
-    if !explicit_env_config {
-        dotenvy::dotenv().ok();
-    }
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
@@ -151,6 +170,56 @@ async fn run_async() -> i32 {
     if let Err(error) = cli.validate_external_message_shorthand() {
         eprintln!("Error: {error}");
         return 2;
+    }
+    // The helper needs neither a runtime configuration nor a reachable Astra
+    // server; it owns only the explicitly selected local MOI session.
+    if let Some(cli::cli_config::cli_args::Command::Auth(command)) = &cli.command {
+        return match cli::native_auth::command(command).await {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("{error}");
+                1
+            }
+        };
+    }
+    if cli.profile.is_none()
+        && matches!(
+            &cli.command,
+            Some(cli::cli_config::cli_args::Command::Logout)
+        )
+    {
+        let native = astra_credentials::native::NativeStore::new().and_then(|s| s.configured());
+        match native {
+            Ok(true) => {
+                return match cli::native_auth::logout().await {
+                    Ok(()) => {
+                        eprintln!("Logged out of MOI");
+                        0
+                    }
+                    Err(error) => {
+                        eprintln!("{error}");
+                        1
+                    }
+                };
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                return 1;
+            }
+            Ok(false) => (),
+        }
+    }
+    // Chat/login can launch credential-consuming children too. Inspect the
+    // actual loaded environment, not a second parse of a mutable .env file.
+    if !explicit_env_config {
+        let native_directory = std::env::var_os("MOI_AUTH_DIR");
+        dotenvy::dotenv().ok();
+        if let Err(error) =
+            validate_native_directory_source(native_directory, std::env::var_os("MOI_AUTH_DIR"))
+        {
+            eprintln!("Error: {error}");
+            return 2;
+        }
     }
     cli::diagnostic_log::init_cli_observability(&cli);
     let mut cli_overlay = astra_config::runtime_config::RuntimeConfig::default();
@@ -219,7 +288,7 @@ async fn run_async() -> i32 {
         &astra_config::runtime_config::RuntimeConfig::load(),
     );
     // Resolve API URL: --api-url flag > ASTRA_API_URL env var > config file > default
-    let base = match cli::config_manager::resolve_api_url(cli.api_url.as_deref()) {
+    let mut base = match cli::config_manager::resolve_api_url(cli.api_url.as_deref()) {
         Ok(base) => base,
         Err(err) => {
             tracing::error!(target: "astra_cli", error = %err, "failed to resolve API URL");
@@ -230,7 +299,25 @@ async fn run_async() -> i32 {
             return 2;
         }
     };
-    let api = match astra_thin_client::ThinClient::new(&base, None) {
+    let native_binding = match cli::native_auth::bind_process(
+        &mut base,
+        cli.api_url.is_some() || std::env::var_os("ASTRA_API_URL").is_some(),
+        cli.profile.as_deref(),
+        matches!(
+            &cli.command,
+            Some(
+                cli::cli_config::cli_args::Command::Login(_)
+                    | cli::cli_config::cli_args::Command::Register(_)
+            )
+        ),
+    ) {
+        Ok(binding) => binding,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            return 1;
+        }
+    };
+    let mut api = match astra_thin_client::ThinClient::new(&base, None) {
         Ok(api) => api,
         Err(err) => {
             tracing::error!(
@@ -246,6 +333,9 @@ async fn run_async() -> i32 {
             return 1;
         }
     };
+    if let Some(binding) = native_binding {
+        api = api.with_bearer_provider(binding);
+    }
 
     let Cli {
         api_url: _,

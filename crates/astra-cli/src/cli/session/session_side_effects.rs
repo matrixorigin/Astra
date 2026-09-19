@@ -148,7 +148,9 @@ pub(crate) fn enqueue_ingestion_for_immediate_drain_pub(
 #[derive(Debug)]
 pub(crate) struct OneShotJournalCommit {
     pub(crate) turn: u32,
-    pub(crate) cursor: astra_turn_types::SessionCursorV1,
+    /// Exact canonical messages and cursor committed to the journal. Derived
+    /// stores must not pair this cursor with the unsanitized stream result.
+    pub(crate) conversation: astra_turn_core::active_conversation::ActiveConversation,
     /// Present when append returned an error but exact readback proved that the
     /// intended canonical commit exists. The commit is authoritative; derived
     /// projections and durability health still require repair.
@@ -295,7 +297,6 @@ pub(crate) fn append_one_shot_journal_events(
             ))
         })?;
     let intended_commit = prepared.commit.clone();
-    let cursor = prepared.commit.cursor.clone();
 
     let mut turn_event = session_journal::JournalEvent::turn(
         Some(session_id),
@@ -337,7 +338,7 @@ pub(crate) fn append_one_shot_journal_events(
             persistence_warning,
         } => Ok(Some(OneShotJournalCommit {
             turn,
-            cursor,
+            conversation: prepared.next,
             persistence_error: persistence_warning,
         })),
         session_journal::CanonicalCommitCasOutcome::NotCommitted(reason)

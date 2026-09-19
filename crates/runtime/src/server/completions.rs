@@ -205,15 +205,7 @@ pub(super) async fn completions_handler(
         Err(error) if crate::turn::llm::durable::is_ledger_error(&error) => {
             return Err(inference_ledger_http_error(error));
         }
-        Err(error) => {
-            let detail = crate::turn::llm::client::redact_provider_secrets(&error.message);
-            let detail = astra_text_utils::str_preview::truncate_str(&detail, 500);
-            return Err(crate::error_response_coded(
-                StatusCode::BAD_GATEWAY,
-                format!("Upstream LLM request failed ({}): {detail}", error.kind),
-                "model_provider_request_failed",
-            ));
-        }
+        Err(error) => return Err(provider_request_http_error(error)),
     };
 
     // 5. Build the stable OpenAI-compatible response surface.
@@ -242,6 +234,26 @@ pub(super) async fn completions_handler(
         }],
         usage,
     }))
+}
+
+fn provider_request_http_error(
+    error: astra_core::ClassifiedError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    let detail = crate::turn::llm::client::redact_provider_secrets(&error.message);
+    let detail = astra_text_utils::str_preview::truncate_str(&detail, 500);
+    let (status, code) = if error.kind == astra_core::ErrorKind::PaymentRequired {
+        (
+            StatusCode::PAYMENT_REQUIRED,
+            "model_provider_payment_required",
+        )
+    } else {
+        (StatusCode::BAD_GATEWAY, "model_provider_request_failed")
+    };
+    crate::error_response_coded(
+        status,
+        format!("Upstream LLM request failed ({}): {detail}", error.kind),
+        code,
+    )
 }
 
 fn inference_ledger_http_error(
@@ -294,6 +306,19 @@ fn completion_usage(raw: &serde_json::Map<String, serde_json::Value>) -> Option<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn payment_required_is_not_reported_as_a_transient_gateway_failure() {
+        let (status, body) = super::provider_request_http_error(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::PaymentRequired,
+            "LLM payment required (402): insufficient_credit",
+        ));
+        assert_eq!(status, axum::http::StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            body.error_code.as_deref(),
+            Some("model_provider_payment_required")
+        );
+    }
+
     use super::*;
     use astra_services::{
         ModelCreateRequestData, ModelListItem, ModelRecord, ModelService, ModelUpdateRequestData,

@@ -21,9 +21,11 @@ pub(super) fn build_auth_service(
     shared_pool: &SharedPool,
     control_pool: Option<&SharedPool>,
     shared_encryptor: &Arc<FernetTokenEncryptor>,
+    uc_provider: Option<astra_services::auth::uc::UcNativeProvider>,
 ) -> Result<Arc<dyn AuthService>, Box<dyn std::error::Error>> {
     let mut service = DatabaseAuthService::new(settings.matrixone.clone(), settings.jwt.clone())
         .with_pool(shared_pool.clone())
+        .with_uc_native(uc_provider)
         .with_memoria_settings(&settings.memoria)?
         .with_encryptor(shared_encryptor.as_ref().clone());
     if let Some(control_pool) = control_pool {
@@ -71,6 +73,7 @@ pub(super) fn build_core_state(
     control_pool: Option<&SharedPool>,
     shared_encryptor: &Arc<FernetTokenEncryptor>,
     auth_service: Arc<dyn AuthService>,
+    uc_provider: Option<astra_services::auth::uc::UcNativeProvider>,
 ) -> AppState {
     let execution_grant_key =
         derive_runtime_subkey(&settings.runtime_root_secret, b"execution-grant");
@@ -122,6 +125,7 @@ pub(super) fn build_core_state(
     ))
     .with_model_service(Arc::new(
         DatabaseModelService::new(settings.matrixone.clone(), Arc::clone(shared_encryptor))
+            .with_uc_native(uc_provider)
             .with_pool(shared_pool.clone()),
     ))
     .with_job_service(Arc::new(InMemoryJobService::new()))

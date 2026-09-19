@@ -126,6 +126,31 @@ fn moi_model_gateway_error(
     })
 }
 
+/// Keep the billing owner's machine-readable reason without forwarding an
+/// arbitrary provider body (which can echo credentials). Both HTTP adapters
+/// use this boundary; 402 is terminal and must never trigger login or retries.
+fn payment_required_error(body: &str) -> astra_core::ClassifiedError {
+    let value = serde_json::from_str::<Value>(body).ok();
+    let code = value
+        .as_ref()
+        .and_then(|value| value.pointer("/error/code"))
+        .and_then(Value::as_str)
+        .filter(|code| {
+            matches!(
+                *code,
+                "insufficient_credit" | "monthly_spend_limit_exceeded"
+            )
+        });
+    let message = match code {
+        Some(code) => format!("LLM payment required (402): {code}"),
+        None => "LLM payment required (402)".to_owned(),
+    };
+    astra_core::ClassifiedError::new(astra_core::ErrorKind::PaymentRequired, message)
+        .with_details_json(
+            json!({"source": "llm_provider", "http_status": 402, "code": code}).to_string(),
+        )
+}
+
 /// Maximum retries for known provider failures (429, 5xx, connect-before-delivery).
 pub(crate) const LLM_MAX_RETRIES: u32 = 3;
 /// Base delay between retries (doubles each attempt: 1s, 2s, 4s).
@@ -5676,6 +5701,17 @@ async fn call_llm_and_collect_with_total_budget(
             return Err(error);
         }
         last_model_gateway_error = None;
+        // A negotiated gateway route must retain its versioned error boundary;
+        // do not reinterpret a missing/mismatched contract as a provider error.
+        // Likewise, an unsolicited gateway header is not trusted on BYOK routes.
+        if status == 402
+            && !uses_moi_model_gateway_error_contract(header_overrides)
+            && model_gateway_error_contract.is_none()
+        {
+            let error = payment_required_error(&text);
+            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+            return Err(error);
+        }
 
         // Auth errors: redact the body in logs and return a generic message
         // so provider-echoed secrets cannot leak through error propagation.
@@ -7421,6 +7457,11 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
                 return Err(error);
             }
         };
+        if status == 402 {
+            let error = payment_required_error(&text);
+            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+            return Err(error);
+        }
         let kind = if status == 401 || status == 403 {
             astra_core::ErrorKind::Auth
         } else if is_rate_limit_status(status) {
@@ -7919,6 +7960,33 @@ pub(crate) fn parse_openai_sse_json_stream(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn payment_required_preserves_owner_codes_without_echoing_provider_secrets() {
+        for code in ["insufficient_credit", "monthly_spend_limit_exceeded"] {
+            let error = super::payment_required_error(
+                &serde_json::json!({
+                    "error": {"code": code, "message": "private-provider-credential"}
+                })
+                .to_string(),
+            );
+            assert_eq!(error.kind, astra_core::ErrorKind::PaymentRequired);
+            assert!(!error.kind.is_retryable());
+            assert!(error.message.contains(code));
+            assert!(!format!("{error:?}").contains("private-provider-credential"));
+            let details: serde_json::Value =
+                serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
+            assert_eq!(details["code"], code);
+        }
+        for body in [
+            "malformed-private-body",
+            r#"{"error":{"code":"private-provider-credential"}}"#,
+        ] {
+            let error = super::payment_required_error(body);
+            assert_eq!(error.message, "LLM payment required (402)");
+            assert!(!format!("{error:?}").contains("private-"));
+        }
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -14416,6 +14484,65 @@ mod tests {
         .expect_err("should fail with context window");
         assert_eq!(err.kind, astra_core::ErrorKind::ContextWindow);
         assert!(err.message.contains("context_length_exceeded"));
+    }
+
+    #[tokio::test]
+    async fn payment_required_is_terminal_in_streaming_and_nonstreaming_adapters() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captured = hits.clone();
+        let app = Router::new().route("/chat/completions", post(move || {
+            let hits = captured.clone();
+            async move {
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Response::builder().status(402).body(Body::from(
+                    r#"{"error":{"code":"insufficient_credit","message":"private-provider-credential"}}"#
+                )).unwrap()
+            }
+        }));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"hello"})];
+        for streaming in [false, true] {
+            let call = LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    model_name: "payment-fixture",
+                    wire_model_name: None,
+                    api_key: "fixture",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            };
+            let error = if streaming {
+                call_llm_and_collect(call, LlmCancel::None)
+                    .await
+                    .unwrap_err()
+            } else {
+                call_llm_nonstream(global_llm_client(), call, std::time::Duration::from_secs(5))
+                    .await
+                    .unwrap_err()
+            };
+            assert_eq!(error.kind, astra_core::ErrorKind::PaymentRequired);
+            assert!(error.message.contains("insufficient_credit"));
+            assert!(!format!("{error:?}").contains("private-provider-credential"));
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "402 must never be retried"
+        );
     }
 
     /// Mock server that returns 401 Unauthorized.

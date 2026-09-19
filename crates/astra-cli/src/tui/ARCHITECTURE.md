@@ -94,7 +94,7 @@ read paths:
 | **RootTranscriptView** | `Ctrl+O`, root row in `Ctrl+G` | Canonical root conversation with pagination and labelled local live suffix |
 | **AgentTranscriptView** | `Ctrl+G` → selected run | The same browser for a child/grandchild run, with typed live suffix and pagination |
 | **SessionPickerView** | `/resume` (no args) | Two-pane recent sessions picker |
-| **LoginView / RegisterView** | `/login`, `/register` | Inline auth form (no drop to bare terminal) |
+| **LoginView / RegisterView** | `/login`, `/register` | Password forms only after shared server discovery; UC/Memoria use asynchronous browser login without leaving the workbench |
 
 ### Cell types
 

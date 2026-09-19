@@ -10,6 +10,8 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod native;
+
 #[derive(Debug, Error)]
 pub enum CredentialError {
     #[error("io error on {path}: {source}")]

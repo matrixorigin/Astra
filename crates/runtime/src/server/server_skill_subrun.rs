@@ -148,6 +148,7 @@ impl Drop for OuterSkillDispatchGuard {
 /// Creates a [`ServerAgenticLoopHost`] for each sub-run with isolated context
 /// but shared LLM credentials and skill resolver.
 pub struct ServerSkillSubRunExecutor {
+    model_service: Option<Arc<dyn astra_services::ModelService>>,
     matrixone: MatrixOneSettings,
     encryptor: Arc<FernetTokenEncryptor>,
     shared_pool: Option<SharedPool>,
@@ -225,6 +226,13 @@ pub struct ServerSkillSubRunExecutor {
 }
 
 impl ServerSkillSubRunExecutor {
+    pub fn with_model_service(
+        mut self,
+        service: Option<Arc<dyn astra_services::ModelService>>,
+    ) -> Self {
+        self.model_service = service;
+        self
+    }
     pub fn new(
         matrixone: MatrixOneSettings,
         encryptor: Arc<FernetTokenEncryptor>,
@@ -232,6 +240,7 @@ impl ServerSkillSubRunExecutor {
         session_id: String,
     ) -> Self {
         Self {
+            model_service: None,
             matrixone,
             encryptor,
             shared_pool: None,
@@ -937,6 +946,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             self.session_id.clone(),
         )
         .with_model(effective_model.clone())
+        .with_model_service(self.model_service.clone())
         .with_admitted_model_execution(self.admitted_model_execution.clone())
         .with_inference_owner_pod_id(Some(parent_owner_pod_id.to_string()))
         .with_edge_tools(self.edge_tools.clone())

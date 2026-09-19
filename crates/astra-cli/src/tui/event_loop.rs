@@ -115,6 +115,61 @@ enum ModelCatalogEffect {
     Ready(Result<Vec<crate::cli::slash::slash_router::ModelCatalogEntry>, String>),
 }
 
+enum LoginEffect {
+    Discovered {
+        method: crate::cli::auth_flow::LoginMethod,
+        register: bool,
+    },
+    Completed {
+        uc: bool,
+    },
+}
+
+fn cancel_login_on_key(
+    key: crossterm::event::KeyEvent,
+    phase: &super::login_control::LoginControl,
+    tasks: &mut tokio::task::JoinSet<Result<LoginEffect, String>>,
+) -> Option<bool> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    if key.code != KeyCode::Esc
+        && !(key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+    {
+        return None;
+    }
+    let cancelled = phase.cancel();
+    if cancelled {
+        // Leave the completion in the JoinSet: the event loop's single failure
+        // path restores retired identity services before admitting more input.
+        tasks.abort_all();
+    }
+    Some(cancelled)
+}
+
+async fn restore_login_identity_services(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    state: &mut crate::cli::session::session_state::SessionState,
+    discovery: &mut tokio::task::JoinHandle<
+        crate::cli::session::session_runtime::ExternalPipelineDiscoveryReport,
+    >,
+    discovery_pending: &mut bool,
+) {
+    if state.session_memory_extractor.is_none() {
+        state.session_memory_extractor =
+            crate::cli::session::session_startup::build_cli_session_memory_extractor(api, profile)
+                .await;
+    }
+    if !*discovery_pending {
+        *discovery = tokio::spawn(
+            crate::cli::session::session_runtime::discover_external_pipeline_capabilities(
+                state.unified_skill_registry.clone(),
+                state.mcp_manager.clone(),
+            ),
+        );
+        *discovery_pending = true;
+    }
+}
+
 /// A completed read-only slash action. The payload stays structured until it
 /// reaches the workbench, so the UI decides how to present an empty result,
 /// a load failure, or an interactive view without parsing display strings.
@@ -3242,6 +3297,8 @@ impl GuidanceSubmissionError {
             | astra_thin_client::ThinClientError::Json(_)
             | astra_thin_client::ThinClientError::SseParse(_)
             | astra_thin_client::ThinClientError::IncompatibleRuntime { .. }
+            | astra_thin_client::ThinClientError::SessionCancellationPending { .. }
+            | astra_thin_client::ThinClientError::InvalidSessionCancellationResponse(_)
             | astra_thin_client::ThinClientError::InvalidSseJson(_) => {
                 Self::Unconfirmed(error.to_string())
             }
@@ -4183,12 +4240,10 @@ fn sync_explain_presentation(
     chat_widget: &mut chat_widget::ChatWidget,
     state: &crate::cli::session::session_state::SessionState,
 ) {
-    chat_widget.set_explain_verbose(matches!(
-        state.explain,
-        crate::cli::session::session_state::ExplainMode::Verbose
-    ));
-    chat_widget.set_explain_live_rows(state.runtime_config.explain.effective_live_rows());
-    chat_widget.set_explain_report_format(state.runtime_config.explain.effective_report_format());
+    chat_widget.restore_explain_preferences(
+        matches!(state.explain, crate::ExplainMode::Verbose),
+        &state.runtime_config.explain,
+    );
 }
 
 #[derive(Debug)]
@@ -6419,6 +6474,10 @@ pub(crate) async fn run_tui_session(
     no_instructions: bool,
     cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<(), String> {
+    // Replace only this surface's transport at an explicit auth boundary.
+    // Previously cloned transports remain pinned to their old credentials.
+    let mut authenticated_api;
+    let mut api = api;
     use crate::cli::session::session_runtime::initialize_session_state;
     use crate::cli::session::session_startup::{SessionStartupArtifacts, complete_session_startup};
     use crate::cli::startup_trace::StartupTracer;
@@ -6463,7 +6522,7 @@ pub(crate) async fn run_tui_session(
         ) => result?,
     };
     let SessionStartupArtifacts {
-        pipeline_modules,
+        mut pipeline_modules,
         mut edge_heartbeat_task,
         shutdown_signal_rx,
         ..
@@ -6522,9 +6581,9 @@ pub(crate) async fn run_tui_session(
     // Local and bundled skills are already available. External providers
     // converge in a supervised task after startup so DB/MCP latency cannot
     // delay the first interactive frame.
-    let skill_registry = Arc::clone(&state.unified_skill_registry);
+    let mut skill_registry = Arc::clone(&state.unified_skill_registry);
     let discovery_registry = Arc::clone(&skill_registry);
-    let mcp_manager = Arc::clone(&state.mcp_manager);
+    let mut mcp_manager = Arc::clone(&state.mcp_manager);
     let discovery_mcp_manager = Arc::clone(&mcp_manager);
     let mut external_skill_discovery = tokio::spawn(async move {
         crate::cli::session::session_runtime::discover_external_pipeline_capabilities(
@@ -6608,6 +6667,10 @@ pub(crate) async fn run_tui_session(
     }
     let (model_catalog_tx, mut model_catalog_rx) = tokio::sync::mpsc::channel(2);
     let mut model_catalog_tasks = tokio::task::JoinSet::new();
+    let mut login_tasks = tokio::task::JoinSet::<Result<LoginEffect, String>>::new();
+    let (login_progress_tx, mut login_progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let login_phase = Arc::new(super::login_control::LoginControl::default());
+    let mut login_view_open = false;
     let mut model_catalog_loading = false;
     let mut model_catalog_cache = None;
     let (slash_background_read_tx, mut slash_background_read_rx) =
@@ -6784,14 +6847,14 @@ pub(crate) async fn run_tui_session(
     // Canonical Work remains the board's only authority. The observer performs
     // bounded reconciliation, while a just-acknowledged server receipt can
     // make that same authority visible before the next read returns.
-    let plan_task_observer = crate::tui::plan_task_observer::PlanTaskObserver::new(
+    let mut plan_task_observer = crate::tui::plan_task_observer::PlanTaskObserver::new(
         api.clone(),
         profile,
         state.session_id.as_deref(),
     );
     let mut board_expanded = false;
     let mut plan_task_projection_sequence = None;
-    let server_agent_observer = crate::tui::server_agent_observer::ServerAgentObserver::new(
+    let mut server_agent_observer = crate::tui::server_agent_observer::ServerAgentObserver::new(
         api.clone(),
         profile,
         state.session_id.as_deref(),
@@ -6864,6 +6927,144 @@ pub(crate) async fn run_tui_session(
         tokio::select! {
             _ = session_shutdown_token.cancelled() => {
                 break 'main Ok(());
+            }
+            Some(progress) = login_progress_rx.recv() => {
+                if login_tasks.is_empty() { continue; }
+                if let crate::cli::auth_flow::LoginProgress::OpenBrowser(url) = progress {
+                    chat_widget.commit_system(history_cell::system::SystemCell::response(
+                        "Complete sign-in in your browser. Esc cancels while waiting.",
+                    ));
+                    // The authorization link is an ephemeral view, never a
+                    // conversation transcript or model-context message.
+                    bottom_pane.push_view(Box::new(super::bottom_pane::info_view::InfoView::from_plain(
+                        "Browser sign-in", vec!["If the browser did not open, visit:".into(), url],
+                    )));
+                    login_view_open = true;
+                }
+                let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                flush_chat_widget(&mut guard, &mut chat_widget, width);
+                frame_requester.schedule_frame();
+            }
+            Some(result) = login_tasks.join_next(), if !login_tasks.is_empty() => {
+                use crate::cli::auth_flow::{self, LoginMethod, LoginProgress};
+                let cancelled = login_phase.is_cancelled();
+                let result = if cancelled {
+                    // Discovery may already have completed when Esc wins.
+                    // Discard that result rather than opening a login form.
+                    Err("Login cancelled".to_string())
+                } else {
+                    result.map_err(|_| "Login task failed".to_string()).and_then(|result| result)
+                };
+                if login_view_open {
+                    bottom_pane.close_active_view();
+                    login_view_open = false;
+                }
+                match result {
+                    Ok(LoginEffect::Discovered { method: LoginMethod::Password, register }) => {
+                        use super::bottom_pane::login_view::{LoginMode, LoginView};
+                        bottom_pane.push_view(Box::new(LoginView::new(if register { LoginMode::Register } else { LoginMode::Login })));
+                    }
+                    Ok(LoginEffect::Discovered { method, .. }) => {
+                        // No model/tool work can start while the login task owns input.
+                        // Retire the old owner before the browser publishes credentials.
+                        auth_flow::begin_browser_session_login(&mut state).await;
+                        if external_skill_discovery_pending {
+                            external_skill_discovery.abort();
+                            let _ = (&mut external_skill_discovery).await;
+                            external_skill_discovery_pending = false;
+                        }
+                        runtime_notification_turn_pending = false;
+                        runtime_notification_wake_at = None;
+                        let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                        flush_chat_widget(&mut guard, &mut chat_widget, width);
+                        chat_widget = chat_widget::ChatWidget::new(String::new());
+                        sync_explain_presentation(&mut chat_widget, &state);
+                        rebind_workbench_observers(None, &task_board, &server_agent_observer, &plan_task_observer, &mut board_user_pin);
+                        refresh_footer_from_state(&mut bottom_pane, &state);
+                        model_catalog_tasks.abort_all();
+                        while model_catalog_tasks.join_next().await.is_some() {}
+                        while model_catalog_rx.try_recv().is_ok() {}
+                        model_catalog_cache = None;
+                        model_catalog_loading = false;
+                        slash_background_read_tasks.abort_all();
+                        slash_background_read_count = 0;
+                        slash_background_read_generation = slash_background_read_generation.wrapping_add(1);
+                        let uc = matches!(method, LoginMethod::Uc(_));
+                        let api = api.clone();
+                        let profile = profile.map(str::to_owned);
+                        let tx = login_progress_tx.clone();
+                        let phase = login_phase.clone();
+                        login_tasks.spawn(async move {
+                            auth_flow::browser_login(&api, profile.as_deref(), method, Arc::new(move |progress| {
+                                match &progress {
+                                    LoginProgress::Completing => phase.begin_exchange()?,
+                                    LoginProgress::OpenBrowser(url) => crate::cli::auth_flow::open_login_url(url),
+                                }
+                                let _ = tx.send(progress);
+                                Ok(())
+                            }), false).await?;
+                            Ok(LoginEffect::Completed { uc })
+                        });
+                    }
+                    Ok(LoginEffect::Completed { uc }) => {
+                        // Keep the old, identity-pinned heartbeat during browser
+                        // waiting/cancellation, but join it before rebinding Edge.
+                        if let Some(task) = edge_heartbeat_task.take() {
+                            task.abort();
+                            let _ = task.await;
+                        }
+                        match auth_flow::finish_browser_session_login(api, profile, uc, &mut state).await {
+                            Ok((replacement, token, modules)) => {
+                                pipeline_modules = modules;
+                                skill_registry = Arc::clone(&state.unified_skill_registry);
+                                mcp_manager = Arc::clone(&state.mcp_manager);
+                                refresh_skill_popup(&skill_registry, &mut bottom_pane);
+                                external_skill_discovery = tokio::spawn(
+                                    crate::cli::session::session_runtime::discover_external_pipeline_capabilities(
+                                        skill_registry.clone(), mcp_manager.clone(),
+                                    ),
+                                );
+                                external_skill_discovery_pending = true;
+                                authenticated_api = replacement;
+                                api = &authenticated_api;
+                                if crate::cli::edge_lifecycle::edge_cloud_registry_enabled() {
+                                    edge_heartbeat_task = crate::cli::edge_lifecycle::spawn_edge_heartbeat(
+                                        api.clone(), token.clone(), profile.map(str::to_owned),
+                                    );
+                                }
+                                server_agent_observer = crate::tui::server_agent_observer::ServerAgentObserver::new(api.clone(), profile, None);
+                                plan_task_observer = crate::tui::plan_task_observer::PlanTaskObserver::new(api.clone(), profile, None);
+                                server_agent_projection_sequence = None;
+                                plan_task_projection_sequence = None;
+                                chat_widget.commit_system(history_cell::system::SystemCell::response("Logged in. You can continue chatting."));
+                                let report = crate::post_auth_cloud_resync(profile, &mut state).await;
+                                if let Some(notice) = report.user_notice() {
+                                    chat_widget.commit_system(history_cell::system::SystemCell::warning(notice));
+                                }
+                                if let Some(model) = sync_default_model_after_auth(api, &token, &mut state, &mut bottom_pane).await {
+                                    chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Default model: {model}")));
+                                }
+                            }
+                            Err(error) => chat_widget.commit_system(history_cell::system::SystemCell::error(error)),
+                        }
+                    }
+                    Err(error) => {
+                        // Cancellation before publication retains the old identity.
+                        // Recreate its retired memory service using the still-pinned
+                        // API; a committed account change cannot reuse this client.
+                        restore_login_identity_services(api, profile, &mut state, &mut external_skill_discovery, &mut external_skill_discovery_pending).await;
+                        if cancelled {
+                            while login_progress_rx.try_recv().is_ok() {}
+                            chat_widget.commit_system(history_cell::system::SystemCell::response("Login cancelled."));
+                        } else {
+                            chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Login failed: {error}")));
+                        }
+                    }
+                }
+                let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                flush_chat_widget(&mut guard, &mut chat_widget, width);
+                bottom_pane.sync_popups();
+                frame_requester.schedule_frame();
             }
             Some(completion) = turn_post_commit_completion_rx.recv() => {
                 let completed_session_id = completion.session_id.clone();
@@ -7202,6 +7403,17 @@ pub(crate) async fn run_tui_session(
                 };
                 match ev {
                     TuiEvent::Key(key) => {
+                        if !login_tasks.is_empty() {
+                            if let Some(cancelled) = cancel_login_on_key(key, &login_phase, &mut login_tasks) {
+                                if !cancelled {
+                                    chat_widget.commit_system(history_cell::system::SystemCell::info("Completing sign-in; waiting for the credential exchange to finish."));
+                                }
+                                let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                                flush_chat_widget(&mut guard, &mut chat_widget, width);
+                                frame_requester.schedule_frame();
+                            }
+                            continue;
+                        }
                         let runtime_notification_submission =
                             runtime_notification_event && runtime_notification_turn_pending;
                         if runtime_notification_event && !runtime_notification_submission {
@@ -7615,6 +7827,21 @@ pub(crate) async fn run_tui_session(
                                     match result {
                                         slash_dispatch::SlashResult::Handled => {}
                                         slash_dispatch::SlashResult::Deferred => {}
+                                        slash_dispatch::SlashResult::Authenticate { register } => {
+                                            if background_registry.running_count() > 0 || work_start_in_flight {
+                                                chat_widget.commit_system(history_cell::system::SystemCell::warning("Wait for or stop background tasks before changing authentication."));
+                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                continue;
+                                            }
+                                            login_phase.reset();
+                                            let api = api.clone();
+                                            let profile = profile.map(str::to_owned);
+                                            chat_widget.commit_system(history_cell::system::SystemCell::response("Discovering sign-in method…"));
+                                            login_tasks.spawn(async move {
+                                                let method = crate::cli::auth_flow::discover_login_method(&api, profile.as_deref()).await?;
+                                                Ok(LoginEffect::Discovered { method, register })
+                                            });
+                                        }
                                         slash_dispatch::SlashResult::OpenRootTranscript {
                                             session_id,
                                         } => {
@@ -11184,6 +11411,8 @@ pub(crate) async fn run_tui_session(
         tracing::debug!("aborted deferred turn-post-commit worker during TUI shutdown");
     }
     model_catalog_tasks.abort_all();
+    login_tasks.abort_all();
+    while login_tasks.join_next().await.is_some() {}
     while model_catalog_tasks.join_next().await.is_some() {}
     for task in startup_observation_tasks {
         task.abort();
@@ -11475,6 +11704,123 @@ mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn escape_browser_login_restores_memory_and_external_discovery() {
+        use crate::cli::{auth_flow, session::session_runtime};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use wiremock::matchers::{body_partial_json, header};
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _creds = crate::tests::isolate_credentials();
+        let _token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        unsafe { std::env::set_var("ASTRA_ACCESS_TOKEN", "old-token") };
+        let server = MockServer::start().await;
+        Mock::given(path("/auth/me"))
+            .and(header("authorization", "Bearer old-token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"user_id": "old-owner"})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(path("/skills"))
+            .and(header("authorization", "Bearer old-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"skills": [], "limit": 100, "total": 0, "next_cursor": null}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/memory/retrieve"))
+            .and(header("authorization", "Bearer old-token"))
+            .and(body_partial_json(
+                serde_json::json!({"user_id": "old-owner"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"memories": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let modules = session_runtime::create_tui_pipeline_modules(&api, None, None);
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.unified_skill_registry = modules.unified_skill_registry.clone();
+        state.mcp_manager = modules.mcp_manager.clone();
+        state.session_memory_extractor =
+            crate::cli::session::session_startup::build_cli_session_memory_extractor(&api, None)
+                .await;
+        assert!(state.session_memory_extractor.is_some());
+        auth_flow::begin_browser_session_login(&mut state).await;
+        assert!(state.session_memory_extractor.is_none());
+        let mut discovery = tokio::spawn(std::future::pending());
+        discovery.abort();
+        let _ = (&mut discovery).await;
+        let mut discovery_pending = false;
+        let phase = Arc::new(super::super::login_control::LoginControl::default());
+        let task_phase = phase.clone();
+        let login_api = api.clone();
+        let website = server.uri();
+        let (opened_tx, mut opened_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            auth_flow::browser_login(
+                &login_api,
+                None,
+                auth_flow::LoginMethod::Memoria(website),
+                Arc::new(move |progress| {
+                    match progress {
+                        auth_flow::LoginProgress::OpenBrowser(url) => {
+                            let _ = opened_tx.send(url);
+                        }
+                        auth_flow::LoginProgress::Completing => task_phase.begin_exchange()?,
+                    }
+                    Ok(())
+                }),
+                false,
+            )
+            .await?;
+            Ok(LoginEffect::Completed { uc: false })
+        });
+        let url = tokio::time::timeout(Duration::from_secs(5), opened_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(url.contains("/connect/astra"));
+        assert_eq!(
+            cancel_login_on_key(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &phase,
+                &mut tasks
+            ),
+            Some(true)
+        );
+        // The key handler must leave cancellation for the normal completion
+        // branch, rather than draining it and bypassing identity restoration.
+        let result = tasks.join_next().await.unwrap();
+        assert!(result.as_ref().is_err_and(|error| error.is_cancelled()));
+        restore_login_identity_services(
+            &api,
+            None,
+            &mut state,
+            &mut discovery,
+            &mut discovery_pending,
+        )
+        .await;
+        assert!(discovery_pending);
+        let report = discovery.await.unwrap();
+        assert!(report.skills.unwrap().failures.is_empty());
+        assert!(report.mcp_failures.is_empty());
+        let memory = state.session_memory_extractor.as_ref().unwrap();
+        assert_eq!(memory.owner_user_id(), Some("old-owner"));
+        memory
+            .run_session_end_governance(&Default::default(), "cancelled-login-session")
+            .await
+            .unwrap();
+        assert!(phase.begin_exchange().is_err());
+    }
 
     #[test]
     fn turn_usage_comes_from_canonical_stream_result() {

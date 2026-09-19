@@ -628,7 +628,7 @@ fn build_cli_session_memory_event_sink() -> std::sync::Arc<SessionMemoryEventSin
     )
 }
 
-async fn build_cli_session_memory_extractor(
+pub(crate) async fn build_cli_session_memory_extractor(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> Option<std::sync::Arc<astra_runtime::session_memory::MemoryExtractionService>> {
@@ -810,7 +810,9 @@ pub(crate) async fn complete_session_startup(
                 session_runtime::ServerDefaultModel::NoModels => {
                     state.model = Some("⚠ none".to_string());
                 }
-                session_runtime::ServerDefaultModel::Unavailable => {}
+                session_runtime::ServerDefaultModel::Unavailable(error) => {
+                    eprintln!("warning: {error}");
+                }
             }
         }
     }

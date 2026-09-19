@@ -65,6 +65,14 @@ An inconclusive quality judgment caused by omitted evidence is not proof that
 the agent's claimed result is false, and a passing exit code is not a substitute
 for inspecting quality failures.
 
+Harness cleanup cancels only the exact server-issued Session observed by its
+CLI invocation. `astra session cancel` waits up to 10 seconds for the Server's
+`execution_settled: true` proof; a `cancelled` display status without that proof
+is not sufficient. Pending cancellation, missing proof, a different Session
+identity, or a timeout fails cleanup instead of claiming that the checkout is
+free. Deletion after capture is harness-owned history cleanup, not a requirement
+for starting a new conversation in an idle checkout.
+
 Live agent cases require exit 0 by default. A negative test can explicitly
 expect a nonzero terminal code using `exit_code`, together with the expected
 `final_state`, `interruption_kind`, and evidence assertions. Passing means the

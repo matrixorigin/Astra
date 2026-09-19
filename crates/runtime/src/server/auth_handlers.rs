@@ -12,10 +12,68 @@ pub(super) async fn auth_methods_handler(State(state): State<AppState>) -> Json<
     let provider = state.auth_service.memoria_credentials().map(|r| r.provider);
     Json(serde_json::json!({
         "password": true,
+        "uc": state.auth_service.uc_discovery(),
         "memoria": provider.and_then(|p| p.web_url.map(|url| serde_json::json!({
             "issuer": p.issuer, "authorization_url": url
         })))
     }))
+}
+
+pub(super) async fn auth_uc_bootstrap_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let discovery = state.auth_service.uc_discovery().ok_or_else(|| {
+        astra_core::error_response_coded(
+            StatusCode::NOT_FOUND,
+            "UC native login is not configured",
+            "uc_not_configured",
+        )
+    })?;
+    let principal = state.auth_service.current_principal(&headers).await?;
+    let astra_services::AuthPrincipalOrigin::VerifiedProvider {
+        provider_id,
+        external_subject,
+    } = &principal.origin
+    else {
+        return Err(astra_core::error_response_coded(
+            StatusCode::UNAUTHORIZED,
+            "UC native session required",
+            "uc_session_required",
+        ));
+    };
+    if provider_id != &format!("uc:{}", discovery.issuer) {
+        return Err(astra_core::error_response_coded(
+            StatusCode::UNAUTHORIZED,
+            "UC native session required",
+            "uc_session_required",
+        ));
+    }
+    let catalog = state
+        .model_service
+        .user_model_catalog(principal.user.user_id.clone())
+        .await?;
+    let default = catalog
+        .default_offering_id
+        .filter(|id| {
+            catalog
+                .items
+                .iter()
+                .any(|item| &item.offering_id == id && item.is_active)
+        })
+        .ok_or_else(|| {
+            astra_core::error_response_coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Genesis default model is not ready",
+                "genesis_not_ready",
+            )
+        })?;
+    // Catalog preparation resolves the user's server-owned credential once,
+    // without a paid call or balance check. Execution revalidates separately.
+    Ok(Json(
+        serde_json::json!({"issuer": discovery.issuer, "subject": external_subject,
+        "user_id": principal.user.user_id, "session_id": principal.session_id, "default_offering_id": default}),
+    ))
 }
 
 pub(super) async fn auth_memoria_disconnect_handler(
@@ -380,6 +438,7 @@ enum MemoriaUserAuthority {
         base_url: String,
         key: String,
         owner: String,
+        owner_scoped_master: bool,
     },
     SelfHosted {
         owner: String,
@@ -475,6 +534,7 @@ async fn resolve_memoria_user_authority(
                 base_url: resolver.provider.base_url,
                 key: credential.key,
                 owner: credential.owner,
+                owner_scoped_master: credential.owner_scoped_master,
             })
         }
         crate::turn::cloud::memoria_compact::MemoriaAuthoritySelection::SelfHosted => {
@@ -511,21 +571,40 @@ async fn forward_memoria_with_authority(
             .forward(method, endpoint, body)
             .await;
     }
-    let MemoriaUserAuthority::Scoped { base_url, key, .. } = authority else {
+    let MemoriaUserAuthority::Scoped {
+        base_url,
+        key,
+        owner,
+        owner_scoped_master,
+    } = authority
+    else {
         unreachable!("non-scoped authorities return through the configured forwarder")
     };
     if let Some(object) = body.as_object_mut() {
         object.remove("user_id");
     }
     let url = format!("{}{}", base_url.trim_end_matches('/'), endpoint);
-    let request = astra_core::net::client_builder_for_target(&url)
+    let mut request = astra_core::net::client_builder_for_target(&url)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| "Memoria HTTP client unavailable")?
         .request(method.clone(), url)
-        .bearer_auth(key)
+        .header(
+            "Authorization",
+            format!(
+                "{} {key}",
+                if *owner_scoped_master {
+                    "Memoria-Owner"
+                } else {
+                    "Bearer"
+                }
+            ),
+        )
         .header("X-Memoria-Tool", "astra")
         .timeout(std::time::Duration::from_secs(30));
+    if *owner_scoped_master {
+        request = request.header("X-User-Id", owner);
+    }
     let response = if method == reqwest::Method::GET {
         request.query(&body)
     } else {

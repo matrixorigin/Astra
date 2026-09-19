@@ -25,17 +25,38 @@ struct PreferenceEntry {
     value: String,
 }
 
-fn build_request(
+async fn build_request(
     method: reqwest::Method,
     url: &str,
     token: Option<&str>,
 ) -> Result<reqwest::RequestBuilder, String> {
-    let client = astra_core::net::client_builder_for_target(url)
-        .timeout(std::time::Duration::from_secs(PREFS_HTTP_TIMEOUT_SECS))
+    let native_binding = crate::cli::native_auth::active();
+    let builder = astra_core::net::client_builder_for_target(url)
+        .timeout(std::time::Duration::from_secs(PREFS_HTTP_TIMEOUT_SECS));
+    let builder = if native_binding.is_some() {
+        builder.redirect(reqwest::redirect::Policy::none())
+    } else {
+        builder
+    };
+    let client = builder
         .build()
         .map_err(|e| format!("http client init: {e}"))?;
     let mut req = client.request(method, url);
-    if let Some(tok) = token {
+    if let Some(binding) = native_binding {
+        // Bind the destination and refreshed credential to the same generation.
+        // Never use a workspace .env URL with a native account's credential.
+        let destination = url::Url::parse(url).map_err(|_| "invalid preferences URL")?;
+        let base = url::Url::parse(binding.endpoint()).map_err(|_| "invalid native endpoint")?;
+        if destination.origin() != base.origin()
+            || !destination.path().starts_with(&format!(
+                "{}/preferences",
+                base.path().trim_end_matches('/')
+            ))
+        {
+            return Err("preferences endpoint differs from the MOI login".into());
+        }
+        req = req.bearer_auth(binding.access_token().await?);
+    } else if let Some(tok) = token {
         req = req.bearer_auth(tok);
     }
     Ok(req)
@@ -49,7 +70,8 @@ pub async fn pull_all_preferences(
     token: Option<&str>,
 ) -> Result<Vec<(String, String)>, String> {
     let url = format!("{}/preferences", cloud_base.trim_end_matches('/'));
-    let resp = build_request(reqwest::Method::GET, &url, token)?
+    let resp = build_request(reqwest::Method::GET, &url, token)
+        .await?
         .send()
         .await
         .map_err(|e| format!("network: {e}"))?;
@@ -94,7 +116,8 @@ pub async fn push_preference(
         cloud_base.trim_end_matches('/'),
         encoded_key
     );
-    let resp = build_request(reqwest::Method::PUT, &url, token)?
+    let resp = build_request(reqwest::Method::PUT, &url, token)
+        .await?
         .json(&json!({ "value": value }))
         .send()
         .await

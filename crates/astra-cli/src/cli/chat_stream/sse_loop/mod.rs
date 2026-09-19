@@ -212,7 +212,16 @@ pub(crate) async fn stream_chat_sse(
                 p.offering_id = Some(selection.offering_id);
                 Some(selection.name)
             }
-            ServerDefaultModel::NoModels | ServerDefaultModel::Unavailable => None,
+            ServerDefaultModel::NoModels => None,
+            ServerDefaultModel::Unavailable(error) => {
+                return Err(crate::TurnFailure {
+                    error,
+                    partial: crate::PartialTurnData {
+                        session_id: p.session_id.map(str::to_string),
+                        ..Default::default()
+                    },
+                });
+            }
         }
     } else {
         None

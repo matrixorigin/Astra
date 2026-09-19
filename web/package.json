@@ -1,6 +1,6 @@
 {
   "name": "astra-web",
-  "version": "0.2.4",
+  "version": "0.2.7",
   "private": true,
   "scripts": {
     "dev": "../scripts/dev/run-web-dev.sh",

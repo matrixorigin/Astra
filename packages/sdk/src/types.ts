@@ -1263,6 +1263,19 @@ export type SessionInfo = {
 
 // ─── Runtime wire response DTOs ───────────────────────────────────
 
+/** A cancellation request is complete only when executionSettled is true. */
+export type SessionCancellationResult = SessionInfo & {
+  executionSettled: boolean;
+  workspaceBlocker?: string | null;
+  runs: Array<{ runId: string; status: string; executionSettled: boolean }>;
+};
+
+export type RuntimeSessionCancellationResponse = RuntimeSessionResponse & {
+  execution_settled: boolean;
+  workspace_blocker?: string | null;
+  runs: Array<{ run_id: string; status: string; execution_settled: boolean }>;
+};
+
 export type RuntimeChatResponse = {
   session_id: string;
   run_id: string;

@@ -839,6 +839,9 @@ fn severity_for(kind: astra_core::ErrorKind, count: i64) -> &'static str {
 fn summary_for(kind: astra_core::ErrorKind, tool: &str, count: i64) -> String {
     use astra_core::ErrorKind as K;
     match kind {
+        K::PaymentRequired => format!(
+            "Model billing restriction ({tool}): check credit and billing limits — {count} occurrences"
+        ),
         K::ResourceLimit => format!(
             "System resource exhaustion ({tool}): OS cannot fork/allocate — {count} occurrences"
         ),

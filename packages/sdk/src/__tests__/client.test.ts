@@ -759,11 +759,44 @@ describe("AstraClient — Session lifecycle and reflect", () => {
   });
 
   test("cancelSession", async () => {
-    globalThis.fetch = mockFetch(200, sessWire);
-    await createClient().cancelSession("sx");
+    globalThis.fetch = mockFetch(200, {
+      ...sessWire, status: "cancelled", execution_settled: true, runs: [],
+    });
+    const result = await createClient().cancelSession("sx");
+    expect(result.executionSettled).toBe(true);
     expect(
       (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
     ).toContain("/sessions/sx/cancel");
+  });
+
+  test("cancelSession preserves pending execution and run evidence", async () => {
+    globalThis.fetch = mockFetch(202, {
+      ...sessWire, status: "cancellation_requested", execution_settled: false,
+      workspace_blocker: "unresolved_tool",
+      runs: [{ run_id: "r1", status: "cancelled", execution_settled: false }],
+    });
+    const result = await createClient().cancelSession("sx");
+    expect(result.executionSettled).toBe(false);
+    expect(result.workspaceBlocker).toBe("unresolved_tool");
+    expect(result.runs).toEqual([{ runId: "r1", status: "cancelled", executionSettled: false }]);
+  });
+
+  test("cancelSession rejects a display status without settlement proof", async () => {
+    globalThis.fetch = mockFetch(200, { ...sessWire, status: "cancelled" });
+    await expect(createClient().cancelSession("sx")).rejects.toThrow("settlement is unconfirmed");
+  });
+
+  test.each([
+    null,
+    { run_id: "r1", status: "cancelled", execution_settled: "false" },
+    { run_id: "", status: "cancelled", execution_settled: true },
+    { run_id: "r1", status: 42, execution_settled: true },
+    { run_id: "r1", status: "cancelled", execution_settled: false },
+  ])("cancelSession rejects malformed or contradictory run proof: %j", async (run) => {
+    globalThis.fetch = mockFetch(200, {
+      ...sessWire, status: "cancelled", execution_settled: true, runs: [run],
+    });
+    await expect(createClient().cancelSession("sx")).rejects.toThrow("settlement is unconfirmed");
   });
 
   test("getSessionActivity", async () => {

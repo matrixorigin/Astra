@@ -62,6 +62,7 @@ pub(super) async fn build_runtime_wiring(
             state.edge_callback_ledger.clone(),
         )
         .with_run_engine(run_engine.clone())
+        .with_model_service(Some(state.model_service.clone()))
         .with_pool(shared_pool.clone())
         .with_edge_connection_pool(state.edge_connection_pool.clone())
         .with_skill_service(state.skill_service.clone())

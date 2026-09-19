@@ -6,13 +6,22 @@ license.workspace = true
 publish = false
 
 [dependencies]
+jsonwebtoken.workspace = true
 dirs.workspace = true
 fs2.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+libc.workspace = true
+reqwest.workspace = true
+tokio = { workspace = true, features = ["time"] }
+uuid.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
+base64.workspace = true
+rand = "0.8"
+rsa = "0.9"
 temp-env.workspace = true
 tempfile.workspace = true

@@ -1031,15 +1031,17 @@ async fn ensure_materialized_admission_usage(
         return Ok(());
     }
 
+    // MatrixOne sums BIGINT inputs as int64. Widen before SUM, not after it:
+    // multiple valid reservation rows can exceed i64::MAX while fitting u64.
     let row = admission_io!(
         tx,
         sqlx::query(
             "SELECT
-                 CAST(COALESCE(SUM(resident_bytes), 0) AS CHAR) AS global_resident_bytes,
-                 CAST(COALESCE(SUM(context_tokens), 0) AS CHAR) AS global_context_tokens,
-                 CAST(COALESCE(SUM(provider_slots), 0) AS CHAR) AS global_provider_slots,
-                 CAST(COALESCE(SUM(cpu_units), 0) AS CHAR) AS global_cpu_units,
-                 CAST(COALESCE(SUM(io_bytes), 0) AS CHAR) AS global_io_bytes,
+                 CAST(COALESCE(SUM(CAST(resident_bytes AS DECIMAL(38, 0))), 0) AS CHAR) AS global_resident_bytes,
+                 CAST(COALESCE(SUM(CAST(context_tokens AS DECIMAL(38, 0))), 0) AS CHAR) AS global_context_tokens,
+                 CAST(COALESCE(SUM(CAST(provider_slots AS DECIMAL(38, 0))), 0) AS CHAR) AS global_provider_slots,
+                 CAST(COALESCE(SUM(CAST(cpu_units AS DECIMAL(38, 0))), 0) AS CHAR) AS global_cpu_units,
+                 CAST(COALESCE(SUM(CAST(io_bytes AS DECIMAL(38, 0))), 0) AS CHAR) AS global_io_bytes,
                  CAST(COALESCE(SUM(CASE
                      WHEN resident_bytes < 0 OR context_tokens < 0 OR provider_slots < 0
                        OR provider_slots > 4294967295 OR cpu_units < 0 OR io_bytes < 0
@@ -1078,11 +1080,11 @@ async fn ensure_materialized_admission_usage(
              (scope_name, isolation_domain, owner_user_id, resident_bytes,
               context_tokens, provider_slots, cpu_units, io_bytes)
              SELECT scope_name, isolation_domain, owner_user_id,
-                    COALESCE(SUM(resident_bytes), 0),
-                    COALESCE(SUM(context_tokens), 0),
-                    COALESCE(SUM(provider_slots), 0),
-                    COALESCE(SUM(cpu_units), 0),
-                    COALESCE(SUM(io_bytes), 0)
+                    COALESCE(SUM(CAST(resident_bytes AS DECIMAL(38, 0))), 0),
+                    COALESCE(SUM(CAST(context_tokens AS DECIMAL(38, 0))), 0),
+                    COALESCE(SUM(CAST(provider_slots AS DECIMAL(38, 0))), 0),
+                    COALESCE(SUM(CAST(cpu_units AS DECIMAL(38, 0))), 0),
+                    COALESCE(SUM(CAST(io_bytes AS DECIMAL(38, 0))), 0)
              FROM session_weighted_admission_reservations
              WHERE scope_name = ?
              GROUP BY scope_name, isolation_domain, owner_user_id",

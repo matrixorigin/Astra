@@ -153,7 +153,7 @@ fn classify_error_kind_outcome(
         ErrorKind::ToolTimeout | ErrorKind::ProviderDeadline => {
             (ExecutionOutcome::Timeout, Some(FailureCategory::Timeout))
         }
-        ErrorKind::ResourceLimit => (
+        ErrorKind::ResourceLimit | ErrorKind::PaymentRequired => (
             ExecutionOutcome::ResourceLimit,
             Some(FailureCategory::ResourceExhaustion),
         ),

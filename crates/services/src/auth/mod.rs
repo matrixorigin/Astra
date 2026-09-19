@@ -46,6 +46,7 @@ mod jwt;
 pub mod memoria;
 pub mod provider_request;
 pub mod session;
+pub mod uc;
 mod validation;
 mod verified;
 
@@ -432,6 +433,10 @@ pub trait AuthService: Send + Sync {
         None
     }
 
+    fn uc_discovery(&self) -> Option<uc::UcDiscovery> {
+        None
+    }
+
     async fn disconnect_memoria(
         &self,
         _user_id: &str,
@@ -726,6 +731,7 @@ pub struct DatabaseAuthService {
     jwt: JwtSettings,
     encryptor: Option<FernetTokenEncryptor>,
     memoria_provider: Option<memoria::MemoriaProvider>,
+    uc_provider: Option<uc::UcNativeProvider>,
     ext_providers: Vec<ExternalAuthProviderConfig>,
     external_client: std::sync::Arc<dyn ExternalProviderClient>,
     provider_request_auth: Vec<ProviderRequestAuthConfig>,
@@ -802,6 +808,7 @@ impl DatabaseAuthService {
             control_pool: None,
             encryptor: None,
             memoria_provider: None,
+            uc_provider: None,
             ext_providers: Vec::new(),
             external_client: HttpExternalProviderClient::shared(),
             provider_request_auth: Vec::new(),
@@ -1774,6 +1781,12 @@ impl AuthService for DatabaseAuthService {
         self.credential_resolver()
     }
 
+    fn uc_discovery(&self) -> Option<uc::UcDiscovery> {
+        self.uc_provider
+            .as_ref()
+            .map(uc::UcNativeProvider::discovery)
+    }
+
     async fn disconnect_memoria(&self, user_id: &str) -> Result<(), AuthHttpError> {
         self.memoria_disconnect(user_id).await
     }
@@ -2104,6 +2117,11 @@ impl AuthService for DatabaseAuthService {
         headers: &HeaderMap,
     ) -> Result<AuthPrincipal, (StatusCode, Json<ErrorResponse>)> {
         let token = bearer_token(headers)?;
+        if let Some(provider) = &self.uc_provider
+            && provider.recognizes(token)
+        {
+            return self.principal_from_uc(headers, token, provider).await;
+        }
         // Edge-registration tokens are verified locally (shared HMAC key) with
         // a fail-closed revocation check — no request descriptor needed since
         // the retired authorize_request callback was replaced by local

@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+fs2.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 chrono.workspace = true

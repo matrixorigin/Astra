@@ -1,3 +1,4 @@
+use crate::cancellation_safe_db::CancellationSafePoolConnection;
 use crate::pagination::MAX_API_LIST_LIMIT;
 use crate::session_lifecycle::{SessionTableDeleteOutcome, hard_delete_session};
 use crate::storage::{log_session_audit, session_record_from_row};
@@ -10,7 +11,7 @@ use axum::{Json, http::StatusCode};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{MySql, QueryBuilder, Row, query};
+use sqlx::{Connection, MySql, QueryBuilder, Row, query};
 use uuid::Uuid;
 
 const MAX_SESSION_ACTIVITY_ROWS: u32 = 200;
@@ -830,7 +831,16 @@ impl SessionService for DatabaseSessionService {
             return Ok(existing);
         }
 
-        let mut tx = pool.begin().await.map_err(internal_error)?;
+        // A disconnected cancel request can drop this future before BEGIN
+        // is acknowledged. Keep the physical connection guarded until commit.
+        let mut connection = CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(internal_error)?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(internal_error)?;
         let locked = query(
             "SELECT IFNULL(CAST(`metadata` AS CHAR), '{}') AS metadata_json \
              FROM agent_sessions WHERE session_id = ? AND user_id = ? FOR UPDATE",
@@ -906,6 +916,7 @@ impl SessionService for DatabaseSessionService {
         }
         tx.commit().await.map_err(internal_error)?;
 
+        connection.release();
         let updated = self
             .fetch_session_for_user(&pool, &session_id, &user_id)
             .await?

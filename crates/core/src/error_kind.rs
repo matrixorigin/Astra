@@ -24,6 +24,8 @@ pub enum ErrorKind {
     // ── LLM provider ─────────────────────────────────
     /// 429, TPM/RPM exceeded.
     RateLimit,
+    /// 402, provider balance or billing limit prevents inference.
+    PaymentRequired,
     /// 5xx from provider.
     ServerError,
     /// 401/403, bad API key or expired token.
@@ -215,6 +217,7 @@ impl ErrorKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::RateLimit => "rate_limit",
+            Self::PaymentRequired => "payment_required",
             Self::ServerError => "server_error",
             Self::Auth => "auth",
             Self::ContextWindow => "context_window",
@@ -283,6 +286,10 @@ impl ErrorKind {
     #[must_use]
     pub fn guidance(self) -> &'static str {
         match self {
+            Self::PaymentRequired => {
+                "Model inference requires available credit or a higher billing limit. \
+                 Do NOT retry or re-authenticate; resolve the provider billing restriction first."
+            }
             Self::RateLimit => {
                 "Rate limit hit. The system will retry automatically. \
                  Reduce parallel tool calls if this persists."
@@ -396,6 +403,7 @@ impl ErrorKind {
     #[must_use]
     pub fn diagnosis_hint(self) -> &'static str {
         match self {
+            Self::PaymentRequired => "Check the model provider balance and billing limits.",
             Self::RateLimit => "Reduce parallel tool calls or raise the provider rate-limit quota.",
             Self::ServerError => {
                 "Transient provider issue. If it persists, switch model or provider."
@@ -511,6 +519,7 @@ impl ErrorKind {
     pub fn parse_tag(s: &str) -> Option<Self> {
         match s {
             "rate_limit" => Some(Self::RateLimit),
+            "payment_required" => Some(Self::PaymentRequired),
             "server_error" => Some(Self::ServerError),
             "auth" => Some(Self::Auth),
             "context_window" => Some(Self::ContextWindow),
@@ -1105,6 +1114,7 @@ mod tests {
     /// Every ErrorKind variant. Keep in sync when adding new variants.
     const ALL_VARIANTS: &[ErrorKind] = &[
         ErrorKind::RateLimit,
+        ErrorKind::PaymentRequired,
         ErrorKind::ServerError,
         ErrorKind::Auth,
         ErrorKind::ContextWindow,

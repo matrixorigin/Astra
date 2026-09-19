@@ -5,6 +5,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(exit_code) = astra_sandbox::run_invocation_supervisor_if_requested() {
         std::process::exit(exit_code);
     }
+    let executable = std::env::current_exe()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = astra_core::client_installation::early_command(&executable, &args, true)? {
+        std::process::exit(code);
+    }
+    let _installation_lease = astra_core::client_installation::acquire(&executable)?;
+    astra_core::client_installation::startup_notice(&executable, &args);
     if astra_core::build_info::write_json_if_requested()? {
         return Ok(());
     }

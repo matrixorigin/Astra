@@ -1447,6 +1447,7 @@ fn llm_main_error_outcome(error: &astra_core::ClassifiedError) -> &'static str {
     }
     match error.kind {
         astra_core::ErrorKind::RateLimit => "error_rate_limit",
+        astra_core::ErrorKind::PaymentRequired => "error_payment_required",
         astra_core::ErrorKind::ServerError => "error_server_error",
         astra_core::ErrorKind::Auth => "error_auth",
         astra_core::ErrorKind::ContextWindow => "error_context_window",
@@ -2247,6 +2248,7 @@ impl WorkAdmissionUnavailableReason {
                 | Self::ProviderRejected
                 | Self::UnsupportedCombination
                 | Self::Auth
+                | Self::InferenceFailure(astra_core::ErrorKind::PaymentRequired)
         )
     }
 
@@ -3391,6 +3393,7 @@ impl ExplainAnalyzeNode {
 }
 
 pub struct ServerAgenticLoopHost {
+    model_service: Option<Arc<dyn astra_services::ModelService>>,
     execution_handoff: Option<ExecutionHandoffContext>,
     // ── LLM resolution ──
     matrixone: MatrixOneSettings,
@@ -4946,6 +4949,7 @@ fn explain_analyze_outcome_for_error(
 
 /// Builder for [`ServerAgenticLoopHost`].
 pub struct ServerAgenticLoopHostBuilder {
+    model_service: Option<Arc<dyn astra_services::ModelService>>,
     matrixone: MatrixOneSettings,
     encryptor: Arc<FernetTokenEncryptor>,
     shared_pool: Option<SharedPool>,
@@ -5012,6 +5016,13 @@ pub struct ServerAgenticLoopHostBuilder {
 }
 
 impl ServerAgenticLoopHostBuilder {
+    pub fn with_model_service(
+        mut self,
+        service: Option<Arc<dyn astra_services::ModelService>>,
+    ) -> Self {
+        self.model_service = service;
+        self
+    }
     pub fn new(
         matrixone: MatrixOneSettings,
         encryptor: Arc<FernetTokenEncryptor>,
@@ -5019,6 +5030,7 @@ impl ServerAgenticLoopHostBuilder {
         session_id: String,
     ) -> Self {
         Self {
+            model_service: None,
             matrixone,
             encryptor,
             shared_pool: None,
@@ -5653,6 +5665,7 @@ impl ServerAgenticLoopHostBuilder {
             .map(RunScopedAgentProgressFilter::new);
 
         ServerAgenticLoopHost {
+            model_service: self.model_service,
             execution_handoff: None,
             matrixone: self.matrixone,
             encryptor: self.encryptor,
@@ -9646,15 +9659,22 @@ impl ServerAgenticLoopHost {
             // no Server-owned route or secret to refresh at this boundary.
             return Ok(());
         }
-        let execution = astra_services::revalidate_admitted_model_execution(
-            &self.matrixone,
-            self.encryptor.as_ref(),
-            &self.user_id,
-            &admitted.offering_id,
-            self.shared_pool.as_ref().map(SharedPool::get),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+        let execution = if let Some(service) = &self.model_service {
+            service
+                .admit_model_offering(self.user_id.clone(), admitted.offering_id.clone())
+                .await
+                .map_err(|(_, body)| body.0.detail)?
+        } else {
+            astra_services::revalidate_admitted_model_execution(
+                &self.matrixone,
+                self.encryptor.as_ref(),
+                &self.user_id,
+                &admitted.offering_id,
+                self.shared_pool.as_ref().map(SharedPool::get),
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        };
         self.admitted_model_execution = Some(execution);
         self.clear_resolved_llm_config();
         Ok(())
@@ -46071,6 +46091,7 @@ mod tests {
         #[test]
         fn work_admission_classification_preserves_kind_without_parsing_message() {
             for kind in [
+                astra_core::ErrorKind::PaymentRequired,
                 astra_core::ErrorKind::ServerError,
                 astra_core::ErrorKind::RateLimit,
                 astra_core::ErrorKind::DatabaseError,
@@ -46084,6 +46105,11 @@ mod tests {
                     WorkAdmissionUnavailableReason::from_inference_error(&error).error_kind(),
                     kind
                 );
+                if kind == astra_core::ErrorKind::PaymentRequired {
+                    assert!(
+                        !WorkAdmissionUnavailableReason::from_inference_error(&error).retryable()
+                    );
+                }
             }
         }
 

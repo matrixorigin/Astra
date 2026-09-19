@@ -938,12 +938,10 @@ fn parse_bool_pref(value: &str, default: bool) -> bool {
 }
 
 /// Resolve the astra server base URL. Returns `None` when no server
-/// is configured (offline mode). Reads `ASTRA_API_URL`.
+/// is configured (offline mode). Native auth owns its endpoint; legacy profiles
+/// retain `ASTRA_API_URL` selection.
 fn resolve_cloud_base() -> Option<String> {
-    std::env::var("ASTRA_API_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim_end_matches('/').to_string())
+    session_runtime::resolve_cloud_base()
 }
 
 /// Check whether the cloud preference endpoint is reachable.
@@ -1127,7 +1125,19 @@ async fn try_drain_sync_outbox_for_snapshot(
     limit: usize,
     auth_snapshot: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
 ) -> SyncOutboxDrainReport {
-    let Some(cloud_base) = resolve_cloud_base() else {
+    if auth_snapshot.native_binding.is_none() && crate::cli::native_auth::active().is_some() {
+        return SyncOutboxDrainReport {
+            cloud_configured: true,
+            blocker: Some(SyncOutboxDrainBlocker::MissingAccessToken),
+            ..Default::default()
+        };
+    }
+    let Some(cloud_base) = auth_snapshot
+        .native_binding
+        .as_ref()
+        .map(|binding| binding.endpoint().to_owned())
+        .or_else(resolve_cloud_base)
+    else {
         return SyncOutboxDrainReport::default();
     };
     let mut report = SyncOutboxDrainReport {
@@ -1165,7 +1175,12 @@ async fn try_drain_sync_outbox_for_snapshot(
             return report;
         }
     }
-    let Some(token) = auth_snapshot.access_token.clone() else {
+    let token = if let Some(binding) = &auth_snapshot.native_binding {
+        binding.access_token().await.ok()
+    } else {
+        auth_snapshot.access_token.clone()
+    };
+    let Some(token) = token else {
         report.blocker = Some(SyncOutboxDrainBlocker::MissingAccessToken);
         tracing::debug!(
             target: "astra_cli::cloud_sync",
@@ -1174,7 +1189,10 @@ async fn try_drain_sync_outbox_for_snapshot(
         return report;
     };
     let client = match astra_thin_client::ThinClient::new(&cloud_base, Some(token.clone())) {
-        Ok(client) => client,
+        Ok(client) => match &auth_snapshot.native_binding {
+            Some(binding) => client.with_bearer_provider(binding.clone()),
+            None => client,
+        },
         Err(error) => {
             report.blocker = Some(SyncOutboxDrainBlocker::InvalidCloudBaseUrl);
             tracing::warn!(

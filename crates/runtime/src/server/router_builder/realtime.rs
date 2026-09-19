@@ -13,6 +13,10 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route("/auth/login", post(auth_handlers::auth_login_handler))
         .route("/auth/methods", get(auth_handlers::auth_methods_handler))
         .route(
+            "/auth/uc/bootstrap",
+            post(auth_handlers::auth_uc_bootstrap_handler),
+        )
+        .route(
             "/auth/memoria",
             post(auth_handlers::auth_memoria_handler)
                 .delete(auth_handlers::auth_memoria_disconnect_handler),

@@ -19,6 +19,9 @@ use crate::tui::terminal::TerminalGuard;
 pub(crate) enum SlashResult {
     Handled,
     Deferred,
+    Authenticate {
+        register: bool,
+    },
     /// Open the canonical root transcript workspace. The event loop owns the
     /// durable/local source selection because it also owns session binding,
     /// live suffix refresh and asynchronous page loading.
@@ -390,19 +393,8 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
         // ── Auth forms (inline TUI card instead of dropping out to
         //    bare-terminal prompts that looked disjoint and stole keys) ─
-        "/login" => {
-            use crate::tui::bottom_pane::login_view::{LoginMode, LoginView};
-            ctx.open_deferred_view("Opened login", Box::new(LoginView::new(LoginMode::Login)));
-            SlashResult::Deferred
-        }
-        "/register" => {
-            use crate::tui::bottom_pane::login_view::{LoginMode, LoginView};
-            ctx.open_deferred_view(
-                "Opened registration",
-                Box::new(LoginView::new(LoginMode::Register)),
-            );
-            SlashResult::Deferred
-        }
+        "/login" => SlashResult::Authenticate { register: false },
+        "/register" => SlashResult::Authenticate { register: true },
 
         // ── Model ───────────────────────────────────────────────────
         //

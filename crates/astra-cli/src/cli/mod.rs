@@ -34,6 +34,7 @@ pub mod journal_digest;
 pub mod journal_tree;
 pub mod mcp_config;
 pub mod mock_llm;
+pub(crate) mod native_auth;
 pub mod notifications;
 pub mod one_shot_session_routing;
 pub(crate) mod permission_command;

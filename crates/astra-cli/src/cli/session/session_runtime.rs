@@ -46,6 +46,9 @@ pub(crate) fn create_tui_pipeline_modules(
 /// Resolve the astra server base URL. Returns `None` when no server
 /// is configured (offline mode).
 pub(crate) fn resolve_cloud_base() -> Option<String> {
+    if let Some(binding) = crate::cli::native_auth::active() {
+        return Some(binding.endpoint().to_owned());
+    }
     std::env::var("ASTRA_API_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -325,7 +328,7 @@ pub(crate) struct ServerModelSelection {
 pub(crate) enum ServerDefaultModel {
     Selected(ServerModelSelection),
     NoModels,
-    Unavailable,
+    Unavailable(String),
 }
 
 fn model_list_entry_is_active(entry: &ModelListItemResponse) -> bool {
@@ -729,7 +732,7 @@ pub(crate) async fn resolve_server_default_model(
                 %error,
                 "resolve_server_default_model: failed to load complete Model Access projection → Unavailable"
             );
-            return ServerDefaultModel::Unavailable;
+            return ServerDefaultModel::Unavailable(error);
         }
     };
     let result = match default_model_selection_from_access(&projection) {
@@ -742,7 +745,7 @@ pub(crate) async fn resolve_server_default_model(
                 catalog_revision = %projection.catalog_revision,
                 "resolve_server_default_model: invalid Model Access projection"
             );
-            ServerDefaultModel::Unavailable
+            ServerDefaultModel::Unavailable(error)
         }
     };
     tracing::debug!(
@@ -810,7 +813,11 @@ pub(crate) async fn ensure_state_default_model(
             }
             Some(selection.name)
         }
-        ServerDefaultModel::NoModels | ServerDefaultModel::Unavailable => None,
+        ServerDefaultModel::NoModels => None,
+        ServerDefaultModel::Unavailable(error) => {
+            eprintln!("warning: {error}");
+            None
+        }
     }
 }
 
@@ -838,6 +845,12 @@ impl SilentRefreshError {
 /// Clears credentials only when the server definitively rejects auth (after handling
 /// refresh-token rotation races — see `recover_credentials_after_refresh_race`).
 pub(crate) async fn try_silent_auth(api: &astra_thin_client::ThinClient, profile: Option<&str>) {
+    if let Some(binding) = crate::cli::native_auth::active() {
+        // Dispatch-time authentication reports failures; legacy refresh must
+        // never receive a UC refresh token or replace the selected account.
+        let _ = binding.access_token().await;
+        return;
+    }
     // When gateway provides a pre-validated token via env, skip auth entirely —
     // the gateway owns token lifecycle and the HTTP round-trip is wasteful.
     if std::env::var("ASTRA_ACCESS_TOKEN")
@@ -1034,6 +1047,9 @@ pub(crate) async fn fresh_access_token(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> Option<String> {
+    if let Some(binding) = crate::cli::native_auth::active() {
+        return binding.access_token().await.ok();
+    }
     let now = chrono::Utc::now().timestamp();
     if let Some(token) = active_env_access_token(now) {
         tracing::debug!(
@@ -1497,6 +1513,30 @@ fn applied_user_intents_from_turn_metadata(metadata: Option<&serde_json::Value>)
         .collect()
 }
 
+// Banner text is clipped before styling, in terminal cells rather than bytes.
+fn banner_clip(text: &str, width: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let text: String = text.chars().filter(|c| !c.is_control()).collect();
+    if width == 0 {
+        return String::new();
+    }
+    if text.width() <= width {
+        return text;
+    }
+    let mut result = String::new();
+    let mut used = 0;
+    for part in text.graphemes(true) {
+        if used + part.width() > width - 1 {
+            break;
+        }
+        used += part.width();
+        result.push_str(part);
+    }
+    result.push('…');
+    result
+}
+
 pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) {
     let creds = load_credentials();
     let pname = profile_name(profile, &creds);
@@ -1509,10 +1549,23 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     let colors_enabled = std::env::var_os("NO_COLOR").is_none();
 
     // ── Two-column card layout ─────────────────────────────────────────
-    let term_w = crossterm::terminal::size()
+    let terminal_size = crossterm::terminal::size().ok();
+    let term_w = terminal_size
         .map(|(c, _)| c as usize)
         .unwrap_or(80)
-        .clamp(60, 120);
+        .saturating_sub(1)
+        .min(120);
+    // Below card dimensions, a static one-line title avoids wrapping animation.
+    if term_w < 32 {
+        eprintln!("{}", banner_clip(&format!("astra v{version}"), term_w));
+        return;
+    }
+    let display_profile = if crate::cli::native_auth::active().is_some() {
+        "MOI"
+    } else {
+        &pname
+    };
+    let left_col_w = (term_w - 7) / 2;
 
     // Layout: │ <left_col> │ <right_col> │
     // outer border = 2 chars (│...│), divider = 3 chars ( │ ), padding = 2 (spaces inside)
@@ -1532,18 +1585,13 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
         "    astra",
         "",
     ];
-    let left_footer = format!(
-        " {} {} {}",
-        style_banner_text(model_display, BannerTextStyle::Warning, colors_enabled),
-        style_banner_text("·", BannerTextStyle::Body, colors_enabled),
-        style_banner_text(
-            format!("v{version} · {pname}"),
-            BannerTextStyle::Body,
-            colors_enabled,
-        )
+    let left_footer = style_banner_text(
+        banner_clip(&format!(" {model_display} · {display_profile}"), left_col_w),
+        BannerTextStyle::Warning,
+        colors_enabled,
     );
 
-    // Build left column first so we can measure its actual width
+    // Left content is bounded before ANSI styling.
     let mut left: Vec<String> = Vec::new();
     for line in logo_plain {
         if line.is_empty() {
@@ -1564,37 +1612,13 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     }
     left.push(left_footer);
 
-    // Derive left column width from content (was hardcoded 24)
-    let left_col_w = left
-        .iter()
-        .map(|l| crate::cli::terminal_region::visible_char_width(l))
-        .max()
-        .unwrap_or(20)
-        .max(10);
     // 7 = │ + sp + │ + sp + │ + sp + │
     let right_col_w = term_w.saturating_sub(left_col_w + 7);
     let total_inner = left_col_w + right_col_w + 3; // 3 = " │ " between columns
 
     // Truncation helper: ensure visible text fits within max_vis columns.
     // Operates on plain text before ANSI styling; appends "…" when truncated.
-    let trunc_vis = |text: &str, max_vis: usize| -> String {
-        let w = crate::cli::terminal_region::visible_char_width(text);
-        if w <= max_vis {
-            return text.to_string();
-        }
-        let mut out = String::new();
-        let mut used = 0usize;
-        for ch in text.chars() {
-            let ch_w = if ch.is_ascii() { 1 } else { 2 };
-            if used + ch_w + 1 > max_vis {
-                break;
-            }
-            out.push(ch);
-            used += ch_w;
-        }
-        out.push('…');
-        out
-    };
+    let trunc_vis = banner_clip;
 
     // Right column: build with truncation safety on every line
     let sep_line = "─".repeat(right_col_w);
@@ -1674,7 +1698,7 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     // Title embedded in the top edge: ╭─ astra v0.1.0 ─────────╮
     let title_text = format!("astra v{version}");
     // " astra v0.1.0 " — leading and trailing space so the title breathes.
-    let title_padded = format!(" {} ", title_text);
+    let title_padded = banner_clip(&format!(" {} ", title_text), inner_w - 1);
     let title_w = crate::cli::terminal_region::visible_char_width(&title_padded);
     // Layout: ╭ ─ <title> ── … ── ╮  (1 leading dash before the title)
     let lead_dash = 1usize;
@@ -1796,7 +1820,7 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     }
 
     use std::io::IsTerminal;
-    let animated = crossterm::terminal::size().is_ok()
+    let animated = terminal_size.is_some_and(|(_, rows)| rows as usize > card_lines + 2)
         && std::env::var("NO_COLOR").is_err()
         && std::env::var("CI").is_err()
         && std::io::stderr().is_terminal();
@@ -1933,6 +1957,9 @@ fn banner_session_display(state: &SessionState) -> String {
 }
 
 pub(crate) fn current_access_token(profile: Option<&str>) -> Option<String> {
+    if let Some(binding) = crate::cli::native_auth::active() {
+        return binding.snapshot().ok().map(|session| session.access_token);
+    }
     // Gateway-injected env tokens still win, but only while locally usable.
     if let Some(token) = active_env_access_token(chrono::Utc::now().timestamp()) {
         return Some(token);
@@ -1947,6 +1974,106 @@ pub(crate) fn current_access_token(profile: Option<&str>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn banner_pty_child() {
+        if std::env::var_os("ASTRA_TEST_BANNER_CHILD").is_none() {
+            return;
+        }
+        super::print_session_banner(
+            Some(&"moi-internal-profile-".repeat(10)),
+            &super::SessionState {
+                model: Some("模型-deepseek-".repeat(10)),
+                ..Default::default()
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn banner_animation_leaves_one_card_in_real_terminal() {
+        use nix::pty::{Winsize, openpty};
+        use std::fs::File;
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+
+        for width in [40, 80, 180] {
+            let home = tempfile::tempdir().unwrap();
+            let pty = openpty(
+                Some(&Winsize {
+                    ws_row: 80,
+                    ws_col: width,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                }),
+                None,
+            )
+            .unwrap();
+            let mut master = File::from(pty.master);
+            let slave = File::from(pty.slave);
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::session::session_runtime::tests::banner_pty_child",
+                    "--nocapture",
+                ])
+                .env("ASTRA_TEST_BANNER_CHILD", "1")
+                .env("HOME", home.path())
+                .env("ASTRA_CLI_CREDENTIALS_DIR", home.path())
+                .env("TERM", "xterm-256color")
+                .env_remove("CI")
+                .env_remove("NO_COLOR")
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::from(slave.try_clone().unwrap()))
+                .stderr(Stdio::from(slave))
+                .spawn()
+                .unwrap();
+            let reader = std::thread::spawn(move || {
+                let mut output = Vec::new();
+                let _ = master.read_to_end(&mut output); // PTY EOF can be EIO.
+                output
+            });
+            assert!(child.wait().unwrap().success());
+            let bytes = reader.join().unwrap();
+            assert!(
+                bytes.windows(3).any(|w| w == b"10A"),
+                "animation did not run"
+            );
+            let mut screen = vt100::Parser::new(80, width, 0);
+            screen.process(&bytes);
+            let rendered = screen.screen().contents();
+            assert_eq!(
+                rendered.matches("╭").count(),
+                1,
+                "width {width}: {rendered}"
+            );
+            assert_eq!(
+                rendered.matches("╰").count(),
+                1,
+                "width {width}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn banner_clipping_bounds_long_profiles_and_unicode_in_terminal_cells() {
+        use super::banner_clip;
+        use crate::cli::terminal_region::visible_char_width;
+        for text in [
+            "moi-".repeat(40),
+            "模型👩‍💻e\u{301}".repeat(20),
+            "foo\n\x1bbar".to_owned(),
+        ] {
+            for width in 0..120 {
+                let clipped = banner_clip(&text, width);
+                assert!(visible_char_width(&clipped) <= width);
+                assert!(!clipped.chars().any(char::is_control));
+            }
+        }
+        assert_eq!(banner_clip("MOI", 3), "MOI");
+        assert_eq!(banner_clip("hello", 1), "…");
+    }
+
     use super::{
         ACCESS_TOKEN_REFRESH_SKEW_SECS, BannerTextStyle, RestoredSessionState, ServerDefaultModel,
         SilentRefreshError, access_token_needs_refresh, applied_user_intents_from_turn_metadata,
@@ -2407,9 +2534,11 @@ mod tests {
             .await;
         let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
 
-        assert_eq!(
-            resolve_server_default_model(&api, "token").await,
-            ServerDefaultModel::Unavailable,
+        assert!(
+            matches!(
+                resolve_server_default_model(&api, "token").await,
+                ServerDefaultModel::Unavailable(_)
+            ),
             "an invalid provider default must not silently fall back"
         );
         let manual = resolve_server_model_selection(&api, "token", "valid-model")

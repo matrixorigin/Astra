@@ -203,7 +203,7 @@ pub trait RunLifecycleService: Send + Sync {
         &self,
         _session_id: String,
         _user_id: String,
-    ) -> Result<Vec<CancelRunRecord>, (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<CancelSessionRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response(
             StatusCode::NOT_IMPLEMENTED,
             "Session run cancellation not supported",
@@ -1200,6 +1200,15 @@ pub struct CancelRunRecord {
     /// Server-owned execution lease has retired; task verification may safely
     /// begin only when this is true.
     pub execution_settled: bool,
+}
+
+/// Cancellation acceptance is distinct from retiring all session execution
+/// authority. An empty run list alone is not settlement evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CancelSessionRecord {
+    pub runs: Vec<CancelRunRecord>,
+    pub execution_settled: bool,
+    pub workspace_blocker: Option<crate::session_context_coordinator::WorkspaceReuseBlocker>,
 }
 
 /// Generic record for run mutations (pause, resume, etc.).
@@ -4384,6 +4393,31 @@ fn run_events_have_open_settlement(events: &[serde_json::Value], generation: u64
     has_started && !has_closed
 }
 
+/// The caller holds the current Run generation lock. Read the same durable
+/// settlement keys used by resume admission, not the executor lease or status.
+pub(crate) async fn run_has_open_settlement_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    run_id: &str,
+    generation: u64,
+) -> Result<bool, sqlx::Error> {
+    let started = format!("run-settlement-started:{generation}");
+    let finished = format!("run-settlement-finished:{generation}");
+    let accounting = format!("run-accounting-finalized:{generation}");
+    let keys: Vec<String> = sqlx::query_scalar(
+        "SELECT idempotency_key FROM agent_run_events WHERE user_id = ? AND run_id = ?
+         AND idempotency_key IN (?, ?, ?) FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(run_id)
+    .bind(&started)
+    .bind(&finished)
+    .bind(&accounting)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(keys.contains(&started) && !keys.contains(&finished) && !keys.contains(&accounting))
+}
+
 /// Exact execution-owner settlement appended by a caller that already owns a
 /// MatrixOne transaction containing the run's canonical evidence.
 ///
@@ -4839,6 +4873,42 @@ pub trait RunStateStore: Send + Sync {
         _run_id: &str,
     ) -> Result<bool, String> {
         Err("durable cancellation requests are not supported by this run store".to_string())
+    }
+
+    /// Publish User stop intent for every currently cancellable Run in one
+    /// Session. Shared stores must override with atomic, bounded propagation;
+    /// this fallback is for process-local stores only.
+    async fn request_session_cancellation(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let mut cursor = None;
+        loop {
+            let page = self
+                .list_active_session_runs_cursor(user_id, session_id, 100, cursor)
+                .await?;
+            for run in page.runs {
+                self.request_run_cancellation(user_id, &run.run_id).await?;
+            }
+            let Some(next) = page.next_cursor else {
+                return Ok(());
+            };
+            cursor = Some(next);
+        }
+    }
+
+    /// Bounded stores override with the three exact generation-scoped keys.
+    async fn has_open_run_settlement(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        generation: u64,
+    ) -> Result<bool, String> {
+        Ok(self
+            .load_run(user_id, run_id)
+            .await?
+            .is_some_and(|run| run_events_have_open_settlement(&run.events, generation)))
     }
 
     /// Atomically terminalize an active run only when its exact execution
@@ -14619,6 +14689,82 @@ impl RunStateStore for DatabaseRunStateStore {
                 }
             }
         }
+    }
+
+    async fn request_session_cancellation(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + RUN_CONTROL_DB_ATTEMPT_TIMEOUT;
+        let mut connection = BoundedRunControlConnection::acquire(
+            &self.pool,
+            deadline,
+            "request_session_cancellation_prepare",
+            session_id,
+        )
+        .await?;
+        // One autocommit statement is one atomic intent publication. Do not
+        // update updated_at: observation retries must not reorder cursor pages.
+        // No Session execution fence: stop must interrupt a turn holding it.
+        let result = tokio::time::timeout_at(
+            deadline,
+            sqlx::query(
+                "UPDATE agent_runs SET cancellation_requested_at = NOW(6)
+             WHERE user_id = ? AND session_id = ?
+               AND status IN ('running', 'waiting', 'paused')
+               AND cancellation_requested_at IS NULL",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .execute(connection.connection_mut()),
+        )
+        .await;
+        match result {
+            Ok(Ok(_)) => {
+                connection
+                    .restore_and_release(
+                        deadline,
+                        "request_session_cancellation_restore",
+                        session_id,
+                    )
+                    .await?;
+                Ok(())
+            }
+            // An unknown acknowledgement is not accepted intent proof. Drop
+            // closes this physical connection; retry is idempotent and atomic.
+            Ok(Err(source)) => {
+                Err(db_error("request_session_cancellation", session_id, source).to_string())
+            }
+            Err(_) => Err(bounded_run_control_timeout(
+                "request_session_cancellation",
+                session_id,
+            )),
+        }
+    }
+
+    async fn has_open_run_settlement(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        generation: u64,
+    ) -> Result<bool, String> {
+        let keys: Vec<String> = sqlx::query_scalar(
+            "SELECT idempotency_key FROM agent_run_events WHERE user_id = ? AND run_id = ?
+             AND idempotency_key IN (?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .bind(format!("run-settlement-started:{generation}"))
+        .bind(format!("run-settlement-finished:{generation}"))
+        .bind(format!("run-accounting-finalized:{generation}"))
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(|source| db_error("load_run_settlement", run_id, source).to_string())?;
+        Ok(keys
+            .iter()
+            .any(|key| key == &format!("run-settlement-started:{generation}"))
+            && keys.len() == 1)
     }
 
     async fn terminalize_orphaned_run_cancellation(

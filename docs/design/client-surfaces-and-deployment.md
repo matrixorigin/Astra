@@ -64,6 +64,11 @@ CLI/TUI owns local interactive ergonomics but not separate agent semantics. It s
 - local diagnostics;
 - reconnect/resume.
 
+The startup card reserves terminal width before styling and clips text by Unicode
+display cells. Native MOI login uses a short `MOI` display label, not its internal
+credential profile identifier. Narrow or short terminals use a static presentation;
+animated frames must not wrap and invalidate cursor-up row accounting.
+
 Inline terminal resize reconciles the viewport with the terminal's cursor
 position before clearing and repainting. The existing crossterm input owner
 pauses its reusable event stream with an acknowledged worker handoff for a
@@ -75,6 +80,34 @@ cannot advance the remembered screen size; viewport growth erases
 transient UI before scrolling. Resize must preserve native history and must
 not purge scrollback. Terminals that do not answer cursor queries fall back to
 height-clamping corrections; width-reflow recovery requires a cursor reply.
+
+## MOI-managed local client updates
+
+MOI-managed client distributions opt into `moi-client-update-v1` with an
+executable-relative `installation.json` marker. Standalone Astra and
+image-managed Edge deployments do not opt in. `astra update` delegates to the
+paired moi-cli in the same immutable release directory; distribution metadata,
+downloads, installation, and recovery have one owner in MOI, not a second Rust
+updater. The command runs before application configuration or authentication.
+
+CLI and local Edge retain a shared `runtime.lock` file lock for the process
+lifetime. The updater needs an exclusive lock, never kills clients, and cannot
+switch while a consumer is admitted. Under the lock, clients reject an
+unfinished installation transaction or an executable no longer selected by
+`current`. Protocol/version probes are offline; update checks never read UC,
+Memoria, Genesis, or provider credentials. TUI startup may show cached notices
+and launch a bounded anonymous metadata check; machine/helper commands remain
+quiet. Hosted Runner updates remain image deployment operations.
+
+Cached notices distinguish an installable update from
+`CLI_UPDATE_COMPATIBILITY_CHANGE`: the latter advertises a new release that
+requires a separate installation prefix and Skill search root, preserving the
+existing installation and login data. It is not eligible for in-place update.
+Notice renderers only display validated bundle identifiers and known reason
+messages. Explicit update/check delegates bounded check-lock waiting to MOI;
+runtime occupancy continues to fail immediately. Missing derived Skill copies
+and same-prefix reinstall recovery are owned by MOI under its exclusive lock,
+not by Rust startup or authentication code.
 
 ## UI projection rules
 

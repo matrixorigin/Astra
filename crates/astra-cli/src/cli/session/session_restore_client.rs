@@ -101,6 +101,11 @@ fn sanitize_cloud_resumable_sessions(sessions: Vec<RestoredSession>) -> Vec<Rest
 }
 
 pub(crate) fn cloud_resume_client() -> Result<Option<astra_thin_client::ThinClient>, String> {
+    if let Some(binding) = crate::cli::native_auth::active() {
+        return astra_thin_client::ThinClient::new(binding.endpoint(), None)
+            .map(|client| Some(client.with_bearer_provider(binding)))
+            .map_err(|error| format!("Create cloud API client failed: {error}"));
+    }
     let Some(cloud_base) = session_runtime::resolve_cloud_base() else {
         return Ok(None);
     };

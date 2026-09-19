@@ -829,6 +829,20 @@ impl ServerConfig {
         if explicit_env_config_requested()? {
             return Self::from_explicit_env();
         }
+        // An orchestrator may pin one server configuration without changing
+        // HOME or loading unrelated system/user credentials.
+        if let Some(path) = std::env::var_os("ASTRA_SERVER_CONFIG") {
+            let path = std::path::PathBuf::from(path);
+            if !path.is_absolute() {
+                return Err(ConfigError::Validation(
+                    "ASTRA_SERVER_CONFIG must be absolute".into(),
+                ));
+            }
+            let mut config = Self::from_file(&path)?;
+            config.apply_env_overrides();
+            config.validate()?;
+            return Ok(config);
+        }
         let mut config = Self::default();
 
         // System-level: /etc/astra/server.toml
@@ -958,6 +972,8 @@ pub struct AppSettings {
     pub jwt: JwtSettings,
     pub api: ApiSettings,
     pub memoria: MemoriaSettings,
+    /// Optional UC native-client integration. Absent for Memoria/self-hosting.
+    pub uc_native: Option<UcNativeSettings>,
     pub runtime_root_secret: String,
     pub token_encryption_key: Option<String>,
     pub provider_request_auth: Vec<ProviderRequestAuthConfig>,
@@ -991,7 +1007,7 @@ impl fmt::Debug for AppSettings {
 
 impl AppSettings {
     pub fn from_env() -> Result<Self, ConfigError> {
-        if !explicit_env_config_requested()? {
+        if !explicit_env_config_requested()? && std::env::var_os("ASTRA_SERVER_CONFIG").is_none() {
             dotenvy::dotenv().ok();
         }
         let server_config = ServerConfig::load()?;
@@ -1131,6 +1147,7 @@ impl AppSettings {
                 web_url: lookup("MEMORIA_WEB_URL"),
                 legacy_issuer: lookup("MEMORIA_LEGACY_ISSUER"),
             },
+            uc_native: UcNativeSettings::from_lookup(&lookup)?,
             runtime_root_secret: required_value(
                 &lookup,
                 "ASTRA_RUNTIME_ROOT_SECRET",
@@ -1146,6 +1163,62 @@ impl AppSettings {
         };
         validate_tool_offer_ids(&settings.disabled_tool_offers).map_err(ConfigError::Validation)?;
         Ok(settings)
+    }
+}
+
+/// Server-only UC adapter credentials; never included in client discovery.
+#[derive(Clone, PartialEq, Eq)]
+pub struct UcNativeSettings {
+    pub issuer: String,
+    pub adapter_url: String,
+    pub client_secret: String,
+    pub moi_api_url: String,
+    pub genesis_url: String,
+    /// Explicit server-side access to the product's built-in memory service.
+    /// Independent of the local-password self-hosted fallback.
+    pub builtin_memory: bool,
+}
+
+impl fmt::Debug for UcNativeSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UcNativeSettings")
+            .field("issuer", &self.issuer)
+            .field("client_secret", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl UcNativeSettings {
+    fn from_lookup(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<Self>, ConfigError> {
+        let Some(issuer) = lookup("ASTRA_UC_ISSUER") else {
+            return Ok(None);
+        };
+        let required = |name: &str| {
+            lookup(name).filter(|v| !v.is_empty()).ok_or_else(|| {
+                ConfigError::Validation(format!("{name} is required when ASTRA_UC_ISSUER is set"))
+            })
+        };
+        if issuer.is_empty() {
+            return Err(ConfigError::Validation(
+                "ASTRA_UC_ISSUER cannot be empty".into(),
+            ));
+        }
+        Ok(Some(Self {
+            issuer,
+            adapter_url: required("ASTRA_UC_ADAPTER_URL")?,
+            client_secret: required("ASTRA_UC_CLIENT_SECRET")?,
+            moi_api_url: required("ASTRA_MOI_API_URL")?,
+            genesis_url: required("ASTRA_GENESIS_URL")?,
+            builtin_memory: match lookup("ASTRA_UC_MEMORY_ENABLED").as_deref() {
+                None | Some("0") => false,
+                Some("1") => true,
+                Some(_) => {
+                    return Err(ConfigError::Validation(
+                        "ASTRA_UC_MEMORY_ENABLED must be 0 or 1".into(),
+                    ));
+                }
+            },
+        }))
     }
 }
 
@@ -1670,6 +1743,32 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn uc_native_configuration_has_no_independent_model_policy() {
+        let mut values = HashMap::from([
+            ("ASTRA_UC_ISSUER", "https://uc.example.test/realms/moi"),
+            ("ASTRA_UC_ADAPTER_URL", "https://uc.example.test"),
+            ("ASTRA_UC_CLIENT_SECRET", "synthetic-secret"),
+            ("ASTRA_MOI_API_URL", "https://moi.example.test/newmoi"),
+            ("ASTRA_GENESIS_URL", "https://genesis.example.test"),
+        ]);
+        let parsed = UcNativeSettings::from_lookup(&|key| values.get(key).map(|v| (*v).into()));
+        assert!(!parsed.unwrap().unwrap().builtin_memory);
+        for (value, enabled) in [("1", true), ("0", false)] {
+            values.insert("ASTRA_UC_MEMORY_ENABLED", value);
+            let parsed = UcNativeSettings::from_lookup(&|key| values.get(key).map(|v| (*v).into()));
+            assert_eq!(parsed.unwrap().unwrap().builtin_memory, enabled);
+        }
+        for value in ["true", "false", "", "yes", "2"] {
+            values.insert("ASTRA_UC_MEMORY_ENABLED", value);
+            assert!(
+                UcNativeSettings::from_lookup(&|key| values.get(key).map(|v| (*v).into())).is_err()
+            );
+        }
+        // Existing Memoria and self-hosted deployments do not enable UC.
+        assert!(UcNativeSettings::from_lookup(&|_| None).unwrap().is_none());
+    }
 
     #[test]
     fn memoria_user_authority_distinguishes_self_hosted_from_scoped_login() {

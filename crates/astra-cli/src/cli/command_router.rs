@@ -4,8 +4,8 @@ use crate::cli::arg_render::{
     render_review_args, render_team_args,
 };
 use crate::cli::auth_flow::{
-    clear_profile_auth, do_login, do_memoria_browser_login, do_memoria_login_with_key, do_register,
-    is_auth_error, parse_auth_tokens, save_refreshed_profile_tokens,
+    clear_profile_auth, do_login, do_memoria_login_with_key, do_register, is_auth_error,
+    parse_auth_tokens, save_refreshed_profile_tokens,
 };
 use crate::cli::cli_config::cli_args::{
     AuditCmd, Cli, Command, JournalCmd, ModelCmd, SessionCaptureCmd, SessionCmd, SkillCmd,
@@ -164,6 +164,27 @@ fn validated_cli_session_arg(session_id: &str) -> Result<&str, String> {
     Ok(session_id)
 }
 
+async fn delete_session_and_local_history(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    session_id: &str,
+) -> Result<String, String> {
+    validate_cli_session_id(session_id)?;
+    // Do not race a live local turn or allow it to recreate a deleted journal.
+    let _lease = astra_services::session_journal::SessionExecutionLease::try_acquire(session_id)
+        .map_err(|error| format!("cannot delete active local session {session_id}: {error}"))?;
+    let body = api
+        .delete_session_text(token, session_id)
+        .await
+        .map_err(map_thin_err)?;
+    // The server cannot remove CLI-local journal/CSL files. Only clean this
+    // profile's exact session after remote deletion has succeeded.
+    astra_services::session_journal::delete_session(session_id).map_err(|error| {
+        format!("session {session_id} was deleted on the server, but local history cleanup failed: {error}")
+    })?;
+    Ok(body)
+}
+
 fn maybe_wire_delegation_engine(
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
@@ -267,18 +288,19 @@ pub(crate) fn persist_headless_session_state(
     let canonical_committed = commit_status == HeadlessCanonicalCommitStatus::Committed;
     let mut canonical_recovery_persisted = false;
     if let (Some(session_id), Some(persisted)) = (sr.session_id.clone(), persisted_turn) {
-        if sr.final_messages.is_empty() {
+        let canonical_messages = persisted.conversation.messages();
+        if canonical_messages.is_empty() {
             record_stream_persistence_error(
                 sr,
                 "failed to persist one-shot canonical continuation: canonical messages are empty",
             );
         } else {
             let csl_state = astra_turn_core::conversation_log::SessionStateCompact {
-                source_cursor: Some(persisted.cursor),
+                source_cursor: Some(persisted.conversation.cursor().clone()),
                 recent_tools: sr.tools_used.clone(),
                 deferred_tool_activations:
                     astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
-                        &sr.final_messages,
+                        canonical_messages,
                         sr.deferred_tool_activations.clone(),
                     ),
                 ..Default::default()
@@ -286,7 +308,7 @@ pub(crate) fn persist_headless_session_state(
             match crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
                 &session_id,
                 persisted.turn,
-                &sr.final_messages,
+                canonical_messages,
                 &csl_state,
             ) {
                 Ok(()) => canonical_recovery_persisted = true,
@@ -390,8 +412,8 @@ async fn resolve_one_shot_model(
     } else {
         match session_runtime::resolve_server_default_model(api, token).await {
             session_runtime::ServerDefaultModel::Selected(selection) => Some(selection.name),
-            session_runtime::ServerDefaultModel::NoModels
-            | session_runtime::ServerDefaultModel::Unavailable => None,
+            session_runtime::ServerDefaultModel::NoModels => None,
+            session_runtime::ServerDefaultModel::Unavailable(error) => return Err(error),
         }
     };
     let Some(model) = model else {
@@ -412,10 +434,161 @@ async fn resolve_one_shot_model(
 }
 
 #[cfg(test)]
-mod exact_model_resolution_tests {
-    use super::resolve_one_shot_model;
+mod session_delete_tests {
+    use super::delete_session_and_local_history;
+    use astra_services::session_journal;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn seed_local_history(session_id: &str) -> std::path::PathBuf {
+        let base = session_journal::local_owner_sessions_dir();
+        std::fs::create_dir_all(base.join(session_id)).unwrap();
+        std::fs::write(base.join(format!("{session_id}.jsonl")), "{}\n").unwrap();
+        std::fs::write(base.join(session_id).join("conversation_log.jsonl"), "{}\n").unwrap();
+        base
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_delete_removes_only_selected_local_history_after_remote_success() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let sid = "delete-selected";
+        let base = seed_local_history(sid);
+        seed_local_history("keep-other-session");
+        let other_owner = astra_services::OwnerScope::user("other-account").unwrap();
+        let other_path = session_journal::journal_file_path_for_owner(&other_owner, sid).unwrap();
+        std::fs::create_dir_all(other_path.parent().unwrap()).unwrap();
+        std::fs::write(&other_path, "{}\n").unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/sessions/{sid}")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        delete_session_and_local_history(&api, "test-token", sid)
+            .await
+            .unwrap();
+        assert!(!base.join(format!("{sid}.jsonl")).exists());
+        assert!(!base.join(sid).exists());
+        assert!(
+            !session_journal::list_sessions()
+                .unwrap()
+                .contains(&sid.to_string())
+        );
+        assert!(base.join("keep-other-session.jsonl").exists());
+        assert!(
+            base.join("keep-other-session/conversation_log.jsonl")
+                .exists()
+        );
+        assert!(other_path.exists());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_delete_keeps_local_history_when_remote_delete_fails() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let sid = "delete-remote-failure";
+        let base = seed_local_history(sid);
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/sessions/{sid}")))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        assert!(
+            delete_session_and_local_history(&api, "test-token", sid)
+                .await
+                .is_err()
+        );
+        assert!(base.join(format!("{sid}.jsonl")).exists());
+        assert!(base.join(sid).join("conversation_log.jsonl").exists());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_delete_rejects_live_local_session_before_remote_mutation() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let sid = "delete-live-session";
+        let base = seed_local_history(sid);
+        let _lease = session_journal::SessionExecutionLease::try_acquire(sid).unwrap();
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let error = delete_session_and_local_history(&api, "test-token", sid)
+            .await
+            .unwrap_err();
+        assert!(error.contains("cannot delete active local session"));
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(base.join(format!("{sid}.jsonl")).exists());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_delete_reports_local_cleanup_failure_after_remote_success() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let sid = "delete-local-failure";
+        let journal = session_journal::journal_file_path(sid);
+        // A directory at the journal path produces a deterministic I/O error.
+        std::fs::create_dir_all(journal).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/sessions/{sid}")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let error = delete_session_and_local_history(&api, "test-token", sid)
+            .await
+            .unwrap_err();
+        assert!(error.contains("was deleted on the server, but local history cleanup failed"));
+    }
+}
+
+#[cfg(test)]
+mod exact_model_resolution_tests {
+    use super::{register_one_shot_edge, resolve_one_shot_model};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn one_shot_edge_registration_requires_server_admission_and_honors_deadline() {
+        assert!(crate::cli::edge_lifecycle::edge_cloud_registry_enabled());
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("client");
+        Mock::given(method("POST"))
+            .and(path("/agents/edge"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = register_one_shot_edge(&api, "token", None)
+            .await
+            .expect_err("registration failure must stop the turn");
+        assert!(error.contains("Edge registration failed before chat"));
+        let requests = server.received_requests().await.expect("requests");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("body");
+        assert!(body["materialization_id"].as_str().is_some());
+        assert!(body["worktree_path"].as_str().is_some());
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/agents/edge"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(1)))
+            .mount(&server)
+            .await;
+        let error = register_one_shot_edge(
+            &api,
+            "token",
+            Some(tokio::time::Instant::now() + std::time::Duration::from_millis(50)),
+        )
+        .await
+        .expect_err("registration must respect the caller deadline");
+        assert!(error.contains("deadline expired during Edge registration"));
+    }
 
     #[tokio::test]
     async fn async_resolution_rejects_model_missing_from_authoritative_catalog() {
@@ -450,6 +623,29 @@ mod exact_model_resolution_tests {
             .await
             .expect_err("missing Offering must fail closed");
         assert!(error.contains("authoritative catalog"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn default_model_failure_does_not_become_missing_model_selection() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/model-access"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                "error": "Service Unavailable",
+                "error_code": "genesis_unavailable",
+                "detail": "Genesis is temporarily unavailable"
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("client");
+        let error = resolve_one_shot_model(&api, "token", None, None, None)
+            .await
+            .expect_err("owner failure must not become an empty model selection");
+        assert!(
+            error.contains("503") || error.contains("genesis_unavailable"),
+            "{error}"
+        );
+        assert!(!error.contains("missing_model_selection"));
     }
 }
 
@@ -959,6 +1155,7 @@ async fn execute_cli_command_impl(
             let raw_message = words.join(" ");
             let message = apply_system_prompt(&raw_message, system_prompt.as_deref());
             let token = fresh_access_token_or_error(api, profile.as_deref()).await?;
+            register_one_shot_edge(api, &token, None).await?;
             let mut session_routing = resolve_one_shot_session_routing(
                 api,
                 profile.as_deref(),
@@ -1149,12 +1346,21 @@ async fn execute_cli_command_impl(
                 let connection_key = prompt_password_masked("Memoria connection key", None)?;
                 do_memoria_login_with_key(api, profile.as_deref(), &connection_key).await?;
             } else {
-                if let Some(website) = crate::cli::auth_flow::discover_login_website(api).await? {
-                    do_memoria_browser_login(api, profile.as_deref(), &website).await?;
-                } else {
+                let method =
+                    crate::cli::auth_flow::discover_login_method(api, profile.as_deref()).await?;
+                if matches!(method, crate::cli::auth_flow::LoginMethod::Password) {
                     let username = prompt_or("Username", None)?;
                     let password = prompt_password_masked("Password", None)?;
                     do_login(api, profile.as_deref(), &username, &password).await?;
+                } else {
+                    crate::cli::auth_flow::browser_login(
+                        api,
+                        profile.as_deref(),
+                        method,
+                        crate::cli::auth_flow::terminal_login_observer(),
+                        true,
+                    )
+                    .await?;
                 }
             }
             eprintln!(
@@ -1171,7 +1377,17 @@ async fn execute_cli_command_impl(
             Ok(ExitCode::Success)
         }
 
+        Some(Command::Auth(command)) => {
+            crate::cli::native_auth::command(&command).await?;
+            Ok(ExitCode::Success)
+        }
+
         Some(Command::Refresh) => {
+            if let Some(binding) = crate::cli::native_auth::active() {
+                binding.access_token().await?;
+                stdout_println!("MOI credential is ready");
+                return Ok(ExitCode::Success);
+            }
             let creds = load_credentials();
             let name = profile_name(profile.as_deref(), &creds);
             let saved_profile = creds
@@ -1193,6 +1409,11 @@ async fn execute_cli_command_impl(
         }
 
         Some(Command::Logout) => {
+            if crate::cli::native_auth::active().is_some() {
+                crate::cli::native_auth::logout().await?;
+                stdout_println!("Logged out of MOI");
+                return Ok(ExitCode::Success);
+            }
             let creds = load_credentials();
             let name = profile_name(profile.as_deref(), &creds);
             let saved_profile = creds
@@ -1475,16 +1696,7 @@ async fn execute_cli_command_impl(
             } else {
                 fresh_access_token_or_error(api, profile.as_deref()).await?
             };
-            // One-shot chat bypasses the interactive session-startup path, but
-            // it still advertises a native CLI Edge executor in every turn.
-            // Register the same stable workspace materialization before the
-            // first request so durable execution admission has an authenticated
-            // physical identity instead of a random process id or a stale row.
-            if crate::cli::edge_lifecycle::edge_cloud_registry_enabled() {
-                crate::cli::edge_lifecycle::register_edge_once(api, &token)
-                    .await
-                    .map_err(|error| format!("Edge registration failed before chat: {error}"))?;
-            }
+            register_one_shot_edge(api, &token, one_shot_terminal_deadline).await?;
             let explicit_session_id = args.session_id.clone();
             let session_routing_future = resolve_one_shot_session_routing(
                 api,
@@ -2083,7 +2295,11 @@ async fn execute_cli_command_impl(
             let session_id = validated_cli_session_arg(&args.session_id)?;
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
-                .post_session_cancel_text(&token, session_id)
+                .cancel_session_until_settled_text(
+                    &token,
+                    session_id,
+                    std::time::Duration::from_secs(10),
+                )
                 .await
                 .map_err(map_thin_err)?;
             clear_profile_last_session_if_matches_or_warn(
@@ -2098,10 +2314,7 @@ async fn execute_cli_command_impl(
         Some(Command::Session(SessionCmd::Delete(args))) => {
             let session_id = validated_cli_session_arg(&args.session_id)?;
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let body = api
-                .delete_session_text(&token, session_id)
-                .await
-                .map_err(map_thin_err)?;
+            let body = delete_session_and_local_history(api, &token, session_id).await?;
             clear_profile_last_session_if_matches_or_warn(
                 profile.as_deref(),
                 session_id,
@@ -2771,6 +2984,24 @@ fn final_json_output_with_context(
     })
 }
 
+// All one-shot entrypoints bypass interactive startup but advertise a native
+// Edge executor. Register its stable materialization before admitting a turn.
+async fn register_one_shot_edge(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(), String> {
+    let registration = crate::cli::edge_lifecycle::register_edge_once(api, token);
+    let result = if let Some(deadline) = deadline {
+        tokio::time::timeout_at(deadline, registration)
+            .await
+            .map_err(|_| "request wall deadline expired during Edge registration".to_string())?
+    } else {
+        registration.await
+    };
+    result.map_err(|error| format!("Edge registration failed before chat: {error}"))
+}
+
 /// `--print` / `-p` mode: headless single-shot query, prints response and exits.
 /// Reads message from positional args (Message variant) or stdin.
 pub(crate) async fn run_print_mode(
@@ -2804,6 +3035,7 @@ pub(crate) async fn run_print_mode(
     let message = apply_system_prompt(&raw_message, system_prompt);
 
     let token = fresh_access_token_or_error(api, profile).await?;
+    register_one_shot_edge(api, &token, None).await?;
     let mut session_routing =
         resolve_one_shot_session_routing(api, profile, cli_context.session_id.clone(), true)
             .await?;
@@ -4086,6 +4318,61 @@ mod one_shot_persistence_tests {
 
     fn execution_lease(session_id: &str) -> astra_services::session_journal::SessionExecutionLease {
         astra_services::session_journal::SessionExecutionLease::try_acquire(session_id).unwrap()
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn one_shot_csl_resume_matches_committed_messages_with_turn_provenance() {
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let sid = format!("one-shot-csl-provenance-{}", uuid::Uuid::new_v4());
+        let lease = execution_lease(&sid);
+        let mut result = crate::tests::stub_stream_result("Approval required; tool not executed.");
+        result.session_id = Some(sid.clone());
+        result.selected_skills = vec!["moi-cli".into()];
+        result.final_messages = vec![
+            serde_json::json!({"role": "user", "content": "list my MOI workspaces",
+                "_astra_turn_provenance": {"schema_version": 1, "turn_chain_id": "run-test"}}),
+            serde_json::json!({"role": "assistant", "content": result.full_text,
+                "_astra_turn_provenance": {"schema_version": 1, "turn_chain_id": "run-test"}}),
+        ];
+        let settlement = persist_headless_session_state(
+            None,
+            Some("test-model"),
+            "list my MOI workspaces",
+            &mut result,
+            std::time::Instant::now(),
+            Some(&lease),
+        );
+        assert_eq!(
+            settlement.commit_status,
+            HeadlessCanonicalCommitStatus::Committed
+        );
+        assert_eq!(settlement.persistence_error, None);
+
+        // A fresh manager is the same validation boundary used by /resume,
+        // not the more permissive blocking display-history reader.
+        let store = std::sync::Arc::new(
+            astra_turn_core::conversation_log::file_store::FileCslStore::new(
+                astra_services::session_journal::local_owner_sessions_dir(),
+            ),
+        );
+        let mut manager = astra_turn_core::conversation_log::manager::CslManager::new(
+            store,
+            sid,
+            Default::default(),
+        )
+        .unwrap();
+        let restored = manager.load().await.expect("valid canonical CSL").unwrap();
+        assert_eq!(restored.messages.len(), 2);
+        assert_eq!(restored.messages[1]["content"], result.full_text);
+        assert_eq!(
+            astra_turn_types::canonical_conversation_root(&restored.messages),
+            restored
+                .session_state
+                .source_cursor
+                .unwrap()
+                .canonical_root_hash,
+        );
     }
 
     #[test]

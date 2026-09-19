@@ -1373,6 +1373,25 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
 
 #[tokio::main]
 async fn main() {
+    // Image-managed runners have no MOI installation marker and remain outside
+    // the local update lifecycle. Local managed Edge holds a lease until exit.
+    let executable = std::env::current_exe().expect("current executable");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match astra_core::client_installation::early_command(&executable, &args, false) {
+        Ok(Some(code)) => std::process::exit(code),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    }
+    let _installation_lease = match astra_core::client_installation::acquire(&executable) {
+        Ok(lease) => lease,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    };
     let process_capture =
         match astra_core::history_work_baseline::ProductionProcessCaptureGuard::from_env(
             astra_core::history_work_baseline::ProductionProcessRole::Edge,

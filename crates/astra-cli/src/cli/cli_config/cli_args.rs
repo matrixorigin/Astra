@@ -41,6 +41,9 @@ fn parse_benchmark_profile_arg(value: &str) -> Result<astra_harness::HarnessProf
 #[derive(Parser, Debug)]
 #[command(name = "astra", version)]
 #[command(about = "AI agent CLI — run `astra` for interactive chat")]
+#[command(
+    after_help = "MOI-managed installations: astra update check | astra update | astra update --rollback"
+)]
 pub(crate) struct Cli {
     /// API server base URL [env: ASTRA_API_URL] [config: api_url] [default: http://127.0.0.1:17001]
     #[arg(long)]
@@ -153,6 +156,9 @@ pub(crate) enum Command {
     Register(RegisterArgs),
     /// Log in with stored credentials
     Login(LoginArgs),
+    /// Inspect the shared MOI login session (internal credential helper included)
+    #[command(subcommand)]
+    Auth(NativeAuthCommand),
     /// Show the current authenticated user
     Whoami,
     /// Refresh the current auth token
@@ -232,6 +238,32 @@ pub(crate) enum Command {
     /// Direct message: astra "your question here"
     #[command(external_subcommand)]
     Message(Vec<String>),
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum NativeAuthCommand {
+    /// Select a MOI workspace; omit the ID to choose interactively
+    Workspace {
+        #[arg(conflicts_with = "clear")]
+        id: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Show non-secret MOI session state
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Internal pipe-only access credential protocol
+    #[command(hide = true)]
+    Credential {
+        #[arg(long, value_parser = ["moi", "astra"])]
+        target: String,
+        #[arg(long)]
+        output_fd: i32,
+        #[arg(long)]
+        generation: Option<String>,
+    },
 }
 
 impl Command {

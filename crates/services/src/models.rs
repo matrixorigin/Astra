@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::auth::FernetTokenEncryptor;
 use astra_core::model_wire::thinking::{ThinkingProtocol, canonical_thinking_protocol};
+mod genesis;
 mod thinking_probe;
 use astra_core::{
     ErrorKind, ErrorResponse, MatrixOneSettings, SharedPool,
@@ -654,6 +655,37 @@ pub enum ModelAccessKind {
     Workspace,
     ThisDevice,
     SelfHosted,
+}
+
+/// One declaration policy shared by catalog display and server-default run
+/// admission. No source is inferred from a model name or an API credential.
+pub fn server_model_access_declarations(
+    allows_deployment: bool,
+    kinds: impl IntoIterator<Item = ModelAccessKind>,
+) -> Vec<DeclaredModelAccess> {
+    let kinds: BTreeSet<_> = kinds.into_iter().collect();
+    let mut declared = Vec::new();
+    let mut add = |id: &str, label: &str, kind| {
+        declared.push(DeclaredModelAccess {
+            id: id.into(),
+            label: label.into(),
+            kind,
+            execution_placement: ModelExecutionPlacement::Server,
+            availability: ModelAccessAvailability::Ready,
+        })
+    };
+    if allows_deployment {
+        add("self-hosted", "Self-hosted", ModelAccessKind::SelfHosted);
+    }
+    if kinds.contains(&ModelAccessKind::AstraCloud) {
+        add("genesis", "Genesis", ModelAccessKind::AstraCloud);
+    }
+    if kinds.contains(&ModelAccessKind::CloudByok)
+        || !allows_deployment && !kinds.contains(&ModelAccessKind::AstraCloud)
+    {
+        add("cloud-byok", "Cloud BYOK", ModelAccessKind::CloudByok);
+    }
+    declared
 }
 
 impl ModelAccessKind {
@@ -1778,7 +1810,7 @@ async fn deployment_models_allowed(pool: &sqlx::MySqlPool, user_id: &str) -> Res
         return Ok(false);
     }
     let mapped: Option<String> = sqlx::query_scalar(
-        "SELECT external_subject FROM auth_external_identities WHERE astra_user_id = ? AND provider_id LIKE 'memoria:%' UNION ALL SELECT memoria_user_id FROM auth_memoria_identities WHERE astra_user_id = ? LIMIT 1",
+        "SELECT external_subject FROM auth_external_identities WHERE astra_user_id = ? AND (provider_id LIKE 'memoria:%' OR provider_id LIKE 'uc:%') UNION ALL SELECT memoria_user_id FROM auth_memoria_identities WHERE astra_user_id = ? LIMIT 1",
     )
     .bind(user_id)
     .bind(user_id)
@@ -2356,8 +2388,35 @@ impl std::fmt::Debug for UserModelUpdateRequestData {
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
+/// Request-scoped, credential-free catalog and its default policy. This is
+/// never a cached admission grant; execution still revalidates its Offering.
+pub struct UserModelCatalog {
+    pub items: Vec<ModelListItem>,
+    pub default_offering_id: Option<String>,
+    pub allows_deployment: bool,
+}
+
+async fn read_user_model_catalog<T: ModelService + ?Sized>(
+    service: &T,
+    user_id: String,
+) -> Result<UserModelCatalog, (StatusCode, Json<ErrorResponse>)> {
+    Ok(UserModelCatalog {
+        items: service.list_models(user_id.clone(), false).await?,
+        default_offering_id: service
+            .default_user_model_offering_id(user_id.clone())
+            .await?,
+        allows_deployment: service.allows_deployment_models(user_id).await?,
+    })
+}
+
 #[async_trait]
 pub trait ModelService: Send + Sync {
+    async fn user_model_catalog(
+        &self,
+        user_id: String,
+    ) -> Result<UserModelCatalog, (StatusCode, Json<ErrorResponse>)> {
+        read_user_model_catalog(self, user_id).await
+    }
     /// Credential-free preflight. This is not authorization for later requests.
     async fn validate_user_model_endpoint(
         &self,
@@ -2527,6 +2586,7 @@ pub struct DatabaseModelService {
     pool: Option<SharedPool>,
     encryptor: std::sync::Arc<FernetTokenEncryptor>,
     catalog_revision_cache: Arc<Mutex<HashMap<bool, CachedCatalogRevision>>>,
+    uc_provider: Option<crate::auth::uc::UcNativeProvider>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2561,6 +2621,7 @@ impl DatabaseModelService {
             encryptor,
             pool: None,
             catalog_revision_cache: Arc::new(Mutex::new(HashMap::new())),
+            uc_provider: None,
         }
     }
 
@@ -3107,10 +3168,28 @@ impl ModelService for DatabaseModelService {
         self.get_user_model(user_id, model_id).await
     }
 
+    async fn user_model_catalog(
+        &self,
+        user_id: String,
+    ) -> Result<UserModelCatalog, (StatusCode, Json<ErrorResponse>)> {
+        if let Some(subject) = self.uc_subject(&user_id).await? {
+            let catalog = self.genesis_catalog(&subject).await?;
+            return Ok(UserModelCatalog {
+                items: catalog.items,
+                default_offering_id: catalog.default_offering_id,
+                allows_deployment: false,
+            });
+        }
+        read_user_model_catalog(self, user_id).await
+    }
+
     async fn default_user_model_offering_id(
         &self,
         user_id: String,
     ) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+        if let Some(subject) = self.uc_subject(&user_id).await? {
+            return Ok(self.genesis_catalog(&subject).await?.default_offering_id);
+        }
         let pool = self.get_pool().await.map_err(internal_error)?;
         query_scalar(
             "SELECT model_id FROM user_llm_models \
@@ -3128,6 +3207,9 @@ impl ModelService for DatabaseModelService {
         user_id: String,
         offering_id: String,
     ) -> Result<AdmittedModelExecution, (StatusCode, Json<ErrorResponse>)> {
+        if let Some(subject) = self.uc_subject(&user_id).await? {
+            return self.admit_genesis(&subject, &offering_id).await;
+        }
         revalidate_admitted_model_execution(
             &self.matrixone,
             self.encryptor.as_ref(),
@@ -3270,6 +3352,9 @@ impl ModelService for DatabaseModelService {
         user_id: String,
         is_admin: bool,
     ) -> Result<Vec<ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
+        if let Some(subject) = self.uc_subject(&user_id).await? {
+            return Ok(self.genesis_catalog(&subject).await?.items);
+        }
         let pool = self.get_pool().await.map_err(internal_error)?;
 
         let sql = if is_admin {

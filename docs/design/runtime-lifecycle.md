@@ -295,6 +295,56 @@ Cancellation is a state transition with cleanup obligations:
 
 Hard stop is reserved for safety or consistency boundaries. Prefer precise degraded states when possible.
 
+### Session cancellation convergence
+
+`POST /sessions/{id}/cancel` accepts cancellation through the canonical Run
+control path and spends a bounded interval converging its execution. Its JSON
+retains the Session fields and adds required `execution_settled` and `runs`
+fields. Each run entry contains `run_id`, its observed `status`, and
+`execution_settled`. HTTP 202 with `status: "cancellation_requested"` and
+`execution_settled: false` is pending, including when the run list is empty.
+Only HTTP 200 with `status: "cancelled"` and `execution_settled: true` reports
+convergence. Pending responses do not write a cancelled Session projection.
+Clients may repeat the same owner-scoped endpoint; a deadline, missing proof,
+or storage failure must not become cancellation success.
+Pending responses may include `workspace_blocker`, the typed result of the
+latest canonical idle proof. Missing proof is not an inferred blocker or
+success. The database Run store publishes all currently active Runs' existing
+cancellation markers in one owner/Session-scoped atomic write, with a bounded,
+cancellation-safe database attempt. An ambiguous acknowledgement fails closed;
+retry is idempotent. This precedes settlement discovery, so slow pages cannot
+starve later intent. The subsequent one-second settlement budget is cooperative:
+checks occur between completed operations, never by dropping an in-flight SQL
+transaction. An individual operation can exceed that budget; CLI callers enforce
+their own hard deadline.
+
+Active-run enumeration is insufficient: terminal runs can retain live
+executors, owner leases, tool invocations or canonical turn authority. Retries
+rediscover that retained authority and preserve the targets observed while
+waiting. The coordinator owns one fenced idle proof shared with checkout
+reuse, including slots, active execution, generation-scoped durable settlement
+fences (started without finished or accounting-finalized), writer/reservation authority,
+unresolved invocations and unfinished execution-binding switches. Run statuses
+remain truthful when completion wins a cancellation race.
+
+An orphan's terminal transition does not itself retire its canonical writer.
+Cleanup rechecks the terminal Run generation and owner under the Session
+execution fence, then releases only the exact internally acquired writer and
+matching reservation. A newer writer, recovered generation or externally
+supplied controller lease is not released. A writer acquired before its Run
+exists remains pending. Cleanup is idempotent and can resume after a failed or
+unacknowledged attempt without replaying execution.
+
+Cancellation invokes the existing terminal tool reconciler promptly. A
+prepared invocation with no dispatch attempts becomes a durable rejection;
+dispatched or unknown outcomes retain their safety obligations. Lease expiry,
+disconnect, terminal status and cancellation intent cannot prove external
+effects stopped. `execution_settled: true` requires this Session no longer to
+block checkout reuse; it does not reserve the checkout against another Session
+or prohibit a later explicitly admitted turn. Session history and execution
+bindings are retained, and new-conversation admission performs its own claim
+check.
+
 ## Recovery
 
 Recovery uses:

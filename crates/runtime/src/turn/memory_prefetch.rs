@@ -53,22 +53,24 @@ pub async fn prefetch_memories_with_client(
     session_id: &str,
     top_k: u32,
 ) -> MemoryPrefetchResult {
-    match client.admits_operation(false).await {
-        Ok(true) => {}
-        Ok(false) => return MemoryPrefetchResult::default(),
-        Err(_) => {
-            return MemoryPrefetchResult {
-                outcome: astra_turn_types::MemoryRetrievalOutcome::Unavailable,
-                ..Default::default()
-            };
-        }
-    }
     if user_msg.trim().is_empty() {
         return MemoryPrefetchResult::default();
     }
     let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + INTERACTIVE_MEMORY_READ_DEADLINE;
+    match tokio::time::timeout_at(deadline, client.admits_operation(false)).await {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => return MemoryPrefetchResult::default(),
+        Ok(Err(_)) | Err(_) => {
+            return MemoryPrefetchResult {
+                outcome: astra_turn_types::MemoryRetrievalOutcome::Unavailable,
+                fetch_ms: started.elapsed().as_millis() as i64,
+                ..Default::default()
+            };
+        }
+    }
     let trimmed_msg = user_msg.trim();
-    let result = retrieve_rankable(client, trimmed_msg, user_id, session_id, top_k).await;
+    let result = retrieve_rankable(client, trimmed_msg, user_id, session_id, top_k, deadline).await;
     let outcome = result.outcome;
     let mut merged_records = merge_structured_results(result.memories, Vec::new());
     astra_turn_types::sort_by_retrieval_score(&mut merged_records);
@@ -105,10 +107,11 @@ async fn retrieve_rankable(
     user_id: &str,
     session_id: &str,
     top_k: u32,
+    deadline: tokio::time::Instant,
 ) -> RankableRetrieval {
     let started = Instant::now();
-    let retrieval = tokio::time::timeout(
-        INTERACTIVE_MEMORY_READ_DEADLINE,
+    let retrieval = tokio::time::timeout_at(
+        deadline,
         client.retrieve_for_prompt(query, user_id, session_id, top_k as usize),
     )
     .await;
@@ -179,17 +182,19 @@ pub async fn prefetch_session_start_memories_with_client(
     user_id: &str,
     session_id: &str,
 ) -> SessionStartPrefetchResult {
-    match client.admits_operation(false).await {
-        Ok(true) => {}
-        Ok(false) => return SessionStartPrefetchResult::default(),
-        Err(_) => {
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + INTERACTIVE_MEMORY_READ_DEADLINE;
+    match tokio::time::timeout_at(deadline, client.admits_operation(false)).await {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => return SessionStartPrefetchResult::default(),
+        Ok(Err(_)) | Err(_) => {
             return SessionStartPrefetchResult {
                 outcome: astra_turn_types::MemoryRetrievalOutcome::Unavailable,
+                fetch_ms: started.elapsed().as_millis() as i64,
                 ..Default::default()
             };
         }
     }
-    let started = Instant::now();
 
     // Two structured queries in parallel:
     //   1. `profile` — broad query to surface user-identity memories.
@@ -207,6 +212,7 @@ pub async fn prefetch_session_start_memories_with_client(
             user_id,
             session_id,
             PROFILE_TOP_K,
+            deadline,
         ),
         retrieve_rankable(
             client,
@@ -214,6 +220,7 @@ pub async fn prefetch_session_start_memories_with_client(
             user_id,
             session_id,
             EPISODE_TOP_K,
+            deadline,
         ),
     );
 
@@ -393,18 +400,32 @@ mod tests {
     #[derive(Default)]
     struct NeverRespondingClient {
         calls: Mutex<usize>,
+        admission_delay: Duration,
+        deny: bool,
+        profile_result: Option<MemoriaMemory>,
     }
 
     #[async_trait::async_trait]
     impl MemoriaPort for NeverRespondingClient {
+        async fn admits_operation(&self, _write: bool) -> Result<bool, String> {
+            if !self.admission_delay.is_zero() {
+                tokio::time::sleep(self.admission_delay).await;
+            }
+            Ok(!self.deny)
+        }
         async fn retrieve_for_prompt(
             &self,
-            _query: &str,
+            query: &str,
             _user_id: &str,
             _session_id: &str,
             _top_k: usize,
         ) -> Result<Vec<MemoriaMemory>, String> {
             *self.calls.lock().expect("calls") += 1;
+            if query == "user profile preferences role"
+                && let Some(memory) = &self.profile_result
+            {
+                return Ok(vec![memory.clone()]);
+            }
             std::future::pending().await
         }
 
@@ -706,6 +727,86 @@ mod tests {
             2,
             "profile and episodic recall are independent but both must be bounded"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn memory_authority_and_retrieval_share_one_interactive_budget() {
+        for delay in [Duration::from_secs(10), Duration::from_millis(400)] {
+            for session_start in [false, true] {
+                let client = NeverRespondingClient {
+                    admission_delay: delay,
+                    ..Default::default()
+                };
+                let started = tokio::time::Instant::now();
+                let outcome = if session_start {
+                    prefetch_session_start_memories_with_client(&client, "user", "session")
+                        .await
+                        .outcome
+                } else {
+                    prefetch_memories_with_client(&client, "query", "user", "session", 5)
+                        .await
+                        .outcome
+                };
+                assert_eq!(
+                    outcome,
+                    astra_turn_types::MemoryRetrievalOutcome::Unavailable
+                );
+                assert_eq!(started.elapsed(), INTERACTIVE_MEMORY_READ_DEADLINE);
+                let expected = if delay > INTERACTIVE_MEMORY_READ_DEADLINE {
+                    0
+                } else if session_start {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(*client.calls.lock().unwrap(), expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_memory_authority_never_contacts_memory_backend() {
+        let client = NeverRespondingClient {
+            deny: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            prefetch_memories_with_client(&client, "query", "user", "session", 5)
+                .await
+                .outcome,
+            astra_turn_types::MemoryRetrievalOutcome::NotAttempted
+        );
+        assert_eq!(
+            prefetch_session_start_memories_with_client(&client, "user", "session")
+                .await
+                .outcome,
+            astra_turn_types::MemoryRetrievalOutcome::NotAttempted
+        );
+        assert_eq!(*client.calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_start_keeps_successful_lane_when_other_lane_times_out() {
+        let client = NeverRespondingClient {
+            admission_delay: Duration::from_millis(400),
+            profile_result: Some(typed_memory(
+                "profile",
+                astra_prompts::memory_proto::NS_PREF,
+                "profile",
+                "Prefers concise answers",
+                0.9,
+            )),
+            ..Default::default()
+        };
+        let started = tokio::time::Instant::now();
+        let result = prefetch_session_start_memories_with_client(&client, "user", "session").await;
+        assert_eq!(started.elapsed(), INTERACTIVE_MEMORY_READ_DEADLINE);
+        assert_eq!(
+            result.outcome,
+            astra_turn_types::MemoryRetrievalOutcome::Partial
+        );
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].memory_id.as_deref(), Some("profile"));
     }
 
     #[test]

@@ -439,11 +439,11 @@ impl UserScopedMemoriaPort {
         ) {
             MemoriaAuthoritySelection::Scoped(credential) => {
                 enforce_memory_access(credential.access.as_str(), write)?;
-                Ok((
+                let mut client =
                     HttpMemoriaPort::new(self.resolver.provider.base_url.clone(), credential.key)
-                        .with_owner_user_id(credential.owner.clone()),
-                    credential.owner,
-                ))
+                        .with_owner_user_id(credential.owner.clone());
+                client.owner_scoped_master = credential.owner_scoped_master;
+                Ok((client, credential.owner))
             }
             MemoriaAuthoritySelection::SelfHosted => {
                 let fallback = self

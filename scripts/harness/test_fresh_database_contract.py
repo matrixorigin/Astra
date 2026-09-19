@@ -6,6 +6,7 @@ import importlib.util
 import json
 import multiprocessing
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -424,6 +425,7 @@ class FreshDatabaseContractTests(unittest.TestCase):
             self.assertEqual(outcomes.count("consumed"), 1)
             self.assertEqual(outcomes.count("rejected"), 1)
 
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux abstract Unix sockets")
     def test_two_processes_two_proof_paths_and_ports_have_one_lifecycle_winner(self):
         database = "astra_tb_round5_0123456789abcdef"
         revision = "a" * 40
@@ -568,6 +570,7 @@ class FreshDatabaseContractTests(unittest.TestCase):
             ):
                 contract._validated_consumption_directory(unsafe)
 
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux abstract Unix sockets")
     def test_abstract_lifecycle_lease_is_versioned_cloexec_and_path_independent(self):
         broker = broker_module
         identity = "a" * 64

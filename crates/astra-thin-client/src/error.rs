@@ -25,6 +25,12 @@ pub enum ThinClientError {
     IncompatibleRuntime { expected: String, actual: String },
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    #[error(
+        "session {session_id} cancellation has not been confirmed complete: {reason}. Retry `astra session cancel {session_id}`; keep the session history"
+    )]
+    SessionCancellationPending { session_id: String, reason: String },
+    #[error("invalid session cancellation response: {0}")]
+    InvalidSessionCancellationResponse(String),
     #[error("expected JSON object in SSE data line, got: {0}")]
     InvalidSseJson(serde_json::Value),
     #[error("JSON error: {0}")]

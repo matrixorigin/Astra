@@ -131,8 +131,8 @@ read-only; server configuration changes are not available here.
 | `/config` | Edit runtime configuration. |
 | `/allow` | Choose a permission mode and manage workspace trust. |
 | `/instructions` | View, reload, or disable project instructions. |
-| `/login` | Sign in to your Astra account. |
-| `/register` | Create a new Astra account. |
+| `/login` | Discover the connected server's login method: UC/Memoria browser sign-in or a self-hosted password form. |
+| `/register` | Open the discovered provider's website for registration, or the self-hosted registration form. |
 
 `/config edit` remains accepted as an alias for `/config`. `/allow` opens a mode
 picker with no arguments. Its modes include `auto`, `bypass`, `read_only`,

@@ -20,6 +20,11 @@ struct RuntimeWiring {
 pub async fn build_server_state(
     settings: AppSettings,
 ) -> Result<AppState, Box<dyn std::error::Error>> {
+    let uc_provider = settings
+        .uc_native
+        .clone()
+        .map(astra_services::auth::uc::UcNativeProvider::new)
+        .transpose()?;
     ensure_core_schema(&settings.matrixone, &settings.database_bootstrap_catalog).await?;
     // Keep a small, bounded control-plane reservation inside the configured
     // total. Long-running runs and background persistence use the general pool;
@@ -47,6 +52,7 @@ pub async fn build_server_state(
         &shared_pool,
         control_pool.as_ref(),
         &shared_encryptor,
+        uc_provider.clone(),
     )?;
 
     let state = core::build_core_state(
@@ -55,6 +61,7 @@ pub async fn build_server_state(
         control_pool.as_ref(),
         &shared_encryptor,
         auth_service,
+        uc_provider,
     );
     let state = core::install_turn_persistence_services(state, &settings, &shared_pool);
     let state =

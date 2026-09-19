@@ -8,6 +8,7 @@ use astra_services::{
     SessionContextCoordinator, SessionContextCoordinatorError, SessionExecutionBindingStateV1,
     SessionExecutionBindingV1,
     runs::{DatabaseRunStateStore, DurableRunRecord, RunStateStore},
+    session_context_coordinator::WorkspaceReuseBlocker,
 };
 use astra_turn_types::{
     ActorContextV1, ActorKindV1, AuthorityEpochsV1, SessionKeyV1, SessionSurfaceV1,
@@ -121,6 +122,25 @@ async fn cleanup(pool: &SharedPool, owner: &str) {
     }
 }
 
+async fn retire_executor(store: &DatabaseRunStateStore, key: &SessionKeyV1, run_id: &str) {
+    let run = store
+        .load_run(&key.owner_user_id, run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .release_owner_lease(
+                &key.owner_user_id,
+                &key.session_id,
+                run_id,
+                run.run_generation,
+            )
+            .await
+            .unwrap()
+    );
+}
+
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn idle_checkout_reuse_preserves_sessions_and_allows_explicit_return() {
@@ -156,7 +176,10 @@ async fn idle_checkout_reuse_preserves_sessions_and_allows_explicit_return() {
     };
     assert!(matches!(
         reserve(&coordinator, &keys[1]).await,
-        Err(SessionContextCoordinatorError::ExecutionWorkspaceClaimed { .. })
+        Err(SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
+            blocker: WorkspaceReuseBlocker::WriterOrReservation,
+            ..
+        })
     ));
     coordinator.release_writer(&lease).await.unwrap();
     assert!(matches!(
@@ -179,7 +202,10 @@ async fn checkout_reuse_blocks_unresolved_tools_even_without_live_authority() {
                 coordinator
                     .load_or_initialize_execution_binding(&keys[1], &binding(&keys[1].session_id))
                     .await,
-                Err(SessionContextCoordinatorError::ExecutionWorkspaceClaimed { .. })
+                Err(SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
+                    blocker: WorkspaceReuseBlocker::UnresolvedTool,
+                    ..
+                })
             ),
             "must block {state}"
         );
@@ -236,7 +262,10 @@ async fn checkout_reuse_blocks_execution_slots_and_fences_delayed_old_run() {
         coordinator
             .load_or_initialize_execution_binding(&keys[1], &binding(&keys[1].session_id))
             .await,
-        Err(SessionContextCoordinatorError::ExecutionWorkspaceClaimed { .. })
+        Err(SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
+            blocker: WorkspaceReuseBlocker::ExecutionSlot,
+            ..
+        })
     ));
     // Model settlement already happened; retain the slot to prove it independently blocks reuse.
     sqlx::query("UPDATE agent_runs SET status = 'completed' WHERE user_id = ?")
@@ -244,17 +273,33 @@ async fn checkout_reuse_blocks_execution_slots_and_fences_delayed_old_run() {
         .execute(pool.get())
         .await
         .unwrap();
-    assert!(
+    assert!(matches!(
         coordinator
             .load_or_initialize_execution_binding(&keys[1], &binding(&keys[1].session_id))
-            .await
-            .is_err()
-    );
+            .await,
+        Err(SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
+            blocker: WorkspaceReuseBlocker::ExecutionSlot,
+            ..
+        })
+    ));
     sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
         .bind(&keys[0].owner_user_id)
         .execute(pool.get())
         .await
         .unwrap();
+    assert!(
+        matches!(
+            coordinator
+                .load_or_initialize_execution_binding(&keys[1], &binding(&keys[1].session_id))
+                .await,
+            Err(SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
+                blocker: WorkspaceReuseBlocker::ActiveRun,
+                ..
+            })
+        ),
+        "terminal status and slot retirement do not imply executor exit"
+    );
+    retire_executor(&store, &keys[0], "old-run").await;
     coordinator
         .load_or_initialize_execution_binding(&keys[1], &binding(&keys[1].session_id))
         .await
@@ -281,12 +326,15 @@ async fn checkout_reuse_blocks_provider_switch_and_active_child_without_root_slo
         .compare_and_swap_execution_binding(&keys[0], 1, &switching)
         .await
         .unwrap();
-    assert!(
+    assert!(matches!(
         coordinator
             .load_or_initialize_execution_binding(&keys[1], &binding(&keys[1].session_id))
-            .await
-            .is_err()
-    );
+            .await,
+        Err(SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
+            blocker: WorkspaceReuseBlocker::BindingNotReady,
+            ..
+        })
+    ));
     switching.generation = 3;
     switching.state = SessionExecutionBindingStateV1::Ready;
     coordinator
@@ -310,17 +358,21 @@ async fn checkout_reuse_blocks_provider_switch_and_active_child_without_root_slo
             .await
             .unwrap();
     assert_eq!(count, 0);
-    assert!(
+    assert!(matches!(
         coordinator
             .load_or_initialize_execution_binding(&keys[1], &binding(&keys[1].session_id))
-            .await
-            .is_err()
-    );
+            .await,
+        Err(SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
+            blocker: WorkspaceReuseBlocker::ActiveRun,
+            ..
+        })
+    ));
     sqlx::query("UPDATE agent_runs SET status = 'completed' WHERE user_id = ?")
         .bind(&keys[0].owner_user_id)
         .execute(pool.get())
         .await
         .unwrap();
+    retire_executor(&store, &keys[0], "child-run").await;
     coordinator
         .load_or_initialize_execution_binding(&keys[1], &binding(&keys[1].session_id))
         .await
@@ -362,6 +414,7 @@ async fn checkout_reuse_fences_root_and_child_resume_without_changing_run_state(
                 .await
                 .unwrap()
         );
+        retire_executor(&store, &keys[0], "paused-run").await;
         coordinator
             .load_or_initialize_execution_binding(&keys[1], &binding(&keys[1].session_id))
             .await

@@ -2543,6 +2543,18 @@ impl ChatWidget {
         self.explain_analyze_verbose = verbose;
     }
 
+    /// Restore every presentation preference when a session/login replaces the
+    /// widget; report format must not silently revert to the constructor default.
+    pub(crate) fn restore_explain_preferences(
+        &mut self,
+        verbose: bool,
+        config: &astra_config::runtime_config::ExplainConfig,
+    ) {
+        self.set_explain_verbose(verbose);
+        self.set_explain_live_rows(config.effective_live_rows());
+        self.set_explain_report_format(config.effective_report_format());
+    }
+
     pub(crate) fn set_explain_live_rows(&mut self, rows: u8) {
         self.explain_analyze_live_rows = rows.clamp(1, 5);
     }
@@ -4907,6 +4919,26 @@ mod tests {
         // A local widget has no durable transcript until the runtime commits
         // canonical journal items. This keeps reducer tests filesystem-free.
         ChatWidget::new("")
+    }
+
+    #[test]
+    fn replacement_widget_restores_all_explain_preferences() {
+        use astra_config::runtime_config::{ExplainConfig, ExplainReportFormat};
+        for format in [
+            ExplainReportFormat::Html,
+            ExplainReportFormat::Markdown,
+            ExplainReportFormat::Text,
+        ] {
+            let config = ExplainConfig {
+                live_rows: Some(2),
+                report_format: Some(format),
+            };
+            let mut widget = fresh();
+            widget.restore_explain_preferences(true, &config);
+            assert_eq!(widget.explain_analyze_report_format, format);
+            assert_eq!(widget.explain_analyze_live_rows, 2);
+            assert!(widget.explain_analyze_verbose);
+        }
     }
 
     fn explain_turn_start() -> astra_turn_types::ExplainAnalyzeEventV1 {

@@ -75,11 +75,22 @@ async fn memoria_proxy_request(
     timeout: Duration,
     body: Option<&Value>,
 ) -> Result<String, String> {
-    let (base, token) = current_memoria_proxy_target()?;
-    let client = astra_core::net::client_builder_for_target(&base)
-        .timeout(timeout)
-        .build()
-        .map_err(|e| format!("build client: {e}"))?;
+    // Capture destination and credential authority together before awaiting a
+    // refresh. A workspace .env must not redirect the native account's bearer,
+    // and an in-flight request must not adopt a later login generation.
+    let binding = crate::cli::native_auth::active();
+    let (base, token) = if let Some(binding) = &binding {
+        (binding.endpoint().to_owned(), binding.access_token().await?)
+    } else {
+        current_memoria_proxy_target()?
+    };
+    let builder = astra_core::net::client_builder_for_target(&base).timeout(timeout);
+    let builder = if binding.is_some() {
+        builder.redirect(reqwest::redirect::Policy::none())
+    } else {
+        builder
+    };
+    let client = builder.build().map_err(|e| format!("build client: {e}"))?;
     let url = format!("{}{}", base.trim_end_matches('/'), path);
     let req = match method {
         astra_tools::memoria::HttpMethod::Get => client.get(&url),

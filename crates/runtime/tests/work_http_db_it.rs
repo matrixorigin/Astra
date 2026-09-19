@@ -216,8 +216,12 @@ impl RunLifecycleService for WorkTurnRecordingLifecycle {
         &self,
         _session_id: String,
         _user_id: String,
-    ) -> Result<Vec<CancelRunRecord>, (StatusCode, Json<ErrorResponse>)> {
-        Ok(Vec::new())
+    ) -> Result<astra_services::runs::CancelSessionRecord, (StatusCode, Json<ErrorResponse>)> {
+        Ok(astra_services::runs::CancelSessionRecord {
+            runs: Vec::new(),
+            execution_settled: true,
+            workspace_blocker: None,
+        })
     }
 
     async fn list_runs_cursor(

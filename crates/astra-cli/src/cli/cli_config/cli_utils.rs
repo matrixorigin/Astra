@@ -39,6 +39,12 @@ pub(crate) fn load_credentials() -> CredentialsFile {
 
     static LAST_ERR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
+    match crate::cli::native_auth::projected_credentials() {
+        Ok(Some(credentials)) => return credentials,
+        Err(_) => return CredentialsFile::default(), // fail closed; never load legacy credentials
+        Ok(None) => (),
+    }
+
     match credential_store().load() {
         Ok(creds) => creds,
         Err(err) => {
@@ -72,6 +78,9 @@ where
 }
 
 pub(crate) fn profile_name(cli_profile: Option<&str>, data: &CredentialsFile) -> String {
+    if let Some(binding) = crate::cli::native_auth::active() {
+        return binding.profile_name();
+    }
     CredentialStore::resolve_profile_name(cli_profile, data.current_profile.as_deref())
 }
 
@@ -94,6 +103,7 @@ pub(crate) struct CliProfileIdentity {
 pub(crate) struct CliOwnerAuthSnapshot {
     pub(crate) owner_scope: astra_services::OwnerScope,
     pub(crate) access_token: Option<String>,
+    pub(crate) native_binding: Option<std::sync::Arc<crate::cli::native_auth::Binding>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,10 +166,23 @@ pub(crate) fn cli_owner_auth_snapshot() -> CliOwnerAuthSnapshot {
         return CliOwnerAuthSnapshot {
             owner_scope: astra_services::local_owner_scope(),
             access_token: None,
+            native_binding: None,
         };
     };
     let owner_scope = astra_services::OwnerScope::user(identity.local_owner_id.clone())
         .expect("installed CLI owner identity is valid");
+    let native_binding = crate::cli::native_auth::active();
+    if let Some(binding) = &native_binding {
+        let matches_owner = binding.profile_name() == identity.profile_name
+            && binding
+                .snapshot()
+                .is_ok_and(|session| Some(session.astra_user_id) == identity.account_id);
+        return CliOwnerAuthSnapshot {
+            owner_scope,
+            access_token: None,
+            native_binding: matches_owner.then(|| binding.clone()),
+        };
+    }
     let access_token = load_credentials()
         .profiles
         .get(&identity.profile_name)
@@ -169,6 +192,7 @@ pub(crate) fn cli_owner_auth_snapshot() -> CliOwnerAuthSnapshot {
     CliOwnerAuthSnapshot {
         owner_scope,
         access_token,
+        native_binding: None,
     }
 }
 
@@ -210,6 +234,10 @@ pub(crate) fn configure_cli_profile_identity(
     cli_profile: Option<&str>,
     admission: CliProfileIdentityAdmission,
 ) -> Result<(), String> {
+    if let Some(binding) = crate::cli::native_auth::active() {
+        let session = binding.snapshot()?;
+        return install_cli_profile_identity(binding.profile_name(), Some(session.astra_user_id));
+    }
     let creds = credential_store()
         .load()
         .map_err(|error| error.to_string())?;
@@ -664,7 +692,11 @@ pub(crate) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
         astra_thin_client::ThinClientError::SseParse(error) => {
             format!("SSE parse error: {error}")
         }
-        error @ astra_thin_client::ThinClientError::IncompatibleRuntime { .. } => error.to_string(),
+        error @ (astra_thin_client::ThinClientError::IncompatibleRuntime { .. }
+        | astra_thin_client::ThinClientError::SessionCancellationPending { .. }
+        | astra_thin_client::ThinClientError::InvalidSessionCancellationResponse(_)) => {
+            error.to_string()
+        }
         astra_thin_client::ThinClientError::InvalidSseJson(value) => {
             format!("Invalid SSE JSON payload: {value}")
         }

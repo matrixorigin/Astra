@@ -297,6 +297,37 @@ async fn effective_model_catalog(
     }
     let user = principal.user;
     let is_admin = !active_only && state.admin.authorizer.require_admin(headers).await.is_ok();
+    if !is_admin {
+        let catalog = state.model_service.user_model_catalog(user.user_id).await?;
+        let declared = astra_services::models::server_model_access_declarations(
+            catalog.allows_deployment,
+            catalog.items.iter().map(|item| item.access_kind),
+        );
+        let catalog_revision = model_catalog_revision(&catalog.items);
+        let default_catalog = catalog
+            .items
+            .iter()
+            .cloned()
+            .map(ModelListItemResponse::from)
+            .collect();
+        let page = paginate_model_items(catalog.items, query.limit, cursor)?;
+        return Ok(EffectiveModelCatalog {
+            declared,
+            offerings: page.items,
+            provider_default: catalog.default_offering_id.map(|offering_id| {
+                ModelDefaultCandidate {
+                    offering_id,
+                    source: ModelDefaultSource::Astra,
+                    scope: ModelDefaultScope::EffectiveCatalog,
+                }
+            }),
+            default_catalog: Some(default_catalog),
+            next_cursor: page.next_cursor,
+            limit: page.limit,
+            total: page.total,
+            catalog_revision,
+        });
+    }
     let user_id = user.user_id.clone();
     let page = state
         .model_service
@@ -346,24 +377,6 @@ async fn effective_model_catalog(
         } else {
             None
         };
-    // Match run admission, and inspect the complete catalog rather than the
-    // current page so access sources cannot disappear across pagination.
-    if !is_admin
-        && (!allows_deployment
-            || default_catalog.as_ref().is_some_and(|catalog| {
-                catalog
-                    .iter()
-                    .any(|offering| offering.access_kind == ModelAccessKind::CloudByok)
-            }))
-    {
-        declared.push(DeclaredModelAccess {
-            id: "cloud-byok".to_string(),
-            kind: ModelAccessKind::CloudByok,
-            label: "Cloud BYOK".to_string(),
-            execution_placement: ModelExecutionPlacement::Server,
-            availability: ModelAccessAvailability::Ready,
-        });
-    }
     Ok(EffectiveModelCatalog {
         declared,
         offerings: page.items,

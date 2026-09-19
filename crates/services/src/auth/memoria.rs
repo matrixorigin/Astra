@@ -50,13 +50,25 @@ pub fn memory_access_for_scopes(scopes: &[String]) -> Option<MemoryAccess> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct MemoriaProvider {
     pub base_url: String,
     pub issuer: String,
     pub provider_id: String,
     pub web_url: Option<String>,
     legacy_issuer: Option<String>,
+    // Never exposed by discovery or Debug. Only the explicit UC product policy
+    // may select this credential; it does not change scoped login or fallback.
+    deployment_key: Option<String>,
+}
+
+impl std::fmt::Debug for MemoriaProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoriaProvider")
+            .field("issuer", &self.issuer)
+            .field("provider_id", &self.provider_id)
+            .finish_non_exhaustive()
+    }
 }
 fn normalize_url(value: &str) -> Result<String, String> {
     let url = reqwest::Url::parse(value).map_err(|_| "Memoria URL must be absolute".to_string())?;
@@ -98,6 +110,7 @@ impl MemoriaProvider {
             }
         }
         Ok(Self {
+            deployment_key: settings.master_key.clone().filter(|key| !key.is_empty()),
             provider_id: format!("memoria:{}", sha256_hex(&issuer)),
             legacy_issuer: settings
                 .legacy_issuer
@@ -195,6 +208,7 @@ pub struct MemoriaCredential {
     pub owner: String,
     pub generation: String,
     pub access: MemoryAccess,
+    pub owner_scoped_master: bool,
     connection_generation: Option<String>,
 }
 
@@ -242,8 +256,61 @@ pub struct MemoriaCredentialResolver {
     pub provider: MemoriaProvider,
     pool: SharedPool,
     encryptor: FernetTokenEncryptor,
+    uc_provider: Option<super::uc::UcNativeProvider>,
 }
 impl MemoriaCredentialResolver {
+    async fn resolve_uc_builtin(
+        &self,
+        user: &str,
+    ) -> Result<Option<MemoriaCredentialResolution<MemoriaCredential>>, String> {
+        let Some(uc) = self
+            .uc_provider
+            .as_ref()
+            .filter(|uc| uc.settings.builtin_memory)
+        else {
+            return Ok(None);
+        };
+        // Retained Memoria identities and disconnected credentials must never
+        // turn into a new deployment grant. Email and untrusted request fields
+        // are not identity evidence. Resolve only the configured UC issuer.
+        let subjects: Vec<String> = sqlx::query_scalar(
+            "SELECT e.external_subject FROM auth_external_identities e \
+             JOIN auth_users u ON u.user_id = e.astra_user_id \
+             WHERE e.astra_user_id = ? AND e.provider_id = ? AND u.is_active = 1 \
+             AND NOT EXISTS (SELECT 1 FROM auth_tokens t WHERE t.type = 'memoria_connection' AND t.provider = 'memoria' AND t.scope_user_id = u.user_id) \
+             AND NOT EXISTS (SELECT 1 FROM auth_external_identities m WHERE m.astra_user_id = u.user_id AND m.provider_id LIKE 'memoria:%') \
+             AND NOT EXISTS (SELECT 1 FROM auth_memoria_identities l WHERE l.astra_user_id = u.user_id) LIMIT 2",
+        ).bind(user).bind(format!("uc:{}", uc.settings.issuer))
+            .fetch_all(self.pool.get()).await
+            .map_err(|_| "UC memory identity lookup failed")?;
+        let subject = match subjects.as_slice() {
+            [] => return Ok(None),
+            [subject] if !subject.is_empty() => subject,
+            _ => return Err("UC memory identity is ambiguous".into()),
+        };
+        if self.provider.web_url.is_some() {
+            return Err("UC built-in memory cannot use a Memoria login website".into());
+        }
+        let key = self
+            .provider
+            .deployment_key
+            .as_ref()
+            .ok_or("UC built-in memory is not configured")?;
+        if !uc.memory_account_active(subject).await? {
+            return Ok(Some(MemoriaCredentialResolution::Denied));
+        }
+        Ok(Some(MemoriaCredentialResolution::Scoped(
+            MemoriaCredential {
+                key: key.clone(),
+                owner: uc.memory_owner(subject),
+                generation: format!("uc:{}", uc.settings.issuer),
+                access: MemoryAccess::ReadWrite,
+                owner_scoped_master: true,
+                connection_generation: None,
+            },
+        )))
+    }
+
     pub fn new(
         provider: MemoriaProvider,
         pool: SharedPool,
@@ -253,6 +320,7 @@ impl MemoriaCredentialResolver {
             provider,
             pool,
             encryptor,
+            uc_provider: None,
         }
     }
     fn token_id(&self, user: &str) -> String {
@@ -280,6 +348,7 @@ impl MemoriaCredentialResolver {
             owner: identity.memoria_user_id,
             generation: identity.key_id,
             access: identity.memory_access,
+            owner_scoped_master: false,
             connection_generation: identity.connection_generation,
         })
     }
@@ -304,6 +373,9 @@ impl MemoriaCredentialResolver {
     ) -> Result<MemoriaCredentialResolution<MemoriaCredential>, String> {
         if let Some(credential) = self.resolve(user).await? {
             return Ok(MemoriaCredentialResolution::Scoped(credential));
+        }
+        if let Some(resolution) = self.resolve_uc_builtin(user).await? {
+            return Ok(resolution);
         }
         let eligible: Option<String> = sqlx::query_scalar(
             "SELECT u.user_id FROM auth_users u \
@@ -424,6 +496,16 @@ impl DatabaseAuthService {
     }
 
     pub fn with_memoria_settings(mut self, settings: &MemoriaSettings) -> Result<Self, String> {
+        if self
+            .uc_provider
+            .as_ref()
+            .is_some_and(|p| p.settings.builtin_memory)
+            && (!settings.is_configured()
+                || settings.web_url.is_some()
+                || settings.base_url.is_empty())
+        {
+            return Err("UC built-in memory requires MEMORIA_BASE_URL and MEMORIA_MASTER_KEY, without MEMORIA_WEB_URL".into());
+        }
         self.memoria_provider = Some(MemoriaProvider::new(settings)?);
         Ok(self)
     }
@@ -439,11 +521,13 @@ impl DatabaseAuthService {
         .expect("valid Memoria URL")
     }
     pub(super) fn credential_resolver(&self) -> Option<MemoriaCredentialResolver> {
-        Some(MemoriaCredentialResolver::new(
+        let mut resolver = MemoriaCredentialResolver::new(
             self.memoria_provider.clone()?,
             self.pool.clone()?,
             self.encryptor.as_ref()?.clone(),
-        ))
+        );
+        resolver.uc_provider = self.uc_provider.clone();
+        Some(resolver)
     }
     pub(super) async fn memoria_owner(
         &self,

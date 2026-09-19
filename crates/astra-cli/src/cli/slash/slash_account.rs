@@ -39,6 +39,19 @@ pub(crate) async fn handle_account_command(
     profile: Option<&str>,
     state: &mut SessionState,
 ) -> Result<(), String> {
+    if crate::cli::native_auth::active().is_some() {
+        match cmd {
+            "/logout" => {
+                clear_auth_runtime(state).await;
+                crate::cli::native_auth::logout().await?;
+                cli_ok!("Logged out of MOI. Exit Astra before signing in again.");
+                return Ok(());
+            }
+            "/login" | "/register" => return Err("Exit Astra and run `astra login` to sign in through UC; restart to bind the new account".into()),
+            "/memory-setup" => return Err("MOI memory is managed by the server, not a local Memoria key".into()),
+            _ => (),
+        }
+    }
     match cmd {
         "/register" => {
             cli_section!("Register a new account");

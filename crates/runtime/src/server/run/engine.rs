@@ -2517,6 +2517,27 @@ impl RunEngine {
         self.store.request_run_cancellation(user_id, run_id).await
     }
 
+    pub async fn request_session_cancellation(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<(), String> {
+        self.store
+            .request_session_cancellation(user_id, session_id)
+            .await
+    }
+
+    pub async fn has_open_run_settlement(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        generation: u64,
+    ) -> Result<bool, String> {
+        self.store
+            .has_open_run_settlement(user_id, run_id, generation)
+            .await
+    }
+
     pub async fn terminalize_orphaned_run_cancellation(
         &self,
         request: AtomicOrphanRunCancellationRequest<'_>,

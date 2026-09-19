@@ -36,6 +36,7 @@ mod insert_history;
 mod keymap;
 mod local_agent_journal;
 mod local_agent_snapshot;
+mod login_control;
 mod markdown;
 mod markdown_render;
 mod mention_menu;

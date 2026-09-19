@@ -8,6 +8,93 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod browser_code;
+#[cfg(test)]
+mod login_discovery_tests;
+pub(crate) mod uc;
+
+#[derive(Clone, Debug)]
+pub(crate) enum LoginMethod {
+    Uc(astra_services::auth::uc::UcDiscovery),
+    Memoria(String),
+    Password,
+}
+
+/// One discovery decision for both terminal and workbench entrypoints.
+pub(crate) async fn discover_login_method(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+) -> Result<LoginMethod, String> {
+    let methods = match api.get_auth_methods().await {
+        Ok(methods) => methods,
+        Err(astra_thin_client::ThinClientError::Api { status, .. }) if status.as_u16() == 404 => {
+            reject_native_login_downgrade(profile)?;
+            return Ok(LoginMethod::Password);
+        }
+        Err(error) => return Err(map_thin_err(error)),
+    };
+    if profile.is_none()
+        && let Some(uc) = methods.get("uc").filter(|value| !value.is_null())
+    {
+        return serde_json::from_value(uc.clone())
+            .map(LoginMethod::Uc)
+            .map_err(|_| "invalid UC login discovery".into());
+    }
+    reject_native_login_downgrade(profile)?;
+    parse_legacy_login_method(methods)
+}
+
+fn reject_native_login_downgrade(profile: Option<&str>) -> Result<(), String> {
+    // `astra login` deliberately has no in-memory bearer binding: it must
+    // work after logout and expired/interrupted credentials. The persisted
+    // environment selection still requires UC, just as the live TUI does.
+    if profile.is_none()
+        && (crate::cli::native_auth::active().is_some()
+            || astra_credentials::native::NativeStore::new()?.configured()?)
+    {
+        return Err(
+            "The selected MOI session requires UC login, but this server no longer advertises UC"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) enum LoginProgress {
+    OpenBrowser(String),
+    Completing,
+}
+
+pub(crate) type LoginObserver =
+    std::sync::Arc<dyn Fn(LoginProgress) -> Result<(), String> + Send + Sync>;
+
+pub(crate) fn terminal_login_observer() -> LoginObserver {
+    std::sync::Arc::new(|progress| {
+        if let LoginProgress::OpenBrowser(url) = progress {
+            eprintln!("Open this page to sign in:\n{url}");
+            open_login_url(&url);
+        }
+        Ok(())
+    })
+}
+
+pub(crate) async fn browser_login(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    method: LoginMethod,
+    observer: LoginObserver,
+    terminal_workspace_prompt: bool,
+) -> Result<(), String> {
+    match method {
+        LoginMethod::Uc(discovery) => {
+            uc::login_with_observer(api, discovery, observer, terminal_workspace_prompt).await
+        }
+        LoginMethod::Memoria(website) => {
+            do_memoria_browser_login_observed(api, profile, &website, observer).await?;
+            Ok(())
+        }
+        LoginMethod::Password => Err("Password authentication requires the account form".into()),
+    }
+}
 
 /// Session authentication failure that can be repaired by `/login`.
 ///
@@ -180,19 +267,48 @@ struct MemoriaConnectionCallback {
     memoria_connection_key: String,
 }
 
-pub(crate) async fn do_memoria_browser_login(
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
-    website_base: &str,
-) -> Result<String, String> {
-    do_memoria_browser_login_with_opener(api, profile, website_base, open_login_url).await
-}
-
+#[cfg(test)]
 async fn do_memoria_browser_login_with_opener(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     website_base: &str,
     open: impl FnOnce(&str),
+) -> Result<String, String> {
+    do_memoria_browser_login_impl(
+        api,
+        profile,
+        website_base,
+        |url| {
+            open(url);
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .await
+}
+
+async fn do_memoria_browser_login_observed(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    website_base: &str,
+    observer: LoginObserver,
+) -> Result<String, String> {
+    do_memoria_browser_login_impl(
+        api,
+        profile,
+        website_base,
+        |url| observer(LoginProgress::OpenBrowser(url.to_owned())),
+        || observer(LoginProgress::Completing),
+    )
+    .await
+}
+
+async fn do_memoria_browser_login_impl(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    website_base: &str,
+    open: impl FnOnce(&str) -> Result<(), String>,
+    completing: impl Fn() -> Result<(), String>,
 ) -> Result<String, String> {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
@@ -216,8 +332,7 @@ async fn do_memoria_browser_login_with_opener(
         env!("CARGO_PKG_VERSION")
     );
     let connect_url = browser_code::append_capability(&connect_url, &verifier)?;
-    eprintln!("Open this page to connect Astra:\n{connect_url}");
-    open(&connect_url);
+    open(&connect_url)?;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     let mut rejected = 0_u8;
@@ -295,6 +410,7 @@ async fn do_memoria_browser_login_with_opener(
                     continue;
                 }
             };
+            completing()?;
             let result = tokio::time::timeout_at(deadline, async {
                 let key =
                     browser_code::redeem(website_base, &code, &verifier, port, &expected_state)
@@ -367,6 +483,7 @@ async fn do_memoria_browser_login_with_opener(
             }
             continue;
         }
+        completing()?;
         match tokio::time::timeout_at(
             deadline,
             do_memoria_login_with_key(api, profile, &callback.memoria_connection_key),
@@ -587,7 +704,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
-fn open_login_url(url: &str) {
+pub(crate) fn open_login_url(url: &str) {
     #[cfg(target_os = "macos")]
     let result = std::process::Command::new("open").arg(url).spawn();
     #[cfg(target_os = "linux")]
@@ -604,18 +721,7 @@ fn open_login_url(url: &str) {
     }
 }
 
-pub(crate) async fn discover_login_website(
-    api: &astra_thin_client::ThinClient,
-) -> Result<Option<String>, String> {
-    let methods = match api.get_auth_methods().await {
-        Ok(value) => value,
-        // Old/self-hosted servers keep the original password journey. Do not
-        // silently downgrade on network errors, denied access or malformed JSON.
-        Err(astra_thin_client::ThinClientError::Api { status, .. }) if status.as_u16() == 404 => {
-            return Ok(None);
-        }
-        Err(error) => return Err(map_thin_err(error)),
-    };
+fn parse_legacy_login_method(methods: serde_json::Value) -> Result<LoginMethod, String> {
     #[derive(Deserialize)]
     struct Methods {
         password: bool,
@@ -633,10 +739,10 @@ pub(crate) async fn discover_login_website(
             return Err("Server login issuer is missing".into());
         }
         validate_login_website(&provider.authorization_url)?;
-        return Ok(Some(provider.authorization_url));
+        return Ok(LoginMethod::Memoria(provider.authorization_url));
     }
     if methods.password {
-        Ok(None)
+        Ok(LoginMethod::Password)
     } else {
         Err("Server has no available login method".into())
     }
@@ -784,6 +890,77 @@ async fn initialize_authenticated_runtime(
         .await;
 }
 
+/// End the old owner's runtime before browser login can publish new credentials.
+/// Cancellation retains credentials, but starts a fresh local conversation.
+pub(crate) async fn begin_browser_session_login(state: &mut SessionState) {
+    retire_auth_runtime(state).await;
+    if state.session_id.is_some() {
+        crate::cli::session::session_cleanup::finalize_session(state).await;
+    }
+    if let Some(memory) = state.session_memory_extractor.take() {
+        memory
+            .stop_for_process_shutdown(AUTH_RUNTIME_SHUTDOWN_WAIT)
+            .await;
+    }
+    state.reset_for_new_session();
+    state.clear_session_id();
+    state.model = None;
+}
+
+pub(crate) async fn finish_browser_session_login(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    uc: bool,
+    state: &mut SessionState,
+) -> Result<
+    (
+        astra_thin_client::ThinClient,
+        String,
+        crate::cli::session::session_runtime::PipelineModules,
+    ),
+    String,
+> {
+    let api = if uc {
+        crate::cli::native_auth::bind_after_login(api)?
+    } else {
+        api.clone()
+    };
+    let token = crate::cli::session::session_runtime::fresh_access_token(&api, profile)
+        .await
+        .ok_or("Login completed but no usable session credential is available")?;
+    // A workbench started while signed out skipped startup registration. Publish
+    // its stable checkout binding under the new identity before admitting chat.
+    crate::cli::edge_lifecycle::register_edge_once(&api, &token)
+        .await
+        .map_err(|_| {
+            "Signed in, but local execution registration failed. Retry /login before chatting."
+                .to_string()
+        })?;
+    let modules = rebuild_browser_identity_services(&api, profile, state).await;
+    initialize_authenticated_runtime(&api, profile, token.clone(), state).await;
+    Ok((api, token, modules))
+}
+
+async fn rebuild_browser_identity_services(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    state: &mut SessionState,
+) -> crate::cli::session::session_runtime::PipelineModules {
+    // A new identity/generation must not inherit cached private skills or a
+    // provider pinned to the preceding login. Reuse the startup composition.
+    let modules = crate::cli::session::session_runtime::create_tui_pipeline_modules(
+        api,
+        profile,
+        crate::cli::session::session_runtime::resolved_session_project_root().as_deref(),
+    );
+    state.unified_skill_registry = modules.unified_skill_registry.clone();
+    state.mcp_manager = modules.mcp_manager.clone();
+    state.session_memory_extractor =
+        crate::cli::session::session_startup::build_cli_session_memory_extractor(api, profile)
+            .await;
+    modules
+}
+
 pub(crate) async fn do_login_for_session(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
@@ -833,6 +1010,105 @@ pub(crate) async fn do_register_for_session(
 mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Debug)]
+    struct GenerationBearer(&'static str);
+
+    impl astra_thin_client::client::BearerProvider for GenerationBearer {
+        fn token(
+            &self,
+        ) -> futures_util::future::BoxFuture<'_, Result<String, astra_thin_client::ThinClientError>>
+        {
+            Box::pin(async move { Ok(self.0.to_owned()) })
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn browser_identity_services_replace_generation_and_private_skill_cache() {
+        use std::sync::Arc;
+        use wiremock::matchers::{body_partial_json, header};
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _creds = crate::tests::isolate_credentials();
+        let _env_token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let server = MockServer::start().await;
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        assert!(state.session_memory_extractor.is_none());
+        let mut previous_registry = None;
+        // First login, same-account re-login, then account switch.
+        for (generation, owner) in [("g1", "alice"), ("g2", "alice"), ("g3", "bob")] {
+            let mut credentials = load_credentials();
+            credentials.profiles.insert(
+                "default".into(),
+                Profile {
+                    access_token: Some("explicit-token-must-not-override-provider".into()),
+                    ..Default::default()
+                },
+            );
+            save_credentials(&credentials).unwrap();
+            let bearer = format!("Bearer {generation}");
+            Mock::given(method("GET"))
+                .and(path("/auth/me"))
+                .and(header("authorization", bearer.as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"user_id": owner})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let name = format!("private-{generation}");
+            let record = json!({"skill_id": name, "skill_name": name, "version": "1.0.0",
+                "metadata": {"instructions": format!("Private instructions for {generation}")}});
+            Mock::given(method("GET"))
+                .and(path("/skills"))
+                .and(header("authorization", bearer.as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "skills": [record.clone()], "limit": 100, "total": 1, "next_cursor": null
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/skills/{name}")))
+                .and(header("authorization", bearer.as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(record))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None)
+                .unwrap()
+                .with_bearer_provider(Arc::new(GenerationBearer(generation)));
+            super::begin_browser_session_login(&mut state).await;
+            assert!(state.session_memory_extractor.is_none());
+            let _modules = super::rebuild_browser_identity_services(&api, None, &mut state).await;
+            let memory = state.session_memory_extractor.as_ref().unwrap();
+            assert_eq!(memory.owner_user_id(), Some(owner));
+            Mock::given(method("POST"))
+                .and(path("/memory/retrieve"))
+                .and(header("authorization", bearer.as_str()))
+                .and(body_partial_json(json!({"user_id": owner})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"memories": []})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            memory
+                .run_session_end_governance(&Default::default(), "identity-test-session")
+                .await
+                .unwrap();
+            let registry = state.unified_skill_registry.clone();
+            if let Some(old) = previous_registry.take() {
+                assert!(!Arc::ptr_eq(&old, &registry));
+            }
+            let report = registry.discover_all_report().await.unwrap();
+            assert!(report.failures.is_empty(), "{:?}", report.failures);
+            registry.load(&name).await.unwrap();
+            if generation != "g1" {
+                assert!(
+                    registry.load("private-g1").await.is_err(),
+                    "old private cache leaked"
+                );
+            }
+            previous_registry = Some(registry);
+        }
+    }
 
     #[serial_test::serial]
     #[tokio::test]
@@ -1326,7 +1602,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn login_discovery_preserves_local_servers_and_rejects_bad_cloud_urls() {
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _native_directory = crate::test_utils::ProcessEnvGuard::remove("MOI_AUTH_DIR");
         use wiremock::{
             Mock, MockServer, ResponseTemplate,
             matchers::{method, path},
@@ -1357,10 +1636,12 @@ mod tests {
                 .mount(&server)
                 .await;
             let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-            let result = super::discover_login_website(&api).await;
+            let result = super::discover_login_method(&api, None).await;
             match expected {
-                "password" => assert_eq!(result.unwrap(), None),
-                "browser" => assert_eq!(result.unwrap().as_deref(), Some("https://thememoria.ai")),
+                "password" => assert!(matches!(result.unwrap(), super::LoginMethod::Password)),
+                "browser" => assert!(
+                    matches!(result.unwrap(), super::LoginMethod::Memoria(url) if url == "https://thememoria.ai")
+                ),
                 _ => assert!(result.is_err()),
             }
         }

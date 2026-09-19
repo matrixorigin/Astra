@@ -31,7 +31,7 @@ exclude = ["vendor/crossterm"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.4"
+version = "0.2.7"
 edition = "2024"
 license = "Apache-2.0"
 
