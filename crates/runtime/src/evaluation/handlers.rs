@@ -9,7 +9,8 @@ use astra_core::{ErrorResponse, error_response, internal_error};
 use astra_services::evaluation::types::*;
 use astra_services::evaluation::{
     DatabaseEvaluationPlanStore, DatabaseEvaluationProjectionStore,
-    EvaluationExperimentCreateRequest, EvaluationExperimentRecord, EvaluationPersistenceError,
+    EvaluationExperimentCreateRequest, EvaluationExperimentPrepareRequest,
+    EvaluationExperimentPrepareResponse, EvaluationExperimentRecord, EvaluationPersistenceError,
     EvaluationProjectionError, EvaluationReportArtifact, EvaluationReportQuery,
     build_report_artifact, validate_report_label,
 };
@@ -67,6 +68,12 @@ pub async fn create_experiment_handler(
     Json(request): Json<EvaluationExperimentCreateRequest>,
 ) -> Result<(StatusCode, Json<EvaluationExperimentRecord>), (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    if request.spec.adapter_profile_version.is_some() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "adapter_profile_version is server-owned; use /evaluation/experiments/prepare",
+        ));
+    }
     let store = DatabaseEvaluationPlanStore::new(evaluation_pool(&state)?);
     let record = store
         .register_experiment(
@@ -77,6 +84,19 @@ pub async fn create_experiment_handler(
         .await
         .map_err(map_evaluation_persistence_error)?;
     Ok((StatusCode::OK, Json(record)))
+}
+
+pub async fn prepare_experiment_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<EvaluationExperimentPrepareRequest>,
+) -> Result<
+    (StatusCode, Json<EvaluationExperimentPrepareResponse>),
+    (StatusCode, Json<ErrorResponse>),
+> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let response = super::prepare::prepare_experiment(&state, &user.user_id, request).await?;
+    Ok((StatusCode::OK, Json(response)))
 }
 
 pub async fn start_trial_handler(

@@ -1323,11 +1323,14 @@ mod tests {
                 baseline: RevisionRef {
                     revision_id: "baseline".to_string(),
                     content_hash: "sha256:baseline".to_string(),
+                    content: None,
                 },
                 candidate: RevisionRef {
                     revision_id: "candidate".to_string(),
                     content_hash: "sha256:candidate".to_string(),
+                    content: None,
                 },
+                skill_name: Some("sample-skill".to_string()),
             },
             cases: vec![EvaluationCase {
                 case_id: "case-a".to_string(),
@@ -1336,6 +1339,7 @@ mod tests {
                 verifier_id: "verifier-a".to_string(),
                 verifier_version: "1".to_string(),
                 holdout: false,
+                input_content: None,
             }],
             repetitions: 1,
             order: TrialOrder::BaselineFirst,
@@ -1354,6 +1358,7 @@ mod tests {
                 max_concurrency: 1,
                 max_wall_time_secs: 60,
             },
+            adapter_profile_version: None,
         }
     }
 

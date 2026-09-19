@@ -47,12 +47,12 @@ use astra_services::ModelService;
 use astra_services::coordination::{AgentProfile, AgentTier};
 use astra_services::evaluation::{
     DatabaseEvaluationObservationStore, DatabaseEvaluationPlanStore,
-    DatabaseMaterializationReceiptStore, EvaluationObservationRequest, EvaluationRunAdmission,
-    EvaluationSkillRevision, EvidenceAvailability, EvidenceKind, EvidenceRef,
-    MaterializationComponentKind, MaterializationOutcome, MaterializationReceiptRequest,
-    TrialStatus, TrustedMaterializerContext, content_fingerprint,
-    evaluation_component_idempotency_key, prompt_context_fingerprint,
-    prompt_only_snapshot_envelope, prompt_policy_fingerprint, terminal_run_observation,
+    DatabaseMaterializationReceiptStore, EvaluationObservationRequest,
+    EvaluationPolicyFingerprintInput, EvaluationRunAdmission, EvaluationSkillRevision,
+    EvidenceAvailability, EvidenceKind, EvidenceRef, MaterializationComponentKind,
+    MaterializationOutcome, MaterializationReceiptRequest, TrialStatus, TrustedMaterializerContext,
+    content_fingerprint, evaluation_component_idempotency_key, evaluation_policy_fingerprint,
+    prompt_context_fingerprint, prompt_only_snapshot_envelope, terminal_run_observation,
 };
 use astra_services::runs::{
     AgentBindingRuntimeRequest, AtomicRunGuidanceAdmission, AtomicRunGuidanceAdmissionRequest,
@@ -8236,21 +8236,20 @@ impl AgenticRunLifecycleService {
                 "evaluation does not admit workspace, edge, MCP, or tool side effects",
             ));
         }
-        let policy_facts = serde_json::json!({
-            "model_binding": experiment.spec.conditions.model_binding,
-            "provider_binding": experiment.spec.conditions.provider_binding,
-            "cache_policy": experiment.spec.conditions.cache_policy,
-            "resolved_model_selection": request.resolved_model_selection,
-            "admitted_provider": admitted_model.provider,
-            "admitted_cache_capability": admitted_model.cache_capability,
-            "execution_policy": request.execution_policy,
-            "allow_skills": request.allow_skills,
-            "allow_skill_sources": request.allow_skill_sources,
-            "allow_tools": request.allow_tools,
-            "enabled_tools": request.enabled_tools,
-            "runtime_profile": request.runtime_profile,
+        let policy_hash = evaluation_policy_fingerprint(&EvaluationPolicyFingerprintInput {
+            model_binding: &experiment.spec.conditions.model_binding,
+            provider_binding: &experiment.spec.conditions.provider_binding,
+            cache_policy: &experiment.spec.conditions.cache_policy,
+            resolved_model_selection: request.resolved_model_selection.as_ref(),
+            admitted_provider: &admitted_model.provider,
+            admitted_cache_capability: admitted_model.cache_capability.as_ref(),
+            execution_policy: &request.execution_policy,
+            allow_skills: request.allow_skills.as_deref(),
+            allow_skill_sources: request.allow_skill_sources.as_deref(),
+            allow_tools: request.allow_tools.as_deref(),
+            enabled_tools: request.enabled_tools.as_deref(),
+            runtime_profile: request.runtime_profile.as_ref(),
         });
-        let policy_hash = prompt_policy_fingerprint(&policy_facts);
         if policy_hash != experiment.spec.conditions.tool_policy_hash {
             return Err(evaluation_preflight_error(
                 StatusCode::CONFLICT,

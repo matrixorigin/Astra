@@ -36,6 +36,11 @@ pub enum EvaluationTargetKind {
 pub struct RevisionRef {
     pub revision_id: String,
     pub content_hash: String,
+    /// Frozen execution material for adapters that need bytes at start time.
+    /// Prompt preparation stores the exact text here; Skill preparation keeps
+    /// this empty and resolves the owner-scoped immutable version by ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +49,9 @@ pub struct EvaluationTarget {
     pub kind: EvaluationTargetKind,
     pub baseline: RevisionRef,
     pub candidate: RevisionRef,
+    /// Owner-scoped Skill name for the instruction-only Skill adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +63,10 @@ pub struct EvaluationCase {
     pub verifier_id: String,
     pub verifier_version: String,
     pub holdout: bool,
+    /// Frozen text for the first prompt/Skill adapter. Generic adapters may
+    /// use only the content hash until they provide their own materializer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_content: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -313,6 +325,10 @@ pub struct ExperimentSpec {
     pub order: TrialOrder,
     pub conditions: FrozenConditions,
     pub budget: EvaluationBudget,
+    /// Present only when the server's user-intent prepare adapter produced
+    /// this spec. Raw registration intentionally has no preparation marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_profile_version: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -345,6 +361,16 @@ impl ExperimentSpec {
         validate_identifier("experiment_id", &self.experiment_id)?;
         validate_revision("baseline", &self.target.baseline)?;
         validate_revision("candidate", &self.target.candidate)?;
+        match (&self.target.kind, self.target.skill_name.as_deref()) {
+            (EvaluationTargetKind::Skill, Some(name)) if !name.trim().is_empty() => {}
+            (EvaluationTargetKind::Skill, _) => {
+                return Err("Skill targets require an owner-scoped skill_name".to_string());
+            }
+            (EvaluationTargetKind::Prompt, Some(_)) => {
+                return Err("Prompt targets must not carry skill_name".to_string());
+            }
+            (_, _) => {}
+        }
         if self.cases.is_empty() {
             return Err("at least one evaluation case is required".to_string());
         }
@@ -374,6 +400,14 @@ impl ExperimentSpec {
                         case.case_id
                     ));
                 }
+            }
+            if let Some(content) = case.input_content.as_deref()
+                && content.trim().is_empty()
+            {
+                return Err(format!(
+                    "input_content must not be empty for case `{}`",
+                    case.case_id
+                ));
             }
         }
         for (field, value) in [
@@ -428,6 +462,11 @@ impl ExperimentSpec {
         }
         if self.budget.max_wall_time_secs == 0 {
             return Err("budget max_wall_time_secs must be greater than zero".to_string());
+        }
+        if let Some(version) = self.adapter_profile_version.as_deref()
+            && version.trim().is_empty()
+        {
+            return Err("adapter_profile_version must not be empty".to_string());
         }
         let max_wall_time_secs = i64::try_from(self.budget.max_wall_time_secs).map_err(|_| {
             "budget max_wall_time_secs exceeds the supported duration range".to_string()
@@ -737,6 +776,11 @@ fn validate_revision(label: &str, revision: &RevisionRef) -> Result<(), String> 
     if revision.content_hash.trim().is_empty() {
         return Err(format!("{label} content_hash must not be empty"));
     }
+    if let Some(content) = revision.content.as_deref()
+        && content.trim().is_empty()
+    {
+        return Err(format!("{label} content must not be empty"));
+    }
     Ok(())
 }
 
@@ -840,11 +884,14 @@ mod tests {
                 baseline: RevisionRef {
                     revision_id: "skill-v1".to_string(),
                     content_hash: "sha256:old".to_string(),
+                    content: None,
                 },
                 candidate: RevisionRef {
                     revision_id: "skill-v2".to_string(),
                     content_hash: "sha256:new".to_string(),
+                    content: None,
                 },
+                skill_name: Some("sample-skill".to_string()),
             },
             cases: vec![EvaluationCase {
                 case_id: "case-a".to_string(),
@@ -853,6 +900,7 @@ mod tests {
                 verifier_id: "verifier".to_string(),
                 verifier_version: "1".to_string(),
                 holdout: false,
+                input_content: None,
             }],
             repetitions: 2,
             order,
@@ -871,6 +919,7 @@ mod tests {
                 max_concurrency: 2,
                 max_wall_time_secs: 300,
             },
+            adapter_profile_version: None,
         }
     }
 
@@ -925,6 +974,7 @@ mod tests {
             verifier_id: "verifier".to_string(),
             verifier_version: "1".to_string(),
             holdout: true,
+            input_content: None,
         });
         spec.budget.max_trials = 8;
         let trials = spec.plan_trials().unwrap();

@@ -262,13 +262,16 @@ mod tests {
                     content_hash:
                         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                             .to_string(),
+                    content: None,
                 },
                 candidate: RevisionRef {
                     revision_id: "cand".to_string(),
                     content_hash:
                         "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                             .to_string(),
+                    content: None,
                 },
+                skill_name: None,
             },
             cases: vec![EvaluationCase {
                 case_id: "case".to_string(),
@@ -279,6 +282,7 @@ mod tests {
                 verifier_id: "none".to_string(),
                 verifier_version: "1".to_string(),
                 holdout: false,
+                input_content: None,
             }],
             repetitions: 1,
             order: TrialOrder::BaselineFirst,
@@ -301,6 +305,7 @@ mod tests {
                 max_concurrency: 1,
                 max_wall_time_secs: 60,
             },
+            adapter_profile_version: None,
         };
         let fingerprint = spec.spec_fingerprint().expect("spec fingerprint");
         let experiment = EvaluationExperimentRecord {

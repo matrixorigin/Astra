@@ -14,7 +14,9 @@ pub mod types;
 pub mod utils;
 
 pub use api::{
-    EvaluationExperimentCreateRequest, EvaluationReportQuery, EvaluationTrialStartRequest,
+    EvaluationExperimentCreateRequest, EvaluationExperimentPrepareRequest,
+    EvaluationExperimentPrepareResponse, EvaluationPrepareCase, EvaluationPrepareRevision,
+    EvaluationPrepareTarget, EvaluationReportQuery, EvaluationTrialStartRequest,
     EvaluationTrialStartResponse,
 };
 pub use assessment::{
@@ -22,7 +24,12 @@ pub use assessment::{
     EvidenceAvailability, EvidenceKind, EvidenceRef, Measurement, MeasurementStatus,
     TrialObservation, TrialStatus, build_comparison_for_plan, render_markdown,
 };
-pub use bootstrap::{EvaluationBootstrapError, EvaluationTrialStartPlan, prepare_trial_start};
+pub use bootstrap::{
+    EVALUATION_ADAPTER_PROFILE_VERSION, EvaluationBootstrapError, EvaluationTrialStartPlan,
+    PreparedModelIdentity, PreparedSkillIdentity, build_prepared_experiment_spec,
+    prepare_trial_start, prepared_cache_policy_identity, prepared_experiment_id,
+    prepared_request_matches_spec,
+};
 pub use database::DatabaseEvaluationService;
 pub use durable::{
     DatabaseEvaluationPlanStore, EvaluationExperimentRecord, EvaluationPersistenceError,
@@ -31,9 +38,10 @@ pub use durable::{
 pub use execution::{
     DatabaseEvaluationObservationStore, EVALUATION_EXECUTION_SCHEMA_VERSION,
     EvaluationAdmissionMarker, EvaluationExecutionError, EvaluationObservationRecord,
-    EvaluationObservationRequest, EvaluationRunAdmission, EvaluationSkillRevision,
-    content_fingerprint, evaluation_component_idempotency_key, prompt_context_fingerprint,
-    prompt_only_snapshot_envelope, prompt_policy_fingerprint, terminal_run_observation,
+    EvaluationObservationRequest, EvaluationPolicyFingerprintInput, EvaluationRunAdmission,
+    EvaluationSkillRevision, content_fingerprint, evaluation_component_idempotency_key,
+    evaluation_policy_fingerprint, prompt_context_fingerprint, prompt_only_snapshot_envelope,
+    prompt_policy_fingerprint, terminal_run_observation,
 };
 pub use experiment::{
     DataIsolation, EXPERIMENT_SCHEMA_VERSION, EvaluationBudget, EvaluationCase, EvaluationTarget,

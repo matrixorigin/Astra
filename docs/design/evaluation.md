@@ -155,10 +155,15 @@ materialization receipt is recorded; registration alone never claims isolation.
 
 ## Control-plane API boundary
 
-The generic control-plane API exposes four owner-authenticated operations:
+The generic control-plane API exposes five owner-authenticated operations:
 
-* `POST /evaluation/experiments` freezes and idempotently registers a client
-  `ExperimentSpec` plus its submission key;
+* `POST /evaluation/experiments/prepare` accepts user intent (a Prompt's
+  baseline/candidate text or two owner-scoped published Skill revisions, one
+  fixed case, a model Offering, and bounded budget), resolves trusted model and
+  Skill facts, computes the server-owned hashes/profile, and idempotently
+  freezes the resulting first-adapter plan;
+* `POST /evaluation/experiments` remains the lower-level registration boundary
+  for trusted/internal callers that already have a complete `ExperimentSpec`;
 * `GET /evaluation/experiments/{experiment_id}` reads a consistent projection
   of the plan, binding, canonical Run status, and terminal observations; and
 * `GET /evaluation/experiments/{experiment_id}/report` returns the structured
@@ -168,12 +173,16 @@ The generic control-plane API exposes four owner-authenticated operations:
 The execution entrypoint is also owner-authenticated and deliberately narrow:
 
 * `POST /evaluation/experiments/{experiment_id}/trials/{trial_id}/start`
-  accepts only the frozen case message plus the exact Prompt revision content
-  or owner-scoped Skill revision name. The server derives the Session and Run
-  identities from `(owner, experiment, trial)`, applies the frozen model and
-  budget, and calls the normal Run lifecycle. It never accepts a provider,
-  tool policy, memory branch, receipt set, or terminal observation from the
-  client.
+  starts one planned trial. The message and Prompt revision content are
+  optional when the prepare endpoint froze them; if supplied, they must match
+  those frozen bytes. Skill starts may omit the owner-scoped Skill name when
+  prepare froze it; if supplied, it must match that frozen name.
+  Before creating the Run, the server re-admits the selected Offering and
+  fails closed if its provider or supported cache contract has drifted. It
+  derives the Session and Run identities from `(owner, experiment, trial)`,
+  applies the frozen model and budget, and calls the normal Run lifecycle. It
+  never accepts a provider, tool policy, memory branch, receipt set, or
+  terminal observation from the client.
 
 One exact trial has one durable Session and one durable Run. Retries and
 concurrent requests with the same normalized payload replay that identity;

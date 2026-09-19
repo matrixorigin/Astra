@@ -151,47 +151,84 @@ fn build_memoria_backed_app(memoria_base_url: String) -> axum::Router {
     build_app(state)
 }
 
-fn generic_experiment_create_body() -> body::Body {
+fn generic_experiment_create_value() -> serde_json::Value {
     let hash = |letter: char| format!("sha256:{}", letter.to_string().repeat(64));
+    json!({
+        "submission_idempotency_key": "contract-submission",
+        "spec": {
+            "schema_version": 1,
+            "experiment_id": "contract-experiment",
+            "target": {
+                "kind": "prompt",
+                "baseline": {"revision_id": "base", "content_hash": hash('a')},
+                "candidate": {"revision_id": "candidate", "content_hash": hash('b')}
+            },
+            "cases": [{
+                "case_id": "case-1",
+                "input_snapshot_ref": "input://case-1",
+                "input_content_hash": hash('c'),
+                "verifier_id": "none",
+                "verifier_version": "1",
+                "holdout": false
+            }],
+            "repetitions": 1,
+            "order": {"kind": "baseline_first"},
+            "conditions": {
+                "isolation_profile": "prompt_only_private",
+                "model_binding": "model",
+                "provider_binding": "provider",
+                "context_snapshot_hash": hash('d'),
+                "tool_policy_hash": hash('e'),
+                "cache_policy": "provider_default_recorded",
+                "memory_isolation": {"kind": "disabled"},
+                "data_isolation": {"kind": "disabled"}
+            },
+            "budget": {
+                "max_trials": 2,
+                "max_concurrency": 1,
+                "max_wall_time_secs": 60
+            }
+        }
+    })
+}
+
+fn generic_experiment_create_body() -> body::Body {
+    body::Body::from(
+        serde_json::to_vec(&generic_experiment_create_value())
+            .expect("serialize generic experiment request"),
+    )
+}
+
+fn generic_experiment_create_with_prepare_marker_body() -> body::Body {
+    let mut value = generic_experiment_create_value();
+    value["spec"]["adapter_profile_version"] =
+        json!(astra_services::evaluation::EVALUATION_ADAPTER_PROFILE_VERSION);
+    body::Body::from(
+        serde_json::to_vec(&value).expect("serialize marked generic experiment request"),
+    )
+}
+
+fn prepared_experiment_body() -> body::Body {
     body::Body::from(
         serde_json::to_vec(&json!({
-            "submission_idempotency_key": "contract-submission",
-            "spec": {
-                "schema_version": 1,
-                "experiment_id": "contract-experiment",
-                "target": {
-                    "kind": "prompt",
-                    "baseline": {"revision_id": "base", "content_hash": hash('a')},
-                    "candidate": {"revision_id": "candidate", "content_hash": hash('b')}
-                },
-                "cases": [{
-                    "case_id": "case-1",
-                    "input_snapshot_ref": "input://case-1",
-                    "input_content_hash": hash('c'),
-                    "verifier_id": "none",
-                    "verifier_version": "1",
-                    "holdout": false
-                }],
-                "repetitions": 1,
-                "order": {"kind": "baseline_first"},
-                "conditions": {
-                    "isolation_profile": "prompt_only_private",
-                    "model_binding": "model",
-                    "provider_binding": "provider",
-                    "context_snapshot_hash": hash('d'),
-                    "tool_policy_hash": hash('e'),
-                    "cache_policy": "provider_default_recorded",
-                    "memory_isolation": {"kind": "disabled"},
-                    "data_isolation": {"kind": "disabled"}
-                },
-                "budget": {
-                    "max_trials": 2,
-                    "max_concurrency": 1,
-                    "max_wall_time_secs": 60
-                }
-            }
+            "submission_idempotency_key": "prepare-contract-submission",
+            "target": {
+                "kind": "prompt",
+                "baseline": {"revision_id": "base", "content": "baseline instructions"},
+                "candidate": {"revision_id": "candidate", "content": "candidate instructions"}
+            },
+            "case": {
+                "case_id": "case-1",
+                "message": "fixed input",
+                "verifier_id": "none",
+                "verifier_version": "1",
+                "holdout": false
+            },
+            "model_offering_id": "model",
+            "max_concurrency": 1,
+            "max_wall_time_secs": 60
         }))
-        .expect("serialize generic experiment request"),
+        .expect("serialize prepared evaluation request"),
     )
 }
 
@@ -299,7 +336,7 @@ async fn generic_evaluation_control_plane_requires_database() {
     assert_eq!(projection.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     let create = oneshot_eval(
-        app,
+        app.clone(),
         "POST",
         "/evaluation/experiments",
         generic_experiment_create_body(),
@@ -307,6 +344,28 @@ async fn generic_evaluation_control_plane_requires_database() {
     )
     .await;
     assert_eq!(create.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let marked_create = oneshot_eval(
+        app,
+        "POST",
+        "/evaluation/experiments",
+        generic_experiment_create_with_prepare_marker_body(),
+        true,
+    )
+    .await;
+    assert_eq!(marked_create.status(), StatusCode::BAD_REQUEST);
+
+    let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+        .with_auth_service(Arc::new(StubAuthService));
+    let prepare = oneshot_eval(
+        build_app(state),
+        "POST",
+        "/evaluation/experiments/prepare",
+        prepared_experiment_body(),
+        true,
+    )
+    .await;
+    assert_eq!(prepare.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]

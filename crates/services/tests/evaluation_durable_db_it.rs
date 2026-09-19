@@ -29,11 +29,14 @@ fn spec(experiment_id: &str) -> ExperimentSpec {
             baseline: RevisionRef {
                 revision_id: "skill-v1".to_string(),
                 content_hash: "sha256:baseline".to_string(),
+                content: None,
             },
             candidate: RevisionRef {
                 revision_id: "skill-v2".to_string(),
                 content_hash: "sha256:candidate".to_string(),
+                content: None,
             },
+            skill_name: Some("sample-skill".to_string()),
         },
         cases: vec![EvaluationCase {
             case_id: "case-a".to_string(),
@@ -42,6 +45,7 @@ fn spec(experiment_id: &str) -> ExperimentSpec {
             verifier_id: "verifier-a".to_string(),
             verifier_version: "1".to_string(),
             holdout: false,
+            input_content: None,
         }],
         repetitions: 1,
         order: TrialOrder::BaselineFirst,
@@ -60,6 +64,7 @@ fn spec(experiment_id: &str) -> ExperimentSpec {
             max_concurrency: 2,
             max_wall_time_secs: 300,
         },
+        adapter_profile_version: None,
     }
 }
 

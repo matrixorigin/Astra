@@ -1204,6 +1204,45 @@ pub fn prompt_policy_fingerprint(policy_facts: &Value) -> String {
     format!("sha256:{:x}", Sha256::digest(canonical.as_bytes()))
 }
 
+/// The exact redacted policy identity consumed by the canonical Run
+/// evaluation preflight. Keeping the inputs in one value makes it difficult
+/// for Prepare and Run to drift while also keeping the public helper small.
+pub struct EvaluationPolicyFingerprintInput<'a> {
+    pub model_binding: &'a str,
+    pub provider_binding: &'a str,
+    pub cache_policy: &'a str,
+    pub resolved_model_selection: Option<&'a crate::runs::ResolvedModelSelection>,
+    pub admitted_provider: &'a str,
+    pub admitted_cache_capability: Option<&'a crate::models::PromptCacheCapabilityData>,
+    pub execution_policy: &'a crate::runs::ExecutionPolicyRequest,
+    pub allow_skills: Option<&'a [String]>,
+    pub allow_skill_sources: Option<&'a [String]>,
+    pub allow_tools: Option<&'a [String]>,
+    pub enabled_tools: Option<&'a [String]>,
+    pub runtime_profile: Option<&'a crate::runs::RuntimeProfileRequest>,
+}
+
+/// Build the exact redacted policy identity consumed by the canonical Run
+/// evaluation preflight. Prepare and Run must use this one shape; a separate
+/// hand-written hash would make every prepared trial unavailable at start.
+pub fn evaluation_policy_fingerprint(input: &EvaluationPolicyFingerprintInput<'_>) -> String {
+    let policy_facts = serde_json::json!({
+        "model_binding": input.model_binding,
+        "provider_binding": input.provider_binding,
+        "cache_policy": input.cache_policy,
+        "resolved_model_selection": input.resolved_model_selection,
+        "admitted_provider": input.admitted_provider,
+        "admitted_cache_capability": input.admitted_cache_capability,
+        "execution_policy": input.execution_policy,
+        "allow_skills": input.allow_skills,
+        "allow_skill_sources": input.allow_skill_sources,
+        "allow_tools": input.allow_tools,
+        "enabled_tools": input.enabled_tools,
+        "runtime_profile": input.runtime_profile,
+    });
+    prompt_policy_fingerprint(&policy_facts)
+}
+
 pub fn content_fingerprint(content: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(content.as_bytes()))
 }

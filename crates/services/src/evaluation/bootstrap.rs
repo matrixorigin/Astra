@@ -5,11 +5,20 @@
 //! profile supported by the first adapter; it does not create sessions, call
 //! providers, or mutate evaluation state.
 
-use super::api::EvaluationTrialStartRequest;
+use super::api::{
+    EvaluationExperimentPrepareRequest, EvaluationPrepareTarget, EvaluationTrialStartRequest,
+};
 use super::durable::{EvaluationExperimentRecord, EvaluationTrialBindingRecord};
 use super::execution::{EvaluationRunAdmission, EvaluationSkillRevision};
-use super::experiment::EvaluationTargetKind;
-use super::{content_fingerprint, prompt_context_fingerprint};
+use super::experiment::{
+    DataIsolation, EXPERIMENT_SCHEMA_VERSION, EvaluationBudget, EvaluationCase, EvaluationTarget,
+    EvaluationTargetKind, ExperimentSpec, FrozenConditions, MemoryIsolation, RevisionRef,
+    TrialOrder,
+};
+use super::{
+    EvaluationPolicyFingerprintInput, content_fingerprint, evaluation_policy_fingerprint,
+    prompt_context_fingerprint,
+};
 use astra_core::canonical_json_string;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -18,6 +27,122 @@ use thiserror::Error;
 
 const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 const MAX_SKILL_NAME_BYTES: usize = 128;
+const MAX_CONCURRENCY: u16 = 64;
+const MAX_WALL_TIME_SECS: u64 = 24 * 60 * 60;
+pub const EVALUATION_ADAPTER_PROFILE_VERSION: &str = "prompt-skill-text.v1";
+
+/// Stable, redacted identity for the model-side prompt-cache behavior frozen
+/// into an evaluation plan. The first adapter deliberately exposes only the
+/// two cache contracts that the canonical Run preflight can prove; it does not
+/// pretend to compare provider-specific internals.
+pub fn prepared_cache_policy_identity(
+    _provider: &str,
+    cache_capability: Option<&crate::models::PromptCacheCapabilityData>,
+) -> String {
+    if cache_capability.is_some() {
+        "explicit_recorded".to_string()
+    } else {
+        "provider_default_recorded".to_string()
+    }
+}
+
+/// Derive the owner-scoped experiment address from the idempotent submission
+/// key. The key remains the durable semantic idempotency boundary; this
+/// derived address keeps clients from choosing arbitrary cross-owner ids.
+pub fn prepared_experiment_id(
+    owner_user_id: &str,
+    submission_idempotency_key: &str,
+) -> Result<String, EvaluationBootstrapError> {
+    if owner_user_id.trim().is_empty() || submission_idempotency_key.trim().is_empty() {
+        return Err(EvaluationBootstrapError::InvalidInput(
+            "owner_user_id and submission_idempotency_key must not be empty".to_string(),
+        ));
+    }
+    if owner_user_id.len() > 128 || submission_idempotency_key.len() > 128 {
+        return Err(EvaluationBootstrapError::InvalidInput(
+            "owner_user_id and submission_idempotency_key are too long".to_string(),
+        ));
+    }
+    let payload = json!({
+        "schema_version": 1,
+        "owner_user_id": owner_user_id,
+        "submission_idempotency_key": submission_idempotency_key,
+    });
+    let digest = Sha256::digest(canonical_json_string(&payload).as_bytes());
+    Ok(format!("evx_{digest:x}"))
+}
+
+/// Compare a retry's user intent with the already-frozen material without
+/// re-resolving mutable model or Skill catalogs. This is what makes the
+/// submission key a real idempotency boundary: an identical retry can replay
+/// the original plan after a catalog change, while a different request gets a
+/// conflict instead of silently adopting new facts.
+pub fn prepared_request_matches_spec(
+    request: &EvaluationExperimentPrepareRequest,
+    spec: &ExperimentSpec,
+) -> bool {
+    if request.model_offering_id != spec.conditions.model_binding
+        || request.max_concurrency != spec.budget.max_concurrency
+        || request.max_wall_time_secs != spec.budget.max_wall_time_secs
+        || spec.adapter_profile_version.as_deref() != Some(EVALUATION_ADAPTER_PROFILE_VERSION)
+        || spec.cases.len() != 1
+    {
+        return false;
+    }
+    let case = &spec.cases[0];
+    if case.case_id != request.case.case_id
+        || case.verifier_id != request.case.verifier_id
+        || case.verifier_version != request.case.verifier_version
+        || case.holdout != request.case.holdout
+        || case.input_content.as_deref() != Some(request.case.message.as_str())
+    {
+        return false;
+    }
+    match &request.target.kind {
+        EvaluationTargetKind::Prompt => {
+            if spec.target.kind != EvaluationTargetKind::Prompt
+                || request.target.skill_name.is_some()
+                || spec.target.skill_name.is_some()
+                || request.target.baseline.content.as_deref()
+                    != spec.target.baseline.content.as_deref()
+                || request.target.candidate.content.as_deref()
+                    != spec.target.candidate.content.as_deref()
+            {
+                return false;
+            }
+        }
+        EvaluationTargetKind::Skill => {
+            if spec.target.kind != EvaluationTargetKind::Skill
+                || request.target.baseline.content.is_some()
+                || request.target.candidate.content.is_some()
+                || request.target.skill_name.as_deref() != spec.target.skill_name.as_deref()
+            {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+    request.target.baseline.revision_id == spec.target.baseline.revision_id
+        && request.target.candidate.revision_id == spec.target.candidate.revision_id
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedModelIdentity {
+    pub offering_id: String,
+    pub model_name: String,
+    pub provider: String,
+    pub cache_policy: String,
+    pub cache_capability: Option<crate::models::PromptCacheCapabilityData>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedSkillIdentity {
+    pub skill_name: String,
+    pub baseline_revision_id: String,
+    pub baseline_content_hash: String,
+    pub candidate_revision_id: String,
+    pub candidate_content_hash: String,
+}
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum EvaluationBootstrapError {
@@ -41,6 +166,189 @@ pub struct EvaluationTrialStartPlan {
     pub model_offering_id: String,
     pub execution_time_budget_secs: u64,
     pub admission: EvaluationRunAdmission,
+}
+
+/// Convert authenticated user intent plus trusted model/Skill facts into the
+/// immutable first adapter spec. Hashes and policy identities are produced
+/// here, never by a client or a second runtime implementation.
+pub fn build_prepared_experiment_spec(
+    _owner_user_id: &str,
+    experiment_id: &str,
+    request: &EvaluationExperimentPrepareRequest,
+    model: &PreparedModelIdentity,
+    skill: Option<&PreparedSkillIdentity>,
+) -> Result<ExperimentSpec, EvaluationBootstrapError> {
+    if experiment_id.trim().is_empty() {
+        return Err(EvaluationBootstrapError::InvalidInput(
+            "experiment_id must not be empty".to_string(),
+        ));
+    }
+    if request.case.message.trim().is_empty() {
+        return Err(EvaluationBootstrapError::InvalidInput(
+            "case.message must not be empty".to_string(),
+        ));
+    }
+    if request.case.message.len() > MAX_MESSAGE_BYTES {
+        return Err(EvaluationBootstrapError::InvalidInput(format!(
+            "case.message exceeds the {MAX_MESSAGE_BYTES} byte limit"
+        )));
+    }
+    if request.max_concurrency == 0 || request.max_concurrency > MAX_CONCURRENCY {
+        return Err(EvaluationBootstrapError::InvalidInput(format!(
+            "max_concurrency must be between 1 and {MAX_CONCURRENCY}"
+        )));
+    }
+    if request.max_wall_time_secs == 0 || request.max_wall_time_secs > MAX_WALL_TIME_SECS {
+        return Err(EvaluationBootstrapError::InvalidInput(format!(
+            "max_wall_time_secs must be between 1 and {MAX_WALL_TIME_SECS}"
+        )));
+    }
+    if model.offering_id != request.model_offering_id || model.provider.trim().is_empty() {
+        return Err(EvaluationBootstrapError::Conflict(
+            "model admission does not match the requested offering".to_string(),
+        ));
+    }
+    if model.cache_policy
+        != prepared_cache_policy_identity(&model.provider, model.cache_capability.as_ref())
+    {
+        return Err(EvaluationBootstrapError::Conflict(
+            "model cache policy is not a supported evaluation contract".to_string(),
+        ));
+    }
+    let input_content_hash = prompt_context_fingerprint(&request.case.message, &[], &[], None);
+    let target = build_prepared_target(&request.target, input_content_hash.as_str(), skill)?;
+    let resolved_model_selection = crate::runs::ResolvedModelSelection {
+        offering_id: model.offering_id.clone(),
+        model_name: model.model_name.clone(),
+    };
+    let execution_policy = crate::runs::ExecutionPolicyRequest::default();
+    let tool_policy_hash = evaluation_policy_fingerprint(&EvaluationPolicyFingerprintInput {
+        model_binding: &model.offering_id,
+        provider_binding: &model.provider,
+        cache_policy: &model.cache_policy,
+        resolved_model_selection: Some(&resolved_model_selection),
+        admitted_provider: &model.provider,
+        admitted_cache_capability: model.cache_capability.as_ref(),
+        execution_policy: &execution_policy,
+        allow_skills: None,
+        allow_skill_sources: None,
+        allow_tools: None,
+        enabled_tools: None,
+        runtime_profile: None,
+    });
+    let spec = ExperimentSpec {
+        schema_version: EXPERIMENT_SCHEMA_VERSION,
+        experiment_id: experiment_id.to_string(),
+        target,
+        cases: vec![EvaluationCase {
+            case_id: request.case.case_id.clone(),
+            input_snapshot_ref: format!("evaluation://input/{input_content_hash}"),
+            input_content_hash: input_content_hash.clone(),
+            verifier_id: request.case.verifier_id.clone(),
+            verifier_version: request.case.verifier_version.clone(),
+            holdout: request.case.holdout,
+            input_content: Some(request.case.message.clone()),
+        }],
+        repetitions: 1,
+        order: TrialOrder::BaselineFirst,
+        conditions: FrozenConditions {
+            isolation_profile: "prompt_only_private".to_string(),
+            model_binding: model.offering_id.clone(),
+            provider_binding: model.provider.clone(),
+            context_snapshot_hash: input_content_hash,
+            tool_policy_hash,
+            cache_policy: model.cache_policy.clone(),
+            memory_isolation: MemoryIsolation::Disabled,
+            data_isolation: DataIsolation::Disabled,
+        },
+        budget: EvaluationBudget {
+            max_trials: 2,
+            max_concurrency: request.max_concurrency,
+            max_wall_time_secs: request.max_wall_time_secs,
+        },
+        adapter_profile_version: Some(EVALUATION_ADAPTER_PROFILE_VERSION.to_string()),
+    };
+    spec.validate()
+        .map_err(EvaluationBootstrapError::InvalidInput)?;
+    Ok(spec)
+}
+
+fn build_prepared_target(
+    target: &EvaluationPrepareTarget,
+    _input_content_hash: &str,
+    skill: Option<&PreparedSkillIdentity>,
+) -> Result<EvaluationTarget, EvaluationBootstrapError> {
+    match &target.kind {
+        EvaluationTargetKind::Prompt => {
+            if target.skill_name.is_some() || skill.is_some() {
+                return Err(EvaluationBootstrapError::InvalidInput(
+                    "Prompt preparation does not accept skill_name".to_string(),
+                ));
+            }
+            let baseline = target.baseline.content.clone().ok_or_else(|| {
+                EvaluationBootstrapError::InvalidInput(
+                    "Prompt baseline content is required".to_string(),
+                )
+            })?;
+            let candidate = target.candidate.content.clone().ok_or_else(|| {
+                EvaluationBootstrapError::InvalidInput(
+                    "Prompt candidate content is required".to_string(),
+                )
+            })?;
+            Ok(EvaluationTarget {
+                kind: EvaluationTargetKind::Prompt,
+                baseline: RevisionRef {
+                    revision_id: target.baseline.revision_id.clone(),
+                    content_hash: content_fingerprint(&baseline),
+                    content: Some(baseline),
+                },
+                candidate: RevisionRef {
+                    revision_id: target.candidate.revision_id.clone(),
+                    content_hash: content_fingerprint(&candidate),
+                    content: Some(candidate),
+                },
+                skill_name: None,
+            })
+        }
+        EvaluationTargetKind::Skill => {
+            if target.baseline.content.is_some() || target.candidate.content.is_some() {
+                return Err(EvaluationBootstrapError::InvalidInput(
+                    "Skill preparation uses owner-scoped revision IDs, not inline content"
+                        .to_string(),
+                ));
+            }
+            let Some(skill) = skill else {
+                return Err(EvaluationBootstrapError::Conflict(
+                    "owner-scoped Skill revisions could not be resolved".to_string(),
+                ));
+            };
+            if target.skill_name.as_deref() != Some(skill.skill_name.as_str())
+                || target.baseline.revision_id != skill.baseline_revision_id
+                || target.candidate.revision_id != skill.candidate_revision_id
+            {
+                return Err(EvaluationBootstrapError::Conflict(
+                    "resolved Skill revisions do not match the requested identity".to_string(),
+                ));
+            }
+            Ok(EvaluationTarget {
+                kind: EvaluationTargetKind::Skill,
+                baseline: RevisionRef {
+                    revision_id: skill.baseline_revision_id.clone(),
+                    content_hash: skill.baseline_content_hash.clone(),
+                    content: None,
+                },
+                candidate: RevisionRef {
+                    revision_id: skill.candidate_revision_id.clone(),
+                    content_hash: skill.candidate_content_hash.clone(),
+                    content: None,
+                },
+                skill_name: Some(skill.skill_name.clone()),
+            })
+        }
+        other => Err(EvaluationBootstrapError::Unsupported(format!(
+            "target kind {other:?} is not supported by the current prepare adapter"
+        ))),
+    }
 }
 
 /// Validate the frozen trial and derive every server-owned identity needed by
@@ -77,12 +385,37 @@ pub fn prepare_trial_start(
         .spec
         .validate_trial_identity(&trial.trial)
         .map_err(EvaluationBootstrapError::Conflict)?;
-    if request.message.trim().is_empty() {
+    let case = experiment
+        .spec
+        .cases
+        .iter()
+        .find(|case| case.case_id == trial.trial.case_id)
+        .ok_or_else(|| {
+            EvaluationBootstrapError::Conflict(format!(
+                "trial case `{}` is missing from the frozen experiment",
+                trial.trial.case_id
+            ))
+        })?;
+    let message = match (&request.message, case.input_content.as_ref()) {
+        (Some(requested), Some(frozen)) if requested != frozen => {
+            return Err(EvaluationBootstrapError::Conflict(
+                "message does not match the frozen case input".to_string(),
+            ));
+        }
+        (Some(requested), _) => requested.clone(),
+        (None, Some(frozen)) => frozen.clone(),
+        (None, None) => {
+            return Err(EvaluationBootstrapError::InvalidInput(
+                "message is required when the frozen case has no input content".to_string(),
+            ));
+        }
+    };
+    if message.trim().is_empty() {
         return Err(EvaluationBootstrapError::InvalidInput(
             "message must not be empty".to_string(),
         ));
     }
-    if request.message.len() > MAX_MESSAGE_BYTES {
+    if message.len() > MAX_MESSAGE_BYTES {
         return Err(EvaluationBootstrapError::InvalidInput(format!(
             "message exceeds the {MAX_MESSAGE_BYTES} byte limit"
         )));
@@ -91,7 +424,7 @@ pub fn prepare_trial_start(
     // The initial adapter freezes the full Context assembly to exactly this
     // text payload. A caller cannot smuggle an unrecorded context through a
     // start request and still receive an Available observation.
-    let input_content_hash = prompt_context_fingerprint(&request.message, &[], &[], None);
+    let input_content_hash = prompt_context_fingerprint(&message, &[], &[], None);
     if input_content_hash != trial.trial.input_content_hash
         || input_content_hash != experiment.spec.conditions.context_snapshot_hash
     {
@@ -111,10 +444,20 @@ pub fn prepare_trial_start(
                     "Prompt evaluation does not accept skill_name".to_string(),
                 ));
             }
-            let Some(content) = request.revision_content.clone() else {
-                return Err(EvaluationBootstrapError::InvalidInput(
-                    "Prompt evaluation requires revision_content".to_string(),
-                ));
+            let content = match (&request.revision_content, revision.content.as_ref()) {
+                (Some(requested), Some(frozen)) if requested != frozen => {
+                    return Err(EvaluationBootstrapError::Conflict(
+                        "revision_content does not match the frozen revision".to_string(),
+                    ));
+                }
+                (Some(requested), _) => requested.clone(),
+                (None, Some(frozen)) => frozen.clone(),
+                (None, None) => {
+                    return Err(EvaluationBootstrapError::InvalidInput(
+                        "Prompt evaluation requires revision_content or a frozen revision content"
+                            .to_string(),
+                    ));
+                }
             };
             if content_fingerprint(&content) != revision.content_hash {
                 return Err(EvaluationBootstrapError::Conflict(
@@ -129,10 +472,22 @@ pub fn prepare_trial_start(
                     "Skill evaluation does not accept revision_content".to_string(),
                 ));
             }
-            let Some(skill_name) = request.skill_name.clone() else {
-                return Err(EvaluationBootstrapError::InvalidInput(
-                    "Skill evaluation requires skill_name".to_string(),
-                ));
+            let skill_name = match (
+                &request.skill_name,
+                experiment.spec.target.skill_name.as_ref(),
+            ) {
+                (Some(requested), Some(frozen)) if requested != frozen => {
+                    return Err(EvaluationBootstrapError::Conflict(
+                        "skill_name does not match the frozen target".to_string(),
+                    ));
+                }
+                (Some(requested), _) => requested.clone(),
+                (None, Some(frozen)) => frozen.clone(),
+                (None, None) => {
+                    return Err(EvaluationBootstrapError::InvalidInput(
+                        "Skill evaluation requires skill_name or a frozen target name".to_string(),
+                    ));
+                }
             };
             if skill_name.trim().is_empty() || skill_name.len() > MAX_SKILL_NAME_BYTES {
                 return Err(EvaluationBootstrapError::InvalidInput(format!(
@@ -211,7 +566,7 @@ pub fn prepare_trial_start(
         "owner_user_id": owner_user_id,
         "experiment_id": experiment.experiment_id,
         "trial_id": trial.trial_id,
-        "message": request.message,
+        "message": message,
         "revision_content": revision_content,
         "skill_name": skill_revision.as_ref().map(|revision| &revision.skill_name),
         "execution_time_budget_secs": execution_time_budget_secs,
@@ -235,7 +590,7 @@ pub fn prepare_trial_start(
         session_id,
         run_id,
         request_fingerprint,
-        message: request.message.clone(),
+        message,
         revision_content,
         model_offering_id: experiment.spec.conditions.model_binding.clone(),
         execution_time_budget_secs,
@@ -269,11 +624,14 @@ mod tests {
                 baseline: RevisionRef {
                     revision_id: "base".to_string(),
                     content_hash: content_fingerprint(&baseline),
+                    content: Some(baseline.clone()),
                 },
                 candidate: RevisionRef {
                     revision_id: "cand".to_string(),
                     content_hash: content_fingerprint(&candidate),
+                    content: Some(candidate.clone()),
                 },
+                skill_name: None,
             },
             cases: vec![EvaluationCase {
                 case_id: "case-1".to_string(),
@@ -282,6 +640,7 @@ mod tests {
                 verifier_id: "verifier".to_string(),
                 verifier_version: "1".to_string(),
                 holdout: false,
+                input_content: Some(message.clone()),
             }],
             repetitions: 1,
             order: TrialOrder::BaselineFirst,
@@ -300,6 +659,7 @@ mod tests {
                 max_concurrency: 1,
                 max_wall_time_secs: 30,
             },
+            adapter_profile_version: None,
         };
         let spec_fingerprint = spec.spec_fingerprint().expect("fingerprint");
         let planned = spec.plan_trials().expect("trials");
@@ -337,8 +697,8 @@ mod tests {
     fn derives_stable_session_run_and_normalized_request_identity() {
         let (experiment, trial, message) = fixtures();
         let request = EvaluationTrialStartRequest {
-            message: message.clone(),
-            revision_content: Some("baseline prompt".to_string()),
+            message: None,
+            revision_content: None,
             skill_name: None,
             execution_time_budget_secs: None,
         };
@@ -353,14 +713,16 @@ mod tests {
         assert_eq!(first.request_fingerprint, second.request_fingerprint);
         assert!(first.session_id.starts_with("evs_"));
         assert!(first.run_id.starts_with("evr_"));
+        assert_eq!(first.message, message);
+        assert_eq!(first.revision_content.as_deref(), Some("baseline prompt"));
     }
 
     #[test]
     fn rejects_context_or_revision_drift_before_execution() {
         let (experiment, trial, _) = fixtures();
         let mut request = EvaluationTrialStartRequest {
-            message: "changed".to_string(),
-            revision_content: Some("baseline prompt".to_string()),
+            message: Some("changed".to_string()),
+            revision_content: None,
             skill_name: None,
             execution_time_budget_secs: None,
         };
@@ -368,7 +730,7 @@ mod tests {
             prepare_trial_start("owner-1", &experiment, &trial, &request),
             Err(EvaluationBootstrapError::Conflict(_))
         ));
-        request.message = "fixed input".to_string();
+        request.message = Some("fixed input".to_string());
         request.revision_content = Some("changed prompt".to_string());
         assert!(matches!(
             prepare_trial_start("owner-1", &experiment, &trial, &request),
@@ -380,8 +742,8 @@ mod tests {
     fn rejects_partial_or_foreign_existing_binding() {
         let (experiment, mut trial, message) = fixtures();
         let request = EvaluationTrialStartRequest {
-            message,
-            revision_content: Some("baseline prompt".to_string()),
+            message: Some(message),
+            revision_content: None,
             skill_name: None,
             execution_time_budget_secs: None,
         };
@@ -401,8 +763,8 @@ mod tests {
     fn rejects_a_plan_loaded_for_another_owner() {
         let (mut experiment, trial, message) = fixtures();
         let request = EvaluationTrialStartRequest {
-            message,
-            revision_content: Some("baseline prompt".to_string()),
+            message: Some(message),
+            revision_content: None,
             skill_name: None,
             execution_time_budget_secs: None,
         };
@@ -410,5 +772,271 @@ mod tests {
         let error = prepare_trial_start("owner-1", &experiment, &trial, &request)
             .expect_err("owner-scoped bootstrap must fail closed");
         assert!(matches!(error, EvaluationBootstrapError::Conflict(_)));
+    }
+
+    fn prepared_request(kind: EvaluationTargetKind) -> EvaluationExperimentPrepareRequest {
+        EvaluationExperimentPrepareRequest {
+            submission_idempotency_key: "submit-prepare-1".to_string(),
+            target: super::super::api::EvaluationPrepareTarget {
+                kind,
+                baseline: super::super::api::EvaluationPrepareRevision {
+                    revision_id: "base".to_string(),
+                    content: Some("baseline prompt".to_string()),
+                },
+                candidate: super::super::api::EvaluationPrepareRevision {
+                    revision_id: "cand".to_string(),
+                    content: Some("candidate prompt".to_string()),
+                },
+                skill_name: None,
+            },
+            case: super::super::api::EvaluationPrepareCase {
+                case_id: "case-1".to_string(),
+                message: "fixed input".to_string(),
+                verifier_id: "verifier".to_string(),
+                verifier_version: "1".to_string(),
+                holdout: false,
+            },
+            model_offering_id: "model-1".to_string(),
+            max_concurrency: 2,
+            max_wall_time_secs: 30,
+        }
+    }
+
+    #[test]
+    fn prepares_prompt_spec_from_user_content_and_trusted_model_facts() {
+        let request = prepared_request(EvaluationTargetKind::Prompt);
+        let spec = build_prepared_experiment_spec(
+            "owner-1",
+            "evx_prepare",
+            &request,
+            &PreparedModelIdentity {
+                offering_id: "model-1".to_string(),
+                model_name: "model-name".to_string(),
+                provider: "openai".to_string(),
+                cache_policy: "provider_default_recorded".to_string(),
+                cache_capability: None,
+            },
+            None,
+        )
+        .expect("prepared spec");
+        assert_eq!(spec.plan_trials().expect("trials").len(), 2);
+        assert_eq!(spec.conditions.provider_binding, "openai");
+        assert_eq!(
+            spec.target.baseline.content.as_deref(),
+            Some("baseline prompt")
+        );
+        assert_eq!(spec.cases[0].input_content.as_deref(), Some("fixed input"));
+        assert_eq!(
+            spec.target.baseline.content_hash,
+            content_fingerprint("baseline prompt")
+        );
+        let resolved = crate::runs::ResolvedModelSelection {
+            offering_id: "model-1".to_string(),
+            model_name: "model-name".to_string(),
+        };
+        let policy = crate::runs::ExecutionPolicyRequest::default();
+        assert_eq!(
+            spec.conditions.tool_policy_hash,
+            evaluation_policy_fingerprint(&EvaluationPolicyFingerprintInput {
+                model_binding: "model-1",
+                provider_binding: "openai",
+                cache_policy: "provider_default_recorded",
+                resolved_model_selection: Some(&resolved),
+                admitted_provider: "openai",
+                admitted_cache_capability: None,
+                execution_policy: &policy,
+                allow_skills: None,
+                allow_skill_sources: None,
+                allow_tools: None,
+                enabled_tools: None,
+                runtime_profile: None,
+            })
+        );
+    }
+
+    #[test]
+    fn prepares_skill_spec_only_from_owner_scoped_revision_facts() {
+        let mut request = prepared_request(EvaluationTargetKind::Skill);
+        request.target.skill_name = Some("reviewer".to_string());
+        request.target.baseline.content = None;
+        request.target.candidate.content = None;
+        let spec = build_prepared_experiment_spec(
+            "owner-1",
+            "evx_skill",
+            &request,
+            &PreparedModelIdentity {
+                offering_id: "model-1".to_string(),
+                model_name: "model-name".to_string(),
+                provider: "openai".to_string(),
+                cache_policy: "provider_default_recorded".to_string(),
+                cache_capability: None,
+            },
+            Some(&PreparedSkillIdentity {
+                skill_name: "reviewer".to_string(),
+                baseline_revision_id: "base".to_string(),
+                baseline_content_hash: content_fingerprint("base skill").to_string(),
+                candidate_revision_id: "cand".to_string(),
+                candidate_content_hash: content_fingerprint("candidate skill").to_string(),
+            }),
+        )
+        .expect("prepared Skill spec");
+        assert_eq!(spec.target.skill_name.as_deref(), Some("reviewer"));
+        assert!(spec.target.baseline.content.is_none());
+        assert_eq!(
+            spec.target.candidate.content_hash,
+            content_fingerprint("candidate skill")
+        );
+    }
+
+    #[test]
+    fn starts_prepared_skill_from_frozen_name_when_request_omits_it() {
+        let mut request = prepared_request(EvaluationTargetKind::Skill);
+        request.target.skill_name = Some("reviewer".to_string());
+        request.target.baseline.content = None;
+        request.target.candidate.content = None;
+        let model = PreparedModelIdentity {
+            offering_id: "model-1".to_string(),
+            model_name: "model-name".to_string(),
+            provider: "openai".to_string(),
+            cache_policy: "provider_default_recorded".to_string(),
+            cache_capability: None,
+        };
+        let spec = build_prepared_experiment_spec(
+            "owner-1",
+            "evx_skill_start",
+            &request,
+            &model,
+            Some(&PreparedSkillIdentity {
+                skill_name: "reviewer".to_string(),
+                baseline_revision_id: "base".to_string(),
+                baseline_content_hash: content_fingerprint("base skill").to_string(),
+                candidate_revision_id: "cand".to_string(),
+                candidate_content_hash: content_fingerprint("candidate skill").to_string(),
+            }),
+        )
+        .expect("prepared Skill spec");
+        let spec_fingerprint = spec.spec_fingerprint().expect("fingerprint");
+        let trial = spec
+            .plan_trials()
+            .expect("trials")
+            .into_iter()
+            .next()
+            .expect("trial");
+        let experiment = EvaluationExperimentRecord {
+            owner_user_id: "owner-1".to_string(),
+            experiment_id: spec.experiment_id.clone(),
+            spec_fingerprint: spec_fingerprint.clone(),
+            spec,
+            submission_idempotency_key: request.submission_idempotency_key,
+            planned_trial_count: 2,
+            created_at: "now".to_string(),
+            updated_at: "now".to_string(),
+        };
+        let binding = EvaluationTrialBindingRecord {
+            owner_user_id: "owner-1".to_string(),
+            trial_id: trial.trial_id.clone(),
+            experiment_id: experiment.experiment_id.clone(),
+            spec_fingerprint,
+            trial,
+            binding_status: "planned".to_string(),
+            session_id: None,
+            run_id: None,
+            run_generation: None,
+            created_at: "now".to_string(),
+            updated_at: "now".to_string(),
+        };
+        let plan = prepare_trial_start(
+            "owner-1",
+            &experiment,
+            &binding,
+            &EvaluationTrialStartRequest {
+                message: None,
+                revision_content: None,
+                skill_name: None,
+                execution_time_budget_secs: None,
+            },
+        )
+        .expect("frozen Skill target should supply the name");
+        assert_eq!(
+            plan.admission.skill_revision.expect("skill").skill_name,
+            "reviewer"
+        );
+    }
+
+    #[test]
+    fn allows_aa_and_rejects_inline_skill_material() {
+        let request = prepared_request(EvaluationTargetKind::Prompt);
+        let mut same = request.clone();
+        same.target.candidate.revision_id = same.target.baseline.revision_id.clone();
+        let model = PreparedModelIdentity {
+            offering_id: "model-1".to_string(),
+            model_name: "model-name".to_string(),
+            provider: "openai".to_string(),
+            cache_policy: "provider_default_recorded".to_string(),
+            cache_capability: None,
+        };
+        let same_spec = build_prepared_experiment_spec("owner-1", "evx_same", &same, &model, None)
+            .expect("A/A is a valid controlled comparison");
+        assert_eq!(
+            same_spec.target.baseline.revision_id,
+            same_spec.target.candidate.revision_id
+        );
+
+        let mut skill = request;
+        skill.target.kind = EvaluationTargetKind::Skill;
+        skill.target.skill_name = Some("reviewer".to_string());
+        assert!(matches!(
+            build_prepared_experiment_spec(
+                "owner-1",
+                "evx_inline",
+                &skill,
+                &model,
+                Some(&PreparedSkillIdentity {
+                    skill_name: "reviewer".to_string(),
+                    baseline_revision_id: "base".to_string(),
+                    baseline_content_hash: "sha256:base".to_string(),
+                    candidate_revision_id: "cand".to_string(),
+                    candidate_content_hash: "sha256:cand".to_string(),
+                }),
+            ),
+            Err(EvaluationBootstrapError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn prepared_experiment_id_is_owner_scoped_and_stable() {
+        let first = prepared_experiment_id("owner-1", "submission-1").expect("id");
+        assert_eq!(
+            first,
+            prepared_experiment_id("owner-1", "submission-1").unwrap()
+        );
+        assert_ne!(
+            first,
+            prepared_experiment_id("owner-2", "submission-1").unwrap()
+        );
+        assert!(first.starts_with("evx_"));
+    }
+
+    #[test]
+    fn prepared_retry_matches_frozen_user_intent_without_dynamic_facts() {
+        let request = prepared_request(EvaluationTargetKind::Prompt);
+        let spec = build_prepared_experiment_spec(
+            "owner-1",
+            "evx_replay",
+            &request,
+            &PreparedModelIdentity {
+                offering_id: "model-1".to_string(),
+                model_name: "model-name".to_string(),
+                provider: "openai".to_string(),
+                cache_policy: "provider_default_recorded".to_string(),
+                cache_capability: None,
+            },
+            None,
+        )
+        .expect("spec");
+        assert!(prepared_request_matches_spec(&request, &spec));
+        let mut changed = request;
+        changed.case.message = "different input".to_string();
+        assert!(!prepared_request_matches_spec(&changed, &spec));
     }
 }

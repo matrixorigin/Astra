@@ -10367,24 +10367,26 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
     );
     let revision_hash = content_fingerprint("Frozen revision text");
     let admitted_model = test_admitted_model_execution();
-    let policy_facts = json!({
-        "model_binding": "model-test-model",
-        "provider_binding": "openai",
-        "cache_policy": "provider_default_recorded",
-        "resolved_model_selection": {
-            "offering_id": "model-test-model",
-            "model_name": "test-model"
+    let resolved_model = astra_services::runs::ResolvedModelSelection {
+        offering_id: "model-test-model".to_string(),
+        model_name: "test-model".to_string(),
+    };
+    let policy_hash = astra_services::evaluation::evaluation_policy_fingerprint(
+        &astra_services::evaluation::EvaluationPolicyFingerprintInput {
+            model_binding: "model-test-model",
+            provider_binding: "openai",
+            cache_policy: "provider_default_recorded",
+            resolved_model_selection: Some(&resolved_model),
+            admitted_provider: &admitted_model.provider,
+            admitted_cache_capability: admitted_model.cache_capability.as_ref(),
+            execution_policy: &request.execution_policy,
+            allow_skills: request.allow_skills.as_deref(),
+            allow_skill_sources: request.allow_skill_sources.as_deref(),
+            allow_tools: request.allow_tools.as_deref(),
+            enabled_tools: request.enabled_tools.as_deref(),
+            runtime_profile: request.runtime_profile.as_ref(),
         },
-        "admitted_provider": admitted_model.provider,
-        "admitted_cache_capability": admitted_model.cache_capability,
-        "execution_policy": request.execution_policy,
-        "allow_skills": request.allow_skills,
-        "allow_skill_sources": request.allow_skill_sources,
-        "allow_tools": request.allow_tools,
-        "enabled_tools": request.enabled_tools,
-        "runtime_profile": request.runtime_profile,
-    });
-    let policy_hash = prompt_policy_fingerprint(&policy_facts);
+    );
     let experiment_id = format!("eval-runtime-exp-{}", Uuid::new_v4());
     let spec = astra_services::evaluation::ExperimentSpec {
         schema_version: 1,
@@ -10394,11 +10396,14 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
             baseline: astra_services::evaluation::RevisionRef {
                 revision_id: "revision-baseline".to_string(),
                 content_hash: revision_hash.clone(),
+                content: None,
             },
             candidate: astra_services::evaluation::RevisionRef {
                 revision_id: "revision-candidate".to_string(),
                 content_hash: content_fingerprint("Candidate revision text"),
+                content: None,
             },
+            skill_name: None,
         },
         cases: vec![astra_services::evaluation::EvaluationCase {
             case_id: "case-runtime".to_string(),
@@ -10407,6 +10412,7 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
             verifier_id: "verifier-runtime".to_string(),
             verifier_version: "1".to_string(),
             holdout: false,
+            input_content: None,
         }],
         repetitions: 1,
         order: astra_services::evaluation::TrialOrder::BaselineFirst,
@@ -10425,6 +10431,7 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
             max_concurrency: 1,
             max_wall_time_secs: 60,
         },
+        adapter_profile_version: None,
     };
     let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
     let experiment = plan_store
@@ -10739,24 +10746,26 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
         content_hash: baseline_skill.content_hash.clone(),
     };
     let admitted_model = test_admitted_model_execution();
-    let policy_facts = json!({
-        "model_binding": "model-test-model",
-        "provider_binding": "openai",
-        "cache_policy": "provider_default_recorded",
-        "resolved_model_selection": {
-            "offering_id": "model-test-model",
-            "model_name": "test-model"
+    let resolved_model = astra_services::runs::ResolvedModelSelection {
+        offering_id: "model-test-model".to_string(),
+        model_name: "test-model".to_string(),
+    };
+    let policy_hash = astra_services::evaluation::evaluation_policy_fingerprint(
+        &astra_services::evaluation::EvaluationPolicyFingerprintInput {
+            model_binding: "model-test-model",
+            provider_binding: "openai",
+            cache_policy: "provider_default_recorded",
+            resolved_model_selection: Some(&resolved_model),
+            admitted_provider: &admitted_model.provider,
+            admitted_cache_capability: admitted_model.cache_capability.as_ref(),
+            execution_policy: &request.execution_policy,
+            allow_skills: request.allow_skills.as_deref(),
+            allow_skill_sources: request.allow_skill_sources.as_deref(),
+            allow_tools: request.allow_tools.as_deref(),
+            enabled_tools: request.enabled_tools.as_deref(),
+            runtime_profile: request.runtime_profile.as_ref(),
         },
-        "admitted_provider": admitted_model.provider,
-        "admitted_cache_capability": admitted_model.cache_capability,
-        "execution_policy": request.execution_policy,
-        "allow_skills": request.allow_skills,
-        "allow_skill_sources": request.allow_skill_sources,
-        "allow_tools": request.allow_tools,
-        "enabled_tools": request.enabled_tools,
-        "runtime_profile": request.runtime_profile,
-    });
-    let policy_hash = prompt_policy_fingerprint(&policy_facts);
+    );
     let experiment_id = format!("eval-skill-exp-{}", Uuid::new_v4());
     let spec = astra_services::evaluation::ExperimentSpec {
         schema_version: 1,
@@ -10766,11 +10775,14 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
             baseline: astra_services::evaluation::RevisionRef {
                 revision_id: baseline_skill.version_id.clone(),
                 content_hash: baseline_skill.content_hash.clone(),
+                content: None,
             },
             candidate: astra_services::evaluation::RevisionRef {
                 revision_id: candidate_skill.version_id.clone(),
                 content_hash: candidate_skill.content_hash.clone(),
+                content: None,
             },
+            skill_name: Some(skill_name.clone()),
         },
         cases: vec![astra_services::evaluation::EvaluationCase {
             case_id: "case-skill-runtime".to_string(),
@@ -10779,6 +10791,7 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
             verifier_id: "verifier-skill-runtime".to_string(),
             verifier_version: "1".to_string(),
             holdout: false,
+            input_content: None,
         }],
         repetitions: 1,
         order: astra_services::evaluation::TrialOrder::BaselineFirst,
@@ -10797,6 +10810,7 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
             max_concurrency: 1,
             max_wall_time_secs: 60,
         },
+        adapter_profile_version: None,
     };
     let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
     let experiment = plan_store

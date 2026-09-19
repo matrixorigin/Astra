@@ -42,7 +42,7 @@ mod interaction_metrics;
 mod llm_trusted_domains_handlers;
 mod mcp_handlers;
 mod meta_handlers;
-mod model_execution_admission;
+pub(crate) mod model_execution_admission;
 mod platform_handlers;
 mod preferences_handlers;
 mod product_harness_handlers;

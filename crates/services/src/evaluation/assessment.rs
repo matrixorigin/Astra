@@ -473,11 +473,14 @@ mod tests {
                 baseline: RevisionRef {
                     revision_id: "base".to_string(),
                     content_hash: "sha256:base".to_string(),
+                    content: None,
                 },
                 candidate: RevisionRef {
                     revision_id: "candidate".to_string(),
                     content_hash: "sha256:candidate".to_string(),
+                    content: None,
                 },
+                skill_name: None,
             },
             cases: vec![EvaluationCase {
                 case_id: "case-1".to_string(),
@@ -486,6 +489,7 @@ mod tests {
                 verifier_id: "verifier".to_string(),
                 verifier_version: "v1".to_string(),
                 holdout: true,
+                input_content: None,
             }],
             repetitions: 2,
             order: TrialOrder::BaselineFirst,
@@ -504,6 +508,7 @@ mod tests {
                 max_concurrency: 2,
                 max_wall_time_secs: 60,
             },
+            adapter_profile_version: None,
         }
     }
 
@@ -602,6 +607,7 @@ mod tests {
             verifier_id: "verifier".to_string(),
             verifier_version: "v1".to_string(),
             holdout: false,
+            input_content: None,
         });
         spec.budget.max_trials = 8;
         let planned = spec.plan_trials().unwrap();
