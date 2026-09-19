@@ -212,6 +212,12 @@ without changing its fact or identity contract.
 
 ## Local workspace evaluation delivery boundary
 
+The existing local `worktree` tool accepts `source_commit` for `action=enter`.
+It resolves the reference (default HEAD) once, creates from that full commit,
+and verifies the created HEAD/tree before switching the session. Result metadata
+contains `source_commit` and `source_tree`. This identifies the creation source;
+shared Git metadata means it is not an Eval isolation receipt.
+
 Status: required delivery contract; the current text adapter does not implement
 this path. Its HTTP integration test proves routing through the canonical Run
 and reporting, not TUI operation or local tool isolation.

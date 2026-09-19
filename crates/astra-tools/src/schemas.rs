@@ -1633,6 +1633,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "properties": {
                         "action": {"type": "string", "enum": ["enter", "exit"]},
                         "branch": {"type": "string", "description": "New branch name; required for enter."},
+                        "source_commit": {"type": "string", "description": "Commit reference to start from; defaults to HEAD. Resolved once to a full commit ID before creation."},
                         "exit_action": {"type": "string", "enum": ["keep", "remove"], "description": "Keep or remove the worktree on exit; defaults to keep."},
                         "discard_changes": {"type": "boolean", "description": "Allow discarding changes when exiting with remove; defaults to false."}
                     },
