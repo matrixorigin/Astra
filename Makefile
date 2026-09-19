@@ -63,7 +63,7 @@ help:
 	@echo "  make test-durable-event-pressure - Live MatrixOne durable event pressure probe (explicit, not part of test-online)"
 	@echo "  make test-saas          - SaaS platform E2E (docs/testing/saas-test-plan.md §5; MatrixOne + optional SDK)"
 	@echo "  make test-saas-coverage - SaaS E2E + llvm line coverage report (needs: cargo install cargo-llvm-cov)"
-	@echo "  make test-live-llm      - Live LLM suite (real provider APIs from .models.yaml; one model per provider)"
+	@echo "  make harness-live-llm   - Live LLM suite (real provider APIs from .models.yaml; one model per provider)"
 	@echo "  make test-contract      - Run contract tests (http/admin/config)"
 	@echo "  (also: test-sdk-offline, test-web-offline, test-sdk-online — @astra/sdk + web offline; remote E2E opt-in on test-online)"
 	@echo ""
@@ -1308,7 +1308,7 @@ test-online:
 	done; \
 	FAILED=""; \
 	if [ "$$ONLINE_LANE" != "integration" ]; then \
-		echo "Running astra-runtime ignored unit/bin tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE); live-LLM suite gated by ASTRA_LIVE_LLM)..."; \
+		echo "Running astra-runtime ignored unit/bin tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE); real provider calls disabled)..."; \
 		ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 			ASTRA_TEST_DB_IT=1 \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
@@ -1362,8 +1362,8 @@ test-online:
 		echo "Skipping real Memoria contract (set ASTRA_MEMORIA_ONLINE=1, or: make test-memoria-online-contract)"; \
 	fi
 	@echo ""
-	@echo "NOTE: live-LLM suite (real provider APIs, reads .models.yaml) auto-skips unless"
-	@echo "      ASTRA_LIVE_LLM=1 is set. Run it explicitly with: make test-live-llm"
+	@echo "NOTE: normal offline/online tests exclude real-provider harness code."
+	@echo "      Real-provider harness is separate and explicit: make harness-live-llm"
 
 # Explicit cleanup pressure probes. This is intentionally not part of
 # test-online because pressure timings are operational evidence, not a normal
@@ -1526,11 +1526,11 @@ test-saas-coverage:
 # Live-LLM suite: hits real provider APIs listed in .models.yaml.
 # Picks ONE model per distinct provider at runtime — what's in the yaml gets
 # tested, nothing is hard-coded. Bypasses MatrixOne / DB fixtures entirely.
-.PHONY: test-live-llm
-test-live-llm:
+.PHONY: harness-live-llm
+harness-live-llm:
 	@echo "Running live-LLM token usage tests (reads .models.yaml; one model per provider)..."
-	@ASTRA_LIVE_LLM=1 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
-		--test live_token_usage_e2e -- --ignored --nocapture
+	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
+		--features live-provider-tests --test live_token_usage_e2e -- --ignored --nocapture
 
 # @astra/sdk — no real HTTP API (Mode A in-process runs via ASTRA_SDK_E2E=1 in test:coverage)
 .PHONY: test-sdk-offline

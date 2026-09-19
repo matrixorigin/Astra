@@ -10,6 +10,15 @@ impl ReflectReport {
         if !matches!(depth, ObservationDepth::Hint | ObservationDepth::Summary) {
             return self;
         }
+        if let Some(usage) = self.judgment_usage.as_mut() {
+            let group_limit = if depth == ObservationDepth::Hint {
+                2
+            } else {
+                8
+            };
+            usage.omitted_groups += usage.groups.len().saturating_sub(group_limit);
+            usage.groups.truncate(group_limit);
+        }
         let (max_observations, max_evidence, max_hints) = depth.report_limits();
         let before = (
             self.observations.len(),
@@ -134,6 +143,7 @@ impl ReflectReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reflect::{JudgmentUsageGroup, JudgmentUsageSummary};
     use serde_json::json;
 
     fn large_report(depth: &str) -> ReflectReport {
@@ -170,6 +180,35 @@ mod tests {
     }
 
     #[test]
+    fn lightweight_judgment_groups_are_bounded_with_omission_count() {
+        let mut report = large_report("hint");
+        report.judgment_usage = Some(JudgmentUsageSummary {
+            scope: super::super::JudgmentUsageScope::default(),
+            capture_incomplete: false,
+            coverage: "available".into(),
+            groups: (0..10)
+                .map(|index| JudgmentUsageGroup {
+                    provider: "typesafe".into(),
+                    offering_id: format!("offering-{index}"),
+                    model: "jev".into(),
+                    operation: "request_judgment".into(),
+                    attempts: 1,
+                    exact_usage_attempts: 1,
+                    known_input_tokens: 10,
+                    known_output_tokens: 2,
+                    input_incomplete: false,
+                    output_incomplete: false,
+                })
+                .collect(),
+            omitted_groups: 0,
+        });
+        let projected = report.project_lightweight();
+        let usage = projected.judgment_usage.unwrap();
+        assert_eq!(usage.groups.len(), 2);
+        assert_eq!(usage.omitted_groups, 8);
+    }
+
+    #[test]
     fn lightweight_reflection_prioritizes_actions_and_drops_missing_support() {
         let mut report = large_report("summary");
         let critical_hint = report.action_hints[0].clone();
@@ -203,6 +242,27 @@ mod tests {
                 .any(|hint| hint.observation_refs.contains(&"obs-59".into()))
         );
         assert!(unsupported.budget_result.truncated);
+    }
+
+    #[test]
+    fn optional_local_usage_does_not_replace_critical_summary_or_diagnosis() {
+        for depth in ["hint", "summary"] {
+            let mut report = large_report(depth);
+            report.summary = "Execution failed: permission denied; do not retry mutation.".into();
+            let expected = report.clone().project_lightweight();
+            report.judgment_usage = Some(JudgmentUsageSummary {
+                scope: super::super::JudgmentUsageScope::LocalCaptureUnavailable,
+                capture_incomplete: true,
+                coverage: "unavailable".into(),
+                groups: vec![],
+                omitted_groups: 0,
+            });
+            let projected = report.project_lightweight();
+            assert_eq!(projected.summary, expected.summary);
+            assert_eq!(projected.observations, expected.observations);
+            assert_eq!(projected.action_hints, expected.action_hints);
+            assert_eq!(projected.clone().project_lightweight(), projected);
+        }
     }
 
     #[test]

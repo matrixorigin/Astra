@@ -26,6 +26,8 @@ use crate::turn::prompt_cache::{PromptCacheConfig, apply_anthropic_cache_metadat
 
 pub(crate) const REQUIRED_RUNTIME_PREAMBLE_MARKER: &str = "__astra_required_runtime_context";
 pub(crate) const RUNTIME_SYSTEM_CONTEXT_MARKER: &str = "__astra_runtime_system_context";
+const RUNTIME_CONTEXT_PREFIX: &str = "<astra-runtime-context>\n";
+const RUNTIME_CONTEXT_SUFFIX: &str = "\n</astra-runtime-context>";
 
 fn is_runtime_instruction(message: &Value) -> bool {
     let Some(kind) = message
@@ -158,16 +160,14 @@ pub(crate) fn project_runtime_roles(messages: &[Value]) -> Vec<Value> {
             message["role"] = Value::String("user".into());
             match message.get_mut("content") {
                 Some(Value::String(text)) => {
-                    *text = format!("<astra-runtime-context>\n{text}\n</astra-runtime-context>")
+                    *text = format!("{RUNTIME_CONTEXT_PREFIX}{text}{RUNTIME_CONTEXT_SUFFIX}")
                 }
                 Some(Value::Array(blocks)) => {
                     blocks.insert(
                         0,
-                        serde_json::json!({"type":"text", "text":"<astra-runtime-context>\n"}),
+                        serde_json::json!({"type":"text", "text":RUNTIME_CONTEXT_PREFIX}),
                     );
-                    blocks.push(
-                        serde_json::json!({"type":"text", "text":"\n</astra-runtime-context>"}),
-                    );
+                    blocks.push(serde_json::json!({"type":"text", "text":RUNTIME_CONTEXT_SUFFIX}));
                 }
                 _ => {}
             }

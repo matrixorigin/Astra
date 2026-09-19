@@ -137,11 +137,11 @@ impl Default for LatestRecordUpdate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExplainAnalyzeArtifactV1 {
     artifact_schema_version: u16,
-    artifact_kind: &'static str,
-    artifact_type: &'static str,
-    content_type: &'static str,
-    storage: &'static str,
-    representation: &'static str,
+    artifact_kind: String,
+    artifact_type: String,
+    content_type: String,
+    storage: String,
+    representation: String,
     schema_version: u16,
     session_id: String,
     run_id: String,
@@ -411,11 +411,11 @@ pub(crate) fn persist(
     let result = (|| {
         let payload = ExplainAnalyzeArtifactV1 {
             artifact_schema_version: ARTIFACT_SCHEMA_VERSION,
-            artifact_kind: "explain_analyze",
-            artifact_type: ARTIFACT_TYPE,
-            content_type: ARTIFACT_CONTENT_TYPE,
-            storage: ARTIFACT_STORAGE,
-            representation: "canonical",
+            artifact_kind: "explain_analyze".into(),
+            artifact_type: ARTIFACT_TYPE.into(),
+            content_type: ARTIFACT_CONTENT_TYPE.into(),
+            storage: ARTIFACT_STORAGE.into(),
+            representation: "canonical".into(),
             schema_version: EXPLAIN_ANALYZE_SCHEMA_VERSION,
             session_id: session_id.to_string(),
             run_id: first.run_id.clone(),
@@ -575,8 +575,7 @@ fn latest_capture(session_dir: &Path) -> Result<Option<LatestExplainAnalyzeCaptu
     if metadata.len() > 16 * 1024 {
         return Err("Explain Analyze artifact index exceeds the read bound".to_string());
     }
-    let bytes = std::fs::read(path)
-        .map_err(|error| format!("read Explain Analyze artifact index: {error}"))?;
+    let bytes = read_bounded_bytes(&path, 16 * 1024)?;
     let capture: LatestExplainAnalyzeCapture = serde_json::from_slice(&bytes)
         .map_err(|error| format!("decode Explain Analyze artifact index: {error}"))?;
     if capture.artifact_schema_version != ARTIFACT_SCHEMA_VERSION
@@ -781,6 +780,146 @@ fn read_artifact_window(
     Ok((content[..end].to_string(), total_bytes, offset + end))
 }
 
+fn read_bounded_bytes(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
+    let file = File::open(path).map_err(|_| "local Explain capture unavailable".to_string())?;
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "local Explain capture unreadable".to_string())?;
+    if bytes.len() > limit {
+        return Err("local Explain capture exceeds read bound".into());
+    }
+    Ok(bytes)
+}
+
+pub(crate) struct LocalCapturedJudgmentUsage {
+    pub(crate) scope: astra_services::reflect::JudgmentUsageScope,
+    pub(crate) facts: astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1,
+}
+
+impl LocalCapturedJudgmentUsage {
+    pub(crate) fn summary(&self) -> astra_services::reflect::JudgmentUsageSummary {
+        let mut summary =
+            astra_services::reflect::JudgmentUsageSummary::from_physical_attempts(&self.facts);
+        summary.scope = self.scope.clone();
+        summary.capture_incomplete = true;
+        for group in &mut summary.groups {
+            group.input_incomplete = true;
+            group.output_incomplete = true;
+        }
+        summary.omitted_groups += summary.groups.len().saturating_sub(32);
+        summary.groups.truncate(32);
+        summary
+    }
+}
+
+/// One owner-local typed reader shared by Reflect and introspect. Never falls
+/// back to an older handle and never interprets journal LLM-round counters.
+pub(crate) fn local_judgment_usage(session_id: &str) -> LocalCapturedJudgmentUsage {
+    read_local_judgment_usage(session_id).unwrap_or_else(|_| LocalCapturedJudgmentUsage {
+        scope: astra_services::reflect::JudgmentUsageScope::LocalCaptureUnavailable,
+        facts: astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
+            available: false,
+            truncated: false,
+            attempts: vec![],
+        },
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn persist_test_judgment_usage(session_id: &str) {
+    let mut events = tests::complete_events();
+    events[1].auxiliary_usage = Some(Box::new(astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
+        available: true,
+        truncated: false,
+        attempts: vec![astra_turn_types::ExplainAnalyzeAuxiliaryAttemptV1 {
+            attempt_id: "physical-1".into(),
+            provider: "typesafe".into(),
+            offering_id: "jev-test".into(),
+            model_name: "jev".into(),
+            purpose: "verification_judge".into(),
+            operation_id: "request_judgment".into(),
+            usage_status: astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+            usage: Some(astra_turn_types::ExplainAnalyzeTokenUsageV1 {
+                basis: astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderExact,
+                fresh_input_tokens: Some(123),
+                output_tokens: Some(7),
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+            }),
+        }],
+    }));
+    events.push(events[1].clone());
+    persist(session_id, &events, false).unwrap();
+}
+
+fn read_local_judgment_usage(session_id: &str) -> Result<LocalCapturedJudgmentUsage, String> {
+    let session_dir = astra_services::local_session_artifact_store().session_dir(session_id)?;
+    if publication_failure(&session_dir.join(ARTIFACT_DIR)).is_some() {
+        return Err("local Explain publication unavailable".into());
+    }
+    let capture = latest_capture(&session_dir)?.ok_or("no local Explain capture")?;
+    let handle = capture
+        .handle
+        .as_deref()
+        .ok_or("local Explain capture not readable")?;
+    let run_id = capture.run_id.as_deref().ok_or("missing capture run")?;
+    let turn_id = capture.turn_id.as_deref().ok_or("missing capture turn")?;
+    if [run_id, turn_id]
+        .iter()
+        .any(|id| id.is_empty() || id.len() > 512 || id.chars().any(char::is_control))
+    {
+        return Err("invalid capture identity".into());
+    }
+    if handle != artifact_handle(run_id, turn_id) {
+        return Err("capture handle mismatch".into());
+    }
+    let token = token_from_handle(handle).ok_or("invalid capture handle")?;
+    let bytes = read_bounded_bytes(&artifact_path(&session_dir, token), ARTIFACT_MAX_BYTES)?;
+    if capture.size_bytes != Some(bytes.len())
+        || capture.checksum_sha256.as_deref()
+            != Some(format!("{:x}", Sha256::digest(&bytes)).as_str())
+    {
+        return Err("capture integrity mismatch".into());
+    }
+    let artifact: ExplainAnalyzeArtifactV1 =
+        serde_json::from_slice(&bytes).map_err(|_| "invalid typed Explain capture".to_string())?;
+    if artifact.artifact_schema_version != ARTIFACT_SCHEMA_VERSION
+        || artifact.schema_version != EXPLAIN_ANALYZE_SCHEMA_VERSION
+        || artifact.artifact_kind != "explain_analyze"
+        || artifact.artifact_type != ARTIFACT_TYPE
+        || artifact.content_type != ARTIFACT_CONTENT_TYPE
+        || artifact.storage != ARTIFACT_STORAGE
+        || artifact.representation != "canonical"
+        || artifact.session_id != session_id
+        || artifact.run_id != run_id
+        || artifact.turn_id != turn_id
+        || artifact.capture_status != capture.status
+        || artifact
+            .events
+            .iter()
+            .any(|e| e.run_id != run_id || e.turn_id != turn_id)
+    {
+        return Err("capture scope or contract mismatch".into());
+    }
+    let mut graph = astra_turn_types::ExplainAnalyzeGraphV1::default();
+    for event in artifact.events {
+        graph.apply(event);
+    }
+    let facts = astra_services::reflect::JudgmentUsageSummary::supported_attempts(
+        &graph.auxiliary_usage_snapshot(),
+    );
+    // Graph::apply validates every event and auxiliary identity before retaining
+    // it. Historical coverage is separate from the producer's truncation flag.
+    Ok(LocalCapturedJudgmentUsage {
+        scope: astra_services::reflect::JudgmentUsageScope::LocalCapturedRunTurn {
+            run_id: artifact.run_id,
+            turn_id: artifact.turn_id,
+        },
+        facts,
+    })
+}
+
 pub(crate) fn resolve_request(session_dir: &Path, args: &Value) -> Option<Result<String, String>> {
     let handle = args.get("artifact")?.as_str().map(str::to_owned);
     let Some(handle) = handle else {
@@ -860,8 +999,9 @@ mod tests {
         }
     }
 
-    fn complete_events() -> Vec<ExplainAnalyzeEventV1> {
+    pub(super) fn complete_events() -> Vec<ExplainAnalyzeEventV1> {
         let common = ExplainAnalyzeEventV1 {
+            auxiliary_usage: None,
             schema_version: EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: "clock-1:0".to_string(),
             run_id: "run-1".to_string(),
@@ -892,6 +1032,144 @@ mod tests {
         finished.duration_ms = Some(5);
         finished.outcome = Some(ExplainAnalyzeOutcomeV1::Completed);
         vec![common, finished]
+    }
+
+    #[test]
+    fn local_usage_conflicting_node_cannot_be_revived_by_independent_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session = "local-usage-conflict";
+        persist_test_judgment_usage(session);
+        let directory = astra_services::local_session_artifact_store()
+            .session_dir(session)
+            .unwrap();
+        let index = latest_capture(&directory).unwrap().unwrap();
+        let path = artifact_path(
+            &directory,
+            token_from_handle(index.handle.as_deref().unwrap()).unwrap(),
+        );
+        let artifact: ExplainAnalyzeArtifactV1 =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let first = artifact.events[1].clone();
+        let mut conflicting = first.clone();
+        conflicting.auxiliary_usage.as_mut().unwrap().attempts[0]
+            .usage
+            .as_mut()
+            .unwrap()
+            .fresh_input_tokens = Some(947);
+        let mut independent = conflicting.clone();
+        independent.event_id = "independent-terminal".into();
+        independent.node_id = "independent-segment".into();
+        let records = [first, conflicting, independent];
+        for order in [[0, 1, 2], [2, 1, 0], [0, 2, 1]] {
+            let mut events = vec![artifact.events[0].clone()];
+            events.extend(order.map(|index| records[index].clone()));
+            assert!(events.iter().all(ExplainAnalyzeEventV1::is_valid));
+            persist(session, &events, false).unwrap();
+            let captured = local_judgment_usage(session);
+            assert!(matches!(
+                captured.scope,
+                astra_services::reflect::JudgmentUsageScope::LocalCapturedRunTurn { .. }
+            ));
+            assert!(!captured.facts.available);
+            assert!(!captured.facts.truncated);
+            assert!(captured.facts.attempts.is_empty());
+            let summary = captured.summary();
+            assert_eq!(summary.coverage, "unavailable");
+            assert!(summary.groups.is_empty());
+            assert!(!summary.render().contains("947"));
+            assert!(!summary.render().contains("123"));
+        }
+    }
+
+    #[test]
+    fn local_usage_validates_scope_checksum_bounds_and_missing_coverage() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session = "local-usage-test";
+        assert!(!local_judgment_usage(session).facts.available);
+        persist(session, &complete_events(), false).unwrap();
+        assert!(
+            !local_judgment_usage(session).facts.available,
+            "no snapshot is not zero usage"
+        );
+        persist_test_judgment_usage(session);
+        let captured = local_judgment_usage(session);
+        assert_eq!(captured.facts.attempts.len(), 1);
+        assert!(!captured.facts.truncated);
+        let summary = captured.summary();
+        assert!(summary.capture_incomplete);
+        assert_eq!(summary.coverage, "available");
+        assert!(!summary.render().contains("capture truncated"));
+        assert_eq!(summary.groups[0].known_input_tokens, 123);
+        assert!(summary.groups[0].input_incomplete);
+        assert!(summary.render().contains("local_captured_run_turn"));
+        let dir = astra_services::local_session_artifact_store()
+            .session_dir(session)
+            .unwrap();
+        let index = latest_capture(&dir).unwrap().unwrap();
+        let path = artifact_path(
+            &dir,
+            token_from_handle(index.handle.as_deref().unwrap()).unwrap(),
+        );
+        let original = std::fs::read(&path).unwrap();
+        for field in [
+            "attempt_id",
+            "provider",
+            "offering_id",
+            "operation_id",
+            "purpose",
+            "model_name",
+        ] {
+            let mut payload: Value = serde_json::from_slice(&original).unwrap();
+            for event in payload["events"].as_array_mut().unwrap() {
+                if let Some(attempts) = event
+                    .get_mut("auxiliary_usage")
+                    .and_then(|usage| usage.get_mut("attempts"))
+                    .and_then(Value::as_array_mut)
+                {
+                    attempts[0][field] = Value::String("x".repeat(1024));
+                }
+            }
+            let bytes = serde_json::to_vec(&payload).unwrap();
+            assert!(
+                serde_json::from_slice::<ExplainAnalyzeArtifactV1>(&bytes).is_ok(),
+                "{field}: fixture must reach canonical identity validation"
+            );
+            std::fs::write(&path, &bytes).unwrap();
+            let mut changed = index.clone();
+            changed.size_bytes = Some(bytes.len());
+            changed.checksum_sha256 = Some(format!("{:x}", Sha256::digest(&bytes)));
+            write_latest(&dir, changed);
+            let invalid = local_judgment_usage(session);
+            assert!(!invalid.facts.available, "{field}");
+            assert!(matches!(
+                invalid.scope,
+                astra_services::reflect::JudgmentUsageScope::LocalCapturedRunTurn { .. }
+            ));
+            assert!(!invalid.summary().render().contains(&"x".repeat(1024)));
+        }
+        std::fs::write(&path, b"{}").unwrap();
+        assert!(!local_judgment_usage(session).facts.available);
+        for field in ["session_id", "run_id", "turn_id"] {
+            let mut payload: Value = serde_json::from_slice(&original).unwrap();
+            payload[field] = Value::String("foreign".into());
+            let bytes = serde_json::to_vec(&payload).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let mut changed = index.clone();
+            changed.size_bytes = Some(bytes.len());
+            changed.checksum_sha256 = Some(format!("{:x}", Sha256::digest(&bytes)));
+            write_latest(&dir, changed);
+            assert!(!local_judgment_usage(session).facts.available, "{field}");
+        }
+        std::fs::write(&path, vec![b'x'; ARTIFACT_MAX_BYTES + 1]).unwrap();
+        assert!(!local_judgment_usage(session).facts.available);
+        persist_test_judgment_usage(session);
+        mark_unavailable(session, None, None, "not captured").unwrap();
+        assert!(
+            !local_judgment_usage(session).facts.available,
+            "must not reuse older success"
+        );
     }
 
     #[test]

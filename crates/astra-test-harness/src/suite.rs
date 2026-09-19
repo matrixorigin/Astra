@@ -1851,8 +1851,10 @@ mod tests {
         assert_eq!(parsed["calls"][1]["result"], "first extraction verified");
         assert_eq!(parsed["calls"][2]["result"], "second extraction verified");
         let prompt = crate::judger::build_judger_prompt("Was extraction verified?", &judged);
-        assert!(prompt.contains(&judged.stderr));
-        assert!(prompt.contains(projection));
+        let request: astra_turn_types::JudgmentRequest = serde_json::from_str(&prompt).unwrap();
+        let evidence = request.state["stderr"].as_str().unwrap();
+        assert!(evidence.contains(&judged.stderr));
+        assert!(evidence.contains(projection));
         assert_eq!(prompt.matches("chars elided").count(), 1);
         assert_eq!(original.stderr, before);
     }
@@ -1946,7 +1948,13 @@ mod tests {
                 assert_eq!(excerpt["tasks"][0]["execution_status"], "not_started");
             }
             let prompt = crate::judger::build_judger_prompt("Was cancellation evidenced?", &judged);
-            assert!(prompt.contains(&judged.stderr));
+            let request: astra_turn_types::JudgmentRequest = serde_json::from_str(&prompt).unwrap();
+            assert!(
+                request.state["stderr"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&judged.stderr)
+            );
         }
     }
 

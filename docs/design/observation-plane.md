@@ -262,6 +262,51 @@ building learning examples must retain per-request coverage and treat missing
 or expired diagnostics as unknown. Foreground settlement and recovery share
 the same coverage projection.
 
+## Semantic judgment trace
+
+Server lifecycle observability flushes prepare one annotated journal batch for
+local persistence and the existing bounded ingestion sender. Only generic
+`TraceSpan` records use this handoff; other event families retain their existing
+durable owners. Trusted owner/session and the captured execution generation bind
+the process-local sink once; this is not per-fact generation verification.
+Generic trace IDs need not be run IDs. Typed semantic readers validate their
+own run correlation. Historical facts may flush after waiting, cancellation or owner
+transfer without granting the old execution new authority. Local IO failure
+does not suppress enqueue or consume the retained buffer; missing/closed/full
+ingestion does not suppress local persistence. Exact batch replay retains the
+content-addressed storage ID. Changed interruption/eviction annotations change
+that ID; semantic readers reconcile equivalent observation identities, while
+generic trace readers must not assume annotation-changing retries are unique.
+The shared ingestion queue is bounded and prioritizes critical audit traffic;
+it does not promise per-owner telemetry fairness or complete trace capture.
+
+Request-classification observations use the existing `trace_span` envelope
+with name `semantic_judgment` and a bounded typed JSON string in
+`attrs["semantic_judgment.v1"]`. They do not create another usage or execution
+ledger. Initial classification and clarification are separate semantic stages,
+not a count of physical provider attempts. A classification that succeeds before
+planning fails remains a successful classification, not a failed judgment.
+
+The payload contains closed reasons, normalized answer values and provenance,
+run/turn/round correlation and a preflight evaluation identity. It excludes raw
+provider responses, prompts, tool output, parser error text and credentials.
+Trace shape alone is not producer authentication; these facts cannot authorize
+execution or settlement. Readers use authenticated owner/session storage scope,
+bound bytes before decoding, and exclude conflicting observation or terminal
+evaluation identities. Optional database reads use the existing
+cancellation-safe connection boundary.
+
+Known preparation failures are not-dispatched facts. Transport failure,
+cancellation and timeout do not by themselves establish whether a request was
+dispatched; delivery remains unresolved unless response receipt is known.
+Classification results do not authorize execution or prove model adoption or
+quality improvement. Success does not invent scores absent from the classifier's
+result. Unsupported old semantic payloads are rejected rather than migrated.
+
+Trace delivery remains lossy. Successful empty reads do not prove inactivity;
+query truncation, display omission and potential upstream loss remain distinct.
+Physical attempts and token totals continue to come from the inference ledger.
+
 ## Agent event field requirements
 
 Agent event storage should support the following logical fields, whether physically normalized or stored with indexed metadata:

@@ -17,6 +17,7 @@ mod config;
 mod http_helpers;
 mod input;
 mod interactive;
+mod judgment_compare;
 mod setup;
 
 pub use cli_args::AdminArgs;
@@ -26,6 +27,175 @@ use http_helpers::*;
 use input::*;
 use interactive::run_interactive;
 use setup::run_setup;
+
+/// Validate the opt-in default before any model or configuration mutation.
+fn judgment_default_name(models: &[serde_yaml_ng::Value]) -> Result<Option<&str>, String> {
+    let mut selected = None;
+    for entry in models {
+        let Some(value) = entry.get("judgment_default") else {
+            continue;
+        };
+        let enabled = value
+            .as_bool()
+            .ok_or("model.judgment_default must be true or false")?;
+        if enabled {
+            let name = entry
+                .get("name")
+                .and_then(serde_yaml_ng::Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .ok_or("judgment default model.name is missing")?;
+            if selected.replace(name).is_some() {
+                return Err("Only one model may set judgment_default: true".into());
+            }
+        }
+    }
+    Ok(selected)
+}
+
+async fn bind_judgment_default(api: &ThinClient, token: &str, name: &str) -> Result<(), String> {
+    api.put_bearer_path_json_text(token, &paths::admin_config_key("judgment_model"), &serde_json::json!({"value":name}))
+        .await.map_err(|e| format!("Could not confirm judgment model '{name}'. Check astra admin config get judgment_model before retrying: {}", map_thin_err(e)))?;
+    stdout_println!(
+        "Judgment model enabled: {name}. New request judgments use it; start a new session to refresh memory selection."
+    );
+    Ok(())
+}
+
+async fn load_models(
+    api: &ThinClient,
+    token: &str,
+    models: &[serde_yaml_ng::Value],
+    args: &ModelLoadArgs,
+) -> Result<(), String> {
+    let judgment_default = judgment_default_name(models)?;
+    for entry in models {
+        let model_name = entry
+            .get("name")
+            .and_then(serde_yaml_ng::Value::as_str)
+            .ok_or_else(|| "model.name missing".to_string())?;
+        let provider = entry
+            .get("provider")
+            .and_then(serde_yaml_ng::Value::as_str)
+            .ok_or_else(|| "model.provider missing".to_string())?;
+        let api_key = entry
+            .get("api_key")
+            .and_then(serde_yaml_ng::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let base_url = entry
+            .get("base_url")
+            .and_then(serde_yaml_ng::Value::as_str)
+            .map(ToString::to_string);
+        let metadata_only_update = args.update_existing && api_key.is_none();
+        let needs_check = if metadata_only_update {
+            let upd = build_model_update_payload(entry, provider, None, base_url.as_deref())?;
+            let body = api
+                .put_bearer_path_json_text(token, &paths::model(model_name), &upd)
+                .await
+                .map_err(map_thin_err)?;
+            stdout_println!("re-synced existing model metadata: {model_name}");
+            print_model_load_server_result(&body, model_name);
+            true
+        } else {
+            let api_key = api_key.ok_or_else(|| {
+                format!("model.api_key missing or empty for new model {model_name}")
+            })?;
+            let payload = build_model_create_payload(
+                entry,
+                model_name,
+                provider,
+                api_key,
+                base_url.as_deref(),
+            )?;
+            match api
+                .post_bearer_path_json_text(token, paths::MODELS, &payload)
+                .await
+            {
+                Ok(body) => {
+                    stdout_println!("loaded model: {model_name}");
+                    print_model_load_server_result(&body, model_name);
+                    true
+                }
+                Err(astra_thin_client::ThinClientError::Api { body, .. })
+                    if body.contains("already exists") =>
+                {
+                    if args.update_existing {
+                        let upd = build_model_update_payload(
+                            entry,
+                            provider,
+                            Some(api_key),
+                            base_url.as_deref(),
+                        )?;
+                        let body = api
+                            .put_bearer_path_json_text(token, &paths::model(model_name), &upd)
+                            .await
+                            .map_err(map_thin_err)?;
+                        stdout_println!("re-synced existing model: {model_name}");
+                        print_model_load_server_result(&body, model_name);
+                        true
+                    } else {
+                        stdout_println!(
+                            "skipped (already exists): {model_name} — use `astra admin model load {} --update-existing` to push YAML credentials and re-run connectivity",
+                            args.path
+                        );
+                        false
+                    }
+                }
+                Err(e) => return Err(map_thin_err(e)),
+            }
+        };
+        if needs_check {
+            match api
+                .post_bearer_path_empty_text(token, &paths::model_check(model_name))
+                .await
+            {
+                Ok(body) => {
+                    let checked = serde_json::from_str::<serde_json::Value>(&body).ok();
+                    if judgment_default == Some(model_name)
+                        && checked
+                            .as_ref()
+                            .and_then(|v| v.get("is_active"))
+                            .and_then(serde_json::Value::as_bool)
+                            != Some(true)
+                    {
+                        return Err(format!(
+                            "Judgment model '{model_name}' check did not confirm an active model; binding was not changed. Run: astra admin model check {model_name}"
+                        ));
+                    }
+                    let cap = checked
+                        .and_then(|v| v.get("thinking_capability")?.as_str().map(String::from));
+                    match cap.as_deref() {
+                        Some("both") => {
+                            stdout_println!("  thinking: both (Normal/Thinking picker) ✓")
+                        }
+                        Some("effort_only") => {
+                            stdout_println!("  thinking: effort_only (Low/High/Max effort) ✓")
+                        }
+                        Some("native_only") => {
+                            stdout_println!("  thinking: native_only (always thinks)")
+                        }
+                        Some("none") => stdout_println!("  thinking: none"),
+                        Some(other) => stdout_println!("  thinking: {other}"),
+                        None => stdout_println!("  thinking: probe returned no capability"),
+                    }
+                }
+                Err(e) => {
+                    if judgment_default == Some(model_name) {
+                        return Err(format!(
+                            "Judgment model '{model_name}' check failed; binding was not changed: {}",
+                            map_thin_err(e)
+                        ));
+                    }
+                    eprintln!("  thinking probe failed for {model_name}: {e}");
+                }
+            }
+        }
+    }
+    if let Some(name) = judgment_default {
+        bind_judgment_default(api, token, name).await?;
+    }
+    Ok(())
+}
 
 /// Parse `POST /models` or `PUT /models/{name}` JSON and print `is_active` / `connectivity`.
 fn print_model_load_server_result(body: &str, model_name: &str) {
@@ -454,11 +624,19 @@ pub async fn run(
             print_json_or_raw(&body);
             Ok(())
         }
+        Command::Model(ModelCmd::Compare(args)) => {
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            judgment_compare::run(&api, &token, &args).await
+        }
         Command::Model(ModelCmd::List) => {
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let body = session_runtime::load_server_model_catalog_json(&api, &token)
-                .await
-                .map_err(|error| error.to_string())?;
+            let body = session_runtime::load_server_model_catalog_json(
+                &api,
+                &token,
+                astra_core::model_wire::purpose::ModelCatalogPurpose::All,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
             print_json_or_raw(&body);
             Ok(())
         }
@@ -526,122 +704,7 @@ pub async fn run(
             };
 
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            for entry in models {
-                let model_name = entry
-                    .get("name")
-                    .and_then(serde_yaml_ng::Value::as_str)
-                    .ok_or_else(|| "model.name missing".to_string())?;
-                let provider = entry
-                    .get("provider")
-                    .and_then(serde_yaml_ng::Value::as_str)
-                    .ok_or_else(|| "model.provider missing".to_string())?;
-                let api_key = entry
-                    .get("api_key")
-                    .and_then(serde_yaml_ng::Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty());
-                let base_url = entry
-                    .get("base_url")
-                    .and_then(serde_yaml_ng::Value::as_str)
-                    .map(ToString::to_string);
-                let metadata_only_update = args.update_existing && api_key.is_none();
-                let needs_check = if metadata_only_update {
-                    let upd =
-                        build_model_update_payload(entry, provider, None, base_url.as_deref())?;
-                    let body = api
-                        .put_bearer_path_json_text(&token, &paths::model(model_name), &upd)
-                        .await
-                        .map_err(map_thin_err)?;
-                    stdout_println!("re-synced existing model metadata: {model_name}");
-                    print_model_load_server_result(&body, model_name);
-                    true
-                } else {
-                    let api_key = api_key.ok_or_else(|| {
-                        format!("model.api_key missing or empty for new model {model_name}")
-                    })?;
-                    let payload = build_model_create_payload(
-                        entry,
-                        model_name,
-                        provider,
-                        api_key,
-                        base_url.as_deref(),
-                    )?;
-                    match api
-                        .post_bearer_path_json_text(&token, paths::MODELS, &payload)
-                        .await
-                    {
-                        Ok(body) => {
-                            stdout_println!("loaded model: {model_name}");
-                            print_model_load_server_result(&body, model_name);
-                            true
-                        }
-                        Err(astra_thin_client::ThinClientError::Api { body, .. })
-                            if body.contains("already exists") =>
-                        {
-                            if args.update_existing {
-                                let upd = build_model_update_payload(
-                                    entry,
-                                    provider,
-                                    Some(api_key),
-                                    base_url.as_deref(),
-                                )?;
-                                let body = api
-                                    .put_bearer_path_json_text(
-                                        &token,
-                                        &paths::model(model_name),
-                                        &upd,
-                                    )
-                                    .await
-                                    .map_err(map_thin_err)?;
-                                stdout_println!("re-synced existing model: {model_name}");
-                                print_model_load_server_result(&body, model_name);
-                                true
-                            } else {
-                                stdout_println!(
-                                    "skipped (already exists): {model_name} — use `astra admin model load {} --update-existing` to push YAML credentials and re-run connectivity",
-                                    args.path
-                                );
-                                false
-                            }
-                        }
-                        Err(e) => return Err(map_thin_err(e)),
-                    }
-                };
-                if needs_check {
-                    match api
-                        .post_bearer_path_empty_text(&token, &paths::model_check(model_name))
-                        .await
-                    {
-                        Ok(body) => {
-                            let cap = serde_json::from_str::<serde_json::Value>(&body)
-                                .ok()
-                                .and_then(|v| {
-                                    v.get("thinking_capability")?.as_str().map(String::from)
-                                });
-                            match cap.as_deref() {
-                                Some("both") => {
-                                    stdout_println!("  thinking: both (Normal/Thinking picker) ✓")
-                                }
-                                Some("effort_only") => {
-                                    stdout_println!(
-                                        "  thinking: effort_only (Low/High/Max effort) ✓"
-                                    )
-                                }
-                                Some("native_only") => {
-                                    stdout_println!("  thinking: native_only (always thinks)")
-                                }
-                                Some("none") => stdout_println!("  thinking: none"),
-                                Some(other) => stdout_println!("  thinking: {other}"),
-                                None => stdout_println!("  thinking: probe returned no capability"),
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("  thinking probe failed for {model_name}: {e}");
-                        }
-                    }
-                }
-            }
-            Ok(())
+            load_models(&api, &token, models, &args).await
         }
         Command::Model(ModelCmd::Update(args)) => {
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
@@ -847,6 +910,101 @@ mod tests {
     }
 
     // ── existing field propagation (regression guard) ───────────────────
+
+    #[test]
+    fn judgment_default_rejects_invalid_or_multiple_selections() {
+        for source in [
+            "[{name: jev, judgment_default: 'true'}]",
+            "[{judgment_default: true}]",
+            "[{name: a, judgment_default: true}, {name: b, judgment_default: true}]",
+        ] {
+            let value = yaml(source);
+            assert!(judgment_default_name(value.as_sequence().unwrap()).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn model_load_binds_default_only_after_successful_checks() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for (default, check_status, active, binding_status, expected_ok) in [
+            (true, 200, Some(true), 200, true),
+            (false, 200, Some(true), 200, true),
+            (true, 503, Some(true), 200, false),
+            (true, 200, Some(true), 400, false),
+            (true, 200, Some(false), 200, false),
+            (true, 200, None, 200, false),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("PUT"))
+                .and(path("/models/jev"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"is_active":true,"context_window":1000})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/models/jev/check"))
+                .respond_with(
+                    ResponseTemplate::new(check_status)
+                        .set_body_json(serde_json::json!({"is_active":active})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path("/admin/config/judgment_model"))
+                .and(body_json(serde_json::json!({"value":"jev"})))
+                .respond_with(
+                    ResponseTemplate::new(binding_status)
+                        .set_body_json(serde_json::json!({"value":"jev"})),
+                )
+                .expect(if default && check_status == 200 && active == Some(true) {
+                    1
+                } else {
+                    0
+                })
+                .mount(&server)
+                .await;
+            // No credentials or profiles: metadata-only load uses the stored server key.
+            let doc = yaml(&format!(
+                "[{{name: jev, provider: typesafe, context_window: 1000, judgment_default: {default}}}]"
+            ));
+            let args = ModelLoadArgs {
+                path: "unused.yaml".into(),
+                update_existing: true,
+            };
+            let api = ThinClient::new(&server.uri(), None).unwrap();
+            let result = load_models(&api, "fake-token", doc.as_sequence().unwrap(), &args).await;
+            assert_eq!(result.is_ok(), expected_ok, "{result:?}");
+            let requests = server.received_requests().await.unwrap();
+            if default && check_status == 200 && active == Some(true) {
+                assert_eq!(
+                    requests.last().unwrap().url.path(),
+                    "/admin/config/judgment_model"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_judgment_default_makes_no_requests() {
+        let server = wiremock::MockServer::start().await;
+        let api = ThinClient::new(&server.uri(), None).unwrap();
+        let doc = yaml("[{name: a, judgment_default: true}, {name: b, judgment_default: true}]");
+        let args = ModelLoadArgs {
+            path: "unused.yaml".into(),
+            update_existing: true,
+        };
+        assert!(
+            load_models(&api, "fake-token", doc.as_sequence().unwrap(), &args)
+                .await
+                .is_err()
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
 
     #[test]
     fn create_payload_includes_all_optional_fields() {

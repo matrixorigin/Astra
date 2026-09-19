@@ -19,6 +19,7 @@ use crate::error_response_coded;
 /// non-serializable value.
 pub(crate) async fn admit_model_execution(
     model_service: &Arc<dyn ModelService>,
+    purpose: astra_core::model_wire::purpose::ModelRequestPurpose,
     user_id: &str,
     selection: &ModelSelection,
     resolved: Option<&ResolvedModelSelection>,
@@ -84,6 +85,7 @@ pub(crate) async fn admit_model_execution(
             astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER.to_string(),
             astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1.to_string(),
         );
+        astra_services::models::validate_model_execution_purpose(&execution, purpose)?;
         return Ok(execution);
     }
 
@@ -94,9 +96,11 @@ pub(crate) async fn admit_model_execution(
             "model_selection_invalid",
         ));
     }
-    model_service
+    let execution = model_service
         .admit_model_offering(user_id.to_string(), selection.offering_id.clone())
-        .await
+        .await?;
+    astra_services::models::validate_model_execution_purpose(&execution, purpose)?;
+    Ok(execution)
 }
 
 fn is_exact_runtime_identity(value: &str) -> bool {
@@ -142,6 +146,11 @@ mod tests {
             &self,
             offering_id: String,
         ) -> Result<ResolvedModelOffering, (StatusCode, Json<ErrorResponse>)> {
+            let provider = if offering_id == "offer-judgment" {
+                "typesafe"
+            } else {
+                "openai"
+            };
             Ok(ResolvedModelOffering {
                 offering_id,
                 model: ResolvedActiveLlmModel {
@@ -149,7 +158,7 @@ mod tests {
                     wire_model_name: Some("wire-model".into()),
                     api_key: "server-secret".into(),
                     base_url: "https://models.example/v1".into(),
-                    provider: "openai".into(),
+                    provider: provider.into(),
                     fallback_chain: Vec::new(),
                     tags: Vec::new(),
                     request_body_overrides: None,
@@ -206,10 +215,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_offering_cannot_bypass_chat_purpose_but_remains_a_typed_judge() {
+        use astra_core::model_wire::purpose::ModelRequestPurpose;
+        let service: Arc<dyn ModelService> = Arc::new(StaticModelService);
+        let selection = ModelSelection {
+            offering_id: "offer-judgment".into(),
+        };
+        let error = admit_model_execution(
+            &service,
+            ModelRequestPurpose::Chat,
+            "user-1",
+            &selection,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a directly supplied judgment Offering must fail before dispatch");
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.0.error_code.as_deref(),
+            Some("model_purpose_unsupported")
+        );
+        let judgment = admit_model_execution(
+            &service,
+            ModelRequestPurpose::TypedJudgment,
+            "user-1",
+            &selection,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("explicit typed judgments retain TypeSafe access");
+        assert_eq!(judgment.provider, "typesafe");
+        let ordinary = ModelSelection {
+            offering_id: "offer-server".into(),
+        };
+        assert!(
+            admit_model_execution(
+                &service,
+                ModelRequestPurpose::TypedJudgment,
+                "user-1",
+                &ordinary,
+                None,
+                None,
+                None
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn catalog_and_provider_context_materialize_the_same_execution_type() {
         let service: Arc<dyn ModelService> = Arc::new(StaticModelService);
         let catalog = admit_model_execution(
             &service,
+            astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
             "user-1",
             &ModelSelection {
                 offering_id: "offer-server".into(),
@@ -226,6 +289,7 @@ mod tests {
 
         let endpoint = admit_model_execution(
             &service,
+            astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
             "user-1",
             &ModelSelection {
                 offering_id: "offer-edge".into(),
@@ -270,6 +334,7 @@ mod tests {
         for context_window in [None, Some(0)] {
             let error = admit_model_execution(
                 &service,
+                astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
                 "user-1",
                 &ModelSelection {
                     offering_id: "offer-edge".into(),
@@ -306,6 +371,7 @@ mod tests {
         let service: Arc<dyn ModelService> = Arc::new(StaticModelService);
         let error = admit_model_execution(
             &service,
+            astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
             "user-1",
             &ModelSelection {
                 offering_id: "offer-requested".into(),

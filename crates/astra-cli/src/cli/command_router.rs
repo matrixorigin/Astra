@@ -422,9 +422,14 @@ async fn resolve_one_shot_model(
             offering_id: None,
         });
     };
-    let selection = session_runtime::resolve_server_model_selection(api, token, &model)
-        .await
-        .map_err(|error| format!("failed to resolve selected model '{model}': {error}"))?;
+    let selection = session_runtime::resolve_server_model_selection(
+        api,
+        token,
+        &model,
+        astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+    )
+    .await
+    .map_err(|error| format!("failed to resolve selected model '{model}': {error}"))?;
     Ok(ResolvedOneShotModel {
         // Preserve the caller's thinking suffix and spelling in the turn
         // payload; the shared resolver owns the canonical Offering identity.
@@ -2223,16 +2228,14 @@ async fn execute_cli_command_impl(
                 return Err("judgment message must not be empty".to_string());
             }
             let token = fresh_access_token_or_error(&api, profile.as_deref()).await?;
-            let selection =
-                session_runtime::resolve_server_model_selection(&api, &token, &args.model).await?;
-            let result = crate::cli::session_judge::execute(
+            let result = crate::cli::session_judge::execute_for_model(
                 &api,
                 &token,
-                &selection.offering_id,
+                &args.model,
                 &args.message,
                 args.timeout_seconds,
             )
-            .await;
+            .await?;
             if let Some(warning) = result.get("cleanup_warning") {
                 eprintln!("judge session cleanup: {warning}");
             }
@@ -2380,9 +2383,13 @@ async fn execute_cli_command_impl(
 
         Some(Command::Model(ModelCmd::List)) => {
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let body = session_runtime::load_server_model_catalog_json(api, &token)
-                .await
-                .map_err(|error| error.to_string())?;
+            let body = session_runtime::load_server_model_catalog_json(
+                api,
+                &token,
+                astra_core::model_wire::purpose::ModelCatalogPurpose::All,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
             print_json_or_raw(&body);
             Ok(ExitCode::Success)
         }

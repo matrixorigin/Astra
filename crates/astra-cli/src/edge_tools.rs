@@ -1441,6 +1441,7 @@ pub struct ToolExecutor {
     /// Populated once via `set_session_lessons`, then passed through on
     /// every `build_self_model_snapshot` for the session's lifetime.
     session_lessons: std::sync::Mutex<Vec<astra_services::LessonHint>>,
+    memory_selection_reports: std::sync::Mutex<Vec<astra_turn_types::MemorySelectionReport>>,
     /// P3.3 seam: latest auto-invoked diagnostic skill output.
     /// `AutoInvokeHandler::maybe_fire` writes each successful parse here;
     /// the next `build_self_model_snapshot` injects it into the prompt and
@@ -1579,6 +1580,7 @@ impl ToolExecutor {
             current_effective_input_budget_tokens: std::sync::RwLock::new(None),
             current_context_window_tokens: std::sync::RwLock::new(None),
             session_lessons: std::sync::Mutex::new(Vec::new()),
+            memory_selection_reports: std::sync::Mutex::new(Vec::new()),
             latest_skill_diagnosis: std::sync::Mutex::new(None),
             latest_turn_quality_feedback: std::sync::Mutex::new(None),
             self_mod_mutation_counter: std::sync::Mutex::new((0, 0)),
@@ -2450,6 +2452,23 @@ impl ToolExecutor {
         self.session_lessons
             .lock()
             .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_memory_selection_reports(
+        &self,
+        report: Vec<astra_turn_types::MemorySelectionReport>,
+    ) {
+        if let Ok(mut slot) = self.memory_selection_reports.lock() {
+            *slot = report;
+        }
+    }
+
+    pub fn memory_selection_reports(&self) -> Vec<astra_turn_types::MemorySelectionReport> {
+        self.memory_selection_reports
+            .lock()
+            .ok()
+            .map(|slot| slot.clone())
             .unwrap_or_default()
     }
 
@@ -3718,6 +3737,53 @@ impl ToolExecutor {
             }
             None => astra_turn_core::introspect::IntrospectSnapshot::default(),
         };
+
+        // Read only for requested local-capable judgment facets. These facts
+        // are historical source-qualified observations, not live authority.
+        if request.source_policy.allows_edge_local_artifacts()
+            && astra_services::semantic_judgment_observation::semantic_judgment_facet_enabled(
+                request.facet,
+            )
+            && let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty())
+        {
+            if snap.semantic_judgments.is_none()
+                || request.source_policy == astra_core::SourcePolicy::LocalOnly
+            {
+                let owner = astra_services::OwnerScope::local_user();
+                let window = astra_services::session_journal::read_journal_observation_window(
+                    &owner,
+                    &session_id,
+                );
+                let mut view = match window {
+                    Ok(window) => astra_services::semantic_judgment_observation::project_local_semantic_judgments(&window, &owner, &session_id, request.depth),
+                    Err(_) => astra_services::semantic_judgment_observation::SemanticJudgmentView::unavailable(astra_services::semantic_judgment_observation::SemanticJudgmentCoverage::SourceUnavailable),
+                };
+                view.scope = astra_services::semantic_judgment_observation::SemanticJudgmentScope::LocalJournalAtRead;
+                snap.semantic_judgments = Some(view);
+            }
+            if snap.judgment_usage.is_none()
+                || request.source_policy == astra_core::SourcePolicy::LocalOnly
+            {
+                let captured = crate::explain_analyze_artifact::local_judgment_usage(&session_id);
+                let mut usage =
+                    astra_turn_core::introspect::JudgmentUsageSnapshot::from_ledger(captured.facts);
+                usage.scope = captured.scope;
+                usage.capture_incomplete = true;
+                usage.input_complete = false;
+                usage.output_complete = false;
+                for group in &mut usage.groups {
+                    group.input_complete = false;
+                    group.output_complete = false;
+                }
+                if usage.coverage
+                    == astra_turn_core::introspect::JudgmentUsageCoverage::LedgerUnavailable
+                {
+                    usage.coverage =
+                        astra_turn_core::introspect::JudgmentUsageCoverage::LocalCaptureUnavailable;
+                }
+                snap.judgment_usage = Some(usage);
+            }
+        }
 
         // Overlay session-scoped injection freshness. The per-turn
         // snapshot lives on `AgenticLoopState` (not session) so the
@@ -9604,6 +9670,31 @@ mod tests {
         assert!(out.contains("not yet observed"), "got: {out}");
         assert!(!out.contains("1000000"), "got: {out}");
         assert!(!out.contains("800000"), "got: {out}");
+    }
+
+    #[test]
+    fn introspect_local_usage_uses_captured_scope_and_unknown_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let executor = test_executor();
+        executor.set_active_session_id("introspect-local-usage");
+        crate::explain_analyze_artifact::persist_test_judgment_usage("introspect-local-usage");
+        for depth in ["hint", "summary"] {
+            let output = executor.handle_introspect(&serde_json::json!({
+                "facet":"session", "source_policy":"local_only", "depth":depth
+            }));
+            assert!(output.contains("local_captured_run_turn"), "{output}");
+            assert!(output.contains("run-1"), "{output}");
+            assert!(output.contains("123"), "{output}");
+            assert!(
+                !output.contains("source=inference_provider_attempts"),
+                "{output}"
+            );
+        }
+        let excluded = executor.handle_introspect(&serde_json::json!({
+            "facet":"session", "source_policy":"cloud_only", "depth":"summary"
+        }));
+        assert!(!excluded.contains("jev-test"), "{excluded}");
     }
 
     #[test]

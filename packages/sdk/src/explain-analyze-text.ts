@@ -1,6 +1,8 @@
 import {
   explainAnalyzeCoverageGapLabel,
+  explainAnalyzeAuxiliaryUsageLines,
   formatMs,
+  memorySelectionLines,
   reduceExplainAnalyzeEvents,
 } from "./explain-analyze";
 import type { ExplainAnalyzeNodeV1 } from "./explain-analyze";
@@ -66,6 +68,8 @@ export function renderExplainAnalyzeText(
       state,
     );
   }
+
+  for (const line of explainAnalyzeAuxiliaryUsageLines(graph)) appendLine(lines, cleanText(line), state);
 
   if (graph.nodes.length === 0) {
     appendLine(lines, "", state);
@@ -306,6 +310,12 @@ function renderContext(
   if (state.truncated || !context.assembly) return;
 
   const assembly = context.assembly;
+  for (const report of assembly.edge_memory_selection ?? []) {
+    for (const line of memorySelectionLines(report)) {
+      appendLine(lines, `${detailPrefix}${line}`, state);
+      if (state.truncated) return;
+    }
+  }
   appendLine(lines, `${detailPrefix}· context estimate (runtime_text_estimate):`, state);
   if (state.truncated) return;
   for (const source of assembly.sources) {

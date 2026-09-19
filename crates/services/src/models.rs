@@ -542,6 +542,34 @@ pub struct ModelListItem {
     pub thinking_capability: Option<ThinkingCapability>,
 }
 
+/// Apply purpose eligibility to the complete catalog before pagination,
+/// revision, defaults and Model Access counts are computed.
+pub fn model_catalog_for_purpose(
+    mut items: Vec<ModelListItem>,
+    purpose: astra_core::model_wire::purpose::ModelCatalogPurpose,
+) -> Vec<ModelListItem> {
+    use astra_core::model_wire::purpose::ModelCatalogPurpose;
+    items.retain(|item| {
+        (purpose == ModelCatalogPurpose::All || item.is_active)
+            && purpose.supports_provider(&item.provider)
+    });
+    items
+}
+
+pub fn validate_model_execution_purpose(
+    execution: &AdmittedModelExecution,
+    purpose: astra_core::model_wire::purpose::ModelRequestPurpose,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if !purpose.supported_by(&execution.provider) {
+        return Err(astra_core::error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "Selected Offering does not support the requested inference purpose",
+            "model_purpose_unsupported",
+        ));
+    }
+    Ok(())
+}
+
 /// Stable seek cursor for the model catalog.
 ///
 /// The tuple is ordered lexicographically by provider, local model name, and
@@ -1953,9 +1981,15 @@ pub async fn resolve_reasoning_offering(
         .get(crate::admin_config::ADMIN_CONFIG_KEY_REASONING_OFFERING)
         .await?
     {
-        return resolve_active_llm_offering(matrixone, encryptor, &offering_id, pool)
+        let offering = resolve_active_llm_offering(matrixone, encryptor, &offering_id, pool)
             .await
-            .map_err(|error| error.to_string());
+            .map_err(|error| error.to_string())?;
+        if !astra_core::model_wire::purpose::ModelRequestPurpose::Chat
+            .supported_by(&offering.model.provider)
+        {
+            return Err("Selected Offering does not support reasoning/chat requests".into());
+        }
+        return Ok(offering);
     }
 
     // 2. Cheapest active. MatrixOne JSON function support is uneven, so sort in Rust:
@@ -1963,7 +1997,7 @@ pub async fn resolve_reasoning_offering(
     let pool = require_pool(pool, matrixone).await?;
 
     let rows = sqlx::query(&format!(
-        "SELECT model_id, {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1"
+        "SELECT model_id, {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1 AND provider != 'typesafe'"
     ))
     .fetch_all(&pool)
     .await
@@ -2115,7 +2149,7 @@ pub async fn resolve_memory_offerings(
     }
 
     let rows = sqlx::query(&format!(
-        "SELECT model_id, {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1"
+        "SELECT model_id, {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1 AND provider != 'typesafe'"
     ))
     .fetch_all(&pool)
     .await
@@ -3967,6 +4001,7 @@ pub fn resolve_provider_base_url(provider: &str) -> Option<String> {
     match provider {
         "openai" => Some("https://api.openai.com/v1".to_string()),
         "anthropic" => None,
+        "typesafe" => Some("https://api.typesafe.ai".to_string()),
         _ => None,
     }
 }
@@ -4141,7 +4176,21 @@ pub async fn validate_connectivity(
         Err(e) => return Some(format!("Client error: {}", e)),
     };
 
-    let result = if provider == "anthropic" {
+    let result = if provider == "typesafe" {
+        if api_key.trim().is_empty() {
+            return Some("TypeSafe API key is not configured".into());
+        }
+        let base = base_url
+            .unwrap_or("https://api.typesafe.ai")
+            .trim_end_matches('/')
+            .trim_end_matches("/v1");
+        let probe = format!("{base}/v1/systemone");
+        let send_result = client.post(&probe).bearer_auth(api_key).json(&serde_json::json!({
+            "model": model_name, "state": "Astra connectivity probe",
+            "questions": {"connected": {"type": "noul", "instructions": "Does the state mention Astra?"}}
+        })).send().await;
+        (send_result, probe)
+    } else if provider == "anthropic" {
         let probe = anthropic_messages_probe_url(base_url);
         let mut req = client
             .post(&probe)
@@ -4320,7 +4369,7 @@ async fn probe_thinking_behavior_with_protocol_inner(
     base_url: Option<&str>,
     protocol_override: Option<ThinkingProtocol>,
 ) -> ThinkingProbeResult {
-    if provider == "mock" {
+    if provider == "mock" || provider == "typesafe" {
         return ThinkingProbeResult {
             capability: ThinkingCapability::None,
             error: None,
@@ -5198,6 +5247,7 @@ pub fn project_model_access_with_default(
         &default_catalog,
         provider_default,
         observed_at,
+        astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
     )
 }
 
@@ -5216,6 +5266,7 @@ pub fn project_model_access_page(
         &default_catalog,
         None,
         observed_at,
+        astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
     )
 }
 
@@ -5228,6 +5279,7 @@ pub fn project_model_access_page_with_default_catalog(
     default_catalog: &[ModelListItemResponse],
     provider_default: Option<ModelDefaultCandidate>,
     observed_at: String,
+    purpose: astra_core::model_wire::purpose::ModelCatalogPurpose,
 ) -> crate::service_error::ServiceResult<ModelAccessProjectionResponse> {
     let mut accesses = BTreeMap::new();
     for access in declared {
@@ -5341,7 +5393,8 @@ pub fn project_model_access_page_with_default_catalog(
     // caller supplied an unsorted complete catalog.
     let mut canonical_default_catalog = default_catalog.to_vec();
     sort_model_list_item_responses(&mut canonical_default_catalog);
-    let default_resolution = resolve_model_default(&canonical_default_catalog, provider_default);
+    let default_resolution =
+        resolve_model_default(&canonical_default_catalog, provider_default, purpose);
     let default_offering_id = match &default_resolution {
         ModelDefaultResolution::Selected { offering_id, .. } => Some(offering_id.clone()),
         ModelDefaultResolution::Missing | ModelDefaultResolution::Invalid { .. } => None,
@@ -5398,6 +5451,7 @@ fn sort_model_list_item_responses(offerings: &mut [ModelListItemResponse]) {
 fn resolve_model_default(
     offerings: &[ModelListItemResponse],
     provider_default: Option<ModelDefaultCandidate>,
+    purpose: astra_core::model_wire::purpose::ModelCatalogPurpose,
 ) -> ModelDefaultResolution {
     match provider_default {
         Some(candidate) if validate_model_offering_id(&candidate.offering_id).is_err() => {
@@ -5406,9 +5460,10 @@ fn resolve_model_default(
             }
         }
         Some(candidate)
-            if offerings
-                .iter()
-                .any(|offering| offering.offering_id == candidate.offering_id) =>
+            if offerings.iter().any(|offering| {
+                offering.offering_id == candidate.offering_id
+                    && purpose.supports_provider(&offering.provider)
+            }) =>
         {
             ModelDefaultResolution::Selected {
                 offering_id: candidate.offering_id,
@@ -5419,7 +5474,10 @@ fn resolve_model_default(
         Some(_) => ModelDefaultResolution::Invalid {
             reason: ModelDefaultInvalidReason::NotEffectiveOffering,
         },
-        None => match offerings.first() {
+        None => match offerings
+            .iter()
+            .find(|offering| purpose.supports_provider(&offering.provider))
+        {
             Some(offering) => ModelDefaultResolution::Selected {
                 offering_id: offering.offering_id.clone(),
                 source: ModelDefaultSource::Astra,
@@ -7003,6 +7061,7 @@ mod tests {
             &[byok_offering],
             None,
             "2026-09-07T00:00:00Z".into(),
+            astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
         )
         .expect("mixed access projection");
 

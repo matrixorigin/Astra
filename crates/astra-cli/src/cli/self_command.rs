@@ -288,9 +288,109 @@ pub(crate) async fn render_reflect_surface_for_session_with_profile(
     request: ReflectRequest,
     profile: Option<&str>,
 ) -> Result<String, String> {
-    let artifacts = self_surface::load_artifacts(session_id, profile).await?;
+    use astra_services::semantic_judgment_observation::{
+        SemanticJudgmentCoverage, SemanticJudgmentScope, SemanticJudgmentView,
+        project_local_semantic_judgments, semantic_judgment_facet_enabled,
+    };
+    let owner = astra_services::OwnerScope::local_user();
+    let local_allowed = !matches!(
+        request.source_policy,
+        SourcePolicy::CloudOnly | SourcePolicy::LiveOnly
+    );
+    let window = if local_allowed {
+        session_journal::read_journal_observation_window(&owner, session_id).ok()
+    } else {
+        None
+    };
+    let semantic_judgments = semantic_judgment_facet_enabled(request.facet).then(|| {
+        if let Some(window) = &window {
+            project_local_semantic_judgments(window, &owner, session_id, request.depth)
+        } else {
+            let mut view = SemanticJudgmentView::unavailable(if local_allowed {
+                SemanticJudgmentCoverage::SourceUnavailable
+            } else {
+                SemanticJudgmentCoverage::SourceExcluded
+            });
+            view.scope = SemanticJudgmentScope::LocalJournalAtRead;
+            view
+        }
+    });
+    let artifacts = if request.source_policy == SourcePolicy::LocalOnly {
+        self_surface::load_local_observation_artifacts(
+            session_id,
+            window
+                .as_ref()
+                .map(|window| window.events.clone())
+                .unwrap_or_default(),
+        )?
+    } else {
+        self_surface::load_artifacts(session_id, profile).await?
+    };
     let bounded_limit = usize::try_from(request.last_n).unwrap_or(journal_limit.max(1));
-    to_json(&build_reflect_response(&artifacts, bounded_limit, request).await)
+    let mut report = build_reflect_response(&artifacts, bounded_limit, request).await;
+    if report.semantic_judgments.is_none() {
+        report.semantic_judgments = semantic_judgments;
+    }
+    if let Some(semantics) = &report.semantic_judgments {
+        report.summary.push(' ');
+        report.summary.push_str(&semantics.render());
+        report.data_coverage.providers.insert(
+            "semantic_judgment_trace".into(),
+            ObservationProviderCoverage {
+                status: if semantics.counts.is_some() {
+                    "partial"
+                } else {
+                    "missing"
+                }
+                .into(),
+                freshness_ms: None,
+                reason: Some(format!(
+                    "{:?}:{:?};classification_not_execution_authority",
+                    semantics.scope, semantics.coverage
+                )),
+            },
+        );
+        if report.judgment_usage.is_none() {
+            let usage = if local_allowed {
+                crate::explain_analyze_artifact::local_judgment_usage(session_id).summary()
+            } else {
+                astra_services::reflect::JudgmentUsageSummary {
+                    scope: astra_services::reflect::JudgmentUsageScope::LocalCaptureUnavailable,
+                    capture_incomplete: true,
+                    coverage: "source_excluded".into(),
+                    groups: vec![],
+                    omitted_groups: 0,
+                }
+            };
+            report.summary.push(' ');
+            report.summary.push_str(&usage.render());
+            report.judgment_usage = Some(usage);
+        }
+    }
+    if report.source_policy == "local_only" {
+        report.summary.push_str(" Local evidence is a bounded journal window (at most 512 records / 256 KiB), not complete session history.");
+        report.data_coverage.overall = "partial".to_string();
+        report.data_coverage.providers.insert(
+            "local_journal".to_string(),
+            ObservationProviderCoverage {
+                status: if window.as_ref().is_some_and(|window| window.available) {
+                    "partial"
+                } else {
+                    "unavailable"
+                }
+                .to_string(),
+                freshness_ms: None,
+                reason: Some(
+                    "Bounded local window; missing history and upstream trace loss are unknown."
+                        .to_string(),
+                ),
+            },
+        );
+    }
+    if let Some(view) = &mut report.view {
+        view.data_coverage = report.data_coverage.clone();
+    }
+    to_json(&report.project_lightweight())
 }
 
 pub(crate) fn agent_info_surface_alias(dimension: &str) -> Option<&'static str> {
@@ -484,6 +584,8 @@ async fn build_reflect_response(
         source_policy: request.source_policy.as_str().to_string(),
         include_context: request.include_context,
         data_coverage,
+        judgment_usage: None,
+        semantic_judgments: None,
         view: Some(view),
         summary,
         observations,
@@ -1649,9 +1751,10 @@ fn event_preview_ref_namespace(event: &EventPreview) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        EventPreview, analysis_view_recent_event_previews, build_reflect_response,
+        EventPreview, SourcePolicy, analysis_view_recent_event_previews, build_reflect_response,
         cli_provider_visible_tool_names, event_preview_has_adverse_signal, event_preview_summary,
-        execute_self_command, persist_config_override, resolve_session_id,
+        execute_self_command, persist_config_override,
+        render_reflect_surface_for_session_with_profile, resolve_session_id,
         restored_recent_turn_previews, session_agent_delivery_summary, verify_runtime_config,
     };
     use crate::cli::cli_config::cli_args::{
@@ -2397,6 +2500,197 @@ mod tests {
         assert!(checks.iter().any(|check| {
             check["name"] == "steps_present_when_journal_present" && check["ok"] == true
         }));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn local_only_reflect_does_not_restore_cloud_and_reports_unknown_usage() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let _creds_guard = crate::tests::isolate_credentials();
+        let server = MockServer::start().await;
+        let _api_url = EnvGuard::set("ASTRA_API_URL", &server.uri());
+        let _token = EnvGuard::set("ASTRA_ACCESS_TOKEN", "test-token");
+        let mut request =
+            ReflectRequest::from_observation_params(None, Some("overview"), None, None, 20, "");
+        request.source_policy = SourcePolicy::LocalOnly;
+        let body = render_reflect_surface_for_session_with_profile(
+            "local-observation-missing",
+            20,
+            request,
+            None,
+        )
+        .await
+        .unwrap();
+        let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            report["semantic_judgments"]["scope"],
+            "local_journal_at_read"
+        );
+        assert_eq!(
+            report["semantic_judgments"]["coverage"],
+            "source_unavailable"
+        );
+        assert!(report["semantic_judgments"]["counts"].is_null());
+        assert_eq!(report["judgment_usage"]["coverage"], "unavailable");
+        assert!(
+            report["summary"]
+                .as_str()
+                .unwrap()
+                .contains("bounded owner-local journal")
+        );
+        assert!(
+            report["summary"]
+                .as_str()
+                .unwrap()
+                .contains("counts unavailable, not zero")
+        );
+        assert_eq!(
+            report["judgment_usage"]["scope"],
+            "local_capture_unavailable"
+        );
+        assert!(
+            report["judgment_usage"]["groups"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            report["view"]["data_coverage"]["providers"]["semantic_judgment_trace"]["status"],
+            "missing"
+        );
+        let observation =
+            serde_json::from_value::<astra_turn_types::SemanticJudgmentObservationV1>(
+                serde_json::json!({
+                    "schema_version": 1,
+                    "correlation": {
+                        "run_id": "local-run", "turn": 1, "round": 0,
+                        "owner_generation": null, "evaluation_span_id": "local-evaluation",
+                        "invocation": {"status": "unavailable"}
+                    },
+                    "fact": {
+                        "stage": "initial",
+                        "result": {"result": "not_dispatched", "reason": "no_offering"}
+                    }
+                }),
+            )
+            .unwrap();
+        let populated_session = "local-observation-populated";
+        let event = astra_services::semantic_judgment_observation::semantic_judgment_trace(
+            "local-observation",
+            &observation,
+            0,
+        )
+        .unwrap()
+        .session_id(Some(populated_session))
+        .build();
+        session_journal::JournalWriter::new(populated_session)
+            .unwrap()
+            .append(&event)
+            .unwrap();
+        for depth in ["hint", "summary"] {
+            let mut request = ReflectRequest::from_observation_params(
+                None,
+                Some("overview"),
+                Some(depth),
+                None,
+                20,
+                "",
+            );
+            request.source_policy = SourcePolicy::LocalOnly;
+            let body = render_reflect_surface_for_session_with_profile(
+                populated_session,
+                20,
+                request,
+                None,
+            )
+            .await
+            .unwrap();
+            let populated: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                populated["semantic_judgments"]["counts"]["not_dispatched"],
+                1
+            );
+            assert_eq!(populated["semantic_judgments"]["counts"]["evaluated"], 0);
+            assert_eq!(
+                populated["semantic_judgments"]["observations"][0]["observation"]["fact"]["result"]
+                    ["reason"],
+                "no_offering"
+            );
+            assert_eq!(populated["judgment_usage"]["coverage"], "unavailable");
+        }
+        crate::explain_analyze_artifact::persist_test_judgment_usage(populated_session);
+        for depth in ["hint", "summary"] {
+            let mut request = ReflectRequest::from_observation_params(
+                None,
+                Some("overview"),
+                Some(depth),
+                None,
+                20,
+                "",
+            );
+            request.source_policy = SourcePolicy::LocalOnly;
+            let body = render_reflect_surface_for_session_with_profile(
+                populated_session,
+                20,
+                request,
+                None,
+            )
+            .await
+            .unwrap();
+            let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                report["judgment_usage"]["groups"][0]["known_input_tokens"],
+                123
+            );
+            assert_eq!(
+                report["judgment_usage"]["groups"][0]["input_incomplete"],
+                true
+            );
+            assert_eq!(
+                report["judgment_usage"]["groups"][0]["known_output_tokens"],
+                7
+            );
+            assert_eq!(
+                report["judgment_usage"]["groups"][0]["output_incomplete"],
+                true
+            );
+            assert_eq!(report["judgment_usage"]["capture_incomplete"], true);
+            assert_eq!(
+                report["judgment_usage"]["scope"]["local_captured_run_turn"]["turn_id"],
+                "turn-2"
+            );
+            assert!(
+                report["summary"].as_str().unwrap().chars().count()
+                    <= if depth == "hint" { 181 } else { 361 }
+            );
+            assert_eq!(
+                report["judgment_usage"]["scope"]["local_captured_run_turn"]["run_id"],
+                "run-1"
+            );
+        }
+        let mut unrelated =
+            ReflectRequest::from_observation_params(None, Some("cache"), None, None, 20, "");
+        assert_eq!(unrelated.facet, astra_core::ObservationFacet::Cache);
+        unrelated.source_policy = SourcePolicy::LocalOnly;
+        let body = render_reflect_surface_for_session_with_profile(
+            "local-observation-missing",
+            20,
+            unrelated,
+            None,
+        )
+        .await
+        .unwrap();
+        let unrelated: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(unrelated["semantic_judgments"].is_null());
+        assert!(unrelated["judgment_usage"].is_null());
+        assert!(
+            !unrelated["summary"]
+                .as_str()
+                .unwrap()
+                .contains("Semantic judgments:")
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[serial_test::serial]

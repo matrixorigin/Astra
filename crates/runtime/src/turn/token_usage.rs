@@ -224,7 +224,7 @@ pub fn extract_usage_presence(
 }
 
 fn as_u64(v: Option<&Value>) -> Option<u64> {
-    v.and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
+    v.and_then(Value::as_u64)
 }
 
 fn extract_openai(u: &Map<String, Value>) -> Option<TokenUsage> {
@@ -369,6 +369,29 @@ fn extract_anthropic(u: &Map<String, Value>) -> Option<TokenUsage> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn negative_provider_counts_are_unknown_but_reported_zero_is_known() {
+        use super::*;
+        for (dialect, input, output) in [
+            (UsageDialect::OpenAi, "prompt_tokens", "completion_tokens"),
+            (
+                UsageDialect::AnthropicMessages,
+                "input_tokens",
+                "output_tokens",
+            ),
+            (UsageDialect::BedrockConverse, "inputTokens", "outputTokens"),
+        ] {
+            let mut raw = serde_json::Map::new();
+            raw.insert(input.into(), serde_json::json!(-1));
+            raw.insert(output.into(), serde_json::json!(0));
+            let presence = extract_usage_presence(dialect, &raw);
+            assert!(!presence.fresh_input_tokens);
+            assert!(presence.output_tokens);
+            raw.insert(input.into(), serde_json::json!(0));
+            assert!(extract_usage_presence(dialect, &raw).fresh_input_tokens);
+        }
+    }
+
     use super::*;
     use serde_json::json;
 

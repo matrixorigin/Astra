@@ -1057,6 +1057,7 @@ mod tests {
     ) -> astra_turn_types::ExplainAnalyzeEventV1 {
         let finished = transition == astra_turn_types::ExplainAnalyzeTransitionV1::Finished;
         astra_turn_types::ExplainAnalyzeEventV1 {
+            auxiliary_usage: None,
             schema_version: astra_turn_types::EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: event_id.to_string(),
             run_id: run_id.to_string(),

@@ -4189,35 +4189,34 @@ fn flush_turn_observability(
     user_id: &str,
     session_id: &str,
     interrupted: bool,
+    ingestion: Option<&astra_services::event_ingestion::IngestionSender>,
+    execution_generation: Option<u64>,
 ) {
+    let scope_matches = state.current_session_id.as_deref() == Some(session_id)
+        && state.context_manifest_user_id.as_deref() == Some(user_id);
+    if !scope_matches {
+        tracing::warn!("turn observability flush rejected: execution owner/session mismatch");
+        return;
+    }
+    let generation_matches = execution_generation.is_some()
+        && state.current_run_owner_generation == execution_generation;
     let Some(buf) = state.turn_event_buffer.as_mut() else {
         return;
     };
     if buf.is_empty() {
         return;
     }
-    let Ok(writer) = astra_services::session_journal::JournalWriter::for_user(user_id, session_id)
-    else {
-        tracing::warn!(
-            session_id,
-            "flush_turn_observability: failed to create journal writer"
-        );
-        return;
-    };
-    if interrupted {
-        if let Err(e) = buf.flush_interrupted(&writer) {
-            tracing::warn!(
-                session_id,
-                error = %e,
-                "flush_turn_observability: flush_interrupted failed"
-            );
+    if generation_matches
+        && let (Some(sender), Some(generation)) = (ingestion, execution_generation)
+    {
+        if let Err(error) =
+            buf.bind_trace_ingestion(user_id, session_id, generation, sender.clone())
+        {
+            tracing::warn!(error, "turn trace sink binding rejected");
         }
-    } else if let Err(e) = buf.flush(&writer) {
-        tracing::warn!(
-            session_id,
-            error = %e,
-            "flush_turn_observability: flush failed"
-        );
+    }
+    if let Err(error) = buf.flush_for_owner(Some(user_id), session_id, interrupted) {
+        tracing::warn!(%error, "turn observability flush failed");
     }
 }
 
@@ -4250,7 +4249,9 @@ async fn configure_runtime_controllers(
     loop_state: &mut AgenticLoopState,
     user_id: &str,
     session_id: &str,
+    trace_ingestion: Option<astra_services::event_ingestion::IngestionSender>,
 ) {
+    loop_state.telemetry.trace_ingestion = trace_ingestion;
     let evaluation_persistence = shared_pool.map(|pool| EvaluationPersistenceContext {
         user_id: user_id.to_string(),
         evaluation_service: build_runtime_evaluation_service(matrixone, pool),
@@ -5310,6 +5311,7 @@ pub struct AgenticRunLifecycleService {
     observer_worker: Option<Arc<dyn TurnObserverWorker>>,
     /// Auxiliary event writer for ask_user lifecycle audit events.
     auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
+    trace_ingestion: Option<astra_services::event_ingestion::IngestionSender>,
     /// Counter of in-flight background agentic loop tasks.
     /// Incremented before spawn, decremented when the task exits.
     /// Used by `drain_background_tasks` for graceful shutdown.
@@ -5431,6 +5433,7 @@ impl AgenticRunLifecycleService {
             hook_db_writer: None,
             observer_worker: None,
             auxiliary_event_writer: None,
+            trace_ingestion: None,
             background_task_count: Arc::new(AtomicUsize::new(0)),
             background_run_abort_handles: Arc::new(std::sync::Mutex::new(Vec::new())),
             execution_handoff_requested: Arc::new(AtomicBool::new(false)),
@@ -6226,6 +6229,14 @@ impl AgenticRunLifecycleService {
         self
     }
 
+    pub fn with_trace_ingestion(
+        mut self,
+        sender: Option<astra_services::event_ingestion::IngestionSender>,
+    ) -> Self {
+        self.trace_ingestion = sender;
+        self
+    }
+
     pub fn with_auxiliary_event_writer(
         mut self,
         writer: Arc<dyn crate::TurnAuxiliaryEventWriter>,
@@ -6509,7 +6520,8 @@ impl AgenticRunLifecycleService {
         .with_skill_service(self.skill_service.clone())
         .with_memory_extraction_service(self.memory_extraction_service.clone())
         .with_reflect_service(Arc::clone(&self.reflect_service))
-        .with_auxiliary_event_writer(self.auxiliary_event_writer.clone());
+        .with_auxiliary_event_writer(self.auxiliary_event_writer.clone())
+        .with_trace_ingestion(self.trace_ingestion.clone());
         if let Some(service) = self.edge_dispatch_service.clone() {
             executor = executor.with_edge_dispatch_service(service);
         }
@@ -9916,7 +9928,10 @@ impl AgenticRunLifecycleService {
                 .model_service
                 .user_model_catalog(user_id.to_string())
                 .await?;
-            let offerings = catalog.items;
+            let offerings = astra_services::models::model_catalog_for_purpose(
+                catalog.items,
+                astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+            );
             let declared = astra_services::models::server_model_access_declarations(
                 catalog.allows_deployment,
                 offerings.iter().map(|item| item.access_kind),
@@ -9957,6 +9972,7 @@ impl AgenticRunLifecycleService {
             let selection = ModelSelection { offering_id };
             let admitted = crate::server::model_execution_admission::admit_model_execution(
                 &self.model_service,
+                astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
                 user_id,
                 &selection,
                 None,
@@ -10012,6 +10028,7 @@ impl AgenticRunLifecycleService {
             request.admitted_model_execution = Some(
                 crate::server::model_execution_admission::admit_model_execution(
                     &self.model_service,
+                    astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
                     user_id,
                     selection,
                     Some(resolved),
@@ -10032,6 +10049,7 @@ impl AgenticRunLifecycleService {
         }
         let admitted = crate::server::model_execution_admission::admit_model_execution(
             &self.model_service,
+            astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
             user_id,
             selection,
             None,
@@ -14189,6 +14207,7 @@ impl AgenticRunLifecycleService {
         let bg_cloud_workspace_record = cloud_workspace_record.clone();
         let bg_workspace_record_store = self.workspace_record_store.clone();
         let bg_shared_pool = self.shared_pool.clone();
+        let bg_trace_ingestion = self.trace_ingestion.clone();
         let bg_explain = request.explain;
         let bg_metrics_registry = self.metrics_registry.clone();
         let bg_cancel_flag = cancel_flag.clone();
@@ -14570,6 +14589,8 @@ impl AgenticRunLifecycleService {
                             &bg_user_id,
                             &bg_session_id,
                             true,
+                            bg_trace_ingestion.as_ref(),
+                            Some(execution_owner_generation),
                         );
                     } else {
                         run.events.extend(events);
@@ -15005,8 +15026,17 @@ impl AgenticRunLifecycleService {
                 // side effects do not extend the executor's apparent lifetime.
                 drop(_owner_lease_heartbeat);
 
+                // Historical trace facts survive waiting, pause and owner transfer;
+                // unlike terminal projections they do not authorize new actions.
+                flush_turn_observability(
+                    &mut loop_state,
+                    &bg_user_id,
+                    &bg_session_id,
+                    false,
+                    bg_trace_ingestion.as_ref(),
+                    Some(execution_owner_generation),
+                );
                 if owner_terminal_committed && persist_terminal_events {
-                    flush_turn_observability(&mut loop_state, &bg_user_id, &bg_session_id, false);
                     persist_turn_evaluation_journal(
                         &bg_user_id,
                         &bg_session_id,
@@ -15632,6 +15662,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &mut loop_state,
             &user_id,
             &session_id,
+            self.trace_ingestion.clone(),
         )
         .await;
         // The RuntimeToolExecutor is the owner for server-side runtime tools
@@ -17121,6 +17152,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &mut state,
             &user_id,
             &session_id,
+            self.trace_ingestion.clone(),
         );
         tokio::join!(persist_user_transcript, configure_controllers);
 
@@ -17405,6 +17437,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_cloud_workspace_record = cloud_workspace_record.clone();
         let bg_workspace_record_store = self.workspace_record_store.clone();
         let bg_shared_pool = self.shared_pool.clone();
+        let bg_trace_ingestion = self.trace_ingestion.clone();
         let bg_explain = request.explain;
         let missing_lifecycle_spawner = Arc::clone(&stream_agent_spawner);
         let bg_metrics_registry = self.metrics_registry.clone();
@@ -17962,7 +17995,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         if final_status != RunStatus::Waiting {
                             run.live_tx = None;
                         }
-                        flush_turn_observability(&mut state, &bg_user_id, &bg_session_id, true);
+                        flush_turn_observability(
+                            &mut state,
+                            &bg_user_id,
+                            &bg_session_id,
+                            true,
+                            bg_trace_ingestion.as_ref(),
+                            Some(execution_owner_generation),
+                        );
                     } else {
                         run.events.append(&mut terminal_state_events);
                         if should_preserve_manual_pause_on_completion(
@@ -17982,7 +18022,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         if !run.status.is_resumable() {
                             run.live_tx = None;
                         }
-                        flush_turn_observability(&mut state, &bg_user_id, &bg_session_id, false);
+                        flush_turn_observability(
+                            &mut state,
+                            &bg_user_id,
+                            &bg_session_id,
+                            false,
+                            bg_trace_ingestion.as_ref(),
+                            Some(execution_owner_generation),
+                        );
                     }
                 }
 
@@ -20035,6 +20082,7 @@ pub struct ServerSpawnAgentExecutor {
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
     reflect_service: Arc<dyn astra_services::ReflectService>,
     auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
+    trace_ingestion: Option<astra_services::event_ingestion::IngestionSender>,
     /// One atomic registry owns current parent lookup, immutable per-attempt
     /// cancellation bindings, and every per-run publication. Terminal drain
     /// is therefore O(generations of this run), never a global binding scan.
@@ -20130,6 +20178,7 @@ impl ServerSpawnAgentExecutor {
             memory_extraction_service: None,
             reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
             auxiliary_event_writer: None,
+            trace_ingestion: None,
             runtime_context_registry: Arc::new(RwLock::new(
                 ServerSpawnRuntimeContextRegistry::default(),
             )),
@@ -20197,6 +20246,14 @@ impl ServerSpawnAgentExecutor {
         service: Arc<dyn astra_services::ReflectService>,
     ) -> Self {
         self.reflect_service = service;
+        self
+    }
+
+    pub fn with_trace_ingestion(
+        mut self,
+        sender: Option<astra_services::event_ingestion::IngestionSender>,
+    ) -> Self {
+        self.trace_ingestion = sender;
         self
     }
 
@@ -20671,6 +20728,7 @@ impl ServerSpawnAgentExecutor {
             .with_edge_tools(edge_tools)
             .with_reflect_service(Arc::clone(&self.reflect_service))
             .with_auxiliary_event_writer(self.auxiliary_event_writer.clone())
+            .with_trace_ingestion(self.trace_ingestion.clone())
             .with_dynamic_agent_spawner(dynamic_agent_spawner)
             .with_client_tool_delivery_tx(client_tool_delivery_tx);
         executor
@@ -21808,6 +21866,7 @@ pub struct ServerSubRunExecutor {
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
     reflect_service: Arc<dyn astra_services::ReflectService>,
     auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
+    trace_ingestion: Option<astra_services::event_ingestion::IngestionSender>,
     inherited_permissions: InheritedPermissions,
     /// Present for dynamic `agent(action='spawn')` descendants.  Delegation
     /// engine sub-runs can omit it; dynamic children must receive the same
@@ -21871,6 +21930,7 @@ impl ServerSubRunExecutor {
             memory_extraction_service: None,
             reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
             auxiliary_event_writer: None,
+            trace_ingestion: None,
             inherited_permissions: InheritedPermissions::auto_approve(),
             dynamic_agent_spawner: None,
             client_tool_delivery_tx: None,
@@ -21943,6 +22003,14 @@ impl ServerSubRunExecutor {
         service: Arc<dyn astra_services::ReflectService>,
     ) -> Self {
         self.reflect_service = service;
+        self
+    }
+
+    pub fn with_trace_ingestion(
+        mut self,
+        sender: Option<astra_services::event_ingestion::IngestionSender>,
+    ) -> Self {
+        self.trace_ingestion = sender;
         self
     }
 
@@ -23656,6 +23724,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             &mut loop_state,
             &config.user_id,
             &config.session_id,
+            self.trace_ingestion.clone(),
         )
         .await;
 
@@ -24111,7 +24180,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
             &loop_state,
             control_authority.map_or(durable_status, DurableSubrunControlAuthority::status),
         );
-        flush_turn_observability(&mut loop_state, &config.user_id, &config.session_id, false);
+        flush_turn_observability(&mut loop_state, &config.user_id, &config.session_id,
+            control_authority == Some(DurableSubrunControlAuthority::Cancelled),
+            self.trace_ingestion.as_ref(), execution_owner_generation);
 
         if let Some(pool) = self.shared_pool.as_ref()
             && let Err(error) = materialize_server_run_transcript_evidence(

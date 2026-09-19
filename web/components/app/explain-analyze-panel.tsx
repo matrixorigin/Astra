@@ -15,6 +15,7 @@ import {
   layoutExplainAnalyzeGraph,
   reduceExplainAnalyzeEvents,
   renderExplainAnalyzeHtml,
+  explainAnalyzeAuxiliaryUsageLines,
   renderExplainAnalyzeText,
 } from "@astra/sdk";
 import type {
@@ -307,6 +308,12 @@ export function ExplainAnalyzePanel({
         {observedAttempts.length > 0 && (!allExact || lanes.some((lane) => lane.value === null)) ?
           <span>Reported subtotal · {reportedAttempts.length}/{observedAttempts.length} requests · partial or estimated</span> : null}
       </div>
+
+      {explainAnalyzeAuxiliaryUsageLines(graph).length > 0 ? (
+        <div aria-label="Auxiliary model token usage" className="space-y-1 border-b border-border px-5 py-2 text-xs text-text-muted">
+          {explainAnalyzeAuxiliaryUsageLines(graph).map((line, index) => <p key={index}>{line}</p>)}
+        </div>
+      ) : null}
 
       <section aria-labelledby={`${panelId}-graph-heading`} className="px-5 pb-4 pt-2">
         <button

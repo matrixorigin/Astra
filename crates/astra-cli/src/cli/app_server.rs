@@ -1904,6 +1904,7 @@ mod tests {
     #[test]
     fn stream_event_notification_maps_typed_explain_analyze_fact() {
         let fact = astra_turn_types::ExplainAnalyzeEventV1 {
+            auxiliary_usage: None,
             schema_version: astra_turn_types::EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: "clock-1:1".into(),
             run_id: "run-1".into(),

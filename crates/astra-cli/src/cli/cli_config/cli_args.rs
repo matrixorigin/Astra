@@ -912,7 +912,7 @@ pub(crate) enum SessionCmd {
 
 #[derive(Args, Debug)]
 pub(crate) struct SessionJudgeArgs {
-    /// Rubric and evidence to evaluate (not an agent task to execute)
+    /// JudgmentRequest JSON with shared evidence and typed questions (no agent task)
     #[arg(short, long)]
     pub message: String,
     /// Active Server model selector

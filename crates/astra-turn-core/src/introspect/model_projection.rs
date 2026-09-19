@@ -22,6 +22,12 @@ impl IntrospectReport {
                 "summary_shortened": false
             }
         });
+        if self.semantic_judgments.is_some() {
+            projected["projection_budget"]["omitted_fields"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("semantic_judgments"));
+        }
         self.update_projection_counts(&mut projected);
         assert!(
             fits(&projected, max_chars),
@@ -128,6 +134,14 @@ impl IntrospectReport {
             json!(self.data_coverage),
             max_chars,
         );
+        if let Some(semantics) = &self.semantic_judgments {
+            self.fit_field(
+                &mut projected,
+                "semantic_judgments",
+                json!(semantics),
+                max_chars,
+            );
+        }
         for hint in &self.action_hints {
             if hint.observation_refs.is_empty()
                 || !hint.observation_refs.iter().all(|reference| {
@@ -242,6 +256,37 @@ mod tests {
             report.observations.len() - result["observations"].as_array().unwrap().len()
         );
         assert_eq!(serde_json::to_value(&report).unwrap(), before);
+    }
+
+    #[test]
+    fn semantic_judgment_projection_only_reports_existing_omitted_field() {
+        let mut report = build_introspect_report(
+            &IntrospectSnapshot::default(),
+            &IntrospectRequest::default(),
+        );
+        report.semantic_judgments = None;
+        let projected: Value =
+            serde_json::from_str(&report.model_projection(INTROSPECT_MODEL_RESULT_CHARS)).unwrap();
+        assert!(
+            !projected["projection_budget"]["omitted_fields"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("semantic_judgments"))
+        );
+        let view = astra_services::semantic_judgment_observation::SemanticJudgmentView {
+            capture_gaps: vec![astra_services::semantic_judgment_observation::SemanticJudgmentCaptureGap::TraceMayBeDropped; INTROSPECT_MODEL_RESULT_CHARS],
+            ..Default::default()
+        };
+        report.semantic_judgments = Some(view);
+        let projected: Value =
+            serde_json::from_str(&report.model_projection(INTROSPECT_MODEL_RESULT_CHARS)).unwrap();
+        assert!(projected.get("semantic_judgments").is_none());
+        assert!(
+            projected["projection_budget"]["omitted_fields"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("semantic_judgments"))
+        );
     }
 
     #[test]

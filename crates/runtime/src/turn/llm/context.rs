@@ -532,6 +532,7 @@ fn explain_analyze_context_assembly_metrics(
     }
 
     let assembly = astra_turn_types::ExplainAnalyzeContextAssemblyV1 {
+        edge_memory_selection: Vec::new(),
         basis: astra_turn_types::ExplainAnalyzeContextAssemblyBasisV1::RuntimeTextEstimate,
         sources: sources
             .into_iter()
@@ -539,6 +540,27 @@ fn explain_analyze_context_assembly_metrics(
             .collect(),
     };
     assembly.is_valid().then_some(assembly)
+}
+
+/// Accept only current-turn facts from the selected CLI/Edge context.
+fn edge_memory_selection_reports(
+    edge_profile: &Map<String, Value>,
+    session_id: &str,
+    turn: u32,
+) -> Vec<astra_turn_types::MemorySelectionReport> {
+    edge_profile
+        .get("memory_selection_reports")
+        .and_then(|value| {
+            serde_json::from_value::<Vec<astra_turn_types::MemorySelectionReport>>(value.clone())
+                .ok()
+        })
+        .filter(|reports| {
+            reports.len() <= 2
+                && reports
+                    .iter()
+                    .all(|r| r.is_valid() && r.session_id == session_id && r.turn == turn)
+        })
+        .unwrap_or_default()
 }
 
 /// A compaction rerun is the authoritative final assembly even if it cannot
@@ -1567,8 +1589,15 @@ pub(crate) fn assemble_context_pipeline(
         }
     }
 
-    let explain_analyze_context_assembly =
+    let mut explain_analyze_context_assembly =
         explain_analyze_context_assembly_metrics(&pipeline_output.serialized.system_blocks);
+    if let Some(assembly) = &mut explain_analyze_context_assembly {
+        assembly.edge_memory_selection = edge_memory_selection_reports(
+            input.runtime_signals.edge_profile,
+            input.session_id,
+            state.session_turn,
+        );
+    }
     let plain = astra_turn_core::context_serializer::flatten_serialized_system_blocks(
         &pipeline_output.serialized,
     );
@@ -2731,6 +2760,7 @@ mod context_cache_contract_tests {
     #[test]
     fn assemble_context_pipeline_keeps_required_runtime_system_context_for_strict_history() {
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.session_turn = 1;
         state
             .messages
             .push(json!({"role": "user", "content": "which model are you?"}));
@@ -2738,6 +2768,17 @@ mod context_cache_contract_tests {
         let runtime_policy =
             "Terminal Control Policy: the delegated action must be first and terminal.";
         let mut edge_profile = serde_json::Map::new();
+        edge_profile.insert(
+            "memory_selection_reports".into(),
+            json!([{
+                "session_id": "sid-deepseek", "turn": 1,
+                "operation": "relevance", "method": "model", "reason": "completed",
+                "model": "jev-test", "elapsed_ms": 12,
+                "selection_order": [0], "candidates": [{"index": 0, "selected": true, "probability_bps": 9000}]
+            }]),
+        );
+        assert!(edge_memory_selection_reports(&edge_profile, "other-session", 1).is_empty());
+        assert!(edge_memory_selection_reports(&edge_profile, "sid-deepseek", 2).is_empty());
         edge_profile.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS
                 .to_string(),
@@ -2778,6 +2819,20 @@ mod context_cache_contract_tests {
             query_source: "test",
         })
         .expect("context pipeline should assemble");
+
+        let decisions = &output
+            .explain_analyze_context_assembly
+            .as_ref()
+            .unwrap()
+            .edge_memory_selection;
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].selected_indices(), vec![0]);
+        assert_eq!(decisions[0].candidates[0].probability_bps, Some(9000));
+        assert!(
+            !serde_json::to_string(&output.system_messages)
+                .unwrap()
+                .contains("probability_bps")
+        );
 
         let primary_text = output
             .system_messages

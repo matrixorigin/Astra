@@ -246,7 +246,13 @@ pub(crate) async fn stream_chat_sse(
     };
     p.model = Some(selected_model);
     if model_context_window.is_none() {
-        match session_runtime::resolve_server_model_selection(p.api, p.token, selected_model).await
+        match session_runtime::resolve_server_model_selection(
+            p.api,
+            p.token,
+            selected_model,
+            astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+        )
+        .await
         {
             Ok(selection) => {
                 p.offering_id = Some(selection.offering_id);
@@ -457,10 +463,9 @@ pub(crate) async fn stream_chat_sse(
     }
     // P6: propagate cross-session lessons (loaded at first-turn bootstrap)
     // into the ToolExecutor so every SelfModel snapshot this turn carries
-    // prior-session advice. No-op when the cache is empty.
-    if !p.session_lessons.is_empty() {
-        executor.set_session_lessons(p.session_lessons.to_vec());
-    }
+    // prior-session advice. Empty snapshots clear previously dismissed lessons.
+    executor.set_session_lessons(p.session_lessons.to_vec());
+    executor.set_memory_selection_reports(p.memory_selection_reports.to_vec());
     // P8: propagate the previous turn's auto-invoke diagnosis so this
     // turn's LLM reads "the system already noticed X" in the self-awareness
     // section. Cloned because the setter takes ownership; the state-side
@@ -899,6 +904,7 @@ pub(crate) async fn stream_chat_sse(
             stall
         },
         telemetry: TelemetryState {
+            trace_ingestion: None,
             explain_analyze_events: Vec::new(),
             explain_analyze_degraded: false,
             first_ttft_ms: None,

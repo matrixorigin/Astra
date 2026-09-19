@@ -147,6 +147,7 @@ impl<'a> CompactCtx<'a> {
             tool_health_entries: &[],
             resume_restricted_tools: &[],
             session_lessons: &[],
+            memory_selection_reports: &[],
             latest_skill_diagnosis: None,
             latest_turn_quality_feedback: None,
             unified_skill_registry: astra_runtime::skills::default_unified_registry(),

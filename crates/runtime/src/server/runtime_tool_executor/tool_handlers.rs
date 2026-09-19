@@ -933,6 +933,42 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
             &context.introspect_snapshot,
             context.journal_turn_index.load(Ordering::Acquire),
         );
+        let request = astra_turn_core::introspect::IntrospectRequest::from_args(args);
+        // Refresh only this request's projection; never retain stale ledger
+        // facts in the shared round snapshot or add them to primary usage.
+        snapshot.judgment_usage = None;
+        snapshot.semantic_judgments = None;
+        if astra_services::semantic_judgment_observation::semantic_judgment_facet_enabled(
+            request.facet,
+        ) {
+            use astra_turn_core::introspect::{JudgmentUsageCoverage, JudgmentUsageSnapshot};
+            let (usage, semantics) = tokio::join!(
+                async {
+                    if matches!(
+                        request.source_policy,
+                        astra_core::SourcePolicy::LiveOnly | astra_core::SourcePolicy::LocalOnly
+                    ) {
+                        JudgmentUsageSnapshot::unavailable(JudgmentUsageCoverage::SourceExcluded)
+                    } else {
+                        load_introspect_judgment_usage(
+                            context.context_manifest_pool.as_ref(),
+                            &context.user_id,
+                            &context.session_id,
+                        )
+                        .await
+                    }
+                },
+                astra_services::semantic_judgment_observation::load_semantic_judgment_view(
+                    context.context_manifest_pool.as_ref(),
+                    &context.user_id,
+                    &context.session_id,
+                    request.source_policy,
+                    request.depth,
+                )
+            );
+            snapshot.judgment_usage = Some(usage);
+            snapshot.semantic_judgments = Some(semantics);
+        }
         let run_id = args
             .get("_run_id")
             .or_else(|| args.get("run_id"))
@@ -990,6 +1026,36 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
         }
         tool_result_from_output(render_introspect_snapshot(args, &snapshot))
             .with_native_recovery_model_projection()
+    }
+}
+
+async fn load_introspect_judgment_usage(
+    pool: Option<&astra_core::SharedPool>,
+    user_id: &str,
+    session_id: &str,
+) -> astra_turn_core::introspect::JudgmentUsageSnapshot {
+    use astra_turn_core::introspect::{JudgmentUsageCoverage, JudgmentUsageSnapshot};
+    let Some(pool) = pool else {
+        return JudgmentUsageSnapshot::unavailable(JudgmentUsageCoverage::NoPool);
+    };
+    bounded_introspect_judgment_usage(
+        astra_services::inference_execution::load_session_auxiliary_usage(
+            pool, user_id, session_id, 128,
+        ),
+    )
+    .await
+}
+
+async fn bounded_introspect_judgment_usage(
+    read: impl std::future::Future<
+        Output = astra_services::ServiceResult<astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1>,
+    >,
+) -> astra_turn_core::introspect::JudgmentUsageSnapshot {
+    use astra_turn_core::introspect::{JudgmentUsageCoverage, JudgmentUsageSnapshot};
+    match tokio::time::timeout(std::time::Duration::from_secs(2), read).await {
+        Ok(Ok(facts)) => JudgmentUsageSnapshot::from_ledger(facts),
+        Ok(Err(_)) => JudgmentUsageSnapshot::unavailable(JudgmentUsageCoverage::QueryFailed),
+        Err(_) => JudgmentUsageSnapshot::unavailable(JudgmentUsageCoverage::Timeout),
     }
 }
 
@@ -1545,6 +1611,69 @@ impl DynamicToolHandler<RuntimeToolExecutor> for McpToolHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn introspect_judgment_usage_degrades_without_pool_on_timeout_or_query_failure() {
+        use astra_turn_core::introspect::JudgmentUsageCoverage;
+        let no_pool = load_introspect_judgment_usage(None, "owner", "session").await;
+        assert_eq!(no_pool.coverage, JudgmentUsageCoverage::NoPool);
+        assert_eq!(no_pool.observed_attempts, None);
+        let timeout = bounded_introspect_judgment_usage(std::future::pending()).await;
+        assert_eq!(timeout.coverage, JudgmentUsageCoverage::Timeout);
+        let failure = bounded_introspect_judgment_usage(async {
+            Err(astra_services::ServiceError::internal(
+                "private database error",
+            ))
+        })
+        .await;
+        assert_eq!(failure.coverage, JudgmentUsageCoverage::QueryFailed);
+        assert!(!failure.render().contains("private database"));
+        let empty = bounded_introspect_judgment_usage(async {
+            Ok(astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
+                available: true,
+                truncated: false,
+                attempts: vec![],
+            })
+        })
+        .await;
+        assert_eq!(empty.coverage, JudgmentUsageCoverage::Available);
+        assert_eq!(empty.observed_attempts, Some(0));
+    }
+
+    #[tokio::test]
+    async fn introspect_judgment_usage_no_pool_keeps_tool_successful_and_source_exclusion_explicit()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = RuntimeToolExecutor::new(
+            dir.path().to_path_buf(),
+            "user".into(),
+            "session".into(),
+            None,
+            None,
+        );
+        for (policy, expected) in [
+            ("auto", "no_pool"),
+            ("live_only", "source_excluded"),
+            ("local_only", "source_excluded"),
+        ] {
+            let result = IntrospectToolHandler
+                .execute(
+                    &executor,
+                    &serde_json::json!({
+                        "format":"json", "source_policy":policy,
+                    }),
+                    None,
+                )
+                .await;
+            assert!(!result.is_error);
+            let report: Value = serde_json::from_str(&result.output).unwrap();
+            assert_eq!(report["judgment_usage"]["coverage"], expected);
+            assert!(report["judgment_usage"]["observed_attempts"].is_null());
+            assert_eq!(report["semantic_judgments"]["coverage"], expected);
+            assert!(report["semantic_judgments"]["counts"].is_null());
+            assert!(report["semantic_judgments"].get("model_adoption").is_none());
+        }
+    }
 
     #[tokio::test]
     async fn task_resolution_submission_requires_exact_local_authority() {

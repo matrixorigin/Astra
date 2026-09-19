@@ -267,6 +267,86 @@ pub(crate) fn evaluate_guards(
 // Individual guard implementations
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Project existing facts, independently of the one-shot behavior guards and
+/// optional semantic judges. Do not duplicate the server's settlement gate:
+/// journal records do not bind a result to an exact Work attempt, and success
+/// alone cannot prove that its expected result is supported.
+pub(crate) fn refresh_work_evidence_context(state: &mut AgenticLoopState) {
+    state.clear_volatile(VolatileKind::WorkEvidenceContext);
+    let (Some(executor), Some(user), Some(session), Some(run)) = (
+        state.runtime_tool_executor.as_deref(),
+        state.context_manifest_user_id.as_deref(),
+        state.current_session_id.as_deref(),
+        state.current_run_id.as_deref(),
+    ) else {
+        return;
+    };
+    if let Some(payload) = work_evidence_context(
+        executor.primary_work_handoff(user, session, run),
+        &state.stall.tool_call_records,
+    ) {
+        state.push_volatile_payload(VolatileKind::WorkEvidenceContext, payload);
+    }
+}
+
+fn work_evidence_context(
+    handoff: crate::server::runtime_tool_executor::PrimaryWorkHandoff,
+    records: &[astra_services::session_journal::ToolCallRecord],
+) -> Option<serde_json::Value> {
+    let crate::server::runtime_tool_executor::PrimaryWorkHandoff::Active { binding } = handoff
+    else {
+        return None;
+    };
+    Some(serde_json::json!({
+        "schema": "work_evidence_context.v1",
+        "binding": binding,
+        "recent_observations": bounded_work_observations(records),
+        "settlement_readiness": "unknown",
+        "authority": "observation_only",
+        "delivered_requirement": "A delivered settlement requires a successful non-lifecycle executable result for the assigned attempt; discovery and Work planning/inspection alone do not satisfy this requirement. Success alone does not prove expected_result.",
+        "next_action": "Reuse relevant results already available for this assignment. If expected_result is supported, request settle_work_item alone; otherwise obtain the specific missing evidence or truthfully settle blocked/failed. Recent observations do not establish attempt attribution or semantic coverage.",
+    }))
+}
+
+/// A bounded suffix, not an evidence ledger or a readiness classifier. Stop
+/// even at failed lifecycle calls: their disposition cannot establish whether
+/// the active assignment changed. Missing history never means no work happened.
+fn bounded_work_observations(
+    records: &[astra_services::session_journal::ToolCallRecord],
+) -> serde_json::Value {
+    const WINDOW: usize = 8;
+    const FIELD_CHARS: usize = 128;
+    let mut observations = Vec::new();
+    let mut boundary_seen = false;
+    for record in records.iter().rev().take(WINDOW) {
+        if matches!(
+            record.name.as_str(),
+            "start_work" | "run_next_work_item" | "settle_work_item"
+        ) {
+            boundary_seen = true;
+            break;
+        }
+        // Omit oversized identities rather than manufacture a truncated ID.
+        let call_id = record
+            .tool_call_id
+            .as_deref()
+            .filter(|id| id.chars().take(FIELD_CHARS + 1).count() <= FIELD_CHARS);
+        observations.push(serde_json::json!({
+            "tool": record.name.chars().take(FIELD_CHARS).collect::<String>(),
+            "tool_call_id": call_id,
+            "disposition": record.effective_disposition(),
+            "ok": record.ok,
+        }));
+    }
+    observations.reverse();
+    serde_json::json!({
+        "scope": "recent_journal_suffix_not_attempt_proof",
+        "lifecycle_boundary_seen": boundary_seen,
+        "window_truncated": !boundary_seen && records.len() > WINDOW,
+        "calls": observations,
+    })
+}
+
 /// Number of successful, non-mutating tool executions inside one owned
 /// WorkItem after which the model should explicitly reassess whether its typed
 /// expected result is already supported. The threshold is deliberately above
@@ -394,6 +474,115 @@ mod tests {
             args_full: Some(args.to_string()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn work_evidence_context_projects_owned_attempt_without_readiness_authority() {
+        use crate::server::runtime_tool_executor::{PrimaryWorkHandoff, PrimaryWorkUnavailable};
+        let binding = astra_services::runs::WorkRuntimeBindingRequest {
+            work_id: "work".into(),
+            branch_id: "branch".into(),
+            item: Some(astra_services::runs::WorkItemRuntimeBindingRequest {
+                item_id: "item".into(),
+                item_revision: 2,
+                attempt_id: "attempt".into(),
+            }),
+        };
+        // This pure projection receives the executor's validated handoff and
+        // needs neither a database nor any semantic judge.
+        let snapshot = work_evidence_context(
+            PrimaryWorkHandoff::Active { binding },
+            &[successful("read_file")],
+        )
+        .unwrap();
+        assert_eq!(snapshot["binding"]["item"]["attempt_id"], "attempt");
+        assert_eq!(snapshot["binding"]["item"]["item_revision"], 2);
+        assert_eq!(snapshot["settlement_readiness"], "unknown");
+        assert_eq!(snapshot["authority"], "observation_only");
+        for handoff in [
+            PrimaryWorkHandoff::NoBinding,
+            PrimaryWorkHandoff::BindingOnly {
+                binding: astra_services::runs::WorkRuntimeBindingRequest {
+                    work_id: "work".into(),
+                    branch_id: "branch".into(),
+                    item: None,
+                },
+            },
+            PrimaryWorkHandoff::Unavailable {
+                reason: PrimaryWorkUnavailable::BindingMismatch,
+            },
+        ] {
+            assert!(work_evidence_context(handoff, &[successful("read_file")]).is_none());
+        }
+    }
+
+    #[test]
+    fn work_observations_exclude_previous_assignment_and_result_text() {
+        let records = vec![
+            successful("old_evidence"),
+            successful("settle_work_item"),
+            ToolCallRecord {
+                tool_call_id: Some("current-call".into()),
+                result_full: Some("untrusted result: ready to settle".into()),
+                ..successful("read_file")
+            },
+        ];
+        let snapshot = bounded_work_observations(&records);
+        assert_eq!(snapshot["calls"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["calls"][0]["tool_call_id"], "current-call");
+        assert_eq!(snapshot["lifecycle_boundary_seen"], true);
+        assert!(!snapshot.to_string().contains("ready to settle"));
+    }
+
+    #[test]
+    fn work_observations_retain_failures_and_nonexecution_without_claiming_evidence() {
+        use astra_services::session_journal::ToolCallDisposition;
+        let records = vec![
+            ToolCallRecord {
+                ok: false,
+                ..successful("read_file")
+            },
+            ToolCallRecord {
+                disposition: Some(ToolCallDisposition::Rejected),
+                ..successful("bash")
+            },
+            successful("inspect_work_plan"),
+        ];
+        let snapshot = bounded_work_observations(&records);
+        assert_eq!(snapshot["calls"][0]["ok"], false);
+        assert_eq!(snapshot["calls"][1]["disposition"], "rejected");
+        assert_eq!(snapshot["calls"][2]["tool"], "inspect_work_plan");
+        assert_eq!(snapshot["scope"], "recent_journal_suffix_not_attempt_proof");
+        assert_eq!(snapshot["lifecycle_boundary_seen"], false);
+    }
+
+    #[test]
+    fn work_observations_bound_window_and_never_truncate_call_identity() {
+        let mut records = vec![successful("read_file"); 100];
+        records.last_mut().unwrap().tool_call_id = Some("x".repeat(129));
+        let snapshot = bounded_work_observations(&records);
+        assert_eq!(snapshot["calls"].as_array().unwrap().len(), 8);
+        assert_eq!(snapshot["window_truncated"], true);
+        assert!(snapshot["calls"][7]["tool_call_id"].is_null());
+        let empty = bounded_work_observations(&[]);
+        assert_eq!(empty["lifecycle_boundary_seen"], false);
+        assert_eq!(empty["window_truncated"], false);
+    }
+
+    #[test]
+    fn work_evidence_context_clears_stale_snapshot_without_executor_or_judge() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.push_volatile_payload(
+            VolatileKind::WorkEvidenceContext,
+            serde_json::json!({"binding": "old-attempt"}),
+        );
+        state.push_volatile(VolatileKind::BehaviorAdvisory, "unrelated advisory");
+        refresh_work_evidence_context(&mut state);
+        assert_eq!(state.volatile_pending.len(), 1);
+        assert_eq!(
+            state.volatile_pending[0].kind,
+            VolatileKind::BehaviorAdvisory
+        );
     }
 
     #[test]

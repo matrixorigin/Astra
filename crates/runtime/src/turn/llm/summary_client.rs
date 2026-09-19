@@ -10,8 +10,7 @@ use astra_turn_types::InferencePurpose;
 use super::client::{LlmCall, OwnedLlmExecutionRoute};
 use super::durable::DurableInferenceLedger;
 
-#[cfg(test)]
-use super::client::{global_llm_client, llm_nonstream_timeout};
+use super::client::{auxiliary_execution_budget, global_llm_client, llm_nonstream_timeout};
 
 #[derive(Clone)]
 struct DurableSummaryExecution {
@@ -389,22 +388,30 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                     let requested_logical_attempt = attempt_allocator
                         .reserve_pair_at_least(&allocator_scope_key, durable_pair_base)
                         .map_err(contract_error)?;
-                    let outcome = ledger
-                        .execute_stream_no_tool_choice(
-                            base_scope.with_logical_attempt(requested_logical_attempt),
-                            LlmCall {
-                                purpose,
-                                messages,
-                                tools: &self.prompt_cache_tools,
-                                cache_capability: self.cache_capability,
-                                route: self.route.borrowed(),
-                                max_output_tokens: Some(self.max_output_tokens),
-                                temperature,
-                                has_fallback: false,
-                                thinking,
-                            },
-                        )
-                        .await;
+                    let call = LlmCall {
+                        purpose,
+                        messages,
+                        tools: &self.prompt_cache_tools,
+                        cache_capability: self.cache_capability,
+                        route: self.route.borrowed(),
+                        max_output_tokens: Some(self.max_output_tokens),
+                        temperature,
+                        has_fallback: false,
+                        thinking,
+                    };
+                    let scope = base_scope.with_logical_attempt(requested_logical_attempt);
+                    let outcome = if self.route.provider == "typesafe" {
+                        ledger
+                            .execute_nonstream(
+                                global_llm_client(),
+                                scope,
+                                call,
+                                auxiliary_execution_budget(purpose, llm_nonstream_timeout()),
+                            )
+                            .await
+                    } else {
+                        ledger.execute_stream_no_tool_choice(scope, call).await
+                    };
                     debug_assert!(
                         outcome.logical_attempt() <= requested_logical_attempt.saturating_add(1),
                         "durable summary recovery exceeded its reserved identity pair"
@@ -433,7 +440,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                         has_fallback: false,
                         thinking,
                     },
-                    llm_nonstream_timeout(),
+                    auxiliary_execution_budget(purpose, llm_nonstream_timeout()),
                 )
                 .await
             }
@@ -718,6 +725,56 @@ mod tests {
             operation_id: "summary_repair".to_string(),
             logical_attempt: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn typesafe_request_judgment_uses_durable_nonstream_and_reports_usage() {
+        let app = Router::new().route("/v1/systemone", post(|axum::Json(body): axum::Json<Value>| async move {
+            assert_eq!(body["model"], "configured-jev");
+            assert!(body.get("messages").is_none());
+            let answers: serde_json::Map<String, Value> = body["questions"].as_object().unwrap().keys().map(|key| {
+                let yes = matches!(key.as_str(), "mutation.read_only" | "scope.unknown" | "domain.none");
+                (key.clone(), serde_json::json!({"type":"noul", "noul": if yes { 1.0 } else { 0.0 }}))
+            }).collect();
+            axum::Json(serde_json::json!({"model":"configured-jev", "answers":answers,"usage":{"input_tokens":123,"output_tokens":19}}))
+        }));
+        let mut execution = summary_execution(spawn_summary_test_server(app).await);
+        execution.provider = "typesafe".into();
+        execution.model_name = "configured-jev".into();
+        execution.offering_id = "configured-judgment-offering".into();
+        let persistence = Arc::new(RecoverFirstAdmissionPersistence::default());
+        let ledger = DurableInferenceLedger::required_with_persistence(
+            None,
+            Some(&execution),
+            "summary-user",
+            Some(persistence.clone()),
+        )
+        .unwrap()
+        .with_run_authority(summary_authority());
+        let client = RuntimeSummaryClient::new_with_attempt_allocator(
+            summary_route(&execution),
+            1024,
+            ledger,
+            summary_scope(),
+            DurableSummaryAttemptAllocator::default(),
+        );
+        let request = astra_services::work_admission_classification_request(&Default::default());
+        let response = client
+            .summarize(
+                InferencePurpose::Introspection,
+                &astra_services::work_admission_classification_messages(&request),
+            )
+            .await
+            .unwrap();
+        let classification =
+            astra_services::parse_work_admission_classification(&request, &response.text).unwrap();
+        assert!(classification.into_not_required().is_ok());
+        assert_eq!(response.usage["input_tokens"], 123);
+        assert_eq!(response.usage["output_tokens"], 19);
+        assert_eq!(
+            *persistence.admitted_logical_attempts.lock().unwrap(),
+            vec![0]
+        );
     }
 
     fn summary_authority() -> super::super::durable::DurableInferenceRunAuthority {

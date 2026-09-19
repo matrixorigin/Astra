@@ -602,6 +602,7 @@ mod tests {
 
     fn explain_analyze_event() -> astra_turn_types::ExplainAnalyzeEventV1 {
         astra_turn_types::ExplainAnalyzeEventV1 {
+            auxiliary_usage: None,
             schema_version: astra_turn_types::EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: "clock-1:1".into(),
             run_id: "run-1".into(),

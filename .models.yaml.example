@@ -5,12 +5,12 @@
 # Quick start:
 #   1. cp .models.yaml.example .models.yaml
 #   2. Fill in your API keys
-#   3. astra-admin model load .models.yaml    # import to running server
-#   4. astra-admin model check <name>         # activate after connectivity probe
+#   3. astra admin model load .models.yaml --update-existing  # import and check
+#   4. astra admin config get judgment_model  # inspect optional judgment default
 #
 # This file defines available LLM models. Each entry is loaded into the
-# `infra_llm_models` table in MatrixOne. Models are inactive until explicitly
-# checked (connectivity probe) via `astra-admin model check`.
+# `infra_llm_models` table in MatrixOne. Load checks new or updated models;
+# `astra admin model check <name>` can repeat the connectivity check later.
 #
 # ─── Field Reference ──────────────────────────────────────────────────────────
 #
@@ -26,6 +26,7 @@
 #   base_url      — API base URL (no trailing slash)
 #
 # Optional fields:
+#   judgment_default      — true on one model: bind it for memory judgments after load
 #   description           — Human-readable description (shown in model list)
 #   tags                  — Capability tags (list). Used for model selection:
 #                             "selector"  — cheap model for intent/memory extraction
@@ -33,7 +34,10 @@
 #                             "chat"      — suitable for conversational tasks
 #                             "reasoning" — suitable for complex reasoning/planning
 #   context_window        — Max input tokens (integer). Affects history truncation.
-#   max_completion_tokens — Max output tokens (integer). Sent to provider.
+#   max_completion_tokens — Max output tokens (integer). Sent to provider. A
+#                           typed judgment model needs enough room for every
+#                           batched answer identity; 512 is a safe starting
+#                           point for the built-in Jev judgment contract.
 #   pricing_prompt        — Cost per token (input), in USD. Used by /stats.
 #   pricing_completion    — Cost per token (output), in USD. Used by /stats.
 #   fallback_chain        — Ordered list of model names for rate-limit recovery.
@@ -203,3 +207,28 @@
   context_window: 65536
   max_completion_tokens: 8192
   supported_parameters: [tools]
+
+# Optional memory and request judgments (not a chat/reasoning/extraction model).
+# Set judgment_default: true on one model to enable it automatically after
+# model load (including make dev-seed). Load checks connectivity before binding.
+# To switch an already active model manually:
+#   astra admin config set judgment_model jev-1.13.0
+#   astra admin config get judgment_model
+# To disable all optional judgment calls in newly started sessions:
+#   astra admin config unset judgment_model
+# The runtime does not silently reuse the main agent model as a judgment
+# fallback; bind an ordinary model explicitly when that is desired.
+# Omitting judgment_default leaves the existing binding unchanged.
+# Credentials are stored encrypted through the existing model registry.
+# An empty api_key is unusable; no JEV_KEY environment variable is required.
+# - name: jev-1.13.0
+#   judgment_default: true
+#   provider: typesafe
+#   base_url: https://api.typesafe.ai
+#   api_key: ""
+#   context_window: 64000
+#   max_completion_tokens: 512
+#   pricing_prompt: 0.000000042
+#   pricing_completion: 0
+#   tags: []
+#   supported_parameters: []

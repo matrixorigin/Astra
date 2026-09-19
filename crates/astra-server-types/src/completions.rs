@@ -22,6 +22,11 @@ pub enum CompletionOperation {
 
 impl CompletionOperation {
     #[must_use]
+    pub const fn is_typed_judgment(self) -> bool {
+        !matches!(self, Self::MemoryExtraction)
+    }
+
+    #[must_use]
     pub const fn purpose(self) -> astra_turn_types::InferencePurpose {
         match self {
             Self::MemoryExtraction => astra_turn_types::InferencePurpose::MemoryExtraction,
@@ -314,6 +319,19 @@ mod tests {
         for invalid in [0, MAX_COMPLETION_OUTPUT_TOKENS + 1] {
             request.max_tokens = invalid;
             assert!(request.validate().is_err(), "{invalid} must be rejected");
+        }
+    }
+
+    #[test]
+    fn only_free_form_memory_extraction_skips_typed_output_contract() {
+        assert!(!CompletionOperation::MemoryExtraction.is_typed_judgment());
+        for operation in [
+            CompletionOperation::MemoryRetrievalRerank,
+            CompletionOperation::TurnIntent,
+            CompletionOperation::SkillAutoRoute,
+            CompletionOperation::VerificationJudge,
+        ] {
+            assert!(operation.is_typed_judgment());
         }
     }
 }

@@ -545,6 +545,7 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Passed through to the ToolExecutor via `set_session_lessons` so
     /// every SelfModel snapshot surfaces prior-session advice.
     pub(crate) session_lessons: &'a [astra_services::LessonHint],
+    pub(crate) memory_selection_reports: &'a [astra_turn_types::MemorySelectionReport],
     /// P8 seam: most recent auto-invoke diagnosis from the previous turn.
     /// Injected into this turn's ToolExecutor via
     /// `set_latest_skill_diagnosis` so the LLM sees "the system already
@@ -800,6 +801,7 @@ impl<'a> ChatTurnParams<'a> {
             tool_health_entries: &[],
             resume_restricted_tools: &[],
             session_lessons: &[],
+            memory_selection_reports: &[],
             latest_skill_diagnosis: None,
             latest_turn_quality_feedback: None,
             unified_skill_registry: ctx.unified_skill_registry,

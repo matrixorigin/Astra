@@ -1281,6 +1281,14 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     {
         ep_obj.insert("lessons_text".to_string(), json!(lessons));
     }
+    let reports = ctx.executor.memory_selection_reports();
+    if !reports.is_empty()
+        && let Some(ep) = payload
+            .get_mut("edge_profile")
+            .and_then(Value::as_object_mut)
+    {
+        ep.insert("memory_selection_reports".into(), json!(reports));
+    }
     // ─── Runtime context: keep it on the typed Server admission lane ───
     if let Some(extra) = ctx.append_system_prompt {
         if let Some(root) = payload.as_object_mut() {
@@ -1960,7 +1968,11 @@ mod tests {
             "capabilities": ["bash"],
             "enabled_tools": ["web_fetch"],
             "edge_tools": [{"type": "function", "function": {"name": "bash"}}],
-            "edge_profile": {"cwd": "/workspace"},
+            "edge_profile": {"cwd": "/workspace", "memory_selection_reports": [{
+                "session_id":"session-1", "turn":9, "operation":"relevance", "method":"model",
+                "reason":"completed", "model":"jev-test", "elapsed_ms":12,
+                "selection_order":[0], "candidates":[{"index":0,"selected":true,"probability_bps":9000}]
+            }]},
             "edge_skills": [{
                 "name": "review-workspace",
                 "description": "Review the current workspace",
@@ -1977,6 +1989,10 @@ mod tests {
             "bash"
         );
         assert_eq!(admitted["context"]["edge_profile"]["cwd"], "/workspace");
+        assert_eq!(
+            admitted["context"]["edge_profile"]["memory_selection_reports"],
+            prepared["edge_profile"]["memory_selection_reports"]
+        );
         assert_eq!(
             admitted["context"]["edge_skills"][0]["name"],
             "review-workspace"

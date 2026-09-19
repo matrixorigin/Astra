@@ -47,6 +47,15 @@ pub(crate) fn render(
 
     writer.push(&overview_card(&graph, delivery_degraded));
 
+    let auxiliary_lines = crate::explain_analyze_report::auxiliary_usage_lines(&graph);
+    if !auxiliary_lines.is_empty() {
+        writer.push("<section class=\"panel\"><h2>Auxiliary model usage</h2>");
+        for line in auxiliary_lines {
+            writer.push(&format!("<p>{}</p>", escape_html(&line, usize::MAX)));
+        }
+        writer.push("</section>");
+    }
+
     if graph.nodes().is_empty() {
         let message = if delivery_degraded {
             "Runtime facts were not recovered before stream delivery stopped. The canonical JSON artifact remains the source of truth for replay."
@@ -779,6 +788,19 @@ fn context_markup(context: &astra_turn_types::ExplainAnalyzeContextMetricsV1) ->
         ));
     }
     if let Some(assembly) = &context.assembly {
+        for report in &assembly.edge_memory_selection {
+            markup.push_str(&format!(
+                "<details><summary>{}</summary>",
+                escape_html(&report.summary(), MAX_TEXT_CHARS)
+            ));
+            for line in report.detail_lines() {
+                markup.push_str(&format!(
+                    "<p class=\"detail-line\">{}</p>",
+                    escape_html(&line, MAX_TEXT_CHARS)
+                ));
+            }
+            markup.push_str("</details>");
+        }
         markup.push_str(
             "<p class=\"detail-line\"><strong>Context sources:</strong></p><div class=\"chips\">",
         );
@@ -1046,6 +1068,7 @@ mod tests {
         outcome: Option<ExplainAnalyzeOutcomeV1>,
     ) -> ExplainAnalyzeEventV1 {
         ExplainAnalyzeEventV1 {
+            auxiliary_usage: None,
             schema_version: EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: event_id.to_string(),
             run_id: "run-1".to_string(),

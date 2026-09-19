@@ -111,6 +111,30 @@ complete effective catalog, not from the current page. Only the first page
 may carry `default_offering_id`; continuation pages carry `null` and clients
 must preserve the first-page server decision.
 
+Both endpoints accept `purpose=chat|typed_judgment`, defaulting to `chat`.
+Only `/models` additionally accepts `purpose=all` for registry inspection;
+`/model-access?purpose=all` returns `400 model_catalog_purpose_invalid`, since
+Model Access describes usable inference products rather than inactive registry rows.
+The shared protocol-purpose capability policy filters the complete authorized
+catalog before pagination, revision, totals, defaults and access counts are
+computed. Chat catalogs contain active chat-capable Offerings; TypeSafe's
+typed-only protocol is not selectable there. Typed-judgment catalogs retain
+TypeSafe and ordinary LLMs that implement the canonical discrete judgment
+contract. Registry inspection (`all`) preserves existing visibility rules,
+including inactive administrator entries; it does not grant inference authority.
+Administrative CLI registry lists request `all`; CLI session judgment and judgment
+comparison request `typed_judgment`. Guided setup bootstraps chat and requests
+`chat`, like ordinary Web/CLI selection: a judgment-only registry must not count
+as an existing chat-ready model configuration.
+Continuation cursors are scoped to the requested purpose: clients must retain
+the same purpose throughout a drain, as well as checking revision and total.
+
+Explicit Offering IDs cannot bypass this policy. Primary chat admission and
+provider-boundary revalidation reject incompatible protocol-purpose pairs before
+provider dispatch, using `model_purpose_unsupported` at HTTP admission. Typed
+internal judgments and `judgment_model` resolution remain available independently
+of chat selection; no automatic model substitution is introduced.
+
 ## Model Access sources
 
 | Product source | Credential owner | Billing owner | Execution | Availability |

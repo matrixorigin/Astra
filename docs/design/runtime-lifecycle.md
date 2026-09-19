@@ -89,6 +89,64 @@ as successful completion or bypass provider and permission boundaries.
 
 ### Execution failures and task resolution
 
+Semantic request classification distinguishes valid decisions, unresolved
+necessary facts, conflicting facts, malformed responses, and provider failures.
+A successful provider invocation is not proof of a usable admission decision.
+Uncertainty retains bounded field evidence and may receive one clarification
+on the explicitly configured judgment Offering within the existing admission
+deadline. This per-turn budget is not reset by trusted skill loading. The
+complete clarification must satisfy the same confidence and dependency rules
+and preserve already determined necessary facts; partial evidence is never
+merged into execution authority. No implicit main-model fallback is permitted.
+
+Mutation completion scope describes the resources the current request actually
+requires changing, not its subject, referenced paths, executor location, or
+previously completed work. Workspace and external scopes put all required
+changes on the corresponding side of the bound-workspace effect boundary;
+mixed requires changes on both sides, and an unclear target/boundary remains
+unknown. Effect-owner domain is independent of this scope. Read-only references
+create no mutation obligation. All judgment carriers share this semantic
+contract; the existing typed receipt checks still own completion evidence.
+
+Mutation classification concerns requested task-resource effects, not runtime
+checkpoint, audit, trace, usage or scheduling writes. Explicit Astra Work
+tracking, board and graph changes remain obligations of the Work lifecycle and
+plan, verified by their existing Work owners; they do not by themselves require
+a workspace or external task-resource mutation. Read-only verification plus a
+requested Work board can therefore be both `read_only` and Work `required`.
+Separately requested workspace or external changes retain their mutation and
+scope obligations, with or without Work. This producer distinction does not
+change unresolved-scope completion handling or any authorization/receipt gate.
+
+The auxiliary classifier is optional. With no configured judgment Offering,
+the primary model uses normal typed admission carriers without an auxiliary
+call. An explicitly configured ordinary LLM or Jev uses the same existing
+`judgment_model` contract and routing; none is not an implicit ordinary-LLM
+configuration. No new router or fallback model call is introduced.
+
+Absent or unreliable auxiliary output supplies no admission authority. Timeout,
+abstention, malformed output, internal contradictory classifications and other
+auxiliary failures therefore preserve the same primary typed-carrier baseline.
+The runtime retains their diagnostic cause, bounded evidence and clarification
+state; it does not invent a complete decision, mutation scope or completion
+obligation. A valid negative topology decision remains distinct from unavailable
+auxiliary evidence. A conflict with trusted runtime workflow/Work state is also
+distinct from internal auxiliary conflict and remains a rejection.
+
+Tool visibility and lifecycle admission share the canonical fanout-proposal
+predicate. Proposing a carrier is not authorization: existing permissions,
+effect boundaries, readiness/capacity, active Work custody, trusted topology,
+canonical delegation, cancellation and completion gates remain authoritative.
+Direct parallel spawn batches do not become an alternative fanout carrier.
+Missing auxiliary facts that these existing carriers and gates can establish
+must not become classifier-only prerequisites. Unresolved mutation locus and
+receipt obligations retain their existing owners; baseline admission does not
+default a target to workspace or erase an outstanding completion obligation.
+
+Diagnostics must not claim that no work happened earlier in the turn merely
+because the current dependent call was rejected. Raw classification payloads
+remain opt-in debug material rather than ordinary lifecycle facts.
+
 Tool results retain their source status, exit semantics, output, and invocation
 identity. Classification uses supported evidence; an unknown cause stays unknown.
 The Agent interprets the impact on the user's task. A later unrelated success
@@ -241,6 +299,26 @@ with an explicit cutover error when an existing Work table has an incompatible
 shape, such as a missing mandatory index. `CREATE TABLE IF NOT EXISTS` and the
 manifest's index declaration are not an in-place upgrade mechanism for an
 existing Work table.
+
+Before the next model call, an owner/session/run-validated active primary Work
+binding receives a bounded `work_evidence_context.v1` snapshot through the
+existing required runtime-context lane. It carries the delivered-settlement
+requirement and at most eight recent journal call identities, dispositions and
+success flags, stopping at a Work lifecycle carrier. It does not copy arguments
+or result bodies, invoke a judge, read storage, or change tool authority. The
+snapshot is rebuilt each boundary and removed when the active binding cannot be
+validated; hosts without an executor or an optional semantic judge still run.
+
+This first stage deliberately reports settlement readiness as unknown. Journal
+execution identity does not bind each result to an exact Work attempt; a missing
+lifecycle boundary after recovery or window truncation cannot prove absence of
+evidence. Even a successful result cannot prove semantic coverage of
+`expected_result`. Recent calls are therefore explicitly a journal suffix, not
+attempt-attributed proof. The existing Work start/continuation context owns the
+expected result, and settlement admission remains the only owner of its gate.
+The projection makes the requirement and reusable observations available before
+a rejected settlement or another inspection; it neither auto-settles nor promises
+that the model will avoid all redundant calls.
 
 Tasks are durable work items projected into UI boards.
 

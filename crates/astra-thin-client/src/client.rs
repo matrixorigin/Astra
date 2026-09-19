@@ -627,8 +627,13 @@ impl ThinClient {
         token: &str,
         timeout: Duration,
     ) -> Result<Response, ThinClientError> {
-        self.get_models_page_response_timeout(token, timeout, None)
-            .await
+        self.get_models_page_response_timeout(
+            token,
+            timeout,
+            None,
+            astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+        )
+        .await
     }
 
     /// Fetch one authoritative model-catalog page. The cursor is the complete
@@ -639,6 +644,7 @@ impl ThinClient {
         token: &str,
         timeout: Duration,
         cursor: Option<(&str, &str, &str)>,
+        purpose: astra_core::model_wire::purpose::ModelCatalogPurpose,
     ) -> Result<Response, ThinClientError> {
         let url = self.url(paths::MODELS)?;
         tracing::debug!(
@@ -653,7 +659,8 @@ impl ThinClient {
             .http
             .get(url.clone())
             .headers(self.auth_headers_for(Some(token)).await?)
-            .timeout(timeout);
+            .timeout(timeout)
+            .query(&[("purpose", purpose.as_str())]);
         if let Some((provider, model_name, model_id)) = cursor {
             request = request.query(&[
                 ("after_provider", provider),
@@ -4475,6 +4482,7 @@ mod tests {
             .and(query_param("after_provider", "bedrock/openai"))
             .and(query_param("after_name", "model two"))
             .and(query_param("after_offering_id", "offer/2"))
+            .and(query_param("purpose", "typed_judgment"))
             .and(header("authorization", "Bearer t"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "items": [],
@@ -4492,6 +4500,7 @@ mod tests {
                 "t",
                 Duration::from_secs(1),
                 Some(("bedrock/openai", "model two", "offer/2")),
+                astra_core::model_wire::purpose::ModelCatalogPurpose::TypedJudgment,
             )
             .await
             .unwrap();

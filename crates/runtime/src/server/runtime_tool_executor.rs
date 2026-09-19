@@ -5588,6 +5588,8 @@ mod tests {
                 source_policy: request.source_policy.as_str().to_string(),
                 include_context: request.include_context,
                 data_coverage,
+                judgment_usage: None,
+                semantic_judgments: None,
                 view: None,
                 summary: "reflect ready".to_string(),
                 observations: Vec::new(),

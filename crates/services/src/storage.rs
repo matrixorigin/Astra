@@ -7304,6 +7304,7 @@ async fn ensure_core_schema_while_leased(
                 CHECK (provider_delivery_state IN ('unknown', 'pre_delivery', 'delivery_authorized')),
             UNIQUE KEY uq_inference_invocation_route (user_id, route_id),
             INDEX idx_inference_invocations_owner_session_created (user_id, session_id, created_at, invocation_id),
+            INDEX idx_inference_invocations_owner_turn (user_id, session_id, turn_index, purpose, invocation_id),
             INDEX idx_inference_invocations_owner_run_created (user_id, run_id, created_at, invocation_id),
             INDEX idx_inference_invocations_owner_harness_created (user_id, harness_run_id, created_at, invocation_id),
             INDEX idx_inference_invocations_logical_cursor
@@ -7385,7 +7386,7 @@ async fn ensure_core_schema_while_leased(
             CONSTRAINT chk_inference_provider_attempts_usage_status
                 CHECK (usage_status IN ('provider_exact', 'provider_partial', 'unavailable')),
             CONSTRAINT chk_inference_provider_attempts_wire
-                CHECK (provider_protocol IN ('openai_compatible', 'anthropic_messages', 'bedrock_converse')
+                CHECK (provider_protocol IN ('openai_compatible', 'anthropic_messages', 'bedrock_converse', 'typesafe_systemone')
                     AND provider_wire_bytes > 0),
             UNIQUE KEY uq_inference_provider_attempt (user_id, invocation_id, attempt_index),
             INDEX idx_inference_attempts_owner_session_started (user_id, session_id, started_at, attempt_id),

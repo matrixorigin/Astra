@@ -110,32 +110,9 @@ static TRACE_CLOCK_ANCHOR: std::sync::LazyLock<(u64, Instant)> = std::sync::Lazy
     (wall_us, Instant::now())
 });
 
-fn now_us() -> u64 {
+pub(super) fn now_us() -> u64 {
     let (wall_us, monotonic_anchor) = &*TRACE_CLOCK_ANCHOR;
     wall_us.saturating_add(monotonic_anchor.elapsed().as_micros() as u64)
-}
-
-pub(crate) fn record_trace_span(
-    buf: &mut astra_services::session_journal::TurnEventBuffer,
-    span_id: String,
-    name: &str,
-    started_at: Instant,
-    parent_span_id: Option<String>,
-    attrs: Option<&HashMap<String, String>>,
-    trace_id: Option<&str>,
-) {
-    let end_us = now_us();
-    let start_us = end_us.saturating_sub(started_at.elapsed().as_micros() as u64);
-    buf.record_trace_span_v2(
-        TraceSpanBuilder::default()
-            .span_id(span_id)
-            .name(name.to_string())
-            .start_us(start_us)
-            .end_us(end_us)
-            .parent_span_id(parent_span_id)
-            .attrs(attrs)
-            .trace_id(trace_id.map(str::to_string)),
-    );
 }
 
 // ─── Host turn result ────────────────────────────────────────────────────────
@@ -272,6 +249,8 @@ pub enum TurnIntentJudgeOutcome {
     /// server turn. This is distinct from `FixedDefault`: no local decision
     /// was made, and the remote lifecycle owns the outcome.
     Delegated,
+    /// The host started asynchronous admission and owns its terminal receipt.
+    Pending,
     Unavailable,
 }
 
@@ -322,14 +301,15 @@ impl TurnPhaseOutcome {
     }
 }
 
-impl From<&TurnIntentJudgeOutcome> for TurnPhaseOutcome {
-    fn from(value: &TurnIntentJudgeOutcome) -> Self {
-        match value {
-            TurnIntentJudgeOutcome::Intent(_) => Self::Decided,
-            TurnIntentJudgeOutcome::FixedDefault => Self::FixedDefault,
-            TurnIntentJudgeOutcome::Delegated => Self::Delegated,
-            TurnIntentJudgeOutcome::Unavailable => Self::Unavailable,
-        }
+impl TurnIntentJudgeOutcome {
+    pub(super) fn terminal_phase_outcome(&self) -> Option<TurnPhaseOutcome> {
+        Some(match self {
+            Self::Intent(_) => TurnPhaseOutcome::Decided,
+            Self::FixedDefault => TurnPhaseOutcome::FixedDefault,
+            Self::Delegated => TurnPhaseOutcome::Delegated,
+            Self::Unavailable => TurnPhaseOutcome::Unavailable,
+            Self::Pending => return None,
+        })
     }
 }
 
@@ -363,22 +343,42 @@ pub(crate) fn complete_turn_phase<H: AgenticLoopHost>(
     outcome: TurnPhaseOutcome,
     span_id: String,
 ) -> TurnPhaseReceipt {
+    complete_turn_phase_at(
+        host,
+        state,
+        TurnPhaseReceipt {
+            phase,
+            round_index,
+            attempt_index,
+            started_at,
+            finished_at: Instant::now(),
+            duration_ms: 0,
+            outcome,
+        },
+        span_id,
+    )
+}
+
+pub(crate) fn complete_turn_phase_at<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+    mut receipt: TurnPhaseReceipt,
+    span_id: String,
+) -> TurnPhaseReceipt {
     // The default host hook is intentionally a no-op. Production hosts start
     // stages at their actual boundary; this call supplies a reconstructable
     // start for hosts that only provide terminal receipts.
-    host.on_turn_phase_started(state, phase, round_index, attempt_index, started_at);
-    let finished_at = Instant::now();
-    let receipt = TurnPhaseReceipt {
-        phase,
-        round_index,
-        attempt_index,
-        started_at,
-        finished_at,
-        duration_ms: finished_at
-            .saturating_duration_since(started_at)
-            .as_millis() as u64,
-        outcome,
-    };
+    host.on_turn_phase_started(
+        state,
+        receipt.phase,
+        receipt.round_index,
+        receipt.attempt_index,
+        receipt.started_at,
+    );
+    receipt.duration_ms = receipt
+        .finished_at
+        .saturating_duration_since(receipt.started_at)
+        .as_millis() as u64;
     let mut attrs = HashMap::new();
     attrs.insert("outcome".to_string(), receipt.outcome.as_str().to_string());
     attrs.insert("round_index".to_string(), receipt.round_index.to_string());
@@ -399,14 +399,21 @@ pub(crate) fn complete_turn_phase<H: AgenticLoopHost>(
         "turn phase completed"
     );
     if let Some(buf) = state.turn_event_buffer.as_mut() {
-        record_trace_span(
-            buf,
-            span_id,
-            receipt.phase.as_str(),
-            started_at,
-            None,
-            Some(&attrs),
-            state.current_run_id.as_deref(),
+        let end_us = now_us().saturating_sub(receipt.finished_at.elapsed().as_micros() as u64);
+        let start_us = end_us.saturating_sub(
+            receipt
+                .finished_at
+                .saturating_duration_since(receipt.started_at)
+                .as_micros() as u64,
+        );
+        buf.record_trace_span_v2(
+            TraceSpanBuilder::default()
+                .span_id(span_id)
+                .name(receipt.phase.as_str().to_string())
+                .start_us(start_us)
+                .end_us(end_us)
+                .attrs(Some(&attrs))
+                .trace_id(state.current_run_id.clone()),
         );
     }
     host.on_turn_phase(receipt);
@@ -719,6 +726,11 @@ pub trait AgenticLoopHost: Send {
     /// source of control state.
     fn on_turn_phase(&mut self, _receipt: TurnPhaseReceipt) {}
 
+    /// Asynchronous hosts publish admission at the background task's boundary.
+    fn owns_semantic_admission_timing(&self) -> bool {
+        false
+    }
+
     /// Publish a meaningful lifecycle stage as it begins. `started_at` comes
     /// from the owner that measures the corresponding terminal receipt, so a
     /// live graph and its completed interval share one clock boundary.
@@ -738,9 +750,9 @@ pub trait AgenticLoopHost: Send {
     fn on_turn_started(&mut self, _state: &AgenticLoopState) {}
 
     /// Close the Explain Analyze turn root with the lifecycle-owned outcome.
-    fn on_turn_terminal(
+    async fn on_turn_terminal(
         &mut self,
-        _state: &AgenticLoopState,
+        _state: &mut AgenticLoopState,
         _outcome: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
     ) {
     }
@@ -1391,6 +1403,8 @@ fn build_introspect_snapshot_with_tool_admission(
         tool_admission,
         semantic_cache_decisions,
         invocation_lifecycle: None,
+        judgment_usage: None,
+        semantic_judgments: None,
         capacity_provider_coverage: state
             .runtime_tool_executor
             .as_deref()
@@ -1807,6 +1821,7 @@ pub struct TelemetryState {
     pub evaluation_persistence: Option<EvaluationPersistenceContext>,
     /// Optional event persistence context for mirroring context traces into cloud events.
     pub context_trace_persistence: Option<ContextTracePersistenceContext>,
+    pub trace_ingestion: Option<astra_services::event_ingestion::IngestionSender>,
     /// Runtime promotion verdicts captured for later audit/report persistence.
     pub promotion_events: Vec<RuntimePromotionEventData>,
     /// Optional turn trace collector for detailed context assembly observability.
@@ -2653,6 +2668,9 @@ pub enum VolatileKind {
     /// a newer repository read supersedes the prior value within the same
     /// human turn instead of creating a second independent authority.
     CanonicalWorkState,
+    /// Bounded execution observations and requirements for the next Work
+    /// decision. Observational only; settlement admission retains authority.
+    WorkEvidenceContext,
     /// A provider response completed after newer durable user guidance was
     /// accepted. The stale response is not executable; this singleton tells
     /// the next request to re-evaluate from the applied control epoch.
@@ -2719,7 +2737,8 @@ impl VolatileKind {
                 | Self::SourceRecoveryAdvisory
                 | Self::ActiveTurnFrame
                 | Self::ActiveWorkSnapshot
-                | Self::CanonicalWorkState,
+                | Self::CanonicalWorkState
+                | Self::WorkEvidenceContext,
         )
     }
 
@@ -2737,6 +2756,7 @@ impl VolatileKind {
             | Self::BackgroundTaskNotification
             | Self::ActiveWorkSnapshot
             | Self::CanonicalWorkState
+            | Self::WorkEvidenceContext
             | Self::UserIntentBoundary
             | Self::FinalAnswerSettlement
             | Self::CanonicalWorkEstablishmentRetry
@@ -8948,8 +8968,8 @@ pub(crate) mod tests {
     #[test]
     fn turn_intent_phase_distinguishes_delegated_from_fixed_default() {
         assert_eq!(
-            TurnPhaseOutcome::from(&TurnIntentJudgeOutcome::Delegated),
-            TurnPhaseOutcome::Delegated
+            TurnIntentJudgeOutcome::Delegated.terminal_phase_outcome(),
+            Some(TurnPhaseOutcome::Delegated)
         );
         assert_eq!(TurnPhaseOutcome::Delegated.as_str(), "delegated");
         assert_ne!(
@@ -10924,6 +10944,32 @@ pub(crate) mod tests {
         };
         assert!(exhausted.advance().is_err());
         assert_eq!(exhausted.iteration_index(), Some(u32::MAX));
+    }
+
+    #[test]
+    fn original_execution_facts_reject_retired_direction_state_and_pending_context() {
+        let state = make_state();
+        let wire =
+            serde_json::to_value(OriginalLoopExecutionFacts::capture(&state).unwrap()).unwrap();
+        serde_json::from_value::<OriginalLoopExecutionFacts>(wire.clone()).unwrap();
+
+        let mut old_state = wire.clone();
+        old_state["provider_adaptation"]["work_direction"] = json!({
+            "attempted": [],
+            "disabled": false,
+            "binding_key": null,
+            "first_round": 0,
+            "cached": null,
+        });
+        assert!(serde_json::from_value::<OriginalLoopExecutionFacts>(old_state).is_err());
+
+        let mut old_pending = wire;
+        old_pending["pending_context"] = json!([{
+            "kind": "work_direction",
+            "payload": {"direction": "prepare_settlement"},
+            "round_index": 0,
+        }]);
+        assert!(serde_json::from_value::<OriginalLoopExecutionFacts>(old_pending).is_err());
     }
 
     #[test]
@@ -14062,6 +14108,36 @@ mod parallel_execution_tests {
         assert_eq!(value[0]["payload"]["signal"], "policy_advisory");
         assert_eq!(value[0]["payload"]["evidence"], "second advisory");
         assert_eq!(value[0]["payload"]["authority"], "advisory_evidence_only");
+    }
+
+    #[test]
+    fn work_evidence_context_replaces_snapshot_and_uses_required_typed_lane() {
+        let mut state = make_state();
+        state.push_volatile_payload(
+            VolatileKind::WorkEvidenceContext,
+            json!({"attempt_id": "old"}),
+        );
+        state.push_volatile_payload(
+            VolatileKind::WorkEvidenceContext,
+            json!({"attempt_id": "current", "settlement_readiness": "unknown"}),
+        );
+        assert_eq!(state.volatile_pending.len(), 1);
+        let wire = runtime_volatile_injections_edge_profile_value(&state.volatile_pending).unwrap();
+        assert_eq!(wire[0]["kind"], "work_evidence_context");
+        assert_eq!(wire[0]["delivery_class"], "required_context");
+        assert_eq!(wire[0]["payload"]["attempt_id"], "current");
+        let injection = serde_json::from_value::<
+            astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection,
+        >(wire[0].clone())
+        .unwrap();
+        let preamble = crate::turn::wire_assembly::runtime_volatile_preamble_message(&injection)
+            .expect("Work evidence must reach the provider preamble");
+        assert!(preamble["content"].as_str().unwrap().contains("current"));
+        assert!(!preamble["content"].as_str().unwrap().contains("old"));
+        assert!(VolatileKind::wire_kind_is_singleton(
+            "work_evidence_context"
+        ));
+        assert!(state.restricted_tools.is_empty());
     }
 
     #[test]

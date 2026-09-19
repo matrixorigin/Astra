@@ -1554,7 +1554,7 @@ async fn web_agent_structured_spawn_waits_for_server_child_before_parent_synthes
 }
 
 #[tokio::test]
-async fn web_agent_parallel_fanout_without_work_authority_fails_closed() {
+async fn web_agent_parallel_fanout_without_auxiliary_admission_uses_typed_carrier() {
     init_env();
     let (app, _ledger) = build_test_app();
 
@@ -1608,32 +1608,77 @@ async fn web_agent_parallel_fanout_without_work_authority_fails_closed() {
     )
     .await;
 
-    let serialized = serde_json::to_string(&events).expect("serialize parallel spawn events");
     let result = find_events(&events, "tool_call_end")
         .into_iter()
         .find(|event| event["call_id"].as_str() == Some("call-fanout"))
         .and_then(|event| event["result"].as_str())
         .and_then(|result| serde_json::from_str::<Value>(result).ok())
-        .unwrap_or_else(|| panic!("fanout must return a terminal structured result: {serialized}"));
-    assert_eq!(result["status"], "rejected", "{serialized}");
-    assert_eq!(
-        result["error_kind"], "parallel_topology_admission_unavailable",
-        "{serialized}"
-    );
+        .expect("fanout must return a terminal structured result");
+    // Auxiliary absence is not a negative topology decision. The fixed typed
+    // carrier still passes through canonical runtime delegation admission.
+    assert_eq!(result["status"], "completed");
     assert!(
         find_events(&events, "text_delta")
             .iter()
             .any(|event| event["content"].as_str() == Some("combined findings from both children")),
-        "the parent should recover from the rejected fanout without hidden topology: {serialized}"
+        "the parent should receive the completed fanout and combine its findings"
     );
-    assert!(
-        find_events(&events, "agent_spawned").is_empty(),
-        "{serialized}"
-    );
-    assert!(
-        find_events(&events, "agent_completed").is_empty(),
-        "{serialized}"
-    );
+    let spawned = find_event_type(&events, "agent_spawned");
+    assert_eq!(spawned.len(), 2);
+    assert_eq!(find_event_type(&events, "agent_completed").len(), 2);
+    for child in spawned {
+        assert_eq!(child["workspace"]["kind"], "none");
+        assert_eq!(child["executor"]["kind"], "server_local");
+    }
+}
+
+#[tokio::test]
+async fn web_agent_parallel_direct_spawns_without_auxiliary_admission_fail_closed() {
+    init_env();
+    let (app, _ledger) = build_test_app();
+    let calls: Vec<Value> = ["direct-a", "direct-b"]
+        .into_iter()
+        .map(|id| {
+            tool_call(
+                id,
+                "invoke_tool",
+                json!({
+                    "name": "agent",
+                    "arguments": {
+                        "action": "spawn",
+                        "agent_type": "code-review",
+                        "prompt": "Review one independent concern."
+                    }
+                }),
+            )
+        })
+        .collect();
+    let events = chat_stream_collect(&app, json!({
+        "message": "Use two independent child agents and combine their findings.",
+        "context": {
+            "test_llm_rounds": [
+                {"tool_calls": [tool_call("select-agent", "tool_search", json!({"query": "select:agent"}))]},
+                {"tool_calls": calls},
+                {"full_text": "Continuing without unauthorized parallel children."}
+            ],
+            "test_spawn_child_llm_rounds": [{"full_text": "must not execute"}]
+        }
+    })).await;
+    for id in ["direct-a", "direct-b"] {
+        let result = find_events(&events, "tool_call_end")
+            .into_iter()
+            .find(|event| event["call_id"].as_str() == Some(id))
+            .and_then(|event| event["result"].as_str())
+            .and_then(|result| serde_json::from_str::<Value>(result).ok())
+            .expect("direct spawn must return a structured rejection");
+        assert_eq!(result["status"], "rejected");
+        assert_eq!(
+            result["error_kind"],
+            "parallel_topology_admission_unavailable"
+        );
+    }
+    assert!(find_event_type(&events, "agent_spawned").is_empty());
+    assert!(find_event_type(&events, "agent_completed").is_empty());
 }
 
 #[tokio::test]
@@ -5924,7 +5969,7 @@ async fn hook_db_multiple_tools_selected() {
 
 #[tokio::test]
 async fn mock_llm_tool_flow_scenario_matrix() {
-    let cases = vec![
+    let cases = [
         MockToolScenario {
             name: "text_only",
             message: "hello".to_string(),

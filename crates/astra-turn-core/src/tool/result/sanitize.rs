@@ -380,18 +380,82 @@ mod tests {
 
     #[test]
     fn introspection_projection_leaves_small_reports_and_artifact_windows_unchanged() {
+        // A focused report exercises passthrough without assuming that the
+        // evolving default session report fits the inline model budget.
+        let request = crate::introspect::IntrospectRequest {
+            facet: astra_core::ObservationFacet::Errors,
+            depth: astra_core::ObservationDepth::Hint,
+            ..Default::default()
+        };
         let report = crate::introspect::build_introspect_report(
             &crate::introspect::IntrospectSnapshot::default(),
-            &crate::introspect::IntrospectRequest::default(),
+            &request,
         );
         let raw = serde_json::to_string(&report).unwrap();
-        assert!(raw.chars().count() <= INTROSPECT_MODEL_RESULT_CHARS);
+        assert!(
+            raw.chars().count() <= INTROSPECT_MODEL_RESULT_CHARS,
+            "focused fixture must fit: {} chars",
+            raw.chars().count()
+        );
         assert_eq!(truncate_tool_result_for_model("introspect", &raw), raw);
 
         let artifact = json!({"artifact": "artifact://session/tool-result/test", "offset": 0, "content": "window", "has_more": false}).to_string();
         assert_eq!(
             truncate_tool_result_for_model("introspect", &artifact),
             artifact
+        );
+    }
+
+    #[test]
+    fn default_introspection_report_has_a_bounded_loss_aware_model_view() {
+        let report = crate::introspect::build_introspect_report(
+            &crate::introspect::IntrospectSnapshot::default(),
+            &crate::introspect::IntrospectRequest::default(),
+        );
+        let raw = serde_json::to_string(&report).unwrap();
+        let output = tool_result_content_for_model("introspect", &raw);
+        let projected: Value = serde_json::from_str(&output).unwrap();
+        assert!(output.chars().count() <= INTROSPECT_MODEL_RESULT_CHARS);
+        assert_eq!(projected["summary"], report.summary);
+        if raw.chars().count() > INTROSPECT_MODEL_RESULT_CHARS {
+            assert_eq!(projected["schema"], "astra-introspect-model-projection-v1");
+            assert_eq!(projected["projection_budget"]["truncated"], true);
+            assert_eq!(
+                projected["snapshot_boundary"],
+                "before_current_introspect_execution"
+            );
+            assert_eq!(
+                projected["projection_budget"]["omitted"]["observations"],
+                report.observations.len() - projected["observations"].as_array().unwrap().len()
+            );
+            for observation in projected["observations"].as_array().unwrap() {
+                for reference in observation["evidence_refs"].as_array().unwrap() {
+                    assert!(
+                        projected["evidence"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|evidence| &evidence["ref_id"] == reference)
+                    );
+                }
+            }
+            assert!(
+                projected["recovery"]
+                    .as_str()
+                    .unwrap()
+                    .contains("new snapshot")
+            );
+        } else {
+            assert_eq!(output, raw);
+        }
+        assert_eq!(
+            serde_json::from_str::<Value>(&tool_result_content_for_model_unbounded(
+                "introspect",
+                &raw
+            ))
+            .unwrap(),
+            serde_json::from_str::<Value>(&raw).unwrap(),
+            "the full durable report must not be reduced to its inline projection"
         );
     }
 

@@ -361,6 +361,7 @@ fn model_selection_from_list_entry(entry: &ModelListItemResponse) -> Option<Serv
 pub(crate) async fn load_server_model_catalog(
     api: &astra_thin_client::ThinClient,
     token: &str,
+    purpose: astra_core::model_wire::purpose::ModelCatalogPurpose,
 ) -> Result<(Vec<ModelListItemResponse>, String), String> {
     let mut cursor: Option<ModelListCursor> = None;
     let mut items = Vec::new();
@@ -385,6 +386,7 @@ pub(crate) async fn load_server_model_catalog(
                 token,
                 std::time::Duration::from_secs(3),
                 cursor_tuple,
+                purpose,
             )
             .await
             .map_err(|error| format!("failed to load server model registry: {error}"))?;
@@ -431,8 +433,9 @@ pub(crate) async fn load_server_model_catalog(
 pub(crate) async fn load_server_model_catalog_json(
     api: &astra_thin_client::ThinClient,
     token: &str,
+    purpose: astra_core::model_wire::purpose::ModelCatalogPurpose,
 ) -> Result<String, String> {
-    let (items, revision) = load_server_model_catalog(api, token).await?;
+    let (items, revision) = load_server_model_catalog(api, token, purpose).await?;
     serde_json::to_string_pretty(&ModelListPageResponse {
         total: items.len() as u32,
         limit: 200,
@@ -638,8 +641,9 @@ pub(crate) async fn resolve_server_model_selection(
     api: &astra_thin_client::ThinClient,
     token: &str,
     model: &str,
+    purpose: astra_core::model_wire::purpose::ModelCatalogPurpose,
 ) -> Result<ServerModelSelection, String> {
-    let (catalog, _) = load_server_model_catalog(api, token).await?;
+    let (catalog, _) = load_server_model_catalog(api, token, purpose).await?;
     resolve_server_model_selection_from_catalog(api, token, model, &catalog).await
 }
 
@@ -709,7 +713,12 @@ pub(crate) async fn resolve_server_offering_selection(
     token: &str,
     offering_id: &str,
 ) -> Result<ServerModelSelection, String> {
-    let (catalog, _) = load_server_model_catalog(api, token).await?;
+    let (catalog, _) = load_server_model_catalog(
+        api,
+        token,
+        astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+    )
+    .await?;
     model_selection_for_offering_from_catalog(&catalog, offering_id)
         .ok_or_else(|| format!("Offering '{offering_id}' is not active in the Server catalog"))
 }
@@ -762,7 +771,14 @@ pub(crate) async fn ensure_state_default_model(
     state: &mut SessionState,
 ) -> Option<String> {
     if let Some(model) = normalize_model_override(state.model.as_deref()).map(str::to_string) {
-        match resolve_server_model_selection(api, token, &model).await {
+        match resolve_server_model_selection(
+            api,
+            token,
+            &model,
+            astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+        )
+        .await
+        {
             Ok(selection) => {
                 crate::cli::slash::slash_config::set_active_offering_id_for_request(Some(
                     selection.offering_id,
@@ -2315,9 +2331,14 @@ mod tests {
             .await;
         let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
 
-        let small = resolve_server_model_selection(&api, "token", "small-model")
-            .await
-            .expect("active Offering without optional context metadata");
+        let small = resolve_server_model_selection(
+            &api,
+            "token",
+            "small-model",
+            astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+        )
+        .await
+        .expect("active Offering without optional context metadata");
         assert_eq!(small.offering_id, "offer-small");
         assert_eq!(small.context_window, Some(8_192));
 
@@ -2325,6 +2346,7 @@ mod tests {
             &api,
             "token",
             "deepseek-v4-pro-official(thinking:high)",
+            astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
         )
         .await
         .expect("active Offering selected through thinking suffix");
@@ -2343,9 +2365,14 @@ mod tests {
             .mount(&mock)
             .await;
         let api = astra_thin_client::ThinClient::new(&mock.uri(), None).expect("client");
-        let error = resolve_server_model_selection(&api, "token", "overflow-model(thinking:high)")
-            .await
-            .expect_err("a missing Offering must fail closed");
+        let error = resolve_server_model_selection(
+            &api,
+            "token",
+            "overflow-model(thinking:high)",
+            astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+        )
+        .await
+        .expect_err("a missing Offering must fail closed");
         assert!(error.contains("authoritative catalog"), "{error}");
     }
 
@@ -2384,9 +2411,14 @@ mod tests {
             .await;
 
         let api = astra_thin_client::ThinClient::new(&mock.uri(), None).expect("client");
-        let selection = resolve_server_model_selection(&api, "token", "second-model")
-            .await
-            .expect("second-page Offering should resolve");
+        let selection = resolve_server_model_selection(
+            &api,
+            "token",
+            "second-model",
+            astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+        )
+        .await
+        .expect("second-page Offering should resolve");
         assert_eq!(selection.offering_id, "offer-second");
     }
 
@@ -2541,9 +2573,14 @@ mod tests {
             ),
             "an invalid provider default must not silently fall back"
         );
-        let manual = resolve_server_model_selection(&api, "token", "valid-model")
-            .await
-            .expect("valid effective Offering remains selectable manually");
+        let manual = resolve_server_model_selection(
+            &api,
+            "token",
+            "valid-model",
+            astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+        )
+        .await
+        .expect("valid effective Offering remains selectable manually");
         assert_eq!(manual.offering_id, "offer-valid");
     }
 

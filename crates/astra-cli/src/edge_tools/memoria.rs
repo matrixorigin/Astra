@@ -727,12 +727,11 @@ mod build_direct_request_tests {
 /// Retrieve procedural/semantic lessons from Memoria for session bootstrap.
 /// `context_query` should be derived from the user's first message — this
 /// produces much better semantic retrieval than keyword stuffing.
-/// Returns canonical lesson hints. Best-effort: returns empty vec
-/// on any error (circuit breaker, timeout, parse failure).
+/// Preserve retrieval failures so Explain does not mistake them for no matches.
 pub async fn memoria_retrieve_lessons(
     top_k: u64,
     context_query: Option<&str>,
-) -> Vec<astra_services::LessonHint> {
+) -> Result<Vec<astra_services::LessonHint>, &'static str> {
     let query = context_query.unwrap_or("reusable lessons and corrections from prior sessions");
     let payload = json!({
         "query": query,
@@ -741,11 +740,11 @@ pub async fn memoria_retrieve_lessons(
     });
     let text = match memoria_retrieve(&payload, Duration::from_secs(3)).await {
         Ok(text) => text,
-        Err(_) => return Vec::new(),
+        Err(_) => return Err("memory retrieval unavailable"),
     };
     let value: serde_json::Value = match serde_json::from_str(&text) {
         Ok(v) => v,
-        Err(_) => return Vec::new(),
+        Err(_) => return Err("invalid memory retrieval response"),
     };
     // Memoria /v1/memories/retrieve returns a direct array when explain
     // is off, or {"results": [...]} when explain is on. Handle both.
@@ -756,12 +755,12 @@ pub async fn memoria_retrieve_lessons(
     } else if let Some(arr) = value.get("results").and_then(|v| v.as_array()) {
         arr
     } else {
-        return Vec::new();
+        return Err("invalid memory retrieval response");
     };
-    memories
+    Ok(memories
         .iter()
         .filter_map(astra_services::memory_value_to_lesson_hint)
-        .collect()
+        .collect())
 }
 
 /// Store extracted lessons in Memoria as L3 durable memory.

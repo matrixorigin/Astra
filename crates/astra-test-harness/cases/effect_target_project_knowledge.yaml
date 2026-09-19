@@ -1,0 +1,45 @@
+name: effect_target_project_knowledge
+description: |
+  Counterfactual pair with effect_target_managed_memory: the same synthetic
+  workspace-file fact has a different explicit persistence destination.
+  File comparisons and canonical tool receipts check effects, not prose alone.
+  Run in a disposable detached checkout. Passing does not prove admission
+  classification accuracy: the primary fallback can also complete the request.
+prompt: |
+  Read .astra_harness_effect_target_local/source.txt. Save the fact
+  "The workspace scratch file contains cobalt-731." only in the project-local
+  file .astra_harness_effect_target_local/knowledge.txt, then read it back.
+  Do not use managed memory or change any other file. Briefly confirm the result.
+capability: tool_use
+difficulty: 2
+timeout_seconds: 120
+setup_cmd: |
+  set -eu
+  rm -f .astra_harness_effect_target_local.created
+  test "$(git rev-parse --is-inside-work-tree)" = true
+  if git symbolic-ref -q HEAD >/dev/null; then exit 1; fi
+  mkdir .astra_harness_effect_target_local
+  touch .astra_harness_effect_target_local.created
+  printf 'cobalt-731\n' > .astra_harness_effect_target_local/source.txt
+teardown_cmd: |
+  set -eu
+  # Setup failure is already fatal; never clean a directory we did not create.
+  test -f .astra_harness_effect_target_local.created || exit 0
+  trap 'rm -f .astra_harness_effect_target_local/source.txt .astra_harness_effect_target_local/knowledge.txt .astra_harness_effect_target_local.created; rmdir .astra_harness_effect_target_local' EXIT
+  printf 'cobalt-731\n' | cmp - .astra_harness_effect_target_local/source.txt
+  test "$(cat .astra_harness_effect_target_local/knowledge.txt)" = 'The workspace scratch file contains cobalt-731.'
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: memory
+    min: 0
+    max: 0
+  - type: hard_judger
+    question: |
+      From canonical tool records, was the requested fact written successfully
+      to .astra_harness_effect_target_local/knowledge.txt and then read back?
+      Require successful write and subsequent read receipts containing the fact,
+      not just a final claim. No other file may be changed and no memory call is
+      allowed. Score 1 only if all conditions hold; otherwise 0.
+    threshold: 1.0

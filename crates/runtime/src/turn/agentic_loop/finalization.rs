@@ -554,7 +554,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         }
     }
 
-    host.on_turn_terminal(state, &result);
+    host.on_turn_terminal(state, &result).await;
 
     // Ensure SessionEnd fires even on error returns that skip finalize_and_render.
     #[cfg(feature = "harness")]
@@ -574,16 +574,14 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         if let Some(sid) = state.current_session_id.as_deref() {
             if let Some(buf) = state.turn_event_buffer.as_mut() {
                 if !buf.is_empty() {
-                    if let Ok(writer) =
-                        journal_writer_for_owner(state.context_manifest_user_id.as_deref(), sid)
+                    if let Err(error) =
+                        buf.flush_for_owner(state.context_manifest_user_id.as_deref(), sid, true)
                     {
-                        if let Err(error) = buf.flush_interrupted(&writer) {
-                            tracing::warn!(
-                                session_id = sid,
-                                error = %error,
-                                "failed to flush interrupted turn journal events after agentic loop error"
-                            );
-                        }
+                        tracing::warn!(
+                            session_id = sid,
+                            error = %error,
+                            "failed to flush interrupted turn journal events after agentic loop error"
+                        );
                     }
                 }
             }
@@ -610,16 +608,14 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             // Best-effort flush of turn observability events on interruption.
             if let Some(buf) = state.turn_event_buffer.as_mut() {
                 if !buf.is_empty() {
-                    if let Ok(writer) =
-                        journal_writer_for_owner(state.context_manifest_user_id.as_deref(), sid)
+                    if let Err(error) =
+                        buf.flush_for_owner(state.context_manifest_user_id.as_deref(), sid, true)
                     {
-                        if let Err(error) = buf.flush_interrupted(&writer) {
-                            tracing::warn!(
-                                session_id = sid,
-                                error = %error,
-                                "failed to flush interrupted turn journal events"
-                            );
-                        }
+                        tracing::warn!(
+                            session_id = sid,
+                            error = %error,
+                            "failed to flush interrupted turn journal events"
+                        );
                     }
                 }
             }
@@ -1104,6 +1100,9 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
         crate::session_memory::SpawnDecision::Skipped => {}
     }
 }
+
+#[cfg(test)]
+mod trace_ingestion_tests;
 
 #[cfg(test)]
 mod tests {

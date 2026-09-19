@@ -62,6 +62,7 @@ pub(super) async fn build_runtime_wiring(
             state.edge_callback_ledger.clone(),
         )
         .with_run_engine(run_engine.clone())
+        .with_trace_ingestion(matrix_rt.clone_ingestion_sender())
         .with_model_service(Some(state.model_service.clone()))
         .with_pool(shared_pool.clone())
         .with_edge_connection_pool(state.edge_connection_pool.clone())
@@ -124,6 +125,7 @@ pub(super) async fn build_runtime_wiring(
         run_engine,
     )
     .with_admission_limits(admission_limits)
+    .with_trace_ingestion(matrix_rt.clone_ingestion_sender())
     .with_pool(shared_pool.clone())
     .with_agent_mailbox_router(agent_mailbox_router)
     .with_delegation_engine(Arc::clone(&delegation_engine))

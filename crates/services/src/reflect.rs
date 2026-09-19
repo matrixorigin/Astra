@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use astra_core::{
     ErrorResponse, MatrixOneSettings, ObservationActionHint, ObservationBudgetOmitted,
@@ -72,6 +72,12 @@ pub struct ReflectReport {
     pub source_policy: String,
     pub include_context: bool,
     pub data_coverage: ObservationDataCoverage,
+    /// Physical inference attempts for internal decisions, scoped to this
+    /// authenticated session. Missing coverage is explicit, never zero usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judgment_usage: Option<JudgmentUsageSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_judgments: Option<crate::semantic_judgment_observation::SemanticJudgmentView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<ObservationView>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -88,6 +94,219 @@ pub struct ReflectReport {
     pub graph_slice: ObservationGraphSlice,
     #[serde(default)]
     pub budget_result: ObservationBudgetResult,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JudgmentUsageSummary {
+    pub scope: JudgmentUsageScope,
+    pub capture_incomplete: bool,
+    pub coverage: String,
+    pub groups: Vec<JudgmentUsageGroup>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub omitted_groups: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgmentUsageScope {
+    #[default]
+    SessionSupportedJudgmentOperationsAtLedgerRead,
+    LocalCapturedRunTurn {
+        run_id: String,
+        turn_id: String,
+    },
+    LocalCaptureUnavailable,
+}
+
+impl JudgmentUsageScope {
+    pub fn is_local(&self) -> bool {
+        !matches!(self, Self::SessionSupportedJudgmentOperationsAtLedgerRead)
+    }
+
+    pub fn render(&self) -> String {
+        match self {
+            Self::SessionSupportedJudgmentOperationsAtLedgerRead => {
+                "scope=session_supported_judgment_operations cutoff=ledger_read".into()
+            }
+            Self::LocalCapturedRunTurn { run_id, turn_id } => format!(
+                "scope=local_captured_run_turn run={run_id} turn={turn_id}; not session totals or necessarily the current turn"
+            ),
+            Self::LocalCaptureUnavailable => {
+                "scope=local_capture_unavailable; run/turn unknown".into()
+            }
+        }
+    }
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JudgmentUsageGroup {
+    pub provider: String,
+    pub offering_id: String,
+    pub model: String,
+    pub operation: String,
+    pub attempts: usize,
+    pub exact_usage_attempts: usize,
+    pub known_input_tokens: u128,
+    pub known_output_tokens: u128,
+    pub input_incomplete: bool,
+    pub output_incomplete: bool,
+}
+
+impl JudgmentUsageSummary {
+    /// The same supported-operation boundary for local introspection and reflection.
+    pub fn supported_attempts(
+        facts: &astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1,
+    ) -> astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
+        let mut supported = facts.clone();
+        supported.attempts.retain(Self::supports_attempt);
+        supported
+    }
+
+    fn supports_attempt(attempt: &astra_turn_types::ExplainAnalyzeAuxiliaryAttemptV1) -> bool {
+        matches!(
+            attempt.operation_id.as_str(),
+            "request_judgment"
+                | "skill_auto_route"
+                | "work_direction"
+                | "memory_relevance"
+                | "memory_feedback"
+                | "verification_judge"
+                | "completion_proxy:turn_intent"
+        ) || attempt.purpose == "memory_retrieval_rerank"
+            || attempt.purpose == "verification_judge"
+    }
+
+    pub fn from_physical_attempts(
+        facts: &astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1,
+    ) -> Self {
+        if !facts.available {
+            return Self {
+                scope: JudgmentUsageScope::default(),
+                capture_incomplete: false,
+                coverage: "unavailable".into(),
+                groups: Vec::new(),
+                omitted_groups: 0,
+            };
+        }
+        let mut groups: BTreeMap<(String, String, String, String), JudgmentUsageGroup> =
+            BTreeMap::new();
+        for attempt in &facts.attempts {
+            if !Self::supports_attempt(attempt) {
+                continue;
+            }
+            let key = (
+                attempt.provider.clone(),
+                attempt.offering_id.clone(),
+                attempt.model_name.clone(),
+                attempt.operation_id.clone(),
+            );
+            let group = groups.entry(key).or_insert_with(|| JudgmentUsageGroup {
+                provider: attempt.provider.clone(),
+                offering_id: attempt.offering_id.clone(),
+                model: attempt.model_name.clone(),
+                operation: attempt.operation_id.clone(),
+                attempts: 0,
+                exact_usage_attempts: 0,
+                known_input_tokens: 0,
+                known_output_tokens: 0,
+                input_incomplete: facts.truncated,
+                output_incomplete: facts.truncated,
+            });
+            group.attempts += 1;
+            if attempt.usage_status
+                == astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact
+            {
+                group.exact_usage_attempts += 1;
+            }
+            let usage = attempt.usage.as_ref();
+            let input_parts = usage.map(|u| {
+                [
+                    u.fresh_input_tokens,
+                    u.cache_read_tokens,
+                    u.cache_creation_tokens,
+                ]
+            });
+            if let Some(parts) = input_parts {
+                for part in parts {
+                    if let Some(value) = part {
+                        group.known_input_tokens += u128::from(value);
+                    } else {
+                        group.input_incomplete = true;
+                    }
+                }
+            } else {
+                group.input_incomplete = true;
+            }
+            if let Some(output) = usage.and_then(|u| u.output_tokens) {
+                group.known_output_tokens += u128::from(output);
+            } else {
+                group.output_incomplete = true;
+            }
+        }
+        Self {
+            scope: JudgmentUsageScope::default(),
+            capture_incomplete: false,
+            coverage: if facts.truncated {
+                "capture_truncated"
+            } else {
+                "available"
+            }
+            .into(),
+            groups: groups.into_values().collect(),
+            omitted_groups: 0,
+        }
+    }
+
+    pub fn render(&self) -> String {
+        format!("{}; {}", self.scope.render(), self.render_usage())
+    }
+
+    fn render_usage(&self) -> String {
+        let truncated = self.coverage == "capture_truncated";
+        if self.coverage != "available" && !truncated {
+            return "Judgment physical-attempt usage unavailable; no token total inferred.".into();
+        }
+        if self.groups.is_empty() && self.omitted_groups == 0 {
+            if truncated || self.capture_incomplete {
+                if !truncated {
+                    return "Judgment physical-attempt capture incomplete; no supported rows captured; total usage unknown, not zero.".into();
+                }
+                return "Judgment physical-attempt capture truncated; no supported judgment rows captured; total usage unknown, not zero.".into();
+            }
+            return "Judgment physical-attempt capture: no supported judgment operations observed in this bounded source view.".into();
+        }
+        let mut lines = Vec::with_capacity(self.groups.len());
+        for group in &self.groups {
+            let input = if truncated || self.capture_incomplete || group.input_incomplete {
+                format!("at least {}", group.known_input_tokens)
+            } else {
+                group.known_input_tokens.to_string()
+            };
+            let output = if truncated || self.capture_incomplete || group.output_incomplete {
+                format!("at least {}", group.known_output_tokens)
+            } else {
+                group.known_output_tokens.to_string()
+            };
+            lines.push(format!("{} ({}, offering {}) {}: {} captured physical call(s), {}/{} captured calls with exact usage; input {input}, output {output} tokens", group.provider, group.model, group.offering_id, group.operation, group.attempts, group.exact_usage_attempts, group.attempts));
+        }
+        if truncated {
+            lines.push("capture truncated; counts cover captured calls only; all token sums are lower bounds".into());
+        }
+        if self.capture_incomplete {
+            lines.push("historical capture incomplete; missing attempts unknown; totals are lower bounds (not a truncation claim)".into());
+        }
+        if self.omitted_groups > 0 {
+            lines.push(format!(
+                "{} captured group(s) omitted from display",
+                self.omitted_groups
+            ));
+        }
+        format!("Judgment physical-attempt capture: {}.", lines.join("; "))
+    }
 }
 
 /// Session-wide child-delivery accounting shared by local journal reflection
@@ -1292,6 +1511,68 @@ impl ReflectService for DatabaseReflectService {
             None
         };
 
+        let (judgment_usage, semantic_judgments) = tokio::join!(
+            async {
+                if let Some(shared_pool) = self.pool.as_ref() {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        crate::inference_execution::load_session_auxiliary_usage(
+                            shared_pool,
+                            user_id,
+                            session_id,
+                            512,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(facts)) => JudgmentUsageSummary::from_physical_attempts(&facts),
+                        outcome => {
+                            tracing::warn!(
+                                target: "astra_services::reflect",
+                                user_id = %user_id,
+                                session_id = %session_id,
+                                ?outcome,
+                                "judgment physical-attempt facts unavailable during reflection"
+                            );
+                            JudgmentUsageSummary {
+                                scope: JudgmentUsageScope::default(),
+                                capture_incomplete: false,
+                                coverage: "unavailable".into(),
+                                groups: Vec::new(),
+                                omitted_groups: 0,
+                            }
+                        }
+                    }
+                } else {
+                    JudgmentUsageSummary {
+                        scope: JudgmentUsageScope::default(),
+                        capture_incomplete: false,
+                        coverage: "unavailable".into(),
+                        groups: Vec::new(),
+                        omitted_groups: 0,
+                    }
+                }
+            },
+            async {
+                if crate::semantic_judgment_observation::semantic_judgment_facet_enabled(
+                    request.facet,
+                ) {
+                    Some(
+                        crate::semantic_judgment_observation::load_semantic_judgment_view(
+                            self.pool.as_ref(),
+                            user_id,
+                            session_id,
+                            request.source_policy,
+                            request.depth,
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                }
+            }
+        );
+
         // `agent_events.meta_duration_ms` is the durable timing projection
         // for model rounds. Keep this optional like cache-context telemetry so
         // older deployments can still produce the causal report when the
@@ -1475,6 +1756,12 @@ impl ReflectService for DatabaseReflectService {
             summary.push(' ');
             summary.push_str(&model_request_summary.render());
         }
+        summary.push(' ');
+        summary.push_str(&judgment_usage.render());
+        if let Some(semantics) = &semantic_judgments {
+            summary.push(' ');
+            summary.push_str(&semantics.render());
+        }
         if let Some(llm_latency_summary) = llm_latency_summary {
             summary.push(' ');
             summary.push_str(&llm_latency_summary.render());
@@ -1486,7 +1773,29 @@ impl ReflectService for DatabaseReflectService {
             &failure_clusters,
             &budget_result,
         );
-        let view = request.view(overview.total_events, overview.total_decisions);
+        let mut view = request.view(overview.total_events, overview.total_decisions);
+        if let Some(semantics) = &semantic_judgments {
+            view.data_coverage.providers.insert(
+                "semantic_judgment_trace".into(),
+                astra_core::ObservationProviderCoverage {
+                    status: if semantics.counts.is_some() {
+                        "partial"
+                    } else {
+                        "missing"
+                    }
+                    .into(),
+                    freshness_ms: None,
+                    reason: Some(format!(
+                        "session_trace_at_read:{:?};classification_not_execution_authority",
+                        semantics.coverage
+                    )),
+                },
+            );
+            view.data_coverage.overall = "partial".into();
+            view.data_coverage.warnings.push(
+                "Semantic trace capture is incomplete; model adoption remains unknown.".into(),
+            );
+        }
         let data_coverage = view.data_coverage.clone();
 
         Ok(ReflectReport {
@@ -1501,6 +1810,8 @@ impl ReflectService for DatabaseReflectService {
             source_policy: request.source_policy.as_str().to_string(),
             include_context: request.include_context,
             data_coverage,
+            judgment_usage: Some(judgment_usage),
+            semantic_judgments,
             view: Some(view),
             summary,
             observations,
@@ -1712,6 +2023,153 @@ use astra_core::ObservationGraphEdge;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_turn_types::{
+        ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
+        ExplainAnalyzeAuxiliaryUsageV1, ExplainAnalyzeTokenUsageV1, ExplainAnalyzeUsageBasisV1,
+    };
+
+    #[test]
+    fn judgment_rollup_uses_physical_attempts_and_preserves_missing_usage() {
+        let exact = ExplainAnalyzeAuxiliaryAttemptV1 {
+            attempt_id: "attempt-1".into(),
+            usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+            provider: "typesafe".into(),
+            offering_id: "offering-1".into(),
+            model_name: "jev-1.13.0".into(),
+            purpose: "introspection".into(),
+            operation_id: "request_judgment".into(),
+            usage: Some(ExplainAnalyzeTokenUsageV1 {
+                basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
+                fresh_input_tokens: Some(120),
+                output_tokens: Some(14),
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+            }),
+        };
+        let missing = ExplainAnalyzeAuxiliaryAttemptV1 {
+            attempt_id: "attempt-2".into(),
+            usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::Unavailable,
+            usage: None,
+            ..exact.clone()
+        };
+        let extraction = ExplainAnalyzeAuxiliaryAttemptV1 {
+            attempt_id: "attempt-3".into(),
+            operation_id: "memory_extraction".into(),
+            purpose: "memory_extraction".into(),
+            ..exact.clone()
+        };
+        let different_offering = ExplainAnalyzeAuxiliaryAttemptV1 {
+            attempt_id: "attempt-4".into(),
+            offering_id: "offering-2".into(),
+            ..exact.clone()
+        };
+        let work_direction = ExplainAnalyzeAuxiliaryAttemptV1 {
+            attempt_id: "attempt-5".into(),
+            operation_id: "work_direction".into(),
+            ..exact.clone()
+        };
+        let facts = ExplainAnalyzeAuxiliaryUsageV1 {
+            available: true,
+            truncated: false,
+            attempts: vec![
+                exact,
+                missing,
+                extraction,
+                different_offering,
+                work_direction,
+            ],
+        };
+        let summary = JudgmentUsageSummary::from_physical_attempts(&facts);
+        assert_eq!(summary.groups.len(), 3);
+        let group = &summary.groups[0];
+        assert_eq!(group.offering_id, "offering-1");
+        assert_eq!((group.attempts, group.exact_usage_attempts), (2, 1));
+        assert_eq!(
+            (group.known_input_tokens, group.known_output_tokens),
+            (120, 14)
+        );
+        assert!(group.input_incomplete && group.output_incomplete);
+        assert!(summary.render().contains("at least 120"));
+        let unavailable =
+            JudgmentUsageSummary::from_physical_attempts(&ExplainAnalyzeAuxiliaryUsageV1 {
+                available: false,
+                truncated: false,
+                attempts: vec![],
+            });
+        assert_eq!(unavailable.coverage, "unavailable");
+        assert!(unavailable.render().contains("unavailable"));
+    }
+
+    #[test]
+    fn judgment_rollup_truncated_capture_retains_facts_and_bounds_every_group() {
+        let attempt = ExplainAnalyzeAuxiliaryAttemptV1 {
+            attempt_id: "attempt".into(),
+            usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+            provider: "typesafe".into(),
+            offering_id: "offering".into(),
+            model_name: "model".into(),
+            purpose: "introspection".into(),
+            operation_id: "work_direction".into(),
+            usage: Some(ExplainAnalyzeTokenUsageV1 {
+                basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
+                fresh_input_tokens: Some(2),
+                output_tokens: Some(3),
+                cache_read_tokens: Some(0),
+                cache_creation_tokens: Some(0),
+            }),
+        };
+        // Model an over-limit ledger's retained 512-row capture, not a
+        // display-limited list. Projection overflow is tested by its owner.
+        let ledger: Vec<_> = (0..513)
+            .map(|i| ExplainAnalyzeAuxiliaryAttemptV1 {
+                attempt_id: format!("attempt-{i}"),
+                offering_id: format!("offering-{}", i % 2),
+                ..attempt.clone()
+            })
+            .collect();
+        let facts = ExplainAnalyzeAuxiliaryUsageV1 {
+            available: true,
+            truncated: ledger.len() > 512,
+            attempts: ledger.into_iter().take(512).collect(),
+        };
+        let summary = JudgmentUsageSummary::from_physical_attempts(&facts);
+        assert_eq!(summary.coverage, "capture_truncated");
+        assert_eq!(summary.groups.len(), 2);
+        for group in &summary.groups {
+            assert_eq!(group.attempts, 256);
+            assert_eq!(group.exact_usage_attempts, 256);
+            assert_eq!(
+                (group.known_input_tokens, group.known_output_tokens),
+                (512, 768)
+            );
+            assert!(group.input_incomplete && group.output_incomplete);
+        }
+        let output = summary.render();
+        assert!(
+            output.contains("input at least 512, output at least 768"),
+            "{output}"
+        );
+        assert!(output.contains("capture truncated"));
+        assert!(!output.contains("unavailable"));
+
+        let empty = JudgmentUsageSummary::from_physical_attempts(&ExplainAnalyzeAuxiliaryUsageV1 {
+            available: true,
+            truncated: true,
+            attempts: vec![],
+        });
+        assert!(empty.render().contains("total usage unknown, not zero"));
+        let mut display_only =
+            JudgmentUsageSummary::from_physical_attempts(&ExplainAnalyzeAuxiliaryUsageV1 {
+                available: true,
+                truncated: false,
+                attempts: vec![attempt],
+            });
+        display_only.omitted_groups = 2;
+        let output = display_only.render();
+        assert!(output.contains("2 captured group(s) omitted from display"));
+        assert!(!output.contains("capture truncated"));
+        assert!(!output.contains("at least"));
+    }
     use crate::model_request_context::{
         ModelRequestCache, ModelRequestCompaction, ModelRequestContextEvent,
         ModelRequestContextRecord, ModelRequestIdentity, ModelRequestLineage, ModelRequestTopology,
@@ -1764,6 +2222,7 @@ mod tests {
             model: "deepseek-v4-flash".into(),
             offering_id: "offering-1".into(),
             inference_purpose: "primary_agent".into(),
+            operation_id: "agent_turn".into(),
             provider_protocol: "openai".into(),
             provider_wire_hash: "hash".into(),
             provider_wire_bytes: 100,
@@ -3166,6 +3625,8 @@ mod tests {
             source_policy: "auto".into(),
             include_context: false,
             data_coverage: data_coverage.clone(),
+            judgment_usage: None,
+            semantic_judgments: None,
             view: Some(ObservationView {
                 topic: "overview".into(),
                 facet: "overview".into(),
@@ -3257,8 +3718,25 @@ mod tests {
             json_value.get("prompt_preview").is_none(),
             "legacy prompt_preview must not be part of the public reflect report"
         );
-        let parsed: ReflectReport = serde_json::from_str(&json).unwrap();
+        let mut parsed: ReflectReport = serde_json::from_str(&json).unwrap();
         assert_eq!(report, parsed);
+        // Old reports omit the new optional field; new unavailable captures
+        // carry unknown counts rather than inventing zero semantic calls.
+        assert!(parsed.semantic_judgments.is_none());
+        let view = crate::semantic_judgment_observation::SemanticJudgmentView::unavailable(
+            crate::semantic_judgment_observation::SemanticJudgmentCoverage::SourceExcluded,
+        );
+        parsed.summary.push_str(&view.render());
+        parsed.semantic_judgments = Some(view);
+        let projected = parsed.project_lightweight();
+        let value = serde_json::to_value(&projected).unwrap();
+        assert_eq!(value["semantic_judgments"]["coverage"], "source_excluded");
+        assert!(value["semantic_judgments"].get("model_adoption").is_none());
+        assert!(value["semantic_judgments"]["counts"].is_null());
+        assert_eq!(
+            serde_json::from_value::<ReflectReport>(value).unwrap(),
+            projected
+        );
     }
 
     #[test]

@@ -180,6 +180,21 @@ fn lifecycle_token_usage_json(
     Some(Value::Object(usage_json))
 }
 
+/// Run totals include auxiliary judgments and may span multiple providers.
+/// A single cache hit ratio here would misrepresent the primary model.
+fn run_token_usage_json(state: &AgenticLoopState) -> Option<Value> {
+    let mut usage = lifecycle_token_usage_json(
+        state.total_prompt,
+        state.total_cache_read,
+        state.total_cache_creation,
+        state.total_completion,
+    )?;
+    let object = usage.as_object_mut().expect("usage is an object");
+    object.remove("prompt_cache_hit_ratio");
+    object.insert("scope".into(), json!("runtime_accounted_usage"));
+    Some(usage)
+}
+
 fn decode_post_compaction_manifest_count(row: &impl RowExt) -> Result<i64, String> {
     RowDecoder::new(row, "post-compaction context manifest count").non_negative_i64("count")
 }
@@ -2101,12 +2116,7 @@ fn build_server_loop_core_events(
         .collect::<Vec<_>>();
 
     let llm_response_event = if !state.final_text.is_empty() {
-        let usage = lifecycle_token_usage_json(
-            state.total_prompt,
-            state.total_cache_read,
-            state.total_cache_creation,
-            state.total_completion,
-        );
+        let usage = run_token_usage_json(state);
         let mut event = TraceEvent::new(
             trace_event_id("response", &[run_id, &trace.turn_id]),
             session_id,
@@ -4441,6 +4451,22 @@ mod tests {
             "persisted runtime events must use canonical prompt-cache field names"
         );
         assert!(lifecycle_token_usage_json(0, 0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn mixed_provider_run_totals_do_not_claim_a_primary_cache_ratio() {
+        let mut state = observer_test_state();
+        // Primary: 100 fresh + 900 cached. Jev: 1000 input + 3 output.
+        state.total_prompt = 1_100;
+        state.total_cache_read = 900;
+        state.total_completion = 3;
+        let usage = run_token_usage_json(&state).unwrap();
+        assert_eq!(usage["scope"], "runtime_accounted_usage");
+        assert_eq!(usage["prompt"], 2_000);
+        assert_eq!(usage["total"], 2_003);
+        assert!(usage.get("prompt_cache_hit_ratio").is_none());
+        let primary = lifecycle_token_usage_json(100, 900, 0, 0).unwrap();
+        assert_eq!(primary["prompt_cache_hit_ratio"], json!(0.9));
     }
 
     #[test]

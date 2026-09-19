@@ -198,6 +198,7 @@ time.sleep(30)
             (root / "run-artifact.log").write_text("generated\n", encoding="utf-8")
             live.ensure_source_checkout_is_clean(root)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux /proc and prctl")
     def test_supervised_leader_exit_reaps_owned_child(self) -> None:
         """A crashed Web/Playwright leader must not leave its child alive."""
 
@@ -210,11 +211,22 @@ time.sleep(30)
 import pathlib
 import time
 
+# File existence means a complete PID; leader exit means the child is ready.
+ready_read, ready_write = os.pipe()
 if os.fork() == 0:
-    pathlib.Path(os.environ['CHILD_PID']).write_text(str(os.getpid()))
+    os.close(ready_read)
+    child_pid = pathlib.Path(os.environ['CHILD_PID'])
+    staged_pid = child_pid.with_suffix('.tmp')
+    staged_pid.write_text(str(os.getpid()), encoding='utf-8')
+    staged_pid.replace(child_pid)
+    os.write(ready_write, b'1')
+    os.close(ready_write)
     time.sleep(30)
     os._exit(0)
-time.sleep(0.2)
+os.close(ready_write)
+if os.read(ready_read, 1) != b'1':
+    os._exit(1)
+os.close(ready_read)
 os._exit(0)
 """,
                 encoding="utf-8",

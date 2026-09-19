@@ -38,9 +38,19 @@ MCP CLI tests launch the prebuilt `mock_mcp_server` beside their test executable
 target triple, and profile. Test processes do not run nested Cargo builds.
 
 Live `astra-test` quality judging invokes `astra session judge --model MODEL
---message RUBRIC_AND_EVIDENCE`. This is one tool-free `VerificationJudge`
+--message JUDGMENT_REQUEST_JSON`. This is one tool-free `VerificationJudge`
 completion through the existing authenticated Offering and durable inference
-owners. Each judgment, quorum vote, and bounded format repair creates its own
+owners. The input is the shared `JudgmentRequest` schema; ordinary LLMs return
+fixed true/uncertain IDs and Jev returns native probabilities. The CLI returns
+normalized answers and their provenance. The harness requires one confident
+rubric category (fully yes, substantially yes, partial, or no), then maps it to
+1.0, 0.7, 0.4, or 0.0. Probabilities are never scores; uncertain, conflicting,
+and malformed judgments fail without format repair. Rubric wire IDs are
+descriptive strings (`rubric_fully_yes`, `rubric_substantially_yes`,
+`rubric_partial`, `rubric_no`), not numeric indices. Sparse chat answers contain
+only `true` and `uncertain`; false answers are omitted. Numeric IDs and an extra
+`false` field remain invalid, not coerced. Criterion thresholds and
+quorum aggregation remain unchanged. Each judgment and quorum vote creates its own
 session; its real usage is separate from the measured agent session. The CLI
 closes the evaluation session after a completed response or client-error rejection.
 Uncertain gateway and transport failures retain the session identity for diagnosis without
@@ -267,6 +277,13 @@ ASTRA_TEST_SUMMARY_MODEL=kimi-k2.6 \
 CARGO_INCREMENTAL=0 cargo test -p astra-runtime --features live-provider-tests --lib \
   live_work_admission_provider_contract -- --ignored --nocapture
 ```
+
+The real-provider token-usage harness uses the same explicit build boundary:
+`make harness-live-llm` enables `live-provider-tests` for
+`live_token_usage_e2e`. Normal offline/online builds do not include this harness
+code. Provider credentials or inherited environment settings cannot enable
+paid calls in those lanes. Ordinary integration coverage uses controlled mock
+providers.
 
 Both paid checks require `live-provider-tests` and `--ignored`; default
 MatrixOne CI can run ignored tests without a paid key. Do not enable this

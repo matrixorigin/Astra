@@ -56,10 +56,12 @@ pub(super) async fn auth_uc_bootstrap_handler(
     let default = catalog
         .default_offering_id
         .filter(|id| {
-            catalog
-                .items
-                .iter()
-                .any(|item| &item.offering_id == id && item.is_active)
+            catalog.items.iter().any(|item| {
+                &item.offering_id == id
+                    && item.is_active
+                    && astra_core::model_wire::purpose::ModelRequestPurpose::Chat
+                        .supported_by(&item.provider)
+            })
         })
         .ok_or_else(|| {
             astra_core::error_response_coded(

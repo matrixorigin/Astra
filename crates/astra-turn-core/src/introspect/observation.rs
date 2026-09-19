@@ -36,6 +36,13 @@ pub struct IntrospectReport {
     /// Desktop. Text summaries are projections of this frame, never a second
     /// authority that clients must parse.
     pub runtime_feedback: Option<crate::context_feedback::RuntimeFeedbackFrame>,
+    /// Session-scoped ledger facts read during this diagnostic, not final
+    /// totals for the live turn. Detail and omission counts follow depth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judgment_usage: Option<super::JudgmentUsageSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_judgments:
+        Option<astra_services::semantic_judgment_observation::SemanticJudgmentView>,
     pub view: ObservationView,
     #[serde(default)]
     pub observations: Vec<ObservationRecord>,
@@ -87,6 +94,25 @@ pub fn build_introspect_report(
             "include_context requested, but this runtime snapshot renderer has no visible-context provider"
                 .to_string(),
         );
+    }
+    let judgment_usage = super::judgment_usage_view(snapshot, request);
+    if let Some(usage) = &judgment_usage
+        && (usage.coverage != super::JudgmentUsageCoverage::Available
+            || usage
+                .attempts_without_complete_usage
+                .is_some_and(|count| count > 0))
+    {
+        warnings.push(format!(
+            "judgment physical usage coverage={:?}; missing usage is unknown, not zero",
+            usage.coverage
+        ));
+    }
+    let semantic_judgments = super::semantic_judgment_view(snapshot, request);
+    if let Some(semantics) = &semantic_judgments {
+        warnings.push(format!(
+            "semantic judgment trace coverage={:?}; capture incomplete; model adoption unknown",
+            semantics.coverage
+        ));
     }
     let data_coverage = introspect_data_coverage(snapshot, request, warnings);
     let view = ObservationView {
@@ -143,6 +169,51 @@ pub fn build_introspect_report(
         summary: runtime_summary,
         confidence: ObservationConfidence::evidence(0.75),
     }];
+    if let Some(semantics) = &semantic_judgments
+        && semantics.counts.is_some()
+    {
+        observations.push(ObservationRecord {
+            ref_id: "urn:astra:observation:local:introspect:semantic_judgments".into(),
+            topic: request.topic.as_str().into(),
+            facet: request.facet.as_str().into(),
+            kind: "semantic_judgment_trace".into(),
+            severity: "info".into(),
+            summary: semantics.render(),
+            // Coverage and captured stages do not establish outcome confidence.
+            confidence: ObservationConfidence {
+                classification: None,
+                evidence: None,
+                causal: None,
+            },
+            evidence_refs: vec![RUNTIME_SNAPSHOT_REF.into()],
+        });
+        evidence[0].summary.push_str(match semantics.scope {
+            astra_services::semantic_judgment_observation::SemanticJudgmentScope::LocalJournalAtRead => "\nsource=owner_local_journal.trace_span; bounded historical capture; model adoption unknown.",
+            _ => "\nsource=agent_events.trace_span; owner/session-scoped captured semantic facts at read time; trace capture incomplete; model adoption unknown.",
+        });
+    }
+    if let Some(usage) = &judgment_usage {
+        if usage.coverage != super::JudgmentUsageCoverage::NotObserved {
+            observations.push(ObservationRecord {
+                ref_id: "urn:astra:observation:local:introspect:judgment_usage".into(),
+                topic: request.topic.as_str().into(),
+                facet: request.facet.as_str().into(),
+                kind: "judgment_physical_usage".into(),
+                severity: "info".into(),
+                summary: usage.render(),
+                confidence: ObservationConfidence::evidence(1.0),
+                evidence_refs: vec![RUNTIME_SNAPSHOT_REF.into()],
+            });
+        }
+        // Hint retains only one evidence unit. Keep the ledger provenance and
+        // bounded detail in the snapshot unit so its references remain valid.
+        evidence[0].summary.push_str(if usage.scope.is_local() {
+            "\nsource=owner_local_explain_capture; "
+        } else {
+            "\nsource=inference_provider_attempts; "
+        });
+        evidence[0].summary.push_str(&usage.render());
+    }
     if let Some(lifecycle) = snapshot.invocation_lifecycle.as_ref() {
         evidence.push(ObservationEvidence {
             ref_id: INVOCATION_LIFECYCLE_REF.to_string(),
@@ -182,6 +253,8 @@ pub fn build_introspect_report(
         data_coverage,
         summary,
         runtime_feedback: snapshot.runtime_feedback.clone(),
+        judgment_usage,
+        semantic_judgments,
         view,
         observations,
         evidence,
@@ -274,6 +347,8 @@ fn build_edge_local_unavailable_report(request: &IntrospectRequest) -> Introspec
         data_coverage,
         summary,
         runtime_feedback: None,
+        judgment_usage: None,
+        semantic_judgments: None,
         view,
         observations,
         evidence: Vec::new(),
@@ -338,6 +413,46 @@ fn introspect_data_coverage(
                 status: "missing".to_string(),
                 freshness_ms: None,
                 reason: Some("provider_not_attached".to_string()),
+            },
+        );
+    }
+    if let Some(semantics) = super::semantic_judgment_view(snapshot, request) {
+        providers.insert(
+            "semantic_judgment_trace".into(),
+            ObservationProviderCoverage {
+                status: if semantics.counts.is_some() {
+                    "partial"
+                } else {
+                    "missing"
+                }
+                .into(),
+                freshness_ms: None,
+                reason: Some(format!(
+                    "session_trace_at_read:{:?};classification_not_execution_authority",
+                    semantics.coverage
+                )),
+            },
+        );
+    }
+    if let Some(usage) = super::judgment_usage_view(snapshot, request) {
+        providers.insert(
+            "judgment_inference_ledger".into(),
+            ObservationProviderCoverage {
+                status: if usage.coverage == super::JudgmentUsageCoverage::CaptureTruncated {
+                    "partial"
+                } else if usage.coverage != super::JudgmentUsageCoverage::Available {
+                    "missing"
+                } else if usage.attempts_without_complete_usage.is_some_and(|n| n > 0) {
+                    "partial"
+                } else {
+                    "fresh"
+                }
+                .into(),
+                freshness_ms: None,
+                reason: Some(format!(
+                    "session_supported_judgment_operations_at_ledger_read:{:?}",
+                    usage.coverage
+                )),
             },
         );
     }

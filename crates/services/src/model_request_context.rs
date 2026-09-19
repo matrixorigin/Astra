@@ -758,6 +758,8 @@ pub struct ModelRequestIdentity {
     pub model: String,
     pub offering_id: String,
     pub inference_purpose: String,
+    /// Canonical business operation within the inference purpose.
+    pub operation_id: String,
     pub provider_protocol: String,
     pub provider_wire_hash: String,
     pub provider_wire_bytes: u64,

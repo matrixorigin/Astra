@@ -3571,6 +3571,18 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         );
     }
 
+    if let (Some(buffer), Some(sender), Some(owner), Some(session), Some(generation)) = (
+        state.turn_event_buffer.as_mut(),
+        state.telemetry.trace_ingestion.clone(),
+        state.context_manifest_user_id.as_deref(),
+        state.current_session_id.as_deref(),
+        state.current_run_owner_generation,
+    ) {
+        if let Err(error) = buffer.bind_trace_ingestion(owner, session, generation, sender) {
+            tracing::warn!(error, "turn trace sink binding rejected");
+        }
+    }
+
     if let (Some(hub), Some(session)) = (
         &state.telemetry.observability_hub,
         &state.telemetry.observability_session,
@@ -3588,27 +3600,35 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     // first round. A resumed non-zero round preserves the restored state.
     if turn_index == 0 {
         let admission_started_at = Instant::now();
-        host.on_turn_phase_started(
-            state,
-            TurnPhaseKind::SemanticAdmission,
-            0,
-            0,
-            admission_started_at,
-        );
+        if !host.owns_semantic_admission_timing() {
+            host.on_turn_phase_started(
+                state,
+                TurnPhaseKind::SemanticAdmission,
+                0,
+                0,
+                admission_started_at,
+            );
+        }
         let outcome = host.judge_turn_intent(state).await;
         // This is emitted before an unavailable admission can terminate the
         // turn, so a slow or unavailable decision remains visible.
-        complete_turn_phase(
-            host,
-            state,
-            admission_started_at,
-            TurnPhaseKind::SemanticAdmission,
-            0,
-            0,
-            TurnPhaseOutcome::from(&outcome),
-            "turn_intent_admission_0".to_string(),
-        );
+        if let Some(phase_outcome) = outcome.terminal_phase_outcome() {
+            complete_turn_phase(
+                host,
+                state,
+                admission_started_at,
+                TurnPhaseKind::SemanticAdmission,
+                0,
+                0,
+                phase_outcome,
+                "turn_intent_admission_0".to_string(),
+            );
+        }
         match outcome {
+            TurnIntentJudgeOutcome::Pending => {
+                // The host publishes the eventual decision; pending is not failure.
+                state.turn_intent = None;
+            }
             TurnIntentJudgeOutcome::Intent(intent) => {
                 let record_feedback = record_current_user_turn_semantics(state, &intent);
                 apply_judged_turn_intent_to_observability(state, &intent, record_feedback);

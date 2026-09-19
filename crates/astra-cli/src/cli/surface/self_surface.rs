@@ -218,6 +218,28 @@ fn merge_workspace_with_restored(
     workspace
 }
 
+/// LocalOnly never consults restore providers. Journal IO is bounded by the
+/// shared observation reader; workspace metadata is not a cloud substitute.
+pub(crate) fn load_local_observation_artifacts(
+    session_id: &str,
+    journal_events: Vec<session_journal::JournalEvent>,
+) -> Result<LoadedSelfSurfaceArtifacts, String> {
+    session_journal::validate_session_id(session_id)?;
+    let workspace = session_workspace::read_workspace_optional(session_id)
+        .map_err(|_| "failed to read local workspace metadata".to_string())?;
+    let latest_full_context_trace = journal_events
+        .iter()
+        .rev()
+        .find_map(|event| event.context_assembly_trace.clone());
+    Ok(LoadedSelfSurfaceArtifacts {
+        session_id: session_id.to_string(),
+        workspace,
+        restored: None,
+        journal_events,
+        latest_full_context_trace,
+    })
+}
+
 fn merge_persistence_errors(local: Option<&str>, restored: Option<&str>) -> Option<String> {
     let normalize = |value: Option<&str>| {
         value

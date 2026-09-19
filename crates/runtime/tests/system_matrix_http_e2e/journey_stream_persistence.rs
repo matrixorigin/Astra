@@ -96,8 +96,7 @@ async fn stream_chat_full_with_timeout(
 #[tokio::test(start_paused = true)]
 #[should_panic(expected = "SSE request did not return headers within 5s")]
 async fn sse_deadline_covers_pending_request_headers() {
-    let app =
-        axum::Router::new().route("/", axum::routing::get(|| std::future::pending::<String>()));
+    let app = axum::Router::new().route("/", axum::routing::get(std::future::pending::<String>));
     collect_full_sse_stream(&app, Request::new(Body::empty()), 5).await;
 }
 
@@ -1119,7 +1118,7 @@ pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids(
         );
     }
 
-    let cases = vec![
+    let cases = [
         ConcurrentFanoutCase {
             name: "a-one-success".to_string(),
             auth: b.auth_header.clone(),

@@ -205,6 +205,7 @@ pub(crate) enum LlmProviderProtocol {
     OpenAiCompatible,
     AnthropicMessages,
     BedrockConverse,
+    TypeSafeSystemOne,
 }
 
 impl LlmProviderProtocol {
@@ -214,6 +215,7 @@ impl LlmProviderProtocol {
             Self::OpenAiCompatible => "openai_compatible",
             Self::AnthropicMessages => "anthropic_messages",
             Self::BedrockConverse => "bedrock_converse",
+            Self::TypeSafeSystemOne => "typesafe_systemone",
         }
     }
 
@@ -230,6 +232,7 @@ pub(crate) fn llm_provider_protocol(provider: &str) -> LlmProviderProtocol {
     match provider {
         "anthropic" => LlmProviderProtocol::AnthropicMessages,
         "bedrock" => LlmProviderProtocol::BedrockConverse,
+        "typesafe" => LlmProviderProtocol::TypeSafeSystemOne,
         _ => LlmProviderProtocol::OpenAiCompatible,
     }
 }
@@ -272,6 +275,12 @@ impl ProviderWireFingerprints {
         cache_capability: Option<CacheCapability>,
     ) -> Result<Self, astra_core::ClassifiedError> {
         let (messages, system, conversation, tools) = match protocol {
+            LlmProviderProtocol::TypeSafeSystemOne => (
+                provider_wire_items(body.get("state")),
+                provider_wire_items(body.get("questions")),
+                provider_wire_items(body.get("state")),
+                Vec::new(),
+            ),
             LlmProviderProtocol::OpenAiCompatible => {
                 let messages = body
                     .get("messages")
@@ -363,6 +372,7 @@ fn provider_cache_key_system_items(
     use astra_turn_core::cache_placement::{CacheProtocol, VolatilePlacement};
 
     let mut system = match protocol {
+        LlmProviderProtocol::TypeSafeSystemOne => provider_wire_items(body.get("questions")),
         LlmProviderProtocol::OpenAiCompatible => {
             let messages = body
                 .get("messages")
@@ -416,9 +426,9 @@ fn provider_cache_key_tool_items(
     use astra_turn_core::cache_placement::CacheProtocol;
 
     let mut tools = match protocol {
-        LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::AnthropicMessages => {
-            provider_wire_items(body.get("tools"))
-        }
+        LlmProviderProtocol::OpenAiCompatible
+        | LlmProviderProtocol::AnthropicMessages
+        | LlmProviderProtocol::TypeSafeSystemOne => provider_wire_items(body.get("tools")),
         LlmProviderProtocol::BedrockConverse => {
             provider_wire_items(body.pointer("/toolConfig/tools"))
         }
@@ -448,7 +458,9 @@ fn provider_cache_key_tool_items(
 
 fn provider_wire_tool_name(protocol: LlmProviderProtocol, tool: &Value) -> Option<&str> {
     let pointer = match protocol {
-        LlmProviderProtocol::OpenAiCompatible => "/function/name",
+        LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
+            "/function/name"
+        }
         LlmProviderProtocol::AnthropicMessages => "/name",
         LlmProviderProtocol::BedrockConverse => "/toolSpec/name",
     };
@@ -510,6 +522,18 @@ impl ProviderWireComposition {
     ) -> Result<Self, astra_core::ClassifiedError> {
         let mut composition = Self::default();
         match protocol {
+            LlmProviderProtocol::TypeSafeSystemOne => {
+                accumulate_wire_items(
+                    body.get("questions"),
+                    &mut composition.system_bytes,
+                    &mut composition.system_items,
+                )?;
+                accumulate_wire_items(
+                    body.get("state"),
+                    &mut composition.conversation_bytes,
+                    &mut composition.conversation_items,
+                )?;
+            }
             LlmProviderProtocol::OpenAiCompatible => {
                 for message in body
                     .get("messages")
@@ -2069,7 +2093,9 @@ pub(crate) fn llm_request_url_for_provider(
             }
         }
         LlmProviderProtocol::BedrockConverse => bedrock_converse_url(base, model_name, streaming),
-        LlmProviderProtocol::OpenAiCompatible => format!("{base}/chat/completions"),
+        LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
+            format!("{base}/chat/completions")
+        }
     }
 }
 
@@ -3359,7 +3385,9 @@ fn build_provider_request_body_with_cache_capability(
             );
             body
         }
-        LlmProviderProtocol::AnthropicMessages | LlmProviderProtocol::OpenAiCompatible => {
+        LlmProviderProtocol::AnthropicMessages
+        | LlmProviderProtocol::OpenAiCompatible
+        | LlmProviderProtocol::TypeSafeSystemOne => {
             let is_anthropic = provider_uses_anthropic_messages(provider);
             if is_anthropic {
                 let (system, anthropic_messages) =
@@ -3517,7 +3545,7 @@ fn apply_no_tool_choice(
     tools: &[Value],
 ) -> Result<(), astra_core::ClassifiedError> {
     match llm_provider_protocol(provider) {
-        LlmProviderProtocol::OpenAiCompatible => {
+        LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
             // Keep the explicit terminal instruction even when the repair
             // request physically removed every schema. OpenAI-compatible
             // models can otherwise infer the tool protocol from conversation
@@ -3561,7 +3589,7 @@ fn apply_required_tool_choice(
     }
 
     match llm_provider_protocol(provider) {
-        LlmProviderProtocol::OpenAiCompatible => {
+        LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
             body["tool_choice"] = json!({
                 "type": "function",
                 "function": { "name": required_tool_name },
@@ -4736,11 +4764,7 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback_and_no_tool_choice
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     // Reuse the provider-attempt deadline owner. Do not put a second timeout
     // around the durable invocation, which would lose terminal settlement.
-    let total_budget = bounded_auxiliary_budget(
-        call.purpose,
-        llm_total_budget(),
-        std::time::Duration::from_secs(llm_secs_from_env("ASTRA_INTROSPECTION_TOTAL_BUDGET_S", 8)),
-    );
+    let total_budget = auxiliary_execution_budget(call.purpose, llm_total_budget());
     call_llm_and_collect_with_total_budget(
         call,
         cancel,
@@ -4756,6 +4780,18 @@ pub(crate) fn provider_supports_no_tool_choice(provider: &str) -> bool {
     matches!(
         llm_provider_protocol(provider),
         LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::AnthropicMessages
+    )
+}
+
+/// Shared deadline policy for streaming LLM and nonstream judgment adapters.
+pub(crate) fn auxiliary_execution_budget(
+    purpose: astra_turn_types::InferencePurpose,
+    global: std::time::Duration,
+) -> std::time::Duration {
+    bounded_auxiliary_budget(
+        purpose,
+        global,
+        std::time::Duration::from_secs(llm_secs_from_env("ASTRA_INTROSPECTION_TOTAL_BUDGET_S", 8)),
     )
 }
 
@@ -4803,6 +4839,12 @@ async fn call_llm_and_collect_with_total_budget(
     tool_choice: RuntimeToolChoice,
     total_budget: std::time::Duration,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    if call.route.provider == "typesafe" {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::InvalidRequest,
+            "TypeSafe supports typed nonstream judgments only",
+        ));
+    }
     let logical_total_budget = total_budget;
     let settlement_reserve = llm_mandatory_settlement_reserve(logical_total_budget);
     let total_budget = logical_total_budget.saturating_sub(settlement_reserve);
@@ -7275,6 +7317,33 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     let upstream_name = wire_model_name.unwrap_or(model_name);
     validate_request_body_overrides(request_body_overrides)?;
 
+    let typesafe_body = if provider == "typesafe" {
+        if api_key.trim().is_empty() {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Auth,
+                "TypeSafe API key is not configured",
+            ));
+        }
+        if !matches!(
+            purpose,
+            astra_turn_types::InferencePurpose::MemoryRetrievalRerank
+                | astra_turn_types::InferencePurpose::Introspection
+                | astra_turn_types::InferencePurpose::VerificationJudge
+        ) || !tools.is_empty()
+            || cache_capability.is_some()
+            || request_body_overrides.is_some()
+            || header_overrides.is_some()
+            || completions_url_override.is_some()
+        {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::InvalidRequest,
+                "TypeSafe requires a typed auxiliary judgment and no tool/cache/wire overrides",
+            ));
+        }
+        Some(super::typesafe::request(messages, upstream_name)?)
+    } else {
+        None
+    };
     let messages = consolidate_system_messages_for_provider(messages, provider, cache_capability);
     validate_append_only_transport_history(&messages, provider, cache_capability)?;
 
@@ -7309,6 +7378,9 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     if matches!(tool_choice, RuntimeToolChoice::None) {
         apply_no_tool_choice(&mut body, provider, tools)?;
     }
+    if let Some(typesafe_body) = typesafe_body {
+        body = typesafe_body;
+    }
     let wire_output_limit = provider_request_output_limit(&body);
     let prepared_request = PreparedProviderRequest::from_json_with_cache_capability(
         &body,
@@ -7323,6 +7395,14 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         upstream_name,
         false,
     );
+    let url = if provider == "typesafe" {
+        format!(
+            "{}/v1/systemone",
+            base_url.trim_end_matches('/').trim_end_matches("/v1")
+        )
+    } else {
+        url
+    };
     let _registered_endpoint_permit =
         acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
     let compatible_client = if provider == astra_services::byok_endpoint::COMPATIBLE_PROVIDER {
@@ -7527,7 +7607,17 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
             return Err(error);
         }
     };
-    let mut result = parse_nonstream_response_for_provider(&v, provider, model_name, started);
+    let mut result = if provider == "typesafe" {
+        match super::typesafe::response(&v, &body, started) {
+            Ok(result) => result,
+            Err(error) => {
+                finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+                return Err(error);
+            }
+        }
+    } else {
+        parse_nonstream_response_for_provider(&v, provider, model_name, started)
+    };
     if matches!(tool_choice, RuntimeToolChoice::Auto) {
         let authorized_tool_names = tools
             .iter()
@@ -7869,7 +7959,7 @@ pub(crate) fn parse_nonstream_response_for_provider(
         LlmProviderProtocol::AnthropicMessages => {
             parse_anthropic_nonstream_response(v, model_name, started)
         }
-        LlmProviderProtocol::OpenAiCompatible => {
+        LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
             parse_openai_compatible_nonstream_response(v, model_name, started)
         }
     }

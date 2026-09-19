@@ -462,6 +462,7 @@ pub(crate) struct SessionState {
     /// Passed through to every turn's ToolExecutor so the LLM sees prior
     /// session's advice on every SelfModel snapshot.
     pub session_lessons: Vec<astra_services::LessonHint>,
+    pub memory_selection_reports: Vec<astra_turn_types::MemorySelectionReport>,
     /// Set after the first bootstrap attempt regardless of result count.
     /// Prevents per-turn DB calls for new users with zero lessons.
     pub session_lessons_loaded: bool,
@@ -697,6 +698,7 @@ impl Default for SessionState {
             drift_user_corrections: Vec::new(),
             drift_original_query: None,
             session_lessons: Vec::new(),
+            memory_selection_reports: Vec::new(),
             session_lessons_loaded: false,
             lesson_checkpointer: astra_runtime::learning::checkpoint::LessonCheckpointer::new(),
             memory_inference_offering: None,
@@ -866,6 +868,7 @@ impl SessionState {
         self.drift_user_corrections.clear();
         self.drift_original_query = None;
         self.session_lessons.clear();
+        self.memory_selection_reports.clear();
         self.session_lessons_loaded = false;
         self.lesson_checkpointer = Default::default();
         self.memory_inference_offering = None;

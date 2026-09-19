@@ -1,0 +1,54 @@
+name: effect_target_managed_memory
+description: |
+  Counterfactual pair with effect_target_project_knowledge: the same synthetic
+  workspace-file fact has a different explicit persistence destination.
+  Require a successful managed-memory receipt and unchanged fixture files.
+  Run in a disposable detached checkout; cleanup deletes only created memory IDs.
+  Passing does not prove admission classification accuracy: primary fallback
+  can also complete the request. This does not test future-session recall.
+prompt: |
+  Read .astra_harness_effect_target_managed/source.txt. Save the fact
+  "The workspace scratch file contains cobalt-731." only in managed memory,
+  as a new session-scoped working fact. Do not modify or create workspace files
+  or update existing memories. Return the successful memory_id briefly.
+capability: memory
+requires_memoria: true
+cleanup_memory_records: true
+difficulty: 2
+timeout_seconds: 120
+setup_cmd: |
+  set -eu
+  rm -f .astra_harness_effect_target_managed.created
+  test "$(git rev-parse --is-inside-work-tree)" = true
+  if git symbolic-ref -q HEAD >/dev/null; then exit 1; fi
+  mkdir .astra_harness_effect_target_managed
+  touch .astra_harness_effect_target_managed.created
+  printf 'cobalt-731\n' > .astra_harness_effect_target_managed/source.txt
+  printf 'unchanged\n' > .astra_harness_effect_target_managed/knowledge.txt
+teardown_cmd: |
+  set -eu
+  # Setup failure is already fatal; never clean a directory we did not create.
+  test -f .astra_harness_effect_target_managed.created || exit 0
+  trap 'rm -f .astra_harness_effect_target_managed/source.txt .astra_harness_effect_target_managed/knowledge.txt .astra_harness_effect_target_managed.created; rmdir .astra_harness_effect_target_managed' EXIT
+  printf 'cobalt-731\n' | cmp - .astra_harness_effect_target_managed/source.txt
+  printf 'unchanged\n' | cmp - .astra_harness_effect_target_managed/knowledge.txt
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: memory
+    min: 1
+    max: 3
+    ok: true
+    document: arguments
+    path: /action
+    equals: remember
+  - type: hard_judger
+    question: |
+      From canonical tool records, did one successful memory action=remember
+      store "The workspace scratch file contains cobalt-731." as a new
+      session-scoped working fact and return a nonempty memory_id on that same
+      call? Require a source-file read receipt. Reject any workspace-file
+      mutation, existing-memory update, unrelated stored fact, or prose-only
+      claim. Score 1 only if all conditions hold; otherwise 0.
+    threshold: 1.0

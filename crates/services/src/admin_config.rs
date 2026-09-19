@@ -16,7 +16,41 @@ use astra_core::{MatrixOneSettings, SharedPool};
 pub const ADMIN_CONFIG_KEY_REASONING_OFFERING: &str = "reasoning_offering_id";
 
 /// Whitelist of admin config keys the server will accept.
-pub const ADMIN_CONFIG_ALLOWED_KEYS: &[&str] = &[ADMIN_CONFIG_KEY_REASONING_OFFERING];
+pub const ADMIN_CONFIG_KEY_JUDGMENT_OFFERING: &str = "judgment_offering_id";
+pub const ADMIN_CONFIG_ALLOWED_KEYS: &[&str] = &[
+    ADMIN_CONFIG_KEY_REASONING_OFFERING,
+    ADMIN_CONFIG_KEY_JUDGMENT_OFFERING,
+];
+
+/// Resolve the optional judgment route under the requesting user's policy.
+/// An invalid configured route is an error, never a silent switch to another model.
+pub async fn resolve_judgment_offering(
+    config: &dyn AdminConfigService,
+    models: &dyn crate::models::ModelService,
+    user_id: &str,
+) -> Result<
+    Option<crate::models::AdmittedModelExecution>,
+    (
+        axum::http::StatusCode,
+        axum::Json<astra_core::ErrorResponse>,
+    ),
+> {
+    let Some(id) = config
+        .get(ADMIN_CONFIG_KEY_JUDGMENT_OFFERING)
+        .await
+        .map_err(astra_core::internal_error)?
+    else {
+        return Ok(None);
+    };
+    let admitted = models.admit_model_offering(user_id.to_string(), id).await?;
+    if admitted.provider == "typesafe" && admitted.api_key.trim().is_empty() {
+        return Err(astra_core::error_response(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Configured TypeSafe judgment Offering has no API key",
+        ));
+    }
+    Ok(Some(admitted))
+}
 
 #[async_trait]
 pub trait AdminConfigService: Send + Sync {
@@ -47,9 +81,11 @@ fn validate_key(key: &str) -> Result<(), String> {
 fn validate_value(key: &str, value: &str) -> Result<(), String> {
     validate_key(key)?;
     match key {
-        ADMIN_CONFIG_KEY_REASONING_OFFERING => crate::models::validate_model_offering_id(value)
-            .map(|_| ())
-            .map_err(|_| "reasoning_offering_id must be an exact Offering ID".to_string()),
+        ADMIN_CONFIG_KEY_REASONING_OFFERING | ADMIN_CONFIG_KEY_JUDGMENT_OFFERING => {
+            crate::models::validate_model_offering_id(value)
+                .map(|_| ())
+                .map_err(|_| format!("{key} must be an exact Offering ID"))
+        }
         _ => Err(format!("admin config key '{key}' has no value contract")),
     }
 }
@@ -222,5 +258,183 @@ mod tests {
         let result = svc.get(ADMIN_CONFIG_KEY_REASONING_OFFERING).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), None);
+    }
+
+    use crate::models::{
+        AdmittedModelExecution, ModelAccessKind, ModelCreateRequestData, ModelExecutionPlacement,
+        ModelListItem, ModelRecord, ModelService, ModelUpdateRequestData, ResolvedModelOffering,
+        UnconfiguredModelService,
+    };
+    use axum::{Json, http::StatusCode};
+    use std::sync::Mutex;
+
+    struct FixedConfig(Result<Option<String>, String>);
+
+    #[async_trait]
+    impl AdminConfigService for FixedConfig {
+        async fn get(&self, key: &str) -> Result<Option<String>, String> {
+            assert_eq!(key, ADMIN_CONFIG_KEY_JUDGMENT_OFFERING);
+            self.0.clone()
+        }
+        async fn list(&self) -> Result<Vec<(String, String)>, String> {
+            unreachable!()
+        }
+        async fn set(&self, _: &str, _: &str, _: Option<&str>) -> Result<(), String> {
+            unreachable!()
+        }
+        async fn unset(&self, _: &str) -> Result<bool, String> {
+            unreachable!()
+        }
+    }
+
+    type ModelResult<T> = Result<T, (StatusCode, Json<astra_core::ErrorResponse>)>;
+
+    struct AdmissionMock {
+        admitted: AdmittedModelExecution,
+        denied: bool,
+        calls: Mutex<Vec<(String, String)>>,
+    }
+
+    impl AdmissionMock {
+        fn new(provider: &str, api_key: &str) -> Self {
+            Self {
+                admitted: AdmittedModelExecution {
+                    offering_id: "judge-offering".into(),
+                    access_kind: ModelAccessKind::SelfHosted,
+                    execution_placement: ModelExecutionPlacement::Server,
+                    model_name: "judge-model".into(),
+                    wire_model_name: None,
+                    api_key: api_key.into(),
+                    base_url: "https://judgment.example.invalid".into(),
+                    provider: provider.into(),
+                    cache_capability: None,
+                    thinking_capability: None,
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    request_body_overrides: None,
+                    context_window: None,
+                    max_completion_tokens: None,
+                    header_overrides: Default::default(),
+                    completions_url_override: None,
+                    request_timeout_ms: None,
+                },
+                denied: false,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelService for AdmissionMock {
+        async fn admit_model_offering(
+            &self,
+            user: String,
+            offering: String,
+        ) -> ModelResult<AdmittedModelExecution> {
+            self.calls.lock().unwrap().push((user, offering));
+            if self.denied {
+                Err(astra_core::error_response(
+                    StatusCode::FORBIDDEN,
+                    "Offering permission denied",
+                ))
+            } else {
+                Ok(self.admitted.clone())
+            }
+        }
+        async fn create_model(
+            &self,
+            user: String,
+            request: ModelCreateRequestData,
+        ) -> ModelResult<ModelRecord> {
+            UnconfiguredModelService.create_model(user, request).await
+        }
+        async fn list_models(&self, user: String, admin: bool) -> ModelResult<Vec<ModelListItem>> {
+            UnconfiguredModelService.list_models(user, admin).await
+        }
+        async fn get_model(&self, name: String) -> ModelResult<ModelRecord> {
+            UnconfiguredModelService.get_model(name).await
+        }
+        async fn resolve_model_offering(&self, id: String) -> ModelResult<ResolvedModelOffering> {
+            UnconfiguredModelService.resolve_model_offering(id).await
+        }
+        async fn update_model(
+            &self,
+            name: String,
+            request: ModelUpdateRequestData,
+        ) -> ModelResult<ModelRecord> {
+            UnconfiguredModelService.update_model(name, request).await
+        }
+        async fn delete_model(&self, name: String) -> ModelResult<()> {
+            UnconfiguredModelService.delete_model(name).await
+        }
+        async fn check_model(&self, name: String) -> ModelResult<ModelRecord> {
+            UnconfiguredModelService.check_model(name).await
+        }
+    }
+
+    #[tokio::test]
+    async fn judgment_route_preserves_permission_denial() {
+        let config = FixedConfig(Ok(Some("judge-offering".into())));
+        let mut models = AdmissionMock::new("typesafe", "test-key");
+        models.denied = true;
+        let (status, body) = resolve_judgment_offering(&config, &models, "user-a")
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body.detail, "Offering permission denied");
+        assert_eq!(
+            *models.calls.lock().unwrap(),
+            vec![("user-a".into(), "judge-offering".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn judgment_route_rejects_typesafe_without_credentials() {
+        let config = FixedConfig(Ok(Some("judge-offering".into())));
+        let models = AdmissionMock::new("typesafe", " ");
+        let (status, body) = resolve_judgment_offering(&config, &models, "user-a")
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.detail.contains("no API key"));
+        assert_eq!(models.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn judgment_route_config_read_failure_is_an_error() {
+        let config = FixedConfig(Err("configuration unavailable".into()));
+        let models = AdmissionMock::new("typesafe", "test-key");
+        let (status, _) = resolve_judgment_offering(&config, &models, "user-a")
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(models.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn judgment_route_unset_config_returns_none_without_admission() {
+        let models = AdmissionMock::new("typesafe", "test-key");
+        let result = resolve_judgment_offering(&UnconfiguredAdminConfigService, &models, "user-a")
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        assert!(models.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn judgment_route_admits_exact_offering_for_requesting_user() {
+        let config = FixedConfig(Ok(Some("judge-offering".into())));
+        for provider in ["typesafe", "openai"] {
+            let models = AdmissionMock::new(provider, "test-key");
+            let result = resolve_judgment_offering(&config, &models, "user-b")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result, models.admitted);
+            assert_eq!(
+                *models.calls.lock().unwrap(),
+                vec![("user-b".into(), "judge-offering".into())]
+            );
+        }
     }
 }

@@ -59,11 +59,39 @@ identify the bottleneck, critical path, token attribution, or parallel overlap
 with adequate coverage, it must say the result is unavailable and why. Never
 fill sparse data with confident-sounding boilerplate or unexplained zeroes.
 
+CLI/Edge lesson decisions are attached to the context assembly as
+`edge_memory_selection`. They carry the source session and turn, operation
+(relevance, explicit dismissal, or cache reuse), candidate count, batch-local
+indices, selected flags and ranking order, selector model, measured selection duration, and
+provider probabilities when supplied (rounded to basis points). These facts
+are reported by the selected CLI/Edge, not independently verified by Server.
+Repeated assemblies reference the same turn decision; their durations must not
+be added together or placed on the Server clock. Missing or stale observations
+are omitted. Selection does not prove final prompt injection; the report
+explicitly says that injection is not measured.
+
+The concise view shows candidate and selected counts and the decision method.
+Details expose candidate decisions and available scores, never invented
+explanations. Model rejection of all candidates, no retrieved candidates,
+unavailable retrieval, selector failure with local fallback, and cache reuse
+remain distinct. Failed dismissal retains memories. Memory text and raw
+provider payloads do not enter this public Explain contract. There are at most
+two decision operations per bootstrap turn and 256 candidates per exported
+operation; these are observation bounds, not limits on selection behavior.
+
 The graph is a deterministic visual rendering of runtime facts; rendering it
 does not call an LLM or generate narrative claims. Any LLM explanation is a
 separate, explicitly requested product action and view. It must point back to
 the graph facts it used, label uncertainty, and stay visually distinct from
 the measured execution record.
+
+Asynchronous request admission is one measured stage, not an unavailable
+placeholder followed by another attempt. Its terminal timestamp is captured
+by the background owner before the main loop consumes the result. A separately
+measured wait may show how long the main loop actually blocked on that result;
+the full background duration must not be labeled added latency. Cancellation
+closes outstanding admission observations. Classification and any required
+Work plan retain distinct auxiliary inference identities and usage.
 
 Web and TUI preserve the execution tree and the
 information density of the README demonstration: context budget and source
@@ -445,3 +473,33 @@ trace payloads.
   durable append failure, slow/full consumers, reconnect at each structural
   boundary, and the replay-to-live handoff. No case may yield a complete graph
   with invented timing or missing execution nodes.
+
+### Auxiliary provider usage
+
+A terminal turn fact can carry a read-only `auxiliary_usage` snapshot of physical
+provider attempts in the authenticated user's Session and turn. It records
+attempt identity, provider, Offering, requested upstream model, purpose/operation and
+reported token lanes. Invocation totals are not added to attempt totals.
+Repeated turn segments deduplicate attempt IDs. Missing usage remains unknown;
+partial provider usage is labeled partial. A failed or timed-out snapshot is
+marked unavailable and does not fail the user's turn. Collection has a one-second
+best-effort budget and runs only when Explain capture is enabled. The snapshot
+uses the existing durable-event batch row budget; overflow retains bounded rows
+with `truncated=true`. Counts then describe captured attempts and token sums are
+lower bounds, including fully reported lanes. An omitted `truncated` field means
+the capture did not overflow, preserving existing facts. The requested model comes from
+the immutable route and is not an assertion about the provider-returned model.
+The text/TUI/HTML projection keeps Offering and operation visible (including
+request classification and Work next-direction judgment). When only some
+attempts report a token lane, its sum is explicitly a lower bound; it is not
+presented as the total consumption of that group.
+
+Consumers validate fields strictly. Deploy the updated Rust/SDK readers before
+upgrading the server in a mixed-version deployment: older readers do
+not recognize `truncated=true` and reject that terminal fact. Non-overflow facts
+omit the field and retain their existing wire representation.
+
+These facts are separate from timed main-model nodes: no interval is invented
+from database timestamps. TUI, text, HTML and Web show Jev auxiliary tokens
+separately from the main model's tokens. The snapshot is complete only as a
+query at terminal time; auxiliary calls performed after capture are not included.

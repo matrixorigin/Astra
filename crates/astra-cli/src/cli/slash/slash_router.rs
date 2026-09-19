@@ -679,7 +679,12 @@ pub(crate) async fn fetch_model_catalog(
             )
         });
         let response = api
-            .get_models_page_response_timeout(tok, std::time::Duration::from_secs(3), cursor_tuple)
+            .get_models_page_response_timeout(
+                tok,
+                std::time::Duration::from_secs(3),
+                cursor_tuple,
+                astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+            )
             .await?;
         if !response.status().is_success() {
             let status = response.status();

@@ -183,12 +183,20 @@ pub struct ExplainAnalyzeContextSourceV1 {
 pub struct ExplainAnalyzeContextAssemblyV1 {
     pub basis: ExplainAnalyzeContextAssemblyBasisV1,
     pub sources: Vec<ExplainAnalyzeContextSourceV1>,
+    /// Selected CLI/Edge reports selection, not proof of final prompt injection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edge_memory_selection: Vec<crate::MemorySelectionReport>,
 }
 
 impl ExplainAnalyzeContextAssemblyV1 {
     pub fn is_valid(&self) -> bool {
         let mut kinds = HashSet::with_capacity(self.sources.len());
-        self.sources.len() <= 15
+        self.edge_memory_selection.len() <= 2
+            && self
+                .edge_memory_selection
+                .iter()
+                .all(crate::MemorySelectionReport::is_valid)
+            && self.sources.len() <= 15
             && self.sources.iter().all(|source| {
                 source.estimated_tokens <= EXPLAIN_ANALYZE_MAX_SAFE_INTEGER
                     && kinds.insert(source.kind)
@@ -205,7 +213,7 @@ pub struct ExplainAnalyzeContextMetricsV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<ExplainAnalyzeContextBudgetV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub assembly: Option<ExplainAnalyzeContextAssemblyV1>,
+    pub assembly: Option<Box<ExplainAnalyzeContextAssemblyV1>>,
 }
 
 impl ExplainAnalyzeContextMetricsV1 {
@@ -242,6 +250,75 @@ impl ExplainAnalyzeTokenUsageV1 {
             || self.cache_read_tokens.is_some()
             || self.cache_creation_tokens.is_some()
             || self.output_tokens.is_some()
+    }
+}
+
+/// Read-only physical-attempt usage snapshot for auxiliary inference in one turn.
+/// No timing interval is inferred from ledger timestamps.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplainAnalyzeAuxiliaryUsageV1 {
+    pub available: bool,
+    /// The bounded capture omitted physical attempts. Counts and token sums
+    /// describe captured evidence only, not complete turn/session totals.
+    #[serde(default, skip_serializing_if = "auxiliary_capture_not_truncated")]
+    pub truncated: bool,
+    pub attempts: Vec<ExplainAnalyzeAuxiliaryAttemptV1>,
+}
+
+fn auxiliary_capture_not_truncated(value: &bool) -> bool {
+    !value
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplainAnalyzeAuxiliaryAttemptV1 {
+    pub attempt_id: String,
+    pub usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1,
+    pub provider: String,
+    pub offering_id: String,
+    pub model_name: String,
+    pub purpose: String,
+    pub operation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ExplainAnalyzeTokenUsageV1>,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExplainAnalyzeAuxiliaryUsageStatusV1 {
+    ProviderExact,
+    ProviderPartial,
+    Unavailable,
+}
+
+impl ExplainAnalyzeAuxiliaryUsageV1 {
+    pub fn is_valid(&self) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        (self.available || (self.attempts.is_empty() && !self.truncated))
+            && self.attempts.iter().all(|a| {
+                valid_id(&a.attempt_id)
+                    && seen.insert(&a.attempt_id)
+                    && valid_id(&a.provider)
+                    && valid_id(&a.offering_id)
+                    && valid_id(&a.purpose)
+                    && valid_id(&a.operation_id)
+                    && match a.usage_status {
+                        ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact => a
+                            .usage
+                            .as_ref()
+                            .is_some_and(|u| u.basis == ExplainAnalyzeUsageBasisV1::ProviderExact),
+                        ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderPartial => a
+                            .usage
+                            .as_ref()
+                            .is_none_or(|u| u.basis == ExplainAnalyzeUsageBasisV1::ProviderPartial),
+                        ExplainAnalyzeAuxiliaryUsageStatusV1::Unavailable => a.usage.is_none(),
+                    }
+                    && !a.model_name.trim().is_empty()
+                    && a.model_name.len() <= 255
+                    && !a.model_name.chars().any(char::is_control)
+                    && a.usage.as_ref().is_none_or(|u| {
+                        u.is_valid() && u.basis != ExplainAnalyzeUsageBasisV1::RuntimeEstimated
+                    })
+            })
     }
 }
 
@@ -283,6 +360,9 @@ pub struct ExplainAnalyzeEventV1 {
     pub outcome: Option<ExplainAnalyzeOutcomeV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<ExplainAnalyzeTokenUsageV1>,
+    /// Auxiliary usage is separate from timed provider-attempt node usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auxiliary_usage: Option<Box<ExplainAnalyzeAuxiliaryUsageV1>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ExplainAnalyzeContextMetricsV1>,
     /// Known boundaries without a measured graph interval. Only terminal turn
@@ -294,6 +374,13 @@ pub struct ExplainAnalyzeEventV1 {
 impl ExplainAnalyzeEventV1 {
     /// Validate a decoded/public event before projection or graph mutation.
     pub fn is_valid(&self) -> bool {
+        if self.auxiliary_usage.as_ref().is_some_and(|a| {
+            self.kind != ExplainAnalyzeNodeKindV1::Turn
+                || self.transition != ExplainAnalyzeTransitionV1::Finished
+                || !a.is_valid()
+        }) {
+            return false;
+        }
         if self.schema_version != EXPLAIN_ANALYZE_SCHEMA_VERSION
             || !valid_id(&self.event_id)
             || !valid_id(&self.run_id)
@@ -391,10 +478,27 @@ fn valid_id(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn auxiliary_capture_overflow_is_partial_evidence_not_unavailability() {
+        use super::ExplainAnalyzeAuxiliaryUsageV1;
+        let legacy = r#"{"available":true,"attempts":[]}"#;
+        let mut facts: ExplainAnalyzeAuxiliaryUsageV1 = serde_json::from_str(legacy).unwrap();
+        assert!(!facts.truncated);
+        assert_eq!(serde_json::to_string(&facts).unwrap(), legacy);
+        facts.truncated = true;
+        assert!(facts.is_valid());
+        let roundtrip: ExplainAnalyzeAuxiliaryUsageV1 =
+            serde_json::from_value(serde_json::to_value(&facts).unwrap()).unwrap();
+        assert!(roundtrip.truncated);
+        facts.available = false;
+        assert!(!facts.is_valid());
+    }
+
     use super::*;
 
     fn started() -> ExplainAnalyzeEventV1 {
         ExplainAnalyzeEventV1 {
+            auxiliary_usage: None,
             schema_version: EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: "turn-1/provider/0/started".to_string(),
             run_id: "run-1".to_string(),
@@ -578,6 +682,7 @@ mod tests {
 
     fn context_assembly() -> ExplainAnalyzeContextAssemblyV1 {
         ExplainAnalyzeContextAssemblyV1 {
+            edge_memory_selection: Vec::new(),
             basis: ExplainAnalyzeContextAssemblyBasisV1::RuntimeTextEstimate,
             sources: vec![ExplainAnalyzeContextSourceV1 {
                 kind: ExplainAnalyzeContextSourceKindV1::Identity,
@@ -601,7 +706,7 @@ mod tests {
         assembly.kind = ExplainAnalyzeNodeKindV1::ContextAssembly;
         assembly.context = Some(ExplainAnalyzeContextMetricsV1 {
             budget: None,
-            assembly: Some(context_assembly()),
+            assembly: Some(Box::new(context_assembly())),
         });
         assert!(assembly.is_valid());
 
@@ -621,7 +726,7 @@ mod tests {
 
         assembly.context = Some(ExplainAnalyzeContextMetricsV1 {
             budget: Some(context_budget()),
-            assembly: Some(context_assembly()),
+            assembly: Some(Box::new(context_assembly())),
         });
         assert!(!assembly.is_valid());
 
@@ -676,7 +781,7 @@ mod tests {
         event.kind = ExplainAnalyzeNodeKindV1::ContextAssembly;
         event.context = Some(ExplainAnalyzeContextMetricsV1 {
             budget: None,
-            assembly: Some(context_assembly()),
+            assembly: Some(Box::new(context_assembly())),
         });
 
         let encoded = serde_json::to_string(&event).unwrap();

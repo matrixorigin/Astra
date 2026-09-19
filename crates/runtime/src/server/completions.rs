@@ -79,7 +79,39 @@ pub(super) async fn completions_handler(
             "invalid_completion_request",
         )
     })?;
+    // Typed operations carry a canonical batched judgment payload. Derive the
+    // minimum answer budget from that payload before model admission; a caller
+    // supplied `max_tokens` that cannot hold every question identity is a
+    // malformed request, not a provider failure.
+    let typed_judgment = if request.operation.is_typed_judgment() {
+        let judgment = astra_turn_types::judgment_request_from_messages(&request.messages)
+            .map_err(|_| {
+                crate::error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    "Typed judgment operations require one valid canonical judgment payload",
+                    "invalid_completion_request",
+                )
+            })?;
+        if astra_turn_types::output_budget_exceeds_completion_cap(
+            judgment.output_token_budget(),
+            Some(request.max_tokens),
+        ) {
+            return Err(crate::error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "max_tokens is below the complete typed judgment answer budget",
+                "invalid_completion_request",
+            ));
+        }
+        Some(judgment)
+    } else {
+        None
+    };
     let provider_timeout = completion_timeout(request.timeout_ms)?;
+    let purpose = if typed_judgment.is_some() {
+        astra_core::model_wire::purpose::ModelRequestPurpose::TypedJudgment
+    } else {
+        astra_core::model_wire::purpose::ModelRequestPurpose::Chat
+    };
 
     // 2. Admit one Offering. Explicit selections use the same catalog boundary
     // as durable chat runs; omission invokes the Server-owned default policy.
@@ -89,6 +121,7 @@ pub(super) async fn completions_handler(
         };
         super::model_execution_admission::admit_model_execution(
             &state.model_service,
+            purpose,
             &user.user_id,
             &selection,
             None,
@@ -144,6 +177,22 @@ pub(super) async fn completions_handler(
             .admit_model_offering(user.user_id.clone(), offering_id)
             .await?
     };
+
+    astra_services::models::validate_model_execution_purpose(&admitted, purpose)?;
+
+    // Typed responses are batched judgments. Their requested output size is a
+    // minimum wire budget, so an Offering with a smaller catalog limit must be
+    // rejected before durable admission and provider I/O. This keeps the
+    // proxy and direct Server memory path on the same contract.
+    if let Some(judgment) = typed_judgment.as_ref()
+        && !judgment.output_budget_fits_completion_cap(admitted.max_completion_tokens)
+    {
+        return Err(crate::error_response_coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Selected Offering cannot emit the complete typed judgment within its output limit",
+            "model_output_budget_unavailable",
+        ));
+    }
 
     // 3. Durably admit the logical invocation before provider I/O. Auxiliary
     // work is often session-scoped; callers must not invent an agent run just
@@ -213,7 +262,7 @@ pub(super) async fn completions_handler(
     let response_id = completion_response_id(parsed.response_id.as_deref());
     let content = parsed.full_text;
     let finish_reason = parsed.finish_reason.unwrap_or_else(|| "stop".to_string());
-    let usage = completion_usage(&parsed.usage);
+    let usage = completion_usage(&parsed.usage, parsed.usage_presence);
     crate::llm_provider_admission::record_llm_provider_admission_calibration(
         admission_estimated_tokens,
         &parsed.usage,
@@ -291,8 +340,13 @@ fn inference_ledger_http_error(
     )
 }
 
-fn completion_usage(raw: &serde_json::Map<String, serde_json::Value>) -> Option<CompletionUsage> {
-    if raw.is_empty() {
+fn completion_usage(
+    raw: &serde_json::Map<String, serde_json::Value>,
+    presence: crate::turn::token_usage::TokenUsagePresence,
+) -> Option<CompletionUsage> {
+    // This compact wire DTO cannot express unknown lanes. Keep partial usage
+    // in the physical-attempt ledger rather than turning missing fields into 0.
+    if !presence.fresh_input_tokens || !presence.output_tokens {
         return None;
     }
     let usage = crate::turn::token_usage::TokenUsage::from_partial_json_map(raw);
@@ -381,6 +435,7 @@ mod tests {
     }
 
     struct CompletionModelService {
+        provider: &'static str,
         base_url: String,
     }
 
@@ -434,7 +489,7 @@ mod tests {
                     wire_model_name: Some("provider-wire-model".into()),
                     api_key: "provider-secret".into(),
                     base_url: self.base_url.clone(),
-                    provider: "openai".into(),
+                    provider: self.provider.into(),
                     fallback_chain: Vec::new(),
                     tags: Vec::new(),
                     request_body_overrides: None,
@@ -443,11 +498,17 @@ mod tests {
                     prompt_cache_capability: None,
                     thinking_capability: None,
                     context_window: Some(32_000),
-                    max_completion_tokens: Some(4_096),
-                    request_headers: Some(serde_json::Map::from_iter([(
-                        "x-offering-route".into(),
-                        serde_json::Value::String("admitted".into()),
-                    )])),
+                    max_completion_tokens: Some(if self.provider == "cap-limited" {
+                        64
+                    } else {
+                        4_096
+                    }),
+                    request_headers: (self.provider != "typesafe").then(|| {
+                        serde_json::Map::from_iter([(
+                            "x-offering-route".into(),
+                            serde_json::Value::String("admitted".into()),
+                        )])
+                    }),
                 },
             })
         }
@@ -487,6 +548,30 @@ mod tests {
             temperature: 0.0,
             timeout_ms: 120_000,
         }
+    }
+
+    fn typed_completion_request(
+        offering_id: &str,
+        operation: CompletionOperation,
+    ) -> CompletionRequest {
+        let judgment = astra_turn_types::JudgmentRequest {
+            schema_version: 1,
+            state: json!({"evidence":"bounded"}),
+            questions: [(
+                "evidence".to_string(),
+                astra_turn_types::JudgmentQuestion::Noul {
+                    instructions: "Does the evidence support this conclusion?".to_string(),
+                    criteria: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let mut request = explicit_completion_request(offering_id);
+        request.operation = operation;
+        request.max_tokens = 512;
+        request.messages = astra_turn_types::judgment_messages(&judgment);
+        request
     }
 
     fn completion_headers() -> HeaderMap {
@@ -670,10 +755,57 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn typed_judgment_rejects_an_offering_cap_before_provider_dispatch() {
+        for operation in [
+            CompletionOperation::MemoryRetrievalRerank,
+            CompletionOperation::TurnIntent,
+            CompletionOperation::SkillAutoRoute,
+            CompletionOperation::VerificationJudge,
+        ] {
+            let state = AppState::new(Default::default(), Arc::new(Healthy))
+                .with_auth_service(Arc::new(astra_services::auth::StubAuthService))
+                .with_model_service(Arc::new(CompletionModelService {
+                    provider: "cap-limited",
+                    base_url: "http://127.0.0.1:1/v1".into(),
+                }));
+            let request = typed_completion_request("offer-completion", operation);
+
+            let error = completions_handler(State(state), completion_headers(), Json(request))
+                .await
+                .expect_err("typed judgment must not exceed the admitted Offering cap");
+
+            assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                error.1.error_code.as_deref(),
+                Some("model_output_budget_unavailable")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_judgment_rejects_a_caller_budget_below_the_complete_answer() {
+        let state = AppState::new(Default::default(), Arc::new(Healthy))
+            .with_auth_service(Arc::new(astra_services::auth::StubAuthService));
+        let mut request =
+            typed_completion_request("offer-completion", CompletionOperation::VerificationJudge);
+        request.max_tokens = 1;
+
+        let error = completions_handler(State(state), completion_headers(), Json(request))
+            .await
+            .expect_err("a typed answer must fit the caller's requested output budget");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.error_code.as_deref(),
+            Some("invalid_completion_request")
+        );
+    }
+
     #[test]
     fn completion_response_does_not_claim_zero_usage_when_provider_omits_usage() {
         let raw = serde_json::Map::new();
-        assert!(completion_usage(&raw).is_none());
+        assert!(completion_usage(&raw, Default::default()).is_none());
     }
 
     #[tokio::test]
@@ -709,6 +841,7 @@ mod tests {
         let state = AppState::new(Default::default(), Arc::new(Healthy))
             .with_auth_service(Arc::new(astra_services::auth::StubAuthService))
             .with_model_service(Arc::new(CompletionModelService {
+                provider: "openai",
                 base_url: format!("http://{address}/v1"),
             }));
 
@@ -741,6 +874,7 @@ mod tests {
         let state = AppState::new(Default::default(), Arc::new(Healthy))
             .with_auth_service(Arc::new(astra_services::auth::StubAuthService))
             .with_model_service(Arc::new(CompletionModelService {
+                provider: "openai",
                 base_url: "http://127.0.0.1:1/v1".into(),
             }));
 
@@ -854,6 +988,7 @@ mod tests {
         let state = AppState::new(Default::default(), Arc::new(Healthy))
             .with_auth_service(Arc::new(astra_services::auth::StubAuthService))
             .with_model_service(Arc::new(CompletionModelService {
+                provider: "openai",
                 base_url: format!("http://{provider_address}/v1"),
             }))
             .with_shared_pool(shared_pool.clone());
@@ -1109,5 +1244,268 @@ mod tests {
                 .is_cancelled()
         );
         shared_pool.close().await;
+    }
+    #[tokio::test]
+    #[ignore = "requires MatrixOne with ASTRA_TEST_DB_IT=1; uses only a local mock provider"]
+    async fn typesafe_completion_ledger_and_explain_preserve_real_counter_semantics() {
+        use astra_turn_types::{
+            ExplainAnalyzeAuxiliaryUsageStatusV1, JudgmentQuestion, JudgmentRequest,
+            JudgmentResponse,
+        };
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let mut settings = astra_core::config::MatrixOneSettings::from_env();
+        settings.db_pool_max_connections = settings.db_pool_max_connections.min(4);
+        settings.db_pool_min_connections = settings.db_pool_min_connections.min(1);
+        let catalog =
+            std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+        astra_services::ensure_core_schema(&settings, &catalog)
+            .await
+            .unwrap();
+        let shared_pool = astra_core::SharedPool::new(&settings).await.unwrap();
+        let session_id = format!("jev-ledger-{}", uuid::Uuid::new_v4().simple());
+        sqlx::query("INSERT INTO agent_sessions (session_id,user_id,status,event_count,project_retention_policy,created_at,updated_at,last_active_at) VALUES (?, 'test-user', 'active', 0, 'session', NOW(6), NOW(6), NOW(6))").bind(&session_id).execute(shared_pool.get()).await.unwrap();
+        let provider = axum::Router::new().route("/v1/systemone", axum::routing::post(|Json(body): Json<serde_json::Value>| async move {
+            assert_eq!(body["model"], "provider-wire-model");
+            assert!(body["questions"].get("evidence").is_some());
+            let mut response = json!({"model":"mock-jev-returned-model","answers":{"evidence":{"type":"noul","noul":0.9}}});
+            match body["state"]["usage"].as_str().unwrap() {
+                "exact" => response["usage"] = json!({"input_tokens":100,"output_tokens":4}),
+                "partial" => response["usage"] = json!({"input_tokens":70}),
+                "missing" => {},
+                other => panic!("unexpected fixture mode {other}"),
+            }
+            Json(response)
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let provider_task =
+            tokio::spawn(async move { axum::serve(listener, provider).await.unwrap() });
+        let state = AppState::new(Default::default(), Arc::new(Healthy))
+            .with_auth_service(Arc::new(astra_services::auth::StubAuthService))
+            .with_model_service(Arc::new(CompletionModelService {
+                provider: "typesafe",
+                base_url,
+            }))
+            .with_shared_pool(shared_pool.clone());
+        for (index, mode) in ["exact", "partial", "missing"].into_iter().enumerate() {
+            let judgment = JudgmentRequest {
+                schema_version: 1,
+                state: json!({"usage":mode}),
+                questions: [(
+                    "evidence".into(),
+                    JudgmentQuestion::Noul {
+                        instructions: "Does the evidence support this conclusion?".into(),
+                        criteria: None,
+                    },
+                )]
+                .into(),
+            };
+            let mut request = explicit_completion_request("offer-completion");
+            request.operation = CompletionOperation::VerificationJudge;
+            request.session_id = session_id.clone();
+            request.logical_attempt = index as u32;
+            request.max_tokens = u32::try_from(judgment.output_token_budget())
+                .expect("test judgment budget fits u32");
+            request.messages =
+                vec![json!({"role":"user","content":serde_json::to_string(&judgment).unwrap()})];
+            let response =
+                completions_handler(State(state.clone()), completion_headers(), Json(request))
+                    .await
+                    .unwrap()
+                    .0;
+            let answer: JudgmentResponse =
+                serde_json::from_str(&response.choices[0].message.content).unwrap();
+            assert_eq!(answer.model, "mock-jev-returned-model");
+            assert_eq!(answer.answers["evidence"].probability(), 0.9);
+            if mode == "exact" {
+                let usage = response.usage.unwrap();
+                assert_eq!(usage.prompt_tokens, 100);
+                assert_eq!(usage.completion_tokens, 4);
+                assert_eq!(usage.total_tokens, 104);
+            } else {
+                assert!(response.usage.is_none());
+            }
+        }
+        let snapshot = astra_services::inference_execution::load_explain_auxiliary_usage(
+            &shared_pool,
+            "test-user",
+            &session_id,
+            1,
+            3,
+        )
+        .await
+        .unwrap();
+        assert!(snapshot.available);
+        assert_eq!(snapshot.attempts.len(), 3);
+        assert!(
+            snapshot
+                .attempts
+                .iter()
+                .all(|attempt| attempt.provider == "typesafe"
+                    && attempt.model_name == "provider-wire-model"
+                    && attempt.purpose == "verification_judge")
+        );
+        let exact = snapshot
+            .attempts
+            .iter()
+            .find(|attempt| {
+                attempt.usage_status == ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact
+            })
+            .unwrap()
+            .usage
+            .as_ref()
+            .unwrap();
+        assert_eq!(exact.fresh_input_tokens, Some(100));
+        assert_eq!(exact.output_tokens, Some(4));
+        let partial = snapshot
+            .attempts
+            .iter()
+            .find(|attempt| {
+                attempt.usage_status == ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderPartial
+            })
+            .unwrap()
+            .usage
+            .as_ref()
+            .unwrap();
+        assert_eq!(partial.fresh_input_tokens, Some(70));
+        assert_eq!(partial.output_tokens, None);
+        assert!(
+            snapshot
+                .attempts
+                .iter()
+                .find(|attempt| attempt.usage_status
+                    == ExplainAnalyzeAuxiliaryUsageStatusV1::Unavailable)
+                .unwrap()
+                .usage
+                .is_none()
+        );
+        let overflow = astra_services::inference_execution::load_explain_auxiliary_usage(
+            &shared_pool,
+            "test-user",
+            &session_id,
+            1,
+            2,
+        )
+        .await
+        .unwrap();
+        assert!(overflow.available && overflow.truncated && overflow.is_valid());
+        assert_eq!(overflow.attempts.len(), 2);
+        assert_eq!(overflow.attempts, snapshot.attempts[..2]);
+        for (user, turn) in [("other-user", 1), ("test-user", 2)] {
+            assert!(
+                astra_services::inference_execution::load_explain_auxiliary_usage(
+                    &shared_pool,
+                    user,
+                    &session_id,
+                    turn,
+                    3
+                )
+                .await
+                .unwrap()
+                .attempts
+                .is_empty()
+            );
+        }
+        assert_eq!(
+            snapshot,
+            astra_services::inference_execution::load_explain_auxiliary_usage(
+                &shared_pool,
+                "test-user",
+                &session_id,
+                1,
+                3
+            )
+            .await
+            .unwrap()
+        );
+        for statement in [
+            "DELETE FROM inference_invocation_settlement_debts WHERE user_id='test-user' AND session_id=?",
+            "DELETE FROM inference_provider_attempts WHERE user_id='test-user' AND session_id=?",
+            "DELETE FROM inference_invocations WHERE user_id='test-user' AND session_id=?",
+            "DELETE FROM inference_routes WHERE user_id='test-user' AND session_id=?",
+            "DELETE FROM agent_sessions WHERE user_id='test-user' AND session_id=?",
+        ] {
+            sqlx::query(statement)
+                .bind(&session_id)
+                .execute(shared_pool.get())
+                .await
+                .unwrap();
+        }
+        provider_task.abort();
+        assert!(provider_task.await.unwrap_err().is_cancelled());
+        shared_pool.close().await;
+    }
+
+    struct JudgmentConfig;
+    #[async_trait]
+    impl astra_services::AdminConfigService for JudgmentConfig {
+        async fn get(&self, key: &str) -> Result<Option<String>, String> {
+            assert_eq!(key, astra_services::ADMIN_CONFIG_KEY_JUDGMENT_OFFERING);
+            Ok(Some("offer-completion".into()))
+        }
+        async fn list(&self) -> Result<Vec<(String, String)>, String> {
+            Ok(vec![])
+        }
+        async fn set(&self, _: &str, _: &str, _: Option<&str>) -> Result<(), String> {
+            Err("read only".into())
+        }
+        async fn unset(&self, _: &str) -> Result<bool, String> {
+            Err("read only".into())
+        }
+    }
+    #[test]
+    fn compact_completion_usage_preserves_canonical_counts_and_source_presence() {
+        use crate::turn::token_usage::TokenUsagePresence;
+        let canonical = json!({"input_tokens":100,"cached_input_tokens":0,"cache_creation_tokens":0,"output_tokens":4});
+        let complete = TokenUsagePresence {
+            fresh_input_tokens: true,
+            output_tokens: true,
+            ..Default::default()
+        };
+        let result = completion_usage(canonical.as_object().unwrap(), complete).unwrap();
+        assert_eq!(result.prompt_tokens, 100);
+        assert_eq!(result.completion_tokens, 4);
+        assert_eq!(result.total_tokens, 104);
+        // Canonical buckets are zero-filled; metadata remains authoritative.
+        assert!(
+            completion_usage(
+                canonical.as_object().unwrap(),
+                TokenUsagePresence {
+                    fresh_input_tokens: true,
+                    ..Default::default()
+                }
+            )
+            .is_none()
+        );
+        assert!(completion_usage(canonical.as_object().unwrap(), Default::default()).is_none());
+        let zero = json!({"input_tokens":0,"cached_input_tokens":0,"cache_creation_tokens":0,"output_tokens":0});
+        assert_eq!(
+            completion_usage(zero.as_object().unwrap(), complete)
+                .unwrap()
+                .total_tokens,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn judgment_catalog_uses_configured_admitted_offering() {
+        let state = AppState::new(Default::default(), Arc::new(Healthy))
+            .with_auth_service(Arc::new(astra_services::auth::StubAuthService))
+            .with_model_service(Arc::new(CompletionModelService {
+                provider: "openai",
+                base_url: "http://127.0.0.1:9".into(),
+            }))
+            .with_admin_config_service(Arc::new(JudgmentConfig));
+        let Json(response) = crate::data_layer::models::get_memory_model_handler(
+            State(state),
+            axum::extract::Query(crate::data_layer::models::MemoryModelQuery {
+                operation: crate::data_layer::models::MemoryCatalogOperation::Judgment,
+            }),
+            completion_headers(),
+        )
+        .await
+        .expect("configured judgment catalog");
+        assert_eq!(response.offerings.len(), 1);
+        assert_eq!(response.offerings[0].offering_id, "offer-completion");
     }
 }

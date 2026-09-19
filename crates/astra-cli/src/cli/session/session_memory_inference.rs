@@ -26,8 +26,27 @@ pub(crate) async fn fetch_memory_inference_offerings(
     api: &astra_thin_client::ThinClient,
     token: &str,
 ) -> Result<Vec<MemoryInferenceOffering>, String> {
+    fetch_memory_offerings_path(api, token, astra_thin_client::paths::model_memory()).await
+}
+
+pub(crate) async fn fetch_memory_judgment_offerings(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+) -> Result<Vec<MemoryInferenceOffering>, String> {
+    let path = format!(
+        "{}?operation=judgment",
+        astra_thin_client::paths::model_memory()
+    );
+    fetch_memory_offerings_path(api, token, &path).await
+}
+
+async fn fetch_memory_offerings_path(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    path: &str,
+) -> Result<Vec<MemoryInferenceOffering>, String> {
     let body = api
-        .get_authed_path_text(token, astra_thin_client::paths::model_memory())
+        .get_authed_path_text(token, path)
         .await
         .map_err(|error| format!("memory inference catalog is unavailable: {error}"))?;
     let envelope = serde_json::from_str::<MemoryInferenceOfferingsEnvelope>(&body)
@@ -425,5 +444,38 @@ mod tests {
             },
         ];
         assert!(validate_memory_inference_offerings(duplicate).is_err());
+    }
+    #[tokio::test]
+    async fn judgment_catalog_query_does_not_change_extraction_request() {
+        use axum::{Json, Router, extract::OriginalUri, routing::get};
+        use std::sync::{Arc, Mutex};
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let capture = seen.clone();
+        let app=Router::new().route("/models/memory",get(move |OriginalUri(uri): OriginalUri| {
+            let capture=capture.clone(); async move {
+                capture.lock().unwrap().push(uri.to_string());
+                Json(serde_json::json!({"offerings":[{"offering_id":"offer-test","model_name":"display","thinking_capability":null}]}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = astra_thin_client::ThinClient::new(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            None,
+        )
+        .unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        fetch_memory_inference_offerings(&api, "token")
+            .await
+            .unwrap();
+        fetch_memory_judgment_offerings(&api, "token")
+            .await
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["/models/memory", "/models/memory?operation=judgment"]
+        );
+        server.abort();
     }
 }

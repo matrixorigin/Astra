@@ -3513,9 +3513,9 @@ pub(crate) struct DurableInferenceInvocation {
 
 /// Exact identity of the latest durably admitted physical provider request.
 ///
-/// This is the bridge between transport-owned serialized bytes and the
-/// turn-level context trace. It is populated only after the attempt row
-/// commits, so a trace can never claim that an unadmitted request was sent.
+/// This bridges transport-owned serialized bytes and the turn-level trace.
+/// Identity is retained before admission acknowledgement for reconciliation;
+/// identity alone does not prove admission or dispatch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DurableProviderRequestIdentity {
     pub request_id: String,

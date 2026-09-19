@@ -72,6 +72,17 @@ in [MOI native login](../guides/moi-native-login.md#built-in-memory). Automatic
 prompt recall budgets both authorization and retrieval together; one successful
 session-start lane remains usable if the other lane times out.
 
+Automatic prompt recall does not reuse candidates across primary-model request
+preparations solely because the turn number and user message are unchanged.
+Each preparation uses the existing current-authority admission and bounded
+retrieval path; denial, lookup failure or timeout must not restore candidates
+from an earlier preparation. Within one preparation, context-budget assembly and physical
+provider retries may reuse its local retrieval result without starting another
+retrieval. This avoids an unversioned cross-request cache; it does not promise atomic authorization
+between an in-flight retrieval and the eventual model dispatch. Any future
+asynchronous candidate selector must address that boundary explicitly before
+retaining or reusing authorized snapshots.
+
 ## Learning boundary
 
 Memory is not training data by default. Learning artifacts require consent, redaction, quality gate, lineage, and deletion propagation.

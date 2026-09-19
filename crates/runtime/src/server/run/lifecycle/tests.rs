@@ -1,4 +1,7 @@
 use super::*;
+
+#[path = "trace_ingestion_tests.rs"]
+mod trace_ingestion_tests;
 use astra_services::runs::{RunStatusCasRequest, RunUsageOwnerUpdateRequest};
 
 #[path = "cancellation_db_tests.rs"]
@@ -25305,6 +25308,94 @@ async fn stream_chat_explain_mode_finishes_a_short_turn() {
         }),
         "short Explain turn did not emit run_finished: {events:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1; provider is localhost mock"]
+async fn db_explain_memory_selection_follows_canonical_admitted_turns() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let owner = format!("memory-explain-owner-{}", Uuid::new_v4());
+    let session = format!("memory-explain-session-{}", Uuid::new_v4());
+    crate::server::run::insert_active_run_session_fixture(&pool, &owner, &session).await;
+    let llm = spawn_terminal_test_llm().await;
+    let service = db_backed_test_service(&pool, "memory-explain-test");
+    let mut run_ids = Vec::new();
+    for (turn, reported_turn) in [(1, 1), (2, 2), (3, 2)] {
+        let mut request = prepared_test_request("hello");
+        request.session_id = Some(session.clone());
+        request.explain = true;
+        request.provider_runtime_authorized = true;
+        request.admitted_model_execution = None;
+        request.runtime_auth = Some(RuntimeAuthRequest {
+            authorization: "Bearer fake-memory-explain".into(),
+        });
+        request.capability_descriptors =
+            Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
+                model_gateway: Some(test_runtime_descriptor(
+                    "memory-explain-gateway",
+                    "model_gateway",
+                    &format!("{}/chat/completions", llm.base_url),
+                )),
+                ..Default::default()
+            });
+        request.execution_policy.skill_auto_route =
+            astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled;
+        request.context = Some(serde_json::Map::from_iter([(
+            "edge_profile".into(),
+            json!({
+                "memory_selection_reports": [{
+                    "session_id": session, "turn": reported_turn,
+                    "operation":"relevance", "method":"model", "reason":"completed",
+                    "model":"jev-test", "elapsed_ms":12,
+                    "selection_order":[0], "candidates":[{"index":0,"selected":true,"probability_bps":9000}]
+                }]
+            }),
+        )]));
+        let stream = ok(service.stream_chat(owner.clone(), request).await);
+        run_ids.push(stream.run_id.clone());
+        let events = tokio::time::timeout(Duration::from_secs(30), collect_chat_stream(stream))
+            .await
+            .expect("mock turn settles");
+        assert!(
+            events
+                .iter()
+                .any(|event| replay_event_type(event) == Some("run_finished")
+                    && chat_stream_event_status(event) == Some(STATUS_COMPLETED)),
+            "{events:?}"
+        );
+        let assemblies = events
+            .iter()
+            .filter_map(|event| astra_turn_types::decode_explain_analyze_wire(event).ok())
+            .filter_map(|fact| fact.context.and_then(|context| context.assembly))
+            .collect::<Vec<_>>();
+        assert!(
+            !assemblies.is_empty(),
+            "turn {turn} should emit measured context assembly: {events:?}"
+        );
+        if turn == reported_turn {
+            assert!(
+                assemblies
+                    .iter()
+                    .any(
+                        |assembly| assembly.edge_memory_selection.iter().any(|r| r.turn == turn
+                            && r.session_id == session
+                            && r.selected_indices() == vec![0])
+                    ),
+                "turn {turn} report missing: {events:?}"
+            );
+        } else {
+            assert!(
+                assemblies
+                    .iter()
+                    .all(|assembly| assembly.edge_memory_selection.is_empty()),
+                "stale report must not be attributed to turn {turn}"
+            );
+        }
+    }
+    for run_id in run_ids {
+        cleanup_lifecycle_run_fixture(&pool, &owner, &run_id).await;
+    }
+    crate::server::run::cleanup_run_session_fixture(&pool, &owner, &session).await;
 }
 
 #[tokio::test]

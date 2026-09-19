@@ -483,12 +483,16 @@ impl DurableExecutionRestrictions {
 /// Request-scoped execution controls.
 ///
 /// Turn-intent classification policy for callers that explicitly need a
-/// server-side semantic admission decision before any primary-agent action.
+/// server-side semantic judgment before a primary-agent action crosses an
+/// ambiguous lifecycle boundary.
 ///
-/// Primary user turns use one bounded semantic admission concurrently with
+/// Primary user turns use one bounded semantic judgment concurrently with
 /// the primary request by default. The result is awaited only before an
 /// executable/completion boundary, so ordinary latency can overlap while a
-/// Work-required goal cannot silently degrade into untracked execution.
+/// Work-required goal cannot silently degrade into untracked execution. If no
+/// judgment Offering is configured, the primary typed carrier remains the
+/// authoritative no-classifier path; the runtime never borrows the primary
+/// model as a hidden sidecar.
 /// Delegated sub-runs explicitly use [`TurnIntentExecutionPolicy::FixedDefault`]
 /// because their parent already owns the lifecycle decision.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -503,9 +507,9 @@ pub struct ExecutionPolicyRequest {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnIntentExecutionPolicy {
-    /// Run Astra's auxiliary TurnIntent LLM before the primary agent. This is
-    /// an explicit strict-admission mode for callers that require a semantic
-    /// decision before ordinary root tool selection.
+    /// Run Astra's auxiliary TurnIntent judgment before the primary agent.
+    /// This is an explicit semantic-admission mode for callers that require a
+    /// typed decision before ordinary root tool selection.
     #[default]
     Auto,
     /// Do not add a serial auxiliary model boundary. The primary agent makes

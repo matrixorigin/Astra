@@ -101,3 +101,12 @@ Skill discovery should be progressive:
 Track per skill version: invocation and success/failure counts, tool-call
 validity, user correction rate, provider fallback/block rate, token cost, and
 regression failures.
+
+## Optional memory candidate judgment pilot
+
+Memory relevance and explicit lesson dismissal use the existing selector boundary.
+An optional server admin `judgment_offering_id` binds those judgments to a
+registered Offering, including the TypeSafe System One adapter. Offering credentials
+remain encrypted and server-owned. This binding never selects a memory extraction
+model or changes agent/tool policy. See [the pilot guide](../guides/memory-judgment-pilot.md)
+for configuration, fallback and validation limitations.

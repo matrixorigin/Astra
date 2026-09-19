@@ -14,6 +14,8 @@ const DEFAULT_MODEL_CATALOG_LIMIT: u32 = 50;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ModelCatalogQuery {
+    #[serde(default)]
+    pub purpose: astra_core::model_wire::purpose::ModelCatalogPurpose,
     #[serde(default = "default_model_catalog_limit")]
     pub limit: u32,
     pub after_provider: Option<String>,
@@ -253,12 +255,15 @@ async fn effective_model_catalog(
                 source: ModelDefaultSource::ExternalProvider,
                 scope: ModelDefaultScope::EffectiveCatalog,
             });
-        let mut offerings = catalog
-            .models
-            .into_iter()
-            .map(ModelListItem::from)
-            .filter(|item| !active_only || item.is_active)
-            .collect::<Vec<_>>();
+        let mut offerings = model_catalog_for_purpose(
+            catalog
+                .models
+                .into_iter()
+                .map(ModelListItem::from)
+                .filter(|item| !active_only || item.is_active)
+                .collect::<Vec<_>>(),
+            query.purpose,
+        );
         offerings.sort_by(|left, right| {
             (
                 left.provider.as_str(),
@@ -296,9 +301,13 @@ async fn effective_model_catalog(
         });
     }
     let user = principal.user;
-    let is_admin = !active_only && state.admin.authorizer.require_admin(headers).await.is_ok();
+    let is_admin = !active_only
+        && query.purpose == astra_core::model_wire::purpose::ModelCatalogPurpose::All
+        && state.admin.authorizer.require_admin(headers).await.is_ok();
     if !is_admin {
-        let catalog = state.model_service.user_model_catalog(user.user_id).await?;
+        let mut catalog = state.model_service.user_model_catalog(user.user_id).await?;
+        catalog.items.retain(|item| !active_only || item.is_active);
+        catalog.items = model_catalog_for_purpose(catalog.items, query.purpose);
         let declared = astra_services::models::server_model_access_declarations(
             catalog.allows_deployment,
             catalog.items.iter().map(|item| item.access_kind),
@@ -329,59 +338,21 @@ async fn effective_model_catalog(
         });
     }
     let user_id = user.user_id.clone();
+    // Only explicit administrator registry inspection uses the unfiltered DB
+    // seek path. Chat and judgment always use the user's effective catalog.
     let page = state
         .model_service
-        .list_models_page(user_id.clone(), is_admin, query.limit, cursor)
+        .list_models_page(user_id.clone(), true, query.limit, cursor)
         .await?;
     let catalog_revision = state
         .model_service
-        .model_catalog_revision(user_id.clone(), is_admin)
+        .model_catalog_revision(user_id, true)
         .await?;
-    let mut declared = Vec::new();
-    let allows_deployment = is_admin
-        || state
-            .model_service
-            .allows_deployment_models(user_id.clone())
-            .await?;
-    if allows_deployment {
-        declared.push(DeclaredModelAccess {
-            id: "self-hosted".to_string(),
-            kind: ModelAccessKind::SelfHosted,
-            label: "Self-hosted".to_string(),
-            execution_placement: ModelExecutionPlacement::Server,
-            availability: ModelAccessAvailability::Ready,
-        });
-    }
-    let provider_default = state
-        .model_service
-        .default_user_model_offering_id(user_id)
-        .await?
-        .map(|offering_id| ModelDefaultCandidate {
-            offering_id,
-            source: ModelDefaultSource::Astra,
-            scope: ModelDefaultScope::EffectiveCatalog,
-        });
-    // Model Access needs the complete catalog both to resolve a default and
-    // to publish per-access counts that stay stable across pagination.
-    let default_catalog: Option<Vec<ModelListItemResponse>> =
-        if !is_admin || active_only || provider_default.is_some() {
-            Some(
-                state
-                    .model_service
-                    .list_models(user.user_id, false)
-                    .await?
-                    .into_iter()
-                    .map(ModelListItemResponse::from)
-                    .collect(),
-            )
-        } else {
-            None
-        };
     Ok(EffectiveModelCatalog {
-        declared,
+        declared: Vec::new(),
         offerings: page.items,
-        provider_default,
-        default_catalog,
+        provider_default: None,
+        default_catalog: None,
         next_cursor: page.next_cursor,
         limit: page.limit,
         total: page.total,
@@ -462,6 +433,13 @@ pub async fn get_model_access_handler(
     headers: HeaderMap,
     Query(query): Query<ModelCatalogQuery>,
 ) -> Result<Json<ModelAccessProjectionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if query.purpose == astra_core::model_wire::purpose::ModelCatalogPurpose::All {
+        return Err(astra_core::error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "Model Access requires an inference purpose; use /models?purpose=all for registry inspection",
+            "model_catalog_purpose_invalid",
+        ));
+    }
     let is_first_page = query.after_provider.is_none()
         && query.after_name.is_none()
         && query.after_offering_id.is_none();
@@ -469,7 +447,6 @@ pub async fn get_model_access_handler(
     let offerings = catalog
         .offerings
         .into_iter()
-        .filter(|offering| offering.is_active)
         .map(ModelListItemResponse::from)
         .collect::<Vec<_>>();
     let default_catalog = catalog.default_catalog.unwrap_or_else(|| offerings.clone());
@@ -480,6 +457,7 @@ pub async fn get_model_access_handler(
         &default_catalog,
         catalog.provider_default,
         chrono::Utc::now().to_rfc3339(),
+        query.purpose,
     )
     .map_err(internal_error)?;
     projection.next_cursor = catalog.next_cursor;
@@ -503,11 +481,47 @@ pub async fn get_model_handler(
     Ok(Json(ModelResponse::from(model)))
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryCatalogOperation {
+    #[default]
+    Extraction,
+    Judgment,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryModelQuery {
+    #[serde(default)]
+    pub operation: MemoryCatalogOperation,
+}
+impl MemoryModelQuery {
+    fn judgment_binding(&self) -> bool {
+        self.operation == MemoryCatalogOperation::Judgment
+    }
+}
+
 pub async fn get_memory_model_handler(
     State(state): State<AppState>,
+    Query(query): Query<MemoryModelQuery>,
     headers: HeaderMap,
 ) -> Result<Json<MemoryInferenceOfferingsResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    if query.judgment_binding() {
+        let offerings = astra_services::admin_config::resolve_judgment_offering(
+            state.admin.config_service.as_ref(),
+            state.model_service.as_ref(),
+            &user.user_id,
+        )
+        .await?
+        .into_iter()
+        .map(|admitted| MemoryInferenceOfferingResponse {
+            offering_id: admitted.offering_id,
+            model_name: admitted.model_name,
+            thinking_capability: admitted.thinking_capability,
+        })
+        .collect();
+        return Ok(Json(MemoryInferenceOfferingsResponse { offerings }));
+    }
     let matrixone = crate::matrix_cloud_runtime::matrix_settings_from_env().map_err(|e| {
         error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -656,6 +670,7 @@ mod tests {
                 scope: ModelDefaultScope::EffectiveCatalog,
             }),
             "2026-08-06T00:00:00Z".to_string(),
+            astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
         )
         .expect("a default on a later page must remain valid");
 
@@ -695,6 +710,7 @@ mod tests {
                 scope: ModelDefaultScope::EffectiveCatalog,
             }),
             "2026-08-10T00:00:00Z".to_string(),
+            astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
         )
         .expect("invalid default must not poison the effective catalog");
 
@@ -752,5 +768,22 @@ mod tests {
             .expect_err("duplicate identity cannot be split across pages");
 
         assert_eq!(error.0, StatusCode::BAD_GATEWAY);
+    }
+}
+
+#[cfg(test)]
+mod memory_catalog_query_tests {
+    use super::*;
+    #[test]
+    fn judgment_binding_is_explicit_and_extraction_is_default() {
+        let default: MemoryModelQuery = serde_json::from_str("{}").unwrap();
+        assert!(!default.judgment_binding());
+        let extraction: MemoryModelQuery =
+            serde_json::from_str(r#"{"operation":"extraction"}"#).unwrap();
+        assert!(!extraction.judgment_binding());
+        let judgment: MemoryModelQuery =
+            serde_json::from_str(r#"{"operation":"judgment"}"#).unwrap();
+        assert!(judgment.judgment_binding());
+        assert!(serde_json::from_str::<MemoryModelQuery>(r#"{"operation":"other"}"#).is_err());
     }
 }

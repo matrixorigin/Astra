@@ -48,7 +48,10 @@ pub(crate) async fn resolve_subrun_model_selection(
 ) -> Result<crate::cli::session::session_runtime::ServerModelSelection, String> {
     if let Some(model) = model {
         return crate::cli::session::session_runtime::resolve_server_model_selection(
-            api, token, model,
+            api,
+            token,
+            model,
+            astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
         )
         .await;
     }

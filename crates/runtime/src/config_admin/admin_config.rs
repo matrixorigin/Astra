@@ -11,6 +11,45 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+const JUDGMENT_MODEL: &str = "judgment_model";
+
+fn storage_key(key: &str) -> &str {
+    if key == JUDGMENT_MODEL {
+        astra_services::ADMIN_CONFIG_KEY_JUDGMENT_OFFERING
+    } else {
+        key
+    }
+}
+
+fn judgment_model_id<'a>(
+    catalog: &'a [astra_services::models::ModelListItem],
+    name: &str,
+) -> Result<&'a str, String> {
+    let matches = catalog
+        .iter()
+        .filter(|m| {
+            m.name == name && m.access_kind == astra_services::models::ModelAccessKind::SelfHosted
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Err(format!(
+            "Judgment model '{name}' not found. Load it with astra admin model load first."
+        )),
+        [model] if !model.is_active => Err(format!(
+            "Judgment model '{name}' is inactive. Run: astra admin model check {name}"
+        )),
+        [model] => Ok(&model.offering_id),
+        models => Err(format!(
+            "Judgment model '{name}' is ambiguous: {}. Select an exact judgment_offering_id instead.",
+            models
+                .iter()
+                .map(|m| format!("{} ({})", m.offering_id, m.provider))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct AdminConfigEntry {
     pub key: String,
@@ -62,18 +101,25 @@ pub async fn get_admin_config_handler(
     Path(key): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<AdminConfigGetResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _admin = state.admin.authorizer.require_admin(&headers).await?;
+    let admin = state.admin.authorizer.require_admin(&headers).await?;
     let value = state
         .admin
         .config_service
-        .get(&key)
+        .get(storage_key(&key))
         .await
         .map_err(|e| error_response(StatusCode::BAD_REQUEST, e))?;
     match value {
-        Some(v) => Ok(Json(AdminConfigGetResponse {
-            key,
-            value: Some(v),
-        })),
+        Some(mut v) => {
+            if key == JUDGMENT_MODEL {
+                let catalog = state.model_service.list_models(admin.user_id, true).await?;
+                v = catalog.iter().find(|m| m.offering_id == v && m.access_kind == astra_services::models::ModelAccessKind::SelfHosted)
+                    .map(|m| m.name.clone()).ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Configured judgment model no longer exists; select a new judgment_model or unset it"))?;
+            }
+            Ok(Json(AdminConfigGetResponse {
+                key,
+                value: Some(v),
+            }))
+        }
         None => Err(error_response(
             StatusCode::NOT_FOUND,
             format!("admin config key '{key}' is not set"),
@@ -88,19 +134,46 @@ pub async fn set_admin_config_handler(
     Json(request): Json<AdminConfigSetRequest>,
 ) -> Result<Json<AdminConfigEntry>, (StatusCode, Json<ErrorResponse>)> {
     let admin = state.admin.authorizer.require_admin(&headers).await?;
-    if key == astra_services::ADMIN_CONFIG_KEY_REASONING_OFFERING {
+    let mut value = request.value.clone();
+    if key == JUDGMENT_MODEL {
+        let catalog = state
+            .model_service
+            .list_models(admin.user_id.clone(), true)
+            .await?;
+        value = judgment_model_id(&catalog, &request.value)
+            .map_err(|e| error_response(StatusCode::BAD_REQUEST, e))?
+            .to_string();
+    }
+    let persisted_key = storage_key(&key);
+    if persisted_key == astra_services::ADMIN_CONFIG_KEY_REASONING_OFFERING
+        || persisted_key == astra_services::ADMIN_CONFIG_KEY_JUDGMENT_OFFERING
+    {
         // Fail at configuration time, while the operator still has the
         // relevant context, instead of breaking every later background
         // inference with a stale or misspelled identity.
-        state
+        let offering = state
             .model_service
-            .resolve_model_offering(request.value.clone())
+            .resolve_model_offering(value.clone())
             .await?;
+        if offering.model.provider == "typesafe" {
+            if persisted_key == astra_services::ADMIN_CONFIG_KEY_REASONING_OFFERING {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "TypeSafe supports memory judgments, not reasoning",
+                ));
+            }
+            if offering.model.api_key.trim().is_empty() {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "TypeSafe API key is not configured",
+                ));
+            }
+        }
     }
     state
         .admin
         .config_service
-        .set(&key, &request.value, Some(&admin.user_id))
+        .set(persisted_key, &value, Some(&admin.user_id))
         .await
         .map_err(|e| error_response(StatusCode::BAD_REQUEST, e))?;
     Ok(Json(AdminConfigEntry {
@@ -118,7 +191,7 @@ pub async fn delete_admin_config_handler(
     let deleted = state
         .admin
         .config_service
-        .unset(&key)
+        .unset(storage_key(&key))
         .await
         .map_err(internal_error)?;
     Ok(Json(AdminConfigDeleteResponse { deleted }))
@@ -228,6 +301,208 @@ mod tests {
         Router::new()
             .route("/admin/config/{key}", get(get_admin_config_handler))
             .with_state(state)
+    }
+
+    use astra_services::models::*;
+
+    struct JudgmentModels {
+        items: Vec<ModelListItem>,
+        key: String,
+    }
+    #[async_trait]
+    impl ModelService for JudgmentModels {
+        async fn list_models(
+            &self,
+            _: String,
+            admin: bool,
+        ) -> Result<Vec<ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
+            assert!(admin);
+            Ok(self.items.clone())
+        }
+        async fn resolve_model_offering(
+            &self,
+            id: String,
+        ) -> Result<ResolvedModelOffering, (StatusCode, Json<ErrorResponse>)> {
+            assert_eq!(id, "offer-jev");
+            Ok(ResolvedModelOffering {
+                offering_id: id,
+                model: ResolvedActiveLlmModel {
+                    model_name: "jev".into(),
+                    wire_model_name: None,
+                    api_key: self.key.clone(),
+                    base_url: "http://unused.invalid".into(),
+                    provider: "typesafe".into(),
+                    fallback_chain: vec![],
+                    tags: vec![],
+                    request_body_overrides: None,
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    prompt_cache_capability: None,
+                    thinking_capability: None,
+                    context_window: Some(1000),
+                    max_completion_tokens: None,
+                    request_headers: None,
+                },
+            })
+        }
+        async fn create_model(
+            &self,
+            _: String,
+            _: ModelCreateRequestData,
+        ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
+            panic!("unexpected model mutation or provider probe")
+        }
+        async fn get_model(
+            &self,
+            _: String,
+        ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
+            panic!("unexpected model mutation or provider probe")
+        }
+        async fn update_model(
+            &self,
+            _: String,
+            _: ModelUpdateRequestData,
+        ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
+            panic!("unexpected model mutation or provider probe")
+        }
+        async fn delete_model(&self, _: String) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+            panic!("unexpected model mutation or provider probe")
+        }
+        async fn check_model(
+            &self,
+            _: String,
+        ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
+            panic!("unexpected model mutation or provider probe")
+        }
+    }
+
+    fn jev_item(active: bool) -> ModelListItem {
+        ModelListItem {
+            offering_id: "offer-jev".into(),
+            access_id: "deployment".into(),
+            access_kind: ModelAccessKind::SelfHosted,
+            access_label: "Server".into(),
+            execution_placement: ModelExecutionPlacement::Server,
+            name: "jev".into(),
+            provider: "typesafe".into(),
+            description: None,
+            is_active: active,
+            context_window: 1000,
+            max_completion_tokens: None,
+            architecture: None,
+            thinking_capability: None,
+        }
+    }
+
+    fn judgment_app(
+        config: Arc<StubAdminConfigService>,
+        items: Vec<ModelListItem>,
+        key: &str,
+    ) -> Router {
+        let state = crate::AppState::new(
+            crate::app_state::ServiceInfo::default(),
+            Arc::new(AlwaysHealthy),
+        )
+        .with_auth_service(Arc::new(astra_services::auth::StubAuthService))
+        .with_admin_authorizer(Arc::new(AllowAllAdmin))
+        .with_admin_config_service(config)
+        .with_model_service(Arc::new(JudgmentModels {
+            items,
+            key: key.into(),
+        }));
+        Router::new()
+            .route(
+                "/admin/config/{key}",
+                get(get_admin_config_handler)
+                    .put(set_admin_config_handler)
+                    .delete(delete_admin_config_handler),
+            )
+            .with_state(state)
+    }
+
+    fn config_request(method: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri("/admin/config/judgment_model")
+            .header("content-type", "application/json")
+            .body(if method == "PUT" {
+                Body::from(r#"{"value":"jev"}"#)
+            } else {
+                Body::empty()
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn judgment_name_set_get_unset_uses_only_canonical_binding() {
+        let config = StubAdminConfigService::empty();
+        let app = judgment_app(config.clone(), vec![jev_item(true)], "fake-key");
+        assert_eq!(
+            app.clone()
+                .oneshot(config_request("PUT"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            config.list().await.unwrap(),
+            vec![(
+                astra_services::ADMIN_CONFIG_KEY_JUDGMENT_OFFERING.into(),
+                "offer-jev".into()
+            )]
+        );
+        let response = app.clone().oneshot(config_request("GET")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["value"],
+            "jev"
+        );
+        assert_eq!(
+            app.oneshot(config_request("DELETE"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert!(config.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_judgment_selection_preserves_previous_binding() {
+        let mut duplicate = jev_item(false);
+        duplicate.provider = "other".into();
+        duplicate.offering_id = "other-offering".into();
+        let mut personal = jev_item(true);
+        personal.access_kind = ModelAccessKind::ThisDevice;
+        for (items, key) in [
+            (vec![], "fake-key"),
+            (vec![jev_item(false)], "fake-key"),
+            (vec![jev_item(true), duplicate], "fake-key"),
+            (vec![personal], "fake-key"),
+            (vec![jev_item(true)], "  "),
+        ] {
+            let config = StubAdminConfigService::with_entry(
+                astra_services::ADMIN_CONFIG_KEY_JUDGMENT_OFFERING,
+                "previous",
+            );
+            let app = judgment_app(config.clone(), items, key);
+            assert_eq!(
+                app.oneshot(config_request("PUT")).await.unwrap().status(),
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                config
+                    .get(astra_services::ADMIN_CONFIG_KEY_JUDGMENT_OFFERING)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("previous")
+            );
+        }
     }
 
     // GET /admin/config/{key} for a missing key must return 404, not 200+null.

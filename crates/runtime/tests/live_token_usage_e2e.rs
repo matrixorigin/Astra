@@ -30,8 +30,8 @@
 //! # How to run
 //!
 //! ```sh
-//! make test-live-llm        # Makefile target — only this file
-//! cargo test -p astra-runtime --test live_token_usage_e2e -- --ignored --nocapture
+//! make harness-live-llm        # Makefile target — only this file
+//! cargo test -p astra-runtime --features live-provider-tests --test live_token_usage_e2e -- --ignored --nocapture
 //! ```
 //!
 //! Missing `.models.yaml`, no matching provider, or a non-2xx response on a
@@ -39,35 +39,15 @@
 //! than a hard failure, so a broken API key in one model doesn't mask real
 //! regressions in another.
 
+// Paid provider code is compiled only for the explicit real-provider harness.
+#![cfg(feature = "live-provider-tests")]
+
 use std::time::Duration;
 
 use astra_runtime::turn::bedrock::eventstream::FrameDecoder;
 use astra_runtime::turn::token_usage::{TokenUsage, UsageDialect, extract_usage};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-
-// ── Opt-in env gate ──────────────────────────────────────────────────────────
-
-/// Live tests cost money + time and depend on external provider availability.
-/// Even though `#[ignore]` already keeps them out of normal `cargo test`, the
-/// `make test-online` DB sweep runs `cargo test -- --ignored` which would pull
-/// them in. Guard with a dedicated env var so the only way they execute is:
-///
-///   - `make test-live-llm` (sets the var for you), OR
-///   - `ASTRA_LIVE_LLM=1 cargo test ... --ignored`
-///
-/// Returns `true` when the suite should SKIP (var not set). Prints a hint
-/// so operators know the test is intentionally bypassed.
-fn skip_if_not_opted_in(test_name: &str) -> bool {
-    if std::env::var("ASTRA_LIVE_LLM").ok().as_deref() == Some("1") {
-        return false;
-    }
-    eprintln!(
-        "SKIP [{test_name}]: live-LLM suite gated behind ASTRA_LIVE_LLM=1 — \
-         run `make test-live-llm` to execute"
-    );
-    true
-}
 
 // ── Model enumeration ────────────────────────────────────────────────────────
 
@@ -455,11 +435,8 @@ fn assert_anthropic_disjoint_identity(raw_usage: &Value, u: &TokenUsage, tag: &s
 /// buckets, the displayed `↑`/`cache%` on every turn with that provider
 /// would be wrong, and this test would catch it.
 #[tokio::test]
-#[ignore = "hits real provider APIs; run with `make test-live-llm` or --ignored"]
+#[ignore = "hits real provider APIs; run with `make harness-live-llm` or --ignored"]
 async fn per_provider_token_usage_invariants() {
-    if skip_if_not_opted_in("per_provider_token_usage_invariants") {
-        return;
-    }
     let models = load_models_yaml();
     if models.is_empty() {
         eprintln!("SKIP: no usable models in .models.yaml");
@@ -520,11 +497,8 @@ async fn per_provider_token_usage_invariants() {
 /// Bedrock-specific regression: repeating the SAME long prompt must not make
 /// `cached_input_tokens` decrease. Uses the first Bedrock model in the yaml.
 #[tokio::test]
-#[ignore = "hits real Bedrock API; run with `make test-live-llm` or --ignored"]
+#[ignore = "hits real Bedrock API; run with `make harness-live-llm` or --ignored"]
 async fn bedrock_cache_read_does_not_regress_on_repeat() {
-    if skip_if_not_opted_in("bedrock_cache_read_does_not_regress_on_repeat") {
-        return;
-    }
     let models = load_models_yaml();
     let bedrock = models_for_provider(&models, "bedrock");
     let Some(model) = bedrock.first() else {
@@ -602,11 +576,8 @@ async fn bedrock_cache_read_does_not_regress_on_repeat() {
 /// have caught the `tokens:0 (↑0 ↓0)` bug where the loop broke on
 /// `is_finished()` once messageStop fired.
 #[tokio::test]
-#[ignore = "hits real Bedrock converse-stream; run with `make test-live-llm` or --ignored"]
+#[ignore = "hits real Bedrock converse-stream; run with `make harness-live-llm` or --ignored"]
 async fn bedrock_converse_stream_yields_metadata_after_message_stop() {
-    if skip_if_not_opted_in("bedrock_converse_stream_yields_metadata_after_message_stop") {
-        return;
-    }
     let models = load_models_yaml();
     let bedrock = models_for_provider(&models, "bedrock");
     let Some(model) = bedrock.first() else {

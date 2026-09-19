@@ -60,23 +60,8 @@ pub(crate) fn build_turn_intent_judge_context(
     // authority. Tool/file output is untrusted transcript content and can
     // contain a forged `<skill-loaded>` marker. The ledger is populated only
     // after a resolved skill succeeds (and, when present, verifies).
-    let mut trusted_invocations = invoked_skills.values().collect::<Vec<_>>();
-    trusted_invocations.sort_by(|left, right| {
-        right
-            .invoked_at_turn
-            .cmp(&left.invoked_at_turn)
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    let loaded_workflow_execution_topology = trusted_invocations
-        .iter()
-        .filter_map(|skill| skill.execution_topology)
-        .find(|topology| *topology == astra_services::WorkExecutionTopology::ParallelSubruns)
-        .or_else(|| {
-            invoked_skills
-                .values()
-                .filter_map(|skill| skill.execution_topology)
-                .next()
-        });
+    let loaded_workflow_execution_topology =
+        trusted_loaded_workflow_execution_topology(invoked_skills);
     TurnIntentJudgeContext {
         message: message.to_string(),
         turn_count,
@@ -86,6 +71,34 @@ pub(crate) fn build_turn_intent_judge_context(
         prior_assistant_message,
         loaded_workflow_execution_topology,
     }
+}
+
+/// Return the topology declared by the trusted invoked-skill ledger.
+///
+/// This is shared by semantic context construction and the executable Work
+/// carrier gate. Keeping one projection prevents a judge failure from making
+/// the context believe a workflow is trusted while the side-effect boundary
+/// silently forgets it.
+pub(crate) fn trusted_loaded_workflow_execution_topology(
+    invoked_skills: &std::collections::HashMap<String, crate::turn::skill_tool::InvokedSkill>,
+) -> Option<astra_services::WorkExecutionTopology> {
+    let mut trusted_invocations = invoked_skills.values().collect::<Vec<_>>();
+    trusted_invocations.sort_by(|left, right| {
+        right
+            .invoked_at_turn
+            .cmp(&left.invoked_at_turn)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    trusted_invocations
+        .iter()
+        .filter_map(|skill| skill.execution_topology)
+        .find(|topology| *topology == astra_services::WorkExecutionTopology::ParallelSubruns)
+        .or_else(|| {
+            invoked_skills
+                .values()
+                .filter_map(|skill| skill.execution_topology)
+                .next()
+        })
 }
 
 /// Judge the user's turn using the supplied LLM judge, falling back to the
@@ -132,6 +145,23 @@ pub(crate) async fn judge_turn_intent_with_llm(
             // parser). Rejections are the model refusing to answer and are
             // expected to be rare but non-fatal.
             match &error {
+                TurnIntentJudgeError::Uncertain { diagnostics } => tracing::info!(
+                    target: "astra::turn_intent",
+                    operation = "turn_intent.judge",
+                    status = "uncertain",
+                    duration_ms,
+                    diagnostics = ?diagnostics,
+                    "turn intent is semantically unresolved; no explicit intent granted"
+                ),
+                TurnIntentJudgeError::Conflicting { fields, detail } => tracing::warn!(
+                    target: "astra::turn_intent",
+                    operation = "turn_intent.judge",
+                    status = "conflicting",
+                    duration_ms,
+                    fields = ?fields,
+                    detail = %detail,
+                    "turn intent contains conflicting semantic decisions"
+                ),
                 TurnIntentJudgeError::Inference(detail) => tracing::warn!(
                     target: "astra::turn_intent",
                     operation = "turn_intent.judge",
@@ -180,6 +210,18 @@ pub(crate) async fn judge_turn_intent_with_llm(
                     has_prior_assistant_turn = ctx.has_prior_assistant_turn,
                     detail = %detail,
                     "turn intent contains an unsupported execution-carrier combination"
+                ),
+                TurnIntentJudgeError::TrustedWorkflowTopologyConflict(detail) => tracing::error!(
+                    target: "astra::turn_intent",
+                    operation = "turn_intent.judge",
+                    source = "trusted_workflow",
+                    status = "unsupported",
+                    error_kind = "trusted_workflow_topology_conflict",
+                    duration_ms,
+                    turn_count = ctx.turn_count,
+                    has_prior_assistant_turn = ctx.has_prior_assistant_turn,
+                    detail = %detail,
+                    "trusted workflow topology has no supported durable Work carrier"
                 ),
             }
             None

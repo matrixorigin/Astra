@@ -30,6 +30,74 @@ Introspect reports system facts. Reflect reasons over those facts.
 
 Introspection must be factual, structured, and bounded. Reflection may synthesize strategy, uncertainty, and next actions, but should not mutate state by itself.
 
+Internal judgment usage is a physical-attempt fact. Session reflection reports
+provider, offering, model, operation, attempt count, and known input/output tokens from
+the authenticated inference ledger. An attempt without complete usage remains
+visible with incomplete token coverage; it is never a zero-token call. Explain
+uses the same ledger at turn scope. Classification confidence and reflection's
+inferred confidence are distinct; neither proves that a direction was applied
+or that Work was delivered.
+The session view covers the supported judgment operations (request admission,
+skill routing, memory relevance/feedback, verification, and completion-proxy
+turn intent), not every auxiliary model call. Routine hint/summary projections
+bound group detail and report how many groups were omitted.
+
+Runtime introspection also exposes typed `judgment_usage` in its snapshot and
+session/overview/recent/trace reports, using the same owner/session-scoped
+service ledger projection. These are individual physical attempts with actual
+provider, offering, model and operation identities, provider usage status and
+nullable input/cache/output buckets. They are not invocation totals, primary
+model usage, a judgment result, or permission to act. Their scope is supported
+judgment operations in the session at ledger-read time, independently of the
+live runtime snapshot's earlier cutoff and the requested recent/turn horizon.
+
+The optional read has a two-second deadline and a 128-attempt capture cap.
+Capture overflow retains the bounded physical attempts with `capture_truncated`
+coverage. Captured attempt counts and token sums remain lower bounds; omitted
+capture rows have an unknown count, distinct from exact display-omission counts.
+Even fully reported captured attempts cannot establish complete session totals.
+No pool, timeout, query failure, unavailable
+capture, and an excluded durable source are typed coverage states and do not
+fail introspection. `live_only` and `local_only` skip this durable read.
+Missing token buckets stay unknown, including unreported cache inputs; text
+reports known input subtotals as incomplete.
+Aggregate known input/output lower bounds and independent completeness flags
+cover all captured attempts before display truncation, including omitted detail.
+The same full capture is grouped by provider/offering/model/operation, with
+physical attempt counts, known input/output subtotals and independent
+completeness flags. Group detail uses the same depth limits and reports
+`omitted_groups`; no displayed group's totals are computed from the truncated
+attempt list. Mixed providers therefore never become a claimed Jev-only total.
+Unavailable ledger totals remain null; missing usage contributes no known tokens
+and marks the corresponding total incomplete. Hint/summary/diagnostic/forensic
+retain at most 2/8/16/32 attempts with explicit omitted counts. Identity display
+fields are capped at 128 characters and truncation is reported; these display
+identities are never execution references. Other facets do not load this data.
+
+Semantic judgment results are separate from physical usage. The shared
+owner/session-scoped C3 projection exposes captured request classifications,
+closed abstention/conflict/invalid-response reasons and explicit preparation or
+execution unavailability. Initial classification and clarification remain
+separate stages; subsequent planning failure does not overwrite their results.
+Normalized answer values retain their provenance; discrete values are category
+encodings, not calibrated confidence. Invocation correlation is unknown unless
+an authoritative invocation reference is available. Consumers must not infer a
+provider, token count, or physical call count from semantic observations.
+
+The projection bounds candidate trace rows as well as displayed observations.
+Exact duplicates collapse; conflicting observation identities are excluded and
+reported as a coverage gap. Even an empty successful query describes captured
+observations only: trace buffering, ingestion and retention can lose events.
+Unavailable sources, source-policy exclusion, capture truncation and display
+omission remain distinct. A valid classification does not prove model adoption
+or improved task outcomes. Missing observations do not prove inactivity. The
+bounded recent trace window is not a complete session-wide judgment count.
+
+Explain presents these semantic facts as fixed-label preparation milestones.
+Their zero-length intervals mark observation instants, not inference latency;
+measured provider duration and usage retain their existing owners. Labels are
+derived from the typed facts and are never parsed back into semantic state.
+
 ## Goals
 
 - Give the agent accurate self-awareness without exposing unsafe internals.
@@ -135,6 +203,36 @@ retained observations and actions must not contain dangling evidence references.
 Explicit `diagnostic` and `forensic` requests retain deeper evidence and graph
 inspection. This is progressive disclosure, not a usage quota or tool disablement.
 Server-backed and local-journal reflection share the same report projection.
+
+CLI reflection also projects typed semantic judgment traces from an explicitly
+owner-local journal window through the shared strict decoder/projector. The
+scope is `local_journal_at_read`, not server history or the requested time
+horizon. Reads retain at most 512 journal records and read at most 256 KiB;
+boundary records may be conservatively omitted. Truncation, malformed records,
+and session/turn mismatches remain coverage gaps. Missing or unreadable journals
+have unavailable counts, not known zero judgments. Even an empty existing
+journal cannot establish that no judgments occurred upstream.
+
+`local_only` CLI reflection bypasses cloud restoration entirely. CLI reflection
+and introspection can read physical judgment usage from the latest owner-local
+typed Explain artifact, bounded to 4 MiB with a 16 KiB index. The reader checks
+handle, checksum, size, schema and session/run/turn identity, then uses the
+canonical graph's auxiliary-attempt projection and shared operation filter.
+The scope is `local_captured_run_turn`, not session-ledger totals or necessarily
+the current turn. Historical capture remains incomplete; known token sums are
+lower bounds and unknown cache buckets stay unknown. Missing, invalid or
+unavailable captures never fall back to an older artifact or generic LLM-round
+counters. Local semantic journal coverage and captured-run usage are independent
+sources. Source-excluded and unrelated facets do not read these local artifacts.
+Repeated physical attempts are counted once. Conflicting attribution or known
+token buckets, or conflicting turn/usage facts, make captured usage unavailable;
+a higher usage-status rank cannot override contradictory evidence. Explain's
+text, TUI, SDK/Web and HTML views share this rule. A conflicting incoming turn
+fact remains a coverage conflict even when it is discarded and the retained
+node has no usage; consumers must show unavailable totals rather than hide the
+usage section. Conflicts are neither zero usage nor producer truncation.
+Lightweight reflection retains scoped usage in typed
+fields without replacing execution diagnoses in the summary.
 
 Reflection may produce:
 

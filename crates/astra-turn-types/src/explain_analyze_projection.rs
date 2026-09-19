@@ -39,6 +39,7 @@ pub struct ExplainAnalyzeProjectedNodeV1 {
     pub outcome: Option<ExplainAnalyzeOutcomeV1>,
     pub usage: Option<ExplainAnalyzeTokenUsageV1>,
     pub context: Option<ExplainAnalyzeContextMetricsV1>,
+    pub auxiliary_usage: Option<Box<crate::ExplainAnalyzeAuxiliaryUsageV1>>,
     pub coverage_gaps: Vec<crate::ExplainAnalyzeCoverageGapV1>,
     pub start_observed: bool,
     pub terminal_observed: bool,
@@ -239,6 +240,8 @@ pub struct ExplainAnalyzeGraphV1 {
     node_indices: HashMap<String, usize>,
     seen_events: HashMap<String, SeenEvent>,
     conflicted_node_ids: BTreeSet<String>,
+    // Retain conflict provenance even when the incoming usage fact is discarded.
+    auxiliary_capture_conflicted: bool,
     duplicate_event_count: usize,
     diagnostics: ExplainAnalyzeProjectionDiagnosticsV1,
     root_indices: BTreeSet<usize>,
@@ -251,6 +254,140 @@ pub struct ExplainAnalyzeGraphV1 {
 }
 
 impl ExplainAnalyzeGraphV1 {
+    /// Captured terminal usage only. Missing snapshots are not an empty ledger.
+    pub fn auxiliary_usage_snapshot(&self) -> crate::ExplainAnalyzeAuxiliaryUsageV1 {
+        let (attempts, conflicts) = self.reconcile_auxiliary_attempts();
+        if conflicts > 0 || self.auxiliary_capture_conflicted() {
+            // The wire has no conflict-coverage field. Do not turn rejected
+            // evidence into either zero usage or producer truncation.
+            return crate::ExplainAnalyzeAuxiliaryUsageV1 {
+                available: false,
+                truncated: false,
+                attempts: Vec::new(),
+            };
+        }
+        let available = self.nodes.iter().any(|node| {
+            node.terminal_observed
+                && !node.conflicted
+                && node
+                    .auxiliary_usage
+                    .as_ref()
+                    .is_some_and(|usage| usage.available)
+        });
+        crate::ExplainAnalyzeAuxiliaryUsageV1 {
+            available,
+            truncated: available && self.auxiliary_usage_truncated(),
+            attempts: attempts.into_iter().cloned().collect(),
+        }
+    }
+
+    /// Deduplicate physical attempts across repeated turn segments.
+    pub fn auxiliary_attempts(&self) -> Vec<&crate::ExplainAnalyzeAuxiliaryAttemptV1> {
+        self.reconcile_auxiliary_attempts().0
+    }
+
+    /// Conflicting physical identities/measurements, not omitted capture rows.
+    pub fn auxiliary_usage_conflict_count(&self) -> usize {
+        self.reconcile_auxiliary_attempts().1
+    }
+
+    /// A conflicted Turn cannot establish capture coverage, even if its
+    /// retained version lacks usage. This is not an attempt-identity count.
+    pub fn auxiliary_capture_conflicted(&self) -> bool {
+        self.auxiliary_capture_conflicted
+            || self.nodes.iter().any(|node| {
+                node.conflicted
+                    && (node.kind == ExplainAnalyzeNodeKindV1::Turn
+                        || node.auxiliary_usage.is_some())
+            })
+    }
+
+    fn reconcile_auxiliary_attempts(
+        &self,
+    ) -> (Vec<&crate::ExplainAnalyzeAuxiliaryAttemptV1>, usize) {
+        use crate::{
+            ExplainAnalyzeAuxiliaryAttemptV1 as Attempt,
+            ExplainAnalyzeAuxiliaryUsageStatusV1 as Status,
+        };
+        let buckets = |attempt: &Attempt| {
+            attempt.usage.as_ref().map_or([None; 4], |usage| {
+                [
+                    usage.fresh_input_tokens,
+                    usage.output_tokens,
+                    usage.cache_read_tokens,
+                    usage.cache_creation_tokens,
+                ]
+            })
+        };
+        fn identity(attempt: &Attempt) -> [&str; 5] {
+            // Compare below without allocating or minting a replacement fact.
+            [
+                attempt.provider.as_str(),
+                attempt.offering_id.as_str(),
+                attempt.model_name.as_str(),
+                attempt.purpose.as_str(),
+                attempt.operation_id.as_str(),
+            ]
+        }
+        let rank = |status| match status {
+            Status::Unavailable => 0,
+            Status::ProviderPartial => 1,
+            Status::ProviderExact => 2,
+        };
+        // Consensus buckets are comparison evidence only, never merged into
+        // the selected record. Remember weaker observations even when a later
+        // exact record omits that bucket, so contradictions cannot disappear.
+        let mut attempts = BTreeMap::new();
+        for attempt in self
+            .nodes
+            .iter()
+            .filter(|n| n.terminal_observed && !n.conflicted)
+            .filter_map(|n| n.auxiliary_usage.as_ref())
+            .flat_map(|u| &u.attempts)
+        {
+            let (selected, known, conflicted) =
+                attempts
+                    .entry(&attempt.attempt_id)
+                    .or_insert((attempt, buckets(attempt), false));
+            *conflicted |= identity(selected) != identity(attempt);
+            for (previous, current) in known.iter_mut().zip(buckets(attempt)) {
+                if let Some(current) = current {
+                    if let Some(previous) = previous {
+                        *conflicted |= *previous != current;
+                    } else {
+                        *previous = Some(current);
+                    }
+                }
+            }
+            // Stable tie-break between compatible original records. Never
+            // add buckets or promote a partial-only value to exact evidence.
+            let key = |a: &Attempt| (rank(a.usage_status), a.usage.is_some(), buckets(a));
+            if key(attempt) > key(selected) {
+                *selected = attempt;
+            }
+        }
+        let conflicts = attempts
+            .values()
+            .filter(|(_, _, conflict)| *conflict)
+            .count();
+        let retained = attempts
+            .into_values()
+            .filter_map(|(attempt, _, conflict)| (!conflict).then_some(attempt))
+            .collect();
+        (retained, conflicts)
+    }
+    pub fn auxiliary_usage_unavailable(&self) -> bool {
+        self.nodes
+            .iter()
+            .any(|n| n.auxiliary_usage.as_ref().is_some_and(|u| !u.available))
+    }
+
+    pub fn auxiliary_usage_truncated(&self) -> bool {
+        self.nodes
+            .iter()
+            .any(|n| n.auxiliary_usage.as_ref().is_some_and(|u| u.truncated))
+    }
+
     pub fn nodes(&self) -> &[ExplainAnalyzeProjectedNodeV1] {
         &self.nodes
     }
@@ -331,6 +468,8 @@ impl ExplainAnalyzeGraphV1 {
                 };
             }
 
+            self.auxiliary_capture_conflicted |=
+                event.kind == ExplainAnalyzeNodeKindV1::Turn || event.auxiliary_usage.is_some();
             let mut node_ids = BTreeSet::new();
             node_ids.insert(seen.node_id);
             node_ids.insert(event.node_id.clone());
@@ -364,6 +503,8 @@ impl ExplainAnalyzeGraphV1 {
             conflict |= self.merge_event(node_index, &event);
         }
         if conflict {
+            self.auxiliary_capture_conflicted |=
+                event.kind == ExplainAnalyzeNodeKindV1::Turn || event.auxiliary_usage.is_some();
             self.mark_conflicted_node_id(&event.node_id);
         }
 
@@ -515,6 +656,7 @@ impl ExplainAnalyzeGraphV1 {
             outcome: event.outcome,
             usage: event.usage.clone(),
             context: event.context.clone(),
+            auxiliary_usage: event.auxiliary_usage.clone(),
             coverage_gaps: event.coverage_gaps.clone(),
             start_observed: event.transition == ExplainAnalyzeTransitionV1::Started,
             terminal_observed: terminal,
@@ -658,6 +800,7 @@ impl ExplainAnalyzeGraphV1 {
                     || node.duration_ms != event.duration_ms
                     || node.outcome != event.outcome
                     || node.usage != event.usage
+                    || node.auxiliary_usage != event.auxiliary_usage
                     || node.context != event.context
                     || node.coverage_gaps != event.coverage_gaps
                 {
@@ -676,6 +819,7 @@ impl ExplainAnalyzeGraphV1 {
                 node.outcome = event.outcome;
                 node.usage = event.usage.clone();
                 node.context = event.context.clone();
+                node.auxiliary_usage = event.auxiliary_usage.clone();
                 node.coverage_gaps = event.coverage_gaps.clone();
                 node.terminal_observed = true;
             }
@@ -892,6 +1036,7 @@ mod tests {
         elapsed_ms: u64,
     ) -> ExplainAnalyzeEventV1 {
         ExplainAnalyzeEventV1 {
+            auxiliary_usage: None,
             schema_version: crate::EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: format!("{node_id}/started"),
             run_id: "run-1".to_owned(),
@@ -930,6 +1075,300 @@ mod tests {
         event.duration_ms = Some(end_elapsed_ms - start_elapsed_ms);
         event.outcome = Some(ExplainAnalyzeOutcomeV1::Succeeded);
         event
+    }
+
+    #[test]
+    fn auxiliary_snapshots_upgrade_status_without_double_counting_attempts() {
+        use crate::{
+            ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
+            ExplainAnalyzeAuxiliaryUsageV1, ExplainAnalyzeTokenUsageV1, ExplainAnalyzeUsageBasisV1,
+        };
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        for (index, status) in [
+            ExplainAnalyzeAuxiliaryUsageStatusV1::Unavailable,
+            ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderPartial,
+            ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut event = finished(
+                started(
+                    &format!("segment-{index}"),
+                    ExplainAnalyzeNodeKindV1::Turn,
+                    None,
+                    "clock",
+                    0,
+                ),
+                0,
+                10,
+            );
+            event.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
+                available: true,
+                truncated: false,
+                attempts: vec![ExplainAnalyzeAuxiliaryAttemptV1 {
+                    attempt_id: "aux-1".into(),
+                    provider: "typesafe".into(),
+                    offering_id: "jev-1".into(),
+                    model_name: "jev1".into(),
+                    purpose: "verification_judge".into(),
+                    operation_id: "verification_judge".into(),
+                    usage_status: status,
+                    usage: (status == ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact)
+                        .then_some(ExplainAnalyzeTokenUsageV1 {
+                            basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
+                            fresh_input_tokens: Some(100),
+                            output_tokens: Some(0),
+                            cache_read_tokens: None,
+                            cache_creation_tokens: None,
+                        }),
+                }],
+            }));
+            graph.apply(event);
+            assert_eq!(graph.auxiliary_attempts().len(), 1);
+            assert_eq!(graph.auxiliary_attempts()[0].usage_status, status);
+            let snapshot = graph.auxiliary_usage_snapshot();
+            assert!(snapshot.available);
+            assert_eq!(snapshot.attempts.len(), 1);
+            assert_eq!(snapshot.attempts[0].usage_status, status);
+        }
+        assert_eq!(
+            graph.auxiliary_attempts()[0]
+                .usage
+                .as_ref()
+                .unwrap()
+                .fresh_input_tokens,
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn auxiliary_conflicts_are_sticky_and_permutation_independent() {
+        use crate::{
+            ExplainAnalyzeAuxiliaryAttemptV1 as Attempt,
+            ExplainAnalyzeAuxiliaryUsageStatusV1 as Status, ExplainAnalyzeAuxiliaryUsageV1,
+            ExplainAnalyzeUsageBasisV1 as Basis,
+        };
+        fn attempt(status: Status, counts: [Option<u64>; 4]) -> Attempt {
+            Attempt {
+                attempt_id: "physical-1".into(),
+                provider: "provider".into(),
+                offering_id: "offering".into(),
+                model_name: "model".into(),
+                purpose: "verification_judge".into(),
+                operation_id: "request_judgment".into(),
+                usage_status: status,
+                usage: (status != Status::Unavailable).then_some(ExplainAnalyzeTokenUsageV1 {
+                    basis: if status == Status::ProviderExact {
+                        Basis::ProviderExact
+                    } else {
+                        Basis::ProviderPartial
+                    },
+                    fresh_input_tokens: counts[0],
+                    output_tokens: counts[1],
+                    cache_read_tokens: counts[2],
+                    cache_creation_tokens: counts[3],
+                }),
+            }
+        }
+        fn graph(records: &[Attempt], order: [usize; 3]) -> ExplainAnalyzeGraphV1 {
+            let mut graph = ExplainAnalyzeGraphV1::default();
+            for index in order {
+                let mut event = finished(
+                    started(
+                        &format!("segment-{index}"),
+                        ExplainAnalyzeNodeKindV1::Turn,
+                        None,
+                        "clock",
+                        0,
+                    ),
+                    0,
+                    10,
+                );
+                event.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
+                    available: true,
+                    truncated: false,
+                    attempts: vec![records[index].clone()],
+                }));
+                assert!(event.is_valid());
+                graph.apply(event.clone());
+                graph.apply(event); // Replay cannot double-count or revive conflicts.
+            }
+            graph
+        }
+        let orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        let unknown = attempt(Status::Unavailable, [None; 4]);
+        let partial = attempt(Status::ProviderPartial, [Some(10), None, None, None]);
+        let exact = attempt(Status::ProviderExact, [Some(10), Some(0), None, None]);
+        for order in orders {
+            let graph = graph(&[unknown.clone(), partial.clone(), exact.clone()], order);
+            assert_eq!(graph.auxiliary_attempts(), vec![&exact]);
+            assert_eq!(graph.auxiliary_usage_conflict_count(), 0);
+            let snapshot = graph.auxiliary_usage_snapshot();
+            assert!(snapshot.available && !snapshot.truncated);
+            assert_eq!(
+                snapshot.attempts[0].usage.as_ref().unwrap().output_tokens,
+                Some(0)
+            );
+            assert_eq!(
+                snapshot.attempts[0]
+                    .usage
+                    .as_ref()
+                    .unwrap()
+                    .cache_read_tokens,
+                None
+            );
+        }
+        // A same-rank complementary record is not fused with another fact.
+        let complementary = attempt(Status::ProviderPartial, [None, Some(0), None, None]);
+        for order in orders {
+            let graph = graph(
+                &[partial.clone(), complementary.clone(), unknown.clone()],
+                order,
+            );
+            assert_eq!(graph.auxiliary_attempts(), vec![&partial]);
+        }
+        let mut conflicts = Vec::new();
+        for field in 0..5 {
+            let mut other = exact.clone();
+            let identity = match field {
+                0 => &mut other.provider,
+                1 => &mut other.offering_id,
+                2 => &mut other.model_name,
+                3 => &mut other.purpose,
+                _ => &mut other.operation_id,
+            };
+            *identity = "other".into();
+            conflicts.push([exact.clone(), other, exact.clone()]);
+        }
+        for bucket in 0..4 {
+            let mut ten = [None; 4];
+            ten[bucket] = Some(10);
+            let mut twenty = [None; 4];
+            twenty[bucket] = Some(20);
+            for (left, right) in [
+                (Status::ProviderPartial, Status::ProviderPartial),
+                (Status::ProviderExact, Status::ProviderExact),
+                (Status::ProviderPartial, Status::ProviderExact),
+            ] {
+                conflicts.push([attempt(left, ten), attempt(right, twenty), unknown.clone()]);
+            }
+            // The higher-ranked record cannot erase weaker known evidence.
+            let mut omitted = [None; 4];
+            omitted[(bucket + 1) % 4] = Some(0);
+            conflicts.push([
+                attempt(Status::ProviderPartial, ten),
+                attempt(Status::ProviderExact, omitted),
+                attempt(Status::ProviderPartial, twenty),
+            ]);
+        }
+        for records in conflicts {
+            for order in orders {
+                let graph = graph(&records, order);
+                assert!(graph.auxiliary_attempts().is_empty());
+                assert_eq!(graph.auxiliary_usage_conflict_count(), 1);
+                let snapshot = graph.auxiliary_usage_snapshot();
+                assert!(!snapshot.available && !snapshot.truncated);
+                assert!(snapshot.attempts.is_empty());
+                assert!(snapshot.is_valid());
+            }
+        }
+        let mut retry = exact.clone();
+        retry.attempt_id = "physical-2".into();
+        let healthy = graph(&[exact.clone(), retry.clone(), exact.clone()], [0, 1, 2]);
+        assert_eq!(healthy.auxiliary_attempts().len(), 2);
+        let mut corrupt = exact.clone();
+        corrupt.provider = "other".into();
+        let mixed = graph(&[exact, corrupt, retry], [0, 1, 2]);
+        assert_eq!(mixed.auxiliary_attempts().len(), 1);
+        assert!(!mixed.auxiliary_usage_snapshot().available);
+        assert!(!mixed.auxiliary_usage_truncated());
+    }
+
+    #[test]
+    fn conflicted_turn_usage_cannot_be_hidden_by_an_independent_snapshot() {
+        use crate::{
+            ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
+            ExplainAnalyzeAuxiliaryUsageV1, ExplainAnalyzeUsageBasisV1,
+        };
+        let make = |node: &str, count| {
+            let mut event = finished(
+                started(node, ExplainAnalyzeNodeKindV1::Turn, None, "clock", 0),
+                0,
+                10,
+            );
+            event.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
+                available: true,
+                truncated: false,
+                attempts: vec![ExplainAnalyzeAuxiliaryAttemptV1 {
+                    attempt_id: "same-attempt".into(),
+                    provider: "provider".into(),
+                    offering_id: "offering".into(),
+                    model_name: "model".into(),
+                    purpose: "verification_judge".into(),
+                    operation_id: "request_judgment".into(),
+                    usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+                    usage: Some(ExplainAnalyzeTokenUsageV1 {
+                        basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
+                        fresh_input_tokens: Some(count),
+                        output_tokens: Some(0),
+                        cache_read_tokens: None,
+                        cache_creation_tokens: None,
+                    }),
+                }],
+            }));
+            event
+        };
+        for retained_has_usage in [false, true] {
+            for same_event_id in [false, true] {
+                let mut original = make("a", 10);
+                if !retained_has_usage {
+                    original.auxiliary_usage = None;
+                }
+                let mut conflict = make("a", 30);
+                if !same_event_id {
+                    conflict.event_id = "another-terminal".into();
+                }
+                let records = [original, conflict, make("b", 20)];
+                for order in [
+                    [0, 1, 2],
+                    [0, 2, 1],
+                    [1, 0, 2],
+                    [1, 2, 0],
+                    [2, 0, 1],
+                    [2, 1, 0],
+                ] {
+                    let mut graph = ExplainAnalyzeGraphV1::default();
+                    for index in order {
+                        graph.apply(records[index].clone());
+                        graph.apply(records[index].clone());
+                    }
+                    assert!(graph.auxiliary_capture_conflicted());
+                    assert_eq!(graph.auxiliary_usage_conflict_count(), 0);
+                    assert!(!graph.auxiliary_usage_truncated());
+                    let snapshot = graph.auxiliary_usage_snapshot();
+                    assert!(
+                        !snapshot.available && !snapshot.truncated && snapshot.attempts.is_empty()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn absent_auxiliary_capture_is_not_zero_usage() {
+        assert!(
+            !ExplainAnalyzeGraphV1::default()
+                .auxiliary_usage_snapshot()
+                .available
+        );
     }
 
     fn is_diagnostic(
@@ -1388,14 +1827,15 @@ mod tests {
         );
         event.context = Some(ExplainAnalyzeContextMetricsV1 {
             budget: None,
-            assembly: Some(ExplainAnalyzeContextAssemblyV1 {
+            assembly: Some(Box::new(ExplainAnalyzeContextAssemblyV1 {
+                edge_memory_selection: Vec::new(),
                 basis: ExplainAnalyzeContextAssemblyBasisV1::RuntimeTextEstimate,
                 sources: vec![ExplainAnalyzeContextSourceV1 {
                     kind: ExplainAnalyzeContextSourceKindV1::Memory,
                     section_count: 2,
                     estimated_tokens: 55,
                 }],
-            }),
+            })),
         });
         let mut graph = ExplainAnalyzeGraphV1::default();
         graph.apply(event);

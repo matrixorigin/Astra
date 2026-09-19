@@ -1123,11 +1123,10 @@ pub async fn run_product_matrix_full_journey(
     assert_eq!(row_get_opt_i64(llm_round, "token_input"), Some(5));
     assert_eq!(row_get_opt_i64(llm_round, "token_output"), Some(15));
     assert_eq!(row_get_opt_i64(llm_round, "token_total"), Some(20));
-    assert_eq!(
+    assert!(
         row_get_opt_str(llm_round, "llm_model_used")
             .as_deref()
             .is_some_and(|model| model.starts_with("mock-")),
-        true,
         "server-owned stream should persist the seeded mock model"
     );
     assert!(

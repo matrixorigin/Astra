@@ -263,6 +263,126 @@ async fn model_access_matches_run_eligibility_across_catalog_pages() {
 
 struct HeaderAuthService;
 
+#[tokio::test]
+async fn catalog_purpose_is_applied_before_pagination_and_shared_by_model_access() {
+    use astra_services::{ModelAccessKind, ModelExecutionPlacement};
+    let catalog = [
+        ("chat-a", "deepseek", true),
+        ("chat-b", "openai", true),
+        ("inactive", "openai", false),
+        ("judgment", "typesafe", true),
+    ]
+    .into_iter()
+    .map(|(id, provider, is_active)| ModelListItem {
+        offering_id: id.into(),
+        access_id: "cloud-byok".into(),
+        access_kind: ModelAccessKind::CloudByok,
+        access_label: "Cloud BYOK".into(),
+        execution_placement: ModelExecutionPlacement::Server,
+        name: id.into(),
+        provider: provider.into(),
+        description: None,
+        is_active,
+        context_window: 128_000,
+        max_completion_tokens: None,
+        architecture: None,
+        thinking_capability: None,
+    })
+    .collect::<Vec<_>>();
+    let service = TestModelService {
+        catalog,
+        ..Default::default()
+    };
+    for (purpose, expected) in [
+        ("chat", vec!["chat-a", "chat-b"]),
+        ("typed_judgment", vec!["chat-a", "chat-b", "judgment"]),
+    ] {
+        let mut shared_revision = None;
+        for (route, field) in [("/models", "items"), ("/model-access", "offerings")] {
+            let mut path = format!("{route}?purpose={purpose}&limit=1");
+            let mut found = Vec::new();
+            loop {
+                let (status, raw) = request(
+                    app(service.clone()),
+                    "GET",
+                    &path,
+                    Some("ordinary-user"),
+                    None,
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{raw}");
+                let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                assert_eq!(body["total"], expected.len());
+                assert_eq!(
+                    shared_revision.get_or_insert(body["catalog_revision"].clone()),
+                    &body["catalog_revision"]
+                );
+                if route == "/model-access" {
+                    assert_eq!(body["accesses"][0]["available_model_count"], expected.len());
+                    if found.is_empty() {
+                        assert_eq!(body["default_offering_id"], "chat-a");
+                    } else {
+                        assert!(body["default_offering_id"].is_null());
+                    }
+                }
+                let page = body[field].as_array().unwrap();
+                assert_eq!(page.len(), 1);
+                found.push(page[0]["offering_id"].as_str().unwrap().to_owned());
+                let cursor = &body["next_cursor"];
+                if cursor.is_null() {
+                    break;
+                }
+                assert!(found.len() < expected.len(), "cursor must terminate");
+                path = format!(
+                    "{route}?purpose={purpose}&limit=1&after_provider={}&after_name={}&after_offering_id={}",
+                    cursor["provider"].as_str().unwrap(),
+                    cursor["model_name"].as_str().unwrap(),
+                    cursor["model_id"].as_str().unwrap()
+                );
+            }
+            assert_eq!(found, expected);
+        }
+    }
+    for route in ["/models", "/model-access"] {
+        let (status, raw) = request(
+            app(service.clone()),
+            "GET",
+            route,
+            Some("ordinary-user"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(body["total"], 2, "unspecified purpose is chat");
+    }
+    let (status, raw) = request(
+        app(service.clone()),
+        "GET",
+        "/models?purpose=all",
+        Some("ordinary-user"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        body["total"], 4,
+        "registry inspection retains inactive and judgment entries"
+    );
+    let (status, raw) = request(
+        app(service),
+        "GET",
+        "/model-access?purpose=all&limit=1",
+        Some("ordinary-user"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(body["error_code"], "model_catalog_purpose_invalid");
+}
+
 #[async_trait]
 impl AuthService for HeaderAuthService {
     async fn register(&self, _: AuthRegisterRequestData) -> Result<AuthUserRecord, HttpError> {

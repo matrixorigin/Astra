@@ -64,6 +64,14 @@ pub struct IntrospectSnapshot {
     /// read-only projection and never becomes execution authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invocation_lifecycle: Option<InvocationLifecycleSnapshot>,
+    /// On-demand session-scoped physical judgment attempts from the service
+    /// inference ledger, independent of the live round snapshot's cutoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judgment_usage: Option<JudgmentUsageSnapshot>,
+    /// Separate C3 semantic facts; never physical attempt counts or adoption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_judgments:
+        Option<astra_services::semantic_judgment_observation::SemanticJudgmentView>,
 
     // ── Task #46: enhanced self-awareness ──
     /// Summary of the most recent LLM rounds (in-memory ring). Available
@@ -105,6 +113,278 @@ pub struct IntrospectSnapshot {
     /// Bridge circuit breaker state — surfaced in stall/full renders.
     #[serde(default)]
     pub circuit_breaker: Option<CircuitBreakerSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgmentUsageCoverage {
+    Available,
+    CaptureTruncated,
+    #[default]
+    NotObserved,
+    NoPool,
+    Timeout,
+    QueryFailed,
+    LedgerUnavailable,
+    LocalCaptureUnavailable,
+    SourceExcluded,
+}
+
+/// Bounded projection of the service ledger, never a judgment or execution
+/// authority. Nullable usage remains nullable, including cache input buckets.
+pub use astra_services::reflect::JudgmentUsageScope;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JudgmentUsageSnapshot {
+    pub scope: JudgmentUsageScope,
+    pub capture_incomplete: bool,
+    pub coverage: JudgmentUsageCoverage,
+    pub observed_attempts: Option<usize>,
+    pub attempts_without_complete_usage: Option<usize>,
+    /// Lower-bound totals across all captured attempts, before display
+    /// truncation. None means ledger coverage is unavailable, not zero usage.
+    pub known_input_tokens: Option<u128>,
+    pub known_output_tokens: Option<u128>,
+    pub input_complete: bool,
+    pub output_complete: bool,
+    pub omitted_attempts: usize,
+    pub truncated_identity_fields: usize,
+    pub attempts: Vec<astra_turn_types::ExplainAnalyzeAuxiliaryAttemptV1>,
+    pub groups: Vec<JudgmentUsageGroup>,
+    pub omitted_groups: usize,
+}
+
+/// Identity-scoped totals across all captured physical attempts, including
+/// retries whose individual detail is omitted from the report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JudgmentUsageGroup {
+    pub provider: String,
+    pub offering_id: String,
+    pub model: String,
+    pub operation: String,
+    pub attempts: usize,
+    pub known_input_tokens: u128,
+    pub known_output_tokens: u128,
+    pub input_complete: bool,
+    pub output_complete: bool,
+}
+
+impl JudgmentUsageSnapshot {
+    pub fn unavailable(coverage: JudgmentUsageCoverage) -> Self {
+        Self {
+            coverage,
+            ..Self::default()
+        }
+    }
+
+    pub fn from_ledger(facts: astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1) -> Self {
+        if !facts.available {
+            return Self::unavailable(JudgmentUsageCoverage::LedgerUnavailable);
+        }
+        let incomplete = facts
+            .attempts
+            .iter()
+            .filter(|attempt| {
+                attempt.usage.as_ref().is_none_or(|usage| {
+                    usage.fresh_input_tokens.is_none()
+                        || usage.cache_read_tokens.is_none()
+                        || usage.cache_creation_tokens.is_none()
+                        || usage.output_tokens.is_none()
+                })
+            })
+            .count();
+        let mut known_input_tokens = 0_u128;
+        let mut known_output_tokens = 0_u128;
+        let mut input_complete = !facts.truncated;
+        let mut output_complete = !facts.truncated;
+        let mut groups = std::collections::BTreeMap::new();
+        for attempt in &facts.attempts {
+            let group = groups
+                .entry((
+                    attempt.provider.clone(),
+                    attempt.offering_id.clone(),
+                    attempt.model_name.clone(),
+                    attempt.operation_id.clone(),
+                ))
+                .or_insert_with(|| JudgmentUsageGroup {
+                    provider: attempt.provider.clone(),
+                    offering_id: attempt.offering_id.clone(),
+                    model: attempt.model_name.clone(),
+                    operation: attempt.operation_id.clone(),
+                    attempts: 0,
+                    known_input_tokens: 0,
+                    known_output_tokens: 0,
+                    input_complete: !facts.truncated,
+                    output_complete: !facts.truncated,
+                });
+            group.attempts += 1;
+            let usage = attempt.usage.as_ref();
+            for value in [
+                usage.and_then(|u| u.fresh_input_tokens),
+                usage.and_then(|u| u.cache_read_tokens),
+                usage.and_then(|u| u.cache_creation_tokens),
+            ] {
+                if let Some(value) = value {
+                    known_input_tokens += u128::from(value);
+                    group.known_input_tokens += u128::from(value);
+                } else {
+                    input_complete = false;
+                    group.input_complete = false;
+                }
+            }
+            if let Some(value) = usage.and_then(|u| u.output_tokens) {
+                known_output_tokens += u128::from(value);
+                group.known_output_tokens += u128::from(value);
+            } else {
+                output_complete = false;
+                group.output_complete = false;
+            }
+        }
+        Self {
+            coverage: if facts.truncated {
+                JudgmentUsageCoverage::CaptureTruncated
+            } else {
+                JudgmentUsageCoverage::Available
+            },
+            observed_attempts: Some(facts.attempts.len()),
+            attempts_without_complete_usage: Some(incomplete),
+            known_input_tokens: Some(known_input_tokens),
+            known_output_tokens: Some(known_output_tokens),
+            input_complete,
+            output_complete,
+            attempts: facts.attempts,
+            groups: groups.into_values().collect(),
+            ..Self::default()
+        }
+        .bounded(ObservationDepth::Forensic)
+    }
+
+    pub fn bounded(&self, depth: ObservationDepth) -> Self {
+        let limit = match depth {
+            ObservationDepth::Hint => 2,
+            ObservationDepth::Summary => 8,
+            ObservationDepth::Diagnostic => 16,
+            ObservationDepth::Forensic => 32,
+        };
+        let mut result = Self {
+            attempts: self.attempts.iter().take(limit).cloned().collect(),
+            groups: self.groups.iter().take(limit).cloned().collect(),
+            omitted_groups: self
+                .omitted_groups
+                .saturating_add(self.groups.len().saturating_sub(limit)),
+            omitted_attempts: self
+                .omitted_attempts
+                .saturating_add(self.attempts.len().saturating_sub(limit)),
+            ..self.clone()
+        };
+        let fields = result
+            .attempts
+            .iter_mut()
+            .flat_map(|attempt| {
+                [
+                    &mut attempt.attempt_id,
+                    &mut attempt.provider,
+                    &mut attempt.offering_id,
+                    &mut attempt.model_name,
+                    &mut attempt.purpose,
+                    &mut attempt.operation_id,
+                ]
+            })
+            .chain(result.groups.iter_mut().flat_map(|group| {
+                [
+                    &mut group.provider,
+                    &mut group.offering_id,
+                    &mut group.model,
+                    &mut group.operation,
+                ]
+            }));
+        for field in fields {
+            if field.chars().nth(128).is_some() {
+                let end = field
+                    .char_indices()
+                    .nth(127)
+                    .map(|(end, _)| end)
+                    .unwrap_or(0);
+                field.truncate(end);
+                field.push('…');
+                result.truncated_identity_fields += 1;
+            }
+        }
+        result
+    }
+
+    pub fn render(&self) -> String {
+        let mut out = format!(
+            "Judgment physical usage: {} coverage={:?} observed_attempts={:?} incomplete_usage_attempts={:?} omitted_attempts={} truncated_identity_fields={}",
+            self.scope.render(),
+            self.coverage,
+            self.observed_attempts,
+            self.attempts_without_complete_usage,
+            self.omitted_attempts,
+            self.truncated_identity_fields,
+        );
+        if self.coverage == JudgmentUsageCoverage::CaptureTruncated {
+            out.push_str(" capture_truncated=true; attempt counts cover captured rows only; additional physical attempts were omitted (count unknown)");
+        }
+        if self.capture_incomplete {
+            out.push_str(" capture_incomplete=true; missing historical attempts unknown; totals are lower bounds, independent of truncation");
+        }
+        let total = |known: Option<u128>, complete: bool| match known {
+            None => "unknown".into(),
+            Some(value) if complete => value.to_string(),
+            Some(value) => format!("at_least_{value} (incomplete)"),
+        };
+        out.push_str(&format!(
+            " total_input={} total_output={} input_complete={} output_complete={} omitted_groups={}",
+            total(self.known_input_tokens, self.input_complete),
+            total(self.known_output_tokens, self.output_complete),
+            self.input_complete,
+            self.output_complete,
+            self.omitted_groups,
+        ));
+        for group in &self.groups {
+            out.push_str(&format!(
+                "\n- group provider={} offering={} model={} operation={} attempts={} input={} output={} input_complete={} output_complete={}",
+                group.provider, group.offering_id, group.model, group.operation, group.attempts,
+                total(Some(group.known_input_tokens), group.input_complete),
+                total(Some(group.known_output_tokens), group.output_complete),
+                group.input_complete, group.output_complete,
+            ));
+        }
+        for attempt in &self.attempts {
+            let usage = attempt.usage.as_ref();
+            let parts = usage.map(|u| {
+                [
+                    u.fresh_input_tokens,
+                    u.cache_read_tokens,
+                    u.cache_creation_tokens,
+                ]
+            });
+            let input = parts.map_or_else(
+                || "unknown".into(),
+                |parts| {
+                    if parts.iter().all(Option::is_none) {
+                        return "unknown".into();
+                    }
+                    let sum: u128 = parts.iter().flatten().map(|v| u128::from(*v)).sum();
+                    if parts.iter().any(Option::is_none) {
+                        format!("at_least_{sum} (incomplete)")
+                    } else {
+                        sum.to_string()
+                    }
+                },
+            );
+            let output = usage
+                .and_then(|u| u.output_tokens)
+                .map_or_else(|| "unknown".into(), |v| v.to_string());
+            out.push_str(&format!(
+                "\n- attempt={} provider={} offering={} model={} operation={} usage={:?} input={} output={}",
+                attempt.attempt_id, attempt.provider, attempt.offering_id, attempt.model_name,
+                attempt.operation_id, attempt.usage_status, input, output,
+            ));
+        }
+        out
+    }
 }
 
 /// Per-round summary surfaced through `introspect(facet=recent)`.
@@ -305,12 +585,73 @@ enum IntrospectTextDepth {
     Hint,
 }
 
-/// Render the normalized introspection request from a runtime snapshot.
-///
-/// CLI/Edge callers may intercept edge-only facets such as `cache` and
-/// `session_memory` before reaching this function. Pure server callers return
-/// an explicit unavailable surface for those facets instead of silently
-/// degrading to the default session view.
+/// Select the same source-scoped semantic trace view for text and JSON.
+fn judgment_source_allowed(source: astra_core::SourcePolicy, local: bool) -> bool {
+    match source {
+        astra_core::SourcePolicy::LiveOnly => false,
+        astra_core::SourcePolicy::LocalOnly => local,
+        astra_core::SourcePolicy::CloudOnly => !local,
+        _ => true,
+    }
+}
+
+fn semantic_judgment_view(
+    snapshot: &IntrospectSnapshot,
+    request: &IntrospectRequest,
+) -> Option<astra_services::semantic_judgment_observation::SemanticJudgmentView> {
+    use astra_services::semantic_judgment_observation::{
+        SemanticJudgmentCoverage, SemanticJudgmentView, semantic_judgment_facet_enabled,
+    };
+    if !semantic_judgment_facet_enabled(request.facet) {
+        return None;
+    }
+    Some(
+        if !judgment_source_allowed(request.source_policy, snapshot.semantic_judgments.as_ref().is_some_and(|view| view.scope == astra_services::semantic_judgment_observation::SemanticJudgmentScope::LocalJournalAtRead)) {
+            SemanticJudgmentView::unavailable(SemanticJudgmentCoverage::SourceExcluded)
+        } else {
+            snapshot
+                .semantic_judgments
+                .clone()
+                .unwrap_or_default()
+                .bounded(request.depth)
+        },
+    )
+}
+
+fn judgment_usage_view(
+    snapshot: &IntrospectSnapshot,
+    request: &IntrospectRequest,
+) -> Option<JudgmentUsageSnapshot> {
+    if !matches!(
+        request.facet,
+        ObservationFacet::Session
+            | ObservationFacet::Overview
+            | ObservationFacet::Recent
+            | ObservationFacet::Trace
+    ) {
+        return None;
+    }
+    Some(
+        if !judgment_source_allowed(
+            request.source_policy,
+            snapshot
+                .judgment_usage
+                .as_ref()
+                .is_some_and(|view| view.scope.is_local()),
+        ) {
+            JudgmentUsageSnapshot::unavailable(JudgmentUsageCoverage::SourceExcluded)
+        } else {
+            snapshot
+                .judgment_usage
+                .clone()
+                .unwrap_or_default()
+                .bounded(request.depth)
+        },
+    )
+}
+
+/// Render a normalized request. Edge-only facets remain explicitly unavailable
+/// when no local artifact provider intercepts them.
 pub fn render_introspect_request(
     snapshot: &IntrospectSnapshot,
     request: &IntrospectRequest,
@@ -348,8 +689,18 @@ pub fn render_introspect_request(
             render_edge_local_unavailable(&live_request)
         }
     };
+    let body = if let Some(usage) = judgment_usage_view(snapshot, request) {
+        format!("{body}\n\n{}", usage.render())
+    } else {
+        body
+    };
     let boundary = "## Observation Boundary\n\
-snapshot_cutoff=before_current_introspect_execution; the selecting round may list `introspect` as requested/in-flight, and calls made after this snapshot are absent. Treat counts and states as snapshot-time observations, not final session totals.";
+snapshot_cutoff=before_current_introspect_execution; the selecting round may list `introspect` as requested/in-flight, and calls made after this snapshot are absent. Judgment usage and semantic traces carry independent source scopes and capture/read cutoffs. Treat counts and states as scoped observations, not final session totals.";
+    let body = if let Some(semantics) = semantic_judgment_view(snapshot, request) {
+        format!("{body}\n\n{}", semantics.render())
+    } else {
+        body
+    };
     if historical_horizon {
         format!(
             "## Introspect Live Projection\nrequested_horizon={} coverage=recent-only; use reflect for persisted causal evidence.\n\n{}\n\n{}",
@@ -1262,6 +1613,393 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    #[test]
+    fn semantic_judgment_detail_has_one_bounded_report_owner() {
+        use astra_services::semantic_judgment_observation::*;
+        use astra_turn_types::*;
+        let observation = SemanticJudgmentObservationV1 {
+            schema_version: 1,
+            correlation: SemanticJudgmentCorrelationV1 {
+                run_id: "run-1".into(),
+                turn: 1,
+                round: 2,
+                owner_generation: None,
+                evaluation_span_id: "eval-1".into(),
+                invocation: SemanticJudgmentInvocationV1::Unavailable,
+            },
+            fact: SemanticJudgmentFactV1 {
+                stage: RequestJudgmentStageV1::Initial,
+                result: RequestJudgmentResultV1::NotDispatched {
+                    reason: SemanticJudgmentPreDispatchReasonV1::NoOffering,
+                },
+            },
+        };
+        let capture = SemanticJudgmentCapture {
+            available: true,
+            capture_incomplete: true,
+            truncated: true,
+            candidates_scanned: 12,
+            duplicate_observations: 0,
+            omitted_observations: 2,
+            observations: (0..10)
+                .map(|i| SemanticJudgmentTraceObservation {
+                    observation_span_id: format!("span-{i}"),
+                    observation: observation.clone(),
+                })
+                .collect(),
+            gaps: vec![
+                SemanticJudgmentCaptureGap::TraceMayBeDropped,
+                SemanticJudgmentCaptureGap::ObservationLimit,
+            ],
+        };
+        let snapshot = IntrospectSnapshot {
+            semantic_judgments: Some(SemanticJudgmentView::from_capture(capture)),
+            ..Default::default()
+        };
+        let request = IntrospectRequest::from_args(&serde_json::json!({"depth":"hint"}));
+        let report = build_introspect_report(&snapshot, &request);
+        let semantics = report.semantic_judgments.as_ref().unwrap();
+        assert_eq!(semantics.observations.len(), 2);
+        assert_eq!(semantics.omitted_details, 8);
+        assert_eq!(semantics.capture_omitted_observations, 2);
+        assert_eq!(semantics.counts.as_ref().unwrap().not_dispatched, 10);
+        assert!(!report.summary.contains("no_offering"));
+        assert!(
+            report
+                .evidence
+                .iter()
+                .all(|e| !e.summary.contains("no_offering"))
+        );
+        assert!(
+            report
+                .observations
+                .iter()
+                .all(|o| !o.summary.contains("no_offering"))
+        );
+        // One reason per retained fact, never replicated through prose/graph.
+        assert_eq!(
+            serde_json::to_string(&report)
+                .unwrap()
+                .matches("no_offering")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn semantic_judgment_consumer_preserves_coverage_and_source_boundaries() {
+        use astra_services::semantic_judgment_observation::{
+            SemanticJudgmentCoverage as Coverage, SemanticJudgmentView,
+        };
+        let snapshot = IntrospectSnapshot {
+            semantic_judgments: Some(SemanticJudgmentView::unavailable(Coverage::QueryFailed)),
+            ..Default::default()
+        };
+        for (policy, expected) in [
+            ("auto", Coverage::QueryFailed),
+            ("live_only", Coverage::SourceExcluded),
+            ("local_only", Coverage::SourceExcluded),
+        ] {
+            let request =
+                IntrospectRequest::from_args(&serde_json::json!({"source_policy":policy}));
+            let report = build_introspect_report(&snapshot, &request);
+            let view = report.semantic_judgments.as_ref().unwrap();
+            assert_eq!(view.coverage, expected);
+            assert!(view.counts.is_none());
+            assert!(view.capture_incomplete);
+            assert!(render_introspect_request(&snapshot, &request).contains(&view.render()));
+            assert!(
+                report
+                    .observations
+                    .iter()
+                    .all(|o| o.kind != "semantic_judgment_trace")
+            );
+            assert_eq!(
+                report.data_coverage.providers["semantic_judgment_trace"].status,
+                "missing"
+            );
+        }
+        let request = IntrospectRequest::from_args(&serde_json::json!({"facet":"errors"}));
+        assert!(
+            build_introspect_report(&snapshot, &request)
+                .semantic_judgments
+                .is_none()
+        );
+        assert!(!render_introspect_request(&snapshot, &request).contains("Semantic judgments:"));
+    }
+
+    fn judgment_facts(count: usize) -> astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
+        use astra_turn_types::*;
+        ExplainAnalyzeAuxiliaryUsageV1 {
+            available: true,
+            truncated: false,
+            attempts: (0..count)
+                .map(|index| ExplainAnalyzeAuxiliaryAttemptV1 {
+                    attempt_id: format!("attempt-{index}"),
+                    provider: "actual-provider".into(),
+                    offering_id: "actual-offering".into(),
+                    model_name: "actual-model".into(),
+                    purpose: "verification_judge".into(),
+                    operation_id: "request_judgment".into(),
+                    usage_status: if index == 0 {
+                        ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderPartial
+                    } else {
+                        ExplainAnalyzeAuxiliaryUsageStatusV1::Unavailable
+                    },
+                    usage: (index == 0).then_some(ExplainAnalyzeTokenUsageV1 {
+                        basis: ExplainAnalyzeUsageBasisV1::ProviderPartial,
+                        fresh_input_tokens: Some(10),
+                        cache_read_tokens: Some(20),
+                        cache_creation_tokens: None,
+                        output_tokens: Some(5),
+                    }),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn judgment_usage_preserves_physical_identity_missing_buckets_and_bounded_detail() {
+        let usage = JudgmentUsageSnapshot::from_ledger(judgment_facts(40));
+        assert_eq!(usage.observed_attempts, Some(40));
+        assert_eq!(usage.attempts_without_complete_usage, Some(40));
+        assert_eq!(usage.attempts.len(), 32);
+        let hint = usage.bounded(ObservationDepth::Hint);
+        assert_eq!(hint.attempts.len(), 2);
+        assert_eq!(hint.omitted_attempts, 38);
+        let text = hint.render();
+        assert!(text.contains("provider=actual-provider offering=actual-offering model=actual-model operation=request_judgment"));
+        assert!(text.contains("input=at_least_30 (incomplete) output=5"));
+        assert!(text.contains("input=unknown output=unknown"));
+        let snapshot = IntrospectSnapshot {
+            judgment_usage: Some(usage),
+            ..Default::default()
+        };
+        let request =
+            IntrospectRequest::from_args(&serde_json::json!({"depth":"hint", "format":"json"}));
+        let report = build_introspect_report(&snapshot, &request);
+        assert_eq!(report.judgment_usage.as_ref().unwrap().omitted_attempts, 38);
+        assert_eq!(report.data_coverage.overall, "partial");
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|e| e.summary.contains("actual-offering"))
+        );
+        let wire = serde_json::to_value(report).unwrap();
+        assert_eq!(
+            wire["judgment_usage"]["scope"],
+            "session_supported_judgment_operations_at_ledger_read"
+        );
+        assert!(wire["judgment_usage"]["attempts"][1].get("usage").is_none());
+    }
+
+    #[test]
+    fn judgment_usage_groups_separate_providers_and_include_hidden_retries() {
+        let mut facts = judgment_facts(40);
+        for attempt in &mut facts.attempts {
+            attempt.provider = "jev".into();
+        }
+        facts.attempts[1].provider = "deepseek".into();
+        let retry_usage = facts.attempts[0].usage.clone();
+        facts.attempts[39].usage = retry_usage;
+        facts.attempts[39].usage_status =
+            astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderPartial;
+        let usage = JudgmentUsageSnapshot::from_ledger(facts).bounded(ObservationDepth::Hint);
+        assert_eq!(usage.attempts.len(), 2);
+        assert_eq!(usage.groups.len(), 2);
+        let jev = usage.groups.iter().find(|g| g.provider == "jev").unwrap();
+        assert_eq!(jev.attempts, 39);
+        assert_eq!(jev.known_input_tokens, 60);
+        assert_eq!(jev.known_output_tokens, 10);
+        assert!(!jev.input_complete && !jev.output_complete);
+        let deepseek = usage
+            .groups
+            .iter()
+            .find(|g| g.provider == "deepseek")
+            .unwrap();
+        assert_eq!(deepseek.attempts, 1);
+        assert_eq!(deepseek.known_input_tokens, 0);
+        assert!(!deepseek.input_complete);
+        assert!(usage.render().contains("group provider=jev"));
+        let mut facts = judgment_facts(4);
+        facts.attempts[1].offering_id = "different-offering".into();
+        facts.attempts[2].model_name = "different-model".into();
+        facts.attempts[3].operation_id = "different-operation".into();
+        let usage = JudgmentUsageSnapshot::from_ledger(facts);
+        assert_eq!(
+            usage.groups.len(),
+            4,
+            "every identity dimension is preserved"
+        );
+        let hint = usage.bounded(ObservationDepth::Hint);
+        assert_eq!(hint.groups.len(), 2);
+        assert_eq!(hint.omitted_groups, 2);
+        assert_eq!(hint.known_input_tokens, Some(30));
+    }
+
+    #[test]
+    fn judgment_usage_exact_zero_is_distinct_from_missing_usage() {
+        let mut facts = judgment_facts(1);
+        let attempt = &mut facts.attempts[0];
+        attempt.usage_status =
+            astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact;
+        let usage = attempt.usage.as_mut().unwrap();
+        usage.basis = astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderExact;
+        usage.fresh_input_tokens = Some(0);
+        usage.cache_read_tokens = Some(0);
+        usage.cache_creation_tokens = Some(0);
+        usage.output_tokens = Some(0);
+        let snapshot = JudgmentUsageSnapshot::from_ledger(facts);
+        assert_eq!(snapshot.attempts_without_complete_usage, Some(0));
+        assert_eq!(snapshot.known_input_tokens, Some(0));
+        assert_eq!(snapshot.known_output_tokens, Some(0));
+        assert!(snapshot.input_complete && snapshot.output_complete);
+        assert!(snapshot.render().contains("input=0 output=0"));
+    }
+
+    #[test]
+    fn judgment_usage_aggregates_all_attempts_before_display_limits() {
+        let mut facts = judgment_facts(40);
+        // The only complete usage is outside even the forensic detail window.
+        let last = facts.attempts.last_mut().unwrap();
+        last.usage_status = astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact;
+        last.usage = Some(astra_turn_types::ExplainAnalyzeTokenUsageV1 {
+            basis: astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderExact,
+            fresh_input_tokens: Some(100),
+            cache_read_tokens: Some(200),
+            cache_creation_tokens: Some(300),
+            output_tokens: Some(70),
+        });
+        let snapshot = JudgmentUsageSnapshot::from_ledger(facts).bounded(ObservationDepth::Hint);
+        assert_eq!(snapshot.known_input_tokens, Some(630));
+        assert_eq!(snapshot.known_output_tokens, Some(75));
+        assert!(!snapshot.input_complete && !snapshot.output_complete);
+        assert_eq!(snapshot.attempts.len(), 2);
+        assert_eq!(snapshot.omitted_attempts, 38);
+        let report = build_introspect_report(
+            &IntrospectSnapshot {
+                judgment_usage: Some(snapshot.clone()),
+                ..Default::default()
+            },
+            &IntrospectRequest::from_args(&serde_json::json!({"depth":"hint"})),
+        );
+        let wire = serde_json::to_value(report).unwrap();
+        assert_eq!(wire["judgment_usage"]["known_input_tokens"], 630);
+        assert_eq!(wire["judgment_usage"]["known_output_tokens"], 75);
+        assert_eq!(wire["judgment_usage"]["input_complete"], false);
+        assert!(snapshot.render().contains(
+            "total_input=at_least_630 (incomplete) total_output=at_least_75 (incomplete)"
+        ));
+        let mut partial = judgment_facts(1);
+        let usage = JudgmentUsageSnapshot::from_ledger(partial.clone());
+        assert!(!usage.input_complete, "unknown cache creation is not zero");
+        assert!(
+            usage.output_complete,
+            "known output remains complete independently"
+        );
+        partial.attempts[0].usage = None;
+        let unavailable_usage = JudgmentUsageSnapshot::from_ledger(partial);
+        assert_eq!(unavailable_usage.known_input_tokens, Some(0));
+        assert!(!unavailable_usage.input_complete);
+        let unavailable_ledger = JudgmentUsageSnapshot::unavailable(JudgmentUsageCoverage::NoPool);
+        assert_eq!(unavailable_ledger.known_input_tokens, None);
+        assert!(!unavailable_ledger.input_complete && !unavailable_ledger.output_complete);
+    }
+
+    #[test]
+    fn judgment_usage_source_exclusion_and_text_json_scope_agree() {
+        let snapshot = IntrospectSnapshot {
+            judgment_usage: Some(JudgmentUsageSnapshot::from_ledger(judgment_facts(3))),
+            ..Default::default()
+        };
+        for policy in ["live_only", "local_only"] {
+            let request =
+                IntrospectRequest::from_args(&serde_json::json!({"source_policy":policy}));
+            let report = build_introspect_report(&snapshot, &request);
+            let usage = report.judgment_usage.unwrap();
+            assert_eq!(usage.coverage, JudgmentUsageCoverage::SourceExcluded);
+            assert!(usage.attempts.is_empty());
+            let text = render_introspect_request(&snapshot, &request);
+            assert!(!text.contains("actual-provider"));
+        }
+        let request =
+            IntrospectRequest::from_args(&serde_json::json!({"horizon":"turn", "depth":"hint"}));
+        let text = render_introspect_request(&snapshot, &request);
+        assert!(text.contains("scope=session_supported_judgment_operations cutoff=ledger_read"));
+        assert!(text.contains("omitted_attempts=1"));
+        assert!(text.contains("actual-provider"));
+    }
+
+    #[test]
+    fn judgment_usage_capture_overflow_retains_exact_facts_as_lower_bounds() {
+        use astra_turn_types::{ExplainAnalyzeAuxiliaryUsageStatusV1, ExplainAnalyzeUsageBasisV1};
+        let mut facts = judgment_facts(1);
+        facts.truncated = true;
+        facts.attempts[0].usage_status = ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact;
+        let usage = facts.attempts[0].usage.as_mut().unwrap();
+        usage.basis = ExplainAnalyzeUsageBasisV1::ProviderExact;
+        usage.cache_creation_tokens = Some(0);
+        let snapshot = JudgmentUsageSnapshot::from_ledger(facts);
+        assert_eq!(snapshot.coverage, JudgmentUsageCoverage::CaptureTruncated);
+        assert_eq!(snapshot.observed_attempts, Some(1));
+        assert_eq!(snapshot.attempts_without_complete_usage, Some(0));
+        assert_eq!(snapshot.known_input_tokens, Some(30));
+        assert_eq!(snapshot.known_output_tokens, Some(5));
+        assert!(!snapshot.input_complete && !snapshot.output_complete);
+        assert!(!snapshot.groups[0].input_complete && !snapshot.groups[0].output_complete);
+        assert_eq!(
+            snapshot.omitted_attempts, 0,
+            "capture omissions have unknown count"
+        );
+        assert!(snapshot.render().contains("total_output=at_least_5"));
+        let report = build_introspect_report(
+            &IntrospectSnapshot {
+                judgment_usage: Some(snapshot),
+                ..Default::default()
+            },
+            &IntrospectRequest::from_args(&serde_json::json!({"depth":"hint", "format":"json"})),
+        );
+        assert_eq!(
+            report.data_coverage.providers["judgment_inference_ledger"].status,
+            "partial"
+        );
+
+        let mut empty = judgment_facts(0);
+        empty.truncated = true;
+        let empty = JudgmentUsageSnapshot::from_ledger(empty);
+        assert_eq!(empty.coverage, JudgmentUsageCoverage::CaptureTruncated);
+        assert!(!empty.output_complete);
+        assert!(empty.render().contains("total_output=at_least_0"));
+    }
+
+    #[test]
+    fn judgment_usage_distinguishes_unavailable_empty_and_truncated_identities() {
+        let unavailable =
+            JudgmentUsageSnapshot::from_ledger(astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
+                available: false,
+                truncated: false,
+                attempts: vec![],
+            });
+        assert_eq!(unavailable.observed_attempts, None);
+        assert_eq!(
+            JudgmentUsageSnapshot::from_ledger(judgment_facts(0)).observed_attempts,
+            Some(0)
+        );
+        let mut facts = judgment_facts(1);
+        facts.attempts[0].provider = "界".repeat(1000);
+        let usage = JudgmentUsageSnapshot::from_ledger(facts);
+        assert_eq!(usage.truncated_identity_fields, 2);
+        assert_eq!(usage.attempts[0].provider.chars().count(), 128);
+        assert_eq!(
+            usage
+                .bounded(ObservationDepth::Hint)
+                .truncated_identity_fields,
+            2
+        );
+        assert!(serde_json::to_string(&usage).unwrap().len() < 3000);
+    }
     use crate::context_feedback::{
         RuntimePolicyFeedbackEntry, RuntimePolicyFeedbackSet, RuntimePolicyRecommendation,
         RuntimePolicySignal, RuntimePolicyStage, RuntimePolicySubject,
@@ -1337,6 +2075,8 @@ mod tests {
             tool_admission: Vec::new(),
             semantic_cache_decisions: Vec::new(),
             invocation_lifecycle: None,
+            judgment_usage: None,
+            semantic_judgments: None,
             recent_rounds: Vec::new(),
             step_latency: Vec::new(),
             volatile_pending: Vec::new(),

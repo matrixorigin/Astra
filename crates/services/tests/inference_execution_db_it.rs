@@ -5105,6 +5105,97 @@ async fn bounded_recovery_recovers_success_without_closing_retryable_attempts() 
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
+async fn auxiliary_capture_overflow_retains_bounded_physical_evidence() {
+    use astra_services::inference_execution::{
+        load_explain_auxiliary_usage, load_session_auxiliary_usage,
+    };
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("capture-user-{suffix}");
+    let session_id = format!("capture-session-{suffix}");
+    let run_id = format!("capture-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+    for round in 0..2 {
+        let plan = plan_inference_invocation(InferenceInvocationInput {
+            user_id: user_id.clone(),
+            scope: InferenceInvocationScope::Session {
+                session_id: session_id.clone(),
+                turn: 1,
+                round,
+                operation_id: "request_judgment".into(),
+                logical_attempt: 0,
+            },
+            offering_id: "capture-offering".into(),
+            resolved_model_name: "capture-model".into(),
+            upstream_model_name: "capture-model".into(),
+            provider: "openai".into(),
+            purpose: InferencePurpose::Introspection,
+            execution_placement: ModelExecutionPlacement::Server,
+            access_kind: ModelAccessKind::SelfHosted,
+            run_authority: None,
+        })
+        .expect("plan judgment");
+        admit_inference_invocation(&shared_pool, &plan)
+            .await
+            .expect("admit judgment");
+        let attempt = provider_attempt(&plan, 0);
+        begin_inference_provider_attempt(&shared_pool, &attempt)
+            .await
+            .expect("begin attempt");
+        let terminal = InferenceInvocationTerminal::succeeded(
+            InferenceUsage {
+                input: astra_turn_types::NormalizedPromptCacheUsage::new(20, 0, 0),
+                output_tokens: 4,
+            },
+            None,
+        );
+        finish_inference_provider_attempt(&shared_pool, &attempt, &terminal)
+            .await
+            .expect("finish attempt");
+        finish_inference_invocation(&shared_pool, &plan, &terminal)
+            .await
+            .expect("finish invocation");
+    }
+    for limit in [0, 1, 2, 3] {
+        let session = load_session_auxiliary_usage(&shared_pool, &user_id, &session_id, limit)
+            .await
+            .expect("session capture");
+        let turn = load_explain_auxiliary_usage(&shared_pool, &user_id, &session_id, 1, limit)
+            .await
+            .expect("turn capture");
+        for facts in [session, turn] {
+            assert!(facts.available && facts.is_valid());
+            assert_eq!(facts.truncated, limit < 2);
+            assert_eq!(facts.attempts.len(), limit.min(2));
+            assert!(
+                facts
+                    .attempts
+                    .iter()
+                    .all(|a| a.usage.as_ref().is_some_and(|u| u.output_tokens == Some(4)))
+            );
+        }
+    }
+    let other_owner =
+        load_session_auxiliary_usage(&shared_pool, "capture-other-owner", &session_id, 1)
+            .await
+            .expect("isolated capture");
+    assert!(other_owner.available && !other_owner.truncated && other_owner.attempts.is_empty());
+    let other_owner_turn =
+        load_explain_auxiliary_usage(&shared_pool, "capture-other-owner", &session_id, 1, 1)
+            .await
+            .expect("isolated turn capture");
+    assert!(
+        other_owner_turn.available
+            && !other_owner_turn.truncated
+            && other_owner_turn.attempts.is_empty()
+    );
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
 async fn session_scoped_auxiliary_inference_is_attributable_without_a_fake_run() {
     let (shared_pool, _) = common::setup_pool_and_settings().await;
     let pool = shared_pool.get();

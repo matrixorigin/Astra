@@ -1,9 +1,25 @@
 use astra_core::SharedPool;
+use chrono::NaiveDateTime;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 /// TTL for sweeper leader-election leases.
-/// Each sweeper independently re-checks leadership within this window.
+/// The local coordinator refreshes the durable lease within this window.
 const SWEEPER_LEASE_TTL_SECS: u64 = 60;
+/// Refresh at half the durable lease TTL. This leaves enough time for another
+/// process to take over after this process disappears while suppressing
+/// duplicate checks from the six in-process sweepers.
+const SWEEPER_LEASE_REFRESH_SECS: u64 = SWEEPER_LEASE_TTL_SECS / 2;
+/// A lease refresh is background coordination, not user work. Bound the
+/// database round-trip so a degraded database cannot pin every sweeper on the
+/// shared coordination mutex indefinitely.
+const SWEEPER_LEASE_REFRESH_TIMEOUT_SECS: u64 = 5;
+/// Non-leaders check more frequently than leaders so takeover is not delayed
+/// by the local observation cache after the current lease expires.
+const SWEEPER_NON_LEADER_REFRESH_SECS: u64 = 5;
+const SWEEPER_LEASE_EXPIRY_SAFETY_SECS: i64 = 1;
 
 /// Result of a leadership check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,18 +32,58 @@ pub(crate) enum LeaderStatus {
     Unavailable(String),
 }
 
-/// Leader-election lease for background sweepers. Each sweeper independently
-/// checks whether this pod still owns the lease before doing work. This avoids
-/// duplicate work when multiple API-server replicas are deployed (HPA).
+#[derive(Debug, Clone)]
+struct LeaseObservation {
+    status: LeaderStatus,
+    valid_until: Instant,
+}
+
+struct LeaseRefresh {
+    status: LeaderStatus,
+    lease_remaining: Option<Duration>,
+}
+
+impl LeaseRefresh {
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: LeaderStatus::Unavailable(message.into()),
+            lease_remaining: None,
+        }
+    }
+}
+
+/// Leader-election lease for background sweepers.
+///
+/// The database lease remains the cross-process authority. The in-process
+/// observation is only a short-lived singleflight/cache so all sweepers in one
+/// server do not repeatedly update the same database row. An unavailable
+/// observation is cached for only one second so a transient database failure
+/// cannot suppress recovery for the whole durable lease interval.
 #[derive(Clone)]
 pub(crate) struct SweeperLease {
     pub(crate) pool: SharedPool,
     pub(crate) pod_id: String,
     pub(crate) lease_name: String,
     pub(crate) table_name: String,
+    coordination: Arc<Mutex<Option<LeaseObservation>>>,
 }
 
 impl SweeperLease {
+    pub(crate) fn new(
+        pool: SharedPool,
+        pod_id: String,
+        lease_name: String,
+        table_name: String,
+    ) -> Self {
+        Self {
+            pool,
+            pod_id,
+            lease_name,
+            table_name,
+            coordination: Arc::new(Mutex::new(None)),
+        }
+    }
+
     /// Check whether this pod holds the lease. Uses INSERT IGNORE followed by
     /// conditional UPDATE to acquire or refresh. Returns the leader status
     /// after a SELECT back-read.
@@ -36,11 +92,58 @@ impl SweeperLease {
     /// lease guard — the caller is expected to match on `LeaderStatus`.
     #[must_use = "leadership status must be checked; ignoring it bypasses the lease guard"]
     pub(crate) async fn check_leader(&self) -> LeaderStatus {
+        // Hold the coordination lock through the database refresh so concurrent
+        // sweepers share one in-flight check instead of serially issuing the
+        // same INSERT/UPDATE/SELECT sequence. The cached interval is shorter
+        // than the durable lease TTL, so failover remains database-driven.
+        let mut observation = self.coordination.lock().await;
+        let now = Instant::now();
+        if let Some(cached) = observation.as_ref()
+            && now < cached.valid_until
+        {
+            return cached.status.clone();
+        }
+
+        let refresh_started = Instant::now();
+        let refresh = match tokio::time::timeout(
+            Duration::from_secs(SWEEPER_LEASE_REFRESH_TIMEOUT_SECS),
+            self.refresh_from_database(),
+        )
+        .await
+        {
+            Ok(refresh) => refresh,
+            Err(_) => LeaseRefresh::unavailable(format!(
+                "lease refresh timed out after {SWEEPER_LEASE_REFRESH_TIMEOUT_SECS}s"
+            )),
+        };
+        let validity = lease_observation_validity(
+            &refresh.status,
+            refresh.lease_remaining,
+            refresh_started.elapsed(),
+        );
+        let status = if matches!(refresh.status, LeaderStatus::Leader) && validity.is_zero() {
+            LeaderStatus::Unavailable("lease expired before observation was safe".to_string())
+        } else {
+            refresh.status
+        };
+        let validity = if matches!(status, LeaderStatus::Unavailable(_)) {
+            Duration::from_secs(1)
+        } else {
+            validity
+        };
+        *observation = Some(LeaseObservation {
+            status: status.clone(),
+            valid_until: Instant::now() + validity,
+        });
+        status
+    }
+
+    async fn refresh_from_database(&self) -> LeaseRefresh {
         // Acquire a single connection for all operations
         let mut conn = match self.pool.get().acquire().await {
             Ok(c) => c,
             Err(e) => {
-                return LeaderStatus::Unavailable(format!("failed to acquire connection: {e}"));
+                return LeaseRefresh::unavailable(format!("failed to acquire connection: {e}"));
             }
         };
 
@@ -64,7 +167,7 @@ impl SweeperLease {
             .await;
 
         if let Err(e) = &insert_result {
-            return LeaderStatus::Unavailable(format!("INSERT failed: {e}"));
+            return LeaseRefresh::unavailable(format!("INSERT failed: {e}"));
         }
 
         // Always attempt the conditional UPDATE: MatrixOne INSERT IGNORE
@@ -85,28 +188,72 @@ impl SweeperLease {
             .await;
 
         if let Err(e) = &update_result {
-            return LeaderStatus::Unavailable(format!("UPDATE failed: {e}"));
+            return LeaseRefresh::unavailable(format!("UPDATE failed: {e}"));
         }
 
         // Step 2: Verify ownership via back-read on the SAME connection.
         // This is the ONLY reliable signal in MatrixOne (rows_affected is
         // unreliable for both INSERT and UPDATE).
         let select_sql = format!(
-            "SELECT owner_pod_id FROM {} WHERE sweeper_name = ?",
+            "SELECT owner_pod_id, expires_at, CAST(NOW(6) AS DATETIME(6)) FROM {} WHERE sweeper_name = ?",
             self.table_name
         );
-        let row = sqlx::query_as::<_, (String,)>(&select_sql)
+        let row = sqlx::query_as::<_, (String, NaiveDateTime, NaiveDateTime)>(&select_sql)
             .bind(&self.lease_name)
             .fetch_optional(&mut *conn)
             .await;
 
         match row {
-            Ok(Some((owner,))) if owner == self.pod_id => LeaderStatus::Leader,
-            Ok(Some(_)) => LeaderStatus::NotLeader,
-            Ok(None) => LeaderStatus::NotLeader,
-            Err(e) => LeaderStatus::Unavailable(format!("SELECT failed: {e}")),
+            Ok(Some((owner, expires_at, database_now))) if owner == self.pod_id => {
+                let lease_remaining = lease_remaining(expires_at, database_now);
+                if lease_remaining.is_zero() {
+                    LeaseRefresh {
+                        status: LeaderStatus::Unavailable(
+                            "lease expired before ownership verification".to_string(),
+                        ),
+                        lease_remaining: Some(lease_remaining),
+                    }
+                } else {
+                    LeaseRefresh {
+                        status: LeaderStatus::Leader,
+                        lease_remaining: Some(lease_remaining),
+                    }
+                }
+            }
+            Ok(Some((_, expires_at, database_now))) => LeaseRefresh {
+                status: LeaderStatus::NotLeader,
+                lease_remaining: Some(lease_remaining(expires_at, database_now)),
+            },
+            Ok(None) => LeaseRefresh {
+                status: LeaderStatus::NotLeader,
+                lease_remaining: None,
+            },
+            Err(e) => LeaseRefresh::unavailable(format!("SELECT failed: {e}")),
         }
     }
+}
+
+fn lease_observation_validity(
+    status: &LeaderStatus,
+    lease_remaining: Option<Duration>,
+    refresh_elapsed: Duration,
+) -> Duration {
+    let default = match status {
+        LeaderStatus::Leader => Duration::from_secs(SWEEPER_LEASE_REFRESH_SECS),
+        LeaderStatus::NotLeader => Duration::from_secs(SWEEPER_NON_LEADER_REFRESH_SECS),
+        LeaderStatus::Unavailable(_) => Duration::from_secs(1),
+    };
+    let Some(lease_remaining) = lease_remaining else {
+        return default;
+    };
+    let safe_remaining = lease_remaining
+        .saturating_sub(refresh_elapsed)
+        .saturating_sub(Duration::from_secs(SWEEPER_LEASE_EXPIRY_SAFETY_SECS as u64));
+    default.min(safe_remaining)
+}
+
+fn lease_remaining(expires_at: NaiveDateTime, database_now: NaiveDateTime) -> Duration {
+    (expires_at - database_now).to_std().unwrap_or_default()
 }
 
 pub(crate) fn spawn_runtime_sweepers(
@@ -123,15 +270,16 @@ pub(crate) fn spawn_runtime_sweepers(
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| format!("astra-runtime-{}", Uuid::new_v4()));
 
-    let lease = std::sync::Arc::new(SweeperLease {
-        pool: shared_pool.clone(),
+    let lease = Arc::new(SweeperLease::new(
+        shared_pool.clone(),
         pod_id,
-        lease_name: "runtime_sweepers".to_string(),
-        table_name: "sweeper_leases".to_string(),
-    });
+        "runtime_sweepers".to_string(),
+        "sweeper_leases".to_string(),
+    ));
 
-    // Each sweeper independently checks the lease before every work cycle.
-    // No master loop — no risk of duplicate spawn.
+    // Each sweeper checks the shared coordinator before every work cycle. The
+    // coordinator keeps one durable lease authority without duplicate local
+    // INSERT/UPDATE/SELECT sequences or a master task that could be duplicated.
     let handles = vec![
         crate::server::runtime_maintenance_sweeper::spawn_runtime_maintenance_sweeper(
             shared_pool.clone(),
@@ -210,12 +358,12 @@ mod tests {
             .await
             .ok();
 
-        let lease = SweeperLease {
-            pool: pool.clone(),
-            pod_id: "test-pod-1".to_string(),
-            lease_name: lease_name.to_string(),
-            table_name: "sweeper_leases".to_string(),
-        };
+        let lease = SweeperLease::new(
+            pool.clone(),
+            "test-pod-1".to_string(),
+            lease_name.to_string(),
+            "sweeper_leases".to_string(),
+        );
 
         use super::LeaderStatus;
 
@@ -234,12 +382,12 @@ mod tests {
         );
 
         // Another pod tries while lease is held: must not become leader.
-        let other = SweeperLease {
-            pool: pool.clone(),
-            pod_id: "test-pod-2".to_string(),
-            lease_name: lease_name.to_string(),
-            table_name: "sweeper_leases".to_string(),
-        };
+        let other = SweeperLease::new(
+            pool.clone(),
+            "test-pod-2".to_string(),
+            lease_name.to_string(),
+            "sweeper_leases".to_string(),
+        );
         assert_eq!(
             other.check_leader().await,
             LeaderStatus::NotLeader,
@@ -271,12 +419,12 @@ mod tests {
         use super::LeaderStatus;
 
         // Pod 1 acquires lease
-        let pod1 = SweeperLease {
-            pool: pool.clone(),
-            pod_id: "pod-expiry-1".to_string(),
-            lease_name: lease_name.to_string(),
-            table_name: "sweeper_leases".to_string(),
-        };
+        let pod1 = SweeperLease::new(
+            pool.clone(),
+            "pod-expiry-1".to_string(),
+            lease_name.to_string(),
+            "sweeper_leases".to_string(),
+        );
         assert_eq!(
             pod1.check_leader().await,
             LeaderStatus::Leader,
@@ -293,12 +441,12 @@ mod tests {
             .expect("force-expire lease");
 
         // Pod 2 should now be able to take over the expired lease
-        let pod2 = SweeperLease {
-            pool: pool.clone(),
-            pod_id: "pod-expiry-2".to_string(),
-            lease_name: lease_name.to_string(),
-            table_name: "sweeper_leases".to_string(),
-        };
+        let pod2 = SweeperLease::new(
+            pool.clone(),
+            "pod-expiry-2".to_string(),
+            lease_name.to_string(),
+            "sweeper_leases".to_string(),
+        );
         assert_eq!(
             pod2.check_leader().await,
             LeaderStatus::Leader,
@@ -319,8 +467,16 @@ mod tests {
         );
 
         // Pod 1 must no longer be leader
+        // The original pod keeps its short-lived local observation. A fresh
+        // coordinator must consult the durable row and see pod2's takeover.
+        let pod1_after_takeover = SweeperLease::new(
+            pool.clone(),
+            "pod-expiry-1".to_string(),
+            lease_name.to_string(),
+            "sweeper_leases".to_string(),
+        );
         assert_eq!(
-            pod1.check_leader().await,
+            pod1_after_takeover.check_leader().await,
             LeaderStatus::NotLeader,
             "pod1 must lose expired lease"
         );
@@ -358,12 +514,12 @@ mod tests {
             let results = results.clone();
             let pod_id = format!("pod-race-{i}");
             handles.push(tokio::spawn(async move {
-                let lease = SweeperLease {
-                    pool: (*pool).clone(),
+                let lease = SweeperLease::new(
+                    (*pool).clone(),
                     pod_id,
-                    lease_name: lease_name.to_string(),
-                    table_name: "sweeper_leases".to_string(),
-                };
+                    lease_name.to_string(),
+                    "sweeper_leases".to_string(),
+                );
                 let status = lease.check_leader().await;
                 results.lock().await.push(status);
             }));
@@ -406,12 +562,12 @@ mod tests {
         // Use a non-existent table name so that check_leader() hits the error path
         // without affecting the shared sweeper_leases table used by other tests.
         let lease_name = "test-leader-error";
-        let lease = SweeperLease {
-            pool: pool.clone(),
-            pod_id: "pod-error".to_string(),
-            lease_name: lease_name.to_string(),
-            table_name: "sweeper_leases_error".to_string(),
-        };
+        let lease = SweeperLease::new(
+            pool.clone(),
+            "pod-error".to_string(),
+            lease_name.to_string(),
+            "sweeper_leases_error".to_string(),
+        );
 
         use super::LeaderStatus;
         let status = lease.check_leader().await;
@@ -425,5 +581,59 @@ mod tests {
             lease.check_leader().await,
             LeaderStatus::Unavailable(_)
         ));
+    }
+
+    #[test]
+    fn lease_observation_never_outlives_the_durable_expiry() {
+        let lease_remaining = Duration::from_secs(4);
+        assert_eq!(
+            lease_observation_validity(
+                &LeaderStatus::Leader,
+                Some(lease_remaining),
+                Duration::ZERO,
+            ),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            lease_observation_validity(
+                &LeaderStatus::NotLeader,
+                Some(lease_remaining),
+                Duration::from_secs(2),
+            ),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            lease_observation_validity(
+                &LeaderStatus::Leader,
+                Some(lease_remaining),
+                Duration::from_secs(4),
+            ),
+            Duration::ZERO
+        );
+        assert_eq!(
+            lease_observation_validity(&LeaderStatus::NotLeader, None, Duration::ZERO),
+            Duration::from_secs(SWEEPER_NON_LEADER_REFRESH_SECS)
+        );
+        assert_eq!(
+            lease_observation_validity(
+                &LeaderStatus::Leader,
+                Some(Duration::from_secs(1)),
+                Duration::ZERO,
+            ),
+            Duration::ZERO
+        );
+        /*
+         * The database's remaining duration is measured at the SQL snapshot,
+         * so an unusually slow response consumes the same budget before the
+         * observation is cached.
+         */
+        assert_eq!(
+            lease_observation_validity(
+                &LeaderStatus::Leader,
+                Some(Duration::from_secs(10)),
+                Duration::from_secs(9),
+            ),
+            Duration::ZERO
+        );
     }
 }

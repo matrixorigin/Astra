@@ -217,9 +217,13 @@ async fn authenticate_with_retry(
 }
 
 async fn active_model_names(api: &ThinClient, token: &str) -> Result<Vec<String>, String> {
-    let (items, _) = session_runtime::load_server_model_catalog(api, token)
-        .await
-        .map_err(|error| format!("could not inspect current model catalog: {error}"))?;
+    let (items, _) = session_runtime::load_server_model_catalog(
+        api,
+        token,
+        astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+    )
+    .await
+    .map_err(|error| format!("could not inspect current model catalog: {error}"))?;
     let mut names = items
         .into_iter()
         .filter(|item| item.is_active)
@@ -430,8 +434,55 @@ pub(crate) async fn run_setup(api: &ThinClient, profile: Option<&str>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn setup_requires_chat_catalog_not_judgment_only_registry() {
+        let item = |name: &str, provider: &str| {
+            serde_json::json!({
+                "offering_id": format!("offer-{name}"), "access_id": "self-hosted",
+                "access_kind": "self_hosted", "access_label": "Self-hosted",
+                "execution_placement": "server", "name": name, "provider": provider,
+                "description": null, "is_active": true, "context_window": 64000,
+                "max_completion_tokens": null, "architecture": null, "thinking_capability": null
+            })
+        };
+        // A judgment-only registry has an empty effective chat catalog. Adding
+        // a chat Offering makes setup's existing-model branch available.
+        for chat_items in [vec![], vec![item("chat-model", "openai")]] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(paths::MODELS))
+                .and(query_param("purpose", "all"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "items": [item("jev", "typesafe")], "total": 1,
+                    "limit": 50, "next_cursor": null, "catalog_revision": "registry"
+                })))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let expected: Vec<String> = chat_items
+                .iter()
+                .map(|entry| entry["name"].as_str().unwrap().to_owned())
+                .collect();
+            Mock::given(method("GET"))
+                .and(path(paths::MODELS))
+                .and(query_param("purpose", "chat"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "total": chat_items.len(), "items": chat_items,
+                    "limit": 50, "next_cursor": null, "catalog_revision": "chat"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let api = ThinClient::new(&server.uri(), None).unwrap();
+            assert_eq!(
+                active_model_names(&api, "admin-token").await.unwrap(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn model_probe_requires_explicit_active_state() {

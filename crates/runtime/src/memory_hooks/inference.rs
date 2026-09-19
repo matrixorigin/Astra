@@ -162,6 +162,31 @@ impl MemoryInferencePort for DurableMemoryInferenceClient {
                 format!("Memory model admission failed: {error}"),
             )
         })?;
+        // Retrieval reranking is a typed batched judgment. Its output budget
+        // is a minimum needed to represent every candidate decision, rather
+        // than a best-effort generation ceiling. Reject an admitted Offering
+        // that cannot satisfy that contract before reserving durable inference
+        // state or contacting the provider; callers can then use their normal
+        // deterministic fallback without treating truncated JSON as a model
+        // decision.
+        if request.purpose == InferencePurpose::MemoryRetrievalRerank
+            && astra_turn_types::output_budget_exceeds_completion_cap(
+                request.max_output_tokens,
+                execution.max_completion_tokens,
+            )
+        {
+            tracing::warn!(
+                offering_id = %self.offering_id,
+                model_name = %execution.model_name,
+                configured_max_completion_tokens = ?execution.max_completion_tokens,
+                required_output_tokens = request.max_output_tokens,
+                "memory judgment route cannot emit a complete typed answer; no provider request dispatched"
+            );
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ResourceLimit,
+                "memory judgment Offering output limit is below the required typed answer budget",
+            ));
+        }
         let direct = DirectMemoryInferenceClient {
             fixed_temperature: execution.fixed_temperature,
             thinking_protocol: execution.thinking_protocol,

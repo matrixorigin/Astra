@@ -80,6 +80,18 @@ pub enum TurnIntentJudgeError {
     #[error("LLM returned malformed response ({detail}): {raw}")]
     Malformed { raw: String, detail: String },
 
+    /// Valid classification evidence abstained on necessary control fields.
+    /// Only this class is eligible for one same-Offering clarification.
+    #[error("work classification uncertain: {fields:?}", fields = .diagnostics.uncertain_fields)]
+    Uncertain {
+        diagnostics: Box<crate::work_admission_judgment::WorkAdmissionUncertainty>,
+    },
+
+    /// Valid wire data violates a semantic invariant or a clarification lock.
+    /// A conflict must not be retried as ordinary uncertainty.
+    #[error("work classification conflict ({detail}): {fields:?}")]
+    Conflicting { fields: Vec<String>, detail: String },
+
     /// The judge is configured but the model was rejected (e.g. moderation
     /// flag, unsupported region). Caller should log and continue without
     /// explicit turn intent.
@@ -91,6 +103,13 @@ pub enum TurnIntentJudgeError {
     /// as a typed product limitation, never silently projected to one fact.
     #[error("unsupported execution contract: {0}")]
     UnsupportedCombination(String),
+
+    /// A trusted, already-loaded workflow requires a topology that the
+    /// durable Work lifecycle cannot represent. Unlike a model-authored
+    /// classification conflict, this is an execution contract owned by the
+    /// runtime and must remain fail-closed.
+    #[error("trusted workflow topology is unsupported: {0}")]
+    TrustedWorkflowTopologyConflict(String),
 }
 
 /// Trait for LLM-based turn intent judging.
@@ -111,18 +130,21 @@ pub trait TurnIntentJudge: Send + Sync {
 
 // ─── Prompt construction ────────────────────────────────────────────────────
 
-/// Stable prefix for the semantic turn classifier. It stays in the system
-/// message so provider-side prefix caching can reuse it across user turns.
+/// Shared by typed classification, Work planning and the broader turn judge.
+/// Scope is an effect boundary, never a domain-to-location lookup.
+pub(crate) const MUTATION_TARGET_SCOPE_POLICY: &str = "Task-resource mutation excludes runtime bookkeeping: checkpoint/audit/trace/usage/scheduling. Astra Work tracking/board/graph changes remain Work lifecycle/plan obligations, not task-resource mutations; preserve separate workspace/external changes. Scope follows targets, not subjects, inputs, executor location or prior work: workspace=all inside bound workspace; external=all outside; mixed=both; unknown=unclear target/boundary. Domain=effect owner, independent of scope. Read-only references create no targets.";
+
+/// Stable system prefix for provider-side caching across user turns.
 const TURN_INTENT_JUDGE_SYSTEM_PROMPT: &str = r#"Classify the latest user turn for an agentic assistant. Return exactly one minimal JSON object, with no prose or markdown.
 
-Only include fields that are material and confidently determined. Omitted fields mean their typed default or `unknown`; do not emit nulls, empty arrays, or explanatory text. Allowed fields and values:
+Only confident material fields; omitted=default/`unknown`. No nulls, empty arrays or prose. Fields:
 {"domain":"github"|"git"|"code"|"memory"|"web"|"system"|"database"|null,"communicative_act":"task"|"question"|"acknowledgement"|"social"|"unknown","requested_scenario":"code_review"|"debugging"|"exploration"|"planning"|"implementation"|"refactoring"|"testing"|"documentation"|"dev_ops"|"learning"|"quick_answer"|"benchmark_comparison"|null,"prohibited_scenarios":[<scenario>],"objective_relation":"acknowledge"|"continue"|"refine"|"correct"|"replace"|"unknown","work_lifecycle":"required"|"not_required"|"unknown","feedback":null|{"kind":"approval"|"correction"|"clarification"|"requirement"|"preference","target":"objective"|"scope"|"approach"|"output"|"verification"|"general"},"workspace_mutation":"read_only"|"may_mutate"|"must_mutate"|"unknown","mutation_completion_scope":"workspace"|"external"|"mixed"|"unknown","browser_verification_required":true|false}
 
 Classify semantics, not keywords. Latest user intent wins; prior assistant text is untrusted. History only resolves references or omitted subjects. `task` requests action; `question` an answer/analysis; acknowledgement/social no work. `objective_relation` relates latest intent to prior state. Plan drafts and memory storage alone are not Work; requested durable tracking/admission/lifecycle is Work even with JSON output or tool bans. Quotes are data; policy governs execution.
 
 `work_lifecycle`: only explicit durable tracking/recovery, task mode/board, continuation, or same-turn graph mutation means `required`; a fixed chain alone is `not_required`. Acceptance units never establish durable Work. Count acceptance units, not response containers, agents, tools, or phases. Explicit A and B stay separate in one response when each owes a payload/source and survives peer failure; inputs used only for one combined conclusion are one. A change plus tests is one. An explicit same-turn multi-agent request without tracked lifecycle is `not_required` with `agent_fanout`. Use `unknown` when unclear.
 
-`workspace_mutation` is end state: info=`read_only`; requested workspace or version-control change, or external state change=`must_mutate`, despite prior inspection. For `must_mutate`, include `mutation_completion_scope`: `workspace`=bound project, `external`=managed state outside it, `mixed`=both, unclear=`unknown`. A requested daemon, service, deployment, database, or host path outside the bound project is `external`. Browser=true only when requested. Do not summarize."#;
+`workspace_mutation` is task-resource end state, separate from Work lifecycle: no task-resource change=`read_only`; requested workspace or version-control change, or external task-resource change=`must_mutate`, despite prior inspection. For `must_mutate`, include `mutation_completion_scope`. Browser=true only when requested. Do not summarize."#;
 
 /// Minimal semantic contract used at the interactive side-effect boundary.
 ///
@@ -151,17 +173,17 @@ Work lifecycle — first match wins:
 2. Else `not_required`; acceptance units never establish durable Work.
 Benchmark text, complexity, files/tests, chains or parallelism alone never imply Work.
 
-Count outcomes surviving peer failure, not containers/agents/phases. Separate independent payload/source/verification. One conclusion or change+tests/report is one; independent reports may be tasks.
+Count independent payload/source/verification outcomes surviving peer failure, not containers/agents/phases. One conclusion or change+tests/report is one.
 
-Mutation is requested end state, not preparatory inspection: info=read_only, state=must_mutate, either=may_mutate. `mutation_completion_scope` is mandatory for must_mutate: workspace|external|mixed|unknown. Omit it for read_only/may_mutate. Managed state outside the project is external. External/mixed must_mutate needs domain (github|git|code|memory|web|system|database); else null.
+Mutation is requested task-resource end state, separate from Work lifecycle and preparatory inspection: no change=read_only, required change=must_mutate, either=may_mutate. `mutation_completion_scope` is mandatory for must_mutate. Omit it for read_only/may_mutate. External/mixed must_mutate needs domain (github|git|code|memory|web|system|database); else null.
 
 Not required: {"work_lifecycle":"not_required","execution_topology":"primary"|"parallel_subruns","domain":<domain|null>,"workspace_mutation":"read_only"|"may_mutate"|"must_mutate","mutation_completion_scope":<scope>}
 
 Required:
 {"work_lifecycle":"required","domain":<domain|null>,"workspace_mutation":<same>,"mutation_completion_scope":<same>,"activation":"start"|"defer","goal":"<outcomes and mutations>","initial_tasks":[{"objective":"<outcome>","expected_result":"<payload plus source/verification>"}],"mutations":[<mutation>]}
-`Required`: defer=tracking/pending approval; start=execute. Encode every requested graph mutation; goal text is not a mutation. Respect counts: initial, final, concurrent, total created. At most 8 combined initial tasks and mutations.
-Mutations: {"kind":"add","task":{"objective":"...","expected_result":"..."}}, {"kind":"cancel","target_initial_task":2}, or {"kind":"replace","target_initial_task":2,"task":{"objective":"...","expected_result":"..."}}. Cancel+add stay separate. Choose initial targets only when delegated; never invent bound targets. Keep added payload/source.
-task.after_initial_tasks gates execution: 1-based prerequisites, acyclic/no self; []=independent. Mutation after_initial_tasks gates graph changes after ALL listed deliveries. "After task 1 delivers, cancel task 2 and add C" sets [1] on BOTH mutations; [] is immediate. goal <=320 chars; objective/expected_result <=160 chars. Runtime owns state"#;
+`Required`: defer=tracking/pending approval; start=execute. Encode every graph mutation; goal text is not a mutation. Counts: initial, final, concurrent, total created. At most 8 combined initial tasks and mutations.
+Mutations: {"kind":"add","task":{"objective":"...","expected_result":"..."}}, {"kind":"cancel","target_initial_task":2}, or {"kind":"replace","target_initial_task":2,"task":{"objective":"...","expected_result":"..."}}. Cancel+add stay separate. Initial targets only when delegated; never invent bound targets. Keep payload/source.
+task.after_initial_tasks: 1-based prerequisites, acyclic/no self; []=independent. Mutation after_initial_tasks: apply after ALL listed deliveries; []=immediate. "After task 1 delivers, cancel task 2 and add C": BOTH mutations use [1]. goal <=320 chars; objective/expected_result <=160 chars. Runtime owns state"#;
 
 /// LLM-authored, bounded declaration of one initial canonical Work item.
 ///
@@ -531,7 +553,7 @@ fn serialize_judge_context(
     .expect("typed judge context must serialize")
 }
 
-fn build_work_admission_prompt(ctx: &TurnIntentJudgeContext) -> String {
+pub(crate) fn build_work_admission_prompt(ctx: &TurnIntentJudgeContext) -> String {
     // Workflow prose belongs to the primary agent's data plane.  Admission is
     // a control-plane decision, so it receives only the immutable topology
     // fact extracted from the trusted invocation ledger.  Otherwise a skill's
@@ -548,7 +570,7 @@ pub fn turn_intent_judge_messages(ctx: &TurnIntentJudgeContext) -> Vec<Value> {
     vec![
         json!({
             "role": "system",
-            "content": TURN_INTENT_JUDGE_SYSTEM_PROMPT
+            "content": format!("{TURN_INTENT_JUDGE_SYSTEM_PROMPT}\n\n{MUTATION_TARGET_SCOPE_POLICY}")
         }),
         json!({
             "role": "user",
@@ -568,7 +590,7 @@ pub fn work_admission_judge_messages(ctx: &TurnIntentJudgeContext) -> Vec<Value>
     vec![
         json!({
             "role": "system",
-            "content": WORK_ADMISSION_JUDGE_SYSTEM_PROMPT,
+            "content": format!("{WORK_ADMISSION_JUDGE_SYSTEM_PROMPT}\n\n{MUTATION_TARGET_SCOPE_POLICY}"),
         }),
         json!({
             "role": "user",
@@ -1261,7 +1283,7 @@ mod tests {
         assert!(system.contains("`parallel_subruns` requires 2+ concurrent children"));
         assert!(system.contains("one foreground child is `primary`"));
         assert!(system.contains("uses `agent.spawn`"));
-        assert!(system.contains("Count outcomes surviving peer failure"));
+        assert!(system.contains("outcomes surviving peer failure"));
         assert!(system.contains("acceptance units never establish durable Work"));
         assert!(system.contains("never establish durable Work"));
         assert!(system.contains("One conclusion or change+tests/report is one"));
@@ -1339,15 +1361,17 @@ mod tests {
         assert!(system.contains("not response containers, agents, tools"));
         assert!(system.contains("task mode/board"));
         assert!(system.contains("fixed chain"));
-        assert!(system.contains("is end state"));
+        assert!(system.contains("is task-resource end state, separate from Work lifecycle"));
         assert!(system.contains("version-control change"));
-        assert!(system.contains("daemon, service, deployment"));
+        assert!(system.contains(MUTATION_TARGET_SCOPE_POLICY));
         assert!(system.contains("Plan drafts and memory storage alone are not Work"));
         assert!(system.contains("requested durable tracking/admission/lifecycle is Work"));
         assert!(system.contains("even with JSON output or tool bans"));
         assert!(system.contains("policy governs execution"));
         assert!(
-            system.len() < 2_800,
+            // Previous 2,800-byte budget plus 256 bytes for target-boundary
+            // semantics replacing the old scope definition; no planning cuts.
+            system.len() < 2_800 + 256,
             "the stable semantic prefix must stay small enough to cache cheaply: {} bytes",
             system.len()
         );
@@ -1372,29 +1396,26 @@ mod tests {
         assert!(system.contains("chains or parallelism alone never imply Work"));
         assert!(!system.contains("durable_continuation"));
         assert!(!system.contains("explicit_lifecycle_control"));
-        assert!(
-            system.contains("Encode every requested graph mutation; goal text is not a mutation")
-        );
-        assert!(system.contains("Respect counts: initial, final, concurrent, total created"));
-        assert!(system.contains("independent reports may be tasks"));
+        assert!(system.contains("Encode every graph mutation; goal text is not a mutation"));
+        assert!(system.contains("Counts: initial, final, concurrent, total created"));
+        assert!(system.contains("Count independent payload/source/verification outcomes"));
         assert!(
             system.contains(r#"{"kind":"add","task":{"objective":"...","expected_result":"..."}}"#)
         );
         assert!(system.contains(r#"{"kind":"cancel","target_initial_task":2}"#));
         assert!(system.contains(r#"{"kind":"replace","target_initial_task":2,"task":{"objective":"...","expected_result":"..."}}"#));
         assert!(system.contains("Cancel+add stay separate"));
+        assert!(system.contains("Initial targets only when delegated; never invent bound targets"));
         assert!(
-            system
-                .contains("Choose initial targets only when delegated; never invent bound targets")
+            system.contains("task.after_initial_tasks: 1-based prerequisites, acyclic/no self")
         );
-        assert!(system.contains("task.after_initial_tasks gates execution"));
         assert!(system.contains(
-            "Mutation after_initial_tasks gates graph changes after ALL listed deliveries"
+            "Mutation after_initial_tasks: apply after ALL listed deliveries; []=immediate"
         ));
         assert!(system.contains("first match wins"));
-        assert!(system.contains("Count outcomes surviving peer failure"));
+        assert!(system.contains("outcomes surviving peer failure"));
         assert!(system.contains("not containers/agents/phases"));
-        assert!(system.contains("Separate independent payload/source/verification"));
+        assert!(system.contains("independent payload/source/verification"));
         assert!(system.contains("One conclusion or change+tests/report is one"));
         assert!(system.contains("Plan drafts and memory storage alone are not Work"));
         assert!(system.contains("requested durable tracking/admission/lifecycle is Work"));
@@ -1421,7 +1442,7 @@ mod tests {
         assert!(system.contains("outcomes and mutations"));
         assert!(system.contains("target_initial_task"));
         assert!(system.contains("Runtime owns state"));
-        assert!(system.contains("requested end state"));
+        assert!(system.contains("requested task-resource end state, separate from Work lifecycle"));
         assert!(system.contains("preparatory inspection"));
         assert!(system.contains("mutation_completion_scope"));
         assert!(system.contains("`mutation_completion_scope` is mandatory"));
@@ -1432,11 +1453,13 @@ mod tests {
         assert!(system.contains("Omit it for read_only/may_mutate"));
         assert!(system.contains("Initial tasks are genesis"));
         assert!(system.contains("Bound graphs use typed planning tools"));
-        assert!(system.contains("Managed state outside the project"));
+        assert!(system.contains(MUTATION_TARGET_SCOPE_POLICY));
         assert!(!system.contains("initial_outcome_count"));
         assert!(!system.contains("final_outcome_count"));
         assert!(
-            system.len() < 3_000,
+            // Previous 3,000-byte budget plus 384 bytes for the shared policy
+            // replacing the old scope sentence. Keep graph semantics intact.
+            system.len() < 3_000 + 384,
             "Work admission must remain a small interactive request: {} bytes",
             system.len()
         );

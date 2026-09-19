@@ -501,7 +501,9 @@ def _canonical_runtime_system_baseline(repo: Path) -> dict[str, object]:
     cursor_source = sources[source_paths[1]]
     lease = re.search(
         r"pub\(crate\) fn spawn_runtime_sweepers\(.*?"
-        r'lease_name:\s*"([^"]+)"\.to_string\(\),',
+        r"SweeperLease::new\(\s*"
+        r"shared_pool\.clone\(\),\s*pod_id,\s*"
+        r'"([^"]+)"\.to_string\(\),',
         sweeper_source,
         re.DOTALL,
     )

@@ -3012,6 +3012,7 @@ const TURN_EVENT_BUFFER_CAP: usize = 1000;
 const TURN_EVENT_DROPPED_META_KEY: &str = "dropped_events_before";
 
 pub struct TurnEventBuffer {
+    trace_ingestion: Option<(String, String, u64, crate::event_ingestion::IngestionSender)>,
     events: std::collections::VecDeque<JournalEvent>,
     dropped_events: u64,
     turn_start: std::time::Instant,
@@ -3045,6 +3046,7 @@ impl TurnEventBuffer {
     /// Start collecting events for a new turn at a specific round offset.
     pub fn begin_turn_with_round(session_id: Option<&str>, turn: u32, round: u32) -> Self {
         Self {
+            trace_ingestion: None,
             events: std::collections::VecDeque::new(),
             dropped_events: 0,
             turn_start: std::time::Instant::now(),
@@ -3066,6 +3068,7 @@ impl TurnEventBuffer {
     /// is retained in metadata while `JournalEvent::turn` remains unset.
     pub fn begin_producer_turn(session_id: Option<&str>, producer_turn: u32) -> Self {
         Self {
+            trace_ingestion: None,
             events: std::collections::VecDeque::new(),
             dropped_events: 0,
             turn_start: std::time::Instant::now(),
@@ -3298,12 +3301,8 @@ impl TurnEventBuffer {
         if self.events.is_empty() {
             return Ok(());
         }
-        let events = self.events.make_contiguous();
-        annotate_dropped_turn_events(events, self.dropped_events);
-        writer.append_bulk(events)?;
-        self.events.clear();
-        self.dropped_events = 0;
-        Ok(())
+        self.enqueue_traces(false);
+        self.append_prepared(writer, false)
     }
 
     /// Best-effort flush on interruption: no fsync, marks events as partial.
@@ -3311,7 +3310,99 @@ impl TurnEventBuffer {
         if self.events.is_empty() {
             return Ok(());
         }
-        for event in &mut self.events {
+        self.enqueue_traces(true);
+        self.append_prepared(writer, true)
+    }
+
+    /// Bind a trusted runtime execution once; never reattribute a retained batch.
+    pub fn bind_trace_ingestion(
+        &mut self,
+        user: &str,
+        session: &str,
+        generation: u64,
+        sender: crate::event_ingestion::IngestionSender,
+    ) -> Result<(), &'static str> {
+        if user.is_empty() || self.session_id.as_deref() != Some(session) {
+            return Err("trace ingestion owner/session mismatch");
+        }
+        if let Some((owner, bound_session, bound_generation, _)) = &self.trace_ingestion {
+            return if owner == user && bound_session == session && *bound_generation == generation {
+                Ok(())
+            } else {
+                Err("trace ingestion execution already bound")
+            };
+        }
+        self.trace_ingestion = Some((user.into(), session.into(), generation, sender));
+        Ok(())
+    }
+
+    fn enqueue_traces(&mut self, interrupted: bool) {
+        let sink = self.trace_ingestion.clone();
+        let batch = self.prepare_flush(interrupted);
+        if let Some((user, session, _, sender)) = sink {
+            for event in batch {
+                if event.event_type == JournalEventType::TraceSpan
+                    && event.session_id.as_deref() == Some(session.as_str())
+                    && let Ok(event) =
+                        crate::event_ingestion::IngestionEvent::from_journal_event_with_redact(
+                            event, &user, true,
+                        )
+                {
+                    sender.enqueue(event);
+                }
+            }
+        }
+    }
+
+    /// Flush at the canonical owner boundary; enqueue survives local writer initialization failure.
+    pub fn flush_for_owner(
+        &mut self,
+        user: Option<&str>,
+        session: &str,
+        interrupted: bool,
+    ) -> std::io::Result<()> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        if self.session_id.as_deref() != Some(session)
+            || self
+                .trace_ingestion
+                .as_ref()
+                .is_some_and(|(owner, sid, _, _)| user != Some(owner.as_str()) || sid != session)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "trace flush scope mismatch",
+            ));
+        }
+        self.enqueue_traces(interrupted);
+        let writer = match user {
+            Some(user) => JournalWriter::for_user(user, session)?,
+            None => JournalWriter::new(session)?,
+        };
+        self.append_prepared(&writer, interrupted)
+    }
+
+    fn append_prepared(
+        &mut self,
+        writer: &JournalWriter,
+        interrupted: bool,
+    ) -> std::io::Result<()> {
+        let batch = self.events.make_contiguous();
+        if interrupted {
+            writer.append_bulk_no_sync(batch)?;
+        } else {
+            writer.append_bulk(batch)?;
+        }
+        self.events.clear();
+        self.dropped_events = 0;
+        Ok(())
+    }
+
+    /// Prepare one canonical batch for local and remote sinks without consuming it.
+    /// Repeated preparation is idempotent; a failed local write retains the batch.
+    pub fn prepare_flush(&mut self, interrupted: bool) -> &[JournalEvent] {
+        for event in self.events.iter_mut().filter(|_| interrupted) {
             let meta = event.metadata.get_or_insert_with(|| serde_json::json!({}));
             if let Some(obj) = meta.as_object_mut() {
                 obj.insert("partial".into(), serde_json::json!(true));
@@ -3319,10 +3410,7 @@ impl TurnEventBuffer {
         }
         let events = self.events.make_contiguous();
         annotate_dropped_turn_events(events, self.dropped_events);
-        writer.append_bulk_no_sync(events)?;
-        self.events.clear();
-        self.dropped_events = 0;
-        Ok(())
+        events
     }
 
     /// Drain collected events (for callers that persist elsewhere, e.g. DB).
@@ -4725,10 +4813,19 @@ struct JournalTailEntry {
 }
 
 fn read_journal_tail_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec<String>> {
+    read_bounded_tail_lines(path, max_lines, RECOVERY_TAIL_MAX_BYTES, false).map(|(lines, _)| lines)
+}
+
+fn read_bounded_tail_lines(
+    path: &Path,
+    max_lines: usize,
+    max_bytes: usize,
+    discard_clipped_record: bool,
+) -> std::io::Result<(Vec<String>, bool)> {
     use std::io::{Read, Seek};
 
     if max_lines == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), true));
     }
 
     let mut file = std::fs::File::open(path)?;
@@ -4737,8 +4834,10 @@ fn read_journal_tail_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec
     let mut bytes_read = 0usize;
     let mut newline_count = 0usize;
 
-    while pos > 0 && newline_count <= max_lines && bytes_read < RECOVERY_TAIL_MAX_BYTES {
-        let read_len = usize::min(RECOVERY_TAIL_CHUNK_BYTES, pos as usize);
+    while pos > 0 && newline_count <= max_lines && bytes_read < max_bytes {
+        let read_len = RECOVERY_TAIL_CHUNK_BYTES
+            .min(pos as usize)
+            .min(max_bytes - bytes_read);
         pos -= read_len as u64;
         file.seek(std::io::SeekFrom::Start(pos))?;
         let mut chunk = vec![0; read_len];
@@ -4754,7 +4853,19 @@ fn read_journal_tail_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec
         bytes.extend_from_slice(&chunk);
     }
 
-    let text = String::from_utf8_lossy(&bytes);
+    // Observation callers conservatively omit the boundary record, even if it
+    // happens to be complete. Recovery retains its historical line semantics.
+    let start = if discard_clipped_record && pos > 0 {
+        bytes
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(bytes.len(), |i| i + 1)
+    } else {
+        0
+    };
+    let text = String::from_utf8_lossy(&bytes[start..]);
+    let truncated =
+        pos > 0 || text.lines().filter(|line| !line.trim().is_empty()).count() > max_lines;
     let mut lines: Vec<String> = text
         .lines()
         .rev()
@@ -4768,7 +4879,55 @@ fn read_journal_tail_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec
         bytes.len(),
         lines.len(),
     );
-    Ok(lines)
+    Ok((lines, truncated))
+}
+
+/// Authorized owner-local observation window, not a complete journal or recovery image.
+pub struct JournalObservationWindow {
+    pub events: Vec<JournalEvent>,
+    pub available: bool,
+    pub truncated: bool,
+    pub malformed_records: usize,
+}
+
+/// Hard bounds apply before JSON decoding, including arbitrarily large records.
+pub fn read_journal_observation_window(
+    owner: &OwnerScope,
+    session_id: &str,
+) -> std::io::Result<JournalObservationWindow> {
+    let path = journal_file_path_for_owner(owner, session_id)?;
+    read_journal_observation_window_from_path(&path)
+}
+
+fn read_journal_observation_window_from_path(
+    path: &Path,
+) -> std::io::Result<JournalObservationWindow> {
+    let (lines, truncated) = match read_bounded_tail_lines(path, 512, 256 * 1024, true) {
+        Ok(window) => window,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(JournalObservationWindow {
+                events: vec![],
+                available: false,
+                truncated: false,
+                malformed_records: 0,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let mut events = Vec::new();
+    let mut malformed_records = 0;
+    for line in lines {
+        match serde_json::from_str(&line) {
+            Ok(event) => events.push(event),
+            Err(_) => malformed_records += 1,
+        }
+    }
+    Ok(JournalObservationWindow {
+        events,
+        available: true,
+        truncated,
+        malformed_records,
+    })
 }
 
 /// Read an exact logical tail without scanning from the beginning of the
@@ -8491,6 +8650,55 @@ mod tests {
     use super::*;
     use astra_core::{DriftCause, DriftEvidence, EvidenceType};
     use tempfile::tempdir;
+
+    #[test]
+    fn observation_window_distinguishes_missing_empty_and_clipped_records() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        assert!(
+            !read_journal_observation_window_from_path(&path)
+                .unwrap()
+                .available
+        );
+        std::fs::write(&path, "").unwrap();
+        let empty = read_journal_observation_window_from_path(&path).unwrap();
+        assert!(empty.available && !empty.truncated);
+        let event = TraceSpanBuilder::default()
+            .span_id("tail".into())
+            .name("test".into())
+            .start_us(0)
+            .end_us(0)
+            .build();
+        let line = serde_json::to_string(&event).unwrap();
+        std::fs::write(
+            &path,
+            format!("{}\ninvalid\n{line}\n", "x".repeat(300 * 1024)),
+        )
+        .unwrap();
+        let window = read_journal_observation_window_from_path(&path).unwrap();
+        assert!(window.truncated);
+        assert_eq!(window.events.len(), 1);
+        assert_eq!(window.malformed_records, 1);
+        std::fs::write(&path, format!("{line}\n").repeat(600)).unwrap();
+        let window = read_journal_observation_window_from_path(&path).unwrap();
+        assert!(window.truncated);
+        assert_eq!(window.events.len(), 512);
+    }
+
+    #[test]
+    fn bounded_tail_preserves_recovery_boundary_semantics() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        std::fs::write(&path, "old\nfirst\nlast\n").unwrap();
+        // The byte window starts exactly on a complete record. Recovery must
+        // retain it; observation may conservatively omit it with coverage loss.
+        let (recovery, clipped) = read_bounded_tail_lines(&path, 10, 11, false).unwrap();
+        assert_eq!(recovery, vec!["first", "last"]);
+        assert!(clipped);
+        let (observation, clipped) = read_bounded_tail_lines(&path, 10, 11, true).unwrap();
+        assert_eq!(observation, vec!["last"]);
+        assert!(clipped);
+    }
 
     const REAL_SESSION_0AC769_FIXTURE: &str =
         include_str!("../fixtures/real_session_0ac769_min.jsonl");
