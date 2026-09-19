@@ -57,10 +57,13 @@ retries reuse those exact templates. Their renderer version also binds history
 rendering and structured-summary validation; an unsupported version does not
 invoke the summary provider.
 
-This process-local capture is groundwork for Evaluation reproducibility, not a
-persisted experiment snapshot. Evaluation must bind these inputs to its frozen
-configuration and verify them at execution. Child hosts currently capture their
-own inputs; this does not establish a frozen parent/child execution tree.
+Evaluation persists these inputs in its required execution configuration.
+Trial start uses the stored date, exact sections, templates and cache enablement;
+it does not read current override files or replace the experiment date with the
+trial date. Work admission and optional auxiliary-call gates are captured
+separately because they have different semantics. Ordinary child hosts still
+capture their own inputs; the instruction-only Evaluation profile does not
+permit a delegated execution tree.
 
 ## Dynamic blocks
 

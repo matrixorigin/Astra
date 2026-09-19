@@ -136,6 +136,22 @@ with no measurements or no evidence references remain explicitly incomplete
 in both structured coverage and Markdown. These basic checks do not prove
 that every evaluation dimension has been measured or that a task verifier ran.
 
+Every experiment requires `conditions.execution_config`, with no missing-field
+fallback. This snapshot binds the admitted model and private route/proxy
+identities, transport policy, context budget, primary thinking, static prompt
+sections and metadata, experiment date, summary templates, cache enablement,
+auxiliary generation policies and call gates, effective loop limits, and the
+complete initial/hard/extension budget for each case. Case budgets must cover
+exactly the declared cases. Unknown contract or renderer versions are rejected.
+
+Prepare captures these values once. A new trial start loads the stored values
+and verifies current model authorization, private routing and auxiliary gate
+identity before binding execution. Both arms use the experiment date even when
+started on different days. An exact prepare or Run retry returns its durable
+identity before resolving new configuration. The same backbone consumers use
+the frozen values; live provider admission and actual provider outcomes remain
+external execution evidence rather than guarantees of identical model output.
+
 Every experiment requires `measurement_profile: "instruction-only.v1"`.
 This immutable version defines the required task, tool, context, provider,
 safety, reliability, and cost metrics and their units. Missing or unsupported

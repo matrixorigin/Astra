@@ -71,9 +71,10 @@ pub struct EvaluationCase {
     pub input_content: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrozenConditions {
+    pub execution_config: super::execution_config::EvaluationExecutionConfig,
     /// The executor must reject side effects outside the declared isolation
     /// profile instead of silently comparing different environments.
     pub isolation_profile: String,
@@ -316,7 +317,7 @@ pub enum TrialOrder {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExperimentSpec {
     pub schema_version: u32,
@@ -421,6 +422,28 @@ impl ExperimentSpec {
                     return Err("case verifier identity does not match frozen task verifier".into());
                 }
             }
+        }
+        self.conditions.execution_config.validate()?;
+        let config = &self.conditions.execution_config;
+        if config.runtime.round_budget_by_case.len() != case_ids.len()
+            || !config
+                .runtime
+                .round_budget_by_case
+                .keys()
+                .all(|id| case_ids.contains(id))
+        {
+            return Err(
+                "execution config round budgets must exactly cover evaluation cases".into(),
+            );
+        }
+        if config.model.offering_id != self.conditions.model_binding
+            || config.model.provider != self.conditions.provider_binding
+            || super::bootstrap::prepared_cache_policy_identity(
+                &config.model.provider,
+                config.model.cache_capability.as_ref(),
+            ) != self.conditions.cache_policy
+        {
+            return Err("frozen model bindings must match execution config".into());
         }
         for (field, value) in [
             ("isolation_profile", &self.conditions.isolation_profile),
@@ -941,6 +964,11 @@ mod tests {
             repetitions: 2,
             order,
             conditions: FrozenConditions {
+                execution_config: crate::evaluation::test_support::execution_config(
+                    "model-v1",
+                    "provider-v1",
+                    "case-a",
+                ),
                 isolation_profile: "prompt_only_private".to_string(),
                 model_binding: "model-v1".to_string(),
                 provider_binding: "provider-v1".to_string(),
@@ -959,6 +987,53 @@ mod tests {
             measurement_profile:
                 crate::evaluation::measurement_profile::MeasurementProfile::InstructionOnlyV1,
         }
+    }
+
+    #[test]
+    fn execution_config_is_required_and_round_budgets_cover_exact_case_set() {
+        let original = spec(TrialOrder::BaselineFirst);
+        let mut encoded = serde_json::to_value(&original).unwrap();
+        encoded["conditions"]
+            .as_object_mut()
+            .unwrap()
+            .remove("execution_config");
+        assert!(serde_json::from_value::<ExperimentSpec>(encoded).is_err());
+        let mut changed = original.clone();
+        let budget = changed
+            .conditions
+            .execution_config
+            .runtime
+            .round_budget_by_case
+            .remove("case-a")
+            .unwrap();
+        assert!(changed.validate().unwrap_err().contains("exactly cover"));
+        changed
+            .conditions
+            .execution_config
+            .runtime
+            .round_budget_by_case
+            .insert("other-case".into(), budget.clone());
+        assert!(changed.validate().unwrap_err().contains("exactly cover"));
+        changed
+            .conditions
+            .execution_config
+            .runtime
+            .round_budget_by_case
+            .insert("case-a".into(), budget);
+        assert!(changed.validate().unwrap_err().contains("exactly cover"));
+        let mut changed = original.clone();
+        changed.conditions.execution_config.runtime_contract_version += 1;
+        assert!(changed.validate().unwrap_err().contains("version"));
+        let mut changed = original.clone();
+        changed.conditions.execution_config.model.offering_id = "other-model".into();
+        assert!(changed.validate().unwrap_err().contains("model bindings"));
+        let mut changed = original.clone();
+        changed.conditions.execution_config.pre_turn_compaction_gate =
+            astra_turn_types::auxiliary_execution::AuxiliaryCallGate::Disabled;
+        assert_ne!(
+            original.spec_fingerprint().unwrap(),
+            changed.spec_fingerprint().unwrap()
+        );
     }
 
     #[test]
@@ -1023,6 +1098,17 @@ mod tests {
             let mut other_case = spec.cases[0].clone();
             other_case.case_id = "case-b".into();
             spec.cases.push(other_case);
+            let budget = spec
+                .conditions
+                .execution_config
+                .runtime
+                .round_budget_by_case["case-a"]
+                .clone();
+            spec.conditions
+                .execution_config
+                .runtime
+                .round_budget_by_case
+                .insert("case-b".into(), budget);
             spec.budget.max_trials = 8;
             let trials = spec.plan_trials().unwrap();
             for trial in &trials {
@@ -1053,6 +1139,17 @@ mod tests {
             task_verifier: None,
             input_content: None,
         });
+        let budget = spec
+            .conditions
+            .execution_config
+            .runtime
+            .round_budget_by_case["case-a"]
+            .clone();
+        spec.conditions
+            .execution_config
+            .runtime
+            .round_budget_by_case
+            .insert("case-b".into(), budget);
         spec.budget.max_trials = 8;
         let trials = spec.plan_trials().unwrap();
         for pair in trials.chunks_exact(2) {
@@ -1106,9 +1203,34 @@ mod tests {
         let mut left = spec(TrialOrder::BaselineFirst);
         left.experiment_id = "a__b".to_string();
         left.cases[0].case_id = "c".to_string();
+        let budget = left
+            .conditions
+            .execution_config
+            .runtime
+            .round_budget_by_case
+            .remove("case-a")
+            .unwrap();
+        left.conditions
+            .execution_config
+            .runtime
+            .round_budget_by_case
+            .insert("c".into(), budget);
         let mut right = spec(TrialOrder::BaselineFirst);
         right.experiment_id = "a".to_string();
         right.cases[0].case_id = "b__c".to_string();
+        let budget = right
+            .conditions
+            .execution_config
+            .runtime
+            .round_budget_by_case
+            .remove("case-a")
+            .unwrap();
+        right
+            .conditions
+            .execution_config
+            .runtime
+            .round_budget_by_case
+            .insert("b__c".into(), budget);
         assert_ne!(
             left.plan_trials().unwrap()[0].trial_id,
             right.plan_trials().unwrap()[0].trial_id

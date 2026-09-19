@@ -10715,10 +10715,21 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
         request.context.as_ref(),
     );
     let revision_hash = content_fingerprint("Frozen revision text");
-    let admitted_model = test_admitted_model_execution();
+    let admitted_model = crate::server::model_execution_admission::admit_model_execution(
+        &service.model_service,
+        &owner,
+        &astra_turn_types::ModelSelection {
+            offering_id: "model-test-model".into(),
+        },
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("admit the fixture model service route");
     let resolved_model = astra_services::runs::ResolvedModelSelection {
-        offering_id: "model-test-model".to_string(),
-        model_name: "test-model".to_string(),
+        offering_id: admitted_model.offering_id.clone(),
+        model_name: admitted_model.model_name.clone(),
     };
     let policy_hash = astra_services::evaluation::evaluation_policy_fingerprint(
         &astra_services::evaluation::EvaluationPolicyFingerprintInput {
@@ -10767,6 +10778,14 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
         repetitions: 1,
         order: astra_services::evaluation::TrialOrder::BaselineFirst,
         conditions: astra_services::evaluation::FrozenConditions {
+            execution_config:
+                crate::turn::execution_config::PreparedExecutionInputs::freeze_for_prepare(
+                    &admitted_model,
+                    &service.encryptor,
+                    "case-runtime",
+                    &request.message,
+                )
+                .expect("freeze the actual admitted fixture execution"),
             isolation_profile: "prompt_only_private".to_string(),
             model_binding: "model-test-model".to_string(),
             provider_binding: "openai".to_string(),
@@ -11328,6 +11347,7 @@ async fn evaluation_http_prepare_start_replays_and_reports() {
     let owner = format!("eval-http-owner-{}", Uuid::new_v4());
     let submission_key = format!("eval-http-{}", Uuid::new_v4());
     let state = crate::AppState::new(crate::ServiceInfo::default(), Arc::new(EvalHttpHealth))
+        .with_fernet_encryptor(test_encryptor().as_ref().clone())
         .with_auth_service(Arc::new(EvalHttpAuth))
         .with_session_service(Arc::new(
             astra_services::DatabaseSessionService::new(pool.settings().clone())
@@ -11460,7 +11480,10 @@ async fn evaluation_http_prepare_start_replays_and_reports() {
         StatusCode::CONFLICT,
         "paired second arm must wait for its predecessor: {premature}"
     );
-    assert_eq!(premature["error_code"], "evaluation_trial_order_blocked");
+    assert_eq!(
+        premature["error_code"], "evaluation_trial_order_blocked",
+        "premature start response: {premature}"
+    );
     assert_eq!(
         llm.requests.load(Ordering::SeqCst),
         calls_before_premature_start
@@ -11714,10 +11737,21 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
         revision_id: baseline_skill.version_id.clone(),
         content_hash: baseline_skill.content_hash.clone(),
     };
-    let admitted_model = test_admitted_model_execution();
+    let admitted_model = crate::server::model_execution_admission::admit_model_execution(
+        &service.model_service,
+        &owner,
+        &astra_turn_types::ModelSelection {
+            offering_id: "model-test-model".into(),
+        },
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("admit the fixture model service route");
     let resolved_model = astra_services::runs::ResolvedModelSelection {
-        offering_id: "model-test-model".to_string(),
-        model_name: "test-model".to_string(),
+        offering_id: admitted_model.offering_id.clone(),
+        model_name: admitted_model.model_name.clone(),
     };
     let policy_hash = astra_services::evaluation::evaluation_policy_fingerprint(
         &astra_services::evaluation::EvaluationPolicyFingerprintInput {
@@ -11766,6 +11800,14 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
         repetitions: 1,
         order: astra_services::evaluation::TrialOrder::BaselineFirst,
         conditions: astra_services::evaluation::FrozenConditions {
+            execution_config:
+                crate::turn::execution_config::PreparedExecutionInputs::freeze_for_prepare(
+                    &admitted_model,
+                    &service.encryptor,
+                    "case-skill-runtime",
+                    &request.message,
+                )
+                .expect("freeze the actual admitted fixture execution"),
             isolation_profile: "skill_inline_private".to_string(),
             model_binding: "model-test-model".to_string(),
             provider_binding: "openai".to_string(),
@@ -24038,6 +24080,121 @@ fn build_initial_state_sets_user_message() {
     assert_eq!(state.agentic_turn_budget, expected_budget);
     assert_eq!(state.message, "write a test");
     assert!(state.cancellation.token.is_none());
+}
+
+#[test]
+#[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+fn shared_assembly_consumes_frozen_execution_policy_without_resolving_defaults() {
+    use crate::turn::execution_config::PreparedExecutionInputs;
+    use astra_turn_core::chat_turn_heuristics::AgenticTurnBudget;
+    use astra_turn_types::ThinkingConfig;
+
+    let svc = test_service();
+    let request = test_request("review the current implementation");
+    assert!(request.execution_budget.is_none());
+    let admitted = test_admitted_model_execution();
+    let encryptor = test_encryptor();
+    let mut frozen = PreparedExecutionInputs::freeze_for_prepare(
+        &admitted,
+        &encryptor,
+        "frozen-case",
+        &request.message,
+    )
+    .expect("freeze actual admitted inputs");
+    // Persist deliberately different values from normal profile resolution.
+    let ordinary_budget = frozen.runtime.round_budget_by_case["frozen-case"].clone();
+    let budget = frozen
+        .runtime
+        .round_budget_by_case
+        .get_mut("frozen-case")
+        .unwrap();
+    budget.initial_turns = ordinary_budget.initial_turns + 1;
+    budget.extension_turns = ordinary_budget.extension_turns + 3;
+    budget.hard_turn_limit = std::num::NonZeroUsize::new(budget.initial_turns + 11);
+    let expected_budget = AgenticTurnBudget::new(
+        budget.initial_turns,
+        budget.hard_turn_limit,
+        budget.extension_turns,
+    );
+    frozen.primary_thinking = ThinkingConfig::Enabled {
+        budget_tokens: 1777,
+    };
+    frozen.runtime.max_turn_input_tokens = 12345;
+    frozen.runtime.max_identical_tool_calls += 1;
+    frozen.runtime.max_tools_per_turn += 2;
+    frozen.runtime.repeated_cache_hit_suppression += 3;
+    frozen.runtime.max_consecutive_empty_name += 4;
+    frozen.session_current_date = "1999-12-31".into();
+    let inputs =
+        PreparedExecutionInputs::from_frozen(&frozen, &admitted, &encryptor, "frozen-case")
+            .expect("rebind exact frozen inputs");
+    let edge = AgenticRunLifecycleService::extract_edge_context(&request).unwrap();
+    let constraints = RequestConstraints::default();
+    let facts = svc
+        .prepare_initial_execution_facts(
+            "test-user",
+            &request,
+            "frozen-session",
+            "frozen-run",
+            None,
+            &edge,
+            &inputs,
+        )
+        .unwrap();
+    let environment = svc.assemble_loop_environment(
+        "test-user",
+        &request,
+        "frozen-session",
+        "frozen-run",
+        None,
+        None,
+        None,
+        None,
+        &constraints,
+        &edge,
+        None,
+        None,
+        None,
+        Some(3),
+    );
+    let state = svc.assemble_loop_state(
+        &request,
+        "frozen-session",
+        "frozen-run",
+        constraints,
+        &edge,
+        None,
+        environment,
+        facts,
+        &inputs,
+    );
+    assert_eq!(state.agentic_turn_budget, expected_budget);
+    assert_eq!(state.max_turns, expected_budget.initial_turns);
+    assert_eq!(state.remaining_turns, expected_budget.initial_turns);
+    assert!(
+        state.budget_is_explicit,
+        "frozen budgets must not be promoted as fallback slices"
+    );
+    assert_eq!(state.thinking, frozen.primary_thinking);
+    assert_eq!(state.max_turn_input_tokens, 12345);
+    assert_eq!(
+        (
+            state.max_identical_tool_calls,
+            state.max_tools_per_turn,
+            state.repeated_cache_hit_suppression,
+            state.max_consecutive_empty_name
+        ),
+        (
+            frozen.runtime.max_identical_tool_calls,
+            frozen.runtime.max_tools_per_turn,
+            frozen.runtime.repeated_cache_hit_suppression,
+            frozen.runtime.max_consecutive_empty_name
+        ),
+    );
+    assert_eq!(
+        state.pipeline_session.as_ref().unwrap().current_date(),
+        "1999-12-31"
+    );
 }
 
 #[test]

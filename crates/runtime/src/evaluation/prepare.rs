@@ -12,8 +12,8 @@ use astra_core::{ErrorResponse, error_response, error_response_coded};
 use astra_services::evaluation::{
     DatabaseEvaluationPlanStore, EVALUATION_ADAPTER_PROFILE_VERSION, EvaluationBootstrapError,
     EvaluationExperimentPrepareRequest, EvaluationExperimentPrepareResponse, EvaluationTargetKind,
-    PreparedModelIdentity, PreparedSkillIdentity, build_prepared_experiment_spec,
-    prepared_cache_policy_identity, prepared_experiment_id, prepared_request_matches_spec,
+    PreparedSkillIdentity, build_prepared_experiment_spec, prepared_experiment_id,
+    prepared_request_matches_spec,
 };
 use astra_services::{DatabasePersonalSkillStore, PersonalSkillError};
 use astra_turn_types::ModelSelection;
@@ -123,16 +123,6 @@ pub async fn prepare_experiment(
         None,
     )
     .await?;
-    let model = PreparedModelIdentity {
-        offering_id: admitted.offering_id.clone(),
-        model_name: admitted.model_name.clone(),
-        provider: admitted.provider.clone(),
-        cache_capability: admitted.cache_capability,
-        cache_policy: prepared_cache_policy_identity(
-            &admitted.provider,
-            admitted.cache_capability.as_ref(),
-        ),
-    };
 
     let skill = if request.target.kind == EvaluationTargetKind::Skill {
         let skill_name = request.target.skill_name.as_deref().ok_or_else(|| {
@@ -217,11 +207,25 @@ pub async fn prepare_experiment(
         None
     };
 
+    let execution_config =
+        crate::turn::execution_config::PreparedExecutionInputs::freeze_for_prepare(
+            &admitted,
+            &state.fernet_encryptor,
+            &request.case.case_id,
+            &request.case.message,
+        )
+        .map_err(|detail| {
+            error_response_coded(
+                StatusCode::CONFLICT,
+                detail,
+                "evaluation_execution_config_unavailable",
+            )
+        })?;
     let spec = build_prepared_experiment_spec(
         owner_user_id,
         &experiment_id,
         &request,
-        &model,
+        &execution_config,
         skill.as_ref(),
     )
     .map_err(map_bootstrap_error)?;

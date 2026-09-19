@@ -343,6 +343,9 @@ mod tests {
             repetitions: 1,
             order: TrialOrder::BaselineFirst,
             conditions: FrozenConditions {
+                execution_config: crate::evaluation::test_support::execution_config(
+                    "model", "provider", "case",
+                ),
                 isolation_profile: "prompt_only_private".to_string(),
                 model_binding: "model".to_string(),
                 provider_binding: "provider".to_string(),

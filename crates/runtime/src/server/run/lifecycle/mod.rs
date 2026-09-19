@@ -9608,8 +9608,10 @@ impl AgenticRunLifecycleService {
                 "runtime_executor_authorization_invalid",
             )
         })?;
-        Self::thinking_from_chat_context(&request.context, request.model.as_deref())
-            .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+        if request.evaluation_admission.is_none() {
+            Self::thinking_from_chat_context(&request.context, request.model.as_deref())
+                .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+        }
         let provider_model_descriptor = Self::provider_model_descriptor(request)?;
         if provider_model_descriptor.is_some() {
             Self::validate_provider_runtime_authorized(request)?;
@@ -10839,15 +10841,20 @@ impl AgenticRunLifecycleService {
                 .transpose()
                 .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
         }
-        let runtime_config = astra_config::RuntimeConfig::load();
-        runtime_config
-            .runtime_limits
-            .resolve_turn_ceiling(
-                astra_turn_core::stop_hooks_yaml::is_plan_subtask_from_chat_context(
-                    &request.context,
-                ),
-            )
-            .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        let runtime_config = request
+            .evaluation_admission
+            .is_none()
+            .then(astra_config::RuntimeConfig::load);
+        if let Some(runtime_config) = runtime_config.as_ref() {
+            runtime_config
+                .runtime_limits
+                .resolve_turn_ceiling(
+                    astra_turn_core::stop_hooks_yaml::is_plan_subtask_from_chat_context(
+                        &request.context,
+                    ),
+                )
+                .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        }
         if request.model_selection_mode == ModelSelectionMode::ServerDefault {
             if request.provider_runtime_authorized
                 || request.model_selection.is_some()
@@ -10921,11 +10928,9 @@ impl AgenticRunLifecycleService {
             request.model = Some(resolved.model_name.clone());
             request.resolved_model_selection = Some(resolved);
             request.admitted_model_execution = Some(admitted);
-            let execution_inputs = crate::turn::execution_config::PreparedExecutionInputs::capture(
-                runtime_config,
-                user_id,
-                request.session_id.as_deref().unwrap_or_default(),
-            );
+            let execution_inputs = self
+                .prepare_execution_inputs(user_id, &request, runtime_config)
+                .await?;
             return Ok((request, execution_inputs));
         }
         let selection = Self::validate_model_selection_shape(request.model_selection.as_ref())?;
@@ -10975,11 +10980,9 @@ impl AgenticRunLifecycleService {
                 .await?,
             );
             request.model = Some(resolved.model_name.clone());
-            let execution_inputs = crate::turn::execution_config::PreparedExecutionInputs::capture(
-                runtime_config,
-                user_id,
-                request.session_id.as_deref().unwrap_or_default(),
-            );
+            let execution_inputs = self
+                .prepare_execution_inputs(user_id, &request, runtime_config)
+                .await?;
             return Ok((request, execution_inputs));
         }
         if request.resolved_model_selection.is_some() {
@@ -11005,12 +11008,87 @@ impl AgenticRunLifecycleService {
         request.model = Some(resolved.model_name.clone());
         request.resolved_model_selection = Some(resolved);
         request.admitted_model_execution = Some(admitted);
-        let execution_inputs = crate::turn::execution_config::PreparedExecutionInputs::capture(
-            runtime_config,
-            user_id,
-            request.session_id.as_deref().unwrap_or_default(),
-        );
+        let execution_inputs = self
+            .prepare_execution_inputs(user_id, &request, runtime_config)
+            .await?;
         Ok((request, execution_inputs))
+    }
+
+    async fn prepare_execution_inputs(
+        &self,
+        user_id: &str,
+        request: &ChatRequestData,
+        runtime_config: Option<astra_config::RuntimeConfig>,
+    ) -> Result<
+        crate::turn::execution_config::PreparedExecutionInputs,
+        (StatusCode, Json<ErrorResponse>),
+    > {
+        use crate::turn::execution_config::PreparedExecutionInputs;
+
+        let Some(admission) = request.evaluation_admission.as_ref() else {
+            return Ok(PreparedExecutionInputs::capture(
+                runtime_config.expect("ordinary request captured runtime configuration"),
+                user_id,
+                request.session_id.as_deref().unwrap_or_default(),
+            ));
+        };
+        let pool = self.shared_pool.clone().ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_store_unavailable",
+                "frozen execution configuration requires the durable evaluation store",
+            )
+        })?;
+        let store = DatabaseEvaluationPlanStore::new(pool);
+        let experiment = store
+            .load_experiment(user_id, &admission.experiment_id)
+            .await
+            .map_err(|error| {
+                evaluation_preflight_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "evaluation_store_error",
+                    error,
+                )
+            })?;
+        let binding = store
+            .load_trial(user_id, &admission.trial_id)
+            .await
+            .map_err(|error| {
+                evaluation_preflight_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "evaluation_store_error",
+                    error,
+                )
+            })?;
+        if binding.experiment_id != experiment.experiment_id
+            || binding.spec_fingerprint != experiment.spec_fingerprint
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_trial_identity_conflict",
+                "trial does not belong to the frozen experiment configuration",
+            ));
+        }
+        let admitted = request.admitted_model_execution.as_ref().ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_model_admission_missing",
+                "frozen execution requires current model authorization",
+            )
+        })?;
+        PreparedExecutionInputs::from_frozen(
+            &experiment.spec.conditions.execution_config,
+            admitted,
+            &self.encryptor,
+            &binding.trial.case_id,
+        )
+        .map_err(|error| {
+            evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_execution_config_mismatch",
+                error,
+            )
+        })
     }
 
     fn validate_effective_user_input(
@@ -13656,40 +13734,51 @@ impl AgenticRunLifecycleService {
         });
 
         let task_profile = infer_task_execution_profile(&prompt_user_message);
-        let runtime_turn_ceiling = execution_inputs
-            .runtime
-            .runtime_limits
-            .resolve_turn_ceiling(is_plan_subtask_from_chat_context(&request.context))
-            .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-        let requested_budget = request
-            .execution_budget
-            .as_ref()
-            .map(|budget| {
-                Ok::<_, (StatusCode, Json<ErrorResponse>)>(
-                    astra_turn_core::chat_turn_heuristics::AgenticTurnBudgetOverride {
-                        initial_turns: budget.initial_turns.map(|value| value as usize),
-                        hard_turn_limit: budget
-                            .hard_turn_limit
-                            .map(|value| {
-                                std::num::NonZeroUsize::new(value as usize).ok_or_else(|| {
-                                    error_response(
-                                        StatusCode::BAD_REQUEST,
-                                        "hard_turn_limit must be positive".to_string(),
-                                    )
-                                })
-                            })
-                            .transpose()?,
-                    },
+        let agentic_turn_budget = match &execution_inputs.policy {
+            crate::turn::execution_config::PreparedExecutionPolicy::Evaluation(frozen) => {
+                frozen.case_budget
+            }
+            crate::turn::execution_config::PreparedExecutionPolicy::Normal(runtime) => {
+                let runtime_turn_ceiling = runtime
+                    .runtime_limits
+                    .resolve_turn_ceiling(is_plan_subtask_from_chat_context(&request.context))
+                    .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+                let requested_budget = request
+                    .execution_budget
+                    .as_ref()
+                    .map(|budget| {
+                        Ok::<_, (StatusCode, Json<ErrorResponse>)>(
+                            astra_turn_core::chat_turn_heuristics::AgenticTurnBudgetOverride {
+                                initial_turns: budget.initial_turns.map(|value| value as usize),
+                                hard_turn_limit: budget
+                                    .hard_turn_limit
+                                    .map(|value| {
+                                        std::num::NonZeroUsize::new(value as usize).ok_or_else(
+                                            || {
+                                                error_response(
+                                                    StatusCode::BAD_REQUEST,
+                                                    "hard_turn_limit must be positive".to_string(),
+                                                )
+                                            },
+                                        )
+                                    })
+                                    .transpose()?,
+                            },
+                        )
+                    })
+                    .transpose()?;
+                astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
+                    task_profile,
+                    runtime_turn_ceiling,
+                    requested_budget,
                 )
-            })
-            .transpose()?;
-        let agentic_turn_budget =
-            astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
-                task_profile,
-                runtime_turn_ceiling,
-                requested_budget,
+            }
+        };
+        let budget_is_explicit = request.execution_budget.is_some()
+            || matches!(
+                &execution_inputs.policy,
+                crate::turn::execution_config::PreparedExecutionPolicy::Evaluation(_)
             );
-        let budget_is_explicit = request.execution_budget.is_some();
         let max_turns = agentic_turn_budget.initial_turns;
         // Use edge profile's git_root/cwd if available; fall back to provisioned
         // server workspace so web-agent sessions still load stop-hooks.yaml.
@@ -13710,11 +13799,18 @@ impl AgenticRunLifecycleService {
             .as_ref()
             .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
             .unwrap_or_default();
-        let max_turn_input_tokens = effective_max_turn_input_tokens(
-            astra_core::RuntimeLimits::global(),
-            request.model.as_deref(),
-            request.admitted_model_execution.as_ref(),
-        );
+        let max_turn_input_tokens = match &execution_inputs.policy {
+            crate::turn::execution_config::PreparedExecutionPolicy::Evaluation(frozen) => {
+                frozen.config.runtime.max_turn_input_tokens
+            }
+            crate::turn::execution_config::PreparedExecutionPolicy::Normal(_) => {
+                effective_max_turn_input_tokens(
+                    astra_core::RuntimeLimits::global(),
+                    request.model.as_deref(),
+                    request.admitted_model_execution.as_ref(),
+                )
+            }
+        };
         Ok(LoopExecutionFacts {
             messages: vec![user_message],
             tool_ledger_receipt: Default::default(),
@@ -13801,13 +13897,43 @@ impl AgenticRunLifecycleService {
             memory_extraction_service,
             harness,
         } = environment;
-        let thinking_config =
-            Self::thinking_from_chat_context(&request.context, request.model.as_deref())
-                .expect("thinking configuration was validated during request admission");
-        let resolved_tool_policy = execution_inputs
-            .runtime
-            .tool_selection
-            .resolve_for_model(request.model.as_deref());
+        let (thinking_config, tool_limits) = match &execution_inputs.policy {
+            crate::turn::execution_config::PreparedExecutionPolicy::Evaluation(frozen) => {
+                let limits = &frozen.config.runtime;
+                (
+                    frozen.config.primary_thinking.clone(),
+                    (
+                        limits.max_identical_tool_calls,
+                        limits.max_tools_per_turn,
+                        limits.repeated_cache_hit_suppression,
+                        limits.max_consecutive_empty_name,
+                    ),
+                )
+            }
+            crate::turn::execution_config::PreparedExecutionPolicy::Normal(runtime) => {
+                let thinking =
+                    Self::thinking_from_chat_context(&request.context, request.model.as_deref())
+                        .expect("thinking configuration was validated during request admission");
+                let limits = runtime
+                    .tool_selection
+                    .resolve_for_model(request.model.as_deref());
+                (
+                    thinking,
+                    (
+                        limits.max_identical_tool_calls,
+                        limits.max_tools_per_turn,
+                        limits.repeated_cache_hit_suppression,
+                        limits.max_consecutive_empty_name,
+                    ),
+                )
+            }
+        };
+        let (
+            max_identical_tool_calls,
+            max_tools_per_turn,
+            repeated_cache_hit_suppression,
+            max_consecutive_empty_name,
+        ) = tool_limits;
         AgenticLoopState {
             messages: facts.messages,
             run_transcript_capture: None,
@@ -13859,10 +13985,10 @@ impl AgenticRunLifecycleService {
             // give stronger models (opus/sonnet-4) more rope than haiku.
             // Security guards (shell_obfuscation, destructive_sql) are
             // unaffected and stay uniform across models.
-            max_identical_tool_calls: resolved_tool_policy.max_identical_tool_calls,
-            max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
-            repeated_cache_hit_suppression: resolved_tool_policy.repeated_cache_hit_suppression,
-            max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
+            max_identical_tool_calls,
+            max_tools_per_turn,
+            repeated_cache_hit_suppression,
+            max_consecutive_empty_name,
             stall: crate::turn::agentic_loop::host::StallTrackingState {
                 active_policy_feedback: facts.original.runtime_policy_evaluation.latest().clone(),
                 runtime_policy_evaluation: facts.original.runtime_policy_evaluation,

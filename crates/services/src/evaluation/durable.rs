@@ -79,7 +79,7 @@ fn execution_persistence_error(
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EvaluationExperimentRecord {
     pub owner_user_id: String,
     pub experiment_id: String,

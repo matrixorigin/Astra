@@ -129,15 +129,6 @@ pub fn prepared_request_matches_spec(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PreparedModelIdentity {
-    pub offering_id: String,
-    pub model_name: String,
-    pub provider: String,
-    pub cache_policy: String,
-    pub cache_capability: Option<crate::models::PromptCacheCapabilityData>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedSkillIdentity {
     pub skill_name: String,
     pub baseline_revision_id: String,
@@ -181,7 +172,7 @@ pub fn build_prepared_experiment_spec(
     _owner_user_id: &str,
     experiment_id: &str,
     request: &EvaluationExperimentPrepareRequest,
-    model: &PreparedModelIdentity,
+    execution_config: &super::execution_config::EvaluationExecutionConfig,
     skill: Option<&PreparedSkillIdentity>,
 ) -> Result<ExperimentSpec, EvaluationBootstrapError> {
     if experiment_id.trim().is_empty() {
@@ -209,16 +200,15 @@ pub fn build_prepared_experiment_spec(
             "max_wall_time_secs must be between 1 and {MAX_WALL_TIME_SECS}"
         )));
     }
+    execution_config
+        .validate()
+        .map_err(EvaluationBootstrapError::InvalidInput)?;
+    let model = &execution_config.model;
+    let cache_policy =
+        prepared_cache_policy_identity(&model.provider, model.cache_capability.as_ref());
     if model.offering_id != request.model_offering_id || model.provider.trim().is_empty() {
         return Err(EvaluationBootstrapError::Conflict(
             "model admission does not match the requested offering".to_string(),
-        ));
-    }
-    if model.cache_policy
-        != prepared_cache_policy_identity(&model.provider, model.cache_capability.as_ref())
-    {
-        return Err(EvaluationBootstrapError::Conflict(
-            "model cache policy is not a supported evaluation contract".to_string(),
         ));
     }
     let input_content_hash = prompt_context_fingerprint(&request.case.message, &[], &[], None);
@@ -231,7 +221,7 @@ pub fn build_prepared_experiment_spec(
     let tool_policy_hash = evaluation_policy_fingerprint(&EvaluationPolicyFingerprintInput {
         model_binding: &model.offering_id,
         provider_binding: &model.provider,
-        cache_policy: &model.cache_policy,
+        cache_policy: &cache_policy,
         resolved_model_selection: Some(&resolved_model_selection),
         admitted_provider: &model.provider,
         admitted_cache_capability: model.cache_capability.as_ref(),
@@ -265,12 +255,13 @@ pub fn build_prepared_experiment_spec(
         repetitions: 1,
         order: TrialOrder::BaselineFirst,
         conditions: FrozenConditions {
+            execution_config: execution_config.clone(),
             isolation_profile: "prompt_only_private".to_string(),
             model_binding: model.offering_id.clone(),
             provider_binding: model.provider.clone(),
             context_snapshot_hash: input_content_hash,
             tool_policy_hash,
-            cache_policy: model.cache_policy.clone(),
+            cache_policy,
             memory_isolation: MemoryIsolation::Disabled,
             data_isolation: DataIsolation::Disabled,
         },
@@ -674,6 +665,11 @@ mod tests {
             repetitions: 1,
             order: TrialOrder::BaselineFirst,
             conditions: FrozenConditions {
+                execution_config: crate::evaluation::test_support::execution_config(
+                    "model-1",
+                    "provider-1",
+                    "case-1",
+                ),
                 isolation_profile: "prompt_only_private".to_string(),
                 model_binding: "model-1".to_string(),
                 provider_binding: "provider-1".to_string(),
@@ -809,6 +805,13 @@ mod tests {
         assert!(matches!(error, EvaluationBootstrapError::Conflict(_)));
     }
 
+    fn prepared_config() -> super::super::execution_config::EvaluationExecutionConfig {
+        let mut config =
+            crate::evaluation::test_support::execution_config("model-1", "openai", "case-1");
+        config.model.model_name = "model-name".into();
+        config
+    }
+
     fn prepared_request(kind: EvaluationTargetKind) -> EvaluationExperimentPrepareRequest {
         EvaluationExperimentPrepareRequest {
             submission_idempotency_key: "submit-prepare-1".to_string(),
@@ -849,18 +852,19 @@ mod tests {
             "owner-1",
             "evx_prepare",
             &request,
-            &PreparedModelIdentity {
-                offering_id: "model-1".to_string(),
-                model_name: "model-name".to_string(),
-                provider: "openai".to_string(),
-                cache_policy: "provider_default_recorded".to_string(),
-                cache_capability: None,
-            },
+            &prepared_config(),
             None,
         )
         .expect("prepared spec");
         assert_eq!(spec.plan_trials().expect("trials").len(), 2);
         assert_eq!(spec.conditions.provider_binding, "openai");
+        assert_eq!(spec.conditions.execution_config, prepared_config());
+        let mut wrong_model = prepared_config();
+        wrong_model.model.offering_id = "other-model".into();
+        assert!(matches!(
+            build_prepared_experiment_spec("owner-1", "evx_prepare", &request, &wrong_model, None),
+            Err(EvaluationBootstrapError::Conflict(_))
+        ));
         assert_eq!(
             spec.target.baseline.content.as_deref(),
             Some("baseline prompt")
@@ -906,13 +910,7 @@ mod tests {
             "owner-1",
             "evx_edge",
             &request,
-            &PreparedModelIdentity {
-                offering_id: "model-1".to_string(),
-                model_name: "model-name".to_string(),
-                provider: "openai".to_string(),
-                cache_policy: "provider_default_recorded".to_string(),
-                cache_capability: None,
-            },
+            &prepared_config(),
             None,
         )
         .expect("prepared spec");
@@ -973,13 +971,7 @@ mod tests {
             "owner-1",
             "evx_skill",
             &request,
-            &PreparedModelIdentity {
-                offering_id: "model-1".to_string(),
-                model_name: "model-name".to_string(),
-                provider: "openai".to_string(),
-                cache_policy: "provider_default_recorded".to_string(),
-                cache_capability: None,
-            },
+            &prepared_config(),
             Some(&PreparedSkillIdentity {
                 skill_name: "reviewer".to_string(),
                 baseline_revision_id: "base".to_string(),
@@ -1003,13 +995,7 @@ mod tests {
         request.target.skill_name = Some("reviewer".to_string());
         request.target.baseline.content = None;
         request.target.candidate.content = None;
-        let model = PreparedModelIdentity {
-            offering_id: "model-1".to_string(),
-            model_name: "model-name".to_string(),
-            provider: "openai".to_string(),
-            cache_policy: "provider_default_recorded".to_string(),
-            cache_capability: None,
-        };
+        let model = prepared_config();
         let spec = build_prepared_experiment_spec(
             "owner-1",
             "evx_skill_start",
@@ -1078,13 +1064,7 @@ mod tests {
         let request = prepared_request(EvaluationTargetKind::Prompt);
         let mut same = request.clone();
         same.target.candidate.revision_id = same.target.baseline.revision_id.clone();
-        let model = PreparedModelIdentity {
-            offering_id: "model-1".to_string(),
-            model_name: "model-name".to_string(),
-            provider: "openai".to_string(),
-            cache_policy: "provider_default_recorded".to_string(),
-            cache_capability: None,
-        };
+        let model = prepared_config();
         let same_spec = build_prepared_experiment_spec("owner-1", "evx_same", &same, &model, None)
             .expect("A/A is a valid controlled comparison");
         assert_eq!(
@@ -1134,13 +1114,7 @@ mod tests {
             "owner-1",
             "evx_replay",
             &request,
-            &PreparedModelIdentity {
-                offering_id: "model-1".to_string(),
-                model_name: "model-name".to_string(),
-                provider: "openai".to_string(),
-                cache_policy: "provider_default_recorded".to_string(),
-                cache_capability: None,
-            },
+            &prepared_config(),
             None,
         )
         .expect("spec");

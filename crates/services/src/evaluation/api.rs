@@ -59,7 +59,7 @@ pub struct EvaluationPrepareCase {
     pub verifier_config: Option<super::task_verifier::JsonValueEqualsConfig>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationExperimentPrepareResponse {
     pub experiment: super::durable::EvaluationExperimentRecord,

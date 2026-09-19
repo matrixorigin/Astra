@@ -1345,12 +1345,17 @@ mod tests {
             repetitions: 1,
             order: TrialOrder::BaselineFirst,
             conditions: FrozenConditions {
+                execution_config: crate::evaluation::test_support::execution_config(
+                    "model-v1",
+                    "provider-a",
+                    "case-a",
+                ),
                 isolation_profile: "prompt_only_private".to_string(),
                 model_binding: "model-v1".to_string(),
                 provider_binding: "provider-a".to_string(),
                 context_snapshot_hash: "ctx-a".to_string(),
                 tool_policy_hash: "policy-a".to_string(),
-                cache_policy: "recorded".to_string(),
+                cache_policy: "provider_default_recorded".to_string(),
                 memory_isolation: MemoryIsolation::Disabled,
                 data_isolation: DataIsolation::Disabled,
             },
@@ -1464,7 +1469,13 @@ mod tests {
             MaterializationOutcome::Available,
         );
         assert!(matches!(
-            validate_receipt_set(&binding, &spec, &envelope, &[context.clone()], Utc::now(),),
+            validate_receipt_set(
+                &binding,
+                &spec,
+                &envelope,
+                std::slice::from_ref(&context),
+                Utc::now(),
+            ),
             Err(MaterializationValidationError::MissingComponent(
                 MaterializationComponentKind::Policy
             ))

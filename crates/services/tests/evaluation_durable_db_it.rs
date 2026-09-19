@@ -6,6 +6,12 @@
 
 mod common;
 
+#[cfg(test)]
+mod execution_fixture {
+    use astra_services as services;
+    include!("fixtures/evaluation_execution_config.rs");
+}
+
 use astra_core::SharedPool;
 use astra_core::composite_snapshot::CompositeSnapshot;
 use astra_services::evaluation::TrialUnit;
@@ -55,6 +61,11 @@ fn spec(experiment_id: &str) -> ExperimentSpec {
         repetitions: 1,
         order: TrialOrder::BaselineFirst,
         conditions: FrozenConditions {
+            execution_config: execution_fixture::execution_config(
+                "model-v1",
+                "provider-v1",
+                "case-a",
+            ),
             isolation_profile: "prompt_only_private".to_string(),
             model_binding: "model-v1".to_string(),
             provider_binding: "provider-v1".to_string(),
@@ -451,7 +462,13 @@ async fn materialization_receipts_are_owner_scoped_idempotent_and_fail_closed() 
         .expect("current generation admits the exact receipt set");
     assert_eq!(admitted.len(), 2);
     assert!(matches!(
-        validate_receipt_set(&binding, &experiment.spec, &envelope, &[first.clone()], now,),
+        validate_receipt_set(
+            &binding,
+            &experiment.spec,
+            &envelope,
+            std::slice::from_ref(&first),
+            now,
+        ),
         Err(MaterializationValidationError::MissingComponent(
             MaterializationComponentKind::Policy
         ))

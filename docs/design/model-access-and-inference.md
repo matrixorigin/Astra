@@ -980,12 +980,20 @@ These settings do not replace Offering authorization or endpoint-specific networ
 restrictions. A transport snapshot alone is not a complete Evaluation execution
 snapshot: context, prompt, model, and runtime policy inputs must also be bound.
 
-Root Run preparation captures its RuntimeConfig once. Admission's round-limit
-validation, initial loop policy, host tool surface, and primary/fallback context
-budget resolution use that captured value. An existing Evaluation Run replay
-returns before new preparation. This process-local capture is not yet a durable
-experiment configuration: evaluation preparation and trial admission must bind
-the complete effective execution inputs, including prompt and auxiliary policy.
+Ordinary root Run preparation captures its RuntimeConfig once. Admission's
+round-limit validation, initial loop policy, host tool surface, and context
+budget resolution use that captured value. Evaluation instead requires the
+persisted `conditions.execution_config`: its model projection, transport,
+context, thinking, prompt inputs, auxiliary policies and case budgets feed the
+same consumers directly. It does not reconstruct a RuntimeConfig or resolve
+those settings again at start. Exact existing-Run replay precedes preparation.
+
+New Evaluation starts reauthorize the Offering and verify its secret-free
+projection and private proxy binding. Credential rotation is allowed when these
+behavior identities remain equal. Later model revalidation applies the same
+comparison, including auxiliary calls; Evaluation cannot switch to a fallback
+model. Provider queue and quota admission remain live operational guards and
+are not bypassed or represented as frozen model output.
 
 Each summary client consumes one resolved generation policy for its operation
 and inference purpose. The policy carries thinking, temperature emission, and

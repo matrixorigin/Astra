@@ -4,6 +4,47 @@ use serde::{Deserialize, Serialize};
 
 pub const AUXILIARY_GENERATION_POLICY_VERSION: u32 = 1;
 
+/// Captured Work-classifier policy; boundary eligibility remains turn-local.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkAdmissionGate {
+    Allowed,
+    Disabled,
+    BoundaryOnly,
+}
+
+impl WorkAdmissionGate {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Disabled => "disabled",
+            Self::BoundaryOnly => "boundary_only",
+        }
+    }
+}
+
+/// Captured admission decision for optional auxiliary calls. This required
+/// enum has no default or deserialization aliases; Work admission is separate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuxiliaryCallGate {
+    Allowed,
+    Disabled,
+    BoundaryOnly,
+    ProviderAdmissionEnabled,
+}
+
+impl AuxiliaryCallGate {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Disabled => "disabled",
+            Self::BoundaryOnly => "boundary_only",
+            Self::ProviderAdmissionEnabled => "provider_admission_enabled",
+        }
+    }
+}
+
 /// Final temperature decision for one auxiliary inference call.
 ///
 /// This is deliberately distinct from `Option<f64>`: both an inherited route

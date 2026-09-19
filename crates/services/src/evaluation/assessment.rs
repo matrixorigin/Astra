@@ -524,12 +524,17 @@ mod tests {
             repetitions: 2,
             order: TrialOrder::BaselineFirst,
             conditions: FrozenConditions {
+                execution_config: crate::evaluation::test_support::execution_config(
+                    "model-v1",
+                    "provider-v1",
+                    "case-1",
+                ),
                 isolation_profile: "prompt_only_private".to_string(),
                 model_binding: "model-v1".to_string(),
                 provider_binding: "provider-v1".to_string(),
                 context_snapshot_hash: "sha256:context".to_string(),
                 tool_policy_hash: "sha256:tools".to_string(),
-                cache_policy: "recorded".to_string(),
+                cache_policy: "provider_default_recorded".to_string(),
                 memory_isolation: MemoryIsolation::Disabled,
                 data_isolation: DataIsolation::Disabled,
             },
@@ -642,6 +647,17 @@ mod tests {
             task_verifier: None,
             input_content: None,
         });
+        let budget = spec
+            .conditions
+            .execution_config
+            .runtime
+            .round_budget_by_case["case-1"]
+            .clone();
+        spec.conditions
+            .execution_config
+            .runtime
+            .round_budget_by_case
+            .insert("case-2".into(), budget);
         spec.budget.max_trials = 8;
         let planned = spec.plan_trials().unwrap();
         let report = build_comparison_for_plan(

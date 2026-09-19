@@ -28502,8 +28502,7 @@ mod tests {
 
             let evaluation = if evaluation {
                 use crate::evaluation::{
-                    DatabaseEvaluationPlanStore, PreparedModelIdentity,
-                    build_prepared_experiment_spec,
+                    DatabaseEvaluationPlanStore, build_prepared_experiment_spec,
                 };
                 let request = serde_json::from_value(json!({
                     "submission_idempotency_key": "atomic-start",
@@ -28516,13 +28515,7 @@ mod tests {
                     &user_id,
                     &format!("experiment-{}", Uuid::new_v4()),
                     &request,
-                    &PreparedModelIdentity {
-                        offering_id: "model".into(),
-                        model_name: "model".into(),
-                        provider: "openai".into(),
-                        cache_policy: "provider_default_recorded".into(),
-                        cache_capability: None,
-                    },
+                    &crate::evaluation::test_support::execution_config("model", "openai", "case"),
                     None,
                 )
                 .unwrap();

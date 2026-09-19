@@ -4,6 +4,7 @@ pub mod bootstrap;
 pub mod database;
 pub mod durable;
 pub mod execution;
+pub mod execution_config;
 pub mod experiment;
 pub mod materialization;
 pub mod measurement_profile;
@@ -28,9 +29,8 @@ pub use assessment::{
 };
 pub use bootstrap::{
     EVALUATION_ADAPTER_PROFILE_VERSION, EvaluationBootstrapError, EvaluationTrialStartPlan,
-    PreparedModelIdentity, PreparedSkillIdentity, build_prepared_experiment_spec,
-    prepare_trial_start, prepared_cache_policy_identity, prepared_experiment_id,
-    prepared_request_matches_spec,
+    PreparedSkillIdentity, build_prepared_experiment_spec, prepare_trial_start,
+    prepared_cache_policy_identity, prepared_experiment_id, prepared_request_matches_spec,
 };
 pub use database::DatabaseEvaluationService;
 pub use durable::{
@@ -44,6 +44,10 @@ pub use execution::{
     EvaluationSkillRevision, content_fingerprint, evaluation_component_idempotency_key,
     evaluation_policy_fingerprint, prompt_context_fingerprint, prompt_only_snapshot_envelope,
     prompt_policy_fingerprint, terminal_run_observation,
+};
+pub use execution_config::{
+    EVALUATION_EXECUTION_CONFIG_SCHEMA_VERSION, EVALUATION_RUNTIME_CONTRACT_VERSION,
+    EvaluationExecutionConfig, FrozenRoundBudget, InstructionOnlyRuntimeConfig,
 };
 pub use experiment::{
     DataIsolation, EXPERIMENT_SCHEMA_VERSION, EvaluationBudget, EvaluationCase, EvaluationTarget,
@@ -68,3 +72,9 @@ pub use report::{
 };
 pub use service::EvaluationService;
 pub use types::*;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate as services;
+    include!("../../tests/fixtures/evaluation_execution_config.rs");
+}

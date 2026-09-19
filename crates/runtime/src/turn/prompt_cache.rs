@@ -146,8 +146,19 @@ impl PromptCacheConfig {
         cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
         provider: &str,
     ) -> Self {
-        let cache_enabled = !std::env::var("ASTRA_TEST_PROMPT_CACHE_DISABLED")
-            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        Self::from_captured_enablement(cache_capability, provider, Self::capture_enablement())
+    }
+
+    pub(crate) fn capture_enablement() -> bool {
+        !std::env::var("ASTRA_TEST_PROMPT_CACHE_DISABLED")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    }
+
+    pub(crate) fn from_captured_enablement(
+        cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+        provider: &str,
+        cache_enabled: bool,
+    ) -> Self {
         let capability =
             astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider(
                 cache_capability,
