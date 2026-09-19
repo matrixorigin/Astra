@@ -1388,7 +1388,7 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             concat!(
                 "#!/bin/sh\n",
                 "if [ \"$1\" = session ] && [ \"$2\" = cancel ] && [ \"$3\" = 550e8400-e29b-41d4-a716-446655440000 ]; then\n",
-                "  printf '%s\\n' '{\"status\":\"cancelled\"}'\n",
+                "  printf '%s\\n' '{\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"status\":\"cancelled\",\"execution_settled\":true}'\n",
                 "  exit 0\n",
                 "fi\n",
                 "events=; next_is_events=0\n",

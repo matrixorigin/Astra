@@ -906,7 +906,7 @@ mod tests {
                     "#!/bin/sh\n",
                     "printf '%s\\n' \"$@\" >> '{}'\n",
                     "if [ \"$3\" = session ] && [ \"$4\" = cancel ] && [ \"$5\" = 550e8400-e29b-41d4-a716-446655440000 ]; then\n",
-                    "  printf '%s\\n' '{{\"status\":\"cancelled\"}}'\n",
+                    "  printf '%s\\n' '{{\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"status\":\"cancelled\",\"execution_settled\":true}}'\n",
                     "  exit 0\n",
                     "fi\n",
                     "printf '%s\\n' '{{\"trace_id\":null,\"request_id\":null,\"run_id\":\"run-1\",\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"text\":\"pong\",\"final_state\":\"completed\",\"interruption_kind\":null,\"tool_result_class_counts\":{{}},\"prompt_tokens\":0,\"fresh_prompt_tokens\":0,\"cache\":{{\"hit\":false,\"read_tokens\":0,\"creation_tokens\":0}},\"completion_tokens\":0,\"llm_rounds\":0,\"tool_calls_count\":0,\"tools_used\":[],\"persistence_error\":null,\"exit_code\":0,\"success\":true,\"error_kind\":null}}'\n",

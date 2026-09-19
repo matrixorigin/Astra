@@ -44,6 +44,7 @@ import type {
   RuntimeSkillListParams,
   RuntimeSessionListResponse,
   RuntimeSessionResponse,
+  RuntimeSessionCancellationResponse,
   RuntimeSessionUpdateBody,
   RuntimeTranscriptParams,
   RuntimeTranscriptResponse,
@@ -53,6 +54,7 @@ import type {
   SessionActivityResponse,
   SessionAuditSummary,
   SessionInfo,
+  SessionCancellationResult,
   SessionUpdateBody,
   SkillInfo,
   SkillRecord,
@@ -2838,10 +2840,40 @@ export class AstraClient {
     return normalizeSession(raw);
   }
 
-  /** `POST /sessions/{id}/cancel` */
-  async cancelSession(sessionId: string): Promise<SessionInfo> {
-    const raw = await this.post<SessionWire>(sessionCancelPath(sessionId), {});
-    return normalizeSession(raw);
+  /** `POST /sessions/{id}/cancel`. Pending cancellation returns executionSettled=false. */
+  async cancelSession(sessionId: string): Promise<SessionCancellationResult> {
+    const raw = await this.post<RuntimeSessionCancellationResponse>(
+      sessionCancelPath(sessionId),
+      {},
+    );
+    if (
+      raw.session_id !== sessionId ||
+      typeof raw.execution_settled !== "boolean" ||
+      (raw.workspace_blocker != null && typeof raw.workspace_blocker !== "string") ||
+      raw.status !== (raw.execution_settled ? "cancelled" : "cancellation_requested") ||
+      !Array.isArray(raw.runs) ||
+      raw.runs.some((run) =>
+        run === null || typeof run !== "object" ||
+        typeof run.run_id !== "string" || run.run_id.trim().length === 0 ||
+        typeof run.status !== "string" || run.status.trim().length === 0 ||
+        typeof run.execution_settled !== "boolean" ||
+        (raw.execution_settled && !run.execution_settled)
+      )
+    ) {
+      throw new Error(
+        "Astra returned an invalid session cancellation response; execution settlement is unconfirmed.",
+      );
+    }
+    return {
+      ...normalizeSession(raw),
+      executionSettled: raw.execution_settled,
+      workspaceBlocker: raw.workspace_blocker,
+      runs: raw.runs.map((run) => ({
+        runId: run.run_id,
+        status: run.status,
+        executionSettled: run.execution_settled,
+      })),
+    };
   }
 
   /** `GET /sessions/{id}/activity` */

@@ -747,6 +747,7 @@ async fn execution_switch_is_idempotent_retriable_and_workspace_exclusive() {
         Err(SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
             ref owner_session_id,
             ref owner_branch_id,
+            ..
         }) if owner_session_id == &key.session_id && owner_branch_id == &key.branch_id
     ));
 
@@ -907,6 +908,7 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
             SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
                 ref owner_session_id,
                 ref owner_branch_id,
+                ..
             } if owner_session_id == &work_key.session_id && owner_branch_id == &work_key.branch_id
         ),
         "unexpected claim failure: {error:?}"

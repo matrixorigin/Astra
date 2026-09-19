@@ -1,6 +1,9 @@
 use super::*;
 use astra_services::runs::{RunStatusCasRequest, RunUsageOwnerUpdateRequest};
 
+#[path = "cancellation_db_tests.rs"]
+mod cancellation_db_tests;
+
 #[test]
 fn explain_artifact_publication_requires_a_durable_terminal_status() {
     assert!(explain_artifact_publishable_status(RunStatus::Completed));
@@ -7483,6 +7486,7 @@ struct FaultInjectedRunStateStore {
     interaction_wait_release: Option<Arc<tokio::sync::Notify>>,
     counters: StdMutex<FaultInjectedRunStoreCounters>,
     append_delay: Duration,
+    cancellation_discovery_delay: Duration,
     terminal_transition_delay: Duration,
     terminal_transition_entries: AtomicUsize,
     appended_batches: StdMutex<Vec<Vec<Value>>>,
@@ -7516,6 +7520,7 @@ impl FaultInjectedRunStateStore {
             interaction_wait_release: None,
             counters: StdMutex::new(FaultInjectedRunStoreCounters::default()),
             append_delay: Duration::ZERO,
+            cancellation_discovery_delay: Duration::ZERO,
             terminal_transition_delay: Duration::ZERO,
             terminal_transition_entries: AtomicUsize::new(0),
             appended_batches: StdMutex::new(Vec::new()),
@@ -7787,6 +7792,16 @@ impl RunStateStore for FaultInjectedRunStateStore {
 
     async fn request_run_cancellation(&self, user_id: &str, run_id: &str) -> Result<bool, String> {
         self.inner.request_run_cancellation(user_id, run_id).await
+    }
+
+    async fn request_session_cancellation(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<(), String> {
+        self.inner
+            .request_session_cancellation(user_id, session_id)
+            .await
     }
 
     async fn cancel_if_exact_live_owner(
@@ -8337,6 +8352,9 @@ impl RunStateStore for FaultInjectedRunStateStore {
         limit: u32,
         cursor: Option<RunListCursor>,
     ) -> Result<astra_services::runs::DurableRunListPage, String> {
+        if !self.cancellation_discovery_delay.is_zero() {
+            tokio::time::sleep(self.cancellation_discovery_delay).await;
+        }
         self.inner
             .list_active_session_runs_cursor(user_id, session_id, limit, cursor)
             .await
@@ -21106,34 +21124,42 @@ async fn active_run_control_watcher_times_out_a_hung_provider_and_polls_again() 
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn cancel_session_runs_cancels_active_run_for_that_session_only() {
     let svc = test_service();
-    let mut session_a = test_request("task a");
-    session_a.session_id = Some("session-a".to_string());
-    let run_a = ok(svc.create_run("user-1".into(), session_a).await);
-
-    let mut session_b = test_request("task b");
-    session_b.session_id = Some("session-b".to_string());
-    let run_b = ok(svc.create_run("user-1".into(), session_b).await);
+    // Keep controlled executors live; provider-failure cleanup in a spawned
+    // production loop can independently cancel the unrelated fixture's token.
+    for (run_id, session_id) in [("run-a", "session-a"), ("run-b", "session-b")] {
+        svc.run_engine
+            .start_run(run_id, "user-1", session_id)
+            .await
+            .unwrap();
+        let (local, _, _, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
+            run_id.into(),
+            session_id.into(),
+            "user-1".into(),
+        );
+        svc.runs.write().await.insert(run_id.into(), local);
+    }
 
     let cancelled = ok(svc
         .cancel_session_runs("session-a".to_string(), "user-1".to_string())
         .await);
 
-    assert_eq!(cancelled.len(), 1);
-    assert_eq!(cancelled[0].run_id, run_a.run_id);
-    assert_eq!(cancelled[0].status, "cancellation_requested");
+    assert_eq!(cancelled.runs.len(), 1);
+    assert_eq!(cancelled.runs[0].run_id, "run-a");
+    assert_eq!(cancelled.runs[0].status, "cancellation_requested");
+    assert!(!cancelled.execution_settled);
     assert_eq!(
-        svc.test_llm_cancel_token_is_cancelled(&run_a.run_id).await,
+        svc.test_llm_cancel_token_is_cancelled("run-a").await,
         Some(true)
     );
     assert_eq!(
-        svc.test_llm_cancel_token_is_cancelled(&run_b.run_id).await,
+        svc.test_llm_cancel_token_is_cancelled("run-b").await,
         Some(false),
         "session cancel must not cancel runs from a different session"
     );
-    let status_b = ok(svc.get_run_status(run_b.run_id, "user-1".into()).await);
+    let status_b = ok(svc.get_run_status("run-b".into(), "user-1".into()).await);
     assert_eq!(status_b.status, "running");
 }
 
@@ -21170,9 +21196,196 @@ async fn cancel_session_runs_includes_nonblocking_paused_history() {
     let cancelled = ok(svc
         .cancel_session_runs("session-paused".to_string(), "user-1".to_string())
         .await);
-    assert_eq!(cancelled.len(), 1);
-    assert_eq!(cancelled[0].run_id, run.run_id);
-    assert_eq!(cancelled[0].status, "cancellation_requested");
+    assert_eq!(cancelled.runs.len(), 1);
+    assert_eq!(cancelled.runs[0].run_id, run.run_id);
+    assert_eq!(cancelled.runs[0].status, STATUS_CANCELLED);
+    assert!(cancelled.execution_settled);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancel_session_runs_retry_keeps_terminal_local_execution_pending() {
+    let svc = test_service();
+    svc.run_engine
+        .start_run("terminal-live", "user-1", "session-terminal-live")
+        .await
+        .unwrap();
+    svc.run_engine
+        .persist_status(
+            "user-1",
+            "session-terminal-live",
+            "terminal-live",
+            STATUS_COMPLETED,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let (mut local, _, _, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
+        "terminal-live".into(),
+        "session-terminal-live".into(),
+        "user-1".into(),
+    );
+    local.execution_live = true;
+    svc.runs.write().await.insert("terminal-live".into(), local);
+    for _ in 0..2 {
+        let pending = ok(svc
+            .cancel_session_runs("session-terminal-live".into(), "user-1".into())
+            .await);
+        assert!(!pending.execution_settled);
+        assert_eq!(pending.runs.len(), 1);
+        assert_eq!(pending.runs[0].status, STATUS_COMPLETED);
+        assert!(!pending.runs[0].execution_settled);
+    }
+    {
+        let mut runs = svc.runs.write().await;
+        let run = runs.get_mut("terminal-live").unwrap();
+        run.execution_live = false;
+        run.settlement_in_progress = true;
+    }
+    let pending = ok(svc
+        .cancel_session_runs("session-terminal-live".into(), "user-1".into())
+        .await);
+    assert!(
+        !pending.execution_settled,
+        "terminal accounting must finish too"
+    );
+    svc.runs
+        .write()
+        .await
+        .get_mut("terminal-live")
+        .unwrap()
+        .settlement_in_progress = false;
+    let settled = ok(svc
+        .cancel_session_runs("session-terminal-live".into(), "user-1".into())
+        .await);
+    assert!(settled.execution_settled);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancel_session_runs_waits_for_retained_terminal_target_to_stop() {
+    let svc = Arc::new(test_service());
+    svc.run_engine
+        .start_run("draining", "user-1", "session-draining")
+        .await
+        .unwrap();
+    svc.run_engine
+        .persist_status(
+            "user-1",
+            "session-draining",
+            "draining",
+            STATUS_COMPLETED,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let (mut local, _, _, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
+        "draining".into(),
+        "session-draining".into(),
+        "user-1".into(),
+    );
+    local.execution_live = true;
+    svc.runs.write().await.insert("draining".into(), local);
+    let release = Arc::clone(&svc);
+    let stopped = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        release
+            .runs
+            .write()
+            .await
+            .get_mut("draining")
+            .unwrap()
+            .execution_live = false;
+    });
+    let settled = ok(svc
+        .cancel_session_runs("session-draining".into(), "user-1".into())
+        .await);
+    stopped.await.unwrap();
+    assert!(settled.execution_settled);
+    assert_eq!(
+        settled.runs.len(),
+        1,
+        "the terminal target must survive rediscovery"
+    );
+    assert_eq!(settled.runs[0].status, STATUS_COMPLETED);
+    assert!(settled.runs[0].execution_settled);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancel_session_runs_missing_pre_run_identity_stays_pending() {
+    let svc = test_service();
+    let (local, _, _, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
+        "not-inserted-yet".into(),
+        "session-preadmission".into(),
+        "user-1".into(),
+    );
+    svc.runs
+        .write()
+        .await
+        .insert("not-inserted-yet".into(), local);
+    let pending = ok(svc
+        .cancel_session_runs("session-preadmission".into(), "user-1".into())
+        .await);
+    assert!(!pending.execution_settled);
+    assert_eq!(pending.runs[0].status, "cancellation_requested");
+    assert!(!pending.runs[0].execution_settled);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancel_session_runs_propagates_all_intent_before_slow_convergence() {
+    let mut store = FaultInjectedRunStateStore::new(&[], &[]);
+    store.cancellation_discovery_delay = Duration::from_secs(2);
+    let store = Arc::new(store);
+    let svc = test_service_with_store(store.clone());
+    svc.run_engine
+        .start_run("wide-root", "user-1", "wide-session")
+        .await
+        .unwrap();
+    let mut targets = vec!["wide-root".to_owned()];
+    for index in 0..105 {
+        let run_id = format!("wide-child-{index:03}");
+        svc.run_engine
+            .start_run_ext(
+                &run_id,
+                "user-1",
+                "wide-session",
+                Some("wide-root"),
+                None,
+                Some("worker"),
+                None,
+            )
+            .await
+            .unwrap();
+        targets.push(run_id);
+    }
+    // Keep every executor live, including the first page, so enumeration
+    // cannot make progress merely because earlier runs leave the active set.
+    for run_id in &targets {
+        let (local, _, _, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
+            run_id.clone(),
+            "wide-session".into(),
+            "user-1".into(),
+        );
+        svc.runs.write().await.insert(run_id.clone(), local);
+    }
+    let pending = ok(svc
+        .cancel_session_runs("wide-session".into(), "user-1".into())
+        .await);
+    assert!(!pending.execution_settled);
+    assert!(
+        pending.runs.len() < targets.len(),
+        "convergence should yield to its budget"
+    );
+    for run_id in targets {
+        assert!(
+            store
+                .inner
+                .is_run_cancellation_requested("user-1", &run_id)
+                .await
+                .unwrap(),
+            "tail target {run_id} was starved"
+        );
+    }
 }
 
 #[tokio::test(start_paused = true)]

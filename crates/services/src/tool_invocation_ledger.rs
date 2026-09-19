@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::cancellation_safe_db::CancellationSafePoolConnection;
 use astra_core::SharedPool;
 use astra_turn_types::{
     DEFAULT_CONVERSATION_BRANCH_ID, DispatchCertainty, SessionKeyV1,
@@ -15,7 +16,7 @@ use astra_turn_types::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{MySql, Row, Transaction};
+use sqlx::{Connection, MySql, Row, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -395,7 +396,8 @@ impl DatabaseToolInvocationLedger {
         session_id: &str,
         run_id: &str,
     ) -> Result<ToolInvocationRunReconciliationOutcome, ToolInvocationLedgerStoreError> {
-        let mut tx = self.pool.get().begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.connection_mut().begin().await?;
         crate::storage::admit_session_event_write(&mut tx, session_id, user_id, false).await?;
         let run_status = lock_terminal_run(&mut tx, user_id, session_id, run_id).await?;
         let completion_source = ToolInvocationCompletionSource::run_closure(&run_status)?;
@@ -593,6 +595,7 @@ impl DatabaseToolInvocationLedger {
             }
         }
         tx.commit().await?;
+        connection.release();
         Ok(ToolInvocationRunReconciliationOutcome {
             prepared_rejected,
             inconsistent_prepared_unknown,

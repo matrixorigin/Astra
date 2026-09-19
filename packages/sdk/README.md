@@ -73,6 +73,13 @@ await client.updateSession(sessionId, { title: 'Renamed' });
 await client.closeSession(sessionId);
 const activity = await client.getSessionActivity(sessionId, { limit: 50 });
 
+// Cancel execution without deleting history. A pending response is not success:
+// keep showing "Stopping" and repeat this operation until executionSettled.
+const cancellation = await client.cancelSession(sessionId);
+if (!cancellation.executionSettled) {
+  console.log('Stopping; execution is not yet confirmed idle', cancellation.runs);
+}
+
 // Reflect / tool-selection evidence (GET /chat/session/.../reflect | decision-trace)
 const report = await client.getSessionReflect(sessionId, { focus: 'auto', last_n: 20, question: '' });
 

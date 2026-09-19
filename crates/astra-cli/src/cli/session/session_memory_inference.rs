@@ -202,6 +202,8 @@ fn classify_thin_client_error(error: ThinClientError) -> ClassifiedError {
         }
         ThinClientError::Json(_)
         | ThinClientError::SseParse(_)
+        | ThinClientError::SessionCancellationPending { .. }
+        | ThinClientError::InvalidSessionCancellationResponse(_)
         | ThinClientError::InvalidSseJson(_) => (
             ErrorKind::ServerError,
             "Astra Server returned an invalid memory inference response",

@@ -257,6 +257,13 @@ to fence delayed execution after reuse. The existing per-checkout uniqueness
 constraint arbitrates concurrent claimants; tool dispatch retains its
 non-locking verification path.
 
+When reuse is unsafe, admission returns `execution_workspace_claimed` with
+the owning Session and branch plus a typed `workspace_blocker` from the fenced
+check. Active execution, turn admission, provider switching, and unresolved
+external effects are different recovery conditions; a conflict must not instruct
+the user to resume or delete history as a universal remedy. Claim races request
+a retry; unresolved effects remain fenced until their outcome is reconciled.
+
 ## Unhappy paths
 
 | Failure | Required behavior |

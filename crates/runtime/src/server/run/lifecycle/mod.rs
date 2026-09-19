@@ -8,6 +8,7 @@
 //! process-local map only keeps live control handles for in-flight runs.
 
 mod admission;
+mod cancellation;
 mod persistence;
 mod projection;
 pub(crate) mod run_state;
@@ -5660,17 +5661,17 @@ impl AgenticRunLifecycleService {
                         if let astra_services::SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
                             owner_session_id,
                             owner_branch_id,
+                            blocker,
                         } = error
                         {
                             return Err(error_response_coded_with_metadata(
                                 StatusCode::CONFLICT,
-                                format!(
-                                    "This checkout is already attached to Session {owner_session_id}; resume it before sending work here"
-                                ),
+                                blocker.user_message(&owner_session_id),
                                 "execution_workspace_claimed",
                                 json!({
                                     "admission_state": "rejected",
-                                    "recovery_action": "resume_session",
+                                    "recovery_action": blocker.recovery_action(),
+                                    "workspace_blocker": blocker,
                                     "owner_session_id": owner_session_id,
                                     "owner_branch_id": owner_branch_id,
                                 }),
@@ -5767,17 +5768,17 @@ impl AgenticRunLifecycleService {
                         if let astra_services::SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
                             owner_session_id,
                             owner_branch_id,
+                            blocker,
                         } = error
                         {
                             return Err(error_response_coded_with_metadata(
                                 StatusCode::CONFLICT,
-                                format!(
-                                    "This checkout is already attached to Session {owner_session_id}; resume it before sending work here"
-                                ),
+                                blocker.user_message(&owner_session_id),
                                 "execution_workspace_claimed",
                                 json!({
                                     "admission_state": "rejected",
-                                    "recovery_action": "resume_session",
+                                    "recovery_action": blocker.recovery_action(),
+                                    "workspace_blocker": blocker,
                                     "owner_session_id": owner_session_id,
                                     "owner_branch_id": owner_branch_id,
                                 }),
@@ -9497,7 +9498,7 @@ impl AgenticRunLifecycleService {
                     } => (
                         StatusCode::CONFLICT,
                         "execution_workspace_claimed",
-                        "This checkout is already attached to another Session; resume that Session or use a separate worktree",
+                        "This checkout still has execution authority held by another Session",
                     ),
                     astra_services::SessionContextCoordinatorError::ExecutionBindingBusy => (
                         StatusCode::CONFLICT,
@@ -9532,17 +9533,17 @@ impl AgenticRunLifecycleService {
                     if let astra_services::SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
                         owner_session_id,
                         owner_branch_id,
+                        blocker,
                     } = error
                     {
                         return error_response_coded_with_metadata(
                             status,
-                            format!(
-                                "This checkout is already attached to Session {owner_session_id}; resume it before sending work here"
-                            ),
+                            blocker.user_message(&owner_session_id),
                             code,
                             json!({
                                 "admission_state": "rejected",
-                                "recovery_action": "resume_session",
+                                "recovery_action": blocker.recovery_action(),
+                                "workspace_blocker": blocker,
                                 "owner_session_id": owner_session_id,
                                 "owner_branch_id": owner_branch_id,
                             }),
@@ -19649,33 +19650,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         &self,
         session_id: String,
         user_id: String,
-    ) -> Result<Vec<CancelRunRecord>, (StatusCode, Json<ErrorResponse>)> {
-        let mut cancelled = Vec::new();
-        let mut cursor = None;
-        loop {
-            let page = self
-                .run_engine
-                .list_active_session_runs_cursor(&user_id, &session_id, 100, cursor)
-                .await
-                .map_err(|error| {
-                    error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("Failed to list active session runs: {error}"),
-                    )
-                })?;
-            if page.runs.is_empty() {
-                break;
-            }
-            let next_cursor = page.next_cursor;
-            for run in page.runs {
-                cancelled.push(self.cancel_run(run.run_id, user_id.clone()).await?);
-            }
-            let Some(next) = next_cursor else {
-                break;
-            };
-            cursor = Some(next);
-        }
-        Ok(cancelled)
+    ) -> Result<astra_services::runs::CancelSessionRecord, (StatusCode, Json<ErrorResponse>)> {
+        self.converge_session_cancellation(&session_id, &user_id)
+            .await
     }
 
     async fn list_runs_cursor(

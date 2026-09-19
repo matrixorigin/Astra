@@ -102,6 +102,8 @@ export type {
   RunProjectionRepairResponse,
   RunListResponse,
   SessionInfo,
+  SessionCancellationResult,
+  RuntimeSessionCancellationResponse,
   RuntimeChatResponse,
   RuntimeSessionResponse,
   RuntimeSessionListCursor,

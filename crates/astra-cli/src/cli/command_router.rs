@@ -2083,7 +2083,11 @@ async fn execute_cli_command_impl(
             let session_id = validated_cli_session_arg(&args.session_id)?;
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
-                .post_session_cancel_text(&token, session_id)
+                .cancel_session_until_settled_text(
+                    &token,
+                    session_id,
+                    std::time::Duration::from_secs(10),
+                )
                 .await
                 .map_err(map_thin_err)?;
             clear_profile_last_session_if_matches_or_warn(

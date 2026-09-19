@@ -55,8 +55,8 @@ pub(crate) fn is_valid_server_session_id(session_id: &str) -> bool {
 }
 
 /// Cancel exactly one harness-owned session through the normal authenticated
-/// CLI surface. The server's cancel endpoint waits for lifecycle convergence,
-/// unlike `session close`, which only changes display status.
+/// CLI surface. The CLI waits for server-confirmed execution settlement;
+/// `session close` only changes display status and cannot supply this proof.
 pub(crate) async fn cancel_server_session(
     astra_bin: &Path,
     profile: Option<&str>,
@@ -72,6 +72,7 @@ pub(crate) async fn cancel_server_session(
     }
     command
         .args(["session", "cancel", session_id])
+        .kill_on_drop(true)
         .env("NO_PROXY", "localhost,127.0.0.1")
         .env("no_proxy", "localhost,127.0.0.1");
     let output = tokio::time::timeout(Duration::from_secs(15), command.output())
@@ -93,7 +94,23 @@ pub(crate) async fn cancel_server_session(
             String::from_utf8_lossy(&output.stdout).trim()
         )
     })?;
-    if response.get("status").and_then(serde_json::Value::as_str) != Some("cancelled") {
+    validate_cancellation_response(&response, session_id)
+}
+
+fn validate_cancellation_response(
+    response: &serde_json::Value,
+    session_id: &str,
+) -> Result<(), String> {
+    if response
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(session_id)
+        || response.get("status").and_then(serde_json::Value::as_str) != Some("cancelled")
+        || response
+            .get("execution_settled")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
         return Err(format!(
             "session cancel did not converge to cancelled: {}",
             response
@@ -103,8 +120,8 @@ pub(crate) async fn cancel_server_session(
 }
 
 /// Cancel and then delete exactly one harness-owned session through the normal
-/// authenticated CLI surface. Cancellation converges active work and deletion
-/// releases durable execution claims that `session close` intentionally keeps.
+/// authenticated CLI surface. Cancellation settles active execution; deletion
+/// is harness-owned history cleanup, not a prerequisite for checkout reuse.
 pub(crate) async fn delete_server_session(
     astra_bin: &Path,
     profile: Option<&str>,
@@ -118,6 +135,7 @@ pub(crate) async fn delete_server_session(
     }
     command
         .args(["session", "delete", session_id])
+        .kill_on_drop(true)
         .env("NO_PROXY", "localhost,127.0.0.1")
         .env("no_proxy", "localhost,127.0.0.1");
     let output = tokio::time::timeout(Duration::from_secs(15), command.output())
@@ -143,6 +161,22 @@ mod tests {
     };
 
     const SESSION_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    #[test]
+    fn cancellation_requires_exact_identity_and_explicit_settlement() {
+        let valid = serde_json::json!({
+            "session_id": SESSION_ID, "status": "cancelled", "execution_settled": true,
+        });
+        assert!(super::validate_cancellation_response(&valid, SESSION_ID).is_ok());
+        for invalid in [
+            serde_json::json!({"session_id": SESSION_ID, "status": "cancelled"}),
+            serde_json::json!({"session_id": SESSION_ID, "status": "cancelled", "execution_settled": false}),
+            serde_json::json!({"session_id": SESSION_ID, "status": "cancelling", "execution_settled": false}),
+            serde_json::json!({"session_id": "another-session", "status": "cancelled", "execution_settled": true}),
+        ] {
+            assert!(super::validate_cancellation_response(&invalid, SESSION_ID).is_err());
+        }
+    }
 
     #[test]
     fn accepts_only_typed_server_session_binding_events() {

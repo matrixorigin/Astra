@@ -664,7 +664,11 @@ pub(crate) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
         astra_thin_client::ThinClientError::SseParse(error) => {
             format!("SSE parse error: {error}")
         }
-        error @ astra_thin_client::ThinClientError::IncompatibleRuntime { .. } => error.to_string(),
+        error @ (astra_thin_client::ThinClientError::IncompatibleRuntime { .. }
+        | astra_thin_client::ThinClientError::SessionCancellationPending { .. }
+        | astra_thin_client::ThinClientError::InvalidSessionCancellationResponse(_)) => {
+            error.to_string()
+        }
         astra_thin_client::ThinClientError::InvalidSseJson(value) => {
             format!("Invalid SSE JSON payload: {value}")
         }

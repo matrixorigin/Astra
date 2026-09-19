@@ -778,6 +778,82 @@ impl ThinClient {
         Self::text_or_api(resp).await
     }
 
+    /// Request cancellation and wait for the server's execution-settlement
+    /// proof. A display status alone is not evidence that tools have stopped.
+    /// Polling is bounded and never deletes history or forces a checkout unlock.
+    pub async fn cancel_session_until_settled_text(
+        &self,
+        token: &str,
+        session_id: &str,
+        budget: Duration,
+    ) -> Result<String, ThinClientError> {
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut reason = "execution shutdown is not yet confirmed".to_owned();
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ThinClientError::SessionCancellationPending {
+                    session_id: session_id.to_owned(),
+                    reason,
+                });
+            }
+            let body =
+                tokio::time::timeout_at(deadline, self.post_session_cancel_text(token, session_id))
+                    .await
+                    .map_err(|_| ThinClientError::SessionCancellationPending {
+                        session_id: session_id.to_owned(),
+                        reason: reason.clone(),
+                    })??;
+            let value: Value = serde_json::from_str(&body)?;
+            if value.get("session_id").and_then(Value::as_str) != Some(session_id) {
+                return Err(ThinClientError::InvalidSessionCancellationResponse(
+                    "server did not confirm the requested session identity".into(),
+                ));
+            }
+            match value.get("execution_settled").and_then(Value::as_bool) {
+                Some(true) if value.get("status").and_then(Value::as_str) == Some("cancelled") => {
+                    return Ok(body);
+                }
+                Some(false)
+                    if value.get("status").and_then(Value::as_str)
+                        == Some("cancellation_requested") => {}
+                _ => {
+                    return Err(ThinClientError::InvalidSessionCancellationResponse(
+                        "server did not provide consistent execution-settlement evidence; upgrade or restart the Server".into(),
+                    ));
+                }
+            }
+            reason = match value.get("workspace_blocker").and_then(Value::as_str) {
+                Some("execution_slot" | "active_run") => "an execution is still stopping",
+                Some("settlement_pending") => {
+                    "execution stopped but its durable settlement is incomplete"
+                }
+                Some("writer_or_reservation") => {
+                    "a conversation write or turn admission is still in progress"
+                }
+                Some("binding_not_ready") => {
+                    "the execution provider is switching or needs attention"
+                }
+                Some("unresolved_tool") => {
+                    "a tool's external outcome is still unknown; the checkout remains protected"
+                }
+                Some("owner_unavailable") => "the previous execution state could not be verified",
+                Some("claim_changed") => "checkout ownership changed during cancellation",
+                _ => "execution shutdown is not yet confirmed",
+            }
+            .to_owned();
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ThinClientError::SessionCancellationPending {
+                    session_id: session_id.to_owned(),
+                    reason,
+                });
+            }
+            tokio::time::sleep_until(
+                deadline.min(tokio::time::Instant::now() + Duration::from_millis(200)),
+            )
+            .await;
+        }
+    }
+
     pub async fn delete_session_text(
         &self,
         token: &str,
@@ -3291,6 +3367,96 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&response).unwrap()["status"],
             "cancelled"
         );
+    }
+
+    #[tokio::test]
+    async fn session_cancel_waits_for_execution_settlement_not_display_status() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let srv = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        Mock::given(method("POST"))
+            .and(path("/sessions/session-1/cancel"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(move |_: &wiremock::Request| {
+                let settled = observed.fetch_add(1, Ordering::SeqCst) > 0;
+                ResponseTemplate::new(if settled { 200 } else { 202 }).set_body_json(
+                    serde_json::json!({
+                        "session_id": "session-1", "status": if settled { "cancelled" } else { "cancellation_requested" },
+                        "execution_settled": settled,
+                    }),
+                )
+            })
+            .mount(&srv)
+            .await;
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let body = client
+            .cancel_session_until_settled_text("tok", "session-1", Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap()["execution_settled"],
+            true
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn session_cancel_deadline_preserves_pending_and_does_not_delete() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sessions/session-1/cancel"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "session_id": "session-1", "status": "cancellation_requested", "execution_settled": false,
+                "workspace_blocker": "unresolved_tool",
+            })))
+            .mount(&srv)
+            .await;
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let result = client
+            .cancel_session_until_settled_text("tok", "session-1", Duration::from_millis(500))
+            .await;
+        assert!(
+            matches!(result, Err(ThinClientError::SessionCancellationPending { session_id, reason }) if session_id == "session-1" && reason.contains("external outcome is still unknown"))
+        );
+        assert!(
+            srv.received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method == "POST"
+                    && request.url.path() == "/sessions/session-1/cancel")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_cancel_rejects_missing_proof_or_wrong_identity() {
+        for response in [
+            serde_json::json!({"session_id": "session-1", "status": "cancelled"}),
+            serde_json::json!({"session_id": "other", "status": "cancelled", "execution_settled": true}),
+            serde_json::json!({"session_id": "session-1", "status": "active", "execution_settled": true}),
+            serde_json::json!({"session_id": "session-1", "execution_settled": false}),
+            serde_json::json!({"session_id": "session-1", "status": 42, "execution_settled": false}),
+            serde_json::json!({"session_id": "session-1", "status": "cancelled", "execution_settled": false}),
+        ] {
+            let srv = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/sessions/session-1/cancel"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                .expect(1)
+                .mount(&srv)
+                .await;
+            let client = ThinClient::new(&srv.uri(), None).unwrap();
+            assert!(matches!(
+                client
+                    .cancel_session_until_settled_text("tok", "session-1", Duration::from_secs(1))
+                    .await,
+                Err(ThinClientError::InvalidSessionCancellationResponse(_))
+            ));
+        }
     }
 
     #[tokio::test]

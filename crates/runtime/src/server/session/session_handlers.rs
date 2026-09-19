@@ -3107,33 +3107,68 @@ pub(crate) async fn cancel_session_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     headers: HeaderMap,
-) -> Result<Json<SessionResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<(StatusCode, Json<CancelSessionResponse>), (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let user_id = user.user_id.clone();
     let session_id_for_cancel = session_id.clone();
-    let _ = state
+    let session = state
         .session_service
         .get_session(session_id.clone(), user_id.clone())
         .await?;
-    state
+    let cancellation = state
         .execution
         .run_lifecycle_service
         .cancel_session_runs(session_id_for_cancel, user_id.clone())
         .await?;
-    let session = state
-        .session_service
-        .update_session(
-            session_id,
-            user_id,
-            SessionUpdateRequestData {
-                title: None,
-                metadata: None,
-                metadata_patch: None,
-                status: Some(STATUS_CANCELLED.to_string()),
-            },
-        )
-        .await?;
-    Ok(Json(SessionResponse::from(session)))
+    let session = if cancellation.execution_settled {
+        state
+            .session_service
+            .update_session(
+                session_id,
+                user_id,
+                SessionUpdateRequestData {
+                    title: None,
+                    metadata: None,
+                    metadata_patch: None,
+                    status: Some(STATUS_CANCELLED.to_string()),
+                },
+            )
+            .await?
+    } else {
+        session
+    };
+    Ok(session_cancellation_response(
+        SessionResponse::from(session),
+        cancellation,
+    ))
+}
+
+fn session_cancellation_response(
+    mut session: SessionResponse,
+    cancellation: astra_services::runs::CancelSessionRecord,
+) -> (StatusCode, Json<CancelSessionResponse>) {
+    let status = if cancellation.execution_settled {
+        session.status = STATUS_CANCELLED.to_string();
+        StatusCode::OK
+    } else {
+        // This response describes the operation, not a premature durable
+        // terminal. Retrying the endpoint continues canonical convergence.
+        session.status = "cancellation_requested".to_string();
+        StatusCode::ACCEPTED
+    };
+    (
+        status,
+        Json(CancelSessionResponse {
+            session,
+            execution_settled: cancellation.execution_settled,
+            workspace_blocker: cancellation.workspace_blocker,
+            runs: cancellation
+                .runs
+                .into_iter()
+                .map(CancelRunResponse::from)
+                .collect(),
+        }),
+    )
 }
 
 pub(crate) async fn session_activity_handler(
@@ -3938,6 +3973,57 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::{AppState, HealthChecker, ServiceInfo};
+
+    #[test]
+    fn session_cancel_wire_requires_explicit_convergence_even_with_no_active_runs() {
+        for settled in [false, true] {
+            let session = SessionResponse {
+                session_id: "session-1".into(),
+                user_id: "user-1".into(),
+                agent_id: None,
+                title: None,
+                metadata: Default::default(),
+                status: "active".into(),
+                event_count: 0,
+                created_at: "2026-09-19T00:00:00".into(),
+                updated_at: None,
+                ended_at: None,
+            };
+            let (status, Json(body)) = session_cancellation_response(
+                session,
+                astra_services::runs::CancelSessionRecord {
+                    runs: vec![],
+                    execution_settled: settled,
+                    workspace_blocker: (!settled).then_some(astra_services::session_context_coordinator::WorkspaceReuseBlocker::UnresolvedTool),
+                },
+            );
+            let wire = serde_json::to_value(body).unwrap();
+            assert_eq!(
+                status,
+                if settled {
+                    StatusCode::OK
+                } else {
+                    StatusCode::ACCEPTED
+                }
+            );
+            assert_eq!(wire["session_id"], "session-1");
+            assert_eq!(
+                wire["status"],
+                if settled {
+                    "cancelled"
+                } else {
+                    "cancellation_requested"
+                }
+            );
+            assert_eq!(wire["execution_settled"], settled);
+            assert_eq!(wire["runs"], json!([]));
+            if settled {
+                assert!(wire.get("workspace_blocker").is_none());
+            } else {
+                assert_eq!(wire["workspace_blocker"], "unresolved_tool");
+            }
+        }
+    }
 
     #[test]
     fn handoff_storage_failure_is_not_reported_as_invalid_user_input() {
