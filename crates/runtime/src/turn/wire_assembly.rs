@@ -1206,6 +1206,7 @@ pub(crate) struct MemoriaContext<'a> {
     /// Exact context/compaction settings checked at execution admission.
     pub context_budget: &'a crate::prompts::ContextBudget,
     pub memoria_config: &'a MemoriaCompactConfig,
+    pub summary_prompt_templates: &'a astra_turn_types::summary_prompts::SummaryPromptTemplates,
     /// Optional HTTP client for Memoria retrieval. `None` = skip retrieval,
     /// fall back to pure truncation.
     pub memoria_client: Option<&'a dyn MemoriaPort>,
@@ -1393,6 +1394,7 @@ impl<'a> MemoriaContext<'a> {
             self.memoria_client,
             &budget.compact_config,
             self.summary_client,
+            self.summary_prompt_templates,
         )
         .await;
 
@@ -3122,6 +3124,8 @@ mod tests {
             memoria_config: &MemoriaCompactConfig::default(),
             memoria_client: None,
             summary_client: None,
+            summary_prompt_templates:
+                &astra_turn_core::cloud_summary::canonical_summary_prompt_templates(),
             tier: CompactionTier::Normal,
             session_facts: None,
         };
@@ -3406,6 +3410,8 @@ mod tests {
             memoria_config: &MemoriaCompactConfig::default(),
             memoria_client: None,
             summary_client: None,
+            summary_prompt_templates:
+                &astra_turn_core::cloud_summary::canonical_summary_prompt_templates(),
             tier: CompactionTier::AggressivePrune,
             session_facts: None,
         };
@@ -3513,6 +3519,8 @@ mod tests {
             memoria_config: &MemoriaCompactConfig::default(),
             memoria_client: None,
             summary_client: None,
+            summary_prompt_templates:
+                &astra_turn_core::cloud_summary::canonical_summary_prompt_templates(),
             tier: CompactionTier::AggressivePrune,
             session_facts: None,
         };

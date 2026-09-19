@@ -244,6 +244,11 @@ impl PipelineSession {
         self.turns_completed
     }
 
+    /// Read the captured prompt sections without initializing or loading them.
+    pub fn static_sections(&self) -> Option<Arc<StaticSections>> {
+        self.static_sections.clone()
+    }
+
     /// Return the immutable prompt sections owned by this pipeline session,
     /// building them once on first use. The returned `Arc` lets the caller
     /// borrow the sections while mutably advancing the rest of the session.
@@ -1077,6 +1082,7 @@ mod tests {
     #[test]
     fn static_sections_cache_is_scoped_to_pipeline_session() {
         let mut first_session = PipelineSession::new(PipelineConfig::default());
+        assert!(first_session.static_sections().is_none());
         let first = first_session.static_sections_or_init(|| {
             let mut sections = StaticSections::test_default();
             sections.core_rules.text = "first session".into();
@@ -1087,6 +1093,10 @@ mod tests {
         });
 
         assert!(Arc::ptr_eq(&first, &reused));
+        assert!(Arc::ptr_eq(
+            &first,
+            &first_session.static_sections().unwrap()
+        ));
         assert_eq!(reused.core_rules.text, "first session");
 
         let mut second_session = PipelineSession::new(PipelineConfig::default());

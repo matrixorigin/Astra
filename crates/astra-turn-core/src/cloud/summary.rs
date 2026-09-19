@@ -12,12 +12,14 @@
 //! - **Testable**: the LLM call is abstracted behind [`SummaryLlmClient`] so
 //!   tests can inject mock responses without a real API.
 
+use astra_turn_types::summary_prompts::{SUMMARY_PROMPT_RENDERER_VERSION, SummaryPromptTemplates};
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 
 use crate::{
     cloud::compact_prompt::{
-        COMPACT_SYSTEM_PROMPT, build_compact_user_prompt, render_messages_for_summary,
+        COMPACT_SYSTEM_PROMPT, COMPACT_USER_PREFIX, COMPACT_USER_SUFFIX, build_compact_user_prompt,
+        render_messages_for_summary,
     },
     cloud::grouping::{ApiRound, drop_oldest_rounds, flatten_rounds, group_by_api_round},
 };
@@ -120,6 +122,22 @@ Use exactly these section headers so the compacted context can be validated and 
 ### Current State\n\n\
 Target under 800 words.";
 
+/// Capture the current canonical templates at the admission boundary.
+/// Summary execution requires an explicit snapshot and never calls this factory.
+pub fn canonical_summary_prompt_templates() -> SummaryPromptTemplates {
+    SummaryPromptTemplates {
+        renderer_version: SUMMARY_PROMPT_RENDERER_VERSION,
+        standalone_system: COMPACT_SYSTEM_PROMPT.to_string(),
+        standalone_user_prefix: COMPACT_USER_PREFIX.to_string(),
+        standalone_user_suffix: COMPACT_USER_SUFFIX.to_string(),
+        inline_instruction: INLINE_COMPACT_INSTRUCTION.to_string(),
+    }
+}
+
+fn supported_summary_renderer(templates: &SummaryPromptTemplates) -> bool {
+    templates.renderer_version == SUMMARY_PROMPT_RENDERER_VERSION
+}
+
 /// Which history projection an inline compaction request is allowed to use.
 /// The append-only mode is explicit because retaining runtime user-role frames
 /// is safe only when the same stable semantic policy is in the system prefix.
@@ -181,6 +199,9 @@ pub trait SummaryLlmClient: Send + Sync {
 /// compaction setting; this function does not resolve defaults.
 ///
 /// PTL retry behaviour:
+/// Templates are mandatory captured inputs. An unsupported renderer returns
+/// `None` before calling the client; no current-template fallback is permitted.
+///
 /// 1. Render messages into compaction prompt
 /// 2. Call LLM
 /// 3. If PTL error: drop oldest round and retry (up to `max_ptl_retries`)
@@ -189,7 +210,11 @@ pub async fn generate_compact_summary(
     messages: &[Value],
     client: &dyn SummaryLlmClient,
     max_ptl_retries: usize,
+    templates: &SummaryPromptTemplates,
 ) -> Option<String> {
+    if !supported_summary_renderer(templates) {
+        return None;
+    }
     let (system_msgs, mut rounds) = group_by_api_round(messages);
     let min_keep = MIN_ROUNDS_TO_KEEP;
 
@@ -207,7 +232,7 @@ pub async fn generate_compact_summary(
                 0,
             );
         }
-        let prompt_messages = build_summary_messages(&rendered);
+        let prompt_messages = build_summary_messages(&rendered, templates);
         record_summary_prompt_clone(&prompt_messages);
 
         match client
@@ -255,15 +280,18 @@ pub async fn generate_compact_summary(
 }
 
 /// Build the messages array for the summary LLM call.
-fn build_summary_messages(rendered_conversation: &str) -> Vec<Value> {
+fn build_summary_messages(
+    rendered_conversation: &str,
+    templates: &SummaryPromptTemplates,
+) -> Vec<Value> {
     vec![
         serde_json::json!({
             "role": "system",
-            "content": COMPACT_SYSTEM_PROMPT,
+            "content": templates.standalone_system,
         }),
         serde_json::json!({
             "role": "user",
-            "content": build_compact_user_prompt(rendered_conversation),
+            "content": build_compact_user_prompt(rendered_conversation, templates),
         }),
     ]
 }
@@ -305,7 +333,11 @@ pub async fn generate_inline_summary(
     history: &[Value],
     history_projection: InlineSummaryHistoryProjection,
     client: &dyn SummaryLlmClient,
+    templates: &SummaryPromptTemplates,
 ) -> Option<String> {
+    if !supported_summary_renderer(templates) {
+        return None;
+    }
     let runtime_frames_visible = matches!(
         history_projection,
         InlineSummaryHistoryProjection::AppendOnlyRuntimeAuthorityPrefix
@@ -345,7 +377,7 @@ pub async fn generate_inline_summary(
         }
         messages.push(json!({
             "role": "user",
-            "content": INLINE_COMPACT_INSTRUCTION,
+            "content": templates.inline_instruction,
         }));
         record_summary_prompt_clone(&messages);
 
@@ -532,12 +564,134 @@ mod tests {
         "### Primary Request\nDo the work\n### Pending Tasks\nNone\n### Current Work\nDone\n### Current State\nVerified"
     }
 
+    fn captured_templates() -> SummaryPromptTemplates {
+        SummaryPromptTemplates {
+            renderer_version: SUMMARY_PROMPT_RENDERER_VERSION,
+            standalone_system: "captured system\n保持原文".into(),
+            standalone_user_prefix: "captured prefix\n".into(),
+            standalone_user_suffix: "\ncaptured suffix".into(),
+            inline_instruction: "captured inline instruction".into(),
+        }
+    }
+
+    #[test]
+    fn summary_templates_roundtrip_requires_every_field() {
+        let templates = canonical_summary_prompt_templates();
+        let value = serde_json::to_value(&templates).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SummaryPromptTemplates>(value.clone()).unwrap(),
+            templates
+        );
+        for field in value.as_object().unwrap().keys() {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<SummaryPromptTemplates>(missing).is_err(),
+                "{field}"
+            );
+        }
+        let mut unknown = value;
+        unknown["fallback"] = json!(true);
+        assert!(serde_json::from_value::<SummaryPromptTemplates>(unknown).is_err());
+    }
+
+    #[tokio::test]
+    async fn compact_summary_retries_consume_exact_captured_templates() {
+        let templates = captured_templates();
+        let client = MockSummaryClient::ptl_then_success(valid_summary());
+        let messages = make_messages(4);
+        assert!(
+            generate_compact_summary(&messages, &client, 1, &templates)
+                .await
+                .is_some()
+        );
+        let requests = client.recorded_requests();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert_eq!(
+                request[0],
+                json!({"role": "system", "content": templates.standalone_system})
+            );
+            let content = request[1]["content"].as_str().unwrap();
+            assert!(content.starts_with(&templates.standalone_user_prefix));
+            assert!(content.ends_with(&templates.standalone_user_suffix));
+        }
+        assert!(
+            requests[0][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("question 0")
+        );
+        assert!(
+            !requests[1][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("question 0")
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_summary_retries_preserve_prefix_and_captured_instruction() {
+        let templates = captured_templates();
+        let system =
+            vec![json!({"role": "system", "content": [{"type": "text", "text": "exact prefix"}]})];
+        let client = MockSummaryClient::ptl_then_success(valid_summary());
+        assert!(
+            generate_inline_summary(
+                &system,
+                &make_messages(4),
+                InlineSummaryHistoryProjection::Semantic,
+                &client,
+                &templates,
+            )
+            .await
+            .is_some()
+        );
+        let requests = client.recorded_requests();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert_eq!(&request[..system.len()], system.as_slice());
+            assert_eq!(
+                request.last(),
+                Some(&json!({"role": "user", "content": templates.inline_instruction}))
+            );
+        }
+        assert!(requests[1].len() < requests[0].len());
+    }
+
+    #[tokio::test]
+    async fn unsupported_summary_renderer_never_calls_client() {
+        let mut templates = captured_templates();
+        templates.renderer_version += 1;
+        let client = MockSummaryClient::success(valid_summary());
+        let history = make_messages(2);
+        assert!(
+            generate_compact_summary(&history, &client, 1, &templates)
+                .await
+                .is_none()
+        );
+        assert!(
+            generate_inline_summary(
+                &[],
+                &history,
+                InlineSummaryHistoryProjection::Semantic,
+                &client,
+                &templates,
+            )
+            .await
+            .is_none()
+        );
+        assert_eq!(client.call_count.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn success_on_first_attempt() {
         let body = "### Primary Request\nDoing stuff\n### Pending Tasks\nNone\n### Current Work\nIn progress\n### Current State\nDone";
         let client = MockSummaryClient::success(body);
         let msgs = make_messages(3);
-        let result = generate_compact_summary(&msgs, &client, 0).await;
+        let result =
+            generate_compact_summary(&msgs, &client, 0, &canonical_summary_prompt_templates())
+                .await;
         assert_eq!(result.as_deref(), Some(body));
         assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
         assert_eq!(
@@ -551,7 +705,9 @@ mod tests {
         let body = "### Primary Request\nX\n### Pending Tasks\nY\n### Current Work\nW\n### Current State\nZ";
         let client = MockSummaryClient::ptl_then_success(body);
         let msgs = make_messages(4); // 4 rounds, enough to drop one
-        let result = generate_compact_summary(&msgs, &client, 1).await;
+        let result =
+            generate_compact_summary(&msgs, &client, 1, &canonical_summary_prompt_templates())
+                .await;
         assert_eq!(result.as_deref(), Some(body));
         assert_eq!(client.call_count.load(Ordering::SeqCst), 2);
         assert_eq!(
@@ -572,9 +728,14 @@ mod tests {
         for max_ptl_retries in [0, 1, 5] {
             let client = MockSummaryClient::always_ptl();
             assert!(
-                generate_compact_summary(&messages, &client, max_ptl_retries)
-                    .await
-                    .is_none()
+                generate_compact_summary(
+                    &messages,
+                    &client,
+                    max_ptl_retries,
+                    &canonical_summary_prompt_templates()
+                )
+                .await
+                .is_none()
             );
             assert_eq!(
                 client.call_count.load(Ordering::SeqCst),
@@ -593,9 +754,14 @@ mod tests {
     async fn zero_compaction_retries_does_not_consume_later_success() {
         let client = MockSummaryClient::ptl_then_success(valid_summary());
         assert!(
-            generate_compact_summary(&make_messages(4), &client, 0)
-                .await
-                .is_none()
+            generate_compact_summary(
+                &make_messages(4),
+                &client,
+                0,
+                &canonical_summary_prompt_templates()
+            )
+            .await
+            .is_none()
         );
         assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
     }
@@ -608,7 +774,9 @@ mod tests {
             json!({"role": "user", "content": "hi"}),
             json!({"role": "assistant", "content": "hello"}),
         ];
-        let result = generate_compact_summary(&msgs, &client, 3).await;
+        let result =
+            generate_compact_summary(&msgs, &client, 3, &canonical_summary_prompt_templates())
+                .await;
         assert!(result.is_none());
     }
 
@@ -616,13 +784,16 @@ mod tests {
     async fn returns_none_on_llm_error() {
         let client = MockSummaryClient::error("connection refused");
         let msgs = make_messages(2);
-        let result = generate_compact_summary(&msgs, &client, 3).await;
+        let result =
+            generate_compact_summary(&msgs, &client, 3, &canonical_summary_prompt_templates())
+                .await;
         assert!(result.is_none());
     }
 
     #[test]
     fn build_summary_messages_structure() {
-        let msgs = build_summary_messages("some conversation");
+        let msgs =
+            build_summary_messages("some conversation", &canonical_summary_prompt_templates());
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["role"].as_str().unwrap(), "system");
         assert_eq!(msgs[1]["role"].as_str().unwrap(), "user");
@@ -688,6 +859,7 @@ mod tests {
             &history,
             InlineSummaryHistoryProjection::Semantic,
             &client,
+            &canonical_summary_prompt_templates(),
         )
         .await
         .expect("inline summary should succeed");
@@ -738,6 +910,7 @@ mod tests {
             &history,
             InlineSummaryHistoryProjection::Semantic,
             &client,
+            &canonical_summary_prompt_templates(),
         )
         .await
         .expect("semantic summary");
@@ -768,6 +941,7 @@ mod tests {
                 &history,
                 InlineSummaryHistoryProjection::AppendOnlyRuntimeAuthorityPrefix,
                 &missing_policy_client,
+                &canonical_summary_prompt_templates(),
             )
             .await
             .is_none()
@@ -786,6 +960,7 @@ mod tests {
             &history,
             InlineSummaryHistoryProjection::AppendOnlyRuntimeAuthorityPrefix,
             &client,
+            &canonical_summary_prompt_templates(),
         )
         .await
         .expect("policy makes exact append history safe for summary semantics");
@@ -804,7 +979,9 @@ mod tests {
             json!({"role": "user", "content": "single question"}),
             json!({"role": "assistant", "content": "single answer"}),
         ];
-        let result = generate_compact_summary(&msgs, &client, 3).await;
+        let result =
+            generate_compact_summary(&msgs, &client, 3, &canonical_summary_prompt_templates())
+                .await;
         assert!(result.is_none());
         // Should give up quickly — can't drop the only round
         assert!(client.call_count.load(Ordering::SeqCst) <= 2);
@@ -816,9 +993,14 @@ mod tests {
         for response in ["", "plain text", "### Primary Request\nOnly one section"] {
             let client = MockSummaryClient::success(response);
             assert!(
-                generate_compact_summary(&messages, &client, 3)
-                    .await
-                    .is_none()
+                generate_compact_summary(
+                    &messages,
+                    &client,
+                    3,
+                    &canonical_summary_prompt_templates()
+                )
+                .await
+                .is_none()
             );
         }
     }

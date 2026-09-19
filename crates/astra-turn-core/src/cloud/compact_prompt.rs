@@ -43,13 +43,21 @@ the reader understand the current state (function signatures, struct definitions
 - Omit superseded decisions unless the failure is informative.\n\
 - The reader is an LLM that needs only the essentials to continue the task seamlessly.";
 
-/// Build the user message that presents the conversation history for summarization.
-pub fn build_compact_user_prompt(conversation_text: &str) -> String {
-    format!(
-        "Please summarize the following conversation history. \
+/// Canonical wrapper bytes captured at admission, never selected during retries.
+pub const COMPACT_USER_PREFIX: &str = "Please summarize the following conversation history. \
 This summary will replace the full history to stay within context limits.\n\n\
----\n{conversation_text}\n---\n\n\
-Provide a complete, dense summary following the format described."
+---\n";
+pub const COMPACT_USER_SUFFIX: &str = "\n---\n\n\
+Provide a complete, dense summary following the format described.";
+
+/// Build the user message using the exact admitted wrapper.
+pub fn build_compact_user_prompt(
+    conversation_text: &str,
+    templates: &astra_turn_types::summary_prompts::SummaryPromptTemplates,
+) -> String {
+    format!(
+        "{}{}{}",
+        templates.standalone_user_prefix, conversation_text, templates.standalone_user_suffix
     )
 }
 
@@ -463,7 +471,10 @@ mod tests {
 
     #[test]
     fn build_compact_user_prompt_wraps_conversation() {
-        let prompt = build_compact_user_prompt("some conversation");
+        let prompt = build_compact_user_prompt(
+            "some conversation",
+            &crate::cloud::summary::canonical_summary_prompt_templates(),
+        );
         assert!(prompt.contains("some conversation"));
         assert!(prompt.contains("summarize"));
     }

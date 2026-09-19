@@ -1396,6 +1396,21 @@ pub(crate) fn assemble_context_pipeline(
         ));
     }
 
+    let statics = state
+        .pipeline_session
+        .as_ref()
+        .expect("pipeline_session checked before context assembly")
+        .static_sections()
+        .ok_or_else(|| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                format!(
+                    "pipeline static sections missing during context assembly for session {}",
+                    input.session_id
+                ),
+            )
+        })?;
+
     enqueue_active_turn_frame(state, input.user_content);
 
     let mut external = build_external_sources(
@@ -1488,14 +1503,6 @@ pub(crate) fn assemble_context_pipeline(
     if !input.tool_surface.deferred_tools_block.is_empty() {
         session_ctx.deferred_tools_block = input.tool_surface.deferred_tools_block.to_string();
     }
-    // Prompt overrides are stable within one pipeline session, but a newly
-    // created/restored session must observe the current override files. Cache
-    // the compiled sections on PipelineSession rather than for the process.
-    let statics = state
-        .pipeline_session
-        .as_mut()
-        .expect("pipeline_session checked before context assembly")
-        .static_sections_or_init(crate::prompts::build_pipeline_static_sections);
     let agent = AgentContext {
         tool_schemas: effective_tools,
         ..Default::default()
@@ -2301,6 +2308,16 @@ mod context_cache_contract_tests {
     use serde_json::json;
     use std::collections::HashSet;
 
+    fn seeded_context_state() -> AgenticLoopState {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state
+            .pipeline_session
+            .as_mut()
+            .expect("test pipeline session")
+            .static_sections_or_init(crate::prompts::build_pipeline_static_sections);
+        state
+    }
+
     fn tool(name: &str) -> Value {
         json!({
             "type": "function",
@@ -2725,7 +2742,7 @@ mod context_cache_contract_tests {
 
     #[test]
     fn assemble_context_pipeline_keeps_required_runtime_system_context_for_strict_history() {
-        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        let mut state = seeded_context_state();
         state
             .messages
             .push(json!({"role": "user", "content": "which model are you?"}));
@@ -2980,6 +2997,71 @@ mod context_cache_contract_tests {
         assert_eq!(err.kind, astra_core::ErrorKind::InvalidRequest);
         assert!(
             err.message.contains("pipeline_session missing"),
+            "error must identify the lifecycle invariant, got {err}"
+        );
+    }
+
+    #[test]
+    fn assemble_context_pipeline_rejects_missing_static_sections() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.pipeline_session = Some(
+            astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
+                astra_turn_core::pipeline_config::PipelineConfig::default(),
+                "2026-01-02",
+            ),
+        );
+        state
+            .messages
+            .push(json!({"role": "user", "content": "hello"}));
+        let history_before = state.messages.clone();
+        let edge_profile = serde_json::Map::new();
+        let visible_tools = vec![tool("bash")];
+        let restricted_tools = HashSet::new();
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+
+        let err = match assemble_context_pipeline(LlmContextAssemblyInput {
+            state: &mut state,
+            session_id: "sid-missing-statics",
+            tool_surface: ToolSurfacePlan::from_visible_tools(&visible_tools, &restricted_tools),
+            runtime_signals: RuntimeSignals::new(&edge_profile, None),
+            cache_cfg: &cache_cfg,
+            provider: "openai",
+            model_name: "gpt-4",
+            context_budget: &crate::prompts::ContextBudget::resolve(
+                Some(200_000),
+                Some(16_384),
+                0.75,
+                6,
+                8_000,
+                crate::prompts::CompactConfig::default(),
+            ),
+            cache_capability: None,
+            user_content: "hello",
+            query_source: "test",
+        }) {
+            Ok(_) => panic!("missing static sections must be a contract error"),
+            Err(err) => err,
+        };
+
+        assert_eq!(state.messages, history_before);
+        assert!(
+            state
+                .pipeline_session
+                .as_ref()
+                .unwrap()
+                .static_sections()
+                .is_none()
+        );
+        assert_eq!(
+            state.pipeline_session.as_ref().unwrap().current_date(),
+            "2026-01-02"
+        );
+        assert_eq!(err.kind, astra_core::ErrorKind::ContractViolation);
+        assert!(
+            err.message.contains("pipeline static sections missing"),
             "error must identify the lifecycle invariant, got {err}"
         );
     }
@@ -3547,7 +3629,7 @@ mod context_cache_contract_tests {
     #[test]
     fn edge_profile_active_turn_frame_cannot_churn_strict_provider_prefix() {
         fn provider_messages(frame_value: &str) -> Vec<Value> {
-            let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+            let mut state = seeded_context_state();
             state.messages = vec![
                 json!({"role": "user", "content": "review the current change"}),
                 json!({"role": "assistant", "content": "I found one issue"}),

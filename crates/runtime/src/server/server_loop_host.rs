@@ -3423,7 +3423,7 @@ pub struct ServerAgenticLoopHost {
     model_override: Option<String>,
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
     llm_transport: Result<Arc<crate::turn::llm::client::LlmTransport>, String>,
-    runtime_config: astra_config::runtime_config::RuntimeConfig,
+    execution_inputs: crate::turn::execution_config::PreparedExecutionInputs,
     inference_owner_pod_id: Option<String>,
     resolved_model_name: Option<String>,
     resolved_context_window: Option<u32>,
@@ -4979,7 +4979,7 @@ pub struct ServerAgenticLoopHostBuilder {
     model_override: Option<String>,
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
     llm_transport: Result<Arc<crate::turn::llm::client::LlmTransport>, String>,
-    runtime_config: Option<astra_config::runtime_config::RuntimeConfig>,
+    execution_inputs: Option<crate::turn::execution_config::PreparedExecutionInputs>,
     inference_owner_pod_id: Option<String>,
     execution_time_budget: Option<RunExecutionTimeBudget>,
     edge_tools: Vec<Value>,
@@ -5061,7 +5061,7 @@ impl ServerAgenticLoopHostBuilder {
             model_override: None,
             admitted_model_execution: None,
             llm_transport: crate::turn::llm::client::shared_llm_transport(),
-            runtime_config: None,
+            execution_inputs: None,
             inference_owner_pod_id: None,
             execution_time_budget: None,
             edge_tools: Vec::new(),
@@ -5387,18 +5387,22 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
-    pub(crate) fn with_runtime_config(
+    pub(crate) fn with_execution_inputs(
         mut self,
-        runtime_config: astra_config::runtime_config::RuntimeConfig,
+        execution_inputs: crate::turn::execution_config::PreparedExecutionInputs,
     ) -> Self {
-        self.runtime_config = Some(runtime_config);
+        self.execution_inputs = Some(execution_inputs);
         self
     }
 
     pub fn build(self) -> ServerAgenticLoopHost {
-        let runtime_config = self
-            .runtime_config
-            .unwrap_or_else(astra_config::runtime_config::RuntimeConfig::load);
+        let execution_inputs = self.execution_inputs.unwrap_or_else(|| {
+            crate::turn::execution_config::PreparedExecutionInputs::capture(
+                astra_config::runtime_config::RuntimeConfig::load(),
+                &self.user_id,
+                &self.session_id,
+            )
+        });
         // Compose the prompt-visible tool surface from provider declarations:
         // server-owned tools are always eligible when the server catalog is
         // enabled, while workspace/process tools require an explicit runtime
@@ -5573,7 +5577,7 @@ impl ServerAgenticLoopHostBuilder {
         // scope, so `tool_search` cannot ever select it.
         let server_tool_surface = crate::tool_registry::surface::ToolSurface::build(
             server_catalog_tools.clone(),
-            &runtime_config.tool_surface,
+            &execution_inputs.runtime.tool_surface,
             &[],
         );
         let mut server_visible_tools = server_tool_surface.always_load_schemas();
@@ -5710,7 +5714,7 @@ impl ServerAgenticLoopHostBuilder {
             model_override: self.model_override,
             admitted_model_execution: self.admitted_model_execution,
             llm_transport: self.llm_transport,
-            runtime_config,
+            execution_inputs,
             inference_owner_pod_id: self.inference_owner_pod_id,
             resolved_model_name: None,
             resolved_context_window: None,
@@ -9681,7 +9685,7 @@ impl ServerAgenticLoopHost {
             effective_model_override.as_deref(),
             pool_ref,
             self.admitted_model_execution.as_ref(),
-            &self.runtime_config,
+            &self.execution_inputs.runtime,
         )
         .await?;
         self.remember_resolved_llm_config(&llm_cfg);
@@ -15943,6 +15947,12 @@ impl ServerAgenticLoopHost {
             model_context_window,
         );
         let cache_cfg = PromptCacheConfig::from_cache_capability(cache_capability, provider);
+        // Checkpoint restoration does not serialize the compiled static cache.
+        // Seed it from this Run's captured input before assembly can read files.
+        if let Some(session) = state.pipeline_session.as_mut() {
+            session
+                .static_sections_or_init(|| self.execution_inputs.static_sections.as_ref().clone());
+        }
         crate::turn::llm::context::assemble_context_pipeline(
             crate::turn::llm::context::LlmContextAssemblyInput {
                 state,
@@ -15998,6 +16008,7 @@ impl ServerAgenticLoopHost {
             session_id: &self.session_id,
             context_budget: &llm_cfg.context_budget,
             memoria_config: &llm_cfg.memoria_config,
+            summary_prompt_templates: &self.execution_inputs.summary_templates,
             memoria_client: self.memoria_client.as_deref(),
             summary_client: summary_client
                 .as_ref()
@@ -17697,7 +17708,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     enc,
                     pool_ref,
                     &credential_owner,
-                    &self.runtime_config,
+                    &self.execution_inputs.runtime,
                 )
                 .await
                 {
@@ -20349,6 +20360,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 astra_turn_core::cloud_summary::InlineSummaryHistoryProjection::Semantic
             },
             &client,
+            &self.execution_inputs.summary_templates,
         )
         .await
         {

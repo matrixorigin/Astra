@@ -10608,7 +10608,11 @@ async fn evaluation_memory_isolation_preserves_ordinary_request_dependencies() {
         None,
         false,
         None,
-        &astra_config::runtime_config::RuntimeConfig::load(),
+        &crate::turn::execution_config::PreparedExecutionInputs::capture(
+            astra_config::runtime_config::RuntimeConfig::load(),
+            "owner",
+            "session",
+        ),
     );
     assert!(
         memory.bindings.load(Ordering::SeqCst) > bindings_before_host,
@@ -10648,7 +10652,11 @@ async fn evaluation_memory_isolation_preserves_ordinary_request_dependencies() {
         None,
         false,
         None,
-        &astra_config::runtime_config::RuntimeConfig::load(),
+        &crate::turn::execution_config::PreparedExecutionInputs::capture(
+            astra_config::runtime_config::RuntimeConfig::load(),
+            "owner",
+            "eval-session",
+        ),
     );
     assert!(state.memory_extraction_service.is_none());
     assert_eq!(
@@ -24046,7 +24054,11 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
             "same-run",
             None,
             &edge,
-            &astra_config::runtime_config::RuntimeConfig::load(),
+            &crate::turn::execution_config::PreparedExecutionInputs::capture(
+                astra_config::runtime_config::RuntimeConfig::load(),
+                "test-user",
+                "same-session",
+            ),
         )
         .unwrap();
     let messages = vec![
@@ -24166,7 +24178,6 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     let mut runtime_config = astra_config::runtime_config::RuntimeConfig::default();
     runtime_config.tool_selection.max_identical_tool_calls = 7;
     let state = svc.assemble_loop_state(
-        "test-user",
         &request,
         "same-session",
         "same-run",
@@ -24175,7 +24186,11 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
         None,
         environment,
         facts,
-        &runtime_config,
+        &crate::turn::execution_config::PreparedExecutionInputs::capture(
+            runtime_config,
+            "test-user",
+            "same-session",
+        ),
     );
     assert_eq!(state.max_identical_tool_calls, 7);
     assert_eq!(state.messages, messages);
@@ -24290,7 +24305,11 @@ fn build_initial_state_shared_assembly_preserves_restored_workspace_evidence() {
             "run",
             None,
             &edge,
-            &astra_config::runtime_config::RuntimeConfig::load(),
+            &crate::turn::execution_config::PreparedExecutionInputs::capture(
+                astra_config::runtime_config::RuntimeConfig::load(),
+                "user",
+                "session",
+            ),
         )
         .unwrap();
     facts.hooks.workspace_root_hint = Some("/app".into());
@@ -24315,7 +24334,6 @@ fn build_initial_state_shared_assembly_preserves_restored_workspace_evidence() {
         Some(3),
     );
     let state = svc.assemble_loop_state(
-        "user",
         &request,
         "session",
         "run",
@@ -24324,7 +24342,11 @@ fn build_initial_state_shared_assembly_preserves_restored_workspace_evidence() {
         None,
         environment,
         facts,
-        &astra_config::runtime_config::RuntimeConfig::load(),
+        &crate::turn::execution_config::PreparedExecutionInputs::capture(
+            astra_config::runtime_config::RuntimeConfig::load(),
+            "user",
+            "session",
+        ),
     );
     assert!(state.stall.tool_call_records.is_empty());
     assert_eq!(state.hooks.workspace_root_hint.as_deref(), Some("/app"));
@@ -24504,7 +24526,11 @@ fn build_initial_state_rejects_zero_execution_budget_cap() {
         None,
         None,
         None,
-        &astra_config::runtime_config::RuntimeConfig::load(),
+        &crate::turn::execution_config::PreparedExecutionInputs::capture(
+            astra_config::runtime_config::RuntimeConfig::load(),
+            "test-user",
+            "s",
+        ),
     );
     let (status, error) = result.err().expect("zero cap must be rejected");
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -25070,7 +25096,11 @@ fn late_streaming_start_binds_owner_generation_into_action_state() {
             None,
             None,
             None,
-            &astra_config::runtime_config::RuntimeConfig::load(),
+            &crate::turn::execution_config::PreparedExecutionInputs::capture(
+                astra_config::runtime_config::RuntimeConfig::load(),
+                "test-user",
+                "session-late-authority",
+            ),
         )
         .expect("valid test execution configuration");
     assert_eq!(state.current_run_owner_generation, None);
@@ -25119,7 +25149,11 @@ fn build_initial_state_agent_binding_uses_binding_skills_and_request_budget() {
             None,
             Some(&binding_context),
             None,
-            &astra_config::runtime_config::RuntimeConfig::load(),
+            &crate::turn::execution_config::PreparedExecutionInputs::capture(
+                astra_config::runtime_config::RuntimeConfig::load(),
+                "test-user",
+                "s",
+            ),
         )
         .expect("valid test execution configuration");
 
@@ -25262,7 +25296,11 @@ async fn request_scoped_runtime_skill_resolver_is_installed_from_provider_capabi
             capabilities.request_scoped_skill_resolver.clone(),
             capabilities.agent_binding.as_ref(),
             None,
-            &astra_config::runtime_config::RuntimeConfig::load(),
+            &crate::turn::execution_config::PreparedExecutionInputs::capture(
+                astra_config::runtime_config::RuntimeConfig::load(),
+                "external-user",
+                "session-1",
+            ),
         )
         .expect("valid test execution configuration");
 

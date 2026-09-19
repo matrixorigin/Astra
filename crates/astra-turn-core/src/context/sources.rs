@@ -16,10 +16,11 @@ use crate::microcompact::ProviderCacheStrategy;
 use crate::pipeline_config::ProviderCachePolicy;
 use crate::pipeline_stats::PipelineStats;
 use crate::recovery_state::RecoveryState;
-use crate::section_types::{CacheScope, PromptSection, PromptTokenBucket, estimate_text_tokens};
+use crate::section_types::{CacheScope, PromptSection, PromptTokenBucket};
 use crate::session_latches::SessionLatches;
 use crate::token_accounting::TokenAccounting;
 use crate::working_memory::WorkingMemoryState;
+pub use astra_turn_types::prompt_sections::StaticSections;
 
 // ── ContextChannelProvider: framework+policy trait for prompt-section injection ──
 
@@ -233,19 +234,6 @@ pub struct ContextSources<'a> {
     pub stats: &'a PipelineStats,
 }
 
-/// Pre-compiled static text sections. Immutable after build.
-#[derive(Debug, Clone)]
-pub struct StaticSections {
-    pub core_rules: PromptSection,
-    pub safety: PromptSection,
-    pub planning_protocol: PromptSection,
-    pub coding_discipline: PromptSection,
-    pub turn_discipline: PromptSection,
-    pub plan_execution: PromptSection,
-    pub output_format: PromptSection,
-    pub tool_error_recovery: PromptSection,
-}
-
 /// Agent-level context. Set at init, stable for agent lifetime.
 #[derive(Debug, Clone, Default)]
 pub struct AgentContext {
@@ -375,57 +363,6 @@ pub struct ExternalSources {
     /// AFTER the Session→None cache marker and can churn freely without
     /// invalidating the cached session prefix.
     pub extra_dynamic_sections: Vec<PromptSection>,
-}
-
-impl StaticSections {
-    /// Collect all static sections into a Vec for iteration.
-    pub fn as_vec(&self) -> Vec<&PromptSection> {
-        vec![
-            &self.core_rules,
-            &self.safety,
-            &self.planning_protocol,
-            &self.coding_discipline,
-            &self.turn_discipline,
-            &self.plan_execution,
-            &self.output_format,
-            &self.tool_error_recovery,
-        ]
-    }
-
-    /// Total estimated tokens across all static sections.
-    pub fn total_tokens_estimate(&self) -> u32 {
-        self.as_vec()
-            .iter()
-            .map(|s| estimate_text_tokens(&s.text))
-            .sum()
-    }
-}
-
-impl StaticSections {
-    /// Build a minimal StaticSections for testing.
-    /// Available in tests (both unit and integration).
-    pub fn test_default() -> Self {
-        use crate::context_assembly_trace::PromptTraceSignals;
-        use crate::section_types::CacheScope;
-        Self {
-            core_rules: PromptSection {
-                text: "You are an expert.".into(),
-                scope: CacheScope::Global,
-                token_bucket: crate::section_types::PromptTokenBucket::BasePersona,
-                trace_signals: PromptTraceSignals::default(),
-            },
-            safety: PromptSection::stable("Refuse harmful requests.", CacheScope::Global),
-            planning_protocol: PromptSection::stable("Plan carefully.", CacheScope::Global),
-            coding_discipline: PromptSection::stable("Read before write.", CacheScope::Global),
-            turn_discipline: PromptSection::stable("Announce actions.", CacheScope::Global),
-            plan_execution: PromptSection::stable(
-                "Execute plan subtasks faithfully.",
-                CacheScope::Global,
-            ),
-            output_format: PromptSection::stable("Be concise.", CacheScope::Global),
-            tool_error_recovery: PromptSection::stable("Retry on error.", CacheScope::Global),
-        }
-    }
 }
 
 #[cfg(test)]

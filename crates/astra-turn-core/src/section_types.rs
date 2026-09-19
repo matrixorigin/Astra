@@ -1,143 +1,18 @@
-//! Prompt section types for the context pipeline.
+//! Context pipeline execution types.
 //!
-//! These types were originally defined in `runtime::prompts::system` but are
-//! needed by both `astra-turn-core` (optimizer, planner) and `astra-runtime`
-//! (prompt builders). Moving them here keeps the dependency DAG clean:
-//! `astra-turn-core` does NOT depend on `astra-runtime`.
+//! Persistable prompt sections and their pure operations are owned by
+//! `astra-turn-types` and re-exported here for pipeline consumers.
+
+pub use astra_turn_types::prompt_sections::{
+    BYTES_PER_TOKEN_ESTIMATE, CacheScope, PromptSection, PromptTokenBucket, estimate_text_tokens,
+};
 
 use std::borrow::Cow;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::context_assembly_trace::PromptTraceSignals;
 use crate::spill_backend::SpillRegistry;
-
-// ── Types moved from runtime::prompts::system ──────────────────────────────
-
-/// Cache scope for a prompt section, indicating how stable it is across turns.
-///
-/// Providers like Anthropic can cache content blocks annotated with
-/// `cache_control: {type: "ephemeral"}`.  Separating static from dynamic
-/// sections maximises prefix-cache hit rates.
-///
-/// The `Ord` impl orders by stability: `Global < Session < None`.
-/// This lets the optimizer sort sections most-stable-first for cache alignment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum CacheScope {
-    /// Stable across sessions — identity, core rules, output format.
-    /// Changes only on agent code updates (weeks/months).
-    Global,
-    /// Reusable within a session or a versioned session epoch — project
-    /// context, skill catalogs, user preferences, and guidance derived from
-    /// the exact visible tool surface. Sections are rebuilt on every turn;
-    /// changed bytes create a new provider prefix rather than reusing stale
-    /// content. Genuinely per-turn state and task hints belong in
-    /// [`CacheScope::None`].
-    Session,
-    /// Changes every turn — project profile, memory signals, and other volatile context.
-    None,
-}
-
-impl CacheScope {
-    /// Ordering key for cache-aligned sorting (lower = more stable = earlier).
-    #[must_use]
-    pub fn order(self) -> u8 {
-        match self {
-            Self::Global => 0,
-            Self::Session => 1,
-            Self::None => 2,
-        }
-    }
-}
-
-impl PartialOrd for CacheScope {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for CacheScope {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.order().cmp(&other.order())
-    }
-}
-
-/// Which token budget category a section belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PromptTokenBucket {
-    BasePersona,
-    Environment,
-    UserPreferences,
-}
-
-/// A section of the system prompt with cache scope metadata.
-#[derive(Debug, Clone)]
-pub struct PromptSection {
-    pub text: String,
-    pub scope: CacheScope,
-    pub token_bucket: PromptTokenBucket,
-    pub trace_signals: PromptTraceSignals,
-}
-
-impl PromptSection {
-    pub fn stable(text: impl Into<String>, scope: CacheScope) -> Self {
-        Self {
-            text: text.into(),
-            scope,
-            token_bucket: PromptTokenBucket::BasePersona,
-            trace_signals: PromptTraceSignals::default(),
-        }
-    }
-
-    pub fn dynamic(text: impl Into<String>, token_bucket: PromptTokenBucket) -> Self {
-        Self {
-            text: text.into(),
-            scope: CacheScope::None,
-            token_bucket,
-            trace_signals: PromptTraceSignals::default(),
-        }
-    }
-
-    /// **DANGEROUS** — construct a volatile (cache-busting) section. Use only
-    /// when content genuinely changes every turn and cannot live in the
-    /// stable prefix. The `_reason` argument is not read at runtime; it
-    /// exists purely to force the caller to document, in source, *why* this
-    /// section is worth invalidating the prompt-cache prefix.
-    ///
-    /// Guidance:
-    /// - Prefer [`PromptSection::stable`] whenever the content is
-    ///   session-stable and safe to include in the provider's cacheable prefix
-    ///   (cwd, git branch, tool list, skills). Model identity needs
-    ///   provider-aware placement because Anthropic cache-control prefixes should
-    ///   not churn when only the model id changes.
-    /// - Prefer [`PromptSection::dynamic`] (plain `CacheScope::None` with no
-    ///   social-engineering red flag) for ordinary per-turn environment
-    ///   context that already lives post-boundary.
-    /// - Reach for this constructor only when you need an **explicit audit
-    ///   trail** for a content source that *must* mutate per-turn and would
-    ///   otherwise silently destroy prefix cache hit-rate.
-    ///
-    /// Behaves identically to [`PromptSection::dynamic`] at runtime.
-    #[must_use]
-    pub fn dangerous_volatile(
-        text: impl Into<String>,
-        token_bucket: PromptTokenBucket,
-        _reason: &'static str,
-    ) -> Self {
-        debug_assert!(
-            !_reason.trim().is_empty(),
-            "PromptSection::dangerous_volatile requires a non-empty reason; \
-             document in source why this content cannot live in the stable prefix"
-        );
-        Self::dynamic(text, token_bucket)
-    }
-
-    pub fn with_trace_signals(mut self, trace_signals: PromptTraceSignals) -> Self {
-        self.trace_signals = trace_signals;
-        self
-    }
-}
 
 // ── New pipeline types ─────────────────────────────────────────────────────
 
@@ -502,33 +377,6 @@ impl BoundSection {
                 .saturating_add(estimate_text_tokens(suffix));
         }
     }
-}
-
-pub const BYTES_PER_TOKEN_ESTIMATE: usize = 4;
-
-/// Estimate token count from raw text.
-///
-/// ASCII-heavy English/code keeps the long-standing ≈4 bytes/token estimate.
-/// Non-ASCII text is counted by Unicode scalar value so dense UTF-8 scripts
-/// such as CJK and emoji do not get discounted just because their byte length
-/// is later divided by the ASCII ratio. This remains a coarse, conservative
-/// budget estimate rather than a provider-specific tokenizer.
-#[must_use]
-pub fn estimate_text_tokens(text: &str) -> u32 {
-    let mut ascii_bytes = 0usize;
-    let mut non_ascii_chars = 0usize;
-    for ch in text.chars() {
-        if ch.is_ascii() {
-            ascii_bytes = ascii_bytes.saturating_add(ch.len_utf8());
-        } else {
-            non_ascii_chars = non_ascii_chars.saturating_add(1);
-        }
-    }
-    ascii_bytes
-        .checked_div(BYTES_PER_TOKEN_ESTIMATE)
-        .unwrap_or(0)
-        .saturating_add(non_ascii_chars)
-        .min(u32::MAX as usize) as u32
 }
 
 #[cfg(test)]
