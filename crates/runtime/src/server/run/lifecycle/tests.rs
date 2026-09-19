@@ -1,6 +1,67 @@
 use super::*;
 use astra_services::runs::{RunStatusCasRequest, RunUsageOwnerUpdateRequest};
 
+#[derive(Clone)]
+struct EvalHttpHealth;
+
+#[async_trait::async_trait]
+impl crate::HealthChecker for EvalHttpHealth {
+    async fn database_healthy(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Clone)]
+struct EvalHttpAuth;
+
+#[async_trait::async_trait]
+impl crate::AuthService for EvalHttpAuth {
+    async fn register(
+        &self,
+        _request: crate::AuthRegisterRequestData,
+    ) -> Result<crate::AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+        unreachable!("evaluation HTTP test does not register users")
+    }
+
+    async fn login(
+        &self,
+        _request: crate::AuthLoginRequestData,
+    ) -> Result<crate::AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+        unreachable!("evaluation HTTP test does not log in users")
+    }
+
+    async fn refresh(
+        &self,
+        _request: crate::AuthRefreshRequestData,
+    ) -> Result<crate::AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+        unreachable!("evaluation HTTP test does not refresh users")
+    }
+
+    async fn logout(
+        &self,
+        _request: crate::AuthRefreshRequestData,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        unreachable!("evaluation HTTP test does not log out users")
+    }
+
+    async fn current_user(
+        &self,
+        headers: &axum::http::HeaderMap,
+    ) -> Result<crate::AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+        let user_id = headers
+            .get("x-user-id")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("eval-http-owner");
+        Ok(crate::AuthUserRecord {
+            user_id: user_id.to_string(),
+            username: user_id.to_string(),
+            email: format!("{user_id}@example.test"),
+            display_name: None,
+        })
+    }
+}
+
 #[test]
 fn explain_artifact_publication_requires_a_durable_terminal_status() {
     assert!(explain_artifact_publishable_status(RunStatus::Completed));
@@ -2530,12 +2591,24 @@ impl UserIntentProvider for StaticRunControlProvider {
 
 struct ActiveTestModelService {
     base_url: String,
+    offering_id: String,
+    model_name: String,
 }
 
 impl ActiveTestModelService {
     fn new(base_url: impl Into<String>) -> Self {
+        Self::with_model(base_url, "model-test-model", "test-model")
+    }
+
+    fn with_model(
+        base_url: impl Into<String>,
+        offering_id: impl Into<String>,
+        model_name: impl Into<String>,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
+            offering_id: offering_id.into(),
+            model_name: model_name.into(),
         }
     }
 }
@@ -2551,10 +2624,18 @@ fn test_resolved_model_offering() -> astra_services::ResolvedModelOffering {
 }
 
 fn test_resolved_model_offering_at(base_url: &str) -> astra_services::ResolvedModelOffering {
+    test_resolved_model_offering_for("model-test-model", "test-model", base_url)
+}
+
+fn test_resolved_model_offering_for(
+    offering_id: &str,
+    model_name: &str,
+    base_url: &str,
+) -> astra_services::ResolvedModelOffering {
     astra_services::ResolvedModelOffering {
-        offering_id: "model-test-model".to_string(),
+        offering_id: offering_id.to_string(),
         model: astra_services::ResolvedActiveLlmModel {
-            model_name: "test-model".to_string(),
+            model_name: model_name.to_string(),
             wire_model_name: None,
             api_key: "test-provider-secret".to_string(),
             base_url: base_url.to_string(),
@@ -2578,9 +2659,13 @@ fn test_admitted_model_execution() -> astra_services::AdmittedModelExecution {
         .expect("valid test model execution")
 }
 
-fn test_model_record_at(name: String, base_url: &str) -> astra_services::ModelRecord {
+fn test_model_record_with_id(
+    model_id: String,
+    name: String,
+    base_url: &str,
+) -> astra_services::ModelRecord {
     astra_services::ModelRecord {
-        model_id: format!("model-{name}"),
+        model_id,
         name,
         provider: "openai".to_string(),
         base_url: Some(base_url.to_string()),
@@ -2617,12 +2702,12 @@ impl astra_services::ModelService for ActiveTestModelService {
         _is_admin: bool,
     ) -> Result<Vec<astra_services::ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
         Ok(vec![astra_services::ModelListItem {
-            offering_id: "model-test-model".to_string(),
+            offering_id: self.offering_id.clone(),
             access_id: "self-hosted".to_string(),
             access_kind: astra_services::ModelAccessKind::SelfHosted,
             access_label: "Self-hosted".to_string(),
             execution_placement: astra_services::ModelExecutionPlacement::Server,
-            name: "test-model".to_string(),
+            name: self.model_name.clone(),
             provider: "openai".to_string(),
             description: None,
             is_active: true,
@@ -2637,8 +2722,12 @@ impl astra_services::ModelService for ActiveTestModelService {
         &self,
         model_name: String,
     ) -> Result<astra_services::ModelRecord, (StatusCode, Json<ErrorResponse>)> {
-        if model_name == "test-model" {
-            return Ok(test_model_record_at(model_name, &self.base_url));
+        if model_name == self.model_name {
+            return Ok(test_model_record_with_id(
+                self.offering_id.clone(),
+                model_name,
+                &self.base_url,
+            ));
         }
         Err(error_response_coded(
             StatusCode::NOT_FOUND,
@@ -2651,14 +2740,18 @@ impl astra_services::ModelService for ActiveTestModelService {
         &self,
         offering_id: String,
     ) -> Result<astra_services::ResolvedModelOffering, (StatusCode, Json<ErrorResponse>)> {
-        if offering_id != "model-test-model" {
+        if offering_id != self.offering_id {
             return Err(error_response_coded(
                 StatusCode::NOT_FOUND,
                 "offering not found",
                 "offering_not_found",
             ));
         }
-        Ok(test_resolved_model_offering_at(&self.base_url))
+        Ok(test_resolved_model_offering_for(
+            &self.offering_id,
+            &self.model_name,
+            &self.base_url,
+        ))
     }
 
     async fn update_model(
@@ -8744,6 +8837,7 @@ async fn spawn_skill_invoking_test_llm(skill_name: &str) -> TerminalTestLlm {
     use axum::{Router, extract::State, response::IntoResponse, routing::post};
 
     let skill_name = skill_name.to_string();
+    #[allow(clippy::needless_return)]
     async fn chat_completions(
         State((skill_name, requests)): State<(String, Arc<AtomicUsize>)>,
         Json(request): Json<Value>,
@@ -10658,6 +10752,290 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
         .execute(pool.get())
         .await
         .expect("clean runtime evaluation model fixture");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn evaluation_http_prepare_start_replays_and_reports() {
+    use axum::{body, body::Body, http::Request};
+    use tower::ServiceExt;
+
+    let pool = setup_lifecycle_run_db_it().await;
+    let llm = spawn_terminal_test_llm().await;
+    let offering_id = format!("model-eval-http-{}", Uuid::new_v4());
+    let model_name = format!("test-model-{}", Uuid::new_v4());
+    sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+        .bind(&offering_id)
+        .execute(pool.get())
+        .await
+        .expect("clear HTTP evaluation model fixture");
+    sqlx::query("INSERT INTO infra_llm_models (model_id, model_name, provider, api_key_encrypted, base_url, is_active, context_window, input_modalities, output_modalities, supported_parameters, pricing, tags, quirks) VALUES (?, ?, 'openai', ?, ?, 1, 128000, ?, ?, ?, ?, ?, ?)")
+        .bind(&offering_id)
+        .bind(&model_name)
+        .bind(test_encryptor().encrypt("test-key").expect("encrypt test key"))
+        .bind(&llm.base_url)
+        .bind(r#"["text"]"#)
+        .bind(r#"["text"]"#)
+        .bind("[]")
+        .bind("{}")
+        .bind("[]")
+        .bind("{}")
+        .execute(pool.get())
+        .await
+        .expect("seed HTTP evaluation model fixture");
+    let lifecycle = db_backed_test_service(&pool, &format!("eval-http-pod-{}", Uuid::new_v4()))
+        .with_model_service(Arc::new(ActiveTestModelService::with_model(
+            llm.base_url.clone(),
+            offering_id.clone(),
+            model_name.clone(),
+        )))
+        .with_run_concurrency_limit(1);
+    let owner = format!("eval-http-owner-{}", Uuid::new_v4());
+    let submission_key = format!("eval-http-{}", Uuid::new_v4());
+    let state = crate::AppState::new(crate::ServiceInfo::default(), Arc::new(EvalHttpHealth))
+        .with_auth_service(Arc::new(EvalHttpAuth))
+        .with_session_service(Arc::new(
+            astra_services::DatabaseSessionService::new(pool.settings().clone())
+                .with_pool(pool.clone()),
+        ))
+        .with_shared_pool(pool.clone())
+        .with_model_service(Arc::new(ActiveTestModelService::with_model(
+            llm.base_url.clone(),
+            offering_id.clone(),
+            model_name.clone(),
+        )))
+        .with_run_lifecycle_service(Arc::new(lifecycle));
+    let app = crate::build_app(state);
+
+    async fn request_json(
+        app: &axum::Router,
+        owner: &str,
+        method: &str,
+        uri: &str,
+        payload: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("x-user-id", owner)
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .expect("evaluation HTTP request");
+        let response = app
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("evaluation response");
+        let status = response.status();
+        let bytes = body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("evaluation response body");
+        let json = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!(
+                "evaluation response must be JSON (status {status}): {error}; body={}",
+                String::from_utf8_lossy(&bytes)
+            )
+        });
+        (status, json)
+    }
+
+    let prepare_body = json!({
+        "submission_idempotency_key": submission_key,
+        "target": {
+            "kind": "prompt",
+            "baseline": {
+                "revision_id": "http-baseline",
+                "content": "Answer briefly."
+            },
+            "candidate": {
+                "revision_id": "http-candidate",
+                "content": "Answer briefly and state assumptions."
+            }
+        },
+        "case": {
+            "case_id": "http-case",
+            "message": "Explain the frozen evaluation input.",
+            "verifier_id": "manual",
+            "verifier_version": "v1",
+            "holdout": false
+        },
+        "model_offering_id": offering_id.clone(),
+        "max_concurrency": 1,
+        "max_wall_time_secs": 60
+    });
+    let (status, prepared) = request_json(
+        &app,
+        &owner,
+        "POST",
+        "/evaluation/experiments/prepare",
+        prepare_body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "prepare response: {prepared}");
+    let experiment_id = prepared["experiment"]["experiment_id"]
+        .as_str()
+        .expect("prepared experiment id")
+        .to_string();
+    let trial_id = prepared["trials"][0]["trial_id"]
+        .as_str()
+        .expect("prepared trial id")
+        .to_string();
+
+    let (retry_status, retry_prepared) = request_json(
+        &app,
+        &owner,
+        "POST",
+        "/evaluation/experiments/prepare",
+        prepare_body,
+    )
+    .await;
+    assert_eq!(
+        retry_status,
+        StatusCode::OK,
+        "prepare replay: {retry_prepared}"
+    );
+    assert_eq!(retry_prepared["experiment"]["experiment_id"], experiment_id);
+    assert_eq!(retry_prepared["trials"][0]["trial_id"], trial_id);
+
+    let start_uri = format!("/evaluation/experiments/{experiment_id}/trials/{trial_id}/start");
+    let foreign_owner = format!("eval-http-foreign-{}", Uuid::new_v4());
+    let (foreign_status, _) = request_json(
+        &app,
+        &foreign_owner,
+        "GET",
+        &format!("/evaluation/experiments/{experiment_id}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(foreign_status, StatusCode::NOT_FOUND);
+    let (foreign_start_status, _) =
+        request_json(&app, &foreign_owner, "POST", &start_uri, json!({})).await;
+    assert_eq!(foreign_start_status, StatusCode::NOT_FOUND);
+
+    let (start_status, started) = request_json(&app, &owner, "POST", &start_uri, json!({})).await;
+    assert_eq!(
+        start_status,
+        StatusCode::ACCEPTED,
+        "start response: {started}"
+    );
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("started session id")
+        .to_string();
+    let run_id = started["run_id"]
+        .as_str()
+        .expect("started run id")
+        .to_string();
+
+    let projection_uri = format!("/evaluation/experiments/{experiment_id}");
+    let projection = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let (status, value) =
+                request_json(&app, &owner, "GET", &projection_uri, json!({})).await;
+            assert_eq!(status, StatusCode::OK, "projection response: {value}");
+            if value["observed_trial_count"].as_u64() == Some(1) {
+                break value;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("HTTP evaluation projection should observe the terminal trial");
+    assert_eq!(projection["trials"][0]["binding"]["session_id"], session_id);
+    assert_eq!(projection["trials"][0]["binding"]["run_id"], run_id);
+    assert!(projection["trials"][0]["observation"].is_object());
+    assert_eq!(
+        projection["trials"][0]["run_status"], "completed",
+        "HTTP evaluation run did not complete: {projection}"
+    );
+    assert_eq!(
+        projection["trials"][0]["observation"]["observation"]["status"],
+        "completed"
+    );
+    assert!(
+        llm.requests.load(Ordering::SeqCst) > 0,
+        "the HTTP start must cross the canonical provider boundary"
+    );
+
+    let requests_before_replay = llm.requests.load(Ordering::SeqCst);
+    let (replay_status, replay_started) =
+        request_json(&app, &owner, "POST", &start_uri, json!({})).await;
+    assert_eq!(
+        replay_status,
+        StatusCode::ACCEPTED,
+        "start replay: {replay_started}"
+    );
+    assert_eq!(replay_started["session_id"], session_id);
+    assert_eq!(replay_started["run_id"], run_id);
+
+    let (foreign_report_status, _) = request_json(
+        &app,
+        &foreign_owner,
+        "GET",
+        &format!("{projection_uri}/report"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(foreign_report_status, StatusCode::NOT_FOUND);
+
+    let (report_status, report) = request_json(
+        &app,
+        &owner,
+        "GET",
+        &format!("{projection_uri}/report"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(report_status, StatusCode::OK, "report response: {report}");
+    assert_eq!(report["manifest"]["experiment_id"], experiment_id);
+    assert_eq!(report["manifest"]["coverage"]["planned_trial_count"], 2);
+    assert_eq!(report["manifest"]["coverage"]["observed_trial_count"], 1);
+    assert_eq!(
+        report["manifest"]["coverage"]["missing_trial_ids"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(report["manifest"]["coverage"]["evidence_incomplete"], true);
+    assert!(
+        report["report"]["conclusion"]
+            .as_str()
+            .is_some_and(|value| value.contains("partial") && value.contains("do not claim"))
+    );
+    assert!(!report["markdown"].as_str().unwrap_or_default().is_empty());
+    assert_eq!(
+        llm.requests.load(Ordering::SeqCst),
+        requests_before_replay,
+        "replaying the same trial must not invoke the provider again"
+    );
+
+    sqlx::query("DELETE FROM evaluation_trial_observations WHERE owner_user_id = ?")
+        .bind(&owner)
+        .execute(pool.get())
+        .await
+        .expect("clean HTTP evaluation observations");
+    sqlx::query("DELETE FROM evaluation_materialization_receipts WHERE owner_user_id = ?")
+        .bind(&owner)
+        .execute(pool.get())
+        .await
+        .expect("clean HTTP evaluation receipts");
+    sqlx::query("DELETE FROM evaluation_trial_bindings WHERE owner_user_id = ?")
+        .bind(&owner)
+        .execute(pool.get())
+        .await
+        .expect("clean HTTP evaluation bindings");
+    sqlx::query("DELETE FROM evaluation_experiments WHERE owner_user_id = ?")
+        .bind(&owner)
+        .execute(pool.get())
+        .await
+        .expect("clean HTTP evaluation experiments");
+    cleanup_lifecycle_run_fixture(&pool, &owner, &run_id).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &owner, &session_id).await;
+    sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+        .bind(&offering_id)
+        .execute(pool.get())
+        .await
+        .expect("clean HTTP evaluation model fixture");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
