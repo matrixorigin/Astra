@@ -1352,6 +1352,7 @@ mod tests {
                 cache_policy: "recorded".to_string(),
                 memory_isolation: MemoryIsolation::Disabled,
                 data_isolation: DataIsolation::Disabled,
+                execution_binding: None,
             },
             budget: super::super::experiment::EvaluationBudget {
                 max_trials: 2,

@@ -10519,6 +10519,7 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
             cache_policy: "provider_default_recorded".to_string(),
             memory_isolation: astra_services::evaluation::MemoryIsolation::Disabled,
             data_isolation: astra_services::evaluation::DataIsolation::Disabled,
+            execution_binding: None,
         },
         budget: astra_services::evaluation::EvaluationBudget {
             max_trials: 2,
@@ -11182,6 +11183,7 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
             cache_policy: "provider_default_recorded".to_string(),
             memory_isolation: astra_services::evaluation::MemoryIsolation::Disabled,
             data_isolation: astra_services::evaluation::DataIsolation::Disabled,
+            execution_binding: None,
         },
         budget: astra_services::evaluation::EvaluationBudget {
             max_trials: 2,

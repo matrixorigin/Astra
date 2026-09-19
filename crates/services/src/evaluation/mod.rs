@@ -27,8 +27,8 @@ pub use assessment::{
 pub use bootstrap::{
     EVALUATION_ADAPTER_PROFILE_VERSION, EvaluationBootstrapError, EvaluationTrialStartPlan,
     PreparedModelIdentity, PreparedSkillIdentity, build_prepared_experiment_spec,
-    prepare_trial_start, prepared_cache_policy_identity, prepared_experiment_id,
-    prepared_request_matches_spec,
+    build_prepared_experiment_spec_with_execution_binding, prepare_trial_start,
+    prepared_cache_policy_identity, prepared_experiment_id, prepared_request_matches_spec,
 };
 pub use database::DatabaseEvaluationService;
 pub use durable::{
@@ -45,8 +45,9 @@ pub use execution::{
 };
 pub use experiment::{
     DataIsolation, EXPERIMENT_SCHEMA_VERSION, EvaluationBudget, EvaluationCase, EvaluationTarget,
-    EvaluationTargetKind, ExperimentSpec, FrozenConditions, MemoryIsolation, RevisionRef,
-    SNAPSHOT_ENVELOPE_SCHEMA_VERSION, SnapshotEnvelope, TrialOrder, TrialUnit,
+    EvaluationTargetKind, ExperimentSpec, FrozenConditions, FrozenExecutionBinding,
+    MemoryIsolation, RevisionRef, SNAPSHOT_ENVELOPE_SCHEMA_VERSION, SnapshotEnvelope, TrialOrder,
+    TrialUnit,
 };
 pub use materialization::{
     DatabaseMaterializationReceiptStore, MATERIALIZATION_RECEIPT_SCHEMA_VERSION,

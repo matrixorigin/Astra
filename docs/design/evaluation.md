@@ -161,7 +161,9 @@ The generic control-plane API exposes five owner-authenticated operations:
   baseline/candidate text or two owner-scoped published Skill revisions, one
   fixed case, a model Offering, and bounded budget), resolves trusted model and
   Skill facts, computes the server-owned hashes/profile, and idempotently
-  freezes the resulting first-adapter plan;
+  freezes the resulting first-adapter plan. An optional `edge_executor_id`
+  selects an owner-scoped active registration; the server freezes its
+  materialization and worktree identities and never accepts a client path;
 * `POST /evaluation/experiments` remains the lower-level registration boundary
   for trusted/internal callers that already have a complete `ExperimentSpec`;
 * `GET /evaluation/experiments/{experiment_id}` reads a consistent projection
@@ -177,6 +179,10 @@ The execution entrypoint is also owner-authenticated and deliberately narrow:
   optional when the prepare endpoint froze them; if supplied, they must match
   those frozen bytes. Skill starts may omit the owner-scoped Skill name when
   prepare froze it; if supplied, it must match that frozen name.
+  An Edge-bound trial reuses the frozen execution identity; the canonical
+  binding owner rechecks the active owner registration and rejects root or
+  materialization drift before claiming a new Run. An existing durable Run is
+  replayed before that dynamic check.
   Before creating the Run, the server re-admits the selected Offering and
   fails closed if its provider or supported cache contract has drifted. It
   derives the Session and Run identities from `(owner, experiment, trial)`,
@@ -218,9 +224,16 @@ and verifies the created HEAD/tree before switching the session. Result metadata
 contains `source_commit` and `source_tree`. This identifies the creation source;
 shared Git metadata means it is not an Eval isolation receipt.
 
-Status: required delivery contract; the current text adapter does not implement
-this path. Its HTTP integration test proves routing through the canonical Run
-and reporting, not TUI operation or local tool isolation.
+Status: the generic prepare/start contract can now freeze an owner-scoped Edge
+selection as `(edge_executor_id, materialization_id, worktree_path)` and
+recheck all three identities before constructing the canonical Run request.
+Owner mismatch, an unavailable registration, a missing materialization/root, or
+root/materialization drift fails before session/run creation. This is still only
+an execution-location fence: the registry row is not a workspace materializer,
+source commit/tree proof, or isolation receipt. The current adapter therefore
+does not claim coding Eval, Bash, Git, or workspace isolation; those capabilities
+remain fail-closed until a trusted materialization receipt and tool policy are
+attached.
 
 Developer-facing coding evaluation must be usable from TUI with an explicitly
 selected Edge or User Runner. HTTP controls the experiment; it does not determine

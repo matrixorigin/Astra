@@ -12,8 +12,9 @@ use astra_core::{ErrorResponse, error_response, error_response_coded};
 use astra_services::evaluation::{
     DatabaseEvaluationPlanStore, EVALUATION_ADAPTER_PROFILE_VERSION, EvaluationBootstrapError,
     EvaluationExperimentPrepareRequest, EvaluationExperimentPrepareResponse, EvaluationTargetKind,
-    PreparedModelIdentity, PreparedSkillIdentity, build_prepared_experiment_spec,
-    prepared_cache_policy_identity, prepared_experiment_id, prepared_request_matches_spec,
+    FrozenExecutionBinding, PreparedModelIdentity, PreparedSkillIdentity,
+    build_prepared_experiment_spec_with_execution_binding, prepared_cache_policy_identity,
+    prepared_experiment_id, prepared_request_matches_spec,
 };
 use astra_services::{DatabasePersonalSkillStore, PersonalSkillError};
 use astra_turn_types::ModelSelection;
@@ -69,6 +70,81 @@ fn map_skill_error(error: PersonalSkillError) -> (StatusCode, Json<ErrorResponse
             "skill_store_unavailable",
         ),
     }
+}
+
+async fn resolve_execution_binding(
+    state: &AppState,
+    owner_user_id: &str,
+    executor_id: &str,
+) -> Result<FrozenExecutionBinding, (StatusCode, Json<ErrorResponse>)> {
+    let executor_id = executor_id.trim();
+    if executor_id.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "edge_executor_id must not be empty",
+        ));
+    }
+    let record = state
+        .execution
+        .edge_registry_service
+        .find_by_user_agent_and_workspace(owner_user_id, executor_id, None)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                owner_user_id,
+                executor_id,
+                %error,
+                "evaluation Edge registry lookup failed"
+            );
+            error_response_coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the selected Edge registry is temporarily unavailable",
+                "evaluation_execution_target_unavailable",
+            )
+        })?
+        .ok_or_else(|| {
+            error_response_coded(
+                StatusCode::PRECONDITION_FAILED,
+                "the selected Edge is not currently registered for this user",
+                "evaluation_execution_target_unavailable",
+            )
+        })?;
+    let worktree_path = record
+        .worktree_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            error_response_coded(
+                StatusCode::PRECONDITION_FAILED,
+                "the selected Edge has no registered workspace root",
+                "evaluation_execution_target_incomplete",
+            )
+        })?;
+    let materialization_id = record
+        .materialization_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|identity| !identity.is_empty())
+        .ok_or_else(|| {
+            error_response_coded(
+                StatusCode::PRECONDITION_FAILED,
+                "the selected Edge has no stable checkout materialization",
+                "evaluation_execution_target_incomplete",
+            )
+        })?;
+    if record.workspace_id.is_some() || record.edge_agent_id != executor_id {
+        return Err(error_response_coded(
+            StatusCode::CONFLICT,
+            "the selected Edge is outside the native owner execution scope",
+            "evaluation_execution_target_mismatch",
+        ));
+    }
+    Ok(FrozenExecutionBinding {
+        executor_id: record.edge_agent_id,
+        materialization_id: materialization_id.to_string(),
+        worktree_path: worktree_path.to_string(),
+    })
 }
 
 pub async fn prepare_experiment(
@@ -217,12 +293,19 @@ pub async fn prepare_experiment(
         None
     };
 
-    let spec = build_prepared_experiment_spec(
+    let execution_binding = match request.edge_executor_id.as_deref() {
+        Some(executor_id) => {
+            Some(resolve_execution_binding(state, owner_user_id, executor_id).await?)
+        }
+        None => None,
+    };
+    let spec = build_prepared_experiment_spec_with_execution_binding(
         owner_user_id,
         &experiment_id,
         &request,
         &model,
         skill.as_ref(),
+        execution_binding,
     )
     .map_err(map_bootstrap_error)?;
     let experiment = match plan_store

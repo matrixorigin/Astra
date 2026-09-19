@@ -8198,10 +8198,52 @@ impl AgenticRunLifecycleService {
             ));
         }
         let edge_context = Self::extract_edge_context(request)?;
-        if request.workspace_binding.is_some()
-            || request.executor_binding.is_some()
-            || request.edge_executor_id.is_some()
-            || !request.runtime_mcp_bindings.is_empty()
+        let frozen_execution_binding = experiment.spec.conditions.execution_binding.as_ref();
+        let edge_binding_matches = frozen_execution_binding.is_some_and(|binding| {
+            let workspace_matches = request.workspace_binding.as_ref().is_some_and(|workspace| {
+                workspace.kind == astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace
+                    && workspace.root.as_deref().map(str::trim)
+                        == Some(binding.worktree_path.as_str())
+                    && workspace.source.as_ref().is_some_and(|source| {
+                        matches!(
+                            source,
+                            astra_services::runs::WorkspaceSourceRequest::EdgePath { path }
+                                if path.trim() == binding.worktree_path
+                        )
+                    })
+                    && workspace.authority
+                        == Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite)
+            });
+            let executor_matches = request.executor_binding.as_ref().is_some_and(|executor| {
+                executor.kind == astra_services::runs::ExecutorBindingRequestKind::EdgeAgent
+                    && executor.executor_id.as_deref() == Some(binding.executor_id.as_str())
+                    && executor.transport
+                        == Some(astra_services::runs::ToolTransportKindRequest::EdgeWs)
+                    && executor.status == Some(astra_services::runs::ExecutorStatusRequest::Online)
+            });
+            workspace_matches
+                && executor_matches
+                && request.edge_executor_id.as_deref() == Some(binding.executor_id.as_str())
+        });
+        if frozen_execution_binding.is_some() && !edge_binding_matches {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_execution_binding_mismatch",
+                "the selected Edge request does not match the frozen execution binding",
+            ));
+        }
+        if frozen_execution_binding.is_none()
+            && (request.workspace_binding.is_some()
+                || request.executor_binding.is_some()
+                || request.edge_executor_id.is_some())
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "evaluation_execution_surface_unsupported",
+                "evaluation does not admit workspace or Edge side effects",
+            ));
+        }
+        if !request.runtime_mcp_bindings.is_empty()
             || !request.agent_bindings.is_empty()
             || request.agent_binding.is_some()
             || request.runtime_skill_binding.is_some()
@@ -10005,6 +10047,62 @@ impl AgenticRunLifecycleService {
             binding.kind == astra_services::runs::ExecutorBindingRequestKind::ServerLocal
         });
 
+        // Evaluation's frozen Edge identity is checked at the same canonical
+        // binding owner that authorizes the live registry materialization. A
+        // later registry row cannot silently replace the checkout between
+        // preparation and Run admission. Existing durable Run replays return
+        // before this method, so this check only gates a new execution claim.
+        let expected_evaluation_physical_workspace = if let Some(admission) =
+            request.evaluation_admission.as_ref()
+        {
+            let pool = self.shared_pool.clone().ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "evaluation_store_unavailable",
+                    "evaluation Edge binding requires the shared durable database",
+                )
+            })?;
+            let plan_store = DatabaseEvaluationPlanStore::new(pool);
+            let experiment = plan_store
+                .load_experiment(user_id, &admission.experiment_id)
+                .await
+                .map_err(|error| {
+                    evaluation_preflight_error(
+                        StatusCode::CONFLICT,
+                        "evaluation_execution_binding_unavailable",
+                        error,
+                    )
+                })?;
+            match (
+                    experiment.spec.conditions.execution_binding.as_ref(),
+                    request_is_edge,
+                ) {
+                    (Some(binding), true) => Some(
+                        astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+                            &binding.materialization_id,
+                            &binding.worktree_path,
+                        ),
+                    ),
+                    (Some(_), false) => {
+                        return Err(evaluation_preflight_error(
+                            StatusCode::PRECONDITION_FAILED,
+                            "evaluation_execution_binding_required",
+                            "the frozen evaluation must run on its selected Edge",
+                        ));
+                    }
+                    (None, true) => {
+                        return Err(evaluation_preflight_error(
+                            StatusCode::NOT_IMPLEMENTED,
+                            "evaluation_execution_surface_unsupported",
+                            "this evaluation has no frozen Edge execution binding",
+                        ));
+                    }
+                    (None, false) => None,
+                }
+        } else {
+            None
+        };
+
         // Provider-authorized runtime requests arrive with an independently
         // authenticated execution grant. They are admitted and dispatched by
         // the provider-runtime path below; they must never be materialized as
@@ -10120,6 +10218,15 @@ impl AgenticRunLifecycleService {
                 let physical_workspace_id = self
                     .authorize_native_edge_execution(user_id, request)
                     .await?;
+                if let Some(expected) = expected_evaluation_physical_workspace.as_deref()
+                    && physical_workspace_id.as_deref() != Some(expected)
+                {
+                    return Err(evaluation_preflight_error(
+                        StatusCode::CONFLICT,
+                        "evaluation_execution_target_changed",
+                        "the selected Edge materialization changed after evaluation preparation",
+                    ));
+                }
                 let workspace = request.workspace_binding.clone().ok_or_else(|| {
                     error_response_coded(
                         StatusCode::PRECONDITION_FAILED,
@@ -10284,6 +10391,15 @@ impl AgenticRunLifecycleService {
                     StatusCode::CONFLICT,
                     "the selected Edge materialization changed; refresh the Work and use an explicit handoff",
                     "execution_binding_provider_mismatch",
+                ));
+            }
+            if let Some(expected) = expected_evaluation_physical_workspace.as_deref()
+                && binding.physical_workspace_id.as_deref() != Some(expected)
+            {
+                return Err(evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_execution_target_changed",
+                    "the Session binding does not match the frozen evaluation Edge materialization",
                 ));
             }
         } else if request_is_edge {

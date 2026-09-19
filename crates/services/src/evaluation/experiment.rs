@@ -82,6 +82,19 @@ pub struct FrozenConditions {
     pub cache_policy: String,
     pub memory_isolation: MemoryIsolation,
     pub data_isolation: DataIsolation,
+    /// Optional owner-authenticated local execution target. The registry
+    /// record is rechecked at trial start; these identities prevent a retry
+    /// from silently moving one arm to another checkout or Edge connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_binding: Option<FrozenExecutionBinding>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenExecutionBinding {
+    pub executor_id: String,
+    pub materialization_id: String,
+    pub worktree_path: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -436,6 +449,20 @@ impl ExperimentSpec {
             && base_snapshot_ref.trim().is_empty()
         {
             return Err("MatrixOne branch base_snapshot_ref must not be empty".to_string());
+        }
+        if let Some(binding) = self.conditions.execution_binding.as_ref() {
+            for (field, value) in [
+                ("execution_binding.executor_id", &binding.executor_id),
+                (
+                    "execution_binding.materialization_id",
+                    &binding.materialization_id,
+                ),
+                ("execution_binding.worktree_path", &binding.worktree_path),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(format!("{field} must not be empty"));
+                }
+            }
         }
         let expected = self
             .cases
@@ -913,6 +940,7 @@ mod tests {
                 cache_policy: "provider_default_recorded".to_string(),
                 memory_isolation: MemoryIsolation::Disabled,
                 data_isolation: DataIsolation::Disabled,
+                execution_binding: None,
             },
             budget: EvaluationBudget {
                 max_trials: 4,
