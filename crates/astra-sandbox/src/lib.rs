@@ -54,3 +54,6 @@ pub use workspace_inspection::{
 
 mod sync_process;
 pub use sync_process::{SyncProcessError, SyncProcessOutput, run_sync_process};
+
+mod shell_process_boundary;
+pub use shell_process_boundary::ShellProcessBoundary;

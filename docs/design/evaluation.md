@@ -296,3 +296,21 @@ outside the declared profile. The execution-facing validation is a
 point-in-time check: after its transaction commits, the Run generation may
 advance. An executor must carry the returned generation into the canonical Run
 admission/fencing CAS and refuse to start if it changed.
+
+### Local shell confinement implementation status
+
+The CLI executor has an opt-in, immutable host shell boundary, independent of
+permission-mode and Skill-policy changes. On macOS it wraps foreground process
+launch with Seatbelt before the canonical Bash process owner. Workspace, private
+HOME/TMP, and explicit read-only toolchain directories are validated at launch;
+network access is denied and user environment overlays are not inherited.
+System executable/library directories remain readable, and file metadata reads
+are permitted globally. This is not a claim that all host data is invisible.
+Detached and environment-lifetime background launches are rejected under this
+boundary. Unsupported hosts fail rather than falling back to ordinary shell.
+
+This is a shell launch primitive, not a workspace Eval admission profile. File
+tools, implicit helpers, provisioning, trusted Runner receipts, and the Eval/TUI
+binding still require integration. It does not upgrade macOS process-group
+ownership into proof that every escaped descendant has terminated; a trial
+cannot claim complete settlement or safely recycle its workspace on that basis.

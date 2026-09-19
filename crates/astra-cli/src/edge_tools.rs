@@ -1312,6 +1312,8 @@ pub struct ToolExecutor {
     /// Wrapped in `RwLock` so the policy can be swapped per-turn (e.g. skill
     /// sandbox activation) while the executor is shared via `Arc<ToolExecutor>`.
     pub sandbox_policy: std::sync::RwLock<Option<SandboxPolicy>>,
+    /// Immutable host boundary; permission and Skill policies cannot remove it.
+    shell_process_boundary: Option<astra_sandbox::ShellProcessBoundary>,
     pub(crate) permission_sandbox_basis: std::sync::Mutex<Option<PermissionSandboxBasis>>,
 
     /// Per-turn budget pressure (0.0 = normal, 1.0 = critical).
@@ -1502,6 +1504,16 @@ pub struct ToolExecutor {
 }
 
 impl ToolExecutor {
+    /// Install a trusted host constraint before sharing this executor.
+    /// This confines shell processes only, not every local tool/helper.
+    pub fn with_shell_process_boundary(
+        mut self,
+        boundary: astra_sandbox::ShellProcessBoundary,
+    ) -> Result<Self, String> {
+        self.shell_process_boundary = Some(boundary.validate(&self.effective_project_root())?);
+        Ok(self)
+    }
+
     pub(crate) fn apply_runtime_permission_sandbox(
         &self,
         mode: crate::cli::permission_manager::PermissionMode,
@@ -1534,6 +1546,7 @@ impl ToolExecutor {
             cli_local_provider_schemas: std::sync::RwLock::new(Vec::new()),
             current_tool_surface: std::sync::RwLock::new(ToolSurfaceNames::default()),
             sandbox_policy: std::sync::RwLock::new(Some(sandbox)),
+            shell_process_boundary: None,
             permission_sandbox_basis: std::sync::Mutex::new(None),
 
             budget_pressure: std::sync::Mutex::new(0.0),
