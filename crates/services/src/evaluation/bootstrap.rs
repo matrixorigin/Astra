@@ -12,8 +12,8 @@ use super::durable::{EvaluationExperimentRecord, EvaluationTrialBindingRecord};
 use super::execution::{EvaluationRunAdmission, EvaluationSkillRevision};
 use super::experiment::{
     DataIsolation, EXPERIMENT_SCHEMA_VERSION, EvaluationBudget, EvaluationCase, EvaluationTarget,
-    EvaluationTargetKind, ExperimentSpec, FrozenConditions, FrozenExecutionBinding,
-    MemoryIsolation, RevisionRef, TrialOrder,
+    EvaluationTargetKind, ExperimentSpec, FrozenConditions, MemoryIsolation, RevisionRef,
+    TrialOrder,
 };
 use super::{
     EvaluationPolicyFingerprintInput, content_fingerprint, evaluation_policy_fingerprint,
@@ -86,12 +86,6 @@ pub fn prepared_request_matches_spec(
         || request.max_wall_time_secs != spec.budget.max_wall_time_secs
         || spec.adapter_profile_version.as_deref() != Some(EVALUATION_ADAPTER_PROFILE_VERSION)
         || spec.cases.len() != 1
-        || request.edge_executor_id.as_deref()
-            != spec
-                .conditions
-                .execution_binding
-                .as_ref()
-                .map(|binding| binding.executor_id.as_str())
     {
         return false;
     }
@@ -171,7 +165,10 @@ pub struct EvaluationTrialStartPlan {
     pub revision_content: Option<String>,
     pub model_offering_id: String,
     pub execution_time_budget_secs: u64,
-    pub execution_binding: Option<FrozenExecutionBinding>,
+    /// The caller's requested Edge identity. The canonical Run binding owner
+    /// resolves and authenticates the current materialization; this field
+    /// never carries a workspace path or materialization identity.
+    pub edge_executor_id: Option<String>,
     pub admission: EvaluationRunAdmission,
 }
 
@@ -179,32 +176,11 @@ pub struct EvaluationTrialStartPlan {
 /// immutable first adapter spec. Hashes and policy identities are produced
 /// here, never by a client or a second runtime implementation.
 pub fn build_prepared_experiment_spec(
-    owner_user_id: &str,
-    experiment_id: &str,
-    request: &EvaluationExperimentPrepareRequest,
-    model: &PreparedModelIdentity,
-    skill: Option<&PreparedSkillIdentity>,
-) -> Result<ExperimentSpec, EvaluationBootstrapError> {
-    build_prepared_experiment_spec_with_execution_binding(
-        owner_user_id,
-        experiment_id,
-        request,
-        model,
-        skill,
-        None,
-    )
-}
-
-/// Prepare the same adapter with a server-verified Edge selection. The
-/// registry record is reduced to the executor, materialization, and workspace
-/// path identities that trial start must match again before creating a Run.
-pub fn build_prepared_experiment_spec_with_execution_binding(
     _owner_user_id: &str,
     experiment_id: &str,
     request: &EvaluationExperimentPrepareRequest,
     model: &PreparedModelIdentity,
     skill: Option<&PreparedSkillIdentity>,
-    execution_binding: Option<FrozenExecutionBinding>,
 ) -> Result<ExperimentSpec, EvaluationBootstrapError> {
     if experiment_id.trim().is_empty() {
         return Err(EvaluationBootstrapError::InvalidInput(
@@ -234,16 +210,6 @@ pub fn build_prepared_experiment_spec_with_execution_binding(
     if model.offering_id != request.model_offering_id || model.provider.trim().is_empty() {
         return Err(EvaluationBootstrapError::Conflict(
             "model admission does not match the requested offering".to_string(),
-        ));
-    }
-    if request.edge_executor_id.is_some() != execution_binding.is_some()
-        || request.edge_executor_id.as_deref()
-            != execution_binding
-                .as_ref()
-                .map(|binding| binding.executor_id.as_str())
-    {
-        return Err(EvaluationBootstrapError::Conflict(
-            "Edge selection is not backed by the authenticated execution binding".to_string(),
         ));
     }
     if model.cache_policy
@@ -298,7 +264,6 @@ pub fn build_prepared_experiment_spec_with_execution_binding(
             cache_policy: model.cache_policy.clone(),
             memory_isolation: MemoryIsolation::Disabled,
             data_isolation: DataIsolation::Disabled,
-            execution_binding,
         },
         budget: EvaluationBudget {
             max_trials: 2,
@@ -404,15 +369,15 @@ pub fn prepare_trial_start(
             "owner_user_id must not be empty".to_string(),
         ));
     }
-    let execution_binding = experiment.spec.conditions.execution_binding.clone();
-    if request.edge_executor_id.as_deref()
-        != execution_binding
-            .as_ref()
-            .map(|binding| binding.executor_id.as_str())
-        && request.edge_executor_id.is_some()
-    {
-        return Err(EvaluationBootstrapError::Conflict(
-            "Edge selection does not match the frozen experiment binding".to_string(),
+    let edge_executor_id = request
+        .edge_executor_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if request.edge_executor_id.is_some() && edge_executor_id.is_none() {
+        return Err(EvaluationBootstrapError::InvalidInput(
+            "edge_executor_id must not be empty".to_string(),
         ));
     }
     if experiment.owner_user_id != owner_user_id || trial.owner_user_id != owner_user_id {
@@ -620,7 +585,7 @@ pub fn prepare_trial_start(
         "revision_content": revision_content,
         "skill_name": skill_revision.as_ref().map(|revision| &revision.skill_name),
         "execution_time_budget_secs": execution_time_budget_secs,
-        "execution_binding": execution_binding,
+        "edge_executor_id": edge_executor_id,
     });
     let request_fingerprint = format!(
         "{:x}",
@@ -645,7 +610,7 @@ pub fn prepare_trial_start(
         revision_content,
         model_offering_id: experiment.spec.conditions.model_binding.clone(),
         execution_time_budget_secs,
-        execution_binding,
+        edge_executor_id,
         admission,
     })
 }
@@ -705,7 +670,6 @@ mod tests {
                 cache_policy: "provider_default_recorded".to_string(),
                 memory_isolation: MemoryIsolation::Disabled,
                 data_isolation: DataIsolation::Disabled,
-                execution_binding: None,
             },
             budget: EvaluationBudget {
                 max_trials: 2,
@@ -856,7 +820,6 @@ mod tests {
             model_offering_id: "model-1".to_string(),
             max_concurrency: 2,
             max_wall_time_secs: 30,
-            edge_executor_id: None,
         }
     }
 
@@ -913,70 +876,67 @@ mod tests {
     }
 
     #[test]
-    fn freezes_owner_verified_edge_identity_and_rejects_start_target_drift() {
-        let mut request = prepared_request(EvaluationTargetKind::Prompt);
-        request.edge_executor_id = Some("edge-a".to_string());
-        let model = PreparedModelIdentity {
-            offering_id: "model-1".to_string(),
-            model_name: "model-name".to_string(),
-            provider: "openai".to_string(),
-            cache_policy: "provider_default_recorded".to_string(),
-            cache_capability: None,
-        };
-        let frozen = FrozenExecutionBinding {
-            executor_id: "edge-a".to_string(),
-            materialization_id: "mat-a".to_string(),
-            worktree_path: "/worktrees/eval-a".to_string(),
-        };
-        let spec = build_prepared_experiment_spec_with_execution_binding(
+    fn trial_start_keeps_edge_selection_out_of_the_shared_experiment_spec() {
+        let request = prepared_request(EvaluationTargetKind::Prompt);
+        let spec = build_prepared_experiment_spec(
             "owner-1",
             "evx_edge",
             &request,
-            &model,
+            &PreparedModelIdentity {
+                offering_id: "model-1".to_string(),
+                model_name: "model-name".to_string(),
+                provider: "openai".to_string(),
+                cache_policy: "provider_default_recorded".to_string(),
+                cache_capability: None,
+            },
             None,
-            Some(frozen.clone()),
         )
-        .expect("Edge identity should be frozen");
-        assert_eq!(spec.conditions.execution_binding, Some(frozen.clone()));
-        assert!(prepared_request_matches_spec(&request, &spec));
-        request.edge_executor_id = Some("edge-b".to_string());
-        assert!(!prepared_request_matches_spec(&request, &spec));
-
-        let (mut experiment, mut trial, _) = fixtures();
-        experiment.spec.conditions.execution_binding = Some(frozen);
-        let spec_fingerprint = experiment.spec.spec_fingerprint().expect("fingerprint");
-        let edge_trial = experiment
+        .expect("prepared spec");
+        let spec_fingerprint = spec.spec_fingerprint().expect("fingerprint");
+        let mut experiment = fixtures().0;
+        experiment.spec = spec;
+        experiment.spec_fingerprint = spec_fingerprint;
+        let trial_unit = experiment
             .spec
             .plan_trials()
             .expect("trials")
             .into_iter()
             .next()
             .expect("first trial");
-        trial.trial_id = edge_trial.trial_id.clone();
-        trial.trial = edge_trial;
-        trial.spec_fingerprint = spec_fingerprint.clone();
-        experiment.spec_fingerprint = spec_fingerprint;
-        let same_target = EvaluationTrialStartRequest {
-            message: None,
-            revision_content: None,
-            skill_name: None,
-            execution_time_budget_secs: None,
-            edge_executor_id: None,
+        let trial = EvaluationTrialBindingRecord {
+            owner_user_id: "owner-1".to_string(),
+            trial_id: trial_unit.trial_id.clone(),
+            experiment_id: experiment.experiment_id.clone(),
+            spec_fingerprint: experiment.spec_fingerprint.clone(),
+            trial: trial_unit,
+            binding_status: "planned".to_string(),
+            session_id: None,
+            run_id: None,
+            run_generation: None,
+            created_at: "now".to_string(),
+            updated_at: "now".to_string(),
         };
-        let plan = prepare_trial_start("owner-1", &experiment, &trial, &same_target)
-            .expect("frozen Edge target can be omitted on start retry");
-        assert_eq!(
-            plan.execution_binding
-                .as_ref()
-                .map(|binding| binding.executor_id.as_str()),
-            Some("edge-a")
+        let plan = prepare_trial_start(
+            "owner-1",
+            &experiment,
+            &trial,
+            &EvaluationTrialStartRequest {
+                message: None,
+                revision_content: None,
+                skill_name: None,
+                execution_time_budget_secs: None,
+                edge_executor_id: Some("edge-a".to_string()),
+            },
+        )
+        .expect("trial Edge selection");
+        assert_eq!(plan.edge_executor_id.as_deref(), Some("edge-a"));
+        assert!(
+            experiment
+                .spec
+                .conditions
+                .tool_policy_hash
+                .starts_with("sha256:")
         );
-        let mut drifted = same_target;
-        drifted.edge_executor_id = Some("edge-b".to_string());
-        assert!(matches!(
-            prepare_trial_start("owner-1", &experiment, &trial, &drifted),
-            Err(EvaluationBootstrapError::Conflict(_))
-        ));
     }
 
     #[test]

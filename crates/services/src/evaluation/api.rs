@@ -26,11 +26,6 @@ pub struct EvaluationExperimentPrepareRequest {
     pub model_offering_id: String,
     pub max_concurrency: u16,
     pub max_wall_time_secs: u64,
-    /// Optional authenticated Edge selection. The server resolves this ID
-    /// against the owner's active registry and freezes its materialization
-    /// identity; clients never submit a workspace root or authority.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub edge_executor_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

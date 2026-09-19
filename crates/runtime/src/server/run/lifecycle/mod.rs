@@ -8198,41 +8198,41 @@ impl AgenticRunLifecycleService {
             ));
         }
         let edge_context = Self::extract_edge_context(request)?;
-        let frozen_execution_binding = experiment.spec.conditions.execution_binding.as_ref();
-        let edge_binding_matches = frozen_execution_binding.is_some_and(|binding| {
-            let workspace_matches = request.workspace_binding.as_ref().is_some_and(|workspace| {
+        let evaluation_edge_requested = request
+            .edge_executor_id
+            .as_deref()
+            .is_some_and(|executor_id| !executor_id.trim().is_empty());
+        let edge_binding_complete =
+            request.workspace_binding.as_ref().is_some_and(|workspace| {
                 workspace.kind == astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace
-                    && workspace.root.as_deref().map(str::trim)
-                        == Some(binding.worktree_path.as_str())
+                    && workspace
+                        .root
+                        .as_deref()
+                        .is_some_and(|root| !root.trim().is_empty())
                     && workspace.source.as_ref().is_some_and(|source| {
                         matches!(
                             source,
                             astra_services::runs::WorkspaceSourceRequest::EdgePath { path }
-                                if path.trim() == binding.worktree_path
+                                if !path.trim().is_empty()
                         )
                     })
                     && workspace.authority
                         == Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite)
-            });
-            let executor_matches = request.executor_binding.as_ref().is_some_and(|executor| {
+            }) && request.executor_binding.as_ref().is_some_and(|executor| {
                 executor.kind == astra_services::runs::ExecutorBindingRequestKind::EdgeAgent
-                    && executor.executor_id.as_deref() == Some(binding.executor_id.as_str())
+                    && executor.executor_id.as_deref() == request.edge_executor_id.as_deref()
                     && executor.transport
                         == Some(astra_services::runs::ToolTransportKindRequest::EdgeWs)
                     && executor.status == Some(astra_services::runs::ExecutorStatusRequest::Online)
             });
-            workspace_matches
-                && executor_matches
-                && request.edge_executor_id.as_deref() == Some(binding.executor_id.as_str())
-        });
-        if frozen_execution_binding.is_some() && !edge_binding_matches {
+        if evaluation_edge_requested && !edge_binding_complete {
             return Err(evaluation_preflight_error(
                 StatusCode::CONFLICT,
                 "evaluation_execution_binding_mismatch",
-                "the selected Edge request does not match the frozen execution binding",
+                "the canonical lifecycle did not establish the selected Edge binding",
             ));
         }
-        if frozen_execution_binding.is_none()
+        if !evaluation_edge_requested
             && (request.workspace_binding.is_some()
                 || request.executor_binding.is_some()
                 || request.edge_executor_id.is_some())
@@ -10036,6 +10036,19 @@ impl AgenticRunLifecycleService {
         request: &mut ChatRequestData,
         work_binding: Option<&ValidatedWorkRuntimeBinding>,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        // Evaluation start carries only an owner-scoped executor choice. The
+        // canonical binding owner resolves the live registry record here so
+        // a start retry can replay an existing Run without requiring the Edge
+        // to be online, while a new claim cannot smuggle a root or
+        // materialization identity through the request.
+        if request.evaluation_admission.is_some()
+            && request.edge_executor_id.is_some()
+            && request.workspace_binding.is_none()
+            && request.executor_binding.is_none()
+        {
+            self.populate_evaluation_edge_binding(user_id, request)
+                .await?;
+        }
         let request_is_edge = request.workspace_binding.as_ref().is_some_and(|binding| {
             binding.kind == astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace
         }) || request.executor_binding.as_ref().is_some_and(|binding| {
@@ -10046,62 +10059,6 @@ impl AgenticRunLifecycleService {
         }) || request.executor_binding.as_ref().is_some_and(|binding| {
             binding.kind == astra_services::runs::ExecutorBindingRequestKind::ServerLocal
         });
-
-        // Evaluation's frozen Edge identity is checked at the same canonical
-        // binding owner that authorizes the live registry materialization. A
-        // later registry row cannot silently replace the checkout between
-        // preparation and Run admission. Existing durable Run replays return
-        // before this method, so this check only gates a new execution claim.
-        let expected_evaluation_physical_workspace = if let Some(admission) =
-            request.evaluation_admission.as_ref()
-        {
-            let pool = self.shared_pool.clone().ok_or_else(|| {
-                evaluation_preflight_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "evaluation_store_unavailable",
-                    "evaluation Edge binding requires the shared durable database",
-                )
-            })?;
-            let plan_store = DatabaseEvaluationPlanStore::new(pool);
-            let experiment = plan_store
-                .load_experiment(user_id, &admission.experiment_id)
-                .await
-                .map_err(|error| {
-                    evaluation_preflight_error(
-                        StatusCode::CONFLICT,
-                        "evaluation_execution_binding_unavailable",
-                        error,
-                    )
-                })?;
-            match (
-                    experiment.spec.conditions.execution_binding.as_ref(),
-                    request_is_edge,
-                ) {
-                    (Some(binding), true) => Some(
-                        astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
-                            &binding.materialization_id,
-                            &binding.worktree_path,
-                        ),
-                    ),
-                    (Some(_), false) => {
-                        return Err(evaluation_preflight_error(
-                            StatusCode::PRECONDITION_FAILED,
-                            "evaluation_execution_binding_required",
-                            "the frozen evaluation must run on its selected Edge",
-                        ));
-                    }
-                    (None, true) => {
-                        return Err(evaluation_preflight_error(
-                            StatusCode::NOT_IMPLEMENTED,
-                            "evaluation_execution_surface_unsupported",
-                            "this evaluation has no frozen Edge execution binding",
-                        ));
-                    }
-                    (None, false) => None,
-                }
-        } else {
-            None
-        };
 
         // Provider-authorized runtime requests arrive with an independently
         // authenticated execution grant. They are admitted and dispatched by
@@ -10218,15 +10175,6 @@ impl AgenticRunLifecycleService {
                 let physical_workspace_id = self
                     .authorize_native_edge_execution(user_id, request)
                     .await?;
-                if let Some(expected) = expected_evaluation_physical_workspace.as_deref()
-                    && physical_workspace_id.as_deref() != Some(expected)
-                {
-                    return Err(evaluation_preflight_error(
-                        StatusCode::CONFLICT,
-                        "evaluation_execution_target_changed",
-                        "the selected Edge materialization changed after evaluation preparation",
-                    ));
-                }
                 let workspace = request.workspace_binding.clone().ok_or_else(|| {
                     error_response_coded(
                         StatusCode::PRECONDITION_FAILED,
@@ -10393,15 +10341,6 @@ impl AgenticRunLifecycleService {
                     "execution_binding_provider_mismatch",
                 ));
             }
-            if let Some(expected) = expected_evaluation_physical_workspace.as_deref()
-                && binding.physical_workspace_id.as_deref() != Some(expected)
-            {
-                return Err(evaluation_preflight_error(
-                    StatusCode::CONFLICT,
-                    "evaluation_execution_target_changed",
-                    "the Session binding does not match the frozen evaluation Edge materialization",
-                ));
-            }
         } else if request_is_edge {
             return Err(error_response_coded(
                 StatusCode::CONFLICT,
@@ -10426,6 +10365,104 @@ impl AgenticRunLifecycleService {
         request.workspace_binding = Some(binding.workspace);
         request.executor_binding = Some(binding.executor);
         request.execution_binding_generation = Some(binding.generation);
+        Ok(())
+    }
+
+    async fn populate_evaluation_edge_binding(
+        &self,
+        user_id: &str,
+        request: &mut ChatRequestData,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        let executor_id = request
+            .edge_executor_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::BAD_REQUEST,
+                    "evaluation_execution_target_invalid",
+                    "edge_executor_id must not be empty",
+                )
+            })?;
+        let registry = self.edge_registry_service.as_ref().ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_execution_target_unavailable",
+                "the Edge registry is temporarily unavailable",
+            )
+        })?;
+        let record = registry
+            .find_by_user_agent_and_workspace(user_id, executor_id, None)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    owner_id = %user_id,
+                    executor_id,
+                    error = %error,
+                    "evaluation Edge registry lookup failed during canonical binding"
+                );
+                evaluation_preflight_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "evaluation_execution_target_unavailable",
+                    "the selected Edge registry is temporarily unavailable",
+                )
+            })?
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::PRECONDITION_FAILED,
+                    "evaluation_execution_target_unavailable",
+                    "the selected Edge is not currently registered for this user",
+                )
+            })?;
+        if record.workspace_id.is_some() || record.edge_agent_id != executor_id {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_execution_target_mismatch",
+                "the selected Edge is outside the native owner execution scope",
+            ));
+        }
+        let root = record
+            .worktree_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::PRECONDITION_FAILED,
+                    "evaluation_execution_target_incomplete",
+                    "the selected Edge has no registered workspace root",
+                )
+            })?;
+        if record
+            .materialization_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::PRECONDITION_FAILED,
+                "evaluation_execution_target_incomplete",
+                "the selected Edge has no stable checkout materialization",
+            ));
+        }
+        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+            kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+            display_name: Some(executor_id.to_string()),
+            root: Some(root.to_string()),
+            source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
+                path: root.to_string(),
+            }),
+            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+        });
+        request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+            kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+            executor_id: Some(executor_id.to_string()),
+            display_name: Some(executor_id.to_string()),
+            transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeWs),
+            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+        });
         Ok(())
     }
 

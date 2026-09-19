@@ -8772,6 +8772,124 @@ fn test_service() -> AgenticRunLifecycleService {
     .with_model_service(Arc::new(ActiveTestModelService::default()))
 }
 
+#[derive(Clone)]
+struct EvaluationEdgeRegistryFixture {
+    owner_id: String,
+    record: astra_services::multi_agent::EdgeAgentRecord,
+}
+
+#[async_trait::async_trait]
+impl astra_services::multi_agent::EdgeRegistryService for EvaluationEdgeRegistryFixture {
+    async fn register_or_update(
+        &self,
+        _user_id: &str,
+        _edge_agent_id: &str,
+        _edge_id_header: &str,
+        _hostname: Option<&str>,
+        _worktree_path: Option<&str>,
+        _capabilities: Option<serde_json::Value>,
+        _workspace_id: Option<&str>,
+    ) -> Result<astra_services::multi_agent::EdgeAgentRecord, String> {
+        Err("registration is not part of this fixture".to_string())
+    }
+
+    async fn heartbeat(
+        &self,
+        _user_id: &str,
+        _edge_agent_id: &str,
+        _edge_id_header: &str,
+        _registration_claim_id: Option<&str>,
+    ) -> Result<(), astra_services::multi_agent::HeartbeatError> {
+        Ok(())
+    }
+
+    async fn list_by_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<astra_services::multi_agent::EdgeAgentRecord>, String> {
+        if user_id == self.owner_id {
+            Ok(vec![self.record.clone()])
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    async fn unregister_generation(
+        &self,
+        _user_id: &str,
+        _edge_agent_id: &str,
+        _edge_id_header: &str,
+    ) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    async fn find_by_agent_id_and_workspace(
+        &self,
+        edge_agent_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Option<astra_services::multi_agent::EdgeAgentRecord>, String> {
+        if workspace_id.is_none() && edge_agent_id == self.record.edge_agent_id {
+            Ok(Some(self.record.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[tokio::test]
+async fn evaluation_edge_start_intent_is_resolved_only_at_canonical_binding() {
+    let service =
+        test_service().with_edge_registry_service(Arc::new(EvaluationEdgeRegistryFixture {
+            owner_id: "eval-owner".to_string(),
+            record: astra_services::multi_agent::EdgeAgentRecord {
+                registry_id: "registry-eval-edge".to_string(),
+                user_id: "eval-owner".to_string(),
+                edge_agent_id: "edge-eval".to_string(),
+                edge_id: "connection-eval".to_string(),
+                hostname: Some("eval-edge".to_string()),
+                worktree_path: Some("/workspace/eval".to_string()),
+                capabilities: None,
+                workspace_id: None,
+                materialization_id: Some("materialization-eval".to_string()),
+                registered_at: "2026-09-19T00:00:00Z".to_string(),
+                last_heartbeat_at: "2026-09-19T00:00:00Z".to_string(),
+            },
+        }));
+    let mut request = test_request("evaluate this");
+    request.edge_executor_id = Some("edge-eval".to_string());
+    request.evaluation_admission = Some(astra_services::evaluation::EvaluationRunAdmission {
+        experiment_id: "experiment-eval".to_string(),
+        trial_id: "trial-eval".to_string(),
+        input_content_hash: "sha256:input".to_string(),
+        revision_content_hash: "sha256:revision".to_string(),
+        skill_revision: None,
+        receipt_ids: Vec::new(),
+        snapshot_envelope: None,
+    });
+
+    let error = service
+        .bind_execution_selection("eval-owner", "session-eval", &mut request, None)
+        .await
+        .expect_err("native evaluation Edge still requires the durable Session binding");
+    assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        error.1.error_code.as_deref(),
+        Some("execution_binding_unavailable")
+    );
+    let workspace = request
+        .workspace_binding
+        .as_ref()
+        .expect("canonical binding should populate the typed workspace intent");
+    assert_eq!(workspace.root.as_deref(), Some("/workspace/eval"));
+    assert_eq!(
+        request
+            .executor_binding
+            .as_ref()
+            .and_then(|binding| binding.executor_id.as_deref()),
+        Some("edge-eval")
+    );
+}
+
 struct TerminalTestLlm {
     base_url: String,
     requests: Arc<AtomicUsize>,
@@ -10519,7 +10637,6 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
             cache_policy: "provider_default_recorded".to_string(),
             memory_isolation: astra_services::evaluation::MemoryIsolation::Disabled,
             data_isolation: astra_services::evaluation::DataIsolation::Disabled,
-            execution_binding: None,
         },
         budget: astra_services::evaluation::EvaluationBudget {
             max_trials: 2,
@@ -11183,7 +11300,6 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
             cache_policy: "provider_default_recorded".to_string(),
             memory_isolation: astra_services::evaluation::MemoryIsolation::Disabled,
             data_isolation: astra_services::evaluation::DataIsolation::Disabled,
-            execution_binding: None,
         },
         budget: astra_services::evaluation::EvaluationBudget {
             max_trials: 2,

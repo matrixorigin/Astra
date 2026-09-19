@@ -13,13 +13,11 @@ use crate::AppState;
 use astra_core::{ErrorResponse, error_response, error_response_coded};
 use astra_services::evaluation::{
     DatabaseEvaluationPlanStore, EvaluationBootstrapError, EvaluationTrialStartRequest,
-    EvaluationTrialStartResponse, FrozenExecutionBinding, prepare_trial_start,
+    EvaluationTrialStartResponse, prepare_trial_start,
 };
 use astra_services::runs::{
-    ChatRequestData, ExecutionPolicyRequest, ExecutionTimeBudget, ExecutorBindingRequest,
-    ExecutorBindingRequestKind, ExecutorStatusRequest, ModelSelectionMode, RunStartIdempotency,
-    RunStartIdempotencyKind, ToolTransportKindRequest, WorkspaceAuthorityRequest,
-    WorkspaceBindingRequest, WorkspaceBindingRequestKind, WorkspaceSourceRequest,
+    ChatRequestData, ExecutionPolicyRequest, ExecutionTimeBudget, ModelSelectionMode,
+    RunStartIdempotency, RunStartIdempotencyKind,
 };
 use astra_turn_types::ModelSelection;
 
@@ -38,7 +36,6 @@ fn map_bootstrap_error(error: EvaluationBootstrapError) -> (StatusCode, Json<Err
 fn build_chat_request(
     plan: astra_services::evaluation::EvaluationTrialStartPlan,
     session_id: String,
-    edge: Option<&FrozenExecutionBinding>,
 ) -> Result<ChatRequestData, (StatusCode, Json<ErrorResponse>)> {
     let run_start_idempotency = RunStartIdempotency::new(
         RunStartIdempotencyKind::EvaluationTrial,
@@ -47,32 +44,6 @@ fn build_chat_request(
     )
     .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     let model_offering_id = plan.model_offering_id;
-    let (workspace_binding, executor_binding, edge_executor_id) = match edge {
-        Some(edge) => {
-            let root = edge.worktree_path.as_str();
-            let display_name = edge.executor_id.clone();
-            (
-                Some(WorkspaceBindingRequest {
-                    kind: WorkspaceBindingRequestKind::EdgeWorkspace,
-                    display_name: Some(display_name.clone()),
-                    root: Some(root.to_string()),
-                    source: Some(WorkspaceSourceRequest::EdgePath {
-                        path: root.to_string(),
-                    }),
-                    authority: Some(WorkspaceAuthorityRequest::ReadWrite),
-                }),
-                Some(ExecutorBindingRequest {
-                    kind: ExecutorBindingRequestKind::EdgeAgent,
-                    executor_id: Some(edge.executor_id.clone()),
-                    display_name: Some(display_name),
-                    transport: Some(ToolTransportKindRequest::EdgeWs),
-                    status: Some(ExecutorStatusRequest::Online),
-                }),
-                Some(edge.executor_id.clone()),
-            )
-        }
-        None => (None, None, None),
-    };
     Ok(ChatRequestData {
         message: plan.message,
         user_intent: None,
@@ -105,12 +76,12 @@ fn build_chat_request(
         allow_skill_sources: None,
         allow_tools: None,
         enabled_tools: None,
-        workspace_binding,
-        executor_binding,
+        workspace_binding: None,
+        executor_binding: None,
         execution_binding_generation: None,
         runtime_mcp_bindings: Vec::new(),
         context: None,
-        edge_executor_id,
+        edge_executor_id: plan.edge_executor_id,
         capabilities: Vec::new(),
         forward_headers: HashMap::new(),
         provider_run_owner: None,
@@ -152,7 +123,6 @@ pub async fn start_trial(
         .map_err(map_persistence_error)?;
     let plan = prepare_trial_start(owner_user_id, &experiment, &trial, &request)
         .map_err(map_bootstrap_error)?;
-    let execution_binding = plan.execution_binding.clone();
 
     let mut metadata = Map::new();
     metadata.insert(
@@ -180,8 +150,7 @@ pub async fn start_trial(
             plan.request_fingerprint.clone(),
         )
         .await?;
-    let chat_request =
-        build_chat_request(plan, session.session_id.clone(), execution_binding.as_ref())?;
+    let chat_request = build_chat_request(plan, session.session_id.clone())?;
     let run = state
         .execution
         .run_lifecycle_service
@@ -237,7 +206,7 @@ mod tests {
             revision_content: Some("fixed prompt".to_string()),
             model_offering_id: "offering-1".to_string(),
             execution_time_budget_secs: 30,
-            execution_binding: None,
+            edge_executor_id: None,
             admission: EvaluationRunAdmission {
                 experiment_id: "exp-1".to_string(),
                 trial_id: "trial-1".to_string(),
@@ -248,7 +217,7 @@ mod tests {
                 snapshot_envelope: None,
             },
         };
-        let request = build_chat_request(plan, "evs_session".to_string(), None).expect("request");
+        let request = build_chat_request(plan, "evs_session".to_string()).expect("request");
         assert_eq!(request.session_id.as_deref(), Some("evs_session"));
         assert_eq!(request.message, "fixed input");
         assert!(request.parts.is_empty());
@@ -266,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_request_projects_frozen_edge_binding_into_canonical_request() {
+    fn chat_request_carries_only_the_edge_selection_intent() {
         let hash = "b".repeat(64);
         let plan = EvaluationTrialStartPlan {
             experiment_id: "exp-edge".to_string(),
@@ -279,11 +248,7 @@ mod tests {
             revision_content: Some("fixed prompt".to_string()),
             model_offering_id: "offering-1".to_string(),
             execution_time_budget_secs: 30,
-            execution_binding: Some(FrozenExecutionBinding {
-                executor_id: "edge-a".to_string(),
-                materialization_id: "mat-a".to_string(),
-                worktree_path: "/worktrees/eval-a".to_string(),
-            }),
+            edge_executor_id: Some("edge-a".to_string()),
             admission: EvaluationRunAdmission {
                 experiment_id: "exp-edge".to_string(),
                 trial_id: "trial-edge".to_string(),
@@ -294,23 +259,9 @@ mod tests {
                 snapshot_envelope: None,
             },
         };
-        let binding = plan.execution_binding.clone().expect("Edge binding");
-        let request =
-            build_chat_request(plan, "evs_edge".to_string(), Some(&binding)).expect("Edge request");
-        assert_eq!(
-            request
-                .workspace_binding
-                .as_ref()
-                .and_then(|binding| binding.root.as_deref()),
-            Some("/worktrees/eval-a")
-        );
-        assert_eq!(
-            request
-                .executor_binding
-                .as_ref()
-                .and_then(|binding| binding.executor_id.as_deref()),
-            Some("edge-a")
-        );
+        let request = build_chat_request(plan, "evs_edge".to_string()).expect("Edge request");
+        assert!(request.workspace_binding.is_none());
+        assert!(request.executor_binding.is_none());
         assert_eq!(request.edge_executor_id.as_deref(), Some("edge-a"));
     }
 }
