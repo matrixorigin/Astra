@@ -382,26 +382,20 @@ mod tests {
     }
 
     #[test]
-    fn turn_guard_adapter_blocks_on_stall() {
+    fn turn_guard_adapter_observes_repetition_without_blocking() {
         let sink = InMemorySnapshotSink::arc();
         let kernel = StandardKernel::new(
             sink.clone(),
-            vec![Box::new(TurnGuardVerifierAdapter {
-                warn_threshold: 3,
-                fatal_threshold: 5,
-            })],
+            vec![Box::new(TurnGuardVerifierAdapter { warn_threshold: 3 })],
         );
 
         // No stall
         let record = make_record(HookPoint::PostTurn, 1, 2);
         assert!(matches!(kernel.on_record(&record), HookVerdict::Continue));
 
-        // Fatal stall
+        // Repetition alone has no stopping authority.
         let record = make_record(HookPoint::PostTurn, 1, 5);
-        assert!(matches!(
-            kernel.on_record(&record),
-            HookVerdict::Block { .. }
-        ));
+        assert!(matches!(kernel.on_record(&record), HookVerdict::Continue));
     }
 
     #[test]
@@ -429,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_verifiers_first_fatal_wins() {
+    fn budget_still_blocks_when_repetition_is_observed() {
         let sink = InMemorySnapshotSink::arc();
         let kernel = StandardKernel::new(
             sink.clone(),
@@ -439,20 +433,30 @@ mod tests {
                     max_tokens: None,
                     max_duration_millis: None,
                 }),
-                Box::new(TurnGuardVerifierAdapter {
-                    warn_threshold: 2,
-                    fatal_threshold: 3,
-                }),
+                Box::new(TurnGuardVerifierAdapter { warn_threshold: 2 }),
             ],
         );
 
-        // Both would fire fatal at PostTurn — first verifier wins
+        // A real budget violation remains fatal alongside repetition evidence.
         let record = make_record(HookPoint::PostTurn, 10, 5);
         match kernel.on_record(&record) {
             HookVerdict::Block { reason } => {
                 assert!(reason.contains("[budget]"));
             }
             _ => panic!("expected block"),
+        }
+    }
+
+    #[test]
+    fn configured_profiles_do_not_stop_on_signature_repetition() {
+        for profile in [HarnessProfile::Default, HarnessProfile::Swebench] {
+            let sink = InMemorySnapshotSink::arc();
+            let kernel = StandardKernel::with_profile(sink.clone(), profile);
+            for streak in [3, 5, 6, 100] {
+                let record = make_record(HookPoint::PostTurn, 1, streak);
+                assert!(matches!(kernel.on_record(&record), HookVerdict::Continue));
+                assert!(sink.latest().is_some());
+            }
         }
     }
 
@@ -570,15 +574,10 @@ mod tests {
             _ => panic!("expected Block verdict"),
         }
 
-        // Exceeds stall threshold → Block
+        // Repetition within budget remains advisory.
         let mut record = make_record(HookPoint::PostTurn, 3, 6);
         record.snapshot.consecutive_same_tool = 6;
-        match kernel.on_record(&record) {
-            HookVerdict::Block { reason } => {
-                assert!(reason.contains("turn_guard"));
-            }
-            _ => panic!("expected Block from stall"),
-        }
+        assert!(matches!(kernel.on_record(&record), HookVerdict::Continue));
     }
 
     // ── Critical verifier panic → Block ─────────────────────────────────

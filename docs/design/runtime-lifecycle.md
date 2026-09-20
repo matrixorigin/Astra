@@ -79,9 +79,22 @@ Missing progress receipts do not establish a stall: capabilities have different
 evidence coverage. In the absence of an authoritative stop condition, another
 bounded slice is allowed without a separate progress-credit ledger or mandatory
 reflection call. Explicit hard limits, cancellation, workspace quarantine,
-and repetition controls remain authoritative. Historical guard verdicts remain
+and explicit execution limits remain authoritative. Historical guard verdicts remain
 audit and recovery advice, not sticky execution vetoes. Continuation
 does not make unexecuted requests successful or grant them completion evidence.
+
+Repeated tool signatures establish a repeated request pattern, not unchanged
+results or lack of progress. Signature-only advice must preserve legitimate
+verification, pagination, evidence recovery and authorized waiting. It must
+not claim that earlier content remains in context, prescribe workspace edits,
+escalate to task termination because prior advice was repeated, or add a tool
+to retry caution solely because its name recurs. Independent tool-health
+evidence remains available to the existing recovery policy.
+
+The runtime harness follows the same boundary: signature repetition is a
+warning observation, never a Fatal/Block or Pause condition. Actual configured
+budgets, safety invariants and critical-verifier failures retain their existing
+enforcement. Empty tool-call sets do not constitute repeated tool activity.
 
 Progress does not discharge completion obligations. Required validation must
 still apply to the final mutation state; a renewed slice must not be reported

@@ -14446,15 +14446,15 @@ mod parallel_execution_tests {
             );
         }
 
-        // ── E2E 2: TurnGuard stall detection blocks loop ───────────────
+        // ── E2E 2: Repetition observations cannot terminate valid work ──
 
         #[tokio::test]
-        async fn harness_stall_detection_blocks_on_repeated_tool() {
+        async fn harness_repetition_allows_fresh_results_through_completion() {
             let limits = HarnessLimits::default();
             let (mut state, _sink, _trace) = setup_harness_state(limits, 20);
 
-            // 10 turns of the same bash tool — TurnGuardVerifierAdapter
-            // should detect stall (default fatal_threshold=5)
+            // Identical calls can yield new evidence. Observe the pattern but
+            // execute all ten rounds and deliver the explicit final answer.
             let mut host = MockHost::new(
                 (0..10)
                     .map(|i| {
@@ -14465,6 +14465,12 @@ mod parallel_execution_tests {
                             Some(50),
                         )
                     })
+                    .chain(std::iter::once(text_result(
+                        "sampling complete",
+                        100,
+                        20,
+                        Some(50),
+                    )))
                     .collect(),
             );
             host = host.with_valid_tools(&["bash"]);
@@ -14472,18 +14478,9 @@ mod parallel_execution_tests {
             let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
             assert!(outcome.is_ok());
 
-            // TurnGuardVerifierAdapter fatal_threshold=5 should block before 10 turns
-            assert!(
-                host.turn_count() < 10,
-                "stall detection should have blocked before 10 turns; ran {}",
-                host.turn_count()
-            );
-
-            // Verify interruption was set
-            assert!(
-                state.interruption.is_some(),
-                "stall block must set interruption"
-            );
+            assert_eq!(host.turn_count(), 11);
+            assert!(state.interruption.is_none(), "{:?}", state.interruption);
+            assert_eq!(state.final_text, "sampling complete");
         }
 
         // ── E2E 3: Observe-only sink captures data ──────────────────────

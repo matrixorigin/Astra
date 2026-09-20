@@ -253,19 +253,13 @@ mod enabled {
     pub(crate) fn compute_consecutive_same_tool(
         sigs: &[std::collections::BTreeSet<astra_turn_core::stall::StallSignature>],
     ) -> u32 {
-        if sigs.len() < 2 {
-            return 0;
+        let count = astra_turn_core::stall::trailing_identical_sig_depth(sigs);
+        // Snapshot convention: a single occurrence is not repetition.
+        if count > 1 {
+            u32::try_from(count).unwrap_or(u32::MAX)
+        } else {
+            0
         }
-        let last = &sigs[sigs.len() - 1];
-        let mut count = 1u32;
-        for prev in sigs[..sigs.len() - 1].iter().rev() {
-            if prev == last {
-                count += 1;
-            } else {
-                break;
-            }
-        }
-        if count > 1 { count } else { 0 }
     }
 
     /// Execute harness hook. Returns `HookVerdict`.
@@ -368,8 +362,20 @@ mod enabled {
             use std::collections::BTreeSet;
 
             assert_eq!(compute_consecutive_same_tool(&[]), 0);
+            assert_eq!(
+                compute_consecutive_same_tool(&[BTreeSet::new(), BTreeSet::new()]),
+                0
+            );
 
             let a = BTreeSet::from([astra_turn_core::stall::StallSignature::new("bash", b"")]);
+            assert_eq!(
+                compute_consecutive_same_tool(&[a.clone(), a.clone(), BTreeSet::new()]),
+                0
+            );
+            assert_eq!(
+                compute_consecutive_same_tool(&[a.clone(), BTreeSet::new(), a.clone()]),
+                0
+            );
             assert_eq!(compute_consecutive_same_tool(std::slice::from_ref(&a)), 0);
             assert_eq!(compute_consecutive_same_tool(&[a.clone(), a.clone()]), 2);
             assert_eq!(
