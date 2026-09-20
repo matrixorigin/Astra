@@ -52,6 +52,7 @@ pub mod task_resolution;
 pub mod token_estimate;
 mod tool_idempotency;
 mod tool_invocation;
+mod tool_result_projection;
 mod turn_provenance;
 mod user_intent;
 mod verification_frontier;
@@ -208,6 +209,12 @@ pub use tool_invocation::{
     ToolInvocationIdentity, ToolInvocationPrepareOutcome, ToolInvocationRecord,
     ToolInvocationResultPayload, ToolInvocationState, ToolInvocationTerminalOutcome,
     canonical_public_arguments_hash, canonical_public_tool_arguments,
+};
+pub use tool_result_projection::{
+    TOOL_RESULT_PROJECTION_POLICY_VERSION, TOOL_RESULT_PROJECTION_RENDERER_VERSION,
+    ToolResultProjectionDecisionV1, ToolResultProjectionDispositionV1,
+    ToolResultProjectionFallbackV1, ToolResultProjectionRangeV1, ToolResultProjectionReceiptV1,
+    ToolResultProjectionWireStateV1,
 };
 pub use turn_provenance::{
     TURN_MESSAGE_PROVENANCE_FIELD, TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
