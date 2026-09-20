@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use astra_turn_types::{
     JudgmentQuestion, JudgmentRequest, JudgmentResponseProvenance, NormalizedJudgmentResponse,
-    NoulCriteria,
+    NoulCriteria, ToolResultProjectionDecisionV1, ToolResultProjectionDispositionV1,
+    ToolResultProjectionFallbackV1, ToolResultProjectionRangeV1,
 };
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +62,80 @@ impl ToolResultSelectionRecommendation {
     }
 }
 
+/// Materialize a validated recommendation as an immutable decision suitable
+/// for admission-time freezing. Creating this fact does not itself prove that
+/// the projection was adopted or sent to a provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedToolResultSelectionProjection {
+    producer_run_id: String,
+    producer_call_id: String,
+    source_sha256: String,
+    source_bytes: u64,
+    selected_ranges: Vec<ToolResultProjectionRangeV1>,
+    body: String,
+}
+
+impl RenderedToolResultSelectionProjection {
+    #[must_use]
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    #[must_use]
+    pub fn selected_ranges(&self) -> &[ToolResultProjectionRangeV1] {
+        &self.selected_ranges
+    }
+}
+
+pub fn selected_tool_result_projection_decision(
+    rendered: &RenderedToolResultSelectionProjection,
+    target_sha256: &str,
+    canonical_message_sha256: &str,
+    judgment_invocation_id: String,
+) -> Result<ToolResultProjectionDecisionV1, &'static str> {
+    if judgment_invocation_id.trim().is_empty() {
+        return Err("tool-result recommendation is not eligible for a selected decision");
+    }
+    ToolResultProjectionDecisionV1::new(
+        rendered.producer_run_id.clone(),
+        rendered.producer_call_id.clone(),
+        rendered.source_sha256.clone(),
+        rendered.source_bytes,
+        target_sha256,
+        canonical_message_sha256,
+        ToolResultProjectionDispositionV1::Selected,
+        rendered.selected_ranges.clone(),
+        Some(judgment_invocation_id),
+        None,
+        rendered.body.as_bytes(),
+    )
+}
+
+/// Record the deterministic baseline chosen when optional selection cannot be
+/// used. Freezing this fact prevents retries from repeatedly invoking a judge.
+pub fn baseline_tool_result_projection_decision(
+    descriptor: &astra_services::session_journal::ToolResultArtifactDescriptor,
+    target_sha256: &str,
+    canonical_message_sha256: &str,
+    judgment_invocation_id: Option<String>,
+    fallback: ToolResultProjectionFallbackV1,
+    baseline_body: &str,
+) -> Result<ToolResultProjectionDecisionV1, &'static str> {
+    ToolResultProjectionDecisionV1::new(
+        descriptor.run_id.clone(),
+        descriptor.call_id.clone(),
+        descriptor.content_sha256.clone(),
+        descriptor.byte_len,
+        target_sha256,
+        canonical_message_sha256,
+        ToolResultProjectionDispositionV1::Baseline,
+        Vec::new(),
+        judgment_invocation_id,
+        Some(fallback),
+        baseline_body.as_bytes(),
+    )
+}
+
 /// Render a smaller exact-source body while retaining the immutable recovery
 /// handle. Incomplete scans and non-reducing projections keep the caller's
 /// existing head/tail baseline so unexamined tail evidence is never erased.
@@ -70,7 +145,7 @@ pub fn render_tool_result_selection_projection(
     projection: &ToolResultChunkCandidateProjection,
     recommendation: &ToolResultSelectionRecommendation,
     baseline: &str,
-) -> Result<Option<String>, &'static str> {
+) -> Result<Option<RenderedToolResultSelectionProjection>, &'static str> {
     validate_projection(descriptor, projection)?;
     if !projection.scan_complete() || !recommendation.can_replace_optional_baseline_body() {
         return Ok(None);
@@ -134,7 +209,24 @@ pub fn render_tool_result_selection_projection(
     if rendered.len() >= baseline.len() {
         return Ok(None);
     }
-    Ok(Some(rendered))
+    let selected_ranges = projection
+        .candidates()
+        .iter()
+        .filter(|candidate| selected.contains(&candidate.chunk().id))
+        .map(|candidate| ToolResultProjectionRangeV1 {
+            chunk_id: candidate.chunk().id.clone(),
+            start_byte: candidate.chunk().start_byte,
+            end_byte: candidate.chunk().end_byte,
+        })
+        .collect();
+    Ok(Some(RenderedToolResultSelectionProjection {
+        producer_run_id: descriptor.run_id.clone(),
+        producer_call_id: descriptor.call_id.clone(),
+        source_sha256: descriptor.content_sha256.clone(),
+        source_bytes: descriptor.byte_len,
+        selected_ranges,
+        body: rendered,
+    }))
 }
 
 /// Build a bounded judgment over exact chunks from one verified artifact.
@@ -494,11 +586,11 @@ mod tests {
         )
         .unwrap()
         .expect("one selected chunk reduces the baseline");
-        assert!(rendered.contains("beta\n"));
-        assert!(!rendered.contains("alpha\n"));
-        assert!(!rendered.contains("gamma\n"));
-        assert!(rendered.contains("artifact://session/tool-result/"));
-        assert!(rendered.len() < baseline.len());
+        assert!(rendered.body().contains("beta\n"));
+        assert!(!rendered.body().contains("alpha\n"));
+        assert!(!rendered.body().contains("gamma\n"));
+        assert!(rendered.body().contains("artifact://session/tool-result/"));
+        assert!(rendered.body().len() < baseline.len());
 
         assert_eq!(
             render_tool_result_selection_projection(
@@ -512,5 +604,68 @@ mod tests {
             None,
             "selection must not expand the request"
         );
+    }
+
+    #[test]
+    fn frozen_decision_binds_exact_selected_ranges_and_baseline_reason() {
+        let (descriptor, projection) = fixture();
+        let ids = projection
+            .candidates()
+            .iter()
+            .map(|candidate| candidate.chunk().id.clone())
+            .collect::<Vec<_>>();
+        let response = NormalizedJudgmentResponse {
+            response: JudgmentResponse {
+                schema_version: 1,
+                model: "judge".into(),
+                answers: BTreeMap::from([
+                    (ids[0].clone(), JudgmentAnswer::Noul { noul: 0.0 }),
+                    (ids[1].clone(), JudgmentAnswer::Noul { noul: 1.0 }),
+                    (ids[2].clone(), JudgmentAnswer::Noul { noul: 0.0 }),
+                ]),
+            },
+            provenance: JudgmentResponseProvenance::DiscreteDecision,
+        };
+        let recommendation = tool_result_selection_recommendation(&projection, &response).unwrap();
+        let rendered = render_tool_result_selection_projection(
+            "exec",
+            &descriptor,
+            &projection,
+            &recommendation,
+            &"baseline preview and navigation ".repeat(100),
+        )
+        .unwrap()
+        .unwrap();
+        let selected = selected_tool_result_projection_decision(
+            &rendered,
+            &"b".repeat(64),
+            &"c".repeat(64),
+            "judgment-1".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            selected.selected_ranges,
+            vec![ToolResultProjectionRangeV1 {
+                chunk_id: ids[1].clone(),
+                start_byte: projection.candidates()[1].chunk().start_byte,
+                end_byte: projection.candidates()[1].chunk().end_byte,
+            }]
+        );
+        selected.validate().unwrap();
+
+        let baseline = baseline_tool_result_projection_decision(
+            &descriptor,
+            &"b".repeat(64),
+            &"c".repeat(64),
+            None,
+            ToolResultProjectionFallbackV1::JudgmentUnavailable,
+            "baseline body",
+        )
+        .unwrap();
+        assert_eq!(
+            baseline.fallback,
+            Some(ToolResultProjectionFallbackV1::JudgmentUnavailable)
+        );
+        baseline.validate().unwrap();
     }
 }
