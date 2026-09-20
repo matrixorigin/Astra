@@ -14,6 +14,8 @@ pub const TOOL_RESULT_PROJECTION_POLICY_VERSION: u32 = 1;
 pub const TOOL_RESULT_PROJECTION_RENDERER_VERSION: u32 = 1;
 const MAX_RANGES: usize = 32;
 const MAX_ID_BYTES: usize = 256;
+const MAX_RUN_ID_BYTES: usize = 64;
+const MAX_CALL_ID_BYTES: usize = 255;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -143,7 +145,9 @@ impl ToolResultProjectionDecisionV1 {
         if self.policy_version != TOOL_RESULT_PROJECTION_POLICY_VERSION
             || self.renderer_version != TOOL_RESULT_PROJECTION_RENDERER_VERSION
             || self.producer_run_id.trim().is_empty()
+            || self.producer_run_id.len() > MAX_RUN_ID_BYTES
             || self.producer_call_id.trim().is_empty()
+            || self.producer_call_id.len() > MAX_CALL_ID_BYTES
             || self.source_bytes == 0
             || self.rendered_body_bytes == 0
             || !is_sha256(&self.source_sha256)
@@ -250,6 +254,19 @@ pub struct ToolResultProjectionReceiptV1 {
     pub actual_body_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolResultProjectionBindingV1 {
+    pub decision: ToolResultProjectionDecisionV1,
+    pub receipt: ToolResultProjectionReceiptV1,
+}
+
+impl ToolResultProjectionBindingV1 {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.receipt.validate_against(&self.decision)
+    }
 }
 
 impl ToolResultProjectionReceiptV1 {
