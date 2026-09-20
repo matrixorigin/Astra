@@ -1215,40 +1215,6 @@ async fn persist_server_loop_canonical_append_inner(
         }
     };
 
-    if settlement.is_some() {
-        // The root user query and terminal assistant response are prerequisites
-        // for a successful terminal. A collision must abort the transaction before
-        // status or any whole-turn projection can make rejected content canonical.
-        let trace = append.trace_context.clone().unwrap_or_else(|| {
-            server_trace_context(
-                append.user_id,
-                append.session_id,
-                append.run_id,
-                state.session_turn,
-            )
-        });
-        let mut rejected_required_event = None;
-        if !append.user_message.is_empty()
-            && !capture_outcome.accepts_projection(&trace.root_event_id)
-        {
-            rejected_required_event = Some(trace.root_event_id.clone());
-        }
-        let response_event_id = trace_event_id("response", &[append.run_id, &trace.turn_id]);
-        if rejected_required_event.is_none()
-            && append.include_terminal_assistant
-            && !state.final_text.is_empty()
-            && !capture_outcome.accepts_projection(&response_event_id)
-        {
-            rejected_required_event = Some(response_event_id);
-        }
-        if let Some(event_id) = rejected_required_event {
-            let _ = tx.rollback().await;
-            return Err(format!(
-                "required canonical event {event_id} was rejected; terminal settlement aborted"
-            ));
-        }
-    }
-
     // Trace detail events (LLM rounds, tool calls).
     match persist_server_loop_trace_events_in_tx(
         &mut tx,
@@ -1282,6 +1248,23 @@ async fn persist_server_loop_canonical_append_inner(
             }
             return Err(msg);
         }
+    }
+
+    // Atomic settlement and its authoritative replay verifier require the same
+    // complete evidence, including tool/round/user-intent events. Non-terminal
+    // capture can retain valid siblings; a terminal must never commit a subset
+    // that verify_canonical_append_evidence would subsequently reject.
+    if settlement.is_some()
+        && let Some(event_id) = capture_outcome
+            .event_outcomes
+            .keys()
+            .find(|event_id| !capture_outcome.accepts_projection(event_id))
+    {
+        let error = format!(
+            "required canonical event {event_id} was rejected; terminal settlement aborted"
+        );
+        let _ = tx.rollback().await;
+        return Err(error);
     }
 
     // The transcript gets one ordered durable sequence in this same
@@ -6171,11 +6154,26 @@ mod tests {
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
     async fn canonical_terminal_success_commits_evidence_usage_and_terminal_together() {
         for with_buffer in [false, true] {
-            assert_canonical_terminal_replay(with_buffer).await;
+            assert_canonical_terminal_replay(with_buffer, None).await;
         }
     }
 
-    async fn assert_canonical_terminal_replay(with_buffer: bool) {
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn canonical_terminal_rejects_colliding_evidence_before_settlement() {
+        for event_type in [
+            "user_query",
+            "llm_response",
+            "user_message",
+            "llm_round_completed",
+            "tool_call_started",
+            "tool_call_completed",
+        ] {
+            assert_canonical_terminal_replay(true, Some(event_type)).await;
+        }
+    }
+
+    async fn assert_canonical_terminal_replay(with_buffer: bool, collision: Option<&str>) {
         let pool = setup_pool().await;
         let db = pool.get().clone();
         let user_id = Uuid::new_v4().to_string();
@@ -6203,6 +6201,43 @@ mod tests {
 
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.final_text = "atomically committed answer".into();
+        state.push_recent_round(crate::turn::agentic_loop::host::RecentRoundSummary {
+            purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+            turn: 1,
+            round: 1,
+            provider: "test".into(),
+            model: "test-model".into(),
+            prompt_tokens: 37,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            completion_tokens: 17,
+            tool_calls_returned: 1,
+            tool_call_names: vec!["read_file".into()],
+            start_offset_ms: 1,
+            duration_ms: 2,
+            finish_reason: Some("tool_calls".into()),
+        });
+        state
+            .stall
+            .tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                tool_call_id: Some("terminal-evidence-tool".into()),
+                name: "read_file".into(),
+                ok: true,
+                ms: 1,
+                start_offset_ms: Some(3),
+                round: Some(1),
+                ..Default::default()
+            });
+        state.user_intents.record_applied_user_intents(&[
+            crate::turn::agentic_loop::host::AppliedUserIntent {
+                intent_id: "terminal-evidence-intent".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                status: astra_turn_types::UserIntentStatus::Applied,
+                event_index: 1,
+                content: "include the evidence".into(),
+            },
+        ]);
         let persist = PostLoopPersistContext {
             matrixone: MatrixOneSettings::from_env(),
             shared_pool: Some(pool.clone()),
@@ -6271,6 +6306,96 @@ mod tests {
             completion_tokens: 17,
             tool_calls: 6,
         };
+        if let Some(event_type) = collision {
+            // First capture exact evidence through the ordinary append boundary,
+            // where valid siblings remain independent. Inject a hash mismatch
+            // without changing identity/content, as with a metadata collision.
+            persist
+                .persist_core_and_trace_in_transaction(&state)
+                .await
+                .expect("capture evidence before injecting a conflicting hash");
+            let event_id: String = sqlx::query_scalar(
+                "SELECT event_id FROM agent_events
+                 WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = ?",
+            )
+            .bind(&user_id)
+            .bind(&session_id)
+            .bind(&run_id)
+            .bind(event_type)
+            .fetch_one(&db)
+            .await
+            .unwrap_or_else(|error| panic!("find {event_type} collision target: {error}"));
+            let original_hash: String = sqlx::query_scalar(
+                "SELECT payload_hash FROM agent_events WHERE user_id = ? AND event_id = ?",
+            )
+            .bind(&user_id)
+            .bind(&event_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            sqlx::query(
+                "UPDATE agent_events SET payload_hash = ? WHERE user_id = ? AND event_id = ?",
+            )
+            .bind("0".repeat(64))
+            .bind(&user_id)
+            .bind(&event_id)
+            .execute(&db)
+            .await
+            .unwrap();
+            for _ in 0..2 {
+                let error = persist_server_loop_canonical_terminal_settlement(
+                    &pool,
+                    append(),
+                    &state,
+                    settlement,
+                )
+                .await
+                .expect_err("any conflicting canonical evidence must abort terminal settlement");
+                assert!(error.contains(&event_id), "{event_type}: {error}");
+                assert!(error.contains("terminal settlement aborted"), "{error}");
+            }
+            let run_row = sqlx::query(
+                "SELECT status, total_prompt_tokens, total_completion_tokens, total_tool_calls
+                 FROM agent_runs WHERE user_id = ? AND run_id = ?",
+            )
+            .bind(&user_id)
+            .bind(&run_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            assert_eq!(
+                run_row.try_get::<String, _>("status").unwrap(),
+                astra_core::STATUS_RUNNING
+            );
+            for column in [
+                "total_prompt_tokens",
+                "total_completion_tokens",
+                "total_tool_calls",
+            ] {
+                assert_eq!(run_row.try_get::<i64, _>(column).unwrap(), 0, "{column}");
+            }
+            let terminals: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM agent_run_events WHERE user_id = ? AND run_id = ?
+                 AND event_type IN ('text_done', 'run_finished')",
+            )
+            .bind(&user_id)
+            .bind(&run_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            assert_eq!(terminals, 0);
+            // Restore the fixture; the same state must now commit, replay, and
+            // resolve a lost acknowledgement through the checks below.
+            sqlx::query(
+                "UPDATE agent_events SET payload_hash = ? WHERE user_id = ? AND event_id = ?",
+            )
+            .bind(original_hash)
+            .bind(&user_id)
+            .bind(&event_id)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
         let commit =
             persist_server_loop_canonical_terminal_settlement(&pool, append(), &state, settlement)
                 .await
@@ -6399,7 +6524,7 @@ mod tests {
         .await
         .expect("load committed durable run");
         assert!(canonical_event_count >= 2);
-        assert_eq!(transcript_count, 2);
+        assert_eq!(transcript_count, 5);
         assert_eq!(terminal_event_count, 2);
         assert_eq!(
             run_row.try_get::<String, _>("status").unwrap(),

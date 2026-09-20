@@ -330,9 +330,13 @@ than retaining per-event samples. A terminal outcome is commit, durable
 admission rejection, or explicit shutdown abandonment; retryable attempts keep
 their original enqueue timestamp. Shutdown seals the receiver before draining,
 so deferred sends that never entered the channel remain pre-acceptance drops.
-If the runtime deadline expires, it records the accepted resident facts as
-having an unresolved durable outcome, then aborts and awaits the worker instead
-of detaching a task that may still own pool resources.
+If the runtime deadline expires, it aborts and awaits the worker instead of
+detaching a task that may still own pool resources. Delivery accounting belongs
+to the shared admission lease: channel acceptance precedes dispatch, and a
+known commit or rejection settles the lease before control returns to the
+scheduler. Explicit shutdown failure or final-owner drop counts an accepted,
+unsettled delivery as unresolved exactly once across retry clones. Residency
+snapshots are not terminal evidence and never add to that count.
 
 Request-classification observations use the existing `trace_span` envelope
 with name `semantic_judgment` and a bounded typed JSON string in
@@ -403,6 +407,13 @@ not create a transcript row or snapshot link from the rejected payload, nor be
 reported as a successfully captured response. Exact replay may repair a missing
 projection from the accepted payload under the existing transaction and session
 fences. Valid sibling events in the same batch continue to be captured.
+
+Atomic run-terminal settlement is stricter than ordinary batch capture: every
+canonical event in the settlement (including user intents, rounds, and tool
+events) must be inserted or exactly replayed. Any collision rolls back the
+settlement before terminal status, usage, or transcript changes can commit.
+Initial commit and lost-acknowledgement recovery therefore require the same
+complete evidence; recovery must not relax hash verification to accept a subset.
 
 Manifest identity and item identity are tenant-scoped: `(user_id, manifest_id)`
 and `(user_id, manifest_id, item_order)`. The manifest digest covers its header

@@ -285,7 +285,7 @@ async fn observed_deliveries_distinguish_insertion_replay_collision_and_session_
         flush_interval_secs: 1,
         ..Default::default()
     };
-    let (sender, shutdown, _, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
     let (sink, mut reports) = IngestionMeasurementSink::bounded(5);
     let first = test_event_for_user(&user_id, "same-event", &session_id, "user_query");
     let replay = first.clone();
@@ -350,6 +350,11 @@ async fn observed_deliveries_distinguish_insertion_replay_collision_and_session_
         .await
         .expect("worker shutdown")
         .expect("worker joined");
+    {
+        let stats = astra_core::sync_poison::recover_mutex_lock(&stats);
+        assert_eq!(stats.events_unresolved_shutdown, 0);
+        assert_eq!(stats.resident_events_current, 0);
+    }
     cleanup_session(&pool, &user_id, &session_id).await;
 }
 

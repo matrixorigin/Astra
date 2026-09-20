@@ -32,7 +32,7 @@ use sqlx::Acquire;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Semaphore, mpsc};
 
@@ -323,6 +323,15 @@ fn delivery_observation(event: &IngestionEvent) -> Option<&DeliveryGuard> {
         .observation
         .as_ref()
         .map(Arc::as_ref)
+}
+
+fn delivery_lease(event: &IngestionEvent) -> Option<&IngestionAdmissionLeaseInner> {
+    event
+        .history_work_queue_reservation
+        .as_ref()?
+        .admission
+        .as_ref()
+        .map(|lease| lease.inner.as_ref())
 }
 
 fn reject_observation(observation: Option<&DeliveryGuard>, reason: IngestionRejectionReason) {
@@ -975,6 +984,9 @@ impl IngestionSender {
         event.ingestion_enqueued_at = Some(std::time::Instant::now());
         match self.tx.try_reserve() {
             Ok(permit) => {
+                if let Some(lease) = delivery_lease(&event) {
+                    lease.accept();
+                }
                 if let Some(observation) = &observation {
                     observation.mark(IngestionMeasurementPhase::ChannelAccepted);
                 }
@@ -1029,6 +1041,9 @@ impl IngestionSender {
                             };
                             match tx.reserve().await {
                                 Ok(permit) => {
+                                    if let Some(lease) = delivery_lease(&event) {
+                                        lease.accept();
+                                    }
                                     if let Some(observation) = &observation {
                                         observation.mark(IngestionMeasurementPhase::ChannelAccepted);
                                     }
@@ -1178,7 +1193,12 @@ impl IngestionSender {
         };
         event.history_work_queue_reservation = Some(ingestion_queue_reservation(bytes, lease));
         event.ingestion_enqueued_at = Some(std::time::Instant::now());
-        if self.tx.send(event).await.is_err() {
+        if let Ok(permit) = self.tx.reserve().await {
+            if let Some(lease) = delivery_lease(&event) {
+                lease.accept();
+            }
+            permit.send(event);
+        } else {
             self.overflow_count.fetch_add(1, Ordering::Relaxed);
             self.record_drop_before_acceptance(priority);
             tracing::warn!(
@@ -1203,7 +1223,9 @@ pub struct IngestionStats {
     pub events_flushed: u64,
     pub events_dropped_permanent: u64,
     pub events_abandoned_shutdown: u64,
-    /// Accepted events whose durable outcome is unknown after shutdown.
+    /// Channel-accepted deliveries abandoned without a terminal attempt result.
+    /// This counts shutdown/cancellation abandonment, not every measurement
+    /// `Unknown` (e.g. admission rejection following an uncertain earlier commit).
     pub events_unresolved_shutdown: u64,
     pub resident_events_current: u64,
     pub resident_events_peak: u64,
@@ -1330,10 +1352,38 @@ struct IngestionAdmissionLeaseInner {
     user_id: String,
     session_id: String,
     bytes: u64,
+    // Shared by retry clones. Only channel-accepted, unsettled deliveries
+    // become unresolved when their final owner is cancelled or dropped.
+    delivery_state: AtomicU8,
+}
+
+impl IngestionAdmissionLeaseInner {
+    const PRE_CHANNEL: u8 = 0;
+    const ACCEPTED: u8 = 1;
+    const TERMINAL: u8 = 2;
+
+    fn accept(&self) {
+        let _ = self.delivery_state.compare_exchange(
+            Self::PRE_CHANNEL,
+            Self::ACCEPTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn finish(&self, unresolved: bool) {
+        if self.delivery_state.swap(Self::TERMINAL, Ordering::AcqRel) == Self::ACCEPTED
+            && unresolved
+        {
+            let mut stats = astra_core::sync_poison::recover_mutex_lock(&self.admission.stats);
+            stats.events_unresolved_shutdown = stats.events_unresolved_shutdown.saturating_add(1);
+        }
+    }
 }
 
 impl Drop for IngestionAdmissionLeaseInner {
     fn drop(&mut self) {
+        self.finish(true);
         self.admission
             .release(&self.user_id, &self.session_id, self.bytes);
     }
@@ -1456,6 +1506,7 @@ impl IngestionAdmission {
                 user_id: event.user_id.clone(),
                 session_id: event.session_id.clone(),
                 bytes,
+                delivery_state: AtomicU8::new(IngestionAdmissionLeaseInner::PRE_CHANNEL),
             }),
         })
     }
@@ -2494,6 +2545,9 @@ impl EventIngestionWorker {
             }
             Err(error) => {
                 if draining {
+                    for lease in completion.events.iter().filter_map(delivery_lease) {
+                        lease.finish(true);
+                    }
                     for observation in completion.events.iter().filter_map(delivery_observation) {
                         observation.finish(IngestionDeliveryTerminal::Unknown(
                             IngestionUnknownReason::ShutdownUnresolved,
@@ -2504,9 +2558,6 @@ impl EventIngestionWorker {
                     if let Ok(mut stats) = self.stats.lock() {
                         stats.events_abandoned_shutdown = stats
                             .events_abandoned_shutdown
-                            .saturating_add(completion.events.len() as u64);
-                        stats.events_unresolved_shutdown = stats
-                            .events_unresolved_shutdown
                             .saturating_add(completion.events.len() as u64);
                         stats.errors = stats.errors.saturating_add(1);
                         stats.last_error = Some(format!("shutdown flush failed: {error}"));
@@ -2767,6 +2818,11 @@ impl EventIngestionWorker {
             tx.rollback()
                 .await
                 .map_err(|error| format!("rollback durable admission rejection: {error}"))?;
+            for lease in events.iter().filter_map(delivery_lease) {
+                // The retry has a terminal admission result. Measurement may
+                // retain prior commit uncertainty, but this is not abandonment.
+                lease.finish(false);
+            }
             return Ok(IngestionBatchOutcome {
                 events_resolved: session_event_count,
                 events_dropped_permanent: session_event_count,
@@ -3066,6 +3122,11 @@ impl EventIngestionWorker {
             observation.commit_started();
         }
         tx.commit().await.map_err(|e| format!("commit tx: {e}"))?;
+        // Settle before returning to the scheduler: cancellation after the
+        // acknowledgement must not relabel a known commit as unresolved.
+        for lease in events.iter().filter_map(delivery_lease) {
+            lease.finish(false);
+        }
         for observation in events.iter().filter_map(delivery_observation) {
             observation.commit_acknowledged();
         }
@@ -3396,6 +3457,64 @@ mod tests {
         assert_eq!(stats.resident_events_current, 0);
         assert_eq!(stats.resident_bytes_current, 0);
         assert_eq!(stats.resident_events_peak, 32);
+    }
+
+    #[tokio::test]
+    async fn delivery_terminal_accounting_survives_retry_clones_and_late_drop() {
+        let (sender, mut receiver) = IngestionSender::for_tests(8);
+        let stats = Arc::clone(&sender.admission.stats);
+        for (id, terminal, expected) in [
+            ("acknowledged", Some(false), 0),
+            ("drain-failed", Some(true), 1),
+            ("cancelled", None, 2),
+        ] {
+            sender
+                .enqueue_async(test_event(id, "session", "user_query"))
+                .await;
+            let event = receiver.recv().await.unwrap();
+            let retry = event.clone();
+            if let Some(unresolved) = terminal {
+                delivery_lease(&event).unwrap().finish(unresolved);
+                // A late cancellation/second cleanup cannot replace the terminal.
+                delivery_lease(&retry).unwrap().finish(true);
+            }
+            drop(event);
+            if terminal.is_none() {
+                assert_eq!(
+                    astra_core::sync_poison::recover_mutex_lock(&stats).events_unresolved_shutdown,
+                    expected - 1,
+                    "retry clone still owns the delivery"
+                );
+            }
+            drop(retry);
+            let snapshot = astra_core::sync_poison::recover_mutex_lock(&stats);
+            assert_eq!(snapshot.events_unresolved_shutdown, expected);
+            assert_eq!(snapshot.resident_events_current, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_pre_channel_send_is_not_an_unresolved_delivery() {
+        let (sender, mut receiver) = IngestionSender::for_tests(1);
+        sender
+            .enqueue_async(test_event("accepted", "session", "user_query"))
+            .await;
+        let mut waiting = test_event("waiting", "other-session", "user_query");
+        waiting.user_id = "other-owner".to_string();
+        let mut pending = Box::pin(sender.enqueue_async(waiting));
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        assert_eq!(
+            astra_core::sync_poison::recover_mutex_lock(&sender.admission.stats)
+                .resident_events_current,
+            2
+        );
+        drop(pending);
+        let event = receiver.recv().await.unwrap();
+        delivery_lease(&event).unwrap().finish(false);
+        drop(event);
+        let stats = astra_core::sync_poison::recover_mutex_lock(&sender.admission.stats);
+        assert_eq!(stats.resident_events_current, 0);
+        assert_eq!(stats.events_unresolved_shutdown, 0);
     }
 
     #[test]
@@ -5369,7 +5488,7 @@ mod tests {
         use measurement::{IngestionDeliveryKey, IngestionMeasurementSink};
         let limiter = IngestionDbLimiter::new(1);
         let held = limiter.acquire().await.unwrap();
-        let (sender, _, _, worker) = EventIngestionWorker::spawn_with_db_limiter(
+        let (sender, _, stats, worker) = EventIngestionWorker::spawn_with_db_limiter(
             dummy_pool(),
             IngestionConfig {
                 batch_size: 1,
@@ -5390,6 +5509,11 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         worker.abort();
         assert!(worker.await.unwrap_err().is_cancelled());
+        {
+            let stats = astra_core::sync_poison::recover_mutex_lock(&stats);
+            assert_eq!(stats.events_unresolved_shutdown, 1);
+            assert_eq!(stats.resident_events_current, 0);
+        }
         let report = reports.recv().await.unwrap();
         assert_eq!(
             report.terminal,
@@ -5492,6 +5616,10 @@ mod tests {
         );
         assert_eq!(sender.pending_deferral_count(), 0);
         assert_eq!(sender.dropped_before_acceptance_count(), 1);
+        assert_eq!(
+            s.events_unresolved_shutdown, 1,
+            "only the accepted failed delivery is unresolved"
+        );
     }
 
     #[tokio::test]
@@ -5636,6 +5764,7 @@ mod tests {
             s.flush_count, 0,
             "dummy pool must fail, so no successful flush should be counted"
         );
+        assert_eq!(s.events_unresolved_shutdown, 5);
         assert!(
             s.last_error
                 .as_deref()
