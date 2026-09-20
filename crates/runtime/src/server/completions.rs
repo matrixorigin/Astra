@@ -759,6 +759,7 @@ mod tests {
     async fn typed_judgment_rejects_an_offering_cap_before_provider_dispatch() {
         for operation in [
             CompletionOperation::MemoryRetrievalRerank,
+            CompletionOperation::ToolResultRerank,
             CompletionOperation::TurnIntent,
             CompletionOperation::SkillAutoRoute,
             CompletionOperation::VerificationJudge,

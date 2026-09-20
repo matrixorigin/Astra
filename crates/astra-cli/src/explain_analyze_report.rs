@@ -847,6 +847,10 @@ mod tests {
             "Request analysis"
         );
         assert_eq!(
+            auxiliary_usage_label("completion_proxy:tool_result_rerank", "tool_result_rerank"),
+            "Tool result selection"
+        );
+        assert_eq!(
             auxiliary_usage_label("unrecognized", "unrecognized"),
             "Auxiliary inference"
         );
@@ -1319,6 +1323,7 @@ fn auxiliary_usage_label(operation: &str, purpose: &str) -> &'static str {
         "work_plan" => "Work planning",
         _ => match purpose {
             "memory_retrieval_rerank" => "Memory judgment",
+            "tool_result_rerank" => "Tool result selection",
             "memory_extraction" => "Memory extraction",
             "introspection" => "Request analysis",
             "verification_judge" => "Verification",

@@ -15,6 +15,7 @@ pub const MAX_COMPLETION_OUTPUT_TOKENS: u32 = 8_192;
 pub enum CompletionOperation {
     MemoryExtraction,
     MemoryRetrievalRerank,
+    ToolResultRerank,
     TurnIntent,
     SkillAutoRoute,
     VerificationJudge,
@@ -33,6 +34,7 @@ impl CompletionOperation {
             Self::MemoryRetrievalRerank => {
                 astra_turn_types::InferencePurpose::MemoryRetrievalRerank
             }
+            Self::ToolResultRerank => astra_turn_types::InferencePurpose::ToolResultRerank,
             Self::TurnIntent => astra_turn_types::InferencePurpose::Introspection,
             Self::SkillAutoRoute => astra_turn_types::InferencePurpose::Introspection,
             Self::VerificationJudge => astra_turn_types::InferencePurpose::VerificationJudge,
@@ -44,6 +46,7 @@ impl CompletionOperation {
         match self {
             Self::MemoryExtraction => "completion_proxy:memory_extraction",
             Self::MemoryRetrievalRerank => "completion_proxy:memory_retrieval_rerank",
+            Self::ToolResultRerank => "completion_proxy:tool_result_rerank",
             Self::TurnIntent => "completion_proxy:turn_intent",
             Self::SkillAutoRoute => "completion_proxy:skill_auto_route",
             Self::VerificationJudge => "completion_proxy:verification_judge",
@@ -327,6 +330,7 @@ mod tests {
         assert!(!CompletionOperation::MemoryExtraction.is_typed_judgment());
         for operation in [
             CompletionOperation::MemoryRetrievalRerank,
+            CompletionOperation::ToolResultRerank,
             CompletionOperation::TurnIntent,
             CompletionOperation::SkillAutoRoute,
             CompletionOperation::VerificationJudge,
