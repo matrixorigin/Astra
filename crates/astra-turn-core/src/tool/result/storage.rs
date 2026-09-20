@@ -98,6 +98,13 @@ pub const TOOL_RESULT_RUN_ID_FIELD: &str = "_astra_tool_result_run_id";
 /// use this typed marker instead of classifying the rendered body.
 pub const TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD: &str = "_astra_tool_result_artifact";
 
+/// Trusted canonical-history marker for results whose generic presentation
+/// may be replaced by an optional, source-bound projection. Absence is not
+/// equivalent to eligibility: older or foreign messages fail closed.
+pub const TOOL_RESULT_OPTIONAL_PROJECTION_FIELD: &str = "_astra_tool_result_optional_projection";
+pub const TOOL_RESULT_TOOL_NAME_FIELD: &str = "_tool_name";
+const TOOL_RESULT_OPTIONAL_PROJECTION_VERSION: u64 = 1;
+
 /// Default payload size for one model-requested artifact window.
 pub const DEFAULT_TOOL_RESULT_WINDOW_BYTES: usize = 8 * 1024;
 
@@ -159,6 +166,50 @@ pub enum ToolResultArtifactMetadataError {
     Conflict,
     #[error("tool-result artifact descriptor identity does not match its message")]
     IdentityMismatch,
+}
+
+/// Mark a freshly produced canonical result as eligible for optional generic
+/// projection. This marker is runtime-owned metadata and must never be
+/// inferred from result text or user-provided metadata.
+pub fn mark_tool_result_optional_projection(
+    message: &mut Value,
+    eligible: bool,
+) -> Result<(), ToolResultArtifactMetadataError> {
+    let Some(object) = message.as_object_mut() else {
+        return Err(ToolResultArtifactMetadataError::NotAnObject);
+    };
+    if !eligible {
+        object.remove(TOOL_RESULT_OPTIONAL_PROJECTION_FIELD);
+        return Ok(());
+    }
+    let marker = serde_json::json!({
+        "schema_version": TOOL_RESULT_OPTIONAL_PROJECTION_VERSION,
+        "presentation": "generic",
+    });
+    if let Some(existing) = object.get(TOOL_RESULT_OPTIONAL_PROJECTION_FIELD) {
+        if existing == &marker {
+            return Ok(());
+        }
+        return Err(ToolResultArtifactMetadataError::Conflict);
+    }
+    object.insert(TOOL_RESULT_OPTIONAL_PROJECTION_FIELD.to_string(), marker);
+    Ok(())
+}
+
+/// Read eligibility only from the exact trusted marker shape.
+#[must_use]
+pub fn tool_result_optional_projection_eligible(message: &Value) -> bool {
+    message
+        .get(TOOL_RESULT_OPTIONAL_PROJECTION_FIELD)
+        .is_some_and(is_tool_result_optional_projection_marker)
+}
+
+#[must_use]
+pub fn is_tool_result_optional_projection_marker(marker: &Value) -> bool {
+    marker.get("schema_version").and_then(Value::as_u64)
+        == Some(TOOL_RESULT_OPTIONAL_PROJECTION_VERSION)
+        && marker.get("presentation").and_then(Value::as_str) == Some("generic")
+        && marker.as_object().is_some_and(|object| object.len() == 2)
 }
 
 /// Return the run identity attached to a canonical tool-result message.

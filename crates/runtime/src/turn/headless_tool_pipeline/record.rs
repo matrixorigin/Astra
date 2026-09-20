@@ -999,7 +999,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 serde_json::Value::Number(self.ctx.llm_round.into()),
             );
             obj.insert(
-                "_tool_name".to_string(),
+                astra_turn_core::tool_result_storage::TOOL_RESULT_TOOL_NAME_FIELD.to_string(),
                 serde_json::Value::String(execution.name.clone()),
             );
             if let Err(error) = astra_turn_core::tool_result_storage::mark_tool_result_run_id(
@@ -1031,6 +1031,21 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     tool_call_id = %execution.id,
                     error = %error,
                     "tool-result artifact descriptor was not attached"
+                );
+            }
+            if let Err(error) =
+                astra_turn_core::tool_result_storage::mark_tool_result_optional_projection(
+                    &mut tool_msg,
+                    result_presentation == astra_tools::ModelResultPresentation::Generic
+                        && journal_result.artifact.is_some()
+                        && structural_model_projection.is_none(),
+                )
+            {
+                tracing::error!(
+                    run_id = ?self.ctx.current_run_id,
+                    tool_call_id = %execution.id,
+                    error = %error,
+                    "tool-result optional projection eligibility was not attached"
                 );
             }
         }

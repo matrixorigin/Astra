@@ -12,6 +12,7 @@ use astra_turn_types::{
     ToolResultProjectionFallbackV1, ToolResultProjectionRangeV1,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::chunks::{
     MAX_TOOL_RESULT_CHUNK_BYTES, MAX_TOOL_RESULT_CHUNKS, MAX_TOOL_RESULT_SCAN_BYTES,
@@ -85,6 +86,43 @@ impl RenderedToolResultSelectionProjection {
     pub fn selected_ranges(&self) -> &[ToolResultProjectionRangeV1] {
         &self.selected_ranges
     }
+}
+
+#[derive(Serialize)]
+struct CanonicalToolResultProjectionIdentity<'a> {
+    schema_version: u32,
+    run_id: &'a str,
+    call_id: &'a str,
+    tool_name: &'a str,
+    descriptor: &'a astra_services::session_journal::ToolResultArtifactDescriptor,
+}
+
+/// Stable identity of one trusted canonical tool-result message. Display
+/// text, timestamps, compaction state, and provider annotations are excluded.
+pub fn canonical_tool_result_projection_identity(
+    message: &serde_json::Value,
+) -> Result<String, &'static str> {
+    if message.get("role").and_then(serde_json::Value::as_str) != Some("tool")
+        || !super::storage::tool_result_optional_projection_eligible(message)
+    {
+        return Err("tool-result message is not eligible for optional projection");
+    }
+    let descriptor = super::storage::tool_result_artifact_descriptor(message)
+        .ok_or("tool-result message has no trusted artifact descriptor")?;
+    let tool_name = message
+        .get(super::storage::TOOL_RESULT_TOOL_NAME_FIELD)
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.trim().is_empty() && name.len() <= MAX_TOOL_NAME_CHARS)
+        .ok_or("tool-result message has no trusted tool identity")?;
+    let encoded = serde_json::to_vec(&CanonicalToolResultProjectionIdentity {
+        schema_version: 1,
+        run_id: &descriptor.run_id,
+        call_id: &descriptor.call_id,
+        tool_name,
+        descriptor: &descriptor,
+    })
+    .map_err(|_| "serialize canonical tool-result projection identity")?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
 }
 
 pub fn selected_tool_result_projection_decision(
@@ -167,13 +205,13 @@ pub fn render_tool_result_selection_projection(
     {
         return Err("tool-result selection recommendation does not match its projection");
     }
-    let mut body = String::new();
+    let mut excerpts = String::new();
     for candidate in projection.candidates() {
         if !selected.contains(&candidate.chunk().id) {
             continue;
         }
         let chunk = candidate.chunk();
-        body.push_str(&format!(
+        excerpts.push_str(&format!(
             "--- original bytes [{}..{}), lines {}..{}{} ---\n",
             chunk.start_byte,
             chunk.end_byte,
@@ -185,27 +223,12 @@ pub fn render_tool_result_selection_projection(
                 ", partial line"
             }
         ));
-        body.push_str(candidate.content());
+        excerpts.push_str(candidate.content());
         if !candidate.content().ends_with('\n') {
-            body.push('\n');
+            excerpts.push('\n');
         }
     }
-    let handle = super::storage::session_tool_result_artifact_uri_for_descriptor(descriptor);
-    let rendered = format!(
-        "<tool-result-selection>\n\
-         Tool: {}\n\
-         Artifact handle: {}\n\
-         Selected exact source: {} of {} chunks from {} bytes.\n\
-         Unselected source remains in the artifact; reading it requires a currently authorized recovery capability.\n\n\
-         {}\
-         </tool-result-selection>",
-        truncate_chars(tool_name, MAX_TOOL_NAME_CHARS),
-        handle,
-        selected.len(),
-        projection.candidates().len(),
-        projection.source_bytes(),
-        body,
-    );
+    let rendered = render_selected_body(tool_name, descriptor, selected.len(), &excerpts);
     if rendered.len() >= baseline.len() {
         return Ok(None);
     }
@@ -227,6 +250,116 @@ pub fn render_tool_result_selection_projection(
         selected_ranges,
         body: rendered,
     }))
+}
+
+fn render_selected_body(
+    tool_name: &str,
+    descriptor: &astra_services::session_journal::ToolResultArtifactDescriptor,
+    selected_count: usize,
+    excerpts: &str,
+) -> String {
+    let handle = super::storage::session_tool_result_artifact_uri_for_descriptor(descriptor);
+    format!(
+        "<tool-result-selection>\n\
+         Tool: {}\n\
+         Artifact handle: {}\n\
+         Selected exact source: {} chunk(s) from {} bytes.\n\
+         Unselected source remains in the artifact; reading it requires a currently authorized recovery capability.\n\n\
+         {}\
+         </tool-result-selection>",
+        truncate_chars(tool_name, MAX_TOOL_NAME_CHARS),
+        handle,
+        selected_count,
+        descriptor.byte_len,
+        excerpts,
+    )
+}
+
+/// Rebuild a frozen selected projection from its immutable owner-scoped
+/// artifact. Failure is a safe signal to retain the ordinary baseline; it
+/// never authorizes changing the frozen decision.
+pub fn recover_frozen_tool_result_selection_projection(
+    session_dir: &std::path::Path,
+    tool_name: &str,
+    descriptor: &astra_services::session_journal::ToolResultArtifactDescriptor,
+    decision: &ToolResultProjectionDecisionV1,
+) -> Result<RenderedToolResultSelectionProjection, String> {
+    decision
+        .validate()
+        .map_err(|error| format!("invalid frozen tool-result decision: {error}"))?;
+    if decision.disposition != ToolResultProjectionDispositionV1::Selected
+        || decision.renderer_version != astra_turn_types::TOOL_RESULT_PROJECTION_RENDERER_VERSION
+        || decision.producer_run_id != descriptor.run_id
+        || decision.producer_call_id != descriptor.call_id
+        || decision.source_sha256 != descriptor.content_sha256
+        || decision.source_bytes != descriptor.byte_len
+        || descriptor.byte_len > MAX_TOOL_RESULT_SCAN_BYTES as u64
+    {
+        return Err("frozen tool-result decision does not match its recoverable source".into());
+    }
+    let source = super::storage::read_verified_persisted_result(
+        session_dir,
+        descriptor,
+        MAX_TOOL_RESULT_SCAN_BYTES as u64,
+    )?;
+    let mut excerpts = String::new();
+    for range in &decision.selected_ranges {
+        let start = usize::try_from(range.start_byte)
+            .map_err(|_| "selected range start exceeds this runtime")?;
+        let end = usize::try_from(range.end_byte)
+            .map_err(|_| "selected range end exceeds this runtime")?;
+        let content = source
+            .get(start..end)
+            .ok_or("selected range is not an exact UTF-8 source slice")?;
+        if range.chunk_id != super::chunks::chunk_id(descriptor, start, end) {
+            return Err("selected range chunk identity does not match its source".into());
+        }
+        let start_line = 1_u32.saturating_add(
+            source.as_bytes()[..start]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count() as u32,
+        );
+        let newline_count = content.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let end_line = if content.ends_with('\n') {
+            start_line.saturating_add(newline_count.saturating_sub(1))
+        } else {
+            start_line.saturating_add(newline_count)
+        };
+        let line_complete = (start == 0 || source.as_bytes()[start - 1] == b'\n')
+            && (end == source.len() || source.as_bytes()[end - 1] == b'\n');
+        excerpts.push_str(&format!(
+            "--- original bytes [{}..{}), lines {}..{}{} ---\n",
+            range.start_byte,
+            range.end_byte,
+            start_line,
+            end_line,
+            if line_complete { "" } else { ", partial line" }
+        ));
+        excerpts.push_str(content);
+        if !content.ends_with('\n') {
+            excerpts.push('\n');
+        }
+    }
+    let body = render_selected_body(
+        tool_name,
+        descriptor,
+        decision.selected_ranges.len(),
+        &excerpts,
+    );
+    if body.len() as u64 != decision.rendered_body_bytes
+        || format!("{:x}", Sha256::digest(body.as_bytes())) != decision.rendered_body_sha256
+    {
+        return Err("recovered tool-result projection does not match its frozen body".into());
+    }
+    Ok(RenderedToolResultSelectionProjection {
+        producer_run_id: descriptor.run_id.clone(),
+        producer_call_id: descriptor.call_id.clone(),
+        source_sha256: descriptor.content_sha256.clone(),
+        source_bytes: descriptor.byte_len,
+        selected_ranges: decision.selected_ranges.clone(),
+        body,
+    })
 }
 
 /// Build a bounded judgment over exact chunks from one verified artifact.
@@ -667,5 +800,132 @@ mod tests {
             Some(ToolResultProjectionFallbackV1::JudgmentUnavailable)
         );
         baseline.validate().unwrap();
+    }
+
+    #[test]
+    fn canonical_identity_requires_trusted_generic_eligibility_and_ignores_body() {
+        let descriptor = fixture().0;
+        let mut message = serde_json::json!({
+            "role": "tool",
+            "tool_call_id": descriptor.call_id,
+            "content": "first display",
+            "_tool_name": "exec",
+        });
+        super::super::storage::mark_tool_result_run_id(&mut message, Some(&descriptor.run_id))
+            .unwrap();
+        super::super::storage::mark_tool_result_artifact_descriptor(
+            &mut message,
+            Some(&descriptor),
+        )
+        .unwrap();
+        assert!(canonical_tool_result_projection_identity(&message).is_err());
+        super::super::storage::mark_tool_result_optional_projection(&mut message, true).unwrap();
+        let first = canonical_tool_result_projection_identity(&message).unwrap();
+        let round_tripped =
+            serde_json::Value::from(crate::compression_types::Message::from(message.clone()));
+        assert_eq!(
+            canonical_tool_result_projection_identity(&round_tripped).unwrap(),
+            first,
+            "compression roundtrip must preserve the stable identity"
+        );
+        message["content"] = serde_json::json!("compacted display");
+        assert_eq!(
+            canonical_tool_result_projection_identity(&message).unwrap(),
+            first
+        );
+        message["_tool_name"] = serde_json::json!("other");
+        assert_ne!(
+            canonical_tool_result_projection_identity(&message).unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn frozen_selected_body_is_rebuilt_exactly_and_tampering_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = "alpha\nbeta\ngamma\n";
+        let persisted = crate::tool::result::storage::persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-recover",
+            "call-recover",
+            "exec",
+            source,
+        )
+        .unwrap();
+        let projection = crate::tool::result::storage::read_verified_tool_result_chunk_candidates(
+            dir.path(),
+            &persisted.descriptor,
+            source.len(),
+            6,
+            3,
+        )
+        .unwrap()
+        .unwrap();
+        let ids = projection
+            .candidates()
+            .iter()
+            .map(|candidate| candidate.chunk().id.clone())
+            .collect::<Vec<_>>();
+        let response = NormalizedJudgmentResponse {
+            response: JudgmentResponse {
+                schema_version: 1,
+                model: "judge".into(),
+                answers: BTreeMap::from([
+                    (ids[0].clone(), JudgmentAnswer::Noul { noul: 0.0 }),
+                    (ids[1].clone(), JudgmentAnswer::Noul { noul: 1.0 }),
+                    (ids[2].clone(), JudgmentAnswer::Noul { noul: 0.0 }),
+                ]),
+            },
+            provenance: JudgmentResponseProvenance::DiscreteDecision,
+        };
+        let recommendation = tool_result_selection_recommendation(&projection, &response).unwrap();
+        let rendered = render_tool_result_selection_projection(
+            "exec",
+            &persisted.descriptor,
+            &projection,
+            &recommendation,
+            &"baseline ".repeat(100),
+        )
+        .unwrap()
+        .unwrap();
+        let decision = selected_tool_result_projection_decision(
+            &rendered,
+            &"b".repeat(64),
+            &"c".repeat(64),
+            "judgment-recover".into(),
+        )
+        .unwrap();
+        let recovered = recover_frozen_tool_result_selection_projection(
+            dir.path(),
+            "exec",
+            &persisted.descriptor,
+            &decision,
+        )
+        .unwrap();
+        assert_eq!(recovered.body(), rendered.body());
+
+        let runs = dir.path().join("tool-results/runs");
+        let run_dir = std::fs::read_dir(runs)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let artifact = std::fs::read_dir(run_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::write(artifact, "alpha\nEVIL\ngamma\n").unwrap();
+        assert!(
+            recover_frozen_tool_result_selection_projection(
+                dir.path(),
+                "exec",
+                &persisted.descriptor,
+                &decision,
+            )
+            .is_err()
+        );
     }
 }

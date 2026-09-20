@@ -279,6 +279,8 @@ impl From<Message> for Value {
                         | astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD
                         | crate::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD
                         | crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD
+                        | crate::tool_result_storage::TOOL_RESULT_OPTIONAL_PROJECTION_FIELD
+                        | crate::tool_result_storage::TOOL_RESULT_TOOL_NAME_FIELD
                         | crate::tool::result::advisory::TOOL_RESULT_ADVISORIES_FIELD
                 )
             {
@@ -493,6 +495,11 @@ mod tests {
             "tool_call_id": "call-1",
             "_astra_tool_result_run_id": "run-1",
             "_astra_tool_result_artifact": descriptor,
+            "_astra_tool_result_optional_projection": {
+                "schema_version": 1,
+                "presentation": "generic"
+            },
+            "_tool_name": "exec",
             "_astra_tool_result_advisories": ["use a targeted recovery read"],
         });
         let msg = Message::from(v.clone());

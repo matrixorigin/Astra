@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const TOOL_RESULT_PROJECTION_POLICY_VERSION: u32 = 1;
-pub const TOOL_RESULT_PROJECTION_RENDERER_VERSION: u32 = 1;
+pub const TOOL_RESULT_PROJECTION_RENDERER_VERSION: u32 = 2;
 const MAX_RANGES: usize = 32;
 const MAX_ID_BYTES: usize = 256;
 const MAX_RUN_ID_BYTES: usize = 64;
