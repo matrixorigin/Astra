@@ -3592,6 +3592,58 @@ impl DurableInferenceInvocation {
         Ok(())
     }
 
+    /// Bind source-verified optional context projections before provider
+    /// assembly. Retries reuse the same immutable decisions and reconstructed
+    /// bodies while each physical attempt receives its own exact wire receipt.
+    pub(crate) fn bind_tool_result_projections(
+        &self,
+        projections: Vec<crate::turn::llm::client::PreparedToolResultProjection>,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        if self.observer.next_attempt.load(Ordering::Acquire) != 0 {
+            return Err(contract_error(
+                "tool-result projection binding",
+                "provider attempt admission already started",
+            ));
+        }
+        let mut freeze_keys = BTreeSet::new();
+        for projection in &projections {
+            projection.decision.validate().map_err(|error| {
+                contract_error(
+                    "tool-result projection binding",
+                    format!("invalid decision: {error}"),
+                )
+            })?;
+            if !freeze_keys.insert(projection.decision.freeze_key_sha256.as_str()) {
+                return Err(contract_error(
+                    "tool-result projection binding",
+                    "duplicate projection freeze key",
+                ));
+            }
+        }
+        let mut bound = self
+            .observer
+            .tool_result_projections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !bound.is_empty()
+            && bound
+                .iter()
+                .map(|value| &value.decision)
+                .collect::<Vec<_>>()
+                != projections
+                    .iter()
+                    .map(|value| &value.decision)
+                    .collect::<Vec<_>>()
+        {
+            return Err(contract_error(
+                "tool-result projection binding",
+                "a different projection set is already bound",
+            ));
+        }
+        *bound = projections;
+        Ok(())
+    }
+
     pub(crate) async fn provider_attempt_facts(&self) -> Vec<DurableProviderAttemptFact> {
         let dispatched_attempts = self
             .observer
@@ -3911,6 +3963,8 @@ struct DurableProviderAttemptObserver {
     invocation: astra_services::InferenceInvocationPlan,
     request_context: astra_services::ModelRequestContextSeed,
     canonical_transitions: std::sync::Mutex<Vec<astra_turn_types::ProviderCanonicalTransitionV2>>,
+    tool_result_projections:
+        std::sync::Mutex<Vec<crate::turn::llm::client::PreparedToolResultProjection>>,
     admitted_canonical_transition_id: std::sync::Mutex<Option<String>>,
     next_attempt: AtomicU32,
     dispatch_started: AtomicBool,
@@ -4106,6 +4160,7 @@ impl DurableProviderAttemptObserver {
             invocation,
             request_context,
             canonical_transitions: std::sync::Mutex::new(Vec::new()),
+            tool_result_projections: std::sync::Mutex::new(Vec::new()),
             admitted_canonical_transition_id: std::sync::Mutex::new(None),
             next_attempt: AtomicU32::new(0),
             dispatch_started: AtomicBool::new(false),
@@ -4275,6 +4330,15 @@ impl Drop for DurableProviderAttemptObserver {
 
 #[async_trait]
 impl ProviderAttemptObserver for DurableProviderAttemptObserver {
+    fn prepared_tool_result_projections(
+        &self,
+    ) -> Vec<crate::turn::llm::client::PreparedToolResultProjection> {
+        self.tool_result_projections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     async fn begin_attempt(
         &self,
         wire: &ProviderWireRequestIdentity,
@@ -4318,7 +4382,9 @@ impl ProviderAttemptObserver for DurableProviderAttemptObserver {
             self.request_context.clone(),
         )
         .with_canonical_transitions(&canonical_transitions)
-        .map_err(|error| service_error("provider canonical transition", error))?;
+        .map_err(|error| service_error("provider canonical transition", error))?
+        .with_tool_result_projections(wire.tool_result_projections.clone())
+        .map_err(|error| service_error("provider tool-result projections", error))?;
         let request = DurableProviderRequestIdentity {
             request_id: attempt.request_id().to_string(),
             request_hash: wire.provider_wire_hash.clone(),
@@ -6014,6 +6080,7 @@ mod tests {
                 ..Default::default()
             },
             fingerprints: Default::default(),
+            tool_result_projections: Vec::new(),
         };
         let attempt = observer
             .begin_attempt(&wire)
@@ -7625,6 +7692,7 @@ mod tests {
                 ..Default::default()
             },
             fingerprints: Default::default(),
+            tool_result_projections: Vec::new(),
         };
         let mut admission = Box::pin(observer.begin_attempt(&wire));
         tokio::select! {
@@ -7686,6 +7754,7 @@ mod tests {
                 ..Default::default()
             },
             fingerprints: Default::default(),
+            tool_result_projections: Vec::new(),
         };
 
         let admitting_observer = observer.clone();
@@ -7777,6 +7846,7 @@ mod tests {
                 ..Default::default()
             },
             fingerprints: Default::default(),
+            tool_result_projections: Vec::new(),
         };
         let attempt = observer
             .begin_attempt(&wire)
@@ -7833,6 +7903,7 @@ mod tests {
                 ..Default::default()
             },
             fingerprints: Default::default(),
+            tool_result_projections: Vec::new(),
         };
         let mut admission = Box::pin(observer.begin_attempt(&wire));
         tokio::select! {
@@ -7923,6 +7994,7 @@ mod tests {
                 ..Default::default()
             },
             fingerprints: Default::default(),
+            tool_result_projections: Vec::new(),
         }
     }
 

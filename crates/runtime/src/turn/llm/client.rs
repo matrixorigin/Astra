@@ -253,6 +253,10 @@ pub(crate) struct ProviderWireRequestIdentity {
     /// diagnostics therefore never need to approximate the dispatched shape
     /// from an earlier logical message/tool projection.
     pub fingerprints: ProviderWireFingerprints,
+    /// Source-bound optional context decisions observed in this exact final
+    /// provider payload. These receipts are derived from protocol structure,
+    /// never from an unscoped search over serialized request bytes.
+    pub tool_result_projections: Vec<astra_turn_types::ToolResultProjectionBindingV1>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -670,6 +674,96 @@ pub(crate) struct PreparedProviderRequest {
     identity: ProviderWireRequestIdentity,
 }
 
+const TOOL_RESULT_PROJECTION_SOURCE_FIELD: &str = "_astra_tool_result_projection_source";
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedToolResultProjection {
+    pub decision: astra_turn_types::ToolResultProjectionDecisionV1,
+    rendered_body: Option<String>,
+}
+
+impl PreparedToolResultProjection {
+    pub(crate) fn new(
+        decision: astra_turn_types::ToolResultProjectionDecisionV1,
+        rendered_body: String,
+    ) -> Result<Self, astra_core::ClassifiedError> {
+        decision.validate().map_err(|error| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                format!("invalid prepared tool-result projection: {error}"),
+            )
+        })?;
+        if rendered_body.len() as u64 != decision.rendered_body_bytes
+            || format!("{:x}", Sha256::digest(rendered_body.as_bytes()))
+                != decision.rendered_body_sha256
+        {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                "prepared tool-result projection body does not match its frozen decision",
+            ));
+        }
+        Ok(Self {
+            decision,
+            rendered_body: Some(rendered_body),
+        })
+    }
+
+    pub(crate) fn not_adopted(
+        decision: astra_turn_types::ToolResultProjectionDecisionV1,
+    ) -> Result<Self, astra_core::ClassifiedError> {
+        decision.validate().map_err(|error| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                format!("invalid non-adopted tool-result projection: {error}"),
+            )
+        })?;
+        Ok(Self {
+            decision,
+            rendered_body: None,
+        })
+    }
+}
+
+fn project_prepared_tool_results(
+    messages: &[Value],
+    projections: &[PreparedToolResultProjection],
+) -> Vec<Value> {
+    let mut projected = messages.to_vec();
+    for message in &mut projected {
+        remove_projection_source_marker(message);
+        let Ok(canonical_identity) =
+            astra_turn_core::tool::result::selection::canonical_tool_result_projection_identity(
+                message,
+            )
+        else {
+            continue;
+        };
+        let run_id = astra_turn_core::tool_result_storage::tool_result_run_id(message);
+        let call_id = message.get("tool_call_id").and_then(Value::as_str);
+        let mut matches = projections.iter().filter(|projection| {
+            projection.decision.canonical_message_sha256 == canonical_identity
+                && run_id == Some(projection.decision.producer_run_id.as_str())
+                && call_id == Some(projection.decision.producer_call_id.as_str())
+        });
+        let Some(projection) = matches.next() else {
+            continue;
+        };
+        if matches.next().is_some() {
+            continue;
+        }
+        if let Some(object) = message.as_object_mut() {
+            if let Some(rendered_body) = &projection.rendered_body {
+                object.insert("content".into(), Value::String(rendered_body.clone()));
+            }
+            object.insert(
+                TOOL_RESULT_PROJECTION_SOURCE_FIELD.into(),
+                Value::String(projection.decision.decision_sha256.clone()),
+            );
+        }
+    }
+    projected
+}
+
 impl PreparedProviderRequest {
     #[cfg(test)]
     pub(crate) fn from_json(
@@ -679,12 +773,24 @@ impl PreparedProviderRequest {
         Self::from_json_with_cache_capability(body, protocol, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn from_json_with_cache_capability(
         body: &Value,
         protocol: LlmProviderProtocol,
         cache_capability: Option<CacheCapability>,
     ) -> Result<Self, astra_core::ClassifiedError> {
-        let encoded = serde_json::to_vec(body).map_err(|error| {
+        Self::from_json_with_projection_decisions(body, protocol, cache_capability, &[])
+    }
+
+    pub(crate) fn from_json_with_projection_decisions(
+        body: &Value,
+        protocol: LlmProviderProtocol,
+        cache_capability: Option<CacheCapability>,
+        decisions: &[astra_turn_types::ToolResultProjectionDecisionV1],
+    ) -> Result<Self, astra_core::ClassifiedError> {
+        let mut provider_body = body.clone();
+        let projection_sources = take_provider_projection_sources(&mut provider_body, protocol);
+        let encoded = serde_json::to_vec(&provider_body).map_err(|error| {
             astra_core::history_work::record_serialization_failure(
                 astra_core::history_work::HistoryWorkSite::ProviderBodySerialization,
                 &error,
@@ -702,8 +808,15 @@ impl PreparedProviderRequest {
             );
         }
         let provider_wire_hash = format!("{:x}", Sha256::digest(&encoded));
-        let composition = ProviderWireComposition::from_body(body, protocol, provider_wire_bytes)?;
-        let fingerprints = ProviderWireFingerprints::from_body(body, protocol, cache_capability)?;
+        let composition =
+            ProviderWireComposition::from_body(&provider_body, protocol, provider_wire_bytes)?;
+        let fingerprints =
+            ProviderWireFingerprints::from_body(&provider_body, protocol, cache_capability)?;
+        let tool_result_projections = projection_receipts_from_final_body(
+            &projection_sources,
+            &provider_wire_hash,
+            decisions,
+        )?;
         Ok(Self {
             body: Bytes::from(encoded),
             identity: ProviderWireRequestIdentity {
@@ -712,6 +825,7 @@ impl PreparedProviderRequest {
                 provider_wire_bytes,
                 composition,
                 fingerprints,
+                tool_result_projections,
             },
         })
     }
@@ -729,6 +843,203 @@ impl PreparedProviderRequest {
     #[cfg(test)]
     fn body_bytes(&self) -> &[u8] {
         self.body.as_ref()
+    }
+}
+
+fn projection_receipts_from_final_body(
+    sources: &[ProviderToolResultProjectionSource],
+    provider_wire_sha256: &str,
+    decisions: &[astra_turn_types::ToolResultProjectionDecisionV1],
+) -> Result<Vec<astra_turn_types::ToolResultProjectionBindingV1>, astra_core::ClassifiedError> {
+    use astra_turn_types::{
+        ToolResultProjectionBindingV1, ToolResultProjectionReceiptV1,
+        ToolResultProjectionWireStateV1,
+    };
+
+    decisions
+        .iter()
+        .map(|decision| {
+            decision.validate().map_err(|error| {
+                astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    format!("invalid prepared tool-result projection decision: {error}"),
+                )
+            })?;
+            let candidates = sources
+                .iter()
+                .filter(|source| source.decision_sha256 == decision.decision_sha256)
+                .collect::<Vec<_>>();
+            let matching = candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.body.as_ref().is_some_and(|body| {
+                        body.len() as u64 == decision.rendered_body_bytes
+                            && format!("{:x}", Sha256::digest(body.as_bytes()))
+                                == decision.rendered_body_sha256
+                    })
+                })
+                .count();
+            let receipt = if candidates.len() == 1 && matching == 1 {
+                ToolResultProjectionReceiptV1 {
+                    decision_sha256: decision.decision_sha256.clone(),
+                    provider_wire_sha256: provider_wire_sha256.to_string(),
+                    state: ToolResultProjectionWireStateV1::Included,
+                    actual_ranges: decision.selected_ranges.clone(),
+                    actual_body_sha256: Some(decision.rendered_body_sha256.clone()),
+                    reason: None,
+                }
+            } else {
+                let reason = if candidates.is_empty() {
+                    "source-bound tool result is absent from the final provider structure"
+                } else if candidates.len() > 1 {
+                    "source-bound tool result is ambiguous in the final provider structure"
+                } else {
+                    "source-bound tool result body differs from the frozen projection"
+                };
+                ToolResultProjectionReceiptV1 {
+                    decision_sha256: decision.decision_sha256.clone(),
+                    provider_wire_sha256: provider_wire_sha256.to_string(),
+                    state: ToolResultProjectionWireStateV1::Unknown,
+                    actual_ranges: Vec::new(),
+                    actual_body_sha256: None,
+                    reason: Some(reason.to_string()),
+                }
+            };
+            let binding = ToolResultProjectionBindingV1 {
+                decision: decision.clone(),
+                receipt,
+            };
+            binding.validate().map_err(|error| {
+                astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    format!("invalid prepared tool-result projection receipt: {error}"),
+                )
+            })?;
+            Ok(binding)
+        })
+        .collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ProviderToolResultProjectionSource {
+    decision_sha256: String,
+    body: Option<String>,
+}
+
+fn take_provider_projection_sources(
+    body: &mut Value,
+    protocol: LlmProviderProtocol,
+) -> Vec<ProviderToolResultProjectionSource> {
+    let messages = body
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .map(Vec::as_mut_slice)
+        .unwrap_or_default();
+    match protocol {
+        LlmProviderProtocol::OpenAiCompatible => messages
+            .iter_mut()
+            .filter_map(|message| {
+                if message.get("role").and_then(Value::as_str) != Some("tool") {
+                    remove_projection_source_marker(message);
+                    return None;
+                }
+                take_projection_source(message).map(|decision_sha256| {
+                    ProviderToolResultProjectionSource {
+                        decision_sha256,
+                        body: coerce_provider_projection_body(message.get("content")),
+                    }
+                })
+            })
+            .collect(),
+        LlmProviderProtocol::AnthropicMessages => messages
+            .iter_mut()
+            .flat_map(|message| {
+                let valid_role = message.get("role").and_then(Value::as_str) == Some("user");
+                message
+                    .get_mut("content")
+                    .and_then(Value::as_array_mut)
+                    .into_iter()
+                    .flatten()
+                    .map(move |block| (valid_role, block))
+            })
+            .filter_map(|(valid_role, block)| {
+                if !valid_role || block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                    remove_projection_source_marker(block);
+                    return None;
+                }
+                take_projection_source(block).map(|decision_sha256| {
+                    ProviderToolResultProjectionSource {
+                        decision_sha256,
+                        body: coerce_provider_projection_body(block.get("content")),
+                    }
+                })
+            })
+            .collect(),
+        LlmProviderProtocol::BedrockConverse => messages
+            .iter_mut()
+            .flat_map(|message| {
+                let valid_role = message.get("role").and_then(Value::as_str) == Some("user");
+                message
+                    .get_mut("content")
+                    .and_then(Value::as_array_mut)
+                    .into_iter()
+                    .flatten()
+                    .map(move |block| (valid_role, block))
+            })
+            .filter_map(|(valid_role, block)| {
+                let Some(result) = block.get_mut("toolResult") else {
+                    remove_projection_source_marker(block);
+                    return None;
+                };
+                if !valid_role {
+                    remove_projection_source_marker(result);
+                    return None;
+                }
+                take_projection_source(result).map(|decision_sha256| {
+                    let body = result
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .filter(|parts| parts.len() == 1)
+                        .and_then(|parts| {
+                            parts[0]
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string)
+                                .or_else(|| parts[0].get("json").map(Value::to_string))
+                        });
+                    ProviderToolResultProjectionSource {
+                        decision_sha256,
+                        body,
+                    }
+                })
+            })
+            .collect(),
+        LlmProviderProtocol::TypeSafeSystemOne => Vec::new(),
+    }
+}
+
+fn take_projection_source(value: &mut Value) -> Option<String> {
+    value
+        .as_object_mut()?
+        .remove(TOOL_RESULT_PROJECTION_SOURCE_FIELD)?
+        .as_str()
+        .map(ToString::to_string)
+}
+
+fn remove_projection_source_marker(value: &mut Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.remove(TOOL_RESULT_PROJECTION_SOURCE_FIELD);
+    }
+}
+
+fn coerce_provider_projection_body(content: Option<&Value>) -> Option<String> {
+    match content? {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) if parts.len() == 1 => parts[0]
+            .get("text")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        _ => None,
     }
 }
 
@@ -1147,6 +1458,13 @@ pub(crate) struct LlmCall<'a> {
 /// contain multiple physical attempts.
 #[async_trait]
 pub(crate) trait ProviderAttemptObserver: Send + Sync {
+    /// Immutable optional context projections bound before physical attempt
+    /// admission. The provider adapter consumes their internal provenance
+    /// markers before serializing the exact request bytes.
+    fn prepared_tool_result_projections(&self) -> Vec<PreparedToolResultProjection> {
+        Vec::new()
+    }
+
     async fn begin_attempt(
         &self,
         wire: &ProviderWireRequestIdentity,
@@ -1242,6 +1560,10 @@ impl ControlledProviderAttemptObserver<'_> {
 
 #[async_trait]
 impl ProviderAttemptObserver for ControlledProviderAttemptObserver<'_> {
+    fn prepared_tool_result_projections(&self) -> Vec<PreparedToolResultProjection> {
+        self.inner.prepared_tool_result_projections()
+    }
+
     async fn begin_attempt(
         &self,
         wire: &ProviderWireRequestIdentity,
@@ -2308,6 +2630,9 @@ fn build_bedrock_message_content(msg: &Value, include_reasoning_content: bool) -
                             "content": [result_block],
                         }
                     })];
+                    if let Some(source) = msg.get(TOOL_RESULT_PROJECTION_SOURCE_FIELD).cloned() {
+                        blocks[0]["toolResult"][TOOL_RESULT_PROJECTION_SOURCE_FIELD] = source;
+                    }
                     if let Some(cache_point) =
                         bedrock_cache_point_from_message_content(msg.get("content"))
                     {
@@ -3226,6 +3551,7 @@ pub(crate) fn build_provider_request_body_with_overrides(
         thinking,
         request_body_overrides,
         None,
+        &[],
     )
 }
 
@@ -3240,9 +3566,17 @@ fn build_provider_request_body_with_cache_capability(
     thinking: &astra_turn_core::thinking_config::ThinkingConfig,
     request_body_overrides: Option<&Map<String, Value>>,
     cache_capability: Option<CacheCapability>,
+    tool_result_projections: &[PreparedToolResultProjection],
 ) -> Value {
     let sanitized_overrides =
         sanitize_request_body_overrides_for_thinking(thinking, request_body_overrides);
+    let projection_messages;
+    let messages = if tool_result_projections.is_empty() {
+        messages
+    } else {
+        projection_messages = project_prepared_tool_results(messages, tool_result_projections);
+        projection_messages.as_slice()
+    };
     // Direct body-building callers use the same projection as streaming and
     // non-streaming dispatch. Already projected requests take the borrowed path.
     let projected_messages;
@@ -4249,6 +4583,9 @@ fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
                     if !obj.contains_key("tool_use_id") {
                         obj.insert("tool_use_id".into(), Value::String(tool_use_id.to_string()));
                     }
+                    if let Some(source) = msg.get(TOOL_RESULT_PROJECTION_SOURCE_FIELD).cloned() {
+                        obj.insert(TOOL_RESULT_PROJECTION_SOURCE_FIELD.into(), source);
+                    }
                 }
                 let mut out = json!({
                     "role": "user",
@@ -4312,6 +4649,10 @@ fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
                 "tool_use_id": tool_use_id,
                 "content": content,
             });
+            let mut tool_result_block = tool_result_block;
+            if let Some(source) = msg.get(TOOL_RESULT_PROJECTION_SOURCE_FIELD).cloned() {
+                tool_result_block[TOOL_RESULT_PROJECTION_SOURCE_FIELD] = source;
+            }
             let mut out = json!({
                 "role": "user",
                 "content": [tool_result_block]
@@ -4912,11 +5253,22 @@ async fn call_llm_and_collect_with_total_budget(
     let attempt_observer = controlled_attempt_observer
         .as_ref()
         .map(|observer| observer as &dyn ProviderAttemptObserver);
+    let prepared_tool_result_projections = attempt_observer
+        .map(ProviderAttemptObserver::prepared_tool_result_projections)
+        .unwrap_or_default();
     let client = global_llm_client();
 
     // Project system messages according to the declared transport/cache shape.
     // A current-user-only capability consolidates them at the head; protocols
     // that admit a runtime system suffix preserve that boundary.
+    let projected_messages;
+    let messages = if prepared_tool_result_projections.is_empty() {
+        messages
+    } else {
+        projected_messages =
+            project_prepared_tool_results(messages, &prepared_tool_result_projections);
+        projected_messages.as_slice()
+    };
     let messages = consolidate_system_messages_for_provider(messages, provider, cache_capability);
     validate_append_only_transport_history(&messages, provider, cache_capability)?;
 
@@ -4934,6 +5286,7 @@ async fn call_llm_and_collect_with_total_budget(
         thinking,
         request_body_overrides,
         cache_capability,
+        &[],
     );
     // `ThinkingConfig::Off` is provider-agnostic; native OpenAI-compatible
     // endpoints still need their typed suppression field to honor it. Apply
@@ -4969,10 +5322,15 @@ async fn call_llm_and_collect_with_total_budget(
             .collect::<HashSet<_>>(),
         RuntimeToolChoice::None => HashSet::new(),
     };
-    let prepared_request = PreparedProviderRequest::from_json_with_cache_capability(
+    let projection_decisions = prepared_tool_result_projections
+        .iter()
+        .map(|projection| projection.decision.clone())
+        .collect::<Vec<_>>();
+    let prepared_request = PreparedProviderRequest::from_json_with_projection_decisions(
         &body,
         llm_provider_protocol(provider),
         cache_capability,
+        &projection_decisions,
     )?;
 
     let url = llm_request_url(
@@ -7323,6 +7681,9 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     let attempt_observer = controlled_attempt_observer
         .as_ref()
         .map(|observer| observer as &dyn ProviderAttemptObserver);
+    let prepared_tool_result_projections = attempt_observer
+        .map(ProviderAttemptObserver::prepared_tool_result_projections)
+        .unwrap_or_default();
     let upstream_name = wire_model_name.unwrap_or(model_name);
     validate_request_body_overrides(request_body_overrides)?;
 
@@ -7354,6 +7715,14 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     } else {
         None
     };
+    let projected_messages;
+    let messages = if prepared_tool_result_projections.is_empty() {
+        messages
+    } else {
+        projected_messages =
+            project_prepared_tool_results(messages, &prepared_tool_result_projections);
+        projected_messages.as_slice()
+    };
     let messages = consolidate_system_messages_for_provider(messages, provider, cache_capability);
     validate_append_only_transport_history(&messages, provider, cache_capability)?;
 
@@ -7368,6 +7737,7 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         thinking,
         request_body_overrides,
         cache_capability,
+        &[],
     );
     if !matches!(provider, "anthropic" | "bedrock") {
         let protocol = thinking_protocol.unwrap_or_else(|| {
@@ -7392,10 +7762,15 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         body = typesafe_body;
     }
     let wire_output_limit = provider_request_output_limit(&body);
-    let prepared_request = PreparedProviderRequest::from_json_with_cache_capability(
+    let projection_decisions = prepared_tool_result_projections
+        .iter()
+        .map(|projection| projection.decision.clone())
+        .collect::<Vec<_>>();
+    let prepared_request = PreparedProviderRequest::from_json_with_projection_decisions(
         &body,
         llm_provider_protocol(provider),
         cache_capability,
+        &projection_decisions,
     )?;
 
     let url = llm_request_url(
@@ -11468,6 +11843,305 @@ mod tests {
         began: Mutex<Vec<u32>>,
         wires: Mutex<Vec<ProviderWireRequestIdentity>>,
         finished: Mutex<Vec<(u32, astra_services::InferenceTerminalStatus)>>,
+    }
+
+    fn projection_decision_for_wire(
+        call_id: &str,
+        rendered_body: &str,
+    ) -> astra_turn_types::ToolResultProjectionDecisionV1 {
+        astra_turn_types::ToolResultProjectionDecisionV1::new(
+            "run-1",
+            call_id,
+            "a".repeat(64),
+            4096,
+            "b".repeat(64),
+            "c".repeat(64),
+            astra_turn_types::ToolResultProjectionDispositionV1::Selected,
+            vec![astra_turn_types::ToolResultProjectionRangeV1 {
+                chunk_id: "chunk-1".into(),
+                start_byte: 0,
+                end_byte: 128,
+            }],
+            Some("judgment-1".into()),
+            None,
+            rendered_body.as_bytes(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn prepared_provider_request_receipts_require_exact_protocol_tool_result_node() {
+        let rendered = "selected exact evidence";
+        let decision = projection_decision_for_wire("call-1", rendered);
+        let cases = [
+            (
+                LlmProviderProtocol::OpenAiCompatible,
+                json!({"messages": [{"role": "tool", "tool_call_id": "call-1", "content": rendered,
+                    (TOOL_RESULT_PROJECTION_SOURCE_FIELD): decision.decision_sha256}]}),
+            ),
+            (
+                LlmProviderProtocol::AnthropicMessages,
+                json!({"messages": [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call-1", "content": rendered,
+                    (TOOL_RESULT_PROJECTION_SOURCE_FIELD): decision.decision_sha256}]}]}),
+            ),
+            (
+                LlmProviderProtocol::BedrockConverse,
+                json!({"messages": [{"role": "user", "content": [{"toolResult": {"toolUseId": "call-1", "content": [{"text": rendered}],
+                    (TOOL_RESULT_PROJECTION_SOURCE_FIELD): decision.decision_sha256}}]}]}),
+            ),
+        ];
+        for (protocol, body) in cases {
+            let prepared = PreparedProviderRequest::from_json_with_projection_decisions(
+                &body,
+                protocol,
+                None,
+                std::slice::from_ref(&decision),
+            )
+            .unwrap();
+            let binding = &prepared.identity().tool_result_projections[0];
+            assert_eq!(
+                binding.receipt.state,
+                astra_turn_types::ToolResultProjectionWireStateV1::Included
+            );
+            assert_eq!(
+                binding.receipt.provider_wire_sha256,
+                prepared.identity().provider_wire_hash
+            );
+            assert!(
+                !String::from_utf8_lossy(&prepared.body())
+                    .contains(TOOL_RESULT_PROJECTION_SOURCE_FIELD)
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_provider_request_marks_missing_changed_and_ambiguous_projection_unknown() {
+        let decision = projection_decision_for_wire("call-1", "selected exact evidence");
+        for body in [
+            json!({"messages": [{"role": "user", "content": "selected exact evidence"}]}),
+            json!({"messages": [{"role": "tool", "tool_call_id": "call-1", "content": "changed",
+                (TOOL_RESULT_PROJECTION_SOURCE_FIELD): decision.decision_sha256}]}),
+            json!({"messages": [
+                {"role": "tool", "tool_call_id": "call-1", "content": "selected exact evidence",
+                    (TOOL_RESULT_PROJECTION_SOURCE_FIELD): decision.decision_sha256},
+                {"role": "tool", "tool_call_id": "call-1", "content": "selected exact evidence",
+                    (TOOL_RESULT_PROJECTION_SOURCE_FIELD): decision.decision_sha256}
+            ]}),
+            json!({"messages": [
+                {"role": "tool", "tool_call_id": "call-1", "content": "selected exact evidence",
+                    (TOOL_RESULT_PROJECTION_SOURCE_FIELD): decision.decision_sha256},
+                {"role": "tool", "tool_call_id": "call-1", "content": [
+                    {"type": "text", "text": "unsupported"}, {"type": "text", "text": "shape"}
+                ], (TOOL_RESULT_PROJECTION_SOURCE_FIELD): decision.decision_sha256}
+            ]}),
+            json!({"messages": [{"role": "assistant", "tool_call_id": "call-1",
+                "content": "selected exact evidence",
+                (TOOL_RESULT_PROJECTION_SOURCE_FIELD): decision.decision_sha256}]}),
+        ] {
+            let prepared = PreparedProviderRequest::from_json_with_projection_decisions(
+                &body,
+                LlmProviderProtocol::OpenAiCompatible,
+                None,
+                std::slice::from_ref(&decision),
+            )
+            .unwrap();
+            assert_eq!(
+                prepared.identity().tool_result_projections[0].receipt.state,
+                astra_turn_types::ToolResultProjectionWireStateV1::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn bedrock_projection_marker_consumption_preserves_nested_tool_json() {
+        let nested = json!({
+            (TOOL_RESULT_PROJECTION_SOURCE_FIELD): "ordinary data",
+            "value": 1,
+        });
+        let rendered = nested.to_string();
+        let decision = astra_turn_types::ToolResultProjectionDecisionV1::new(
+            "run-1",
+            "call-1",
+            "a".repeat(64),
+            4096,
+            "b".repeat(64),
+            "c".repeat(64),
+            astra_turn_types::ToolResultProjectionDispositionV1::Baseline,
+            Vec::new(),
+            None,
+            Some(astra_turn_types::ToolResultProjectionFallbackV1::NoClearMatch),
+            rendered.as_bytes(),
+        )
+        .unwrap();
+        let body = json!({"messages": [{"role": "user", "content": [{"toolResult": {
+            "toolUseId": "call-1",
+            "content": [{"json": nested}],
+            (TOOL_RESULT_PROJECTION_SOURCE_FIELD): decision.decision_sha256,
+        }}]}]});
+        let prepared = PreparedProviderRequest::from_json_with_projection_decisions(
+            &body,
+            LlmProviderProtocol::BedrockConverse,
+            None,
+            std::slice::from_ref(&decision),
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.identity().tool_result_projections[0].receipt.state,
+            astra_turn_types::ToolResultProjectionWireStateV1::Included
+        );
+        let wire: Value = serde_json::from_slice(&prepared.body()).unwrap();
+        assert_eq!(
+            wire["messages"][0]["content"][0]["toolResult"]["content"][0]["json"]
+                [TOOL_RESULT_PROJECTION_SOURCE_FIELD],
+            "ordinary data"
+        );
+        assert!(
+            wire["messages"][0]["content"][0]["toolResult"]
+                .get(TOOL_RESULT_PROJECTION_SOURCE_FIELD)
+                .is_none()
+        );
+
+        let unbound = PreparedProviderRequest::from_json_with_projection_decisions(
+            &json!({"messages": [{"role": "user", "content": [{"toolResult": {
+                "toolUseId": "call-1", "content": [{"json": nested}]
+            }}]}]}),
+            LlmProviderProtocol::BedrockConverse,
+            None,
+            &[],
+        )
+        .unwrap();
+        let unbound_wire: Value = serde_json::from_slice(&unbound.body()).unwrap();
+        assert_eq!(
+            unbound_wire["messages"][0]["content"][0]["toolResult"]["content"][0]["json"]
+                [TOOL_RESULT_PROJECTION_SOURCE_FIELD],
+            "ordinary data"
+        );
+    }
+
+    #[test]
+    fn trusted_canonical_projection_survives_assembly_and_is_consumed_before_wire() {
+        let source_sha256 = "a".repeat(64);
+        let rendered = "selected exact evidence";
+        let canonical = json!({
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "ordinary baseline",
+            (astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD): "run-1",
+            (astra_turn_core::tool_result_storage::TOOL_RESULT_TOOL_NAME_FIELD): "exec",
+            (astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD): {
+                "version": 1,
+                "run_id": "run-1",
+                "call_id": "call-1",
+                "content_sha256": source_sha256,
+                "byte_len": 4096,
+            },
+            (astra_turn_core::tool_result_storage::TOOL_RESULT_OPTIONAL_PROJECTION_FIELD): {
+                "schema_version": 1,
+                "presentation": "generic",
+            },
+        });
+        let canonical_identity =
+            astra_turn_core::tool::result::selection::canonical_tool_result_projection_identity(
+                &canonical,
+            )
+            .unwrap();
+        let decision = astra_turn_types::ToolResultProjectionDecisionV1::new(
+            "run-1",
+            "call-1",
+            "a".repeat(64),
+            4096,
+            "b".repeat(64),
+            canonical_identity,
+            astra_turn_types::ToolResultProjectionDispositionV1::Selected,
+            vec![astra_turn_types::ToolResultProjectionRangeV1 {
+                chunk_id: "chunk-1".into(),
+                start_byte: 0,
+                end_byte: 128,
+            }],
+            Some("judgment-1".into()),
+            None,
+            rendered.as_bytes(),
+        )
+        .unwrap();
+        let projection =
+            PreparedToolResultProjection::new(decision.clone(), rendered.into()).unwrap();
+        let canonical_messages = [
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "exec", "arguments": "{}"},
+                }],
+            }),
+            canonical,
+        ];
+        let projected_messages =
+            project_prepared_tool_results(&canonical_messages, std::slice::from_ref(&projection));
+        let provider_messages =
+            consolidate_system_messages_for_provider(&projected_messages, "openai", None);
+        let body = build_provider_request_body_with_cache_capability(
+            &provider_messages,
+            &[],
+            "model",
+            "openai",
+            Some(128),
+            None,
+            true,
+            &ThinkingConfig::Off,
+            None,
+            None,
+            &[],
+        );
+        let prepared = PreparedProviderRequest::from_json_with_projection_decisions(
+            &body,
+            LlmProviderProtocol::OpenAiCompatible,
+            None,
+            &[decision.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.identity().tool_result_projections[0].receipt.state,
+            astra_turn_types::ToolResultProjectionWireStateV1::Included
+        );
+        let wire: Value = serde_json::from_slice(&prepared.body()).unwrap();
+        assert_eq!(wire["messages"][1]["content"], rendered);
+        assert!(
+            !String::from_utf8_lossy(&prepared.body())
+                .contains(TOOL_RESULT_PROJECTION_SOURCE_FIELD)
+        );
+
+        let non_adopted = PreparedToolResultProjection::not_adopted(decision.clone()).unwrap();
+        let projected_messages = project_prepared_tool_results(&canonical_messages, &[non_adopted]);
+        let provider_messages =
+            consolidate_system_messages_for_provider(&projected_messages, "openai", None);
+        let body = build_provider_request_body_with_cache_capability(
+            &provider_messages,
+            &[],
+            "model",
+            "openai",
+            Some(128),
+            None,
+            true,
+            &ThinkingConfig::Off,
+            None,
+            None,
+            &[],
+        );
+        let prepared = PreparedProviderRequest::from_json_with_projection_decisions(
+            &body,
+            LlmProviderProtocol::OpenAiCompatible,
+            None,
+            &[decision],
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.identity().tool_result_projections[0].receipt.state,
+            astra_turn_types::ToolResultProjectionWireStateV1::Unknown
+        );
+        let wire: Value = serde_json::from_slice(&prepared.body()).unwrap();
+        assert_eq!(wire["messages"][1]["content"], "ordinary baseline");
     }
 
     #[test]
@@ -18774,6 +19448,7 @@ mod tests {
             &thinking,
             None,
             Some(capability),
+            &[],
         );
         let second_body = build_provider_request_body_with_cache_capability(
             &second,
@@ -18786,6 +19461,7 @@ mod tests {
             &thinking,
             None,
             Some(capability),
+            &[],
         );
 
         let first_wire = first_body["messages"].as_array().unwrap();
@@ -18831,6 +19507,7 @@ mod tests {
             },
             None,
             Some(capability),
+            &[],
         );
 
         assert!(
