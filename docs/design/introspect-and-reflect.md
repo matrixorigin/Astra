@@ -74,6 +74,14 @@ retain at most 2/8/16/32 attempts with explicit omitted counts. Identity display
 fields are capped at 128 characters and truncation is reported; these display
 identities are never execution references. Other facets do not load this data.
 
+The bounded model view retains a compact `judgment_usage` ledger summary ahead
+of routine observations. It copies the captured totals and coverage without
+recounting displayed groups, omits individual attempts with explicit counts,
+and adds complete identity groups only while the model budget permits. If the
+summary itself cannot fit, `projection_budget.omitted_fields` names
+`judgment_usage`. Missing auxiliary evidence must not be inferred from the
+separately scoped runtime request/run accounting.
+
 Semantic judgment results are separate from physical usage. The shared
 owner/session-scoped C3 projection exposes captured request classifications,
 closed abstention/conflict/invalid-response reasons and explicit preparation or
