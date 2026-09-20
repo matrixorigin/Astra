@@ -47,7 +47,7 @@ pub(crate) const DEFAULT_DB_POOL_MIN_CONNECTIONS: u32 = 1;
 
 /// Default acquire timeout for the shared DB pool (seconds).
 /// Override with `ASTRA_DB_POOL_ACQUIRE_TIMEOUT_SECS`.
-pub(crate) const DEFAULT_DB_POOL_ACQUIRE_TIMEOUT_SECS: u64 = 5;
+pub(crate) const DEFAULT_DB_POOL_ACQUIRE_TIMEOUT_SECS: u64 = 30;
 
 /// Default idle timeout for the shared DB pool (seconds).
 /// Override with `ASTRA_DB_POOL_IDLE_TIMEOUT_SECS`.
@@ -1160,7 +1160,7 @@ pub struct MatrixOneSettings {
     pub db_pool_max_connections: u32,
     /// Min idle connections in the shared pool (env `ASTRA_DB_POOL_MIN_CONNECTIONS`, default 1).
     pub db_pool_min_connections: u32,
-    /// Acquire timeout in seconds (env `ASTRA_DB_POOL_ACQUIRE_TIMEOUT_SECS`, default 5).
+    /// Acquire timeout in seconds (env `ASTRA_DB_POOL_ACQUIRE_TIMEOUT_SECS`, default 30).
     pub db_pool_acquire_timeout_secs: u64,
     /// Idle timeout in seconds (env `ASTRA_DB_POOL_IDLE_TIMEOUT_SECS`, default 60).
     pub db_pool_idle_timeout_secs: u64,
@@ -1762,7 +1762,16 @@ mod tests {
     }
 
     #[test]
-    fn matrixone_default_pool_lifetime_avoids_short_recycle_storms() {
+    fn matrixone_default_pool_timeouts_cover_slow_control_plane_operations() {
+        assert_eq!(DEFAULT_DB_POOL_ACQUIRE_TIMEOUT_SECS, 30);
+        assert_eq!(
+            MatrixOneSettings::default().db_pool_acquire_timeout_secs,
+            DEFAULT_DB_POOL_ACQUIRE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            DatabaseConfig::default().connect_timeout_s(),
+            DEFAULT_DB_POOL_ACQUIRE_TIMEOUT_SECS
+        );
         assert_eq!(DEFAULT_DB_POOL_MAX_LIFETIME_SECS, 1800);
         assert_eq!(
             MatrixOneSettings::default().db_pool_max_lifetime_secs,

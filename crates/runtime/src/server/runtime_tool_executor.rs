@@ -49,7 +49,6 @@ use astra_turn_types::{
 use async_trait::async_trait;
 
 const TOOL_RESULT_ARTIFACT_MAX_BYTES: usize = 16 * 1024 * 1024;
-const TOOL_RESULT_ARTIFACT_PERSIST_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PROVIDER_INTERACTION_ROUNDS_PER_TOOL_CALL: usize = 16;
 
 /// Normalize authenticated, durable Edge evidence without inferring execution
@@ -786,6 +785,14 @@ pub struct RuntimeToolExecutor {
     tool_engine: ToolEngine<RuntimeToolExecutor>,
     /// Cooperative cancellation for server-owned runtime/control-plane tool awaits.
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
+    /// Immutable request-admission deadline for durable tool-result writes.
+    ///
+    /// Large results are not acknowledged until their artifact is durable. A
+    /// short storage-local timeout would turn temporary database latency into
+    /// a false terminal failure, while an unbounded write could outlive the
+    /// admitted turn. The request deadline and run cancellation token are the
+    /// authoritative bounds for this operation.
+    durable_operation_deadline: Option<tokio::time::Instant>,
     /// Explicit workspace, executor, runtime, and provisioned workspace record
     /// used for routing, tool visibility, and runtime preparation.
     execution_binding: ExecutionBindingState,
@@ -1015,6 +1022,7 @@ impl RuntimeToolExecutor {
             introspect_snapshot: Arc::new(std::sync::RwLock::new(None)),
             session_config: SessionConfigState::new(),
             cancel_token: None,
+            durable_operation_deadline: None,
             session_artifact_store: None,
             context_manifest_pool: None,
             work_binding: std::sync::OnceLock::new(),
@@ -2754,6 +2762,15 @@ impl RuntimeToolExecutor {
         self
     }
 
+    pub fn with_admitted_execution_deadline(
+        mut self,
+        deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
+    ) -> Self {
+        self.durable_operation_deadline =
+            deadline.map(|deadline| tokio::time::Instant::from_std(deadline.monotonic_deadline()));
+        self
+    }
+
     pub fn with_session_artifact_store(
         mut self,
         store: astra_services::DatabaseSessionArtifactStore,
@@ -4003,12 +4020,40 @@ impl RuntimeToolExecutor {
                 },
             ],
         };
-        let stored = match tokio::time::timeout(
-            TOOL_RESULT_ARTIFACT_PERSIST_TIMEOUT,
-            store.persist_json_artifact(record),
-        )
-        .await
-        {
+        enum ArtifactPersistenceWaitError {
+            Cancelled,
+            ExecutionDeadlineReached,
+        }
+
+        let persist = store.persist_json_artifact(record);
+        tokio::pin!(persist);
+        let persist_result = match (
+            self.cancel_token.as_deref(),
+            self.durable_operation_deadline,
+        ) {
+            (Some(cancel_token), Some(deadline)) => tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => Err(ArtifactPersistenceWaitError::Cancelled),
+                _ = tokio::time::sleep_until(deadline) => {
+                    Err(ArtifactPersistenceWaitError::ExecutionDeadlineReached)
+                }
+                result = &mut persist => Ok(result),
+            },
+            (Some(cancel_token), None) => tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => Err(ArtifactPersistenceWaitError::Cancelled),
+                result = &mut persist => Ok(result),
+            },
+            (None, Some(deadline)) => tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => {
+                    Err(ArtifactPersistenceWaitError::ExecutionDeadlineReached)
+                }
+                result = &mut persist => Ok(result),
+            },
+            (None, None) => Ok(persist.await),
+        };
+        let stored = match persist_result {
             Ok(Ok(stored)) => stored,
             Ok(Err(error)) => {
                 tracing::warn!(
@@ -4024,18 +4069,30 @@ impl RuntimeToolExecutor {
                     "result artifact persistence failed",
                 );
             }
-            Err(_) => {
+            Err(ArtifactPersistenceWaitError::Cancelled) => {
                 tracing::warn!(
                     user_id = %identity.user_id,
                     session_id = %identity.session_id,
                     invocation_id = %identity.invocation_id,
-                    timeout_ms = TOOL_RESULT_ARTIFACT_PERSIST_TIMEOUT.as_millis(),
-                    "governed tool result artifact persistence timed out"
+                    "governed tool result artifact persistence was cancelled"
                 );
                 return durable_result_persistence_failure(
                     identity,
                     &result,
-                    "result artifact persistence timed out",
+                    "result artifact persistence was cancelled",
+                );
+            }
+            Err(ArtifactPersistenceWaitError::ExecutionDeadlineReached) => {
+                tracing::warn!(
+                    user_id = %identity.user_id,
+                    session_id = %identity.session_id,
+                    invocation_id = %identity.invocation_id,
+                    "governed tool result artifact persistence reached the admitted execution deadline"
+                );
+                return durable_result_persistence_failure(
+                    identity,
+                    &result,
+                    "result artifact persistence reached the admitted execution deadline",
                 );
             }
         };
@@ -5252,6 +5309,7 @@ mod tests {
     struct RecordingResultArtifactStore {
         seen: StdMutex<Option<astra_services::SessionArtifactJsonRecord>>,
         fail_persist: bool,
+        persist_barrier: StdMutex<Option<ProjectionWriteBarrier>>,
         projection_barrier: StdMutex<Option<ProjectionWriteBarrier>>,
     }
 
@@ -5283,6 +5341,10 @@ mod tests {
         fn block_next_workspace_projection(&self, barrier: ProjectionWriteBarrier) {
             *self.projection_barrier.lock().unwrap() = Some(barrier);
         }
+
+        fn block_next_persist(&self, barrier: ProjectionWriteBarrier) {
+            *self.persist_barrier.lock().unwrap() = Some(barrier);
+        }
     }
 
     #[async_trait]
@@ -5293,6 +5355,11 @@ mod tests {
         ) -> Result<astra_services::StoredSessionArtifact, astra_services::SessionArtifactStoreError>
         {
             tokio::task::yield_now().await;
+            let barrier = self.persist_barrier.lock().unwrap().take();
+            if let Some(barrier) = &barrier {
+                barrier.entered.notify_one();
+                barrier.release.notified().await;
+            }
             if self.fail_persist {
                 return Err(
                     astra_services::SessionArtifactStoreError::InvalidArtifactId(
@@ -5713,11 +5780,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn governed_result_artifact_persistence_stops_when_run_is_cancelled() {
+        let (exec, _dir) = test_executor();
+        let store = Arc::new(RecordingResultArtifactStore::default());
+        let barrier = ProjectionWriteBarrier {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            completed: Arc::new(tokio::sync::Notify::new()),
+        };
+        store.block_next_persist(barrier.clone());
+        let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+        let exec = exec
+            .with_test_session_artifact_store(store.clone())
+            .with_cancel_token(Some(cancel_token.clone()));
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "user",
+            "session",
+            "run",
+            "turn",
+            "call-cancelled-artifact",
+        )
+        .unwrap();
+        let governed = govern_runtime_tool_result(
+            astra_tools::ToolResult::text(
+                "x".repeat(astra_turn_types::TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES + 1),
+            ),
+            false,
+        )
+        .into_inner();
+        let task = tokio::spawn(async move {
+            exec.attach_governed_result_artifact_if_needed(&identity, governed)
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), barrier.entered.notified())
+            .await
+            .expect("artifact persistence should start");
+        cancel_token.cancel();
+        let attached = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("run cancellation should stop artifact persistence")
+            .expect("artifact task should not panic");
+
+        assert!(attached.is_error);
+        assert_eq!(
+            attached.metadata.as_ref().unwrap()["error_kind"],
+            "durable_result_persistence"
+        );
+        assert!(store.seen.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn governed_result_artifact_persistence_obeys_admitted_execution_deadline() {
+        let (exec, _dir) = test_executor();
+        let store = Arc::new(RecordingResultArtifactStore::default());
+        let deadline = astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+            astra_services::runs::ExecutionTimeBudget {
+                remaining_seconds: 0,
+            },
+            0,
+        )
+        .unwrap();
+        let exec = exec
+            .with_test_session_artifact_store(store.clone())
+            .with_admitted_execution_deadline(Some(deadline));
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "user",
+            "session",
+            "run",
+            "turn",
+            "call-expired-artifact",
+        )
+        .unwrap();
+        let governed = govern_runtime_tool_result(
+            astra_tools::ToolResult::text(
+                "x".repeat(astra_turn_types::TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES + 1),
+            ),
+            false,
+        )
+        .into_inner();
+
+        let attached = exec
+            .attach_governed_result_artifact_if_needed(&identity, governed)
+            .await;
+
+        assert!(attached.is_error);
+        assert_eq!(
+            attached.metadata.as_ref().unwrap()["error_kind"],
+            "durable_result_persistence"
+        );
+        assert!(store.seen.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn artifact_failure_is_a_non_retryable_durability_failure_not_truncated_success() {
         let (exec, _dir) = test_executor();
         let store = Arc::new(RecordingResultArtifactStore {
             seen: StdMutex::new(None),
             fail_persist: true,
+            persist_barrier: StdMutex::new(None),
             projection_barrier: StdMutex::new(None),
         });
         let exec = exec.with_test_session_artifact_store(store.clone());

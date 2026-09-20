@@ -9734,21 +9734,50 @@ pub enum DatabaseRunStateStoreError {
 
 type DbStoreResult<T> = Result<T, DatabaseRunStateStoreError>;
 
-const RUN_CONTROL_DB_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+// Foreground control mutations are part of the user-visible stop/settlement
+// contract. They may contain several ordered statements and a commit
+// reconciliation, so a five-second whole-operation budget is not viable on a
+// loaded MatrixOne deployment even when each individual statement is healthy.
+const FOREGROUND_RUN_CONTROL_DB_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+// Orphan recovery is a retrying background worker. Keep each attempt short so
+// one contended run cannot starve the rest of the recovery scan.
+const BACKGROUND_RECOVERY_DB_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const RUN_CONTROL_LOCK_WAIT_TIMEOUT_SECS: i64 = 3;
+
+#[derive(Clone, Copy)]
+struct RunControlDeadline {
+    at: tokio::time::Instant,
+    budget: Duration,
+}
+
+impl RunControlDeadline {
+    fn after(budget: Duration) -> Self {
+        Self {
+            at: tokio::time::Instant::now() + budget,
+            budget,
+        }
+    }
+
+    fn timeout(self, operation: &'static str, entity: &str) -> String {
+        format!(
+            "{operation} timed out after {} seconds for {entity}",
+            self.budget.as_secs()
+        )
+    }
+}
 
 async fn acquire_cancellation_safe_connection(
     pool: &SharedPool,
-    deadline: tokio::time::Instant,
+    deadline: RunControlDeadline,
     operation: &'static str,
     entity: &str,
 ) -> Result<CancellationSafePoolConnection, String> {
     tokio::time::timeout_at(
-        deadline,
+        deadline.at,
         CancellationSafePoolConnection::acquire(pool.get()),
     )
     .await
-    .map_err(|_| bounded_run_control_timeout(operation, entity))?
+    .map_err(|_| deadline.timeout(operation, entity))?
     .map_err(|source| db_error(operation, entity, source).to_string())
 }
 
@@ -9760,14 +9789,14 @@ struct BoundedRunControlConnection {
 impl BoundedRunControlConnection {
     async fn acquire(
         pool: &SharedPool,
-        deadline: tokio::time::Instant,
+        deadline: RunControlDeadline,
         operation: &'static str,
         entity: &str,
     ) -> Result<Self, String> {
         let mut connection =
             acquire_cancellation_safe_connection(pool, deadline, operation, entity).await?;
         let original_lock_wait_timeout = match tokio::time::timeout_at(
-            deadline,
+            deadline.at,
             sqlx::query_scalar::<_, String>("SELECT @@session.lock_wait_timeout")
                 .fetch_one(connection.connection_mut()),
         )
@@ -9778,7 +9807,7 @@ impl BoundedRunControlConnection {
                 connection.release();
                 return Err(db_error(operation, entity, source).to_string());
             }
-            Err(_) => return Err(bounded_run_control_timeout(operation, entity)),
+            Err(_) => return Err(deadline.timeout(operation, entity)),
         };
         let original_lock_wait_timeout = match original_lock_wait_timeout.parse::<i64>() {
             Ok(value) if value >= 0 => value,
@@ -9798,7 +9827,7 @@ impl BoundedRunControlConnection {
         let bounded_lock_wait =
             format!("SET SESSION lock_wait_timeout = {RUN_CONTROL_LOCK_WAIT_TIMEOUT_SECS}");
         match tokio::time::timeout_at(
-            deadline,
+            deadline.at,
             connection
                 .connection_mut()
                 .execute(bounded_lock_wait.as_str()),
@@ -9813,7 +9842,7 @@ impl BoundedRunControlConnection {
                 connection.release();
                 Err(db_error(operation, entity, source).to_string())
             }
-            Err(_) => Err(bounded_run_control_timeout(operation, entity)),
+            Err(_) => Err(deadline.timeout(operation, entity)),
         }
     }
 
@@ -9826,7 +9855,7 @@ impl BoundedRunControlConnection {
     /// connection is discarded.
     async fn restore_and_release(
         mut self,
-        deadline: tokio::time::Instant,
+        deadline: RunControlDeadline,
         operation: &'static str,
         entity: &str,
     ) -> Result<(), String> {
@@ -9835,7 +9864,7 @@ impl BoundedRunControlConnection {
             self.original_lock_wait_timeout
         );
         match tokio::time::timeout_at(
-            deadline,
+            deadline.at,
             self.connection.connection_mut().execute(reset.as_str()),
         )
         .await
@@ -9845,16 +9874,9 @@ impl BoundedRunControlConnection {
                 Ok(())
             }
             Ok(Err(source)) => Err(db_error(operation, entity, source).to_string()),
-            Err(_) => Err(bounded_run_control_timeout(operation, entity)),
+            Err(_) => Err(deadline.timeout(operation, entity)),
         }
     }
-}
-
-fn bounded_run_control_timeout(operation: &'static str, entity: &str) -> String {
-    format!(
-        "{operation} timed out after {} seconds for {entity}",
-        RUN_CONTROL_DB_ATTEMPT_TIMEOUT.as_secs()
-    )
 }
 
 enum StagedExecutionOwnerCancellation {
@@ -13394,7 +13416,7 @@ impl DatabaseRunStateStore {
     /// generation-scoped terminal receipt at the authoritative event tail.
     async fn orphan_cancellation_commit_is_durable(
         &self,
-        deadline: tokio::time::Instant,
+        deadline: RunControlDeadline,
         request: AtomicOrphanRunCancellationRequest<'_>,
         terminal_event: &serde_json::Value,
     ) -> Result<bool, String> {
@@ -13410,7 +13432,7 @@ impl DatabaseRunStateStore {
         )
         .await?;
         let row = match tokio::time::timeout_at(
-            deadline,
+            deadline.at,
             sqlx::query(
                 "SELECT events.payload_json, events.event_hash, events.event_idx, runs.last_event_idx
                  FROM agent_runs runs
@@ -13447,7 +13469,7 @@ impl DatabaseRunStateStore {
                 );
             }
             Err(_) => {
-                return Err(bounded_run_control_timeout(
+                return Err(deadline.timeout(
                     "reconcile_orphan_cancellation_commit",
                     request.run_id,
                 ));
@@ -13602,7 +13624,7 @@ impl DatabaseRunStateStore {
 
     async fn cancellation_marker_receipt_is_durable(
         &self,
-        deadline: tokio::time::Instant,
+        deadline: RunControlDeadline,
         user_id: &str,
         run_id: &str,
     ) -> Result<bool, String> {
@@ -13614,7 +13636,7 @@ impl DatabaseRunStateStore {
         )
         .await?;
         let marker = match tokio::time::timeout_at(
-            deadline,
+            deadline.at,
             sqlx::query_scalar::<_, i64>(
                 "SELECT CAST(cancellation_requested_at IS NOT NULL AS SIGNED)
                  FROM agent_runs FORCE INDEX (PRIMARY)
@@ -13635,10 +13657,7 @@ impl DatabaseRunStateStore {
                 );
             }
             Err(_) => {
-                return Err(bounded_run_control_timeout(
-                    "request_run_cancellation_reconcile_receipt",
-                    run_id,
-                ));
+                return Err(deadline.timeout("request_run_cancellation_reconcile_receipt", run_id));
             }
         };
         connection.release();
@@ -13904,7 +13923,7 @@ impl DatabaseRunStateStore {
 
     async fn execution_owner_cancellation_receipt_is_durable(
         &self,
-        deadline: tokio::time::Instant,
+        deadline: RunControlDeadline,
         request: AtomicExecutionOwnerCancellationRequest<'_>,
         terminal_event: &serde_json::Value,
     ) -> Result<bool, String> {
@@ -13920,7 +13939,7 @@ impl DatabaseRunStateStore {
             request.expected_owner_generation,
         );
         let row = match tokio::time::timeout_at(
-            deadline,
+            deadline.at,
             sqlx::query(EXECUTION_OWNER_CANCELLATION_RECEIPT_SELECT_SQL)
                 .bind(request.user_id)
                 .bind(request.expected_session_id)
@@ -13942,7 +13961,7 @@ impl DatabaseRunStateStore {
                 .to_string());
             }
             Err(_) => {
-                return Err(bounded_run_control_timeout(
+                return Err(deadline.timeout(
                     "execution_owner_cancellation_reconcile_receipt",
                     request.run_id,
                 ));
@@ -14041,7 +14060,7 @@ impl RunStateStore for DatabaseRunStateStore {
     }
 
     async fn request_run_cancellation(&self, user_id: &str, run_id: &str) -> Result<bool, String> {
-        let deadline = tokio::time::Instant::now() + RUN_CONTROL_DB_ATTEMPT_TIMEOUT;
+        let deadline = RunControlDeadline::after(FOREGROUND_RUN_CONTROL_DB_ATTEMPT_TIMEOUT);
         let mut connection = BoundedRunControlConnection::acquire(
             &self.pool,
             deadline,
@@ -14050,17 +14069,14 @@ impl RunStateStore for DatabaseRunStateStore {
         )
         .await?;
         let attempt = match tokio::time::timeout_at(
-            deadline,
+            deadline.at,
             self.request_run_cancellation_transaction(connection.connection_mut(), user_id, run_id),
         )
         .await
         {
             Ok(attempt) => attempt,
             Err(_) => {
-                return Err(bounded_run_control_timeout(
-                    "request_run_cancellation",
-                    run_id,
-                ));
+                return Err(deadline.timeout("request_run_cancellation", run_id));
             }
         };
         match attempt {
@@ -14103,7 +14119,7 @@ impl RunStateStore for DatabaseRunStateStore {
         &self,
         request: AtomicOrphanRunCancellationRequest<'_>,
     ) -> Result<bool, String> {
-        let deadline = tokio::time::Instant::now() + RUN_CONTROL_DB_ATTEMPT_TIMEOUT;
+        let deadline = RunControlDeadline::after(BACKGROUND_RECOVERY_DB_ATTEMPT_TIMEOUT);
         let mut connection = BoundedRunControlConnection::acquire(
             &self.pool,
             deadline,
@@ -14112,7 +14128,7 @@ impl RunStateStore for DatabaseRunStateStore {
         )
         .await?;
 
-        let outcome = tokio::time::timeout_at(deadline, async {
+        let outcome = tokio::time::timeout_at(deadline.at, async {
             let mut tx = connection.connection_mut().begin().await.map_err(|source| {
                 db_error(
                     "terminalize_orphaned_run_cancellation_begin",
@@ -14373,10 +14389,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 drop(connection);
                 (
                     true,
-                    Some(bounded_run_control_timeout(
-                        "terminalize_orphaned_run_cancellation",
-                        request.run_id,
-                    )),
+                    Some(deadline.timeout("terminalize_orphaned_run_cancellation", request.run_id)),
                 )
             }
         };
@@ -17802,7 +17815,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     request.expected_owner_generation, request.run_id
                 )
             })?;
-        let deadline = tokio::time::Instant::now() + RUN_CONTROL_DB_ATTEMPT_TIMEOUT;
+        let deadline = RunControlDeadline::after(FOREGROUND_RUN_CONTROL_DB_ATTEMPT_TIMEOUT);
         let mut connection = BoundedRunControlConnection::acquire(
             &self.pool,
             deadline,
@@ -17811,7 +17824,7 @@ impl RunStateStore for DatabaseRunStateStore {
         )
         .await?;
         let attempt = match tokio::time::timeout_at(
-            deadline,
+            deadline.at,
             self.cancel_if_exact_live_owner_transaction(
                 connection.connection_mut(),
                 request,
@@ -17822,10 +17835,7 @@ impl RunStateStore for DatabaseRunStateStore {
         {
             Ok(attempt) => attempt,
             Err(_) => {
-                return Err(bounded_run_control_timeout(
-                    "execution_owner_cancellation",
-                    request.run_id,
-                ));
+                return Err(deadline.timeout("execution_owner_cancellation", request.run_id));
             }
         };
         match attempt {
@@ -21090,34 +21100,38 @@ impl RunStateStore for DatabaseRunStateStore {
                     request.expected_owner_generation, request.run_id
                 )
             })?;
-        let deadline = tokio::time::Instant::now() + RUN_CONTROL_DB_ATTEMPT_TIMEOUT;
-        let mut connection = acquire_cancellation_safe_connection(
-            &self.pool,
-            deadline,
-            "authorize_execution_boundary_prepare",
-            request.run_id,
-        )
-        .await?;
-        let update = tokio::time::timeout_at(
-            deadline,
-            sqlx::query(
-                "UPDATE agent_runs
+        // The runtime heartbeat owns the exact lease-safety deadline for this
+        // provider boundary. Do not add a shorter storage-local timeout: the
+        // caller drops this future at that deadline, and this guard then closes
+        // the in-flight physical connection instead of returning an
+        // unsynchronized MySQL protocol stream to the shared pool.
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error(
+                    "authorize_execution_boundary_prepare",
+                    request.run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+        let update = sqlx::query(
+            "UPDATE agent_runs
              SET owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND)
              WHERE user_id = ? AND session_id = ? AND run_id = ? AND owner_pod_id = ?
                AND run_generation = ? AND status IN (?, ?)
                AND owner_lease_expires_at >= NOW(6)
                AND cancellation_requested_at IS NULL",
-            )
-            .bind(self.lease_ttl_micros())
-            .bind(request.user_id)
-            .bind(request.expected_session_id)
-            .bind(request.run_id)
-            .bind(&self.owner_pod_id)
-            .bind(expected_generation)
-            .bind(STATUS_RUNNING)
-            .bind(STATUS_WAITING)
-            .execute(connection.connection_mut()),
         )
+        .bind(self.lease_ttl_micros())
+        .bind(request.user_id)
+        .bind(request.expected_session_id)
+        .bind(request.run_id)
+        .bind(&self.owner_pod_id)
+        .bind(expected_generation)
+        .bind(STATUS_RUNNING)
+        .bind(STATUS_WAITING)
+        .execute(connection.connection_mut())
         .await;
         let acknowledgement_unknown = {
             #[cfg(test)]
@@ -21131,26 +21145,23 @@ impl RunStateStore for DatabaseRunStateStore {
             }
         };
         match update {
-            Err(_) => {
-                return Err(bounded_run_control_timeout(
-                    "authorize_execution_boundary",
-                    request.run_id,
-                ));
-            }
-            Ok(Ok(result)) if result.rows_affected() == 1 && !acknowledgement_unknown => {
+            Ok(result) if result.rows_affected() == 1 && !acknowledgement_unknown => {
                 connection.release();
                 return Ok(RunExecutionBoundaryAuthorization::Authorized);
             }
-            Ok(Ok(_)) => {}
-            Ok(Err(update_error)) => {
+            Ok(_) => {}
+            Err(update_error) => {
                 drop(connection);
-                let mut reread = acquire_cancellation_safe_connection(
-                    &self.pool,
-                    deadline,
-                    "authorize_execution_boundary_reconcile_prepare",
-                    request.run_id,
-                )
-                .await?;
+                let mut reread = CancellationSafePoolConnection::acquire(self.pool.get())
+                    .await
+                    .map_err(|source| {
+                        db_error(
+                            "authorize_execution_boundary_reconcile_prepare",
+                            request.run_id,
+                            source,
+                        )
+                        .to_string()
+                    })?;
                 let authority = load_exact_live_run_execution_authority(
                     &mut *reread.connection_mut(),
                     request.user_id,
@@ -21196,7 +21207,7 @@ impl RunStateStore for DatabaseRunStateStore {
         run_id: &str,
         expected_owner_generation: u64,
     ) -> Result<bool, String> {
-        let deadline = tokio::time::Instant::now() + RUN_CONTROL_DB_ATTEMPT_TIMEOUT;
+        let deadline = RunControlDeadline::after(BACKGROUND_RECOVERY_DB_ATTEMPT_TIMEOUT);
         let mut connection = acquire_cancellation_safe_connection(
             &self.pool,
             deadline,
@@ -21204,7 +21215,7 @@ impl RunStateStore for DatabaseRunStateStore {
             run_id,
         )
         .await?;
-        let result = tokio::time::timeout_at(deadline, sqlx::query(
+        let result = tokio::time::timeout_at(deadline.at, sqlx::query(
             "UPDATE agent_runs
              SET owner_pod_id = NULL, owner_lease_expires_at = NULL
              WHERE user_id = ? AND session_id = ? AND run_id = ? AND owner_pod_id = ? AND run_generation = ?",
@@ -21216,7 +21227,7 @@ impl RunStateStore for DatabaseRunStateStore {
         .bind(expected_owner_generation as i64)
         .execute(connection.connection_mut()))
         .await
-        .map_err(|_| bounded_run_control_timeout("release_owner_lease", run_id))?
+        .map_err(|_| deadline.timeout("release_owner_lease", run_id))?
         .map_err(|source| db_error("release_owner_lease", run_id, source).to_string())?;
         let released = result.rows_affected() > 0;
         connection.release();
@@ -25930,7 +25941,8 @@ mod tests {
                 .await
         });
 
-        tokio::time::sleep(RUN_CONTROL_DB_ATTEMPT_TIMEOUT + Duration::from_millis(250)).await;
+        tokio::time::sleep(BACKGROUND_RECOVERY_DB_ATTEMPT_TIMEOUT + Duration::from_millis(250))
+            .await;
         assert!(
             !renewal.is_finished(),
             "the generic run-control timeout must not preempt the caller's lease fence"
@@ -26164,7 +26176,7 @@ mod tests {
         );
         assert!(
             blocked_elapsed >= Duration::from_secs(2)
-                && blocked_elapsed < RUN_CONTROL_DB_ATTEMPT_TIMEOUT,
+                && blocked_elapsed < FOREGROUND_RUN_CONTROL_DB_ATTEMPT_TIMEOUT,
             "server lock wait must be bounded inside the absolute deadline: {blocked_elapsed:?}"
         );
 
