@@ -563,6 +563,57 @@ fn edge_memory_selection_reports(
         .unwrap_or_default()
 }
 
+/// Attach a consumer-side receipt only after the final system prompt has been
+/// serialized. The edge report records what the selector recommended; this
+/// receipt records whether that exact selected lesson payload reached the
+/// model-visible request. Dismissal decisions describe removal and therefore
+/// do not claim prompt inclusion.
+fn memory_selection_reports_with_projection(
+    edge_profile: &Map<String, Value>,
+    session_id: &str,
+    turn: u32,
+    final_system_blocks: &[astra_turn_core::context_serializer::SerializedSystemBlock],
+) -> Vec<astra_turn_types::MemorySelectionReport> {
+    let mut reports = edge_memory_selection_reports(edge_profile, session_id, turn);
+    // Projection is runtime-owned evidence. Never trust a caller-supplied
+    // value, including on an earlier report when a turn carries both a
+    // relevance and reuse decision.
+    for report in &mut reports {
+        report.prompt_projection = None;
+    }
+    let lessons_text = edge_profile
+        .get("lessons_text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty());
+    let Some(report) = reports.iter_mut().rev().find(|report| {
+        matches!(
+            report.operation,
+            astra_turn_types::MemorySelectionOperation::Relevance
+                | astra_turn_types::MemorySelectionOperation::Reuse
+        )
+    }) else {
+        return reports;
+    };
+    let selected_candidates = report.selected_indices().len() as u32;
+    let included_candidates = if selected_candidates == 0 {
+        Some(0)
+    } else if lessons_text.is_some_and(|text| {
+        final_system_blocks.iter().any(|block| {
+            block.kind == astra_turn_core::section_types::SectionKind::RuntimeIdentity
+                && block.text.contains(text)
+        })
+    }) {
+        Some(selected_candidates)
+    } else {
+        None
+    };
+    report.prompt_projection = Some(astra_turn_types::MemoryPromptProjection {
+        selected_candidates,
+        included_candidates,
+    });
+    reports
+}
+
 /// A compaction rerun is the authoritative final assembly even if it cannot
 /// produce metrics. `None` for the outer option means there was no rerun.
 pub(crate) fn final_explain_analyze_context_assembly(
@@ -1589,18 +1640,19 @@ pub(crate) fn assemble_context_pipeline(
         }
     }
 
-    let mut explain_analyze_context_assembly =
-        explain_analyze_context_assembly_metrics(&pipeline_output.serialized.system_blocks);
-    if let Some(assembly) = &mut explain_analyze_context_assembly {
-        assembly.edge_memory_selection = edge_memory_selection_reports(
-            input.runtime_signals.edge_profile,
-            input.session_id,
-            state.session_turn,
-        );
-    }
     let plain = astra_turn_core::context_serializer::flatten_serialized_system_blocks(
         &pipeline_output.serialized,
     );
+    let mut explain_analyze_context_assembly =
+        explain_analyze_context_assembly_metrics(&pipeline_output.serialized.system_blocks);
+    if let Some(assembly) = &mut explain_analyze_context_assembly {
+        assembly.edge_memory_selection = memory_selection_reports_with_projection(
+            input.runtime_signals.edge_profile,
+            input.session_id,
+            state.session_turn,
+            &pipeline_output.serialized.system_blocks,
+        );
+    }
     let system_prompt_override = input
         .runtime_signals
         .edge_profile
@@ -2758,6 +2810,65 @@ mod context_cache_contract_tests {
     }
 
     #[test]
+    fn memory_selection_projection_distinguishes_selection_from_final_inclusion() {
+        let mut edge_profile = serde_json::Map::new();
+        edge_profile.insert(
+            "memory_selection_reports".into(),
+            json!([{
+                "session_id": "session-1", "turn": 2,
+                "operation": "relevance", "method": "model", "reason": "completed",
+                "model": "jev-test", "elapsed_ms": 12,
+                "selection_order": [0], "candidates": [
+                    {"index": 0, "selected": true, "probability_bps": 9000},
+                    {"index": 1, "selected": false, "probability_bps": 1000}
+                ]
+            }]),
+        );
+        edge_profile.insert(
+            "lessons_text".into(),
+            Value::String("prompt_shape:rust:run cargo test".into()),
+        );
+
+        let included = memory_selection_reports_with_projection(
+            &edge_profile,
+            "session-1",
+            2,
+            &[astra_turn_core::context_serializer::SerializedSystemBlock {
+                kind: astra_turn_core::section_types::SectionKind::RuntimeIdentity,
+                scope: astra_turn_core::section_types::CacheScope::Session,
+                text: "## Session Lessons\nprompt_shape:rust:run cargo test".into(),
+                cache_control: None,
+            }],
+        );
+        assert_eq!(
+            included[0].prompt_projection,
+            Some(astra_turn_types::MemoryPromptProjection {
+                selected_candidates: 1,
+                included_candidates: Some(1),
+            })
+        );
+
+        let omitted = memory_selection_reports_with_projection(
+            &edge_profile,
+            "session-1",
+            2,
+            &[astra_turn_core::context_serializer::SerializedSystemBlock {
+                kind: astra_turn_core::section_types::SectionKind::WorkingMemory,
+                scope: astra_turn_core::section_types::CacheScope::Session,
+                text: "prompt_shape:rust:run cargo test".into(),
+                cache_control: None,
+            }],
+        );
+        assert_eq!(
+            omitted[0].prompt_projection,
+            Some(astra_turn_types::MemoryPromptProjection {
+                selected_candidates: 1,
+                included_candidates: None,
+            })
+        );
+    }
+
+    #[test]
     fn assemble_context_pipeline_keeps_required_runtime_system_context_for_strict_history() {
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.session_turn = 1;
@@ -2776,6 +2887,10 @@ mod context_cache_contract_tests {
                 "model": "jev-test", "elapsed_ms": 12,
                 "selection_order": [0], "candidates": [{"index": 0, "selected": true, "probability_bps": 9000}]
             }]),
+        );
+        edge_profile.insert(
+            "lessons_text".into(),
+            Value::String("prompt_shape:rust:run cargo test".into()),
         );
         assert!(edge_memory_selection_reports(&edge_profile, "other-session", 1).is_empty());
         assert!(edge_memory_selection_reports(&edge_profile, "sid-deepseek", 2).is_empty());
@@ -2827,6 +2942,13 @@ mod context_cache_contract_tests {
             .edge_memory_selection;
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].selected_indices(), vec![0]);
+        assert_eq!(
+            decisions[0].prompt_projection,
+            Some(astra_turn_types::MemoryPromptProjection {
+                selected_candidates: 1,
+                included_candidates: Some(1),
+            })
+        );
         assert_eq!(decisions[0].candidates[0].probability_bps, Some(9000));
         assert!(
             !serde_json::to_string(&output.system_messages)
@@ -2845,6 +2967,10 @@ mod context_cache_contract_tests {
             "runtime model identity must stay out of the strict-history prefix: {primary_text}"
         );
         assert!(!primary_text.contains("via openai"));
+        assert!(
+            primary_text.contains("prompt_shape:rust:run cargo test"),
+            "selected session lesson should enter the strict-history stable request: {primary_text}"
+        );
         assert!(
             !primary_text.contains("must be suppressed"),
             "ordinary volatile content must stay out of strict-history stable prompt: {primary_text}"

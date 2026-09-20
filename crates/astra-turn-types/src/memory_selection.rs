@@ -30,6 +30,8 @@ mod tests {
                 selected: true,
                 probability_bps: Some(9000),
             }],
+            candidate_coverage: None,
+            prompt_projection: None,
         };
         assert!(report.is_valid());
         let mut invalid = report.clone();
@@ -50,6 +52,33 @@ mod tests {
         invalid = report.clone();
         invalid.turn = 0;
         assert!(!invalid.is_valid());
+        invalid = report.clone();
+        invalid.prompt_projection = Some(MemoryPromptProjection {
+            selected_candidates: 1,
+            included_candidates: Some(2),
+        });
+        assert!(!invalid.is_valid());
+        invalid = report.clone();
+        invalid.candidate_coverage = Some(MemoryCandidateCoverage {
+            source_items: 8,
+            evaluated_candidates: 2,
+            truncated: true,
+        });
+        assert!(!invalid.is_valid());
+        let mut projected = report.clone();
+        projected.prompt_projection = Some(MemoryPromptProjection {
+            selected_candidates: 1,
+            included_candidates: Some(1),
+        });
+        assert!(projected.is_valid());
+        assert!(projected.summary().contains("1/1 entered request"));
+        projected.candidate_coverage = Some(MemoryCandidateCoverage {
+            source_items: 8,
+            evaluated_candidates: 1,
+            truncated: true,
+        });
+        assert!(projected.is_valid());
+        assert!(projected.summary().contains("bounded 8 source items"));
         let mut value = serde_json::to_value(report).unwrap();
         value["raw_response"] = serde_json::json!("private");
         assert!(serde_json::from_value::<MemorySelectionReport>(value).is_err());
@@ -87,6 +116,28 @@ pub struct MemoryCandidateDecision {
     pub probability_bps: Option<u16>,
 }
 
+/// Evidence produced by the final context serializer, after selection and
+/// context optimization. It is deliberately separate from the selector's
+/// recommendation: a selected candidate is not proof that the model saw it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryPromptProjection {
+    pub selected_candidates: u32,
+    /// `None` means the final serializer could not prove inclusion or
+    /// exclusion (for example, only a spill reference was visible).
+    #[serde(deserialize_with = "crate::deserialize_required_option")]
+    pub included_candidates: Option<u32>,
+}
+
+/// Coverage of the bounded retrieval-to-judgment candidate projection.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryCandidateCoverage {
+    pub source_items: u32,
+    pub evaluated_candidates: u32,
+    pub truncated: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MemorySelectionReport {
@@ -101,6 +152,14 @@ pub struct MemorySelectionReport {
     pub selection_order: Vec<u32>,
     /// Measured at the selection owner; not part of the server clock domain.
     pub elapsed_ms: u64,
+    /// Present when the retrieval owner can report how a provider response was
+    /// bounded before any rule/model judgment saw it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_coverage: Option<MemoryCandidateCoverage>,
+    /// Present only when the final serialized request could verify whether
+    /// the selected lesson payload entered the model-visible context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_projection: Option<MemoryPromptProjection>,
 }
 
 impl MemorySelectionReport {
@@ -120,6 +179,17 @@ impl MemorySelectionReport {
             })
             && self.semantics_valid()
             && self.elapsed_ms <= crate::EXPLAIN_ANALYZE_MAX_SAFE_INTEGER
+            && self.candidate_coverage.as_ref().is_none_or(|coverage| {
+                coverage.evaluated_candidates as usize == self.candidates.len()
+                    && coverage.source_items >= coverage.evaluated_candidates
+            })
+            && self.prompt_projection.as_ref().is_none_or(|projection| {
+                self.operation != MemorySelectionOperation::Dismissal
+                    && projection.selected_candidates as usize == self.selected_indices().len()
+                    && projection
+                        .included_candidates
+                        .is_none_or(|included| included <= projection.selected_candidates)
+            })
             && self.model.as_ref().is_none_or(|m| {
                 !m.trim().is_empty() && m.len() <= 160 && !m.chars().any(char::is_control)
             })
@@ -193,8 +263,35 @@ impl MemorySelectionReport {
             MemorySelectionMethod::None => "not run",
             MemorySelectionMethod::Reuse => "session cache",
         };
+        let projection = self
+            .prompt_projection
+            .as_ref()
+            .map(|projection| {
+                if projection.selected_candidates == 0 {
+                    " · no memory entered request".to_string()
+                } else if let Some(included) = projection.included_candidates {
+                    format!(
+                        " · {included}/{} entered request",
+                        projection.selected_candidates
+                    )
+                } else {
+                    " · request inclusion unknown".to_string()
+                }
+            })
+            .unwrap_or_default();
+        let coverage = self
+            .candidate_coverage
+            .as_ref()
+            .filter(|coverage| coverage.truncated)
+            .map(|coverage| {
+                format!(
+                    " · bounded {} source items to {} candidates",
+                    coverage.source_items, coverage.evaluated_candidates
+                )
+            })
+            .unwrap_or_default();
         format!(
-            "Memory selection · {method} · {} candidates → {} {action} · {}ms · {}",
+            "Memory selection · {method} · {} candidates → {} {action}{coverage}{projection} · {}ms · {}",
             self.candidates.len(),
             self.selected_indices().len(),
             self.elapsed_ms,
@@ -203,8 +300,13 @@ impl MemorySelectionReport {
     }
 
     pub fn detail_lines(&self) -> Vec<String> {
+        let projection = if self.prompt_projection.is_some() {
+            "final request projection measured"
+        } else {
+            "final request projection unavailable"
+        };
         let mut lines = vec![format!(
-            "Reported by CLI/Edge · turn {} · same decision across request rounds · final prompt injection not measured",
+            "Reported by CLI/Edge · turn {} · same decision across request rounds · {projection}",
             self.turn
         )];
         for candidate in &self.candidates {
@@ -230,19 +332,25 @@ impl MemorySelectionReport {
         match self.reason {
             MemorySelectionReason::Completed => "completed",
             MemorySelectionReason::NoCandidates => "no candidates",
-            MemorySelectionReason::NoSelector => "no selector available",
+            MemorySelectionReason::NoSelector => {
+                if self.operation == MemorySelectionOperation::Dismissal {
+                    "no selector available; memories kept"
+                } else {
+                    "no selector available; ranked locally, candidates kept"
+                }
+            }
             MemorySelectionReason::CallUnavailable => {
                 if self.operation == MemorySelectionOperation::Dismissal {
                     "selector unavailable; memories kept"
                 } else {
-                    "selector unavailable; local fallback"
+                    "selector unavailable; ranked locally, candidates kept"
                 }
             }
             MemorySelectionReason::InvalidResponse => {
                 if self.operation == MemorySelectionOperation::Dismissal {
                     "invalid selector response; memories kept"
                 } else {
-                    "invalid selector response; local fallback"
+                    "invalid selector response; ranked locally, candidates kept"
                 }
             }
             MemorySelectionReason::RetrievalUnavailable => "retrieval failed",

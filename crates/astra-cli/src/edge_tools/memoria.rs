@@ -728,10 +728,50 @@ mod build_direct_request_tests {
 /// `context_query` should be derived from the user's first message — this
 /// produces much better semantic retrieval than keyword stuffing.
 /// Preserve retrieval failures so Explain does not mistake them for no matches.
+pub const MAX_RETRIEVED_LESSONS: usize = 32;
+const MAX_RETRIEVAL_SCAN_MULTIPLIER: usize = 4;
+
+#[derive(Debug, Clone)]
+pub struct RetrievedLessonBatch {
+    pub lessons: Vec<astra_services::LessonHint>,
+    pub source_items: u32,
+    pub truncated: bool,
+}
+
+fn project_retrieved_lessons(memories: &[serde_json::Value], top_k: u64) -> RetrievedLessonBatch {
+    let limit = usize::try_from(top_k)
+        .unwrap_or(MAX_RETRIEVED_LESSONS)
+        .min(MAX_RETRIEVED_LESSONS);
+    let scan_limit = limit
+        .saturating_mul(MAX_RETRIEVAL_SCAN_MULTIPLIER)
+        .min(MAX_RETRIEVED_LESSONS.saturating_mul(MAX_RETRIEVAL_SCAN_MULTIPLIER));
+    let mut lessons = memories
+        .iter()
+        .take(scan_limit)
+        .filter_map(astra_services::memory_value_to_lesson_hint)
+        .take(limit.saturating_add(1))
+        .collect::<Vec<_>>();
+    let oversized_content = memories.iter().take(scan_limit).any(|memory| {
+        memory
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|content| {
+                content.chars().count() > astra_services::MAX_LESSON_ACTION_CHARS
+            })
+    });
+    let truncated = memories.len() > scan_limit || lessons.len() > limit || oversized_content;
+    lessons.truncate(limit);
+    RetrievedLessonBatch {
+        lessons,
+        source_items: u32::try_from(memories.len()).unwrap_or(u32::MAX),
+        truncated,
+    }
+}
+
 pub async fn memoria_retrieve_lessons(
     top_k: u64,
     context_query: Option<&str>,
-) -> Result<Vec<astra_services::LessonHint>, &'static str> {
+) -> Result<RetrievedLessonBatch, &'static str> {
     let query = context_query.unwrap_or("reusable lessons and corrections from prior sessions");
     let payload = json!({
         "query": query,
@@ -757,10 +797,7 @@ pub async fn memoria_retrieve_lessons(
     } else {
         return Err("invalid memory retrieval response");
     };
-    Ok(memories
-        .iter()
-        .filter_map(astra_services::memory_value_to_lesson_hint)
-        .collect())
+    Ok(project_retrieved_lessons(memories, top_k))
 }
 
 /// Store extracted lessons in Memoria as L3 durable memory.
@@ -810,7 +847,7 @@ pub async fn memoria_store_lessons_fire_and_forget(
 
 #[cfg(test)]
 mod tests {
-    use super::memoria_store_lessons_fire_and_forget;
+    use super::{memoria_store_lessons_fire_and_forget, project_retrieved_lessons};
     use serial_test::serial;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -836,6 +873,30 @@ mod tests {
                 unsafe { std::env::remove_var(self.key) };
             }
         }
+    }
+
+    #[test]
+    fn retrieved_lessons_enforce_provider_count_before_optional_judgment() {
+        let memories = (0..20)
+            .map(|index| {
+                serde_json::json!({
+                    "content": format!("Always verify bounded lesson candidate number {index} before use"),
+                    "memory_type": "semantic"
+                })
+            })
+            .collect::<Vec<_>>();
+        let batch = project_retrieved_lessons(&memories, 6);
+        assert_eq!(batch.source_items, 20);
+        assert_eq!(batch.lessons.len(), 6);
+        assert!(batch.truncated);
+
+        let oversized = vec![serde_json::json!({
+            "content": format!("Always verify this reusable lesson {}", "x".repeat(10_000)),
+            "memory_type": "semantic"
+        })];
+        let batch = project_retrieved_lessons(&oversized, 6);
+        assert!(batch.lessons.is_empty());
+        assert!(batch.truncated);
     }
 
     #[tokio::test]

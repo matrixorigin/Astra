@@ -59,6 +59,42 @@ pub(crate) fn should_bootstrap_lessons(state: &SessionState) -> bool {
     !state.session_lessons_loaded
 }
 
+fn ensure_reuse_selection_report(state: &mut SessionState, session_id: String, turn: u32) {
+    if state.memory_selection_reports.iter().any(|report| {
+        matches!(
+            report.operation,
+            astra_turn_types::MemorySelectionOperation::Relevance
+                | astra_turn_types::MemorySelectionOperation::Reuse
+        )
+    }) {
+        return;
+    }
+    state
+        .memory_selection_reports
+        .push(astra_turn_types::MemorySelectionReport {
+            session_id,
+            turn,
+            operation: astra_turn_types::MemorySelectionOperation::Reuse,
+            method: astra_turn_types::MemorySelectionMethod::Reuse,
+            selection_order: (0..state.session_lessons.len() as u32).collect(),
+            reason: astra_turn_types::MemorySelectionReason::Reused,
+            model: None,
+            candidates: state
+                .session_lessons
+                .iter()
+                .enumerate()
+                .map(|(i, _)| astra_turn_types::MemoryCandidateDecision {
+                    index: i as u32,
+                    selected: true,
+                    probability_bps: None,
+                })
+                .collect(),
+            elapsed_ms: 0,
+            candidate_coverage: None,
+            prompt_projection: None,
+        });
+}
+
 async fn filter_lessons_by_relevance(
     invocation_scope: Option<&astra_turn_types::InferenceInvocationScope>,
     user_message: &str,
@@ -77,11 +113,10 @@ async fn filter_lessons_by_relevance(
         false,
     )
     .await;
-    let selected = lessons
-        .into_iter()
-        .enumerate()
-        .filter_map(|(i, lesson)| report.candidates[i].selected.then_some(lesson))
-        .collect();
+    let selected = astra_runtime::memory_hooks::relevance::filter_by_indices(
+        &lessons,
+        &report.selected_indices(),
+    );
     (selected, report)
 }
 
@@ -165,30 +200,11 @@ pub(crate) async fn ensure_bootstrapped_lessons(
     }
 
     if !should_bootstrap_lessons(state) {
-        if state.memory_selection_reports.is_empty() {
-            state
-                .memory_selection_reports
-                .push(astra_turn_types::MemorySelectionReport {
-                    session_id: session_id_for_scope.clone().unwrap_or_default(),
-                    turn,
-                    operation: astra_turn_types::MemorySelectionOperation::Reuse,
-                    method: astra_turn_types::MemorySelectionMethod::Reuse,
-                    selection_order: (0..state.session_lessons.len() as u32).collect(),
-                    reason: astra_turn_types::MemorySelectionReason::Reused,
-                    model: None,
-                    candidates: state
-                        .session_lessons
-                        .iter()
-                        .enumerate()
-                        .map(|(i, _)| astra_turn_types::MemoryCandidateDecision {
-                            index: i as u32,
-                            selected: true,
-                            probability_bps: None,
-                        })
-                        .collect(),
-                    elapsed_ms: 0,
-                });
-        }
+        ensure_reuse_selection_report(
+            state,
+            session_id_for_scope.clone().unwrap_or_default(),
+            turn,
+        );
         return;
     }
 
@@ -200,8 +216,8 @@ pub(crate) async fn ensure_bootstrapped_lessons(
         crate::edge_tools::memoria::memoria_retrieve_lessons(6, Some(user_message)),
     )
     .await;
-    let lessons = match retrieval {
-        Ok(Ok(lessons)) => lessons,
+    let retrieval = match retrieval {
+        Ok(Ok(retrieval)) => retrieval,
         failure => {
             state
                 .memory_selection_reports
@@ -219,6 +235,8 @@ pub(crate) async fn ensure_bootstrapped_lessons(
                     model: None,
                     candidates: Vec::new(),
                     elapsed_ms: retrieval_started.elapsed().as_millis() as u64,
+                    candidate_coverage: None,
+                    prompt_projection: None,
                 });
             state.session_lessons_loaded = true;
             return;
@@ -236,7 +254,7 @@ pub(crate) async fn ensure_bootstrapped_lessons(
     let (lessons, mut report) = filter_lessons_by_relevance(
         session_scope("memory_relevance").as_ref(),
         user_message,
-        lessons,
+        retrieval.lessons,
         client
             .as_ref()
             .map(|client| client as &dyn astra_runtime::memory_hooks::MemoryInferencePort),
@@ -244,6 +262,11 @@ pub(crate) async fn ensure_bootstrapped_lessons(
     .await;
     report.session_id = session_id_for_scope.clone().unwrap_or_default();
     report.turn = turn;
+    report.candidate_coverage = Some(astra_turn_types::MemoryCandidateCoverage {
+        source_items: retrieval.source_items,
+        evaluated_candidates: report.candidates.len() as u32,
+        truncated: retrieval.truncated,
+    });
     state.session_lessons = lessons;
     state.memory_selection_reports.push(report);
     state.session_lessons_loaded = true;
@@ -251,7 +274,9 @@ pub(crate) async fn ensure_bootstrapped_lessons(
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_lessons_by_relevance, should_bootstrap_lessons};
+    use super::{
+        ensure_reuse_selection_report, filter_lessons_by_relevance, should_bootstrap_lessons,
+    };
     use crate::cli::session::session_state::SessionState;
 
     fn lesson(action: &str) -> astra_services::LessonHint {
@@ -283,8 +308,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dismissal_is_followed_by_a_receipt_for_the_retained_set() {
+        for retained in [2_usize, 1, 0] {
+            let mut state = SessionState::default();
+            state.session_lessons = (0..retained)
+                .map(|index| lesson(&format!("retained lesson number {index}")))
+                .collect();
+            state
+                .memory_selection_reports
+                .push(astra_turn_types::MemorySelectionReport {
+                    session_id: "session-1".into(),
+                    turn: 2,
+                    operation: astra_turn_types::MemorySelectionOperation::Dismissal,
+                    method: astra_turn_types::MemorySelectionMethod::None,
+                    reason: astra_turn_types::MemorySelectionReason::NoSelector,
+                    model: None,
+                    candidates: vec![astra_turn_types::MemoryCandidateDecision {
+                        index: 0,
+                        selected: false,
+                        probability_bps: None,
+                    }],
+                    selection_order: vec![],
+                    elapsed_ms: 0,
+                    candidate_coverage: None,
+                    prompt_projection: None,
+                });
+
+            ensure_reuse_selection_report(&mut state, "session-1".into(), 2);
+
+            assert_eq!(state.memory_selection_reports.len(), 2);
+            let receipt = &state.memory_selection_reports[1];
+            assert_eq!(
+                receipt.operation,
+                astra_turn_types::MemorySelectionOperation::Reuse
+            );
+            assert_eq!(receipt.selected_indices().len(), retained);
+            assert!(receipt.is_valid());
+        }
+    }
+
     #[tokio::test]
-    async fn filter_lessons_without_inference_client_uses_local_relevance() {
+    async fn filter_lessons_without_inference_client_ranks_without_dropping() {
         let lessons = vec![
             lesson("Do not treat curl checks as browser verification"),
             lesson("Prefer cargo test for Rust executor changes"),
@@ -293,11 +358,15 @@ mod tests {
         let (filtered, report) =
             filter_lessons_by_relevance(None, "review Rust executor code", lessons, None).await;
 
-        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered.len(), 2);
         assert_eq!(report.candidates.len(), 2);
         assert_eq!(
             filtered[0].action,
             "Prefer cargo test for Rust executor changes"
+        );
+        assert_eq!(
+            filtered[1].action,
+            "Do not treat curl checks as browser verification"
         );
     }
 

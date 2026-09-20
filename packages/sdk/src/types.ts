@@ -425,7 +425,7 @@ export type ExplainAnalyzeContextAssemblyV1 = {
   edge_memory_selection?: MemorySelectionReport[];
 };
 
-/** CLI/Edge decision facts, not proof of final prompt injection. Indices are batch-local. */
+/** CLI/Edge selection facts plus runtime-owned final prompt projection. Indices are batch-local. */
 export type MemorySelectionReport = {
   session_id: string;
   turn: number;
@@ -436,6 +436,16 @@ export type MemorySelectionReport = {
   candidates: Array<{ index: number; selected: boolean; probability_bps: number | null }>;
   selection_order: number[];
   elapsed_ms: number;
+  candidate_coverage?: {
+    source_items: number;
+    evaluated_candidates: number;
+    truncated: boolean;
+  };
+  prompt_projection?: {
+    selected_candidates: number;
+    /** null means final inclusion could not be proven. */
+    included_candidates: number | null;
+  };
 };
 
 /** Assembly observations and final request estimates have different scopes.

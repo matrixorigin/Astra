@@ -134,9 +134,9 @@ pub use agent_bindings::{
     validate_agent_binding_payload,
 };
 pub use agent_lessons::{
-    Lesson, LessonHint, LessonKind, MIN_LESSON_ACTION_CHARS, MIN_LESSON_ACTION_WORDS, NewLesson,
-    SCRATCHPAD_LOWERCASE_PHRASES, is_action_prompt_worthy, memory_value_to_lesson_hint,
-    sanitize_for_prompt,
+    Lesson, LessonHint, LessonKind, MAX_LESSON_ACTION_CHARS, MIN_LESSON_ACTION_CHARS,
+    MIN_LESSON_ACTION_WORDS, NewLesson, SCRATCHPAD_LOWERCASE_PHRASES, is_action_prompt_worthy,
+    memory_value_to_lesson_hint, sanitize_for_prompt,
 };
 pub use agents::{
     AgentCreateRequestData, AgentListItem, AgentListRecord, AgentRecord, AgentService,
