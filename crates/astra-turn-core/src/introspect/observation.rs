@@ -43,6 +43,9 @@ pub struct IntrospectReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_judgments:
         Option<astra_services::semantic_judgment_observation::SemanticJudgmentView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_result_judgments:
+        Option<astra_services::tool_result_selection_observation::ToolResultJudgmentView>,
     pub view: ObservationView,
     #[serde(default)]
     pub observations: Vec<ObservationRecord>,
@@ -112,6 +115,18 @@ pub fn build_introspect_report(
         warnings.push(format!(
             "semantic judgment trace coverage={:?}; capture incomplete; model adoption unknown",
             semantics.coverage
+        ));
+    }
+    let tool_result_judgments = super::tool_result_judgment_view(snapshot, request);
+    if let Some(judgments) = &tool_result_judgments
+        && (judgments.evaluation_coverage
+            != astra_services::tool_result_selection_observation::ToolResultJudgmentCoverage::NotObserved
+            || judgments.application_coverage
+                != astra_services::tool_result_selection_observation::ToolResultJudgmentCoverage::NotObserved)
+    {
+        warnings.push(format!(
+            "tool-result judgment evaluation coverage={:?}; application coverage={:?}",
+            judgments.evaluation_coverage, judgments.application_coverage
         ));
     }
     let data_coverage = introspect_data_coverage(snapshot, request, warnings);
@@ -214,6 +229,23 @@ pub fn build_introspect_report(
         });
         evidence[0].summary.push_str(&usage.render());
     }
+    if let Some(judgments) = &tool_result_judgments
+        && (judgments.evaluation_coverage
+            != astra_services::tool_result_selection_observation::ToolResultJudgmentCoverage::NotObserved
+            || judgments.application_coverage
+                != astra_services::tool_result_selection_observation::ToolResultJudgmentCoverage::NotObserved)
+    {
+        observations.push(ObservationRecord {
+            ref_id: "urn:astra:observation:local:introspect:tool_result_judgments".into(),
+            topic: request.topic.as_str().into(),
+            facet: request.facet.as_str().into(),
+            kind: "tool_result_judgment".into(),
+            severity: "info".into(),
+            summary: judgments.render(),
+            confidence: ObservationConfidence::evidence(1.0),
+            evidence_refs: vec![RUNTIME_SNAPSHOT_REF.into()],
+        });
+    }
     if let Some(lifecycle) = snapshot.invocation_lifecycle.as_ref() {
         evidence.push(ObservationEvidence {
             ref_id: INVOCATION_LIFECYCLE_REF.to_string(),
@@ -255,6 +287,7 @@ pub fn build_introspect_report(
         runtime_feedback: snapshot.runtime_feedback.clone(),
         judgment_usage,
         semantic_judgments,
+        tool_result_judgments,
         view,
         observations,
         evidence,
@@ -349,6 +382,7 @@ fn build_edge_local_unavailable_report(request: &IntrospectRequest) -> Introspec
         runtime_feedback: None,
         judgment_usage: None,
         semantic_judgments: None,
+        tool_result_judgments: None,
         view,
         observations,
         evidence: Vec::new(),
@@ -430,6 +464,41 @@ fn introspect_data_coverage(
                 reason: Some(format!(
                     "session_trace_at_read:{:?};classification_not_execution_authority",
                     semantics.coverage
+                )),
+            },
+        );
+    }
+    if let Some(judgments) = super::tool_result_judgment_view(snapshot, request) {
+        use astra_services::tool_result_selection_observation::ToolResultJudgmentCoverage as Coverage;
+        let missing = matches!(
+            judgments.evaluation_coverage,
+            Coverage::NotObserved | Coverage::SourceUnavailable | Coverage::SourceExcluded
+        ) && matches!(
+            judgments.application_coverage,
+            Coverage::NotObserved | Coverage::SourceUnavailable | Coverage::SourceExcluded
+        );
+        let partial = matches!(
+            judgments.evaluation_coverage,
+            Coverage::CaptureIncomplete | Coverage::CaptureTruncated
+        ) || matches!(
+            judgments.application_coverage,
+            Coverage::CaptureIncomplete | Coverage::CaptureTruncated
+        );
+        providers.insert(
+            "tool_result_judgment".into(),
+            ObservationProviderCoverage {
+                status: if missing {
+                    "missing"
+                } else if partial {
+                    "partial"
+                } else {
+                    "fresh"
+                }
+                .into(),
+                freshness_ms: None,
+                reason: Some(format!(
+                    "evaluation={:?};application={:?};recommendation_not_adoption",
+                    judgments.evaluation_coverage, judgments.application_coverage
                 )),
             },
         );

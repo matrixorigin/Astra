@@ -1405,6 +1405,7 @@ fn build_introspect_snapshot_with_tool_admission(
         invocation_lifecycle: None,
         judgment_usage: None,
         semantic_judgments: None,
+        tool_result_judgments: None,
         capacity_provider_coverage: state
             .runtime_tool_executor
             .as_deref()

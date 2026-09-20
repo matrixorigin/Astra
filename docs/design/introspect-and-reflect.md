@@ -98,6 +98,18 @@ Their zero-length intervals mark observation instants, not inference latency;
 measured provider duration and usage retain their existing owners. Labels are
 derived from the typed facts and are never parsed back into semantic state.
 
+Large tool-result selection has a separate shared read projection for
+introspection and reflection. Evaluation traces answer what was evaluated and
+recommended; immutable projection receipts answer what the provider wire
+actually contained. A recommendation without a receipt has unconfirmed
+application. A receipt without a trace is still valid application evidence but
+does not recover the missing evaluation rationale. A `Started` trace without a
+terminal trace is reported as missing terminal evidence, not inferred to be a
+cancellation or interruption. Evaluation capture and application capture have
+independent bounded-coverage states, and conflicting identities are quarantined
+without discarding unrelated facts. Default text is a compact outcome summary;
+hashes, ranges and internal identities remain diagnostic details.
+
 ## Goals
 
 - Give the agent accurate self-awareness without exposing unsafe internals.

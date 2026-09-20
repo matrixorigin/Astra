@@ -4929,9 +4929,10 @@ fn explain_tool_result_application(
         })
         .collect::<Vec<_>>();
     if selected.is_empty() {
-        if bindings.iter().any(|binding| {
-            binding.receipt.state == ToolResultProjectionWireStateV1::Unknown
-        }) {
+        if bindings
+            .iter()
+            .any(|binding| binding.receipt.state == ToolResultProjectionWireStateV1::Unknown)
+        {
             return Some("tool-result context adoption not confirmed".to_string());
         }
         return bindings
@@ -4950,9 +4951,10 @@ fn explain_tool_result_application(
     let all_included = selected
         .iter()
         .all(|binding| binding.receipt.state == ToolResultProjectionWireStateV1::Included);
-    if selected.iter().any(|binding| {
-        binding.receipt.state == ToolResultProjectionWireStateV1::Unknown
-    }) {
+    if selected
+        .iter()
+        .any(|binding| binding.receipt.state == ToolResultProjectionWireStateV1::Unknown)
+    {
         return Some("tool-result selection adoption not fully confirmed".to_string());
     }
     Some(if all_included && proposed == included {
@@ -5199,6 +5201,20 @@ impl PendingToolResultProjection {
 struct ToolResultProjectionPreparation {
     prepared: Vec<crate::turn::llm::client::PreparedToolResultProjection>,
     pending: Option<PendingToolResultProjection>,
+}
+
+fn split_canonical_and_provider_budget_messages(
+    canonical_messages: Vec<Value>,
+    provider: &str,
+    cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+) -> (Vec<Value>, Vec<Value>) {
+    let provider_budget_messages =
+        crate::turn::llm::client::consolidate_system_messages_for_provider(
+            &canonical_messages,
+            provider,
+            cache_capability,
+        );
+    (canonical_messages, provider_budget_messages)
 }
 
 async fn prepare_tool_result_projections(
@@ -19559,7 +19575,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // this exact prefix. A matching WAL transition is bound to provider
         // attempt admission before HTTP is authorized.
         let mut durable_canonical_cursor = state.messages.len();
-        let (mut llm_messages, max_output_tokens, final_wire_compaction_boundary) = match self
+        let (llm_messages, max_output_tokens, final_wire_compaction_boundary) = match self
             .assemble_llm_messages_with_final_budget(
                 final_system_messages,
                 final_volatile_preamble,
@@ -19609,23 +19625,24 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             final_tools = ?final_tools.iter().filter_map(tool_schema_name).collect::<Vec<_>>(),
             "resolved final wire tool surface"
         );
-        // From this boundary onward, budget estimation and planned prompt
-        // diagnostics consume one shared pre-client projection. The client
-        // remains the sole provider-final projector: its immutable prepared
-        // body receipt is attached after durable admission/dispatch below.
-        let pre_client_wire_messages = llm_messages;
-        llm_messages = crate::turn::llm::client::consolidate_system_messages_for_provider(
-            &pre_client_wire_messages,
-            &llm_cfg.provider,
-            llm_cfg.cache_capability,
-        );
+        // Budget estimation and planned-prompt diagnostics consume the same
+        // provider-visible projection. Keep the canonical messages separate:
+        // tool-result selection and the client's projection application both
+        // require their trusted artifact metadata, which the provider
+        // projection deliberately strips at the wire boundary.
+        let (canonical_llm_messages, provider_budget_messages) =
+            split_canonical_and_provider_budget_messages(
+                llm_messages,
+                &llm_cfg.provider,
+                llm_cfg.cache_capability,
+            );
         let final_wire_budget_status =
             if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
                 crate::turn::llm::context::augment_manifest_trace_with_wire_detail_from_identity(
                     trace,
-                    &llm_messages,
+                    &provider_budget_messages,
                     &final_tools,
-                    &pre_client_wire_messages,
+                    &canonical_llm_messages,
                     if self.full_llm_capture {
                         crate::turn::llm::context::WireTraceDetail::Debug
                     } else {
@@ -19634,7 +19651,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 );
                 crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget_and_metadata(
                     trace,
-                    &llm_messages,
+                    &provider_budget_messages,
                     &final_tools,
                     &llm_cfg.model_name,
                     llm_cfg.context_window,
@@ -19643,7 +19660,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 )
             } else {
                 crate::turn::wire_assembly::wire_budget_status_with_metadata(
-                    &llm_messages,
+                    &provider_budget_messages,
                     &final_tools,
                     &llm_cfg.model_name,
                     llm_cfg.context_window,
@@ -19696,7 +19713,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
         if let Some(pipeline_session) = state.pipeline_session.as_mut() {
             pipeline_session.replace_pending_planned_wire_prompt_with_cache_capability(
-                &llm_messages,
+                &provider_budget_messages,
                 &final_tools,
                 llm_cfg.cache_capability,
             );
@@ -19770,6 +19787,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let mut streamed_reasoning = String::new();
         let mut first_stream_update_turn_ms: Option<u64> = None;
         let mut first_visible_text_turn_ms: Option<u64> = None;
+        // The provider client owns the final metadata-stripping projection.
+        // Preserve canonical artifact identity until optional selection has
+        // been applied and bound to the admitted provider request.
+        let mut llm_messages = canonical_llm_messages;
         // Optional tool-result selection is prepared before the primary
         // logical invocation is admitted. The auxiliary request therefore
         // cannot leave an open primary attempt while it waits, and every
@@ -22834,6 +22855,75 @@ mod tests {
     }
 
     #[test]
+    fn provider_budget_projection_does_not_consume_selection_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let persisted = astra_turn_core::tool_result_storage::persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-selection-boundary",
+            "call-selection-boundary",
+            "exec",
+            &"relevant evidence\n".repeat(2_000),
+        )
+        .unwrap();
+        let mut tool_message = json!({
+            "role": "tool",
+            "tool_call_id": "call-selection-boundary",
+            "content": persisted.replacement,
+            (astra_turn_core::tool_result_storage::TOOL_RESULT_TOOL_NAME_FIELD): "exec",
+        });
+        astra_turn_core::tool_result_storage::mark_tool_result_run_id(
+            &mut tool_message,
+            Some("run-selection-boundary"),
+        )
+        .unwrap();
+        astra_turn_core::tool_result_storage::mark_tool_result_artifact_descriptor(
+            &mut tool_message,
+            Some(&persisted.descriptor),
+        )
+        .unwrap();
+        astra_turn_core::tool_result_storage::mark_tool_result_optional_projection(
+            &mut tool_message,
+            true,
+        )
+        .unwrap();
+        let expected_identity =
+            astra_turn_core::tool::result::selection::canonical_tool_result_projection_identity(
+                &tool_message,
+            )
+            .unwrap();
+
+        let (canonical, provider_budget) = split_canonical_and_provider_budget_messages(
+            vec![json!({"role": "system", "content": "stable"}), tool_message],
+            "openai",
+            None,
+        );
+
+        assert_eq!(
+            astra_turn_core::tool::result::selection::canonical_tool_result_projection_identity(
+                &canonical[1],
+            )
+            .unwrap(),
+            expected_identity,
+            "selection must consume the canonical message with immutable artifact authority",
+        );
+        assert!(
+            astra_turn_core::tool::result::selection::canonical_tool_result_projection_identity(
+                &provider_budget[1],
+            )
+            .is_err(),
+            "provider budget projection must strip internal selection authority",
+        );
+        for field in [
+            astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD,
+            astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD,
+            astra_turn_core::tool_result_storage::TOOL_RESULT_OPTIONAL_PROJECTION_FIELD,
+            astra_turn_core::tool_result_storage::TOOL_RESULT_TOOL_NAME_FIELD,
+        ] {
+            assert!(provider_budget[1].get(field).is_none());
+        }
+    }
+
+    #[test]
     fn tool_result_projection_must_reduce_bytes_without_increasing_budget_tokens() {
         let ascii_baseline = "a".repeat(8_000);
         let dense_unicode_selection = "界".repeat(1_500);
@@ -22929,8 +23019,8 @@ mod tests {
             .unwrap();
         assert_eq!(application, "tool-result selection included · 1 chunk(s)");
         let unknown_decision = prepared[0].decision.clone();
-        let unknown_application = explain_tool_result_application(&[
-            astra_turn_types::ToolResultProjectionBindingV1 {
+        let unknown_application =
+            explain_tool_result_application(&[astra_turn_types::ToolResultProjectionBindingV1 {
                 receipt: astra_turn_types::ToolResultProjectionReceiptV1 {
                     decision_sha256: unknown_decision.decision_sha256.clone(),
                     provider_wire_sha256: "e".repeat(64),
@@ -22940,9 +23030,8 @@ mod tests {
                     reason: Some("wire body could not be proven".into()),
                 },
                 decision: unknown_decision,
-            },
-        ])
-        .unwrap();
+            }])
+            .unwrap();
         assert_eq!(
             unknown_application,
             "tool-result selection adoption not fully confirmed"

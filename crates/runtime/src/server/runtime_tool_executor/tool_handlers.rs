@@ -938,11 +938,12 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
         // facts in the shared round snapshot or add them to primary usage.
         snapshot.judgment_usage = None;
         snapshot.semantic_judgments = None;
+        snapshot.tool_result_judgments = None;
         if astra_services::semantic_judgment_observation::semantic_judgment_facet_enabled(
             request.facet,
         ) {
             use astra_turn_core::introspect::{JudgmentUsageCoverage, JudgmentUsageSnapshot};
-            let (usage, semantics) = tokio::join!(
+            let (usage, semantics, tool_result_judgments) = tokio::join!(
                 async {
                     if matches!(
                         request.source_policy,
@@ -964,10 +965,42 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
                     &context.session_id,
                     request.source_policy,
                     request.depth,
-                )
+                ),
+                async {
+                    if matches!(
+                        request.source_policy,
+                        astra_core::SourcePolicy::LiveOnly | astra_core::SourcePolicy::LocalOnly
+                    ) {
+                        return astra_services::tool_result_selection_observation::ToolResultJudgmentView::unavailable(
+                            astra_services::tool_result_selection_observation::ToolResultJudgmentCoverage::SourceExcluded,
+                        );
+                    }
+                    let Some(pool) = context.context_manifest_pool.as_ref() else {
+                        return astra_services::tool_result_selection_observation::ToolResultJudgmentView::unavailable(
+                            astra_services::tool_result_selection_observation::ToolResultJudgmentCoverage::SourceUnavailable,
+                        );
+                    };
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        astra_services::tool_result_selection_observation::load_tool_result_judgment_view(
+                            pool,
+                            &context.user_id,
+                            &context.session_id,
+                            128,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(view)) => view,
+                        _ => astra_services::tool_result_selection_observation::ToolResultJudgmentView::unavailable(
+                            astra_services::tool_result_selection_observation::ToolResultJudgmentCoverage::SourceUnavailable,
+                        ),
+                    }
+                }
             );
             snapshot.judgment_usage = Some(usage);
             snapshot.semantic_judgments = Some(semantics);
+            snapshot.tool_result_judgments = Some(tool_result_judgments);
         }
         let run_id = args
             .get("_run_id")

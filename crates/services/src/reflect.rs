@@ -78,6 +78,11 @@ pub struct ReflectReport {
     pub judgment_usage: Option<JudgmentUsageSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_judgments: Option<crate::semantic_judgment_observation::SemanticJudgmentView>,
+    /// Evaluation and provider-wire application facts for large tool-result
+    /// selection. Recommendations alone never count as application.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_result_judgments:
+        Option<crate::tool_result_selection_observation::ToolResultJudgmentView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<ObservationView>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -1547,7 +1552,7 @@ impl ReflectService for DatabaseReflectService {
             None
         };
 
-        let (judgment_usage, semantic_judgments) = tokio::join!(
+        let (judgment_usage, semantic_judgments, tool_result_judgments) = tokio::join!(
             async {
                 if let Some(shared_pool) = self.pool.as_ref() {
                     match tokio::time::timeout(
@@ -1606,7 +1611,43 @@ impl ReflectService for DatabaseReflectService {
                 } else {
                     None
                 }
-            }
+            },
+            async {
+                if !crate::semantic_judgment_observation::semantic_judgment_facet_enabled(
+                    request.facet,
+                ) {
+                    return None;
+                }
+                if matches!(
+                    request.source_policy,
+                    astra_core::SourcePolicy::LiveOnly | astra_core::SourcePolicy::LocalOnly
+                ) {
+                    return Some(crate::tool_result_selection_observation::ToolResultJudgmentView::unavailable(
+                        crate::tool_result_selection_observation::ToolResultJudgmentCoverage::SourceExcluded,
+                    ));
+                }
+                let Some(shared_pool) = self.pool.as_ref() else {
+                    return Some(crate::tool_result_selection_observation::ToolResultJudgmentView::unavailable(
+                        crate::tool_result_selection_observation::ToolResultJudgmentCoverage::SourceUnavailable,
+                    ));
+                };
+                Some(match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    crate::tool_result_selection_observation::load_tool_result_judgment_view(
+                        shared_pool,
+                        user_id,
+                        session_id,
+                        512,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(view)) => view,
+                    _ => crate::tool_result_selection_observation::ToolResultJudgmentView::unavailable(
+                        crate::tool_result_selection_observation::ToolResultJudgmentCoverage::SourceUnavailable,
+                    ),
+                })
+            },
         );
 
         // `agent_events.meta_duration_ms` is the durable timing projection
@@ -1798,6 +1839,10 @@ impl ReflectService for DatabaseReflectService {
             summary.push(' ');
             summary.push_str(&semantics.render());
         }
+        if let Some(judgments) = &tool_result_judgments {
+            summary.push(' ');
+            summary.push_str(&judgments.render());
+        }
         if let Some(llm_latency_summary) = llm_latency_summary {
             summary.push(' ');
             summary.push_str(&llm_latency_summary.render());
@@ -1832,6 +1877,41 @@ impl ReflectService for DatabaseReflectService {
                 "Semantic trace capture is incomplete; model adoption remains unknown.".into(),
             );
         }
+        if let Some(judgments) = &tool_result_judgments {
+            use crate::tool_result_selection_observation::ToolResultJudgmentCoverage as Coverage;
+            let missing = matches!(
+                judgments.evaluation_coverage,
+                Coverage::NotObserved | Coverage::SourceUnavailable | Coverage::SourceExcluded
+            ) && matches!(
+                judgments.application_coverage,
+                Coverage::NotObserved | Coverage::SourceUnavailable | Coverage::SourceExcluded
+            );
+            let partial = matches!(
+                judgments.evaluation_coverage,
+                Coverage::CaptureIncomplete | Coverage::CaptureTruncated
+            ) || matches!(
+                judgments.application_coverage,
+                Coverage::CaptureIncomplete | Coverage::CaptureTruncated
+            );
+            view.data_coverage.providers.insert(
+                "tool_result_judgment".into(),
+                astra_core::ObservationProviderCoverage {
+                    status: if missing {
+                        "missing"
+                    } else if partial {
+                        "partial"
+                    } else {
+                        "fresh"
+                    }
+                    .into(),
+                    freshness_ms: None,
+                    reason: Some(format!(
+                        "evaluation={:?};application={:?};recommendation_not_adoption",
+                        judgments.evaluation_coverage, judgments.application_coverage
+                    )),
+                },
+            );
+        }
         let data_coverage = view.data_coverage.clone();
 
         Ok(ReflectReport {
@@ -1848,6 +1928,7 @@ impl ReflectService for DatabaseReflectService {
             data_coverage,
             judgment_usage: Some(judgment_usage),
             semantic_judgments,
+            tool_result_judgments,
             view: Some(view),
             summary,
             observations,
@@ -3698,6 +3779,7 @@ mod tests {
             data_coverage: data_coverage.clone(),
             judgment_usage: None,
             semantic_judgments: None,
+            tool_result_judgments: None,
             view: Some(ObservationView {
                 topic: "overview".into(),
                 facet: "overview".into(),
