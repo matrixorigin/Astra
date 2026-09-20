@@ -1,0 +1,30 @@
+name: required_repeated_sampling
+description: |
+  Required live observations must continue despite identical call signatures.
+  Checks six exact calls and a successful terminal outcome. Inspect captured
+  results and final answer as well: call counts alone do not prove freshness
+  or accurate reporting. Run both with and without optional judgment.
+prompt: |
+  Collect six separate live UTC timestamp samples. For each sample call bash
+  with exactly `sleep 1; date -u +%s`. Make six sequential tool calls with
+  identical arguments; each invocation waits then obtains a fresh timestamp.
+  Do not batch them into one shell command, substitute cached observations,
+  change the command, or call any other tools. Report the six observed values
+  in order. This is a read-only sampling task; the repetition is required.
+capability: tool_use
+difficulty: 3
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: bash
+    ok: true
+    min: 6
+    max: 6
+    document: arguments
+    path: /command
+    equals: "sleep 1; date -u +%s"
+  - type: tools_count_between
+    min: 6
+    max: 6

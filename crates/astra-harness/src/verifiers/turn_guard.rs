@@ -3,18 +3,15 @@ use crate::{DecisionRecord, HookPoint, Severity, Verifier, Violation};
 /// Bridges TurnGuard-style stall detection to the Verifier interface.
 ///
 /// Reads `consecutive_same_tool` from the snapshot (derived from TurnGuard's
-/// tool_sigs) and emits violations when thresholds are exceeded.
+/// tool_sigs). Signatures establish repetition, not failed progress, so this
+/// verifier has observation authority only. Budgets and safety own hard limits.
 pub struct TurnGuardVerifierAdapter {
     pub warn_threshold: u32,
-    pub fatal_threshold: u32,
 }
 
 impl Default for TurnGuardVerifierAdapter {
     fn default() -> Self {
-        Self {
-            warn_threshold: 3,
-            fatal_threshold: 5,
-        }
+        Self { warn_threshold: 3 }
     }
 }
 
@@ -29,25 +26,13 @@ impl Verifier for TurnGuardVerifierAdapter {
 
     fn check(&self, record: &DecisionRecord) -> Vec<Violation> {
         let streak = record.snapshot.consecutive_same_tool;
-        if streak >= self.fatal_threshold {
-            vec![Violation {
-                severity: Severity::Fatal,
-                verifier: self.name().to_string(),
-                message: format!(
-                    "tool stall detected: same tool signature repeated {streak} consecutive times \
-                     (fatal threshold: {})",
-                    self.fatal_threshold
-                ),
-                recovery_threshold: None,
-            }]
-        } else if streak >= self.warn_threshold {
+        if streak >= self.warn_threshold {
             vec![Violation {
                 severity: Severity::Warning,
                 verifier: self.name().to_string(),
                 message: format!(
-                    "possible tool stall: same tool signature repeated {streak} consecutive times \
-                     (warn threshold: {})",
-                    self.warn_threshold
+                    "Same tool-call signature set observed across {streak} consecutive rounds. \
+                     Result novelty and progress are unknown."
                 ),
                 recovery_threshold: None,
             }]
@@ -92,24 +77,28 @@ mod tests {
     }
 
     #[test]
-    fn fatal_at_fatal_threshold() {
+    fn signature_repetition_never_has_termination_authority() {
         let v = TurnGuardVerifierAdapter::default();
-        let violations = v.check(&record_with_streak(5));
-        assert_eq!(violations.len(), 1);
-        assert_eq!(violations[0].severity, Severity::Fatal);
+        for streak in [3, 5, 6, 100, u32::MAX] {
+            let violations = v.check(&record_with_streak(streak));
+            assert_eq!(violations.len(), 1);
+            assert_eq!(violations[0].severity, Severity::Warning);
+            assert_eq!(violations[0].recovery_threshold, None);
+            assert!(violations[0].message.contains("progress are unknown"));
+        }
     }
 
     #[test]
     fn custom_thresholds() {
-        let v = TurnGuardVerifierAdapter {
-            warn_threshold: 2,
-            fatal_threshold: 4,
-        };
+        let v = TurnGuardVerifierAdapter { warn_threshold: 2 };
         assert!(v.check(&record_with_streak(1)).is_empty());
         assert_eq!(
             v.check(&record_with_streak(2))[0].severity,
             Severity::Warning
         );
-        assert_eq!(v.check(&record_with_streak(4))[0].severity, Severity::Fatal);
+        assert_eq!(
+            v.check(&record_with_streak(4))[0].severity,
+            Severity::Warning
+        );
     }
 }

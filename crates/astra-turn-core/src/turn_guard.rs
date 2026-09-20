@@ -771,8 +771,10 @@ impl TurnGuard {
         });
         let divergence_detected = matches!(divergence, DivergenceStatus::Diverging(_));
         if divergence_detected {
-            injections.push(stall::DIVERGENCE_CORRECTION.to_string());
             if !stall_detected {
+                // These detectors observe overlapping signature evidence.
+                // Emit one repetition advisory, not two competing diagnoses.
+                injections.push(stall::DIVERGENCE_CORRECTION.to_string());
                 self.nudge_count += 1;
             }
             severity = severity.max(VerdictSeverity::Warning);
@@ -1386,7 +1388,7 @@ mod tests {
     }
 
     #[test]
-    fn divergence_triggers_correction() {
+    fn overlapping_stall_and_divergence_emit_one_signature_advisory() {
         let mut guard = TurnGuard::new();
         // New semantics: divergence correction fires on exact signature
         // repetition over the exploration budget window (5 rounds default).
@@ -1396,14 +1398,17 @@ mod tests {
 
         let verdict = guard.evaluate();
         assert!(
-            verdict
-                .injections
-                .iter()
-                .any(|m| m.contains("same tool calls") || m.contains("same arguments")),
+            verdict.injections.iter().any(|m| m.contains("REFLECTION")),
             "injections: {:?}",
             verdict.injections
         );
         assert!(verdict.is_diverging);
+        assert!(
+            !verdict
+                .injections
+                .iter()
+                .any(|m| m == stall::DIVERGENCE_CORRECTION)
+        );
     }
 
     /// Regression for session bc74b214-3e2e turn-2: distinct
@@ -2463,6 +2468,7 @@ mod tests {
     #[test]
     fn followed_true_when_following_avoid_guidance() {
         let mut guard = TurnGuard::new();
+        record_tool_failures(&mut guard, "bash", 5);
         let calls = [make_tool_call("bash", r#"{"command":"ls"}"#)];
         guard.record_tool_calls(&calls);
         guard.record_tool_calls(&calls);
@@ -2476,7 +2482,7 @@ mod tests {
                 .unwrap()
                 .avoid_tools
                 .contains(&"bash".to_string()),
-            "bash should be in avoid_tools after stall"
+            "independent health failures should produce retry caution"
         );
 
         // Agent follows avoid guidance.
@@ -2491,6 +2497,7 @@ mod tests {
     #[test]
     fn followed_false_when_ignoring_avoid_guidance() {
         let mut guard = TurnGuard::new();
+        record_tool_failures(&mut guard, "bash", 5);
         let calls = [make_tool_call("bash", r#"{"command":"ls"}"#)];
         guard.record_tool_calls(&calls);
         guard.record_tool_calls(&calls);
@@ -2500,7 +2507,7 @@ mod tests {
         let outcome_record = guard.pending_correction.as_ref().unwrap();
         assert!(
             outcome_record.avoid_tools.contains(&"bash".to_string()),
-            "bash should be in avoid guidance after stall"
+            "independent health failures should produce retry caution"
         );
 
         // Agent ignores the correction and uses bash again
@@ -2843,10 +2850,9 @@ mod tests {
         panic!("stall was never detected in 5 identical turns");
     }
 
-    /// Verify that when the agent ignores a correction (uses avoided tools),
-    /// the next evaluate detects the violation and escalates.
+    /// Repetition without health failures remains an uncertain advisory.
     #[test]
-    fn nudge_ignore_detected_and_escalates() {
+    fn repeated_successful_calls_do_not_create_tool_avoidance() {
         let mut guard = TurnGuard::new();
         let bash_call = vec![
             serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}}),
@@ -2858,7 +2864,7 @@ mod tests {
             guard.evaluate();
         }
 
-        // Agent IGNORES correction — uses bash again
+        // The next repeated call may be required; similarity is not disobedience.
         guard.record_tool_calls(&bash_call);
         guard.record_tool_result("bash", "ok");
         let verdict = guard.evaluate();
@@ -2872,12 +2878,11 @@ mod tests {
             !verdict.injections.is_empty(),
             "ignoring correction must produce injection messages"
         );
-        // The injections should contain stall reflection or escalation guidance
+        assert!(verdict.avoid_tools.is_empty());
+        // Repetition remains visible without inventing a failed outcome.
         let all_text = verdict.injections.join(" ");
         assert!(
-            all_text.contains("stuck")
-                || all_text.contains("Avoid")
-                || all_text.contains("WARNING"),
+            all_text.contains("progress is uncertain"),
             "injections must contain stall/avoidance guidance: {all_text}"
         );
     }
@@ -2921,7 +2926,7 @@ mod tests {
     /// P1-F: Full correction lifecycle — stall → correction → compliance →
     /// ignore → mixed effectiveness metrics.
     #[test]
-    fn correction_lifecycle_mixed_compliance() {
+    fn repetition_alone_does_not_record_avoidance_violations() {
         let mut guard = TurnGuard::new();
         let bash_call = vec![
             serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}}),
@@ -2962,16 +2967,9 @@ mod tests {
             "must have at least 2 corrections, got {}",
             eff.total_corrections
         );
-        // follow_rate should be between 0 and 1 (some followed, some not)
-        assert!(
-            eff.follow_rate > 0.0,
-            "at least one correction was followed (grep turn)"
-        );
-        assert!(
-            eff.follow_rate < 1.0,
-            "not all corrections were followed (relapse happened), got follow_rate={}",
-            eff.follow_rate
-        );
+        // This existing metric measures avoidance compliance, not semantic
+        // adoption. With no health-based caution there is no violation.
+        assert_eq!(eff.follow_rate, 1.0);
         assert!(
             eff.effective_rate < 1.0,
             "effective_rate must reflect the relapse, got {}",
