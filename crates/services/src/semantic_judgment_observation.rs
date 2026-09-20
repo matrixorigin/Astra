@@ -734,35 +734,56 @@ impl SemanticJudgmentView {
 
     pub fn render(&self) -> String {
         let source = match self.scope {
-            SemanticJudgmentScope::SessionTraceAtRead => "session trace at read time",
-            SemanticJudgmentScope::LocalJournalAtRead => {
-                "bounded owner-local journal at read time (not server history)"
-            }
+            SemanticJudgmentScope::SessionTraceAtRead => "session trace",
+            SemanticJudgmentScope::LocalJournalAtRead => "local journal (not server history)",
         };
-        let boundary = format!(
-            "Semantic judgments: {source} (independent of requested horizon); capture incomplete; classification is not execution authority or model adoption. Stage observations are not physical calls or usage."
-        );
         let Some(c) = &self.counts else {
             return format!(
-                "{boundary} Coverage={:?}; counts unavailable, not zero.",
+                "Request classification · details unavailable from {source} ({:?}); this does not mean no classification ran.",
                 self.coverage
             );
         };
-        format!(
-            "{boundary} Captured evaluations={} (decisions={}, abstained={}, invalid={}, conflicting={}); not dispatched={}, evaluation unavailable={}; initial stages={}, clarification stages={}. Missing stages are not proof they never occurred. Capture truncated={}; captured omissions={}; display omissions={}.",
-            c.evaluated,
-            c.decisions,
-            c.abstained,
-            c.invalid,
-            c.conflicting,
-            c.not_dispatched,
-            c.evaluation_unavailable,
-            c.initial,
-            c.clarification,
-            self.capture_truncated,
-            self.capture_omitted_observations,
-            self.omitted_details
-        )
+        let mut parts = vec![format!("{} decided", c.decisions)];
+        if c.abstained > 0 {
+            parts.push(format!("{} uncertain", c.abstained));
+        }
+        if c.conflicting > 0 || c.invalid > 0 {
+            parts.push(format!(
+                "{} rejected",
+                c.conflicting.saturating_add(c.invalid)
+            ));
+        }
+        if c.not_dispatched > 0 {
+            parts.push(format!("{} skipped", c.not_dispatched));
+        }
+        if c.evaluation_unavailable > 0 {
+            parts.push(format!("{} unavailable", c.evaluation_unavailable));
+        }
+        let mut rendered = format!(
+            "Request classification · captured {} · {source}",
+            parts.join(" · ")
+        );
+        if self.capture_truncated {
+            rendered.push_str(" · capture truncated");
+        } else if self.capture_incomplete {
+            rendered.push_str(" · bounded capture; missing stages are possible");
+        }
+        if self.capture_omitted_observations > 0 {
+            rendered.push_str(&format!(
+                " · {} observation(s) not counted",
+                self.capture_omitted_observations
+            ));
+        }
+        if self.omitted_details > 0 {
+            rendered.push_str(&format!(
+                " · {} detail(s) hidden but included in counts",
+                self.omitted_details
+            ));
+        }
+        rendered.push_str(
+            ". Classification informs preparation; it does not prove the agent followed it. Model and token usage are reported separately.",
+        );
+        rendered
     }
 }
 
@@ -1480,7 +1501,15 @@ mod tests {
         assert_eq!(view.omitted_details, 1);
         assert_eq!(view.observations.len(), 2);
         assert!(view.capture_incomplete);
-        assert!(view.render().contains("not physical calls"));
+        assert!(
+            view.render()
+                .contains("Model and token usage are reported separately")
+        );
+        assert!(
+            view.render()
+                .contains("1 detail(s) hidden but included in counts")
+        );
+        assert!(!view.render().contains("observation(s) not counted"));
         assert!(!view.render().contains("0.5"));
         assert!(serde_json::to_string(&view).unwrap().contains("0.5"));
         assert_eq!(
@@ -1488,6 +1517,26 @@ mod tests {
             view
         );
         assert!(!serde_json::to_string(&view).unwrap().contains("tokens"));
+    }
+
+    #[test]
+    fn semantic_judgment_view_distinguishes_capture_loss_from_hidden_details() {
+        let mut view = SemanticJudgmentView::from_capture(project(
+            vec![row(metadata("one", &observation()))],
+            1,
+            1,
+        ));
+        view.capture_omitted_observations = 3;
+        view.capture_truncated = true;
+        let rendered = view.render();
+        assert!(rendered.contains("capture truncated"));
+        assert!(rendered.contains("3 observation(s) not counted"));
+        assert!(!rendered.contains("detail(s) hidden"));
+
+        view.omitted_details = 1;
+        let rendered = view.render();
+        assert!(rendered.contains("3 observation(s) not counted"));
+        assert!(rendered.contains("1 detail(s) hidden but included in counts"));
     }
 
     #[tokio::test]

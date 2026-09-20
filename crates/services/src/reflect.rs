@@ -126,14 +126,12 @@ impl JudgmentUsageScope {
     pub fn render(&self) -> String {
         match self {
             Self::SessionSupportedJudgmentOperationsAtLedgerRead => {
-                "scope=session_supported_judgment_operations cutoff=ledger_read".into()
+                "session ledger at read time".into()
             }
-            Self::LocalCapturedRunTurn { run_id, turn_id } => format!(
-                "scope=local_captured_run_turn run={run_id} turn={turn_id}; not session totals or necessarily the current turn"
-            ),
-            Self::LocalCaptureUnavailable => {
-                "scope=local_capture_unavailable; run/turn unknown".into()
+            Self::LocalCapturedRunTurn { run_id, turn_id } => {
+                format!("captured run {run_id}, turn {turn_id} (not session totals)")
             }
+            Self::LocalCaptureUnavailable => "local capture; run and turn unavailable".into(),
         }
     }
 }
@@ -262,42 +260,78 @@ impl JudgmentUsageSummary {
     }
 
     pub fn render(&self) -> String {
-        format!("{}; {}", self.scope.render(), self.render_usage())
+        format!(
+            "Judgment usage · {} · {}",
+            self.scope.render(),
+            self.render_usage()
+        )
     }
 
     fn render_usage(&self) -> String {
         let truncated = self.coverage == "capture_truncated";
         if self.coverage != "available" && !truncated {
-            return "Judgment physical-attempt usage unavailable; no token total inferred.".into();
+            return "usage unavailable; no token total inferred".into();
         }
         if self.groups.is_empty() && self.omitted_groups == 0 {
             if truncated || self.capture_incomplete {
                 if !truncated {
-                    return "Judgment physical-attempt capture incomplete; no supported rows captured; total usage unknown, not zero.".into();
+                    return "partial capture; no judgment calls captured; total usage unknown, not zero".into();
                 }
-                return "Judgment physical-attempt capture truncated; no supported judgment rows captured; total usage unknown, not zero.".into();
+                return "truncated capture; no judgment calls captured; total usage unknown, not zero".into();
             }
-            return "Judgment physical-attempt capture: no supported judgment operations observed in this bounded source view.".into();
+            return "no judgment calls observed in this bounded view".into();
         }
-        let mut lines = Vec::with_capacity(self.groups.len());
+        // Offering IDs remain available in the structured groups for forensic
+        // attribution. The user-facing summary combines offerings that used
+        // the same provider/model/operation so identical lines do not pile up.
+        let mut display_groups =
+            BTreeMap::<(String, String, String), (usize, usize, u128, u128, bool, bool)>::new();
         for group in &self.groups {
-            let input = if truncated || self.capture_incomplete || group.input_incomplete {
-                format!("at least {}", group.known_input_tokens)
+            let values = display_groups
+                .entry((
+                    group.provider.clone(),
+                    group.model.clone(),
+                    group.operation.clone(),
+                ))
+                .or_default();
+            values.0 = values.0.saturating_add(group.attempts);
+            values.1 = values.1.saturating_add(group.exact_usage_attempts);
+            values.2 = values.2.saturating_add(group.known_input_tokens);
+            values.3 = values.3.saturating_add(group.known_output_tokens);
+            values.4 |= group.input_incomplete;
+            values.5 |= group.output_incomplete;
+        }
+        let mut lines = Vec::with_capacity(display_groups.len());
+        for ((provider, model, operation), values) in display_groups {
+            let (
+                attempts,
+                exact_attempts,
+                known_input,
+                known_output,
+                input_partial,
+                output_partial,
+            ) = values;
+            let input = if truncated || self.capture_incomplete || input_partial {
+                format!("at least {known_input}")
             } else {
-                group.known_input_tokens.to_string()
+                known_input.to_string()
             };
-            let output = if truncated || self.capture_incomplete || group.output_incomplete {
-                format!("at least {}", group.known_output_tokens)
+            let output = if truncated || self.capture_incomplete || output_partial {
+                format!("at least {known_output}")
             } else {
-                group.known_output_tokens.to_string()
+                known_output.to_string()
             };
-            lines.push(format!("{} ({}, offering {}) {}: {} captured physical call(s), {}/{} captured calls with exact usage; input {input}, output {output} tokens", group.provider, group.model, group.offering_id, group.operation, group.attempts, group.exact_usage_attempts, group.attempts));
+            let calls = if attempts == 1 { "call" } else { "calls" };
+            lines.push(format!(
+                "{} ({}) · {} · {} {calls} · in {input} · out {output} · {}/{} exact",
+                model, provider, operation, attempts, exact_attempts, attempts
+            ));
         }
         if truncated {
-            lines.push("capture truncated; counts cover captured calls only; all token sums are lower bounds".into());
+            lines.push("capture truncated; counts and tokens are lower bounds".into());
         }
         if self.capture_incomplete {
-            lines.push("historical capture incomplete; missing attempts unknown; totals are lower bounds (not a truncation claim)".into());
+            lines.push("historical capture incomplete; totals are lower bounds".into());
         }
         if self.omitted_groups > 0 {
             lines.push(format!(
@@ -305,7 +339,7 @@ impl JudgmentUsageSummary {
                 self.omitted_groups
             ));
         }
-        format!("Judgment physical-attempt capture: {}.", lines.join("; "))
+        lines.join("; ")
     }
 }
 
@@ -2146,7 +2180,7 @@ mod tests {
         }
         let output = summary.render();
         assert!(
-            output.contains("input at least 512, output at least 768"),
+            output.contains("in at least 1024 · out at least 1536"),
             "{output}"
         );
         assert!(output.contains("capture truncated"));
