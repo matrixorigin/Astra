@@ -3274,6 +3274,14 @@ fn build_provider_request_body_with_cache_capability(
             || message
                 .get(astra_turn_core::tool::result::advisory::TOOL_RESULT_ADVISORIES_FIELD)
                 .is_some()
+            || [
+                astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD,
+                astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD,
+                astra_turn_core::tool_result_storage::TOOL_RESULT_OPTIONAL_PROJECTION_FIELD,
+                astra_turn_core::tool_result_storage::TOOL_RESULT_TOOL_NAME_FIELD,
+            ]
+            .iter()
+            .any(|field| message.get(*field).is_some())
     }) {
         marker_stripped_messages = {
             astra_core::history_work::record_serialized_value(
@@ -3888,11 +3896,12 @@ fn strip_internal_runtime_markers(messages: &mut [Value]) {
             // prompt cache suffix.
             for key in [
                 "_round_index",
-                "_tool_name",
+                astra_turn_core::tool_result_storage::TOOL_RESULT_TOOL_NAME_FIELD,
                 "_timestamp",
                 "_synthetic",
                 astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD,
                 astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD,
+                astra_turn_core::tool_result_storage::TOOL_RESULT_OPTIONAL_PROJECTION_FIELD,
             ] {
                 object.remove(key);
             }
@@ -15087,6 +15096,8 @@ mod tests {
             "byte_len": 4,
             "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         });
+        runtime[astra_turn_core::tool_result_storage::TOOL_RESULT_OPTIONAL_PROJECTION_FIELD] =
+            json!({"schema_version":1,"presentation":"generic"});
         runtime["_round_index"] = json!(7);
         runtime["_tool_name"] = json!("read_file");
         runtime["_timestamp"] = json!(1234);
@@ -15118,9 +15129,57 @@ mod tests {
             "_synthetic",
             astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD,
             astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD,
+            astra_turn_core::tool_result_storage::TOOL_RESULT_OPTIONAL_PROJECTION_FIELD,
         ] {
             assert!(out[0].get(key).is_none(), "internal key leaked: {key}");
         }
+    }
+
+    #[test]
+    fn direct_provider_body_strips_projection_authority_without_other_runtime_markers() {
+        let messages = vec![
+            json!({"role":"system","content":"system"}),
+            json!({"role":"assistant","content":"","tool_calls":[{
+                "id":"call-1","type":"function","function":{"name":"exec","arguments":"{}"}
+            }]}),
+            json!({
+                "role":"tool",
+                "tool_call_id":"call-1",
+                "content":"bounded baseline",
+                "_tool_name":"exec",
+                astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD:"run-1",
+                astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD:{
+                    "version":1,"document_kind":"result","call_id":"call-1","run_id":"run-1",
+                    "byte_len":4,"content_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                astra_turn_core::tool_result_storage::TOOL_RESULT_OPTIONAL_PROJECTION_FIELD:{
+                    "schema_version":1,"presentation":"generic"
+                }
+            }),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "model",
+            "openai",
+            None,
+            None,
+            false,
+            &astra_turn_core::thinking_config::ThinkingConfig::default(),
+        );
+        let encoded = body.to_string();
+        for marker in [
+            "_tool_name",
+            astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD,
+            astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD,
+            astra_turn_core::tool_result_storage::TOOL_RESULT_OPTIONAL_PROJECTION_FIELD,
+        ] {
+            assert!(
+                !encoded.contains(marker),
+                "internal marker leaked: {marker}"
+            );
+        }
+        assert!(encoded.contains("bounded baseline"));
     }
 
     #[test]
