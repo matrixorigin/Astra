@@ -14,11 +14,12 @@
 [![VLDB ADS](https://img.shields.io/badge/VLDB_ADS-Accepted-6F42C1)](https://vldb-ads.top/)
 [![arXiv](https://img.shields.io/badge/arXiv-2609.00749-B31B1B?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2609.00749)
 [![Terminal-Bench](https://img.shields.io/badge/Terminal--Bench_2.1-67.4%25-0A7EA4)](#terminal-bench-21)
+[![Jev](https://img.shields.io/badge/Jev-Native_agent_integration-2563EB)](#jev-agent-integration)
 [![Rust 1.97](https://img.shields.io/badge/Rust-1.97-000000?logo=rust)](rust-toolchain.toml)
 [![TypeScript](https://img.shields.io/badge/SDK-TypeScript-3178C6?logo=typescript&logoColor=white)](packages/sdk)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-[Why Astra](#why-astra) · [Research](#research-and-benchmarks) · [Quick start](#quick-start) · [Architecture](#architecture) · [Runner](#runner-and-private-enterprise-it) · [Comparison](#how-astra-differs-from-coding-agents) · [Docs](#documentation)
+[Why Astra](#why-astra) · [Jev integration](#jev-agent-integration) · [Research](#research-and-benchmarks) · [Quick start](#quick-start) · [Architecture](#architecture) · [Runner](#runner-and-private-enterprise-it) · [Comparison](#how-astra-differs-from-coding-agents) · [Docs](#documentation)
 
 </div>
 
@@ -28,6 +29,9 @@ Astra is a self-hosted runtime for long-running agent Work. Every model
 request is assembled by a budgeted pipeline you can EXPLAIN, every attempt
 leaves evidence you can inspect, diff, and roll back, and execution runs
 through a Runner inside your own environment.
+
+**[Native Jev agent integration](#jev-agent-integration):** an optional judgment layer
+for memory relevance, lesson dismissal, request classification, and skill selection.
 
 | What did the model receive? | What changed, and what next? | Where does it run? |
 | --- | --- | --- |
@@ -71,6 +75,31 @@ context window Astra keeps for it, what it cut and why, and the Explain Analyze
 tree behind the answer.
 
 https://github.com/user-attachments/assets/c008be26-4320-413c-9ad6-100aefcfa728
+
+### Jev agent integration
+
+Astra integrates **Jev (TypeSafe AI's System One model)** at the agent-runtime
+level: an optional judgment layer for AI agents, configured separately from the
+main generation model.
+Its structured answers feed four existing decision points:
+
+- **Agent memory filtering:** select memories that contribute facts or constraints to the current task.
+- **Lesson dismissal:** distinguish an explicit correction from a one-time exception.
+- **Request classification:** identify request requirements before runtime admission.
+- **Skill selection:** select a workflow when the evidence clearly supports one.
+
+These callers share typed questions, validated responses, provider routing, and
+usage accounting. Native probabilities retain their meaning; uncertainty,
+timeouts, and unavailable models follow each caller's bounded fallback rules.
+The runtime retains execution authority. An ordinary LLM can serve the same
+judgment role through the shared contract—Jev is optional.
+
+**[Configure Jev or another judgment model](docs/guides/memory-judgment-pilot.md)** ·
+**[Reproduce the memory evaluation](expriment/jev-memory/SKILL.md)**
+
+The evaluation compares No JEV, native JEV, and Flash JEV-like judgments for
+accuracy, relevance, latency, and cache-aware cost. It includes failures and
+optimization tradeoffs; it does not establish whole-agent cost savings.
 
 ### Pick the layer you need
 
