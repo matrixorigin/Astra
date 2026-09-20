@@ -7796,6 +7796,62 @@ async fn ensure_core_schema_while_leased(
 
     core_schema_create!(
         pool,
+        "tool_result_projection_decisions",
+        "CREATE TABLE IF NOT EXISTS tool_result_projection_decisions (
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            freeze_key_sha256 CHAR(64) NOT NULL,
+            decision_sha256 CHAR(64) NOT NULL,
+            decision_json LONGTEXT NOT NULL,
+            decision_bytes BIGINT NOT NULL,
+            canonical_message_sha256 CHAR(64) NOT NULL,
+            source_sha256 CHAR(64) NOT NULL,
+            source_bytes BIGINT NOT NULL,
+            rendered_body_sha256 CHAR(64) NOT NULL,
+            rendered_body_bytes BIGINT NOT NULL,
+            producer_run_id VARCHAR(64) NOT NULL,
+            producer_call_id VARCHAR(255) NOT NULL,
+            first_admitted_attempt_id VARCHAR(64) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, session_id, freeze_key_sha256),
+            INDEX idx_tool_result_projection_decisions_attempt
+                (user_id, first_admitted_attempt_id),
+            CONSTRAINT chk_tool_result_projection_decision_bounds
+                CHECK (decision_bytes > 0 AND source_bytes > 0 AND rendered_body_bytes > 0)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "tool_result_projection_receipts",
+        "CREATE TABLE IF NOT EXISTS tool_result_projection_receipts (
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            attempt_id VARCHAR(64) NOT NULL,
+            freeze_key_sha256 CHAR(64) NOT NULL,
+            decision_sha256 CHAR(64) NOT NULL,
+            provider_wire_sha256 CHAR(64) NOT NULL,
+            receipt_sha256 CHAR(64) NOT NULL,
+            receipt_json TEXT NOT NULL,
+            receipt_bytes BIGINT NOT NULL,
+            wire_state VARCHAR(32) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, attempt_id, freeze_key_sha256),
+            INDEX idx_tool_result_projection_receipts_session
+                (user_id, session_id, attempt_id),
+            CONSTRAINT chk_tool_result_projection_receipt_bounds
+                CHECK (receipt_bytes > 0),
+            CONSTRAINT chk_tool_result_projection_receipt_state
+                CHECK (wire_state IN ('included', 'partially_included', 'omitted', 'unknown'))
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
         "inference_canonical_transition_heads",
         "CREATE TABLE IF NOT EXISTS inference_canonical_transition_heads (
             user_id VARCHAR(128) NOT NULL,

@@ -717,6 +717,11 @@ pub struct ModelRequestContextEvent {
     pub usage: Option<ModelRequestUsage>,
     pub composition: ModelRequestComposition,
     pub wire_composition: ModelRequestWireComposition,
+    /// Attempt-level observation of optional tool-result projection bindings.
+    /// Empty means no binding evidence was captured; an adopted baseline is
+    /// represented by an explicit Baseline decision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_result_projections: Vec<astra_turn_types::ToolResultProjectionBindingV1>,
     pub cache: ModelRequestCache,
     pub compaction: ModelRequestCompaction,
     pub terminal_status: Option<String>,

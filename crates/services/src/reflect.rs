@@ -2310,6 +2310,7 @@ mod tests {
             }),
             composition: Default::default(),
             wire_composition: ModelRequestWireComposition::default(),
+            tool_result_projections: Vec::new(),
             cache: ModelRequestCache {
                 invalidation_reasons: vec!["tool_schemas_changed".into()],
                 ..Default::default()

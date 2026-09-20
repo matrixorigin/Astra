@@ -448,6 +448,20 @@ const SESSION_DELETE_ARTIFACT_TABLES: &[SessionDeleteStatement] = &[
 
 const SESSION_DELETE_DIRECT_BATCH_TABLES: &[SessionBatchDeleteStatement] = &[
     SessionBatchDeleteStatement {
+        label: "tool_result_projection_receipts",
+        sql: "DELETE FROM tool_result_projection_receipts
+             WHERE session_id = ? AND user_id = ?
+             ORDER BY attempt_id ASC, freeze_key_sha256 ASC
+             LIMIT ?",
+    },
+    SessionBatchDeleteStatement {
+        label: "tool_result_projection_decisions",
+        sql: "DELETE FROM tool_result_projection_decisions
+             WHERE session_id = ? AND user_id = ?
+             ORDER BY freeze_key_sha256 ASC
+             LIMIT ?",
+    },
+    SessionBatchDeleteStatement {
         label: "inference_invocation_settlement_debts",
         sql: SESSION_DELETE_INFERENCE_SETTLEMENT_DEBTS_SQL,
     },
@@ -1740,6 +1754,8 @@ mod tests {
                 "prompt_request_records",
                 "session_tool_output_batches",
                 "session_tool_outputs",
+                "tool_result_projection_decisions",
+                "tool_result_projection_receipts",
             ])
         );
         for statement in statements {

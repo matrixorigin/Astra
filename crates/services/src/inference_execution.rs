@@ -1,8 +1,10 @@
-use astra_core::{SharedPool, matrixone_statement_with_null_shape};
+use astra_core::{
+    SharedPool, matrixone_statement_with_null_shape, push_matrixone_bound_string_set,
+};
 use astra_turn_types::{InferenceInvocationScope, InferencePurpose};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{Acquire, Row};
+use sqlx::{Acquire, MySql, QueryBuilder, Row};
 
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
 
@@ -16,6 +18,10 @@ use crate::models::{ModelAccessKind, ModelExecutionPlacement, validate_model_off
 use crate::service_error::{ServiceError, ServiceErrorKind, ServiceResult};
 
 const INFERENCE_ID_HEX_LEN: usize = 32;
+const MAX_TOOL_RESULT_PROJECTION_DECISION_BYTES: usize = 512 * 1024;
+const MAX_TOOL_RESULT_PROJECTION_RECEIPT_BYTES: usize = 64 * 1024;
+const MAX_TOOL_RESULT_PROJECTION_DECISIONS_PER_SESSION: u64 = 4_096;
+const MAX_TOOL_RESULT_PROJECTION_BYTES_PER_SESSION: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InferenceInvocationInput {
@@ -80,6 +86,8 @@ pub struct InferenceProviderAttemptPlan {
     canonical_transition_predecessor: Option<astra_turn_types::ProviderCanonicalHistoryIdentityV2>,
     canonical_transition_result: Option<astra_turn_types::ProviderCanonicalHistoryIdentityV2>,
     canonical_transition_recovery_mode: Option<astra_turn_types::ProviderCanonicalRecoveryModeV2>,
+    tool_result_projection_decisions: Vec<astra_turn_types::ToolResultProjectionDecisionV1>,
+    tool_result_projections: Vec<astra_turn_types::ToolResultProjectionBindingV1>,
     invocation_input: InferenceInvocationInput,
     request_context: ModelRequestContextSeed,
 }
@@ -258,6 +266,348 @@ impl InferenceProviderAttemptPlan {
         })?);
         Ok(self)
     }
+
+    /// Bind optional context projection facts to the same admission event as
+    /// the exact provider payload. The event's owner/session/generation and
+    /// physical-attempt identity provide the durable isolation envelope.
+    pub fn with_tool_result_projections(
+        mut self,
+        bindings: Vec<astra_turn_types::ToolResultProjectionBindingV1>,
+    ) -> ServiceResult<Self> {
+        if bindings.len() > 32 {
+            return Err(ServiceError::invalid(
+                "too many tool-result projections for one provider request",
+            ));
+        }
+        if !bindings.is_empty()
+            && (self.invocation_input.purpose != InferencePurpose::PrimaryAgent
+                || !matches!(
+                    self.invocation_input.scope,
+                    InferenceInvocationScope::Run { .. }
+                ))
+        {
+            return Err(ServiceError::invalid(
+                "tool-result projections require a run-scoped primary-agent owner",
+            ));
+        }
+        let mut freeze_keys = std::collections::BTreeSet::new();
+        for binding in &bindings {
+            binding.validate().map_err(|error| {
+                ServiceError::invalid(format!("invalid tool-result projection binding: {error}"))
+            })?;
+            if binding.receipt.provider_wire_sha256 != self.wire.provider_wire_hash {
+                return Err(ServiceError::invalid(
+                    "tool-result projection receipt does not name the exact provider wire",
+                ));
+            }
+            if !freeze_keys.insert(binding.decision.freeze_key_sha256.as_str()) {
+                return Err(ServiceError::invalid(
+                    "duplicate tool-result projection freeze key",
+                ));
+            }
+        }
+        let mut bindings = bindings;
+        bindings.sort_by(|left, right| {
+            left.decision
+                .freeze_key_sha256
+                .cmp(&right.decision.freeze_key_sha256)
+        });
+        self.tool_result_projection_decisions = bindings
+            .iter()
+            .map(|binding| binding.decision.clone())
+            .collect();
+        self.tool_result_projections = bindings;
+        Ok(self)
+    }
+}
+
+async fn freeze_tool_result_projection_decisions(
+    connection: &mut sqlx::MySqlConnection,
+    attempt: &InferenceProviderAttemptPlan,
+) -> ServiceResult<()> {
+    if attempt.tool_result_projection_decisions.is_empty() {
+        return Ok(());
+    }
+    let session_id = match &attempt.invocation_input.scope {
+        InferenceInvocationScope::Run { session_id, .. }
+            if attempt.invocation_input.purpose == InferencePurpose::PrimaryAgent =>
+        {
+            session_id
+        }
+        _ => {
+            return Err(ServiceError::invalid(
+                "tool-result projection freeze requires a run-scoped primary-agent owner",
+            ));
+        }
+    };
+    let mut new_rows = Vec::new();
+    for decision in &attempt.tool_result_projection_decisions {
+        decision.validate().map_err(|error| {
+            ServiceError::invalid(format!("invalid tool-result projection decision: {error}"))
+        })?;
+        let existing = sqlx::query(
+            "SELECT freeze_key_sha256, decision_sha256, decision_json, decision_bytes,
+                    canonical_message_sha256, source_sha256, source_bytes,
+                    rendered_body_sha256, rendered_body_bytes, producer_run_id, producer_call_id
+             FROM tool_result_projection_decisions
+             WHERE user_id = ? AND session_id = ? AND freeze_key_sha256 = ?
+             FOR UPDATE",
+        )
+        .bind(&attempt.user_id)
+        .bind(session_id)
+        .bind(&decision.freeze_key_sha256)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "lock durable tool-result projection decision",
+                error,
+            )
+        })?;
+        if let Some(row) = existing {
+            let persisted = decode_tool_result_projection_decision(&row)?;
+            if persisted != *decision {
+                return Err(ServiceError::conflict(
+                    "tool-result projection freeze key already has a different decision",
+                ));
+            }
+            continue;
+        }
+        let json = serde_json::to_string(decision).map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Internal,
+                "serialize projection decision",
+                error,
+            )
+        })?;
+        if json.len() > MAX_TOOL_RESULT_PROJECTION_DECISION_BYTES {
+            return Err(ServiceError::invalid(
+                "tool-result projection decision exceeds its durable byte bound",
+            ));
+        }
+        new_rows.push((decision, json));
+    }
+    if !new_rows.is_empty() {
+        let aggregate = sqlx::query(
+            "SELECT CAST(COUNT(*) AS SIGNED) AS decision_count,
+                CAST(COALESCE(SUM(decision_bytes), 0) AS SIGNED) AS decision_bytes
+         FROM tool_result_projection_decisions
+         WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&attempt.user_id)
+        .bind(session_id)
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "measure session projection decisions",
+                error,
+            )
+        })?;
+        let existing_count: i64 = aggregate.try_get("decision_count").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode session projection decision count",
+                error,
+            )
+        })?;
+        let existing_bytes: i64 = aggregate.try_get("decision_bytes").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode session projection decision bytes",
+                error,
+            )
+        })?;
+        let new_count = u64::try_from(new_rows.len()).unwrap_or(u64::MAX);
+        let new_bytes = new_rows
+            .iter()
+            .try_fold(0_u64, |total, (_, json)| {
+                total.checked_add(u64::try_from(json.len()).unwrap_or(u64::MAX))
+            })
+            .ok_or_else(|| {
+                ServiceError::invalid("tool-result projection decision bytes overflow")
+            })?;
+        if u64::try_from(existing_count)
+            .unwrap_or(u64::MAX)
+            .saturating_add(new_count)
+            > MAX_TOOL_RESULT_PROJECTION_DECISIONS_PER_SESSION
+            || u64::try_from(existing_bytes)
+                .unwrap_or(u64::MAX)
+                .saturating_add(new_bytes)
+                > MAX_TOOL_RESULT_PROJECTION_BYTES_PER_SESSION
+        {
+            return Err(ServiceError::conflict(
+                "session tool-result projection decision capacity is exhausted",
+            ));
+        }
+        for (decision, json) in new_rows {
+            let inserted = sqlx::query(
+                "INSERT INTO tool_result_projection_decisions
+             (user_id, session_id, freeze_key_sha256, decision_sha256,
+              decision_json, decision_bytes, canonical_message_sha256,
+              source_sha256, source_bytes, rendered_body_sha256, rendered_body_bytes,
+              producer_run_id, producer_call_id, first_admitted_attempt_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+            )
+            .bind(&attempt.user_id)
+            .bind(session_id)
+            .bind(&decision.freeze_key_sha256)
+            .bind(&decision.decision_sha256)
+            .bind(&json)
+            .bind(
+                i64::try_from(json.len())
+                    .map_err(|_| ServiceError::invalid("projection decision is too large"))?,
+            )
+            .bind(&decision.canonical_message_sha256)
+            .bind(&decision.source_sha256)
+            .bind(
+                i64::try_from(decision.source_bytes)
+                    .map_err(|_| ServiceError::invalid("projection source is too large"))?,
+            )
+            .bind(&decision.rendered_body_sha256)
+            .bind(
+                i64::try_from(decision.rendered_body_bytes)
+                    .map_err(|_| ServiceError::invalid("projection body is too large"))?,
+            )
+            .bind(&decision.producer_run_id)
+            .bind(&decision.producer_call_id)
+            .bind(&attempt.attempt_id)
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| {
+                if astra_core::is_duplicate_key_error(&error) {
+                    ServiceError::conflict(
+                        "tool-result projection decision was frozen concurrently",
+                    )
+                } else {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "freeze tool-result projection decision",
+                        error,
+                    )
+                }
+            })?;
+            if inserted.rows_affected() != 1 {
+                return Err(ServiceError::conflict(
+                    "tool-result projection decision was not frozen exactly once",
+                ));
+            }
+        }
+    }
+    for binding in &attempt.tool_result_projections {
+        let json = serde_json::to_string(&binding.receipt).map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Internal,
+                "serialize tool-result projection receipt",
+                error,
+            )
+        })?;
+        if json.len() > MAX_TOOL_RESULT_PROJECTION_RECEIPT_BYTES {
+            return Err(ServiceError::invalid(
+                "tool-result projection receipt exceeds its durable byte bound",
+            ));
+        }
+        let receipt_sha256 = format!("{:x}", Sha256::digest(json.as_bytes()));
+        let existing = sqlx::query(
+            "SELECT receipt_sha256, receipt_json, receipt_bytes
+             FROM tool_result_projection_receipts
+             WHERE user_id = ? AND attempt_id = ? AND freeze_key_sha256 = ?
+             FOR UPDATE",
+        )
+        .bind(&attempt.user_id)
+        .bind(&attempt.attempt_id)
+        .bind(&binding.decision.freeze_key_sha256)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "lock durable tool-result projection receipt",
+                error,
+            )
+        })?;
+        if let Some(row) = existing {
+            let persisted_hash: String = row.try_get("receipt_sha256").map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "decode projection receipt hash",
+                    error,
+                )
+            })?;
+            let persisted_json: String = row.try_get("receipt_json").map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "decode projection receipt JSON",
+                    error,
+                )
+            })?;
+            let persisted_bytes: i64 = row.try_get("receipt_bytes").map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "decode projection receipt bytes",
+                    error,
+                )
+            })?;
+            if persisted_hash != receipt_sha256
+                || persisted_json != json
+                || usize::try_from(persisted_bytes).ok() != Some(json.len())
+            {
+                return Err(ServiceError::conflict(
+                    "physical attempt already has a different or corrupt projection receipt",
+                ));
+            }
+            continue;
+        }
+        let wire_state = match binding.receipt.state {
+            astra_turn_types::ToolResultProjectionWireStateV1::Included => "included",
+            astra_turn_types::ToolResultProjectionWireStateV1::PartiallyIncluded => {
+                "partially_included"
+            }
+            astra_turn_types::ToolResultProjectionWireStateV1::Omitted => "omitted",
+            astra_turn_types::ToolResultProjectionWireStateV1::Unknown => "unknown",
+        };
+        let inserted = sqlx::query(
+            "INSERT INTO tool_result_projection_receipts
+             (user_id, session_id, attempt_id, freeze_key_sha256, decision_sha256,
+              provider_wire_sha256, receipt_sha256, receipt_json, receipt_bytes,
+              wire_state, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+        )
+        .bind(&attempt.user_id)
+        .bind(session_id)
+        .bind(&attempt.attempt_id)
+        .bind(&binding.decision.freeze_key_sha256)
+        .bind(&binding.receipt.decision_sha256)
+        .bind(&binding.receipt.provider_wire_sha256)
+        .bind(&receipt_sha256)
+        .bind(&json)
+        .bind(
+            i64::try_from(json.len())
+                .map_err(|_| ServiceError::invalid("projection receipt is too large"))?,
+        )
+        .bind(wire_state)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            if astra_core::is_duplicate_key_error(&error) {
+                ServiceError::conflict("tool-result projection receipt was frozen concurrently")
+            } else {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "freeze tool-result projection receipt",
+                    error,
+                )
+            }
+        })?;
+        if inserted.rows_affected() != 1 {
+            return Err(ServiceError::conflict(
+                "tool-result projection receipt was not frozen exactly once",
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl InferenceProviderWireIdentity {
@@ -700,9 +1050,140 @@ pub fn plan_inference_provider_attempt_with_context(
         canonical_transition_predecessor: None,
         canonical_transition_result: None,
         canonical_transition_recovery_mode: None,
+        tool_result_projection_decisions: Vec::new(),
+        tool_result_projections: Vec::new(),
         invocation_input: invocation.input.clone(),
         request_context,
     }
+}
+
+pub async fn load_tool_result_projection_decisions(
+    pool: &SharedPool,
+    user_id: &str,
+    session_id: &str,
+    freeze_keys: &[String],
+) -> ServiceResult<
+    std::collections::BTreeMap<String, astra_turn_types::ToolResultProjectionDecisionV1>,
+> {
+    if user_id.trim().is_empty() || session_id.trim().is_empty() || freeze_keys.len() > 32 {
+        return Err(ServiceError::invalid(
+            "tool-result projection lookup identity or key count is invalid",
+        ));
+    }
+    if freeze_keys.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    for key in freeze_keys {
+        if key.len() != 64
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            || !unique.insert(key.as_str())
+        {
+            return Err(ServiceError::invalid(
+                "tool-result projection lookup contains an invalid or duplicate freeze key",
+            ));
+        }
+    }
+    let mut query = QueryBuilder::<MySql>::new(
+        "SELECT decision.freeze_key_sha256, decision.decision_sha256,
+                decision.decision_json, decision.decision_bytes,
+                decision.canonical_message_sha256, decision.source_sha256,
+                decision.source_bytes, decision.rendered_body_sha256,
+                decision.rendered_body_bytes, decision.producer_run_id,
+                decision.producer_call_id
+         FROM tool_result_projection_decisions AS decision INNER JOIN ",
+    );
+    push_matrixone_bound_string_set(&mut query, freeze_keys.iter().map(String::as_str));
+    query
+        .push(" AS requested ON requested.value = decision.freeze_key_sha256")
+        .push(" WHERE decision.user_id = ")
+        .push_bind(user_id)
+        .push(" AND decision.session_id = ")
+        .push_bind(session_id)
+        .push(" ORDER BY decision.freeze_key_sha256 ASC");
+    let rows = query.build().fetch_all(pool.get()).await.map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "load tool-result projection decisions",
+            error,
+        )
+    })?;
+    let mut decisions = std::collections::BTreeMap::new();
+    for row in rows {
+        let decision = decode_tool_result_projection_decision(&row)?;
+        let freeze_key = decision.freeze_key_sha256.clone();
+        if !unique.contains(freeze_key.as_str()) {
+            return Err(ServiceError::conflict(
+                "durable tool-result projection decision identity mismatch",
+            ));
+        }
+        decisions.insert(freeze_key, decision);
+    }
+    Ok(decisions)
+}
+
+fn decode_tool_result_projection_decision(
+    row: &sqlx::mysql::MySqlRow,
+) -> ServiceResult<astra_turn_types::ToolResultProjectionDecisionV1> {
+    let text = |column: &str| -> ServiceResult<String> {
+        row.try_get(column).map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                format!("decode projection decision {column}"),
+                error,
+            )
+        })
+    };
+    let number = |column: &str| -> ServiceResult<i64> {
+        row.try_get(column).map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                format!("decode projection decision {column}"),
+                error,
+            )
+        })
+    };
+    let json = text("decision_json")?;
+    let decision_bytes = number("decision_bytes")?;
+    if usize::try_from(decision_bytes).ok() != Some(json.len())
+        || json.len() > MAX_TOOL_RESULT_PROJECTION_DECISION_BYTES
+    {
+        return Err(ServiceError::conflict(
+            "durable tool-result projection decision has invalid byte identity",
+        ));
+    }
+    let decision: astra_turn_types::ToolResultProjectionDecisionV1 = serde_json::from_str(&json)
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "parse projection decision JSON",
+                error,
+            )
+        })?;
+    decision.validate().map_err(|error| {
+        ServiceError::conflict(format!(
+            "invalid durable tool-result projection decision: {error}"
+        ))
+    })?;
+    let source_bytes = number("source_bytes")?;
+    let rendered_body_bytes = number("rendered_body_bytes")?;
+    let metadata_matches = text("freeze_key_sha256")? == decision.freeze_key_sha256
+        && text("decision_sha256")? == decision.decision_sha256
+        && text("canonical_message_sha256")? == decision.canonical_message_sha256
+        && text("source_sha256")? == decision.source_sha256
+        && u64::try_from(source_bytes).ok() == Some(decision.source_bytes)
+        && text("rendered_body_sha256")? == decision.rendered_body_sha256
+        && u64::try_from(rendered_body_bytes).ok() == Some(decision.rendered_body_bytes)
+        && text("producer_run_id")? == decision.producer_run_id
+        && text("producer_call_id")? == decision.producer_call_id;
+    if !metadata_matches {
+        return Err(ServiceError::conflict(
+            "durable tool-result projection decision metadata mismatch",
+        ));
+    }
+    Ok(decision)
 }
 
 fn checked_i64(value: u64, label: &str) -> ServiceResult<i64> {
@@ -798,6 +1279,7 @@ fn model_request_event(
         usage: None,
         composition: attempt.request_context.composition.clone(),
         wire_composition: attempt.wire.composition.clone(),
+        tool_result_projections: attempt.tool_result_projections.clone(),
         cache: attempt.request_context.cache.clone(),
         compaction: attempt.request_context.compaction.clone(),
         terminal_status: terminal.map(|terminal| terminal.status.as_str().to_string()),
@@ -2925,6 +3407,7 @@ async fn insert_inference_provider_attempt_admission(
     attempt: &InferenceProviderAttemptPlan,
     provider_wire_bytes: i64,
 ) -> ServiceResult<()> {
+    freeze_tool_result_projection_decisions(connection, attempt).await?;
     let insert_sql = matrixone_statement_with_null_shape(
         "INSERT INTO inference_provider_attempts
          (attempt_id, invocation_id, user_id, session_id, run_id, harness_run_id, attempt_index,
@@ -3696,6 +4179,10 @@ pub async fn begin_inference_provider_attempt(
             "inference invocation {} already has an open provider attempt; concurrent provider delivery is forbidden",
             attempt.invocation_id
         )));
+    }
+    if let Err(error) = freeze_tool_result_projection_decisions(&mut tx, attempt).await {
+        rollback_inference_tx(tx, "freeze tool-result projection decisions").await;
+        return Err(error);
     }
     let insert_sql = matrixone_statement_with_null_shape(
         "INSERT INTO inference_provider_attempts
@@ -7857,6 +8344,57 @@ mod tests {
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         );
         assert_eq!(wire.provider_wire_bytes(), 4_096);
+    }
+
+    #[test]
+    fn provider_attempt_binds_validated_tool_result_projection_to_exact_wire() {
+        let base_attempt = exact_provider_attempt_with_transition();
+        let wire_hash = base_attempt.wire().provider_wire_hash().to_string();
+        let decision = astra_turn_types::ToolResultProjectionDecisionV1::new(
+            "run-1",
+            "call-1",
+            "a".repeat(64),
+            100,
+            "b".repeat(64),
+            "c".repeat(64),
+            astra_turn_types::ToolResultProjectionDispositionV1::Baseline,
+            Vec::new(),
+            None,
+            Some(astra_turn_types::ToolResultProjectionFallbackV1::JudgmentUnavailable),
+            b"baseline body",
+        )
+        .unwrap();
+        let binding = astra_turn_types::ToolResultProjectionBindingV1 {
+            receipt: astra_turn_types::ToolResultProjectionReceiptV1 {
+                decision_sha256: decision.decision_sha256.clone(),
+                provider_wire_sha256: wire_hash,
+                state: astra_turn_types::ToolResultProjectionWireStateV1::Included,
+                actual_ranges: Vec::new(),
+                actual_body_sha256: Some(decision.rendered_body_sha256.clone()),
+                reason: None,
+            },
+            decision,
+        };
+        let attempt = base_attempt
+            .clone()
+            .with_tool_result_projections(vec![binding.clone()])
+            .unwrap();
+        let (_, encoded, event) =
+            model_request_event(&attempt, ModelRequestEventStage::Accepted, None).unwrap();
+        assert_eq!(event.tool_result_projections, vec![binding.clone()]);
+        let decoded: ModelRequestContextEvent = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            decoded.tool_result_projections,
+            event.tool_result_projections
+        );
+
+        let mut wrong_binding = binding;
+        wrong_binding.receipt.provider_wire_sha256 = "e".repeat(64);
+        assert!(
+            base_attempt
+                .with_tool_result_projections(vec![wrong_binding])
+                .is_err()
+        );
     }
 
     #[test]
