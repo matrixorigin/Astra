@@ -123,17 +123,6 @@ impl PersistedToolResultWindow {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PersistedFormat {
-    PlainText,
-    PrettyJson,
-}
-
-struct PersistedContent {
-    text: String,
-    format: PersistedFormat,
-}
-
 /// Persisted model projection plus the journal-only authority for its full
 /// bytes. The replacement is intentionally unchanged from the ordinary
 /// provider-facing representation; only the typed journal record carries the
@@ -519,8 +508,7 @@ pub fn prepare_tool_result_for_compaction(
             "run_id and tool_call_id must be valid non-empty identifiers",
         )));
     }
-    let persisted = persistable_content(content);
-    let persisted_bytes = persisted.text.as_bytes();
+    let persisted_bytes = content.as_bytes();
     let byte_len = u64::try_from(persisted_bytes.len()).map_err(|_| {
         ToolResultPersistenceError::Io(io::Error::other(
             "persisted tool result exceeds supported byte length",
@@ -596,11 +584,10 @@ fn persist_tool_document(
     let safe_id = safe_filename_stem(tool_call_id);
     let file_path = dir.join(format!("{safe_id}.txt"));
 
-    let persisted = persistable_content(content);
     if let Some(run_id) = run_id {
         let authoritative_path =
             run_scoped_document_path(session_dir, run_id, tool_call_id, document_kind);
-        match write_immutable_result(&authoritative_path, persisted.text.as_bytes()) {
+        match write_immutable_result(&authoritative_path, content.as_bytes()) {
             Ok(()) => {}
             Err(ImmutableWriteError::IdentityConflict) => {
                 return Err(ToolResultPersistenceError::IdentityConflict {
@@ -621,7 +608,7 @@ fn persist_tool_document(
     // run-scoped file.  Once a run-bound file exists, failure of this mutable
     // convenience projection must not invalidate the immutable artifact.
     if document_kind.is_result()
-        && let Err(error) = std::fs::write(&file_path, persisted.text.as_str())
+        && let Err(error) = std::fs::write(&file_path, content)
     {
         if run_id.is_none() {
             return Err(ToolResultPersistenceError::Io(error));
@@ -633,7 +620,7 @@ fn persist_tool_document(
         );
     }
 
-    let persisted_bytes = persisted.text.as_bytes();
+    let persisted_bytes = content.as_bytes();
     let byte_len = u64::try_from(persisted_bytes.len()).map_err(|_| {
         ToolResultPersistenceError::Io(io::Error::other(
             "persisted tool result exceeds supported byte length",
@@ -657,7 +644,7 @@ fn persist_tool_document(
         },
     );
     Ok(PersistedWrite {
-        replacement: build_replacement(tool_call_id, tool_name, content, &persisted, &artifact_uri),
+        replacement: build_replacement(tool_call_id, tool_name, content, &artifact_uri),
         byte_len,
         content_sha256,
     })
@@ -1105,6 +1092,43 @@ fn read_verified_persisted_result_window(
     read_persisted_result_window_at_path(&file_path, offset, max_bytes)
 }
 
+/// Verify one immutable result in its owner-scoped session store, read a
+/// bounded prefix, and derive stable source ranges from that verified window.
+///
+/// Full-file digest verification is storage integrity work and may read the
+/// complete artifact. `scan_bytes` bounds only the bytes exposed to candidate
+/// construction; the returned coverage never conflates those two costs.
+pub fn read_verified_tool_result_chunk_projection(
+    session_dir: &Path,
+    descriptor: &astra_services::session_journal::ToolResultArtifactDescriptor,
+    scan_bytes: usize,
+    target_chunk_bytes: usize,
+    max_chunks: usize,
+) -> Result<Option<crate::tool::result::chunks::ToolResultChunkProjection>, String> {
+    if !descriptor.document_kind.is_result() {
+        return Err("runtime guidance is not eligible for tool-result selection".to_string());
+    }
+    if scan_bytes == 0 || scan_bytes > crate::tool::result::chunks::MAX_TOOL_RESULT_SCAN_BYTES {
+        return Err(format!(
+            "scan_bytes must be between 1 and {}",
+            crate::tool::result::chunks::MAX_TOOL_RESULT_SCAN_BYTES
+        ));
+    }
+    let Some(window) =
+        read_verified_persisted_result_window(session_dir, descriptor, 0, scan_bytes)?
+    else {
+        return Ok(None);
+    };
+    crate::tool::result::chunks::project_tool_result_chunks(
+        descriptor,
+        &window,
+        target_chunk_bytes,
+        max_chunks,
+    )
+    .map(Some)
+    .map_err(ToString::to_string)
+}
+
 /// Return the greatest UTF-8 boundary at or before `offset` without loading
 /// the whole artifact.  A UTF-8 scalar is at most four bytes, so at most three
 /// one-byte probes are required.  The caller has already checked that
@@ -1250,22 +1274,6 @@ pub fn session_tool_result_artifact_uri_for_descriptor(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn persistable_content(content: &str) -> PersistedContent {
-    if content.lines().count() <= 1
-        && let Ok(value) = serde_json::from_str::<Value>(content)
-        && let Ok(pretty) = serde_json::to_string_pretty(&value)
-    {
-        return PersistedContent {
-            text: pretty,
-            format: PersistedFormat::PrettyJson,
-        };
-    }
-    PersistedContent {
-        text: content.to_string(),
-        format: PersistedFormat::PlainText,
-    }
-}
-
 /// Return the encoded length of a valid UTF-8 scalar from its first byte.
 /// Continuation bytes and invalid leading bytes deliberately return `None`.
 fn utf8_scalar_len(first: u8) -> Option<usize> {
@@ -1281,13 +1289,11 @@ fn utf8_scalar_len(first: u8) -> Option<usize> {
 fn build_replacement(
     tool_call_id: &str,
     tool_name: &str,
-    original_content: &str,
-    persisted: &PersistedContent,
+    persisted_content: &str,
     artifact_uri: &str,
 ) -> String {
-    let total_chars = original_content.chars().count();
-    let stored_chars = persisted.text.chars().count();
-    let preview = model_preview(&persisted.text, PREVIEW_CHARS);
+    let total_chars = persisted_content.chars().count();
+    let preview = model_preview(persisted_content, PREVIEW_CHARS);
 
     // Try to cut at a newline for cleaner preview
     let preview = if let Some(nl_pos) = preview.rfind('\n') {
@@ -1299,13 +1305,6 @@ fn build_replacement(
     } else {
         &preview
     };
-    let format_note = match persisted.format {
-        PersistedFormat::PlainText => String::new(),
-        PersistedFormat::PrettyJson => format!(
-            "Stored as pretty JSON for readable line ranges ({stored_chars} chars on disk; semantic JSON unchanged).\n         "
-        ),
-    };
-
     format!(
         "{PERSISTED_TAG_OPEN}\n\
          Tool `{tool_name}` produced {total_chars} chars of output.\n\
@@ -1313,7 +1312,6 @@ fn build_replacement(
          Artifact handle: {artifact_uri}\n\
          Storage: session tool-result artifact.\n\
          Reading retained output requires an authorized artifact reader; the handle does not grant access. Do not search, copy, or read physical local session paths.\n\
-         {format_note}\
          \n\
          Preview (~{prev_len} chars; structured head/tail when available):\n\
          {preview}\n\
@@ -1984,7 +1982,7 @@ mod tests {
     }
 
     #[test]
-    fn large_single_line_json_is_persisted_as_pretty_json() {
+    fn large_single_line_json_is_persisted_without_rewriting_source_bytes() {
         let dir = std::env::temp_dir().join("trs_pretty_json");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
@@ -2006,19 +2004,10 @@ mod tests {
             maybe_persist_tool_result(&dir, "call-json", "agent_fanout", &content).unwrap();
         let recovered = read_persisted_result(&dir, "call-json").unwrap();
 
-        assert!(
-            replacement.contains("Stored as pretty JSON"),
-            "{replacement}"
-        );
         assert!(replacement.contains("\"results\""), "{replacement}");
-        assert!(
-            recovered.lines().count() > 100,
-            "persisted JSON must be readable by line range, got {} lines",
-            recovered.lines().count()
-        );
         assert_eq!(
-            serde_json::from_str::<Value>(&recovered).unwrap(),
-            serde_json::from_str::<Value>(&content).unwrap()
+            recovered, content,
+            "artifact ranges must address exact source bytes"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2121,6 +2110,49 @@ mod tests {
         )));
         assert!(rendered.contains("Continue with introspect("));
         assert!(!rendered.contains(dir.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn verified_chunk_projection_is_owner_scoped_bounded_and_makes_unicode_progress() {
+        let owner = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let content = format!("😀{}\nTAIL-EVIDENCE\n", "middle\n".repeat(20_000));
+        let persisted = persist_tool_result_with_descriptor(
+            owner.path(),
+            "run-chunks",
+            "call-chunks",
+            "bash",
+            &content,
+        )
+        .unwrap();
+
+        let projection = read_verified_tool_result_chunk_projection(
+            owner.path(),
+            &persisted.descriptor,
+            1,
+            1,
+            2,
+        )
+        .unwrap()
+        .expect("owner can read its artifact");
+        assert_eq!(projection.scanned_bytes, 4);
+        assert!(!projection.scan_complete);
+        assert_eq!(projection.chunks.len(), 1);
+        assert_eq!(projection.chunks[0].start_byte, 0);
+        assert_eq!(projection.chunks[0].end_byte, 4);
+
+        assert!(
+            read_verified_tool_result_chunk_projection(
+                other.path(),
+                &persisted.descriptor,
+                1024,
+                128,
+                4,
+            )
+            .unwrap()
+            .is_none(),
+            "the same descriptor does not cross its session store boundary"
+        );
     }
 
     #[test]

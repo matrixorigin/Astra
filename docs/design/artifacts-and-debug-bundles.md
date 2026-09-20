@@ -70,6 +70,20 @@ Requirements:
 
 Large or unsafe tool output should be stored as artifact and summarized through the tool result quality firewall.
 
+The immutable tool-result artifact preserves the exact UTF-8 bytes after the
+existing safety/redaction boundary and before lossy model presentation. Storage
+does not pretty-print or otherwise rewrite those bytes: descriptor hashes,
+byte ranges, recovery windows, and any relevance-selection chunks must all
+address the same source. Formatting belongs to bounded display projections.
+
+Semantic chunks are deterministic navigation over that artifact, not separate
+artifacts or generated summaries. Their identities bind the artifact document
+kind, run/call identity, content digest, chunker version, and byte range. Chunk
+construction consumes an owner-scoped, integrity-verified, bounded source
+window; it reports scanned coverage separately from full-artifact integrity
+verification. A partial scan must never imply that unscanned content was
+judged irrelevant.
+
 Artifact possession does not grant read authority. Stored result previews and
 compact projections retain the artifact identity without promising a callable
 reader. The shared request assembler derives bounded recovery guidance from
