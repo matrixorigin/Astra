@@ -413,7 +413,11 @@ pub fn build_tool_result_selection_judgment(
         schema_version: 1,
         state: serde_json::json!({
             "policy": "Judge only the supplied exact source chunks. Do not infer that unscanned source is irrelevant. Mark uncertainty rather than guessing. Selection cannot alter tool status, permissions, or durable evidence.",
-            "goal": truncate_chars(goal, MAX_GOAL_CHARS),
+            "goal": bounded_goal(goal),
+            "goal_coverage": {
+                "source_chars": goal.chars().count(),
+                "complete": tool_result_selection_goal_coverage_complete(goal),
+            },
             "tool_name": truncate_chars(tool_name, MAX_TOOL_NAME_CHARS),
             "artifact": {
                 "document_kind": descriptor.document_kind,
@@ -430,6 +434,23 @@ pub fn build_tool_result_selection_judgment(
         }),
         questions,
     })
+}
+
+/// Stable identity of the exact typed selection problem presented to a judge.
+/// The request uses ordered maps, so its JSON encoding is deterministic.
+pub fn tool_result_selection_target_sha256(
+    goal: &str,
+    request: &JudgmentRequest,
+) -> Result<String, &'static str> {
+    request.validate()?;
+    let encoded = serde_json::to_vec(&(goal, request))
+        .map_err(|_| "serialize tool-result selection judgment")?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+#[must_use]
+pub fn tool_result_selection_goal_coverage_complete(goal: &str) -> bool {
+    goal.chars().count() <= MAX_GOAL_CHARS
 }
 
 /// Convert a validated typed response into a conservative recommendation.
@@ -557,6 +578,22 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
+fn bounded_goal(value: &str) -> String {
+    let total = value.chars().count();
+    if total <= MAX_GOAL_CHARS {
+        return value.to_string();
+    }
+    const MARKER: &str = "\n… goal middle omitted …\n";
+    let marker_chars = MARKER.chars().count();
+    let retained = MAX_GOAL_CHARS.saturating_sub(marker_chars);
+    let head = retained / 2;
+    let tail = retained.saturating_sub(head);
+    let mut bounded = value.chars().take(head).collect::<String>();
+    bounded.push_str(MARKER);
+    bounded.extend(value.chars().skip(total.saturating_sub(tail)));
+    bounded
+}
+
 #[cfg(test)]
 mod tests {
     use astra_turn_types::{JudgmentAnswer, JudgmentResponse};
@@ -624,6 +661,63 @@ mod tests {
             )
             .is_err(),
             "chunk identities must remain bound to their artifact descriptor"
+        );
+    }
+
+    #[test]
+    fn judgment_target_binds_goal_and_preserves_late_constraints() {
+        let (descriptor, projection) = fixture();
+        let first_goal = format!("{}must use production", "context ".repeat(200));
+        let second_goal = format!("{}must use staging", "context ".repeat(200));
+        let first =
+            build_tool_result_selection_judgment(&first_goal, "exec", &descriptor, &projection)
+                .unwrap();
+        let second =
+            build_tool_result_selection_judgment(&second_goal, "exec", &descriptor, &projection)
+                .unwrap();
+
+        assert!(
+            first.state["goal"]
+                .as_str()
+                .unwrap()
+                .contains("goal middle omitted")
+        );
+        assert!(
+            first.state["goal"]
+                .as_str()
+                .unwrap()
+                .ends_with("must use production")
+        );
+        assert_ne!(
+            tool_result_selection_target_sha256(&first_goal, &first).unwrap(),
+            tool_result_selection_target_sha256(&second_goal, &second).unwrap(),
+            "a changed late constraint must create a different semantic target"
+        );
+    }
+
+    #[test]
+    fn target_identity_binds_an_omitted_middle_constraint() {
+        let (descriptor, projection) = fixture();
+        let prefix = "x".repeat(600);
+        let suffix = "y".repeat(600);
+        let production_goal = format!("{prefix}use production only{suffix}");
+        let staging_goal = format!("{prefix}use staging only{suffix}");
+        let production = build_tool_result_selection_judgment(
+            &production_goal,
+            "exec",
+            &descriptor,
+            &projection,
+        )
+        .unwrap();
+        let staging =
+            build_tool_result_selection_judgment(&staging_goal, "exec", &descriptor, &projection)
+                .unwrap();
+
+        assert_eq!(production.state["goal"], staging.state["goal"]);
+        assert_eq!(production.state["goal_coverage"]["complete"], false);
+        assert_ne!(
+            tool_result_selection_target_sha256(&production_goal, &production).unwrap(),
+            tool_result_selection_target_sha256(&staging_goal, &staging).unwrap(),
         );
     }
 
