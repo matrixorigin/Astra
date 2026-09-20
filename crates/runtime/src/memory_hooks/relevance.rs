@@ -17,7 +17,7 @@ use astra_turn_types::{
 use super::inference::{MemoryInferencePort, MemoryInferenceRequest};
 
 /// Prompt for the selector model to judge memory relevance.
-pub const RELEVANCE_FILTER_PROMPT: &str = "Judge each memory independently by its contribution to the current task. A memory need only supply one requested fact or applicable constraint, not answer the whole task. Keep all such contributions. Respect the requested subject, scope and current instructions; shared words alone are insufficient. Without task context, answer no. Mark uncertainty rather than guess; uncertain candidates are excluded.";
+pub const RELEVANCE_FILTER_PROMPT: &str = "Judge each memory independently by its contribution to the current task. A memory need only supply one requested fact or applicable constraint, not answer the whole task. Keep all such contributions. Respect the requested subject, scope and current instructions; shared words alone are insufficient. Without task context, answer no. Mark uncertainty rather than guess; uncertain candidates are retained after clear matches so optional judgment cannot silently erase potentially useful context.";
 
 /// Business policy for explicitly rejected previously injected memories.
 pub const MEMORY_FEEDBACK_FILTER_PROMPT: &str = "Identify candidates the latest user message explicitly rejects as irrelevant, stale, wrong, conflicting, or no longer applicable. A task change alone or a current-task exception to a general lesson is not rejection. Mark uncertainty rather than guess; uncertain candidates are excluded.";
@@ -69,6 +69,7 @@ fn parse_relevance_response(
         &normalized.response,
         memory_count,
         RELEVANCE_THRESHOLD,
+        true,
     ))
 }
 
@@ -76,11 +77,18 @@ fn selector_indices(
     response: &JudgmentResponse,
     memory_count: usize,
     threshold: f64,
+    retain_uncertain: bool,
 ) -> Vec<usize> {
-    // 0.5 is abstention, never an affirmative relevance/dismissal decision.
-    (0..memory_count)
+    let mut selected = (0..memory_count)
         .filter(|i| response.answers[&i.to_string()].probability() > threshold)
-        .collect()
+        .collect::<Vec<_>>();
+    if retain_uncertain {
+        selected.extend(
+            (0..memory_count)
+                .filter(|i| response.answers[&i.to_string()].probability() == threshold),
+        );
+    }
+    selected
 }
 
 /// Filter memories by the indices returned from the selector model.
@@ -123,6 +131,17 @@ pub fn lexical_relevant_indices(user_message: &str, items: &[String]) -> Vec<usi
             .then_with(|| left_idx.cmp(right_idx))
     });
     scored.into_iter().map(|(idx, _)| idx).collect()
+}
+
+/// Failure fallback for an optional selector. Local evidence can rank bounded
+/// candidates, but lack of lexical overlap is not proof of irrelevance. Keep
+/// the remaining retrieval-ranked candidates after the evidenced matches so a
+/// missing/invalid judge cannot weaken the no-enhancement baseline.
+fn lexical_fallback_indices(user_message: &str, items: &[String]) -> Vec<usize> {
+    let mut ranked = lexical_relevant_indices(user_message, items);
+    let matched = ranked.iter().copied().collect::<HashSet<_>>();
+    ranked.extend((0..items.len()).filter(|index| !matched.contains(index)));
+    ranked
 }
 
 fn meaningful_terms(text: &str) -> HashSet<String> {
@@ -221,7 +240,8 @@ fn is_meaningful_term(term: &str) -> bool {
 /// Filter a list of text items through the selector model.
 /// Returns only items deemed relevant to `user_message`.
 ///
-/// On transport/model errors, falls back to the deterministic lexical gate.
+/// On transport/model errors, falls back to deterministic lexical ranking
+/// while retaining the bounded candidate set.
 /// If the selector explicitly returns no relevant indices, returns an empty
 /// list. The relevance question must recognize partial task contributions as
 /// useful; a missed necessary fact can prevent a correct downstream answer.
@@ -286,6 +306,8 @@ pub async fn select_memories(
             })
             .collect(),
         elapsed_ms: 0,
+        candidate_coverage: None,
+        prompt_projection: None,
     };
     if items.is_empty() {
         return report;
@@ -317,8 +339,12 @@ pub async fn select_memories(
                 match normalize_judgment_response(&judgment, &text, client.model_name()) {
                     Err(_) => report.reason = Reason::InvalidResponse,
                     Ok(normalized) => {
-                        let indices =
-                            selector_indices(&normalized.response, items.len(), threshold);
+                        let indices = selector_indices(
+                            &normalized.response,
+                            items.len(),
+                            threshold,
+                            !dismissal,
+                        );
                         report.selection_order = indices.iter().map(|i| *i as u32).collect();
                         report.method = Method::Model;
                         report.reason = Reason::Completed;
@@ -339,7 +365,7 @@ pub async fn select_memories(
     }
     if report.method != Method::Model && !dismissal {
         report.method = Method::Lexical;
-        let indices = lexical_relevant_indices(user_message, items);
+        let indices = lexical_fallback_indices(user_message, items);
         report.selection_order = indices.iter().map(|i| *i as u32).collect();
         for index in indices {
             report.candidates[index].selected = true;
@@ -517,7 +543,7 @@ mod tests {
         for (input, expected) in [
             (r#"{"true":["4","0","2"],"uncertain":[]}"#, vec![0, 2, 4]),
             (r#"{"true":[],"uncertain":[]}"#, vec![]),
-            (r#"{"true":["1"],"uncertain":["2"]}"#, vec![1]),
+            (r#"{"true":["1"],"uncertain":["2"]}"#, vec![1, 2]),
         ] {
             assert_eq!(parse_relevance_response(input, 5).unwrap(), expected);
         }
@@ -570,8 +596,8 @@ mod tests {
                 M::Model,
                 vec![0, 1],
             ),
-            ("invalid", R::InvalidResponse, M::Lexical, vec![0]),
-            ("", R::CallUnavailable, M::Lexical, vec![0]),
+            ("invalid", R::InvalidResponse, M::Lexical, vec![0, 1]),
+            ("", R::CallUnavailable, M::Lexical, vec![0, 1]),
         ] {
             let report = select_memories(
                 Some(&FixedDecision(response)),
@@ -762,9 +788,11 @@ mod tests {
             assert!(criteria.no.contains("another scope"));
             assert!(criteria.no.contains("explicitly excluded"));
         }
-        // Better question semantics must not silently turn abstention into yes.
+        // Better question semantics must not turn abstention into evidence of
+        // irrelevance. Rank the clear match first, retain the uncertain item
+        // behind it, and still exclude the explicit negative.
         let response = r#"{"schema_version":1,"model":"native","answers":{"0":{"type":"noul","noul":0.5},"1":{"type":"noul","noul":0.51},"2":{"type":"noul","noul":0.49}}}"#;
-        assert_eq!(parse_relevance_response(response, 3).unwrap(), vec![1]);
+        assert_eq!(parse_relevance_response(response, 3).unwrap(), vec![1, 0]);
     }
 
     #[test]
@@ -833,8 +861,11 @@ mod tests {
         let result = filter_memories(&params, &test_scope(), "rust executor review", &items).await;
         assert_eq!(
             result,
-            vec!["cargo test for rust executor changes".to_string()],
-            "unreachable server should fall back to local relevance"
+            vec![
+                "cargo test for rust executor changes".to_string(),
+                "browser verification for html pages".to_string()
+            ],
+            "unreachable server should rank locally without dropping the baseline candidates"
         );
     }
 
@@ -951,7 +982,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filter_memories_malformed_selector_output_uses_lexical_fallback() {
+    async fn malformed_selector_ranks_locally_without_dropping_baseline_candidates() {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "<think>[0, 1]</think>").await;
         let params = DirectMemoryInferenceClient {
@@ -974,7 +1005,10 @@ mod tests {
         let result = filter_memories(&params, &test_scope(), "rust executor review", &items).await;
         assert_eq!(
             result,
-            vec!["cargo test for rust executor changes".to_string()]
+            vec![
+                "cargo test for rust executor changes".to_string(),
+                "browser verification for html pages".to_string()
+            ]
         );
     }
 
@@ -1079,7 +1113,7 @@ mod tests {
                 false,
             )
             .await;
-            assert_eq!(report.selected_indices(), vec![0]);
+            assert_eq!(report.selected_indices(), vec![0, 1]);
             assert_eq!(
                 report
                     .candidates

@@ -1030,7 +1030,8 @@ mod tests {
                         "session_id":"s", "turn":1, "operation":"relevance", "method":"model",
                         "reason":"completed", "model":"jev-test", "elapsed_ms":398,
                         "selection_order":[0], "candidates":[{"index":0,"selected":true,"probability_bps":9000},
-                                      {"index":1,"selected":false,"probability_bps":1000}]
+                                      {"index":1,"selected":false,"probability_bps":1000}],
+                        "prompt_projection":{"selected_candidates":1,"included_candidates":1}
                     }))
                     .unwrap(),
                 ],
@@ -1110,12 +1111,13 @@ mod tests {
         );
         assert!(!output.contains("trace"), "{output}");
         assert!(output.contains("2 candidates → 1 selected"), "{output}");
+        assert!(output.contains("1/1 entered request"), "{output}");
         assert!(
             output.contains("Candidate 1 · selected · model score 90.00%"),
             "{output}"
         );
         assert!(
-            output.contains("final prompt injection not measured"),
+            output.contains("final request projection measured"),
             "{output}"
         );
     }

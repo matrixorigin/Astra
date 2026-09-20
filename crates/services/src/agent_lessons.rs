@@ -148,6 +148,10 @@ pub const MIN_LESSON_ACTION_CHARS: usize = 12;
 /// Minimum distinct word count (Unicode word-ish tokens). `"test"` → 1,
 /// `"run cargo test"` → 3.
 pub const MIN_LESSON_ACTION_WORDS: usize = 3;
+/// Maximum model-visible characters for one lesson candidate. Retrieval is an
+/// untrusted boundary; oversized lessons are rejected rather than truncated,
+/// because a missing suffix could remove a condition, exception, or negation.
+pub const MAX_LESSON_ACTION_CHARS: usize = 1_024;
 
 /// Lowercase phrases that sometimes surface from scratchpad memory
 /// storage but never carry reusable advice. Matched case-insensitively
@@ -223,6 +227,9 @@ pub fn memory_value_to_lesson_hint(m: &serde_json::Value) -> Option<LessonHint> 
     let content = m.get("content")?.as_str()?;
     let memory_type = m.get("memory_type")?.as_str()?;
     if !matches!(memory_type, "semantic" | "procedural") {
+        return None;
+    }
+    if content.chars().count() > MAX_LESSON_ACTION_CHARS {
         return None;
     }
     let action = sanitize_for_prompt(content);
@@ -531,6 +538,18 @@ mod tests {
             "memory_type": "procedural",
         });
         assert!(memory_value_to_lesson_hint(&m).is_some());
+    }
+
+    #[test]
+    fn mapper_rejects_oversized_prompt_content_without_changing_its_meaning() {
+        let m = serde_json::json!({
+            "content": format!(
+                "Always perform the destructive action {} unless the user has not approved it",
+                "x".repeat(10_000)
+            ),
+            "memory_type": "semantic",
+        });
+        assert!(memory_value_to_lesson_hint(&m).is_none());
     }
 
     #[test]

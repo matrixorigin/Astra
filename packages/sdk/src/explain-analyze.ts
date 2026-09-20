@@ -321,7 +321,7 @@ function isExplainContext(value: unknown, kind: string): value is ExplainAnalyze
 }
 
 function isMemorySelectionReport(value: unknown): value is MemorySelectionReport {
-  if (!isRecord(value) || Object.keys(value).some(k => !["session_id", "turn", "operation", "method", "reason", "model", "candidates", "selection_order", "elapsed_ms"].includes(k)) ||
+  if (!isRecord(value) || Object.keys(value).some(k => !["session_id", "turn", "operation", "method", "reason", "model", "candidates", "selection_order", "elapsed_ms", "candidate_coverage", "prompt_projection"].includes(k)) ||
       typeof value.session_id !== "string" || value.session_id.length === 0 || new TextEncoder().encode(value.session_id).length > 512 || /[\u0000-\u001f\u007f-\u009f]/u.test(value.session_id) ||
       !isNonNegativeInteger(value.turn) || value.turn === 0 || value.turn > 0xffff_ffff ||
       !["relevance", "dismissal", "reuse"].includes(String(value.operation)) ||
@@ -335,6 +335,17 @@ function isMemorySelectionReport(value: unknown): value is MemorySelectionReport
   const r = value as MemorySelectionReport;
   if (!Array.isArray(r.selection_order) || r.selection_order.length !== r.candidates.filter(c => c.selected).length ||
       new Set(r.selection_order).size !== r.selection_order.length || !r.selection_order.every(i => isNonNegativeInteger(i) && r.candidates[i]?.selected)) return false;
+  if (r.candidate_coverage !== undefined &&
+      (!isRecord(r.candidate_coverage) || Object.keys(r.candidate_coverage).some(k => !["source_items", "evaluated_candidates", "truncated"].includes(k)) ||
+       !isNonNegativeInteger(r.candidate_coverage.source_items) || !isNonNegativeInteger(r.candidate_coverage.evaluated_candidates) ||
+       r.candidate_coverage.evaluated_candidates !== r.candidates.length || r.candidate_coverage.source_items < r.candidate_coverage.evaluated_candidates ||
+       typeof r.candidate_coverage.truncated !== "boolean")) return false;
+  if (r.prompt_projection !== undefined &&
+      (!isRecord(r.prompt_projection) || Object.keys(r.prompt_projection).some(k => !["selected_candidates", "included_candidates"].includes(k)) ||
+       r.operation === "dismissal" || !isNonNegativeInteger(r.prompt_projection.selected_candidates) ||
+       r.prompt_projection.selected_candidates !== r.selection_order.length ||
+       !(r.prompt_projection.included_candidates === null ||
+         (isNonNegativeInteger(r.prompt_projection.included_candidates) && r.prompt_projection.included_candidates <= r.prompt_projection.selected_candidates)))) return false;
   const noScores = r.candidates.every(c => c.probability_bps === null);
   switch (r.reason) {
     case "completed": return r.method === "model" && r.operation !== "reuse" && r.model !== null && r.candidates.length > 0;
@@ -346,15 +357,19 @@ function isMemorySelectionReport(value: unknown): value is MemorySelectionReport
 }
 
 export function memorySelectionLines(report: MemorySelectionReport): string[] {
-  const reasons = { completed: "completed", no_candidates: "no candidates", no_selector: "no selector available",
-    call_unavailable: report.operation === "dismissal" ? "selector unavailable; memories kept" : "selector unavailable; local fallback", invalid_response: report.operation === "dismissal" ? "invalid selector response; memories kept" : "invalid selector response; local fallback",
+  const reasons = { completed: "completed", no_candidates: "no candidates", no_selector: report.operation === "dismissal" ? "no selector available; memories kept" : "no selector available; ranked locally, candidates kept",
+    call_unavailable: report.operation === "dismissal" ? "selector unavailable; memories kept" : "selector unavailable; ranked locally, candidates kept", invalid_response: report.operation === "dismissal" ? "invalid selector response; memories kept" : "invalid selector response; ranked locally, candidates kept",
     retrieval_unavailable: "retrieval failed", retrieval_timeout: "retrieval timed out", reused: "no new relevance check" };
   const selected = report.candidates.filter(c => c.selected).length;
   const action = report.operation === "dismissal" ? "dismissed" : report.operation === "reuse" ? "reused" : "selected";
   const method = report.method === "model" ? report.model ?? "model" : report.method === "lexical" ? "local keyword matching" : report.method === "reuse" ? "session cache" : "not run";
+  const coverage = report.candidate_coverage?.truncated ? ` · bounded ${report.candidate_coverage.source_items} source items to ${report.candidate_coverage.evaluated_candidates} candidates` : "";
+  const projection = report.prompt_projection === undefined ? "" : report.prompt_projection.selected_candidates === 0 ? " · no memory entered request" :
+    report.prompt_projection.included_candidates === null ? " · request inclusion unknown" : ` · ${report.prompt_projection.included_candidates}/${report.prompt_projection.selected_candidates} entered request`;
   const summary = report.reason.startsWith("retrieval_") ? `Memory retrieval unavailable · ${reasons[report.reason]}` :
-    `Memory selection · ${method} · ${report.candidates.length} candidates → ${selected} ${action} · ${report.elapsed_ms}ms · ${reasons[report.reason]}`;
-  return [summary, `Reported by CLI/Edge · turn ${report.turn} · same decision across request rounds · final prompt injection not measured`, ...report.candidates.map(c => {
+    `Memory selection · ${method} · ${report.candidates.length} candidates → ${selected} ${action} · ${report.elapsed_ms}ms · ${reasons[report.reason]}${coverage}${projection}`;
+  const projectionDetail = report.prompt_projection === undefined ? "final request projection unavailable" : "final request projection measured";
+  return [summary, `Reported by CLI/Edge · turn ${report.turn} · same decision across request rounds · ${projectionDetail}`, ...report.candidates.map(c => {
     const decision = report.operation === "dismissal" ? (c.selected ? "dismissed" : "kept") : (c.selected ? "selected" : "not selected");
     return `Candidate ${c.index + 1} · ${decision}${c.probability_bps === null ? "" : ` · model score ${(c.probability_bps / 100).toFixed(2)}%`}`;
   })];

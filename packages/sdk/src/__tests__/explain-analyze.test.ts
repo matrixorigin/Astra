@@ -434,7 +434,7 @@ describe("context facts", () => {
     const html = renderExplainAnalyzeHtml([event]);
     expect(html).toContain("2 candidates → 1 selected");
     expect(html).toContain("90.00%");
-    expect(html).toContain("final prompt injection not measured");
+    expect(html).toContain("final request projection unavailable");
     for (const bad of [
       { ...report, reason: "no_candidates" }, { ...report, method: "lexical" },
       { ...report, session_id: "" }, { ...report, turn: 0 },
@@ -444,6 +444,23 @@ describe("context facts", () => {
       { ...report, selection_order: [1] }, { ...report, selection_order: [0, 0] },
     ]) {
       expect(isExplainAnalyzeEventV1({ ...event, context: { assembly: { ...assembly, edge_memory_selection: [bad] } } })).toBe(false);
+    }
+  });
+
+  it("preserves bounded memory coverage and distinguishes known from unknown prompt inclusion", () => {
+    const base = { session_id: "s", turn: 1, operation: "relevance" as const,
+      method: "model" as const, reason: "completed" as const, model: "jev-test", elapsed_ms: 398, selection_order: [0],
+      candidates: [{ index: 0, selected: true, probability_bps: 9000 }],
+      candidate_coverage: { source_items: 20, evaluated_candidates: 1, truncated: true } };
+    for (const [included_candidates, expected] of [[1, "1/1 entered request"], [null, "request inclusion unknown"]] as const) {
+      const report = { ...base, prompt_projection: { selected_candidates: 1, included_candidates } };
+      const event = finished("context", "context_assembly", 0, 10, { context: { assembly: { ...assembly, edge_memory_selection: [report] } } });
+      expect(isExplainAnalyzeEventV1(event)).toBe(true);
+      expect(reduceExplainAnalyzeEvents([event]).nodes[0].context?.assembly?.edge_memory_selection).toEqual([report]);
+      const html = renderExplainAnalyzeHtml([event]);
+      expect(html).toContain("bounded 20 source items to 1 candidates");
+      expect(html).toContain(expected);
+      expect(html).toContain("final request projection measured");
     }
   });
 
