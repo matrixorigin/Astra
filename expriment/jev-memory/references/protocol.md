@@ -5,6 +5,9 @@ real Rust `select_memories` implementation, strict judgment codec, lexical/no-di
 fallbacks, and nonstream provider adapters. It is not a Server/DB/Offering-admission
 test, Memoria retrieval benchmark, or full tool-using Agent evaluation.
 
+See the [published results index](../results/README.md) for the retained final
+measurements, optimization baselines, and their complete structured evidence.
+
 ## Fixed comparison
 
 Three arms share the same synthetic candidate list and task:

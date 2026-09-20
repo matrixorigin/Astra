@@ -5,7 +5,7 @@
   <img alt="Astra" src="docs/assets/logo/astra-lockup.svg" width="340">
 </picture>
 
-### An agent runtime with EXPLAIN ANALYZE for context
+### An agent runtime with native Jev judgments and EXPLAIN ANALYZE for context
 
 **Inspect context and state. Adjust and recover with evidence. Run in your environment.**
 
@@ -30,8 +30,32 @@ request is assembled by a budgeted pipeline you can EXPLAIN, every attempt
 leaves evidence you can inspect, diff, and roll back, and execution runs
 through a Runner inside your own environment.
 
-**[Native Jev agent integration](#jev-agent-integration):** an optional judgment layer
-for memory relevance, lesson dismissal, request classification, and skill selection.
+### Jev agent integration
+
+Astra integrates **Jev (TypeSafe AI's System One model)** at the agent-runtime
+level: an optional judgment layer for AI agents, configured separately from the
+main generation model. Its structured answers feed four existing decision points:
+
+- **Agent memory filtering:** select memories that contribute facts or constraints to the current task.
+- **Lesson dismissal:** distinguish an explicit correction from a one-time exception.
+- **Request classification:** identify request requirements before runtime admission.
+- **Skill selection:** select a workflow when the evidence clearly supports one.
+
+These callers share typed questions, validated responses, provider routing, and
+usage accounting. Native probabilities retain their meaning; uncertainty,
+timeouts, and unavailable models follow each caller's bounded fallback rules.
+The runtime retains execution authority. An ordinary LLM can serve the same
+judgment role through the shared contract—Jev is optional.
+
+**[Configure Jev or another judgment model](docs/guides/memory-judgment-pilot.md)** ·
+**[Reproduce the memory evaluation](expriment/jev-memory/SKILL.md)** ·
+**[Read the results and evidence](expriment/jev-memory/results/README.md)**
+
+The evaluation compares No JEV, native JEV, and Flash JEV-like judgments for
+accuracy, relevance, latency, and cache-aware cost. It includes failures and
+optimization tradeoffs; it does not establish whole-agent cost savings.
+
+### Inspect context and execution
 
 | What did the model receive? | What changed, and what next? | Where does it run? |
 | --- | --- | --- |
@@ -75,31 +99,6 @@ context window Astra keeps for it, what it cut and why, and the Explain Analyze
 tree behind the answer.
 
 https://github.com/user-attachments/assets/c008be26-4320-413c-9ad6-100aefcfa728
-
-### Jev agent integration
-
-Astra integrates **Jev (TypeSafe AI's System One model)** at the agent-runtime
-level: an optional judgment layer for AI agents, configured separately from the
-main generation model.
-Its structured answers feed four existing decision points:
-
-- **Agent memory filtering:** select memories that contribute facts or constraints to the current task.
-- **Lesson dismissal:** distinguish an explicit correction from a one-time exception.
-- **Request classification:** identify request requirements before runtime admission.
-- **Skill selection:** select a workflow when the evidence clearly supports one.
-
-These callers share typed questions, validated responses, provider routing, and
-usage accounting. Native probabilities retain their meaning; uncertainty,
-timeouts, and unavailable models follow each caller's bounded fallback rules.
-The runtime retains execution authority. An ordinary LLM can serve the same
-judgment role through the shared contract—Jev is optional.
-
-**[Configure Jev or another judgment model](docs/guides/memory-judgment-pilot.md)** ·
-**[Reproduce the memory evaluation](expriment/jev-memory/SKILL.md)**
-
-The evaluation compares No JEV, native JEV, and Flash JEV-like judgments for
-accuracy, relevance, latency, and cache-aware cost. It includes failures and
-optimization tradeoffs; it does not establish whole-agent cost savings.
 
 ### Pick the layer you need
 
