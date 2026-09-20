@@ -54,6 +54,22 @@ pub enum ToolResultSelectionUnavailableReasonV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolResultSelectionExecutionV1 {
+    pub invocation_id: String,
+    pub model_name: String,
+    pub provider: String,
+}
+
+impl ToolResultSelectionExecutionV1 {
+    fn is_valid(&self) -> bool {
+        valid_id(&self.invocation_id, 256)
+            && valid_id(&self.model_name, 255)
+            && valid_id(&self.provider, 128)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ToolResultSelectionOutcomeV1 {
     Started,
@@ -66,8 +82,7 @@ pub enum ToolResultSelectionOutcomeV1 {
         irrelevant_chunks: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fallback: Option<ToolResultProjectionFallbackV1>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        judgment_invocation_id: Option<String>,
+        execution: ToolResultSelectionExecutionV1,
     },
     Baseline {
         decision_sha256: String,
@@ -79,7 +94,7 @@ pub enum ToolResultSelectionOutcomeV1 {
     Unavailable {
         reason: ToolResultSelectionUnavailableReasonV1,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        judgment_invocation_id: Option<String>,
+        execution: Option<ToolResultSelectionExecutionV1>,
     },
 }
 
@@ -121,7 +136,7 @@ impl ToolResultSelectionObservationV1 {
                 uncertain_chunks,
                 irrelevant_chunks,
                 fallback,
-                judgment_invocation_id,
+                execution,
             } => {
                 if relevant_chunks
                     .saturating_add(*uncertain_chunks)
@@ -132,7 +147,7 @@ impl ToolResultSelectionObservationV1 {
                 }
                 if !self.coverage.source_complete
                     || !self.coverage.goal_complete
-                    || judgment_invocation_id.is_none()
+                    || !execution.is_valid()
                     || *selected_chunks > self.coverage.candidate_chunks
                     || match (disposition, fallback) {
                         (ToolResultProjectionDispositionV1::Selected, None) => {
@@ -158,7 +173,7 @@ impl ToolResultSelectionObservationV1 {
                     *disposition,
                     *selected_chunks,
                     *fallback,
-                    judgment_invocation_id.as_deref(),
+                    Some(execution.invocation_id.as_str()),
                 )
             }
             ToolResultSelectionOutcomeV1::NotDispatched { .. } => Ok(()),
@@ -174,14 +189,8 @@ impl ToolResultSelectionObservationV1 {
                 }
                 Ok(())
             }
-            ToolResultSelectionOutcomeV1::Unavailable {
-                judgment_invocation_id,
-                ..
-            } => {
-                if judgment_invocation_id
-                    .as_deref()
-                    .is_some_and(|id| !valid_id(id, 256))
-                {
+            ToolResultSelectionOutcomeV1::Unavailable { execution, .. } => {
+                if execution.as_ref().is_some_and(|value| !value.is_valid()) {
                     return Err("invalid tool-result selection invocation identity");
                 }
                 Ok(())
@@ -259,6 +268,14 @@ mod tests {
         }
     }
 
+    fn execution() -> ToolResultSelectionExecutionV1 {
+        ToolResultSelectionExecutionV1 {
+            invocation_id: "invocation-1".into(),
+            model_name: "jev-1.13.0".into(),
+            provider: "typesafe".into(),
+        }
+    }
+
     #[test]
     fn selected_decision_requires_real_invocation_and_matching_counts() {
         let valid = observation(ToolResultSelectionOutcomeV1::Decided {
@@ -269,17 +286,13 @@ mod tests {
             uncertain_chunks: 0,
             irrelevant_chunks: 1,
             fallback: None,
-            judgment_invocation_id: Some("invocation-1".into()),
+            execution: execution(),
         });
         valid.validate().unwrap();
 
         let mut invalid = valid;
-        if let ToolResultSelectionOutcomeV1::Decided {
-            judgment_invocation_id,
-            ..
-        } = &mut invalid.outcome
-        {
-            *judgment_invocation_id = None;
+        if let ToolResultSelectionOutcomeV1::Decided { execution, .. } = &mut invalid.outcome {
+            execution.model_name.clear();
         }
         assert!(invalid.validate().is_err());
     }
@@ -293,7 +306,7 @@ mod tests {
         .unwrap();
         observation(ToolResultSelectionOutcomeV1::Unavailable {
             reason: ToolResultSelectionUnavailableReasonV1::ProviderPtlError,
-            judgment_invocation_id: None,
+            execution: None,
         })
         .validate()
         .unwrap();
@@ -301,6 +314,8 @@ mod tests {
 
     #[test]
     fn baseline_provenance_matches_how_the_decision_was_made() {
+        let mut missing_provenance = execution();
+        missing_provenance.invocation_id.clear();
         let model_baseline = observation(ToolResultSelectionOutcomeV1::Decided {
             decision_sha256: "b".repeat(64),
             disposition: ToolResultProjectionDispositionV1::Baseline,
@@ -309,7 +324,7 @@ mod tests {
             uncertain_chunks: 2,
             irrelevant_chunks: 0,
             fallback: Some(ToolResultProjectionFallbackV1::NoClearMatch),
-            judgment_invocation_id: None,
+            execution: missing_provenance,
         });
         assert!(model_baseline.validate().is_err());
 
@@ -332,7 +347,7 @@ mod tests {
             uncertain_chunks: 0,
             irrelevant_chunks: 1,
             fallback: None,
-            judgment_invocation_id: Some("invocation-1".into()),
+            execution: execution(),
         });
         assert!(selected.validate().is_err());
 

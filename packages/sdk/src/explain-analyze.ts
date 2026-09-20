@@ -64,6 +64,7 @@ const nodeKinds = new Set([
   "admission",
   "preparation",
   "context_assembly",
+  "judgment",
   "model_round",
   "provider_attempt",
   "tool_batch",

@@ -60,6 +60,23 @@ function finished(
 }
 
 describe("Explain Analyze graph reducer", () => {
+  it("accepts and renders a terminal judgment stage", () => {
+    const judgment = finished("tool-result-judgment", "judgment", 10, 25, {
+      round_index: 0,
+      label: "Tool-result judgment · jev-1.13.0 · selected 1/2 chunks",
+    });
+
+    expect(isExplainAnalyzeEventV1(judgment)).toBe(true);
+    const graph = reduceExplainAnalyzeEvents([judgment]);
+    expect(graph.integrity).toBe("consistent");
+    expect(graph.nodes).toHaveLength(1);
+    expect(graph.nodes[0]).toMatchObject({
+      kind: "judgment",
+      terminalObserved: true,
+    });
+    expect(renderExplainAnalyzeHtml([judgment])).toContain("jev-1.13.0");
+  });
+
   it("canonicalizes empty dependencies the same way for live and indexed replay facts", () => {
     const live = started("attempt", "provider_attempt", 0, {
       round_index: 0,

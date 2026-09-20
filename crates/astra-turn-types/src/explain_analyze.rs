@@ -24,6 +24,7 @@ pub enum ExplainAnalyzeNodeKindV1 {
     Admission,
     Preparation,
     ContextAssembly,
+    Judgment,
     ModelRound,
     ProviderAttempt,
     ToolBatch,

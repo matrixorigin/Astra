@@ -354,6 +354,7 @@ export type ExplainAnalyzeNodeKindV1 =
   | "admission"
   | "preparation"
   | "context_assembly"
+  | "judgment"
   | "model_round"
   | "provider_attempt"
   | "tool_batch"

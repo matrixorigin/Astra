@@ -4915,6 +4915,55 @@ impl ToolRouteObserver for ExplainAnalyzeToolRouteObserver {
 /// boundaries while leaving durable inference observation as the sole attempt
 /// authority. Live facts share the ordered host event lane; callers without a
 /// live lane publish the same facts through the ordinary host emitter.
+fn explain_tool_result_application(
+    bindings: &[astra_turn_types::ToolResultProjectionBindingV1],
+) -> Option<String> {
+    use astra_turn_types::{ToolResultProjectionDispositionV1, ToolResultProjectionWireStateV1};
+    if bindings.iter().any(|binding| binding.validate().is_err()) {
+        return Some("tool-result context adoption not confirmed".to_string());
+    }
+    let selected = bindings
+        .iter()
+        .filter(|binding| {
+            binding.decision.disposition == ToolResultProjectionDispositionV1::Selected
+        })
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        if bindings.iter().any(|binding| {
+            binding.receipt.state == ToolResultProjectionWireStateV1::Unknown
+        }) {
+            return Some("tool-result context adoption not confirmed".to_string());
+        }
+        return bindings
+            .iter()
+            .any(|binding| binding.receipt.state == ToolResultProjectionWireStateV1::Omitted)
+            .then(|| "tool-result context omitted from request".to_string());
+    }
+    let proposed = selected
+        .iter()
+        .map(|binding| binding.decision.selected_ranges.len())
+        .sum::<usize>();
+    let included = selected
+        .iter()
+        .map(|binding| binding.receipt.actual_ranges.len())
+        .sum::<usize>();
+    let all_included = selected
+        .iter()
+        .all(|binding| binding.receipt.state == ToolResultProjectionWireStateV1::Included);
+    if selected.iter().any(|binding| {
+        binding.receipt.state == ToolResultProjectionWireStateV1::Unknown
+    }) {
+        return Some("tool-result selection adoption not fully confirmed".to_string());
+    }
+    Some(if all_included && proposed == included {
+        format!("tool-result selection included · {included} chunk(s)")
+    } else if included > 0 {
+        format!("tool-result selection partially included · {included}/{proposed} chunks")
+    } else {
+        "tool-result selection not included".to_string()
+    })
+}
+
 struct ExplainAnalyzeProviderAttemptObserver<'a> {
     inner: &'a dyn crate::turn::llm::client::ProviderAttemptObserver,
     context: Option<ExplainAnalyzeContext>,
@@ -4923,6 +4972,7 @@ struct ExplainAnalyzeProviderAttemptObserver<'a> {
     model_round_index: u32,
     model_name: String,
     wire_model_name: Option<String>,
+    tool_result_application_labels: std::sync::Mutex<HashMap<u32, String>>,
     spans: std::sync::Mutex<HashMap<u32, ExplainAnalyzeProviderAttemptSpan>>,
 }
 
@@ -4944,6 +4994,7 @@ impl<'a> ExplainAnalyzeProviderAttemptObserver<'a> {
             model_round_index,
             model_name: model_name.into(),
             wire_model_name,
+            tool_result_application_labels: std::sync::Mutex::new(HashMap::new()),
             spans: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -4972,7 +5023,14 @@ impl crate::turn::llm::client::ProviderAttemptObserver
         &self,
         wire: &crate::turn::llm::client::ProviderWireRequestIdentity,
     ) -> Result<u32, astra_core::ClassifiedError> {
-        self.inner.begin_attempt(wire).await
+        let attempt_index = self.inner.begin_attempt(wire).await?;
+        if let Some(label) = explain_tool_result_application(&wire.tool_result_projections) {
+            self.tool_result_application_labels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(attempt_index, label);
+        }
+        Ok(attempt_index)
     }
 
     async fn finish_attempt(
@@ -5058,7 +5116,7 @@ impl crate::turn::llm::client::ProviderAttemptObserver
             return;
         };
         let started_at = Instant::now();
-        let model_label = match self
+        let mut model_label = match self
             .wire_model_name
             .as_deref()
             .filter(|wire_model| *wire_model != self.model_name)
@@ -5066,6 +5124,15 @@ impl crate::turn::llm::client::ProviderAttemptObserver
             Some(wire_model) => format!("{} → {}", self.model_name, wire_model),
             None => self.model_name.clone(),
         };
+        if let Some(application) = self
+            .tool_result_application_labels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&attempt_index)
+        {
+            model_label.push_str(" · ");
+            model_label.push_str(&application);
+        }
         let node = ExplainAnalyzeNode::new(
             context,
             format!("{parent_node_id}/physical/{attempt_index}"),
@@ -5447,7 +5514,7 @@ async fn complete_tool_result_projection_preparation(
             *observed_outcome = Some(
                 astra_turn_types::ToolResultSelectionOutcomeV1::Unavailable {
                     reason: astra_turn_types::ToolResultSelectionUnavailableReasonV1::Cancelled,
-                    judgment_invocation_id: None,
+                    execution: None,
                 },
             );
             return Err(error);
@@ -5460,16 +5527,19 @@ async fn complete_tool_result_projection_preparation(
                 astra_turn_types::ToolResultSelectionOutcomeV1::Unavailable {
                     reason:
                         astra_turn_types::ToolResultSelectionUnavailableReasonV1::ExecutionError,
-                    judgment_invocation_id: None,
+                    execution: None,
                 },
             );
             return Ok(preparation.prepared);
         }
     };
-    let judgment_invocation_id = response
-        .execution
-        .as_ref()
-        .map(|execution| execution.invocation_id.clone());
+    let judgment_execution = response.execution.as_ref().map(|execution| {
+        astra_turn_types::ToolResultSelectionExecutionV1 {
+            invocation_id: execution.invocation_id.clone(),
+            model_name: execution.model_name.clone(),
+            provider: execution.provider.clone(),
+        }
+    });
     if response.is_ptl_error || response.finish_reason.as_deref() != Some("stop") {
         // No complete semantic conclusion exists. Preserve this request's
         // baseline without freezing a failure across later healthy routes.
@@ -5480,7 +5550,7 @@ async fn complete_tool_result_projection_preparation(
                 } else {
                     astra_turn_types::ToolResultSelectionUnavailableReasonV1::UnexpectedFinish
                 },
-                judgment_invocation_id,
+                execution: judgment_execution,
             },
         );
         return Ok(preparation.prepared);
@@ -5500,20 +5570,20 @@ async fn complete_tool_result_projection_preparation(
                 astra_turn_types::ToolResultSelectionOutcomeV1::Unavailable {
                     reason:
                         astra_turn_types::ToolResultSelectionUnavailableReasonV1::InvalidResponse,
-                    judgment_invocation_id,
+                    execution: judgment_execution,
                 },
             );
             return Ok(preparation.prepared);
         }
     };
-    let Some(judgment_invocation_id) = judgment_invocation_id else {
+    let Some(judgment_execution) = judgment_execution else {
         // Every reusable model-derived decision, including NoClearMatch and
         // ProjectionNotSmaller, must be attributable to a real durable
         // auxiliary execution.
         *observed_outcome = Some(
             astra_turn_types::ToolResultSelectionOutcomeV1::Unavailable {
                 reason: astra_turn_types::ToolResultSelectionUnavailableReasonV1::MissingExecutionProvenance,
-                judgment_invocation_id: None,
+                execution: None,
             },
         );
         return Ok(preparation.prepared);
@@ -5529,7 +5599,7 @@ async fn complete_tool_result_projection_preparation(
                 *observed_outcome = Some(
                     astra_turn_types::ToolResultSelectionOutcomeV1::Unavailable {
                         reason: astra_turn_types::ToolResultSelectionUnavailableReasonV1::InvalidResponse,
-                        judgment_invocation_id: Some(judgment_invocation_id),
+                        execution: Some(judgment_execution),
                     },
                 );
                 return Ok(preparation.prepared);
@@ -5555,7 +5625,7 @@ async fn complete_tool_result_projection_preparation(
     if !recommendation.has_clear_match() {
         let prepared = baseline(
             astra_turn_types::ToolResultProjectionFallbackV1::NoClearMatch,
-            Some(judgment_invocation_id.clone()),
+            Some(judgment_execution.invocation_id.clone()),
         )?;
         *observed_outcome = Some(astra_turn_types::ToolResultSelectionOutcomeV1::Decided {
             decision_sha256: prepared.decision.decision_sha256.clone(),
@@ -5565,7 +5635,7 @@ async fn complete_tool_result_projection_preparation(
             uncertain_chunks,
             irrelevant_chunks,
             fallback: Some(astra_turn_types::ToolResultProjectionFallbackV1::NoClearMatch),
-            judgment_invocation_id: Some(judgment_invocation_id),
+            execution: judgment_execution,
         });
         preparation.prepared.push(prepared);
         return Ok(preparation.prepared);
@@ -5589,7 +5659,7 @@ async fn complete_tool_result_projection_preparation(
     }) else {
         let prepared = baseline(
             astra_turn_types::ToolResultProjectionFallbackV1::ProjectionNotSmaller,
-            Some(judgment_invocation_id.clone()),
+            Some(judgment_execution.invocation_id.clone()),
         )?;
         *observed_outcome = Some(astra_turn_types::ToolResultSelectionOutcomeV1::Decided {
             decision_sha256: prepared.decision.decision_sha256.clone(),
@@ -5599,7 +5669,7 @@ async fn complete_tool_result_projection_preparation(
             uncertain_chunks,
             irrelevant_chunks,
             fallback: Some(astra_turn_types::ToolResultProjectionFallbackV1::ProjectionNotSmaller),
-            judgment_invocation_id: Some(judgment_invocation_id),
+            execution: judgment_execution,
         });
         preparation.prepared.push(prepared);
         return Ok(preparation.prepared);
@@ -5609,7 +5679,7 @@ async fn complete_tool_result_projection_preparation(
             &rendered,
             &pending.target_sha256,
             &pending.canonical_identity,
-            judgment_invocation_id.clone(),
+            judgment_execution.invocation_id.clone(),
         )
         .map_err(|error| {
             astra_core::ClassifiedError::new(
@@ -5625,7 +5695,7 @@ async fn complete_tool_result_projection_preparation(
         uncertain_chunks,
         irrelevant_chunks,
         fallback: None,
-        judgment_invocation_id: Some(judgment_invocation_id),
+        execution: judgment_execution,
     });
     preparation
         .prepared
@@ -5682,6 +5752,83 @@ fn record_tool_result_selection_observation(
         if let Some(buffer) = state.turn_event_buffer.as_mut() {
             buffer.record_trace_span_v2(trace);
         }
+    }
+}
+
+fn explain_tool_result_selection(
+    coverage: &astra_turn_types::ToolResultSelectionCoverageV1,
+    outcome: &astra_turn_types::ToolResultSelectionOutcomeV1,
+) -> (String, astra_turn_types::ExplainAnalyzeOutcomeV1) {
+    use astra_turn_types::{
+        ExplainAnalyzeOutcomeV1, ToolResultProjectionDispositionV1, ToolResultProjectionFallbackV1,
+        ToolResultSelectionOutcomeV1,
+    };
+    match outcome {
+        ToolResultSelectionOutcomeV1::Started => (
+            "Tool-result judgment started".into(),
+            ExplainAnalyzeOutcomeV1::Waiting,
+        ),
+        ToolResultSelectionOutcomeV1::Decided {
+            disposition: ToolResultProjectionDispositionV1::Selected,
+            selected_chunks,
+            execution,
+            ..
+        } => (
+            format!(
+                "Tool-result judgment · {} · selected {selected_chunks}/{} chunks",
+                execution.model_name, coverage.candidate_chunks
+            ),
+            ExplainAnalyzeOutcomeV1::Succeeded,
+        ),
+        ToolResultSelectionOutcomeV1::Decided {
+            fallback: Some(ToolResultProjectionFallbackV1::NoClearMatch),
+            execution,
+            ..
+        } => (
+            format!(
+                "Tool-result judgment · {} · kept existing tool context (no clear match)",
+                execution.model_name
+            ),
+            ExplainAnalyzeOutcomeV1::Fallback,
+        ),
+        ToolResultSelectionOutcomeV1::Decided {
+            execution,
+            fallback: Some(ToolResultProjectionFallbackV1::ProjectionNotSmaller),
+            ..
+        } => (
+            format!(
+                "Tool-result judgment · {} · kept existing tool context (selection was not smaller)",
+                execution.model_name
+            ),
+            ExplainAnalyzeOutcomeV1::Fallback,
+        ),
+        ToolResultSelectionOutcomeV1::Decided { execution, .. } => (
+            format!(
+                "Tool-result judgment · {} · kept existing tool context",
+                execution.model_name
+            ),
+            ExplainAnalyzeOutcomeV1::Fallback,
+        ),
+        ToolResultSelectionOutcomeV1::Baseline { .. } => (
+            "Tool-result selection · kept existing tool context (incomplete evidence)".into(),
+            ExplainAnalyzeOutcomeV1::Fallback,
+        ),
+        ToolResultSelectionOutcomeV1::NotDispatched { .. } => (
+            "Tool-result selection · kept existing tool context (judgment unavailable)".into(),
+            ExplainAnalyzeOutcomeV1::Unavailable,
+        ),
+        ToolResultSelectionOutcomeV1::Unavailable { execution, .. } => (
+            execution.as_ref().map_or_else(
+                || "Tool-result judgment · unavailable; kept existing tool context".into(),
+                |execution| {
+                    format!(
+                        "Tool-result judgment · {} · unavailable; kept existing tool context",
+                        execution.model_name
+                    )
+                },
+            ),
+            ExplainAnalyzeOutcomeV1::Unavailable,
+        ),
     }
 }
 
@@ -11969,6 +12116,58 @@ impl ServerAgenticLoopHost {
         );
         self.start_explain_analyze_node(node);
         Some(node_id)
+    }
+
+    fn emit_explain_analyze_tool_result_selection(
+        &mut self,
+        state: &AgenticLoopState,
+        started_at: Instant,
+        coverage: &astra_turn_types::ToolResultSelectionCoverageV1,
+        outcome: &astra_turn_types::ToolResultSelectionOutcomeV1,
+    ) {
+        let Some(context) = self.explain_analyze_context.clone() else {
+            return;
+        };
+        let finished_at = Instant::now();
+        let (label, explain_outcome) = explain_tool_result_selection(coverage, outcome);
+        let parent_node_id = Self::explain_phase_node(
+            &context,
+            TurnPhaseKind::RequestPreparation,
+            state.current_round_index,
+            0,
+            started_at,
+        )
+        .node_id;
+        let node = ExplainAnalyzeNode::new(
+            &context,
+            format!(
+                "{}/judgment/tool_result/{}",
+                context.root_node_id,
+                context.next_event_id()
+            ),
+            Some(parent_node_id),
+            astra_turn_types::ExplainAnalyzeNodeKindV1::Judgment,
+            label,
+            started_at,
+            Some(state.current_round_index),
+            None,
+        );
+        let duration_ms = u64::try_from(
+            finished_at
+                .saturating_duration_since(started_at)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        if let Some(event) = context.event(
+            &node,
+            astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
+            finished_at,
+            Some(duration_ms),
+            Some(explain_outcome),
+            None,
+        ) {
+            self.emit_progress_event(event);
+        }
     }
 
     fn finish_explain_analyze_context_assembly(
@@ -19609,6 +19808,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     },
                 ))
             });
+        let tool_result_selection_started_at = Instant::now();
         let (tool_result_judgment_client, tool_result_client_unavailable) = if let Some(pending) =
             tool_result_projection_preparation.pending.as_ref()
             && pending.has_complete_judgment_evidence()
@@ -19648,9 +19848,27 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &mut tool_result_selection_outcome,
         )
         .await;
+        if prepared_tool_result_projection_result.is_err()
+            && tool_result_selection_outcome.is_none()
+            && tool_result_evaluation.is_some()
+        {
+            tool_result_selection_outcome = Some(
+                astra_turn_types::ToolResultSelectionOutcomeV1::Unavailable {
+                    reason:
+                        astra_turn_types::ToolResultSelectionUnavailableReasonV1::ExecutionError,
+                    execution: None,
+                },
+            );
+        }
         if let (Some((correlation, coverage)), Some(outcome)) =
             (tool_result_evaluation, tool_result_selection_outcome)
         {
+            self.emit_explain_analyze_tool_result_selection(
+                state,
+                tool_result_selection_started_at,
+                &coverage,
+                &outcome,
+            );
             record_tool_result_selection_observation(
                 state,
                 &self.session_id,
@@ -22680,6 +22898,55 @@ mod tests {
             Some("invocation-actual")
         );
         assert_eq!(prepared[0].decision.selected_ranges.len(), 1);
+        let (label, explain_outcome) = explain_tool_result_selection(
+            &astra_turn_types::ToolResultSelectionCoverageV1 {
+                source_bytes: 100,
+                scanned_bytes: 100,
+                candidate_chunks: 2,
+                source_complete: true,
+                goal_complete: true,
+            },
+            outcome.as_ref().unwrap(),
+        );
+        assert!(label.contains("jev-1.13.0") && label.contains("selected 1/2 chunks"));
+        assert_eq!(
+            explain_outcome,
+            astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded
+        );
+        let decision = prepared[0].decision.clone();
+        let application =
+            explain_tool_result_application(&[astra_turn_types::ToolResultProjectionBindingV1 {
+                receipt: astra_turn_types::ToolResultProjectionReceiptV1 {
+                    decision_sha256: decision.decision_sha256.clone(),
+                    provider_wire_sha256: "d".repeat(64),
+                    state: astra_turn_types::ToolResultProjectionWireStateV1::Included,
+                    actual_ranges: decision.selected_ranges.clone(),
+                    actual_body_sha256: Some(decision.rendered_body_sha256.clone()),
+                    reason: None,
+                },
+                decision,
+            }])
+            .unwrap();
+        assert_eq!(application, "tool-result selection included · 1 chunk(s)");
+        let unknown_decision = prepared[0].decision.clone();
+        let unknown_application = explain_tool_result_application(&[
+            astra_turn_types::ToolResultProjectionBindingV1 {
+                receipt: astra_turn_types::ToolResultProjectionReceiptV1 {
+                    decision_sha256: unknown_decision.decision_sha256.clone(),
+                    provider_wire_sha256: "e".repeat(64),
+                    state: astra_turn_types::ToolResultProjectionWireStateV1::Unknown,
+                    actual_ranges: Vec::new(),
+                    actual_body_sha256: None,
+                    reason: Some("wire body could not be proven".into()),
+                },
+                decision: unknown_decision,
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            unknown_application,
+            "tool-result selection adoption not fully confirmed"
+        );
         assert!(matches!(
             outcome,
             Some(astra_turn_types::ToolResultSelectionOutcomeV1::Decided {
@@ -22759,9 +23026,24 @@ mod tests {
             Some(astra_turn_types::ToolResultProjectionFallbackV1::IncompleteCoverage)
         );
         assert!(matches!(
-            outcome,
+            outcome.as_ref(),
             Some(astra_turn_types::ToolResultSelectionOutcomeV1::Baseline { .. })
         ));
+        let (label, explain_outcome) = explain_tool_result_selection(
+            &astra_turn_types::ToolResultSelectionCoverageV1 {
+                source_bytes: 100,
+                scanned_bytes: 100,
+                candidate_chunks: 2,
+                source_complete: true,
+                goal_complete: false,
+            },
+            outcome.as_ref().unwrap(),
+        );
+        assert!(label.contains("existing tool context") && !label.contains("full result"));
+        assert_eq!(
+            explain_outcome,
+            astra_turn_types::ExplainAnalyzeOutcomeV1::Fallback
+        );
     }
 
     #[tokio::test]
