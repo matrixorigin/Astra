@@ -161,7 +161,9 @@ use crate::server::agent_binding_skill_runtime;
 use crate::server::deployment_tool_policy::{
     apply_deployment_tool_policy, load_deployment_tool_policy,
 };
-use crate::server::run::engine::{RunEngine, RunStartContext, TerminalTransitionOutcome};
+use crate::server::run::engine::{
+    ExecutionAuthorityConfirmation, RunEngine, RunStartContext, TerminalTransitionOutcome,
+};
 use crate::server::run::handlers as run_handlers;
 use crate::server::runtime_mcp;
 use crate::server::server_loop_host::{self, ServerAgenticLoopHostBuilder};
@@ -15302,7 +15304,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 return Err(error);
             }
         };
-        let execution_authority_confirmed = self
+        let execution_authority_confirmation = self
             .run_engine
             .confirm_execution_authority(
                 &user_id,
@@ -15312,36 +15314,42 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 llm_cancel_token.as_ref(),
             )
             .await;
-        if !matches!(execution_authority_confirmed, Ok(true)) {
-            self.runs.write().await.remove(&run_id);
-            if let Some(record) = cloud_workspace_record.as_ref() {
-                self.cleanup_cloud_workspace_after_failed_start(
-                    &user_id,
-                    &session_id,
-                    &run_id,
-                    record,
-                    "durable execution authority could not be confirmed before activation"
-                        .to_string(),
-                )
-                .await;
+        let confirmed_authority = match execution_authority_confirmation {
+            Ok(ExecutionAuthorityConfirmation::Confirmed(confirmed)) => confirmed,
+            failed => {
+                self.runs.write().await.remove(&run_id);
+                if let Some(record) = cloud_workspace_record.as_ref() {
+                    self.cleanup_cloud_workspace_after_failed_start(
+                        &user_id,
+                        &session_id,
+                        &run_id,
+                        record,
+                        "durable execution authority could not be confirmed before activation"
+                            .to_string(),
+                    )
+                    .await;
+                }
+                return match failed {
+                    Ok(ExecutionAuthorityConfirmation::Superseded) => Err(error_response(
+                        StatusCode::CONFLICT,
+                        "durable execution authority expired before activation".to_string(),
+                    )),
+                    Err(error) => Err(error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to confirm durable execution authority: {error}"),
+                    )),
+                    Ok(ExecutionAuthorityConfirmation::Confirmed(_)) => {
+                        unreachable!("matched above")
+                    }
+                };
             }
-            return match execution_authority_confirmed {
-                Ok(false) => Err(error_response(
-                    StatusCode::CONFLICT,
-                    "durable execution authority expired before activation".to_string(),
-                )),
-                Err(error) => Err(error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to confirm durable execution authority: {error}"),
-                )),
-                Ok(true) => unreachable!("matched above"),
-            };
-        }
+        };
         let owner_lease_heartbeat = self.run_engine.start_owner_lease_heartbeat(
             user_id.clone(),
             session_id.clone(),
             run_id.clone(),
             execution_owner_generation,
+            confirmed_authority,
             execution_lease_lost.clone(),
             llm_cancel_token.clone(),
         );
@@ -16086,7 +16094,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let mut owner_lease_heartbeat = None;
         let mut owner_lease_fence_initialized = false;
         if let Some(owner_generation) = execution_owner_generation {
-            let early_authority = self
+            let early_authority_confirmation = self
                 .run_engine
                 .confirm_execution_authority(
                     &user_id,
@@ -16096,38 +16104,45 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     llm_cancel_token.as_ref(),
                 )
                 .await;
-            if !matches!(early_authority, Ok(true)) {
-                // A timeout here normally means the durable store itself is
-                // unavailable. Issuing a second synchronous terminal write
-                // against that same store would undo the activation bound.
-                // No provider/tool side effect has started, so drop only the
-                // process-local projection and let the exact-generation lease
-                // recovery path reconcile the durable Running row.
-                self.runs.write().await.remove(&run_id);
-                tracing::warn!(
-                    target: "astra_runtime::run_lifecycle",
-                    user_id,
-                    run_id,
-                    owner_generation,
-                    "idempotent run activation failed before side effects; durable recovery owns the row"
-                );
-                return match early_authority {
-                    Ok(false) => Err(error_response(
-                        StatusCode::CONFLICT,
-                        "durable execution authority expired after idempotent claim".to_string(),
-                    )),
-                    Err(error) => Err(error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("failed to activate durable execution authority: {error}"),
-                    )),
-                    Ok(true) => unreachable!("matched above"),
-                };
-            }
+            let confirmed_authority = match early_authority_confirmation {
+                Ok(ExecutionAuthorityConfirmation::Confirmed(confirmed)) => confirmed,
+                failed => {
+                    // A timeout here normally means the durable store itself is
+                    // unavailable. Issuing a second synchronous terminal write
+                    // against that same store would undo the activation bound.
+                    // No provider/tool side effect has started, so drop only the
+                    // process-local projection and let the exact-generation lease
+                    // recovery path reconcile the durable Running row.
+                    self.runs.write().await.remove(&run_id);
+                    tracing::warn!(
+                        target: "astra_runtime::run_lifecycle",
+                        user_id,
+                        run_id,
+                        owner_generation,
+                        "idempotent run activation failed before side effects; durable recovery owns the row"
+                    );
+                    return match failed {
+                        Ok(ExecutionAuthorityConfirmation::Superseded) => Err(error_response(
+                            StatusCode::CONFLICT,
+                            "durable execution authority expired after idempotent claim"
+                                .to_string(),
+                        )),
+                        Err(error) => Err(error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("failed to activate durable execution authority: {error}"),
+                        )),
+                        Ok(ExecutionAuthorityConfirmation::Confirmed(_)) => {
+                            unreachable!("matched above")
+                        }
+                    };
+                }
+            };
             owner_lease_heartbeat = self.run_engine.start_owner_lease_heartbeat(
                 user_id.clone(),
                 session_id.clone(),
                 run_id.clone(),
                 owner_generation,
+                confirmed_authority,
                 execution_lease_lost.clone(),
                 llm_cancel_token.clone(),
             );
@@ -16951,7 +16966,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // start; otherwise every guarded dispatch correctly fails closed even
         // though this executor owns the run.
         bind_execution_owner_generation(&mut state, execution_owner_generation);
-        let execution_authority_confirmed = self
+        let execution_authority_confirmation = self
             .run_engine
             .confirm_execution_authority(
                 &user_id,
@@ -16961,37 +16976,44 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 llm_cancel_token.as_ref(),
             )
             .await;
-        if !matches!(execution_authority_confirmed, Ok(true)) {
-            self.runs.write().await.remove(&run_id);
-            if let Some(record) = cloud_workspace_record.as_ref() {
-                self.cleanup_cloud_workspace_after_failed_start(
-                    &user_id,
-                    &session_id,
-                    &run_id,
-                    record,
-                    "durable execution authority could not be confirmed before streaming activation"
-                        .to_string(),
-                )
-                .await;
+        let confirmed_authority = match execution_authority_confirmation {
+            Ok(ExecutionAuthorityConfirmation::Confirmed(confirmed)) => confirmed,
+            failed => {
+                self.runs.write().await.remove(&run_id);
+                if let Some(record) = cloud_workspace_record.as_ref() {
+                    self.cleanup_cloud_workspace_after_failed_start(
+                        &user_id,
+                        &session_id,
+                        &run_id,
+                        record,
+                        "durable execution authority could not be confirmed before streaming activation"
+                            .to_string(),
+                    )
+                    .await;
+                }
+                return match failed {
+                    Ok(ExecutionAuthorityConfirmation::Superseded) => Err(error_response(
+                        StatusCode::CONFLICT,
+                        "durable execution authority expired before streaming activation"
+                            .to_string(),
+                    )),
+                    Err(error) => Err(error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to confirm durable execution authority: {error}"),
+                    )),
+                    Ok(ExecutionAuthorityConfirmation::Confirmed(_)) => {
+                        unreachable!("matched above")
+                    }
+                };
             }
-            return match execution_authority_confirmed {
-                Ok(false) => Err(error_response(
-                    StatusCode::CONFLICT,
-                    "durable execution authority expired before streaming activation".to_string(),
-                )),
-                Err(error) => Err(error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to confirm durable execution authority: {error}"),
-                )),
-                Ok(true) => unreachable!("matched above"),
-            };
-        }
+        };
         if !owner_lease_fence_initialized {
             owner_lease_heartbeat = self.run_engine.start_owner_lease_heartbeat(
                 user_id.clone(),
                 session_id.clone(),
                 run_id.clone(),
                 execution_owner_generation,
+                confirmed_authority,
                 execution_lease_lost.clone(),
                 llm_cancel_token.clone(),
             );
@@ -22765,9 +22787,10 @@ impl SubRunExecutor for ServerSubRunExecutor {
         ) {
             sink.publish(authority.owner_generation);
         }
-        if let (Some(engine), Some(authority)) = (durable_run_engine.as_ref(), execution_authority)
+        let confirmed_execution_authority = if let (Some(engine), Some(authority)) =
+            (durable_run_engine.as_ref(), execution_authority)
         {
-            match engine
+            let confirmed = match engine
                 .confirm_execution_authority(
                     &config.user_id,
                     &config.session_id,
@@ -22777,8 +22800,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 )
                 .await
             {
-                Ok(true) => {}
-                Ok(false) => {
+                Ok(ExecutionAuthorityConfirmation::Confirmed(confirmed)) => confirmed,
+                Ok(ExecutionAuthorityConfirmation::Superseded) => {
                     let exact_cancellation = engine
                         .load_run_control(&config.user_id, &config.run_id)
                         .await?
@@ -22828,18 +22851,26 @@ impl SubRunExecutor for ServerSubRunExecutor {
                         "failed to confirm durable sub-run execution authority: {error}"
                     ));
                 }
-            }
-        }
+            };
+            Some(confirmed)
+        } else {
+            None
+        };
         // Start lease fencing immediately after durable activation. Model
         // selection, binding materialization, and queueing must not create a
         // window in which recovery can supersede this child before its
         // heartbeat exists.
-        let mut owner_lease_heartbeat = match (durable_run_engine.as_ref(), execution_authority) {
-            (Some(engine), Some(authority)) => engine.start_owner_lease_heartbeat(
+        let mut owner_lease_heartbeat = match (
+            durable_run_engine.as_ref(),
+            execution_authority,
+            confirmed_execution_authority,
+        ) {
+            (Some(engine), Some(authority), Some(confirmed)) => engine.start_owner_lease_heartbeat(
                 config.user_id.clone(),
                 config.session_id.clone(),
                 config.run_id.clone(),
                 authority.owner_generation,
+                confirmed,
                 local_execution_lease_lost.clone(),
                 local_cancel_token.clone(),
             ),

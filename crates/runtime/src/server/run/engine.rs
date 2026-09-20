@@ -340,6 +340,21 @@ pub struct RunExecutionAuthority {
     pub owner_generation: u64,
 }
 
+/// Evidence returned by the activation renewal and consumed exactly once when
+/// the owner heartbeat starts. For durable stores, the deadline is anchored
+/// to the activation request start so a delayed acknowledgement cannot grant
+/// the local executor more time than the renewed database lease.
+#[derive(Debug)]
+pub(crate) struct ConfirmedExecutionAuthority {
+    owner_lease_fence_deadline: Option<tokio::time::Instant>,
+}
+
+#[derive(Debug)]
+pub(crate) enum ExecutionAuthorityConfirmation {
+    Confirmed(ConfirmedExecutionAuthority),
+    Superseded,
+}
+
 impl Drop for RunOwnerLeaseHeartbeat {
     fn drop(&mut self) {
         self.authority.deactivate();
@@ -994,16 +1009,20 @@ impl RunEngine {
         expected_session_id: String,
         run_id: String,
         expected_owner_generation: u64,
+        confirmed_authority: ConfirmedExecutionAuthority,
         execution_lease_lost: Arc<AtomicBool>,
         execution_cancel_token: Arc<tokio_util::sync::CancellationToken>,
     ) -> Option<RunOwnerLeaseHeartbeat> {
+        let initial_fence_deadline = confirmed_authority.owner_lease_fence_deadline?;
         let interval = self
             .store
-            .owner_lease_renewal_interval()?
+            .owner_lease_renewal_interval()
+            .expect("durable activation evidence requires a renewal interval")
             .max(Duration::from_millis(1));
         let lease_duration = self
             .store
-            .owner_lease_duration()?
+            .owner_lease_duration()
+            .expect("durable activation evidence requires a lease duration")
             .max(Duration::from_millis(1));
         // Fence before the database TTL can expire. This leaves one renewal
         // interval as skew/scheduling margin and makes a hung renewal future
@@ -1017,9 +1036,7 @@ impl RunEngine {
             run_id: run_id.clone(),
             owner_generation: expected_owner_generation,
         };
-        let authority = Arc::new(RunOwnerLeaseAuthority::new(
-            tokio::time::Instant::now() + fence_window,
-        ));
+        let authority = Arc::new(RunOwnerLeaseAuthority::new(initial_fence_deadline));
         self.owner_lease_authorities
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1029,7 +1046,7 @@ impl RunEngine {
         let engine = self.clone();
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
         let join = tokio::spawn(async move {
-            let mut fence_deadline = tokio::time::Instant::now() + fence_window;
+            let mut fence_deadline = initial_fence_deadline;
             let mut next_renewal = tokio::time::Instant::now();
             let mut ownership_lost = false;
             loop {
@@ -1164,9 +1181,13 @@ impl RunEngine {
         run_id: &str,
         expected_owner_generation: u64,
         cancel_token: &tokio_util::sync::CancellationToken,
-    ) -> Result<bool, String> {
+    ) -> Result<ExecutionAuthorityConfirmation, String> {
         let Some(lease_duration) = self.store.owner_lease_duration() else {
-            return Ok(true);
+            return Ok(ExecutionAuthorityConfirmation::Confirmed(
+                ConfirmedExecutionAuthority {
+                    owner_lease_fence_deadline: None,
+                },
+            ));
         };
         let renewal_interval = self
             .store
@@ -1181,6 +1202,8 @@ impl RunEngine {
         let activation_wait = lease_duration
             .saturating_sub(renewal_interval)
             .max(Duration::from_millis(1));
+        let activation_started_at = tokio::time::Instant::now();
+        let owner_lease_fence_deadline = activation_started_at + activation_wait;
         let renew = self.store.renew_owner_lease(
             user_id,
             expected_session_id,
@@ -1193,8 +1216,19 @@ impl RunEngine {
             _ = cancel_token.cancelled() => Err(format!(
                 "durable execution authority activation was cancelled for run {run_id}"
             )),
-            result = tokio::time::timeout(activation_wait, renew) => match result {
-                Ok(result) => result,
+            result = tokio::time::timeout_at(owner_lease_fence_deadline, renew) => match result {
+                Ok(Ok(true)) if tokio::time::Instant::now() < owner_lease_fence_deadline => {
+                    Ok(ExecutionAuthorityConfirmation::Confirmed(
+                        ConfirmedExecutionAuthority {
+                            owner_lease_fence_deadline: Some(owner_lease_fence_deadline),
+                        },
+                    ))
+                }
+                Ok(Ok(true)) => Err(format!(
+                    "durable execution authority activation acknowledgement arrived after the lease safety deadline for run {run_id}; durable recovery owns the unactivated row"
+                )),
+                Ok(Ok(false)) => Ok(ExecutionAuthorityConfirmation::Superseded),
+                Ok(Err(error)) => Err(error),
                 Err(_) => Err(format!(
                     "durable execution authority activation timed out after {}ms for run {run_id}; durable recovery owns the unactivated row",
                     activation_wait.as_millis()
@@ -4356,6 +4390,23 @@ mod tests {
         RunEngine::new(Arc::new(InMemoryRunStateStore::new()))
     }
 
+    fn test_confirmed_execution_authority(engine: &RunEngine) -> ConfirmedExecutionAuthority {
+        let owner_lease_fence_deadline = engine.owner_lease_duration().map(|lease_duration| {
+            let renewal_interval = engine
+                .store
+                .owner_lease_renewal_interval()
+                .unwrap_or_else(|| lease_duration / 3)
+                .max(Duration::from_millis(1));
+            tokio::time::Instant::now()
+                + lease_duration
+                    .saturating_sub(renewal_interval)
+                    .max(Duration::from_millis(1))
+        });
+        ConfirmedExecutionAuthority {
+            owner_lease_fence_deadline,
+        }
+    }
+
     async fn transition_typed_cancellation(
         engine: &RunEngine,
         user_id: &str,
@@ -4595,13 +4646,16 @@ mod tests {
     async fn owner_lease_heartbeat_is_disabled_when_store_has_no_interval() {
         let lease_lost = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        let engine = test_engine();
+        let confirmed = test_confirmed_execution_authority(&engine);
         assert!(
-            test_engine()
+            engine
                 .start_owner_lease_heartbeat(
                     "user-1".to_string(),
                     "session-1".to_string(),
                     "run-1".to_string(),
                     0,
+                    confirmed,
                     lease_lost,
                     cancel,
                 )
@@ -4625,6 +4679,7 @@ mod tests {
                 "session-1".to_string(),
                 "run-1".to_string(),
                 0,
+                test_confirmed_execution_authority(&engine),
                 lease_lost.clone(),
                 cancel.clone(),
             )
@@ -4673,6 +4728,7 @@ mod tests {
                 "session-1".to_string(),
                 "run-1".to_string(),
                 7,
+                test_confirmed_execution_authority(&engine),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(tokio_util::sync::CancellationToken::new()),
             )
@@ -4727,6 +4783,7 @@ mod tests {
                 "session-1".to_string(),
                 "run-1".to_string(),
                 execution.owner_generation,
+                test_confirmed_execution_authority(&engine),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(tokio_util::sync::CancellationToken::new()),
             )
@@ -4795,6 +4852,7 @@ mod tests {
                 "session-1".to_string(),
                 "run-1".to_string(),
                 execution.owner_generation,
+                test_confirmed_execution_authority(&engine),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(tokio_util::sync::CancellationToken::new()),
             )
@@ -4833,12 +4891,14 @@ mod tests {
         );
         let lease_lost = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
-        let guard = RunEngine::new(store.clone())
+        let engine = RunEngine::new(store.clone());
+        let guard = engine
             .start_owner_lease_heartbeat(
                 "user-1".to_string(),
                 "session-1".to_string(),
                 "run-release-pending".to_string(),
                 0,
+                test_confirmed_execution_authority(&engine),
                 lease_lost.clone(),
                 cancel.clone(),
             )
@@ -4874,12 +4934,14 @@ mod tests {
         );
         let lease_lost = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
-        let guard = RunEngine::new(store.clone())
+        let engine = RunEngine::new(store.clone());
+        let guard = engine
             .start_owner_lease_heartbeat(
                 "user-1".to_string(),
                 "session-1".to_string(),
                 "run-1".to_string(),
                 7,
+                test_confirmed_execution_authority(&engine),
                 lease_lost.clone(),
                 cancel.clone(),
             )
@@ -4902,12 +4964,14 @@ mod tests {
         );
         let lease_lost = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
-        let guard = RunEngine::new(store.clone())
+        let engine = RunEngine::new(store.clone());
+        let guard = engine
             .start_owner_lease_heartbeat(
                 "user-1".to_string(),
                 "session-1".to_string(),
                 "run-1".to_string(),
                 3,
+                test_confirmed_execution_authority(&engine),
                 lease_lost.clone(),
                 cancel.clone(),
             )
@@ -5002,11 +5066,103 @@ mod tests {
         assert_eq!(store.lease_renewals(), 1);
         tokio::time::advance(Duration::from_secs(6)).await;
         assert!(
-            task.await
-                .expect("activation task")
-                .expect("renewal within the lease-derived deadline"),
+            matches!(
+                task.await
+                    .expect("activation task")
+                    .expect("renewal within the lease-derived deadline"),
+                ExecutionAuthorityConfirmation::Confirmed(_)
+            ),
             "a renewal slower than the generic five-second database budget must still activate"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_activation_ack_does_not_reset_the_first_heartbeat_fence() {
+        let store = Arc::new(
+            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
+                .with_owner_lease_heartbeat(Duration::from_secs(10))
+                .with_lease_renewal_behavior(LeaseRenewalBehavior::DelayedFirstThenPending(
+                    Duration::from_secs(15),
+                )),
+        );
+        let engine = RunEngine::new(store.clone());
+        let authority = engine
+            .start_run("activation-handoff", "user-1", "session-1")
+            .await
+            .expect("durable admission");
+        let activation_started_at = tokio::time::Instant::now();
+        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        let activation = tokio::spawn({
+            let engine = engine.clone();
+            let cancel = cancel.clone();
+            async move {
+                engine
+                    .confirm_execution_authority(
+                        "user-1",
+                        "session-1",
+                        "activation-handoff",
+                        authority.owner_generation,
+                        cancel.as_ref(),
+                    )
+                    .await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(store.lease_renewals(), 1);
+        tokio::time::advance(Duration::from_secs(15)).await;
+        let confirmed = match activation
+            .await
+            .expect("activation task")
+            .expect("activation within safety window")
+        {
+            ExecutionAuthorityConfirmation::Confirmed(confirmed) => confirmed,
+            ExecutionAuthorityConfirmation::Superseded => panic!("activation was superseded"),
+        };
+        assert_eq!(
+            confirmed.owner_lease_fence_deadline,
+            Some(activation_started_at + Duration::from_secs(20)),
+            "the activation request start, not its acknowledgement, owns the first fence"
+        );
+
+        let lease_lost = Arc::new(AtomicBool::new(false));
+        let guard = engine
+            .start_owner_lease_heartbeat(
+                "user-1".to_string(),
+                "session-1".to_string(),
+                "activation-handoff".to_string(),
+                authority.owner_generation,
+                confirmed,
+                lease_lost.clone(),
+                cancel.clone(),
+            )
+            .expect("heartbeat-enabled store");
+        tokio::task::yield_now().await;
+        assert_eq!(store.lease_renewals(), 2);
+
+        tokio::time::advance(Duration::from_secs(4)).await;
+        tokio::task::yield_now().await;
+        assert!(!cancel.is_cancelled());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(lease_lost.load(Ordering::Acquire));
+        assert!(cancel.is_cancelled());
+        assert!(
+            tokio::time::Instant::now() < activation_started_at + Duration::from_secs(30),
+            "local execution must be fenced before the durable lease TTL"
+        );
+        assert!(
+            engine
+                .owner_lease_authority(
+                    "user-1",
+                    "session-1",
+                    "activation-handoff",
+                    authority.owner_generation,
+                )
+                .is_err(),
+            "the provider-boundary authority must be inactive at the inherited fence"
+        );
+        drop(guard);
     }
 
     #[tokio::test]
@@ -5068,12 +5224,14 @@ mod tests {
         );
         let lease_lost = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
-        let guard = RunEngine::new(store.clone())
+        let engine = RunEngine::new(store.clone());
+        let guard = engine
             .start_owner_lease_heartbeat(
                 "user-1".to_string(),
                 "session-1".to_string(),
                 "run-1".to_string(),
                 3,
+                test_confirmed_execution_authority(&engine),
                 lease_lost.clone(),
                 cancel.clone(),
             )
@@ -5437,6 +5595,7 @@ mod tests {
         Refuse,
         Pending,
         Delayed(Duration),
+        DelayedFirstThenPending(Duration),
     }
 
     #[derive(Clone, Copy)]
@@ -5947,7 +6106,7 @@ mod tests {
             _expected_owner_generation: u64,
             _expected_statuses: &[&str],
         ) -> Result<bool, String> {
-            self.lease_renewals.fetch_add(1, Ordering::SeqCst);
+            let attempt = self.lease_renewals.fetch_add(1, Ordering::SeqCst);
             match self.lease_renewal_behavior {
                 LeaseRenewalBehavior::Renew => Ok(true),
                 LeaseRenewalBehavior::Refuse => Ok(false),
@@ -5957,6 +6116,13 @@ mod tests {
                 LeaseRenewalBehavior::Delayed(delay) => {
                     tokio::time::sleep(delay).await;
                     Ok(true)
+                }
+                LeaseRenewalBehavior::DelayedFirstThenPending(delay) if attempt == 0 => {
+                    tokio::time::sleep(delay).await;
+                    Ok(true)
+                }
+                LeaseRenewalBehavior::DelayedFirstThenPending(_) => {
+                    std::future::pending::<Result<bool, String>>().await
                 }
             }
         }
