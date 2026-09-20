@@ -259,43 +259,57 @@ pub struct SemanticJudgmentFactV1 {
     pub result: RequestJudgmentResultV1,
 }
 impl SemanticJudgmentFactV1 {
-    pub const fn preparation_label(&self) -> &'static str {
+    /// Short, user-facing outcome for Explain's preparation timeline.
+    /// Provider/model and usage belong to the correlated physical-attempt
+    /// ledger; this label describes only the semantic outcome.
+    pub fn preparation_label(&self) -> String {
         match &self.result {
-            RequestJudgmentResultV1::Decided { .. } => "Request judgment: classified",
-            RequestJudgmentResultV1::Abstained { .. } => "Request judgment: uncertain fields",
-            RequestJudgmentResultV1::Conflicting { .. } => "Request judgment: conflicting fields",
+            RequestJudgmentResultV1::Decided { classification } => {
+                let outcome = if !classification.work_required {
+                    "no agent work needed"
+                } else if classification.activation_deferred {
+                    "work deferred"
+                } else {
+                    match classification.mutation {
+                        RequestJudgmentMutationV1::ReadOnly => "read-only work",
+                        RequestJudgmentMutationV1::MayMutate => "work may make changes",
+                        RequestJudgmentMutationV1::MustMutate => "changes required",
+                    }
+                };
+                format!("Classify request · {outcome}")
+            }
+            RequestJudgmentResultV1::Abstained { .. } => "Classify request · uncertain".into(),
+            RequestJudgmentResultV1::Conflicting { .. } => {
+                "Classify request · conflicting result".into()
+            }
             RequestJudgmentResultV1::Invalid {
                 reason: SemanticJudgmentInvalidV1::MalformedJson,
-            } => "Request judgment: malformed JSON",
+            } => "Classify request · invalid response".into(),
             RequestJudgmentResultV1::Invalid {
                 reason: SemanticJudgmentInvalidV1::UnsupportedCombination,
-            } => "Request judgment: unsupported classification combination",
-            RequestJudgmentResultV1::Invalid { .. } => {
-                "Request judgment: invalid response contract"
-            }
+            } => "Classify request · unsupported result".into(),
+            RequestJudgmentResultV1::Invalid { .. } => "Classify request · invalid response".into(),
             RequestJudgmentResultV1::NotDispatched {
                 reason: SemanticJudgmentPreDispatchReasonV1::NoOffering,
-            } => "Request judgment: no Offering",
-            RequestJudgmentResultV1::NotDispatched { .. } => "Request judgment: not dispatched",
+            } => "Classify request · skipped; no eligible model".into(),
+            RequestJudgmentResultV1::NotDispatched { .. } => "Classify request · skipped".into(),
             RequestJudgmentResultV1::Unavailable {
                 reason: SemanticJudgmentUnavailableReasonV1::Deadline,
                 ..
-            } => "Request judgment: deadline; delivery unresolved",
+            } => "Classify request · timed out".into(),
             RequestJudgmentResultV1::Unavailable {
                 reason: SemanticJudgmentUnavailableReasonV1::Cancelled,
                 ..
-            } => "Request judgment: cancelled; delivery unresolved",
+            } => "Classify request · cancelled".into(),
             RequestJudgmentResultV1::Unavailable {
                 reason: SemanticJudgmentUnavailableReasonV1::ProviderPtlError,
                 ..
-            } => "Request judgment: provider PTL error",
+            } => "Classify request · provider rejected result".into(),
             RequestJudgmentResultV1::Unavailable {
                 reason: SemanticJudgmentUnavailableReasonV1::UnexpectedFinish,
                 ..
-            } => "Request judgment: unexpected response finish",
-            RequestJudgmentResultV1::Unavailable { .. } => {
-                "Request judgment: execution error; delivery unresolved"
-            }
+            } => "Classify request · incomplete result".into(),
+            RequestJudgmentResultV1::Unavailable { .. } => "Classify request · unavailable".into(),
         }
     }
     pub const fn preparation_outcome(&self) -> crate::ExplainAnalyzeOutcomeV1 {
@@ -599,7 +613,7 @@ mod tests {
                 assert!(
                     fact.fact
                         .preparation_label()
-                        .starts_with("Request judgment:")
+                        .starts_with("Classify request ·")
                 );
                 assert!(fact.fact.preparation_label().len() < 160);
                 let value: Value = serde_json::from_str(&raw).unwrap();
@@ -613,6 +627,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn uncertain_initial_stage_does_not_claim_fallback_before_clarification() {
+        let mut initial = observation();
+        assert!(matches!(
+            initial.fact.result,
+            RequestJudgmentResultV1::Abstained { .. }
+        ));
+        assert_eq!(
+            initial.fact.preparation_label(),
+            "Classify request · uncertain"
+        );
+        assert!(!initial.fact.preparation_label().contains("baseline"));
+
+        initial.fact.stage = RequestJudgmentStageV1::Clarification;
+        initial.fact.result = RequestJudgmentResultV1::Decided {
+            classification: RequestJudgmentClassificationV1 {
+                work_required: true,
+                activation_deferred: false,
+                domain: Some(RequestJudgmentDomainV1::Code),
+                mutation: RequestJudgmentMutationV1::MustMutate,
+                scope: RequestJudgmentScopeV1::Workspace,
+                parallel_subruns: false,
+                capabilities: vec![],
+            },
+        };
+        assert_eq!(
+            initial.fact.preparation_label(),
+            "Classify request · changes required"
+        );
     }
     #[test]
     fn request_judgment_rejects_raw_data_and_obsolete_contracts() {

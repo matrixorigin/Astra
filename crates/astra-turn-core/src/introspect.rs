@@ -1927,7 +1927,7 @@ mod tests {
         let request =
             IntrospectRequest::from_args(&serde_json::json!({"horizon":"turn", "depth":"hint"}));
         let text = render_introspect_request(&snapshot, &request);
-        assert!(text.contains("scope=session_supported_judgment_operations cutoff=ledger_read"));
+        assert!(text.contains("session ledger at read time"));
         assert!(text.contains("omitted_attempts=1"));
         assert!(text.contains("actual-provider"));
     }
