@@ -435,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn reward_hacking_warning_records_without_retry_or_schema_restriction() {
+    fn repeated_calls_within_one_batch_do_not_emit_behavior_advice() {
         let mut messages = Vec::new();
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
@@ -470,21 +470,14 @@ mod tests {
             interaction_mode: TurnInteractionMode::Prompt,
         });
 
-        let advisories = proceed_advisories(out);
-        assert_eq!(advisories.len(), 1);
-        assert_eq!(advisories[0].severity, "warning");
+        assert!(proceed_advisories(out).is_empty());
         assert_eq!(remaining_turns, 10);
-        // Reward-hacking guidance is advisory and must not hide the schema.
-        assert!(
-            !restricted_tools.contains("read_file"),
-            "read-only tools must not be added to restricted_tools"
-        );
-        assert!(
-            messages.is_empty(),
-            "behavioral warnings must not inject corrective prompt messages"
-        );
-        assert_eq!(verdict_events.len(), 1);
-        assert_eq!(verdict_events[0].severity, "warning");
+        assert!(restricted_tools.is_empty());
+        assert!(messages.is_empty());
+        assert!(verdict_events.is_empty());
+        assert_eq!(turn_guard.nudge_count, 0);
+        assert!(turn_guard.pending_correction.is_none());
+        assert!(last_heavy_checkpoint.is_none());
     }
 
     #[test]
@@ -508,13 +501,10 @@ mod tests {
         step_recorder.begin_turn(0);
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
-        let tool_calls = vec![
-            json!({"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}}),
-            json!({"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}}),
-        ];
-        turn_guard.record_tool_calls(&tool_calls);
-        turn_guard.record_tool_result("read_file", "fn main() {}");
-        turn_guard.record_tool_result("read_file", "fn main() {}");
+        // Independent tool failures still warrant a recovery checkpoint.
+        for _ in 0..3 {
+            turn_guard.record_failed_tool_result_with_kind("write_file", None);
+        }
         let quarantine =
             astra_pipeline::step_protocol::WorkspaceObservationQuarantineV1::weak_process_ownership(
                 Some("warning-call".into()),
@@ -552,7 +542,7 @@ mod tests {
             current_session_id: Some(&session_id),
             workspace_observation_quarantine: Some(&quarantine),
             max_turns: 20,
-            recent_tools: &["read_file".to_string()],
+            recent_tools: &["write_file".to_string()],
             last_heavy_checkpoint: &mut last_heavy_checkpoint,
             interaction_mode: TurnInteractionMode::Prompt,
         });
@@ -649,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn advisory_avoid_tools_do_not_remove_visible_tool_schema() {
+    fn repeated_batches_emit_only_signature_advice_without_tool_avoidance() {
         let mut messages = Vec::new();
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
@@ -663,7 +653,9 @@ mod tests {
             json!({"function": {"name": "agent_fanout", "arguments": {"action": "get_results", "group_id": "review"}}}),
             json!({"function": {"name": "agent_fanout", "arguments": {"action": "get_results", "group_id": "review"}}}),
         ];
-        turn_guard.record_tool_calls(&tool_calls);
+        for _ in 0..turn_guard.stall_window() {
+            turn_guard.record_tool_calls(&tool_calls);
+        }
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
             run_execution_budget: None,
@@ -686,25 +678,17 @@ mod tests {
 
         let advisories = proceed_advisories(out);
         assert_eq!(advisories.len(), 1);
-        assert_eq!(advisories[0].kind, "tool_behavior");
+        assert_eq!(advisories[0].kind, "stall");
+        assert_eq!(advisories[0].severity, "warning");
         assert_eq!(verdict_events.len(), 1);
-        assert!(
-            verdict_events[0]
-                .avoid_tools
-                .contains(&"agent_fanout".to_string())
-        );
-        assert!(
-            !turn_guard.health.is_avoidance_advised("agent_fanout"),
-            "stall advice alone must not mark the tool unhealthy"
-        );
-        assert!(
-            !restricted_tools.contains("agent_fanout"),
-            "advisory avoid_tools must not remove the tool schema"
-        );
-        assert!(
-            messages.is_empty(),
-            "advisory avoid_tools must not be injected back into the prompt"
-        );
+        assert!(verdict_events[0].avoid_tools.is_empty());
+        assert_eq!(verdict_events[0].injections.len(), 1);
+        assert!(!verdict_events[0].injections[0].contains("Reward-hacking"));
+        assert_eq!(turn_guard.nudge_count, 1);
+        assert!(!turn_guard.health.is_avoidance_advised("agent_fanout"));
+        assert!(restricted_tools.is_empty());
+        assert!(messages.is_empty());
+        assert_eq!(remaining_turns, 10);
     }
 
     #[test]

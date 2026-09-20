@@ -1,29 +1,16 @@
 use crate::{DecisionRecord, HookPoint, Severity, Verifier, Violation};
 
-/// Warns on overlapping re-reads and pauses only when redundant reads persist
-/// across a sustained read-only streak.
+/// Observes historical read overlap without treating it as failed progress.
+/// A range match does not establish unchanged contents or retained context.
 pub struct ProgressVerifier {
-    pub max_read_only_round_streak: u32,
-    /// Single-turn warning threshold for overlapping reads with no intervening
-    /// edit. This is advisory only; it should not pause legitimate
-    /// investigation on its own.
+    /// Warning threshold for the captured historical overlap count; zero disables it.
     pub max_redundant_read_count: u32,
-    /// Tighter threshold applied after recovery from a read-only pause.
-    /// Prevents repeated waste if the agent doesn't act on the checkpoint.
-    pub recovery_read_only_round_streak: u32,
-    /// Minimum redundant reads required to trigger pause, even when `read_only_round_streak`
-    /// exceeds `max_read_only_round_streak`. This distinguishes productive exploration
-    /// (reading many new files) from stalled loops (repeated reads).
-    pub min_redundant_reads_for_pause: u32,
 }
 
 impl Default for ProgressVerifier {
     fn default() -> Self {
         Self {
-            max_read_only_round_streak: 32,
             max_redundant_read_count: 4,
-            recovery_read_only_round_streak: 16,
-            min_redundant_reads_for_pause: 6,
         }
     }
 }
@@ -39,60 +26,25 @@ impl Verifier for ProgressVerifier {
 
     fn check(&self, record: &DecisionRecord) -> Vec<Violation> {
         let snap = &record.snapshot;
-        if is_terminal(snap.final_state.as_deref()) {
+        if matches!(
+            snap.final_state.as_deref(),
+            Some("completed" | "interrupted")
+        ) || self.max_redundant_read_count == 0
+            || snap.read_only_round_streak == 0
+            || snap.redundant_read_count < self.max_redundant_read_count
+        {
             return Vec::new();
         }
-
-        let read_only_stalled = self.max_read_only_round_streak > 0
-            && snap.read_only_round_streak >= self.max_read_only_round_streak
-            && snap.redundant_read_count >= self.min_redundant_reads_for_pause;
-        let redundant_read_warning = self.max_redundant_read_count > 0
-            && snap.read_only_round_streak > 0
-            && snap.redundant_read_count >= self.max_redundant_read_count;
-
-        if read_only_stalled {
-            return vec![Violation {
-                severity: Severity::Pause,
-                verifier: self.name().to_string(),
-                message: format!(
-                    "decision checkpoint: {} consecutive read-only round(s) and {} redundant read(s) passed without any mutation. Reuse the evidence already gathered; if one specific fact is still missing, fetch only that fact. Otherwise choose one concrete next action: edit, run targeted verification, or explicitly report why the task cannot be completed.",
-                    snap.read_only_round_streak, snap.redundant_read_count
-                ),
-                recovery_threshold: normalized_recovery_threshold(
-                    self.max_read_only_round_streak,
-                    self.recovery_read_only_round_streak,
-                ),
-            }];
-        }
-
-        if redundant_read_warning {
-            return vec![Violation {
-                severity: Severity::Warning,
-                verifier: self.name().to_string(),
-                message: format!(
-                    "read-loop warning: {} overlapping read(s) were repeated within a read-only streak. Reuse what is already in context before opening the same ranges again.",
-                    snap.redundant_read_count
-                ),
-                recovery_threshold: None,
-            }];
-        }
-
-        Vec::new()
+        vec![Violation {
+            severity: Severity::Warning,
+            verifier: self.name().to_string(),
+            message: format!(
+                "Captured history contains {} overlapping read(s). Content changes, current context coverage, and task progress are not established by this count.",
+                snap.redundant_read_count
+            ),
+            recovery_threshold: None,
+        }]
     }
-}
-
-fn is_terminal(final_state: Option<&str>) -> bool {
-    matches!(final_state, Some("completed" | "interrupted"))
-}
-
-fn normalized_recovery_threshold(
-    max_read_only_round_streak: u32,
-    recovery_read_only_round_streak: u32,
-) -> Option<u32> {
-    if max_read_only_round_streak <= 1 || recovery_read_only_round_streak == 0 {
-        return None;
-    }
-    Some(recovery_read_only_round_streak.min(max_read_only_round_streak - 1))
 }
 
 #[cfg(test)]
@@ -100,7 +52,7 @@ mod tests {
     use super::*;
     use crate::RuntimeSnapshot;
 
-    fn record(read_only_round_streak: u32, redundant_read_count: u32) -> DecisionRecord {
+    fn record(streak: u32, overlap: u32) -> DecisionRecord {
         DecisionRecord {
             session_id: "test".into(),
             turn: 1,
@@ -109,131 +61,51 @@ mod tests {
             monotonic_millis_since_session: 0,
             snapshot: RuntimeSnapshot {
                 final_state: Some("empty".into()),
-                read_only_round_streak,
-                redundant_read_count,
+                read_only_round_streak: streak,
+                redundant_read_count: overlap,
                 ..RuntimeSnapshot::empty()
             },
         }
     }
 
     #[test]
-    fn progress_verifier_allows_progress_below_thresholds() {
+    fn overlap_and_streak_never_authorize_pause_or_stop() {
+        let verifier = ProgressVerifier::default();
+        for streak in [1, 32, 100, u32::MAX] {
+            for overlap in [4, 6, 100, u32::MAX] {
+                let violations = verifier.check(&record(streak, overlap));
+                assert_eq!(violations.len(), 1);
+                assert_eq!(violations[0].severity, Severity::Warning);
+                assert_eq!(violations[0].recovery_threshold, None);
+                assert!(violations[0].message.contains("Captured history"));
+                assert!(violations[0].message.contains("not established"));
+                assert!(!violations[0].message.contains("Reuse"));
+                assert!(!violations[0].message.contains("edit"));
+            }
+        }
+    }
+
+    #[test]
+    fn warns_only_at_enabled_threshold_during_read_streak() {
         let verifier = ProgressVerifier {
-            max_read_only_round_streak: 4,
             max_redundant_read_count: 3,
-            recovery_read_only_round_streak: 2,
-            min_redundant_reads_for_pause: 2,
         };
-        assert!(verifier.check(&record(3, 2)).is_empty());
+        assert!(verifier.check(&record(100, 2)).is_empty());
+        assert!(verifier.check(&record(100, 0)).is_empty());
+        assert!(verifier.check(&record(0, 100)).is_empty());
+        assert_eq!(verifier.check(&record(1, 3)).len(), 1);
+        let disabled = ProgressVerifier {
+            max_redundant_read_count: 0,
+        };
+        assert!(disabled.check(&record(u32::MAX, u32::MAX)).is_empty());
     }
 
     #[test]
-    fn progress_verifier_pauses_on_read_only_streak() {
-        let verifier = ProgressVerifier {
-            max_read_only_round_streak: 4,
-            max_redundant_read_count: 10,
-            recovery_read_only_round_streak: 2,
-            min_redundant_reads_for_pause: 3,
-        };
-        let violations = verifier.check(&record(4, 3));
-        assert_eq!(violations.len(), 1);
-        assert_eq!(violations[0].severity, Severity::Pause);
-        assert!(violations[0].message.contains("decision checkpoint"));
-        assert!(violations[0].message.contains("one specific fact"));
-    }
-
-    #[test]
-    fn progress_verifier_warns_on_redundant_reads_without_mutation() {
-        let verifier = ProgressVerifier {
-            max_read_only_round_streak: 10,
-            max_redundant_read_count: 3,
-            recovery_read_only_round_streak: 5,
-            min_redundant_reads_for_pause: 2,
-        };
-        let violations = verifier.check(&record(1, 3));
-        assert_eq!(violations.len(), 1);
-        assert_eq!(violations[0].severity, Severity::Warning);
-        assert!(violations[0].message.contains("read-loop warning"));
-    }
-
-    #[test]
-    fn progress_verifier_ignores_redundant_reads_after_mutation_signal() {
-        let verifier = ProgressVerifier {
-            max_read_only_round_streak: 10,
-            max_redundant_read_count: 3,
-            recovery_read_only_round_streak: 5,
-            min_redundant_reads_for_pause: 2,
-        };
-        assert!(verifier.check(&record(0, 4)).is_empty());
-    }
-
-    #[test]
-    fn progress_verifier_does_not_pause_terminal_snapshots() {
-        let verifier = ProgressVerifier {
-            max_read_only_round_streak: 1,
-            max_redundant_read_count: 1,
-            recovery_read_only_round_streak: 1,
-            min_redundant_reads_for_pause: 1,
-        };
-        let mut rec = record(8, 8);
-        rec.snapshot.final_state = Some("completed".into());
-        assert!(verifier.check(&rec).is_empty());
-    }
-
-    #[test]
-    fn progress_verifier_allows_productive_exploration() {
-        // Reading 20 new files with 0 redundant reads should NOT pause
-        let verifier = ProgressVerifier {
-            max_read_only_round_streak: 20,
-            max_redundant_read_count: 10,
-            recovery_read_only_round_streak: 10,
-            min_redundant_reads_for_pause: 3,
-        };
-        assert!(verifier.check(&record(20, 0)).is_empty());
-    }
-
-    #[test]
-    fn progress_verifier_pauses_stalled_exploration() {
-        // Reading 10 rounds with 5 redundant reads SHOULD pause
-        let verifier = ProgressVerifier {
-            max_read_only_round_streak: 10,
-            max_redundant_read_count: 10,
-            recovery_read_only_round_streak: 5,
-            min_redundant_reads_for_pause: 3,
-        };
-        let violations = verifier.check(&record(10, 5));
-        assert_eq!(violations.len(), 1);
-        assert_eq!(violations[0].severity, Severity::Pause);
-    }
-
-    #[test]
-    fn progress_verifier_requires_both_conditions_for_read_only_stall() {
-        // High read_only_round_streak but low redundant_count should NOT pause
-        let verifier = ProgressVerifier {
-            max_read_only_round_streak: 20,
-            max_redundant_read_count: 10,
-            recovery_read_only_round_streak: 10,
-            min_redundant_reads_for_pause: 5,
-        };
-        // 20 rounds but only 2 redundant reads
-        assert!(verifier.check(&record(20, 2)).is_empty());
-    }
-
-    #[test]
-    fn progress_verifier_clamps_recovery_threshold_below_pause_threshold() {
-        let verifier = ProgressVerifier {
-            max_read_only_round_streak: 4,
-            max_redundant_read_count: 10,
-            recovery_read_only_round_streak: 99,
-            min_redundant_reads_for_pause: 3,
-        };
-        let violations = verifier.check(&record(4, 3));
-        assert_eq!(violations[0].recovery_threshold, Some(3));
-    }
-
-    #[test]
-    fn progress_verifier_omits_invalid_recovery_thresholds() {
-        assert_eq!(normalized_recovery_threshold(1, 1), None);
-        assert_eq!(normalized_recovery_threshold(4, 0), None);
+    fn terminal_snapshots_do_not_receive_new_advice() {
+        for state in ["completed", "interrupted"] {
+            let mut rec = record(100, 100);
+            rec.snapshot.final_state = Some(state.into());
+            assert!(ProgressVerifier::default().check(&rec).is_empty());
+        }
     }
 }

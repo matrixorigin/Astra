@@ -1379,8 +1379,8 @@ pub fn execution_slice_guidance(
         return String::new();
     }
 
-    let instruction = if available_boundaries == 1 && may_receive_adaptive_renewal {
-        "This is an adaptive review checkpoint, not a final boundary. A further slice is granted only when recent typed progress supports it. You may take one smallest decisive action needed to complete or verify the active objective; do not begin a broad new investigation. If you stop now, return the best truthful result from retained evidence, explicitly labeling unresolved gaps."
+    let instruction = if may_receive_adaptive_renewal {
+        "This is an adaptive capacity checkpoint, not a task-completion boundary. Renewal is not evidence of progress or unfinished work and does not expand the user request. Continue only for an unmet authorized objective; if the requested work is complete, return the result now. Base completion claims on actual execution evidence, not the requested outcome, and explicitly label unresolved gaps."
     } else if available_boundaries == 1 {
         "This is the final model boundary. Do not call any tool or begin another check. Return the best truthful result from retained evidence now, explicitly labeling unresolved gaps."
     } else if available_boundaries == 2 {
@@ -2131,9 +2131,18 @@ mod tests {
         assert!(execution_slice_guidance(0, 0, false).is_empty());
 
         let renewable_checkpoint = execution_slice_guidance(0, 40, true);
-        assert!(renewable_checkpoint.contains("adaptive review checkpoint"));
-        assert!(renewable_checkpoint.contains("one smallest decisive action"));
+        assert!(renewable_checkpoint.contains("adaptive capacity checkpoint"));
+        assert!(renewable_checkpoint.contains("not evidence of progress or unfinished work"));
+        assert!(renewable_checkpoint.contains("does not expand the user request"));
+        assert!(renewable_checkpoint.contains("actual execution evidence"));
+        assert!(!renewable_checkpoint.contains("recent typed progress supports it"));
         assert!(!renewable_checkpoint.contains("Do not call any tool"));
+        for remaining in [1, 7] {
+            let renewable = execution_slice_guidance(remaining, 40, true);
+            assert!(renewable.contains("not evidence of progress or unfinished work"));
+            assert!(!renewable.contains("final boundary for truthful settlement"));
+            assert!(!renewable.contains("Close the active objective"));
+        }
     }
 
     #[test]

@@ -1122,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn external_sources_keep_one_decisive_action_at_a_renewable_final_boundary() {
+    fn external_sources_keep_renewable_capacity_distinct_from_completion() {
         let ep = serde_json::Map::new();
         let mut state = make_state();
         state.max_turns = 32;
@@ -1134,11 +1134,11 @@ mod tests {
             .tool_guidance
             .expect("renewable final-boundary guidance");
         assert!(
-            guidance.contains("adaptive review checkpoint"),
+            guidance.contains("adaptive capacity checkpoint"),
             "{guidance}"
         );
         assert!(
-            guidance.contains("one smallest decisive action"),
+            guidance.contains("not evidence of progress or unfinished work"),
             "{guidance}"
         );
         assert!(!guidance.contains("Do not call any tool"), "{guidance}");

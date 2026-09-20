@@ -695,7 +695,7 @@ impl ToolExecutor {
                 delivered_range,
             );
 
-            let read_warning = self.read_warning_for(&path, overlaps_prior_delivery);
+            let read_warning = Self::read_warning_for(overlaps_prior_delivery);
             push_suffix_if_fits(
                 &mut output,
                 &read_warning,
@@ -790,7 +790,7 @@ impl ToolExecutor {
             delivered_range,
         );
 
-        let read_warning = self.read_warning_for(&path, overlaps_prior_delivery);
+        let read_warning = Self::read_warning_for(overlaps_prior_delivery);
         push_suffix_if_fits(
             &mut result,
             &read_warning,
@@ -799,19 +799,10 @@ impl ToolExecutor {
         Ok(result)
     }
 
-    fn read_warning_for(&self, path: &Path, overlaps_prior_delivery: bool) -> String {
-        let read_count = self.file_read_count(path);
-        if read_count >= 4 {
-            "\n\n⚠ WARNING: This file has been read 4+ times this session. You already \
-             have this content — stop re-reading and use the information from earlier reads."
-                .to_string()
-        } else if read_count >= 3 {
-            "\n\n⚠ Note: This file has been read 3 times. Consider using content from \
-             earlier reads instead of requesting more ranges."
-                .to_string()
-        } else if overlaps_prior_delivery {
-            "\n\n⚠ This range overlaps lines already returned for the current file content. \
-             Reuse the earlier output and request only lines you have not received."
+    fn read_warning_for(overlaps_prior_delivery: bool) -> String {
+        if overlaps_prior_delivery {
+            "\n\nNote: Some returned content overlaps lines already returned for the same captured file content. \
+             Earlier output may no longer be in context; authorized rereads can still be necessary."
                 .to_string()
         } else {
             String::new()
@@ -4234,41 +4225,7 @@ type Handler interface {
         );
     }
 
-    // ── Bug fix: ranged reads don't increment read_count ─────────────────────
-
-    #[test]
-    fn read_file_ranged_reads_no_warning() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("big.txt");
-        let mut f = std::fs::File::create(&file_path).unwrap();
-        for i in 0..3000 {
-            writeln!(f, "line {i}: {}", "x".repeat(30)).unwrap();
-        }
-        drop(f);
-
-        let executor = test_executor_in(dir.path());
-        // 5 ranged reads of different sections — should NOT trigger "read 4+ times" warning
-        for start in (1..=50).step_by(10) {
-            executor.read_file(&serde_json::json!({
-                "path": "big.txt",
-                "start_line": start,
-                "end_line": start + 5
-            }));
-        }
-        let last = executor.read_file(&serde_json::json!({
-            "path": "big.txt",
-            "start_line": 60,
-            "end_line": 65
-        }));
-        assert!(
-            !last.contains("read 4+ times"),
-            "ranged reads should not trigger warning"
-        );
-        assert!(
-            !last.contains("read 3 times"),
-            "ranged reads should not trigger warning"
-        );
-    }
+    // ── Read observations preserve legitimate repeated and ranged reads ─────
 
     #[test]
     fn read_file_disjoint_pagination_does_not_claim_redundant_reads() {
@@ -4307,6 +4264,25 @@ type Handler interface {
     }
 
     #[test]
+    fn repeated_full_reads_preserve_content_without_count_based_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observations.txt");
+        std::fs::write(&path, "first observation\n").unwrap();
+        let executor = test_executor_in(dir.path());
+        for index in 0..6 {
+            let output = executor.read_file(&serde_json::json!({"path": "observations.txt"}));
+            assert!(output.contains("first observation"));
+            if index > 0 {
+                assert!(output.contains("Earlier output may no longer be in context"));
+            }
+        }
+        std::fs::write(&path, "changed observation\n").unwrap();
+        let changed = executor.read_file(&serde_json::json!({"path": "observations.txt"}));
+        assert!(changed.contains("changed observation"));
+        assert!(!changed.contains("overlaps lines already returned"));
+    }
+
+    #[test]
     fn read_file_warns_only_when_a_successfully_delivered_range_overlaps() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("big.txt");
@@ -4324,6 +4300,11 @@ type Handler interface {
                 "end_line": end
             }));
             if start == 75 {
+                assert!(
+                    output.contains("line 99:"),
+                    "new range content must remain available"
+                );
+                assert!(output.contains("authorized rereads can still be necessary"));
                 assert!(
                     output.contains("overlaps lines already returned"),
                     "an actual overlap should be called out, got: {output}"

@@ -57,9 +57,6 @@ pub(crate) struct FileState {
     /// write.  A changed digest clears it, so a partial view of a new file
     /// cannot be used to authorize an overwrite.
     pub(super) full_content_known: bool,
-    /// How many times this file has been fully read.
-    /// Used for escalating warnings when the model loops on the same file.
-    pub(super) read_count: u32,
     /// Bounded union of source line intervals actually returned for the
     /// current content digest. Partial/truncated lines are never included.
     pub(super) delivered_line_ranges: Vec<DeliveredLineRange>,
@@ -248,7 +245,6 @@ impl ToolExecutor {
         let mut overlapped = false;
         if let Ok(mut state) = self.file_state.lock() {
             let prev = state.get(&key);
-            let prev_count = prev.map(|fs| fs.read_count).unwrap_or(0);
             let same_content = content_sha256.is_some()
                 && prev.is_some_and(|previous| previous.content_sha256 == content_sha256);
             let mut delivered_line_ranges = if same_content {
@@ -276,11 +272,6 @@ impl ToolExecutor {
                         .any(|previous| previous.overlaps(delivered_range));
                 insert_delivered_line_range(&mut delivered_line_ranges, delivered_range);
             }
-            let new_count = if is_partial {
-                prev_count
-            } else {
-                prev_count + 1
-            };
             let full_content_known = if is_partial {
                 prev.is_some_and(|previous| {
                     previous.full_content_known
@@ -297,7 +288,6 @@ impl ToolExecutor {
                     from_read: true,
                     is_partial,
                     full_content_known,
-                    read_count: new_count,
                     delivered_line_ranges,
                     cached_content,
                     content_sha256,
@@ -338,7 +328,6 @@ impl ToolExecutor {
                     from_read: false,
                     is_partial: false,
                     full_content_known: content_sha256.is_some(),
-                    read_count: 0,
                     delivered_line_ranges: Vec::new(),
                     cached_content,
                     content_sha256,
@@ -416,16 +405,6 @@ impl ToolExecutor {
             .ok()
             .and_then(|s| s.get(&key).map(|fs| fs.full_content_known))
             .unwrap_or(false)
-    }
-
-    /// How many times this file has been read in the current session.
-    pub(super) fn file_read_count(&self, path: &Path) -> u32 {
-        let key = self.file_state_key(path);
-        self.file_state
-            .lock()
-            .ok()
-            .and_then(|s| s.get(&key).map(|fs| fs.read_count))
-            .unwrap_or(0)
     }
 
     /// Try to retrieve cached file content. Returns `Some(content)` if:
@@ -746,7 +725,6 @@ mod tests {
         let state = exe.file_state.lock_recover();
         let fs = state.get(&key).unwrap();
         assert!(!fs.from_read);
-        assert_eq!(fs.read_count, 0);
     }
 
     #[test]

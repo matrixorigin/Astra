@@ -79,12 +79,14 @@ pub struct RuntimeContextFeedback {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimePolicySignal {
     ExplorationFamilyChurn,
-    RedundantReads,
+    /// Historical range overlap, not proof that content is unchanged or retained.
+    ReadCoverageOverlap,
     UnresolvedToolOutcomes,
     RejectedToolRequests,
     SearchFanout,
     ValidationRetryChurn,
-    LowYieldRoundChurn,
+    /// Review-triggering activity; its count does not measure semantic progress.
+    RoundActivity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,12 +100,12 @@ pub enum RuntimePolicyStage {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimePolicyRecommendation {
     TestExactHypothesis,
-    ReuseKnownContent,
+    ReviewReadCoverage,
     DiagnoseToolOutcomes,
     RepairToolRequest,
     NarrowEvidenceSearch,
     ChangeValidationStrategy,
-    SynthesizeAndDecide,
+    ReviewTaskProgress,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,7 +180,7 @@ pub enum RuntimePolicyFeedbackSet {
 }
 
 impl RuntimePolicyFeedbackSet {
-    pub const SCHEMA_VERSION: u32 = 2;
+    pub const SCHEMA_VERSION: u32 = 3;
     pub const MAX_ENTRIES: usize = 4;
 
     #[must_use]
@@ -548,11 +550,11 @@ mod tests {
             expected_result: "The typed frame is projected unchanged".into(),
         };
         let entry = RuntimePolicyFeedbackEntry {
-            signal: RuntimePolicySignal::RedundantReads,
+            signal: RuntimePolicySignal::ReadCoverageOverlap,
             stage: RuntimePolicyStage::Observe,
             observed_at_round: 3,
             evidence_count: 8,
-            recommendation: RuntimePolicyRecommendation::ReuseKnownContent,
+            recommendation: RuntimePolicyRecommendation::ReviewReadCoverage,
         };
         let evaluated = |subject, entries| RuntimePolicyFeedbackSet::Evaluated {
             schema_version: RuntimePolicyFeedbackSet::SCHEMA_VERSION,
@@ -564,6 +566,11 @@ mod tests {
 
         assert!(evaluated(subject.clone(), vec![entry.clone()]).is_valid(3));
         assert!(!evaluated(subject.clone(), vec![entry.clone(), entry.clone()]).is_valid(3));
+        let mut invalid_version = evaluated(subject.clone(), vec![entry.clone()]);
+        if let RuntimePolicyFeedbackSet::Evaluated { schema_version, .. } = &mut invalid_version {
+            *schema_version = 0;
+        }
+        assert!(!invalid_version.is_valid(3));
 
         let mut future = entry.clone();
         future.observed_at_round = 4;

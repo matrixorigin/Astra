@@ -7066,7 +7066,11 @@ pub(crate) mod tests {
         result
     }
 
-    fn make_edge_tool_with_args(name: &str, args: Value, output: &str) -> EdgeToolExecResult {
+    pub(crate) fn make_edge_tool_with_args(
+        name: &str,
+        args: Value,
+        output: &str,
+    ) -> EdgeToolExecResult {
         let mut fields = edge_runtime_environment_fields();
         if matches!(
             name,
@@ -14481,6 +14485,91 @@ mod parallel_execution_tests {
             assert_eq!(host.turn_count(), 11);
             assert!(state.interruption.is_none(), "{:?}", state.interruption);
             assert_eq!(state.final_text, "sampling complete");
+        }
+
+        #[tokio::test]
+        async fn harness_overlapping_reads_cross_old_pause_threshold_and_complete() {
+            struct CountPauses {
+                inner: Arc<dyn HarnessKernel>,
+                pauses: Arc<std::sync::atomic::AtomicUsize>,
+            }
+            impl HarnessKernel for CountPauses {
+                fn snapshot(&self) -> Option<astra_harness::RuntimeSnapshot> {
+                    self.inner.snapshot()
+                }
+                fn on_record(&self, record: &DecisionRecord) -> HookVerdict {
+                    let verdict = self.inner.on_record(record);
+                    if matches!(verdict, HookVerdict::Pause { .. }) {
+                        self.pauses
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    verdict
+                }
+            }
+            let (mut state, _sink, trace) = setup_harness_state(HarnessLimits::default(), 60);
+            let pauses = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            state.harness.kernel = Some(Arc::new(CountPauses {
+                inner: state.harness.kernel.take().unwrap(),
+                pauses: pauses.clone(),
+            }));
+            let mut host = MockHost::new(
+                (0..40)
+                    .map(|i| {
+                        let mut result = make_edge_tool_with_args(
+                            "read_file",
+                            json!({"path":"/tmp/observation.txt", "start_line":1, "end_line":10}),
+                            "unchanged observed content",
+                        );
+                        result.request_id = format!("overlap-read-{i}");
+                        edge_tool_result(vec![result], 100, 20, Some(50))
+                    })
+                    .chain(std::iter::once(text_result(
+                        "observations complete",
+                        100,
+                        20,
+                        Some(50),
+                    )))
+                    .collect(),
+            )
+            .with_valid_tools(&["read_file"]);
+            assert!(
+                run_agentic_loop_with_host(&mut host, &mut state)
+                    .await
+                    .is_ok()
+            );
+            assert_eq!(host.turn_count(), 41);
+            assert!(state.interruption.is_none(), "{:?}", state.interruption);
+            assert_eq!(state.final_text, "observations complete");
+            assert_eq!(
+                pauses.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "overlap must not even enter pause recovery"
+            );
+            assert_eq!(
+                state
+                    .stall
+                    .tool_call_records
+                    .iter()
+                    .filter(|r| r.was_executed() && r.ok)
+                    .count(),
+                40
+            );
+            let trace = trace.read().unwrap();
+            assert!(
+                trace
+                    .records_at_point(HookPoint::PostTurn)
+                    .iter()
+                    .filter(|r| {
+                        !matches!(
+                            r.snapshot.final_state.as_deref(),
+                            Some("completed" | "interrupted")
+                        ) && r.snapshot.read_only_round_streak >= 32
+                            && r.snapshot.redundant_read_count >= 6
+                    })
+                    .count()
+                    >= 3,
+                "must exercise the former pause condition, not merely many calls"
+            );
         }
 
         // ── E2E 3: Observe-only sink captures data ──────────────────────

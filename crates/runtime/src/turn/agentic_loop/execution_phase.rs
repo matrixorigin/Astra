@@ -16807,7 +16807,7 @@ mod tests {
         install_committed_work_synthesis_wire_surface(&mut state);
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
             "state": "evaluated",
-            "schema_version": 2,
+            "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
             "revision": 2,
             "evaluated_at_round": 4,
             "subject": {"kind": "run"},
@@ -16862,7 +16862,7 @@ mod tests {
             );
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
             "state": "evaluated",
-            "schema_version": 2,
+            "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
             "revision": 2,
             "evaluated_at_round": 4,
             "subject": {"kind": "run"},
@@ -16940,7 +16940,7 @@ mod tests {
         .unwrap();
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
             "state": "evaluated",
-            "schema_version": 2,
+            "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
             "revision": 2,
             "evaluated_at_round": 2,
             "subject": {"kind": "run"},
@@ -17035,7 +17035,7 @@ mod tests {
         .unwrap();
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
             "state": "evaluated",
-            "schema_version": 2,
+            "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
             "revision": 2,
             "evaluated_at_round": 2,
             "subject": {"kind": "run"},
@@ -17102,7 +17102,7 @@ mod tests {
         .unwrap();
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
             "state": "evaluated",
-            "schema_version": 2,
+            "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
             "revision": 1,
             "evaluated_at_round": 1,
             "subject": {"kind": "run"},
@@ -17140,7 +17140,7 @@ mod tests {
             );
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
             "state": "evaluated",
-            "schema_version": 2,
+            "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
             "revision": 2,
             "evaluated_at_round": 4,
             "subject": {"kind": "run"},
@@ -17185,7 +17185,7 @@ mod tests {
         );
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
             "state": "evaluated",
-            "schema_version": 2,
+            "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
             "revision": 2,
             "evaluated_at_round": 4,
             "subject": {"kind": "run"},
@@ -17272,7 +17272,7 @@ mod tests {
         state.budget_wrapup_injected = true;
         state.hooks.completion_settlement.text_only = true;
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
-            "state": "evaluated", "schema_version": 2, "revision": 3,
+            "state": "evaluated", "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION, "revision": 3,
             "evaluated_at_round": 6, "subject": {"kind": "run"},
             "entries": [{"signal": "unresolved_tool_outcomes", "stage": "converge",
                 "observed_at_round": 6, "evidence_count": 3, "recommendation": "diagnose_tool_outcomes"}]
@@ -17452,7 +17452,7 @@ mod tests {
         state.runtime_tool_executor = None;
         // Restore only the policy signal for the no-executor opening control.
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
-            "state": "evaluated", "schema_version": 2, "revision": 3,
+            "state": "evaluated", "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION, "revision": 3,
             "evaluated_at_round": 6, "subject": {"kind": "run"},
             "entries": [{"signal": "unresolved_tool_outcomes", "stage": "converge",
                 "observed_at_round": 6, "evidence_count": 3, "recommendation": "diagnose_tool_outcomes"}]
@@ -17495,7 +17495,7 @@ mod tests {
             .outcome_reconciliation_retries = 1;
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
             "state": "evaluated",
-            "schema_version": 2,
+            "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
             "revision": 3,
             "evaluated_at_round": 6,
             "subject": {"kind": "run"},
@@ -17539,16 +17539,16 @@ mod tests {
         let remaining_turns = state.remaining_turns;
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
             "state": "evaluated",
-            "schema_version": 2,
+            "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
             "revision": 3,
             "evaluated_at_round": 8,
             "subject": {"kind": "run"},
             "entries": [{
-                "signal": "low_yield_round_churn",
+                "signal": "round_activity",
                 "stage": "observe",
                 "observed_at_round": 8,
                 "evidence_count": 8,
-                "recommendation": "synthesize_and_decide"
+                "recommendation": "review_task_progress"
             }]
         }))
         .expect("valid policy feedback");
@@ -17675,11 +17675,11 @@ mod tests {
                     "expected_result": "One verified result"
                 },
                 "entries": [{
-                    "signal": "redundant_reads",
+                    "signal": "read_coverage_overlap",
                     "stage": "observe",
                     "observed_at_round": 2,
                     "evidence_count": 3,
-                    "recommendation": "reuse_known_content"
+                    "recommendation": "review_read_coverage"
                 }]
             }
         }))
@@ -23075,7 +23075,7 @@ mod tests {
                     state.stall.active_policy_feedback =
                         serde_json::from_value(serde_json::json!({
                             "state": "evaluated",
-                            "schema_version": 2,
+                            "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
                             "revision": 2,
                             "evaluated_at_round": 4,
                             "subject": {"kind": "run"},
@@ -24178,7 +24178,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn renewable_review_boundary_keeps_one_decisive_tool_action_available() {
+    async fn renewable_capacity_boundary_does_not_require_completion() {
         let mut state = make_state();
         state.max_turns = 32;
         state.remaining_turns = 0;
@@ -24199,8 +24199,11 @@ mod tests {
             .find(|injection| injection.kind == VolatileKind::BudgetAdvisory)
             .expect("renewable review advisory");
         let text = advisory.payload.to_string();
-        assert!(text.contains("adaptive review checkpoint"), "{text}");
-        assert!(text.contains("one smallest decisive action"), "{text}");
+        assert!(text.contains("adaptive capacity checkpoint"), "{text}");
+        assert!(
+            text.contains("not evidence of progress or unfinished work"),
+            "{text}"
+        );
         assert!(!text.contains("Do not call any tool"), "{text}");
     }
 
