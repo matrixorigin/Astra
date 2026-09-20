@@ -17,7 +17,7 @@ use astra_turn_types::{
 use super::inference::{MemoryInferencePort, MemoryInferenceRequest};
 
 /// Prompt for the selector model to judge memory relevance.
-pub const RELEVANCE_FILTER_PROMPT: &str = "Keep only memories clearly useful for the current task. Mere shared words or unrelated preferences are insufficient. Without task context, answer no. Mark uncertainty rather than guess; uncertain candidates are excluded.";
+pub const RELEVANCE_FILTER_PROMPT: &str = "Judge each memory independently by its contribution to the current task. A memory need only supply one requested fact or applicable constraint, not answer the whole task. Keep all such contributions. Respect the requested subject, scope and current instructions; shared words alone are insufficient. Without task context, answer no. Mark uncertainty rather than guess; uncertain candidates are excluded.";
 
 /// Business policy for explicitly rejected previously injected memories.
 pub const MEMORY_FEEDBACK_FILTER_PROMPT: &str = "Identify candidates the latest user message explicitly rejects as irrelevant, stale, wrong, conflicting, or no longer applicable. A task change alone or a current-task exception to a general lesson is not rejection. Mark uncertainty rather than guess; uncertain candidates are excluded.";
@@ -223,7 +223,8 @@ fn is_meaningful_term(term: &str) -> bool {
 ///
 /// On transport/model errors, falls back to the deterministic lexical gate.
 /// If the selector explicitly returns no relevant indices, returns an empty
-/// list. Prompt noise is more harmful than a missed memory.
+/// list. The relevance question must recognize partial task contributions as
+/// useful; a missed necessary fact can prevent a correct downstream answer.
 pub async fn filter_memories(
     client: &dyn MemoryInferencePort,
     invocation_scope: &astra_turn_types::InferenceInvocationScope,
@@ -382,7 +383,11 @@ fn build_memory_judgment(
         state: serde_json::json!({
             "policy": policy,
             "user_message": truncate(user_message, message_chars),
-            "candidates": items.iter().map(|item| truncate(item, candidate_chars)).collect::<Vec<_>>()
+            // Explicit identities avoid asking either backend to count array
+            // positions, especially when numeric-looking keys sort lexically.
+            "candidates": items.iter().enumerate().map(|(i, item)|
+                (i.to_string(), truncate(item, candidate_chars))
+            ).collect::<std::collections::BTreeMap<_, _>>()
         }),
         questions: items
             .iter()
@@ -390,11 +395,25 @@ fn build_memory_judgment(
             .map(|(i, _)| {
                 (
                     i.to_string(),
-                    astra_turn_types::JudgmentQuestion::Noul {
-                        instructions: format!(
-                            "Evaluate candidates[{i}] against user_message under state.policy."
-                        ),
-                        criteria: None,
+                    match kind {
+                        MemoryJudgmentKind::Relevance => astra_turn_types::JudgmentQuestion::Noul {
+                            instructions: format!(
+                                "Does the memory at state.candidates[\"{i}\"] contribute a requested fact or applicable constraint to user_message? Apply state.policy."
+                            ),
+                            criteria: Some(astra_turn_types::NoulCriteria {
+                                yes: "Supplies at least one needed fact or applicable instruction, even if it answers only part of the task.".into(),
+                                no: "Only shares a topic, concerns another scope, or is unrelated, superseded or explicitly excluded by the current request.".into(),
+                            }),
+                        },
+                        MemoryJudgmentKind::ExplicitDismissal => astra_turn_types::JudgmentQuestion::Noul {
+                            instructions: format!(
+                                "Does user_message explicitly invalidate the memory at state.candidates[\"{i}\"] as a lesson, rather than merely suspend its application to the current task? Apply state.policy."
+                            ),
+                            criteria: Some(astra_turn_types::NoulCriteria {
+                                yes: "The user explicitly rejects or corrects this particular lesson itself as wrong, stale, or no longer applicable within its stated scope.".into(),
+                                no: "The user only changes tasks, makes a current-task exception, postpones an action, quotes someone else's rejection without endorsing it, or gives no clear rejection of this particular lesson. A lesson can be inapplicable now yet remain valid for later tasks.".into(),
+                            }),
+                        },
                     },
                 )
             })
@@ -644,7 +663,7 @@ mod tests {
         let judgment: astra_turn_types::JudgmentRequest = serde_json::from_str(&query).unwrap();
         assert_eq!(
             judgment.state["candidates"],
-            serde_json::json!(["use rg not grep", "RS256 for JWT"])
+            serde_json::json!({"0":"use rg not grep", "1":"RS256 for JWT"})
         );
         assert_eq!(judgment.questions.len(), 2);
     }
@@ -658,9 +677,51 @@ mod tests {
         let judgment: astra_turn_types::JudgmentRequest = serde_json::from_str(&query).unwrap();
         assert_eq!(
             judgment.state["candidates"],
-            serde_json::json!(["candidate one", "candidate two"])
+            serde_json::json!({"0":"candidate one", "1":"candidate two"})
         );
         assert_eq!(judgment.questions.len(), 2);
+    }
+
+    #[test]
+    fn dismissal_questions_define_invalidation_not_current_applicability() {
+        let query = build_memory_feedback_query(
+            "Only this time, postpone verification",
+            &[
+                "Verify changes before delivery".into(),
+                "Use the project formatter".into(),
+            ],
+        );
+        let judgment: JudgmentRequest = serde_json::from_str(&query).unwrap();
+        for (i, question) in judgment.questions.values().enumerate() {
+            let astra_turn_types::JudgmentQuestion::Noul {
+                instructions,
+                criteria,
+            } = question;
+            assert!(instructions.contains(&format!("state.candidates[\"{i}\"]")));
+            assert!(instructions.contains("explicitly invalidate"));
+            let criteria = criteria
+                .as_ref()
+                .expect("explicit dismissal truth conditions");
+            assert!(criteria.yes.contains("this particular lesson itself"));
+            for boundary in [
+                "changes tasks",
+                "current-task exception",
+                "postpones",
+                "quotes",
+                "remain valid for later tasks",
+            ] {
+                assert!(criteria.no.contains(boundary));
+            }
+        }
+        let relevance: JudgmentRequest = serde_json::from_str(&build_relevance_query(
+            "verification",
+            &["Verify changes".into()],
+        ))
+        .unwrap();
+        let astra_turn_types::JudgmentQuestion::Noul { criteria, .. } = &relevance.questions["0"];
+        let criteria = criteria.as_ref().expect("relevance truth conditions");
+        assert!(criteria.yes.contains("needed fact"));
+        assert!(!criteria.yes.contains("rejects"));
     }
 
     #[test]
@@ -676,6 +737,57 @@ mod tests {
                 .count(),
             200
         );
+    }
+
+    #[test]
+    fn relevance_questions_evaluate_partial_contributions_without_changing_evidence() {
+        let items = vec![
+            "Production export uses Parquet".into(),
+            "Production export uses key k17".into(),
+            "Staging export uses CSV".into(),
+        ];
+        let query = "Give the production export format and key";
+        let judgment = build_memory_judgment(MemoryJudgmentKind::Relevance, query, &items);
+        assert_eq!(judgment.state["user_message"], query);
+        for (i, item) in items.iter().enumerate() {
+            let id = i.to_string();
+            assert_eq!(judgment.state["candidates"][&id], *item);
+            let astra_turn_types::JudgmentQuestion::Noul {
+                instructions,
+                criteria,
+            } = &judgment.questions[&id];
+            assert!(instructions.contains("contribute a requested fact"));
+            let criteria = criteria.as_ref().unwrap();
+            assert!(criteria.yes.contains("only part of the task"));
+            assert!(criteria.no.contains("another scope"));
+            assert!(criteria.no.contains("explicitly excluded"));
+        }
+        // Better question semantics must not silently turn abstention into yes.
+        let response = r#"{"schema_version":1,"model":"native","answers":{"0":{"type":"noul","noul":0.5},"1":{"type":"noul","noul":0.51},"2":{"type":"noul","noul":0.49}}}"#;
+        assert_eq!(parse_relevance_response(response, 3).unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn candidate_identity_is_explicit_and_stable_across_multi_digit_batches() {
+        let items: Vec<String> = (0..128).map(|i| format!("memory content {i}")).collect();
+        for raw in [
+            build_relevance_query("current task", &items),
+            build_memory_feedback_query("correction", &items),
+        ] {
+            let request: JudgmentRequest = serde_json::from_str(&raw).unwrap();
+            let candidates = request.state["candidates"]
+                .as_object()
+                .expect("explicit ID map");
+            assert_eq!(candidates.len(), items.len());
+            assert_eq!(request.questions.len(), items.len());
+            for (i, item) in items.iter().enumerate() {
+                let id = i.to_string();
+                assert_eq!(candidates[&id], *item);
+                let astra_turn_types::JudgmentQuestion::Noul { instructions, .. } =
+                    &request.questions[&id];
+                assert!(instructions.contains(&format!("state.candidates[\"{id}\"]")));
+            }
+        }
     }
 
     // ── filter_memories tests ──

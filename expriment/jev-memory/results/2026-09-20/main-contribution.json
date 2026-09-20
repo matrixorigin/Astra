@@ -1,0 +1,3432 @@
+{
+  "run": "main",
+  "commit": "0db06a3dba515798f4befa71ea3c930ffb84c5ce",
+  "provenance": {
+    "started_at": "2026-09-20T08:02:18.576799777+00:00",
+    "binary_sha256": "d5087a922703c74c44f2f2a3a8b940a9697d4b4ac3c66376fa417d1be97c1f3b",
+    "sources": {
+      "crates/astra-turn-types/src/judgment.rs": "b138ba976095656389c9f75fa52653cd3e2e57620937448200e742abf37abb6d",
+      "crates/runtime/src/memory_hooks/article_eval.rs": "2ba454f1b501883e60fce561637e7ffbd38cb9148f787e445a89404f8ae1c518",
+      "crates/runtime/src/memory_hooks/relevance.rs": "429354fd65229283129bdb6943c2c17ab7c886b362737ed2c79f0882ef391c42",
+      "crates/runtime/src/turn/llm/client.rs": "b01cb52cc91d41ff5122bb6a1b8851a8909a9f6c1c1f7dcbe8363bf656983a85",
+      "crates/runtime/src/turn/llm/typesafe.rs": "f55fa38125bc3cbc21b1ed13d179c9cb4d05910f7444c7f2b65156e130f8a51b"
+    },
+    "cases_sha256": "9c452da3e9de87c858faa346848f3954910f73ff306cc748469d8bbf78614e50",
+    "features": "--no-default-features --features live-provider-tests",
+    "repeat": 3,
+    "scope": "live production memory selector and provider adapters; fixed synthetic retrieval; isolated answer task, no server/DB/tools",
+    "selector_deadline_ms": 3000,
+    "answer_deadline_ms": 20000
+  },
+  "results_sha256": "2e6ade94b6659ef6621302bae9e47f5419cae7d3eb939b4716beefbf7d38c157",
+  "price_basis": "dated official USD price card; reported cache discounts; unknown usage not zero",
+  "price_card": {
+    "schema_version": 1,
+    "checked_on": "2026-09-20",
+    "currency": "USD",
+    "tier": "off_peak",
+    "tier_reason": "Evaluation ran on Sunday; official Flash pricing lists weekends as off-peak.",
+    "unit": "USD per token",
+    "flash": {
+      "input": 1.5e-07,
+      "cache_read": 3e-09,
+      "output": 6e-07
+    },
+    "jev": {
+      "input": 4.2e-08,
+      "cache_read": null,
+      "output": 0
+    },
+    "sources": [
+      "https://api-docs.deepseek.com/quick_start/pricing/",
+      "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/",
+      "https://docs.typesafe.ai/models"
+    ],
+    "model_identity_note": "DeepSeek official documentation says legacy deepseek-v4-flash requests are now served by DeepSeek-V4.1-Flash. Preserve actual response model fields; do not infer a pinned weight revision from the alias.",
+    "limits": "Official-price estimate using provider-reported usage, not an invoice. Unknown failed-call usage is not zero. No currency conversion or local YAML price is used. Unknown JEV cache counters remain unknown."
+  },
+  "prices_per_token": {
+    "jev": {
+      "input": 4.2e-08,
+      "cache_read": null,
+      "output": 0
+    },
+    "flash": {
+      "input": 1.5e-07,
+      "cache_read": 3e-09,
+      "output": 6e-07
+    }
+  },
+  "groups": {
+    "all": {
+      "flash_jev_like": {
+        "rows": 72,
+        "unique_cases": 24,
+        "selection_exact": 61,
+        "answer_pass": 66,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "completed": 72
+        },
+        "selector_finish": {
+          "stop": 72
+        },
+        "tp": 42,
+        "fp": 19,
+        "fn": 9,
+        "candidate_decisions": 432,
+        "selected_total": 61,
+        "mean_false_positives": 0.2638888888888889,
+        "mean_injected_chars": 99.69444444444444,
+        "precision": 0.6885245901639344,
+        "recall": 0.8235294117647058,
+        "selector_latency_all": {
+          "n": 72,
+          "p50_ms": 677.0,
+          "p95_ms": 916
+        },
+        "selector_latency_valid": {
+          "n": 72,
+          "p50_ms": 677.0,
+          "p95_ms": 916
+        },
+        "answer_latency": {
+          "n": 72,
+          "p50_ms": 669.0,
+          "p95_ms": 970
+        },
+        "total_latency": {
+          "n": 72,
+          "p50_ms": 1302.0,
+          "p95_ms": 1755
+        },
+        "injected_chars_total": 7178,
+        "selector_cost": {
+          "calls": 72,
+          "input_output_coverage": 72,
+          "cache_read_coverage": 72,
+          "tokens": {
+            "reported_input": 66924,
+            "reported_output": 842,
+            "reported_cache_read": 43392
+          },
+          "list_price_estimate_usd": 0.004165175999999994,
+          "all_input_cache_miss_scenario_usd": 0.010543800000000004,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        },
+        "answer_cost": {
+          "calls": 72,
+          "input_output_coverage": 72,
+          "cache_read_coverage": 72,
+          "tokens": {
+            "reported_input": 8853,
+            "reported_output": 918,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.0018787500000000002,
+          "all_input_cache_miss_scenario_usd": 0.0018787500000000002,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      },
+      "jev": {
+        "rows": 72,
+        "unique_cases": 24,
+        "selection_exact": 63,
+        "answer_pass": 66,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "completed": 72
+        },
+        "selector_finish": {
+          "stop": 72
+        },
+        "tp": 42,
+        "fp": 15,
+        "fn": 9,
+        "candidate_decisions": 432,
+        "selected_total": 57,
+        "mean_false_positives": 0.20833333333333334,
+        "mean_injected_chars": 96.25,
+        "precision": 0.7368421052631579,
+        "recall": 0.8235294117647058,
+        "selector_latency_all": {
+          "n": 72,
+          "p50_ms": 368.5,
+          "p95_ms": 833
+        },
+        "selector_latency_valid": {
+          "n": 72,
+          "p50_ms": 368.5,
+          "p95_ms": 833
+        },
+        "answer_latency": {
+          "n": 72,
+          "p50_ms": 701.5,
+          "p95_ms": 975
+        },
+        "total_latency": {
+          "n": 72,
+          "p50_ms": 1087.0,
+          "p95_ms": 1524
+        },
+        "injected_chars_total": 6930,
+        "selector_cost": {
+          "calls": 72,
+          "input_output_coverage": 72,
+          "cache_read_coverage": 0,
+          "tokens": {
+            "reported_input": 82098,
+            "reported_output": 7200
+          },
+          "list_price_estimate_usd": 0.003448116,
+          "all_input_cache_miss_scenario_usd": 0.003448116,
+          "estimate_complete": true,
+          "cache_discount_applied": false
+        },
+        "answer_cost": {
+          "calls": 72,
+          "input_output_coverage": 72,
+          "cache_read_coverage": 72,
+          "tokens": {
+            "reported_input": 8748,
+            "reported_output": 919,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.0018636000000000004,
+          "all_input_cache_miss_scenario_usd": 0.0018636000000000004,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      },
+      "no_jev": {
+        "rows": 72,
+        "unique_cases": 24,
+        "selection_exact": 15,
+        "answer_pass": 69,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "no_selector": 72
+        },
+        "selector_finish": {},
+        "tp": 33,
+        "fp": 129,
+        "fn": 18,
+        "candidate_decisions": 432,
+        "selected_total": 162,
+        "mean_false_positives": 1.7916666666666667,
+        "mean_injected_chars": 192.75,
+        "precision": 0.2037037037037037,
+        "recall": 0.6470588235294118,
+        "selector_latency_all": {
+          "n": 72,
+          "p50_ms": 0.0,
+          "p95_ms": 0
+        },
+        "selector_latency_valid": {
+          "n": 0,
+          "p50_ms": null,
+          "p95_ms": null
+        },
+        "answer_latency": {
+          "n": 72,
+          "p50_ms": 656.0,
+          "p95_ms": 914
+        },
+        "total_latency": {
+          "n": 72,
+          "p50_ms": 656.0,
+          "p95_ms": 914
+        },
+        "injected_chars_total": 13878,
+        "selector_cost": {
+          "calls": 0,
+          "input_output_coverage": 0,
+          "cache_read_coverage": 0,
+          "tokens": {},
+          "list_price_estimate_usd": 0.0,
+          "all_input_cache_miss_scenario_usd": 0.0,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        },
+        "answer_cost": {
+          "calls": 72,
+          "input_output_coverage": 72,
+          "cache_read_coverage": 72,
+          "tokens": {
+            "reported_input": 10476,
+            "reported_output": 931,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.00213,
+          "all_input_cache_miss_scenario_usd": 0.00213,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      }
+    },
+    "core": {
+      "flash_jev_like": {
+        "rows": 60,
+        "unique_cases": 20,
+        "selection_exact": 58,
+        "answer_pass": 60,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "completed": 60
+        },
+        "selector_finish": {
+          "stop": 60
+        },
+        "tp": 39,
+        "fp": 2,
+        "fn": 0,
+        "candidate_decisions": 360,
+        "selected_total": 41,
+        "mean_false_positives": 0.03333333333333333,
+        "mean_injected_chars": 92.86666666666666,
+        "precision": 0.9512195121951219,
+        "recall": 1.0,
+        "selector_latency_all": {
+          "n": 60,
+          "p50_ms": 682.0,
+          "p95_ms": 895
+        },
+        "selector_latency_valid": {
+          "n": 60,
+          "p50_ms": 682.0,
+          "p95_ms": 895
+        },
+        "answer_latency": {
+          "n": 60,
+          "p50_ms": 659.0,
+          "p95_ms": 970
+        },
+        "total_latency": {
+          "n": 60,
+          "p50_ms": 1302.0,
+          "p95_ms": 1743
+        },
+        "injected_chars_total": 5572,
+        "selector_cost": {
+          "calls": 60,
+          "input_output_coverage": 60,
+          "cache_read_coverage": 60,
+          "tokens": {
+            "reported_input": 55971,
+            "reported_output": 682,
+            "reported_cache_read": 36864
+          },
+          "list_price_estimate_usd": 0.0033858419999999957,
+          "all_input_cache_miss_scenario_usd": 0.008804850000000001,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        },
+        "answer_cost": {
+          "calls": 60,
+          "input_output_coverage": 60,
+          "cache_read_coverage": 60,
+          "tokens": {
+            "reported_input": 7203,
+            "reported_output": 834,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.0015808500000000002,
+          "all_input_cache_miss_scenario_usd": 0.0015808500000000002,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      },
+      "jev": {
+        "rows": 60,
+        "unique_cases": 20,
+        "selection_exact": 60,
+        "answer_pass": 60,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "completed": 60
+        },
+        "selector_finish": {
+          "stop": 60
+        },
+        "tp": 39,
+        "fp": 0,
+        "fn": 0,
+        "candidate_decisions": 360,
+        "selected_total": 39,
+        "mean_false_positives": 0.0,
+        "mean_injected_chars": 90.9,
+        "precision": 1.0,
+        "recall": 1.0,
+        "selector_latency_all": {
+          "n": 60,
+          "p50_ms": 368.5,
+          "p95_ms": 819
+        },
+        "selector_latency_valid": {
+          "n": 60,
+          "p50_ms": 368.5,
+          "p95_ms": 819
+        },
+        "answer_latency": {
+          "n": 60,
+          "p50_ms": 707.0,
+          "p95_ms": 966
+        },
+        "total_latency": {
+          "n": 60,
+          "p50_ms": 1087.0,
+          "p95_ms": 1494
+        },
+        "injected_chars_total": 5454,
+        "selector_cost": {
+          "calls": 60,
+          "input_output_coverage": 60,
+          "cache_read_coverage": 0,
+          "tokens": {
+            "reported_input": 68721,
+            "reported_output": 6000
+          },
+          "list_price_estimate_usd": 0.002886281999999999,
+          "all_input_cache_miss_scenario_usd": 0.002886281999999999,
+          "estimate_complete": true,
+          "cache_discount_applied": false
+        },
+        "answer_cost": {
+          "calls": 60,
+          "input_output_coverage": 60,
+          "cache_read_coverage": 60,
+          "tokens": {
+            "reported_input": 7161,
+            "reported_output": 835,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.0015751500000000002,
+          "all_input_cache_miss_scenario_usd": 0.0015751500000000002,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      },
+      "no_jev": {
+        "rows": 60,
+        "unique_cases": 20,
+        "selection_exact": 15,
+        "answer_pass": 57,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "no_selector": 60
+        },
+        "selector_finish": {},
+        "tp": 24,
+        "fp": 96,
+        "fn": 15,
+        "candidate_decisions": 360,
+        "selected_total": 120,
+        "mean_false_positives": 1.6,
+        "mean_injected_chars": 166.85,
+        "precision": 0.2,
+        "recall": 0.6153846153846154,
+        "selector_latency_all": {
+          "n": 60,
+          "p50_ms": 0.0,
+          "p95_ms": 0
+        },
+        "selector_latency_valid": {
+          "n": 0,
+          "p50_ms": null,
+          "p95_ms": null
+        },
+        "answer_latency": {
+          "n": 60,
+          "p50_ms": 648.0,
+          "p95_ms": 914
+        },
+        "total_latency": {
+          "n": 60,
+          "p50_ms": 648.5,
+          "p95_ms": 914
+        },
+        "injected_chars_total": 10011,
+        "selector_cost": {
+          "calls": 0,
+          "input_output_coverage": 0,
+          "cache_read_coverage": 0,
+          "tokens": {},
+          "list_price_estimate_usd": 0.0,
+          "all_input_cache_miss_scenario_usd": 0.0,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        },
+        "answer_cost": {
+          "calls": 60,
+          "input_output_coverage": 60,
+          "cache_read_coverage": 60,
+          "tokens": {
+            "reported_input": 8382,
+            "reported_output": 799,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.0017367,
+          "all_input_cache_miss_scenario_usd": 0.0017367,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      }
+    },
+    "stress": {
+      "flash_jev_like": {
+        "rows": 12,
+        "unique_cases": 4,
+        "selection_exact": 3,
+        "answer_pass": 6,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "completed": 12
+        },
+        "selector_finish": {
+          "stop": 12
+        },
+        "tp": 3,
+        "fp": 17,
+        "fn": 9,
+        "candidate_decisions": 72,
+        "selected_total": 20,
+        "mean_false_positives": 1.4166666666666667,
+        "mean_injected_chars": 133.83333333333334,
+        "precision": 0.15,
+        "recall": 0.25,
+        "selector_latency_all": {
+          "n": 12,
+          "p50_ms": 617.0,
+          "p95_ms": 1036
+        },
+        "selector_latency_valid": {
+          "n": 12,
+          "p50_ms": 617.0,
+          "p95_ms": 1036
+        },
+        "answer_latency": {
+          "n": 12,
+          "p50_ms": 670.0,
+          "p95_ms": 854
+        },
+        "total_latency": {
+          "n": 12,
+          "p50_ms": 1299.0,
+          "p95_ms": 1813
+        },
+        "injected_chars_total": 1606,
+        "selector_cost": {
+          "calls": 12,
+          "input_output_coverage": 12,
+          "cache_read_coverage": 12,
+          "tokens": {
+            "reported_input": 10953,
+            "reported_output": 160,
+            "reported_cache_read": 6528
+          },
+          "list_price_estimate_usd": 0.0007793339999999999,
+          "all_input_cache_miss_scenario_usd": 0.0017389499999999997,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        },
+        "answer_cost": {
+          "calls": 12,
+          "input_output_coverage": 12,
+          "cache_read_coverage": 12,
+          "tokens": {
+            "reported_input": 1650,
+            "reported_output": 84,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.0002979,
+          "all_input_cache_miss_scenario_usd": 0.0002979,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      },
+      "jev": {
+        "rows": 12,
+        "unique_cases": 4,
+        "selection_exact": 3,
+        "answer_pass": 6,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "completed": 12
+        },
+        "selector_finish": {
+          "stop": 12
+        },
+        "tp": 3,
+        "fp": 15,
+        "fn": 9,
+        "candidate_decisions": 72,
+        "selected_total": 18,
+        "mean_false_positives": 1.25,
+        "mean_injected_chars": 123.0,
+        "precision": 0.16666666666666666,
+        "recall": 0.25,
+        "selector_latency_all": {
+          "n": 12,
+          "p50_ms": 367.0,
+          "p95_ms": 872
+        },
+        "selector_latency_valid": {
+          "n": 12,
+          "p50_ms": 367.0,
+          "p95_ms": 872
+        },
+        "answer_latency": {
+          "n": 12,
+          "p50_ms": 678.5,
+          "p95_ms": 1022
+        },
+        "total_latency": {
+          "n": 12,
+          "p50_ms": 1073.5,
+          "p95_ms": 1524
+        },
+        "injected_chars_total": 1476,
+        "selector_cost": {
+          "calls": 12,
+          "input_output_coverage": 12,
+          "cache_read_coverage": 0,
+          "tokens": {
+            "reported_input": 13377,
+            "reported_output": 1200
+          },
+          "list_price_estimate_usd": 0.0005618339999999999,
+          "all_input_cache_miss_scenario_usd": 0.0005618339999999999,
+          "estimate_complete": true,
+          "cache_discount_applied": false
+        },
+        "answer_cost": {
+          "calls": 12,
+          "input_output_coverage": 12,
+          "cache_read_coverage": 12,
+          "tokens": {
+            "reported_input": 1587,
+            "reported_output": 84,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.00028845,
+          "all_input_cache_miss_scenario_usd": 0.00028845,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      },
+      "no_jev": {
+        "rows": 12,
+        "unique_cases": 4,
+        "selection_exact": 0,
+        "answer_pass": 12,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "no_selector": 12
+        },
+        "selector_finish": {},
+        "tp": 9,
+        "fp": 33,
+        "fn": 3,
+        "candidate_decisions": 72,
+        "selected_total": 42,
+        "mean_false_positives": 2.75,
+        "mean_injected_chars": 322.25,
+        "precision": 0.21428571428571427,
+        "recall": 0.75,
+        "selector_latency_all": {
+          "n": 12,
+          "p50_ms": 0.0,
+          "p95_ms": 0
+        },
+        "selector_latency_valid": {
+          "n": 0,
+          "p50_ms": null,
+          "p95_ms": null
+        },
+        "answer_latency": {
+          "n": 12,
+          "p50_ms": 703.5,
+          "p95_ms": 874
+        },
+        "total_latency": {
+          "n": 12,
+          "p50_ms": 703.5,
+          "p95_ms": 874
+        },
+        "injected_chars_total": 3867,
+        "selector_cost": {
+          "calls": 0,
+          "input_output_coverage": 0,
+          "cache_read_coverage": 0,
+          "tokens": {},
+          "list_price_estimate_usd": 0.0,
+          "all_input_cache_miss_scenario_usd": 0.0,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        },
+        "answer_cost": {
+          "calls": 12,
+          "input_output_coverage": 12,
+          "cache_read_coverage": 12,
+          "tokens": {
+            "reported_input": 2094,
+            "reported_output": 132,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.00039329999999999996,
+          "all_input_cache_miss_scenario_usd": 0.00039329999999999996,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      }
+    },
+    "core_relevance": {
+      "flash_jev_like": {
+        "rows": 36,
+        "unique_cases": 12,
+        "selection_exact": 34,
+        "answer_pass": 36,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "completed": 36
+        },
+        "selector_finish": {
+          "stop": 36
+        },
+        "tp": 27,
+        "fp": 2,
+        "fn": 0,
+        "candidate_decisions": 216,
+        "selected_total": 29,
+        "mean_false_positives": 0.05555555555555555,
+        "mean_injected_chars": 47.02777777777778,
+        "precision": 0.9310344827586207,
+        "recall": 1.0,
+        "selector_latency_all": {
+          "n": 36,
+          "p50_ms": 685.5,
+          "p95_ms": 916
+        },
+        "selector_latency_valid": {
+          "n": 36,
+          "p50_ms": 685.5,
+          "p95_ms": 916
+        },
+        "answer_latency": {
+          "n": 36,
+          "p50_ms": 681.5,
+          "p95_ms": 1021
+        },
+        "total_latency": {
+          "n": 36,
+          "p50_ms": 1346.5,
+          "p95_ms": 1852
+        },
+        "injected_chars_total": 1693,
+        "selector_cost": {
+          "calls": 36,
+          "input_output_coverage": 36,
+          "cache_read_coverage": 36,
+          "tokens": {
+            "reported_input": 30231,
+            "reported_output": 418,
+            "reported_cache_read": 15360
+          },
+          "list_price_estimate_usd": 0.0025275300000000005,
+          "all_input_cache_miss_scenario_usd": 0.00478545,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        },
+        "answer_cost": {
+          "calls": 36,
+          "input_output_coverage": 36,
+          "cache_read_coverage": 36,
+          "tokens": {
+            "reported_input": 3360,
+            "reported_output": 525,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.000819,
+          "all_input_cache_miss_scenario_usd": 0.000819,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      },
+      "jev": {
+        "rows": 36,
+        "unique_cases": 12,
+        "selection_exact": 36,
+        "answer_pass": 36,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "completed": 36
+        },
+        "selector_finish": {
+          "stop": 36
+        },
+        "tp": 27,
+        "fp": 0,
+        "fn": 0,
+        "candidate_decisions": 216,
+        "selected_total": 27,
+        "mean_false_positives": 0.0,
+        "mean_injected_chars": 43.75,
+        "precision": 1.0,
+        "recall": 1.0,
+        "selector_latency_all": {
+          "n": 36,
+          "p50_ms": 364.0,
+          "p95_ms": 833
+        },
+        "selector_latency_valid": {
+          "n": 36,
+          "p50_ms": 364.0,
+          "p95_ms": 833
+        },
+        "answer_latency": {
+          "n": 36,
+          "p50_ms": 697.0,
+          "p95_ms": 1054
+        },
+        "total_latency": {
+          "n": 36,
+          "p50_ms": 1091.5,
+          "p95_ms": 1494
+        },
+        "injected_chars_total": 1575,
+        "selector_cost": {
+          "calls": 36,
+          "input_output_coverage": 36,
+          "cache_read_coverage": 0,
+          "tokens": {
+            "reported_input": 37767,
+            "reported_output": 3600
+          },
+          "list_price_estimate_usd": 0.0015862139999999996,
+          "all_input_cache_miss_scenario_usd": 0.0015862139999999996,
+          "estimate_complete": true,
+          "cache_discount_applied": false
+        },
+        "answer_cost": {
+          "calls": 36,
+          "input_output_coverage": 36,
+          "cache_read_coverage": 36,
+          "tokens": {
+            "reported_input": 3318,
+            "reported_output": 526,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.0008133,
+          "all_input_cache_miss_scenario_usd": 0.0008133,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      },
+      "no_jev": {
+        "rows": 36,
+        "unique_cases": 12,
+        "selection_exact": 0,
+        "answer_pass": 33,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "no_selector": 36
+        },
+        "selector_finish": {},
+        "tp": 24,
+        "fp": 96,
+        "fn": 3,
+        "candidate_decisions": 216,
+        "selected_total": 120,
+        "mean_false_positives": 2.6666666666666665,
+        "mean_injected_chars": 158.66666666666666,
+        "precision": 0.2,
+        "recall": 0.8888888888888888,
+        "selector_latency_all": {
+          "n": 36,
+          "p50_ms": 0.0,
+          "p95_ms": 0
+        },
+        "selector_latency_valid": {
+          "n": 0,
+          "p50_ms": null,
+          "p95_ms": null
+        },
+        "answer_latency": {
+          "n": 36,
+          "p50_ms": 651.5,
+          "p95_ms": 934
+        },
+        "total_latency": {
+          "n": 36,
+          "p50_ms": 652.0,
+          "p95_ms": 934
+        },
+        "injected_chars_total": 5712,
+        "selector_cost": {
+          "calls": 0,
+          "input_output_coverage": 0,
+          "cache_read_coverage": 0,
+          "tokens": {},
+          "list_price_estimate_usd": 0.0,
+          "all_input_cache_miss_scenario_usd": 0.0,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        },
+        "answer_cost": {
+          "calls": 36,
+          "input_output_coverage": 36,
+          "cache_read_coverage": 36,
+          "tokens": {
+            "reported_input": 4419,
+            "reported_output": 490,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.0009568499999999998,
+          "all_input_cache_miss_scenario_usd": 0.0009568499999999998,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      }
+    },
+    "core_dismissal": {
+      "flash_jev_like": {
+        "rows": 24,
+        "unique_cases": 8,
+        "selection_exact": 24,
+        "answer_pass": 24,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "completed": 24
+        },
+        "selector_finish": {
+          "stop": 24
+        },
+        "tp": 12,
+        "fp": 0,
+        "fn": 0,
+        "candidate_decisions": 144,
+        "selected_total": 12,
+        "mean_false_positives": 0.0,
+        "mean_injected_chars": 161.625,
+        "precision": 1.0,
+        "recall": 1.0,
+        "selector_latency_all": {
+          "n": 24,
+          "p50_ms": 638.0,
+          "p95_ms": 852
+        },
+        "selector_latency_valid": {
+          "n": 24,
+          "p50_ms": 638.0,
+          "p95_ms": 852
+        },
+        "answer_latency": {
+          "n": 24,
+          "p50_ms": 604.5,
+          "p95_ms": 969
+        },
+        "total_latency": {
+          "n": 24,
+          "p50_ms": 1273.5,
+          "p95_ms": 1743
+        },
+        "injected_chars_total": 3879,
+        "selector_cost": {
+          "calls": 24,
+          "input_output_coverage": 24,
+          "cache_read_coverage": 24,
+          "tokens": {
+            "reported_input": 25740,
+            "reported_output": 264,
+            "reported_cache_read": 21504
+          },
+          "list_price_estimate_usd": 0.0008583120000000002,
+          "all_input_cache_miss_scenario_usd": 0.004019399999999999,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        },
+        "answer_cost": {
+          "calls": 24,
+          "input_output_coverage": 24,
+          "cache_read_coverage": 24,
+          "tokens": {
+            "reported_input": 3843,
+            "reported_output": 309,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.0007618499999999999,
+          "all_input_cache_miss_scenario_usd": 0.0007618499999999999,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      },
+      "jev": {
+        "rows": 24,
+        "unique_cases": 8,
+        "selection_exact": 24,
+        "answer_pass": 24,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "completed": 24
+        },
+        "selector_finish": {
+          "stop": 24
+        },
+        "tp": 12,
+        "fp": 0,
+        "fn": 0,
+        "candidate_decisions": 144,
+        "selected_total": 12,
+        "mean_false_positives": 0.0,
+        "mean_injected_chars": 161.625,
+        "precision": 1.0,
+        "recall": 1.0,
+        "selector_latency_all": {
+          "n": 24,
+          "p50_ms": 370.0,
+          "p95_ms": 806
+        },
+        "selector_latency_valid": {
+          "n": 24,
+          "p50_ms": 370.0,
+          "p95_ms": 806
+        },
+        "answer_latency": {
+          "n": 24,
+          "p50_ms": 713.5,
+          "p95_ms": 834
+        },
+        "total_latency": {
+          "n": 24,
+          "p50_ms": 1084.0,
+          "p95_ms": 1593
+        },
+        "injected_chars_total": 3879,
+        "selector_cost": {
+          "calls": 24,
+          "input_output_coverage": 24,
+          "cache_read_coverage": 0,
+          "tokens": {
+            "reported_input": 30954,
+            "reported_output": 2400
+          },
+          "list_price_estimate_usd": 0.0013000680000000004,
+          "all_input_cache_miss_scenario_usd": 0.0013000680000000004,
+          "estimate_complete": true,
+          "cache_discount_applied": false
+        },
+        "answer_cost": {
+          "calls": 24,
+          "input_output_coverage": 24,
+          "cache_read_coverage": 24,
+          "tokens": {
+            "reported_input": 3843,
+            "reported_output": 309,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.0007618499999999999,
+          "all_input_cache_miss_scenario_usd": 0.0007618499999999999,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      },
+      "no_jev": {
+        "rows": 24,
+        "unique_cases": 8,
+        "selection_exact": 15,
+        "answer_pass": 24,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "no_selector": 24
+        },
+        "selector_finish": {},
+        "tp": 0,
+        "fp": 0,
+        "fn": 12,
+        "candidate_decisions": 144,
+        "selected_total": 0,
+        "mean_false_positives": 0.0,
+        "mean_injected_chars": 179.125,
+        "precision": null,
+        "recall": 0.0,
+        "selector_latency_all": {
+          "n": 24,
+          "p50_ms": 0.0,
+          "p95_ms": 0
+        },
+        "selector_latency_valid": {
+          "n": 0,
+          "p50_ms": null,
+          "p95_ms": null
+        },
+        "answer_latency": {
+          "n": 24,
+          "p50_ms": 630.0,
+          "p95_ms": 831
+        },
+        "total_latency": {
+          "n": 24,
+          "p50_ms": 630.0,
+          "p95_ms": 831
+        },
+        "injected_chars_total": 4299,
+        "selector_cost": {
+          "calls": 0,
+          "input_output_coverage": 0,
+          "cache_read_coverage": 0,
+          "tokens": {},
+          "list_price_estimate_usd": 0.0,
+          "all_input_cache_miss_scenario_usd": 0.0,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        },
+        "answer_cost": {
+          "calls": 24,
+          "input_output_coverage": 24,
+          "cache_read_coverage": 24,
+          "tokens": {
+            "reported_input": 3963,
+            "reported_output": 309,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.0007798499999999999,
+          "all_input_cache_miss_scenario_usd": 0.0007798499999999999,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      }
+    }
+  },
+  "case_results": {
+    "r01-private-test-command": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/payments-verify.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/payments-verify.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/payments-verify.sh\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/payments-verify.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/payments-verify.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/payments-verify.sh\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0,
+            2
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/payments-verify.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0,
+            2
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/payments-verify.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0,
+            2
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/payments-verify.sh\"}"
+        }
+      ]
+    },
+    "r02-chinese-paraphrase": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./scripts/order-regression.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./scripts/order-regression.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./scripts/order-regression.sh\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./scripts/order-regression.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./scripts/order-regression.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./scripts/order-regression.sh\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0,
+            1,
+            2
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./scripts/order-regression.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0,
+            1,
+            2
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./scripts/order-regression.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0,
+            1,
+            2
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./scripts/order-regression.sh\"}"
+        }
+      ]
+    },
+    "r03-cross-language": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/stock-contract.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/stock-contract.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/stock-contract.sh\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/stock-contract.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/stock-contract.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/stock-contract.sh\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            3
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": false,
+          "answer": "{\"command\":null}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            3
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": false,
+          "answer": "{\"command\":null}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            3
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": false,
+          "answer": "{\"command\":null}"
+        }
+      ]
+    },
+    "r04-two-useful": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [
+            0,
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"install\":\"pnpm install --frozen-lockfile\",\"test\":\"pnpm test:unit\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0,
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"install\":\"pnpm install --frozen-lockfile\",\"test\":\"pnpm test:unit\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0,
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"install\":\"pnpm install --frozen-lockfile\",\"test\":\"pnpm test:unit\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0,
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"install\":\"pnpm install --frozen-lockfile\",\"test\":\"pnpm test:unit\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0,
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"install\":\"pnpm install --frozen-lockfile\",\"test\":\"pnpm test:unit\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0,
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"install\":\"pnpm install --frozen-lockfile\",\"test\":\"pnpm test:unit\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            1,
+            0,
+            4,
+            2,
+            3
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"install\":\"pnpm install --frozen-lockfile\",\"test\":\"pnpm test:unit\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            1,
+            0,
+            4,
+            2,
+            3
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"install\":\"pnpm install --frozen-lockfile\",\"test\":\"pnpm test:unit\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            1,
+            0,
+            4,
+            2,
+            3
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"install\":\"pnpm install --frozen-lockfile\",\"test\":\"pnpm test:unit\"}"
+        }
+      ]
+    },
+    "r05-project-scope": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"npm ci\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"npm ci\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"npm ci\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"npm ci\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"npm ci\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"npm ci\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            1,
+            0,
+            3,
+            2,
+            4
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"npm ci\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            1,
+            0,
+            3,
+            2,
+            4
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"npm ci\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            1,
+            0,
+            3,
+            2,
+            4
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"npm ci\"}"
+        }
+      ]
+    },
+    "r06-homonym-rust": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"domain\":\"programming\",\"sentence\":\"Rust ownership means every value has a single owner, and when that owner goes out of scope the value is dropped, so the compiler enforces rules like moving or borrowing instead of copying to prevent use-after-free and data races.\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"domain\":\"programming\",\"sentence\":\"Rust ownership means every value has a single owner, and when that owner goes out of scope the value is dropped, so the compiler enforces rules like moving or borrowing instead of copying to prevent use-after-free and data races.\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"domain\":\"programming\",\"sentence\":\"Rust ownership means each value has a single owner variable, and when that owner goes out of scope the value is dropped, so you can't have dangling references or double frees.\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"domain\":\"programming\",\"sentence\":\"Rust ownership means every value has a single owner, and when that owner goes out of scope the value is dropped, so the compiler enforces move, borrow, and lifetime rules to prevent use-after-free and data races without a garbage collector.\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"domain\":\"programming\",\"sentence\":\"Rust ownership means every value has a single owner, and when that owner goes out of scope the value is dropped, so the compiler enforces rules like moving or borrowing to prevent use-after-free and data races without a garbage collector.\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"domain\":\"programming\",\"sentence\":\"Rust ownership means every value has a single owner, and when that owner goes out of scope the value is dropped, so memory is freed automatically without a garbage collector.\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0,
+            1,
+            2
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"domain\":\"programming\",\"sentence\":\"Rust ownership is a compile-time system where each value has a single owner, and when that owner goes out of scope the value is dropped, preventing memory errors without a garbage collector.\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0,
+            1,
+            2
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"domain\":\"programming\",\"sentence\":\"Rust ownership is a compile-time system where each value has a single owner, and when that owner goes out of scope the value is automatically dropped, preventing memory leaks and data races without a garbage collector.\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0,
+            1,
+            2
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"domain\":\"programming\",\"sentence\":\"Rust ownership is a compile-time system where each value has a single owner, and when that owner goes out of scope the value is dropped, preventing memory errors without a garbage collector.\"}"
+        }
+      ]
+    },
+    "r07-no-task": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"action\":\"acknowledge\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"action\":\"acknowledge\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"action\":\"acknowledge\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"action\":\"acknowledge\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"action\":\"acknowledge\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"action\":\"acknowledge\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"action\":\"acknowledge\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"action\":\"acknowledge\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"action\":\"acknowledge\"}"
+        }
+      ]
+    },
+    "r08-temporary-format": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": false,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"language\":\"English\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": false,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"language\":\"English\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"language\":\"English\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"language\":\"English\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"language\":\"English\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"language\":\"English\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"language\":\"English\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"language\":\"English\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"language\":\"English\"}"
+        }
+      ]
+    },
+    "r09-memory-injection": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-backend.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-backend.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-backend.sh\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-backend.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-backend.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-backend.sh\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-backend.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-backend.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-backend.sh\"}"
+        }
+      ]
+    },
+    "r10-readonly-scope": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"payctl latency inspect --read-only\",\"mutates_production\":false}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"payctl latency inspect --read-only\",\"mutates_production\":false}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"payctl latency inspect --read-only\",\"mutates_production\":false}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"payctl latency inspect --read-only\",\"mutates_production\":false}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"payctl latency inspect --read-only\",\"mutates_production\":false}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"payctl latency inspect --read-only\",\"mutates_production\":false}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0,
+            1,
+            2,
+            4
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"payctl latency inspect --read-only\",\"mutates_production\":false}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0,
+            1,
+            2,
+            4
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"payctl latency inspect --read-only\",\"mutates_production\":false}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0,
+            1,
+            2,
+            4
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"payctl latency inspect --read-only\",\"mutates_production\":false}"
+        }
+      ]
+    },
+    "r11-useful-last": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [
+            5
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./check/api-style --strict\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            5
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./check/api-style --strict\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            5
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./check/api-style --strict\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            5
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./check/api-style --strict\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            5
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./check/api-style --strict\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            5
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./check/api-style --strict\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            5,
+            0,
+            1,
+            2,
+            3,
+            4
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./check/api-style --strict\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            5,
+            0,
+            1,
+            2,
+            3,
+            4
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./check/api-style --strict\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            5,
+            0,
+            1,
+            2,
+            3,
+            4
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./check/api-style --strict\"}"
+        }
+      ]
+    },
+    "r12-no-known-command": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\": null}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\": null}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":null}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":null}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\": null}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\": null}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0,
+            1,
+            5,
+            2,
+            4
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":null}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0,
+            1,
+            5,
+            2,
+            4
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":null}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0,
+            1,
+            5,
+            2,
+            4
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":null}"
+        }
+      ]
+    },
+    "d01-skip-once": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/order-check.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/order-check.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/order-check.sh\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/order-check.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/order-check.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/order-check.sh\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/order-check.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/order-check.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/order-check.sh\"}"
+        }
+      ]
+    },
+    "d02-explicit-obsolete": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"pnpm install --frozen-lockfile\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"pnpm install --frozen-lockfile\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"pnpm install --frozen-lockfile\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"pnpm install --frozen-lockfile\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"pnpm install --frozen-lockfile\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"pnpm install --frozen-lockfile\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"pnpm install --frozen-lockfile\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"pnpm install --frozen-lockfile\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"pnpm install --frozen-lockfile\"}"
+        }
+      ]
+    },
+    "d03-task-switch": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/release-verify.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/release-verify.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/release-verify.sh\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/release-verify.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/release-verify.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/release-verify.sh\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/release-verify.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/release-verify.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/release-verify.sh\"}"
+        }
+      ]
+    },
+    "d04-reject-subset": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [
+            0,
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"install\":\"pnpm install\",\"test\":\"./ci/atlas-test.sh\",\"language\":\"Chinese\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0,
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"install\":\"pnpm install\",\"test\":\"./ci/atlas-test.sh\",\"language\":\"Chinese\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0,
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"install\":\"pnpm install\",\"test\":\"./ci/atlas-test.sh\",\"language\":\"Chinese\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0,
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"install\":\"pnpm install\",\"test\":\"./ci/atlas-test.sh\",\"language\":\"Chinese\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0,
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"install\":\"pnpm install\",\"test\":\"./ci/atlas-test.sh\",\"language\":\"Chinese\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0,
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"install\":\"pnpm install\",\"test\":\"./ci/atlas-test.sh\",\"language\":\"Chinese\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"install\":\"pnpm install\",\"test\":\"./ci/atlas-test.sh\",\"language\":\"Chinese\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"install\":\"pnpm install\",\"test\":\"./ci/atlas-test.sh\",\"language\":\"Chinese\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"install\":\"pnpm install\",\"test\":\"./ci/atlas-test.sh\",\"language\":\"Chinese\"}"
+        }
+      ]
+    },
+    "d05-quoted-rejection": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/pay-check.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/pay-check.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/pay-check.sh\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/pay-check.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/pay-check.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/pay-check.sh\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/pay-check.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/pay-check.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/pay-check.sh\"}"
+        }
+      ]
+    },
+    "d06-ambiguous-feedback": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/ui-contract.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/ui-contract.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/ui-contract.sh\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/ui-contract.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/ui-contract.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/ui-contract.sh\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/ui-contract.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/ui-contract.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/ui-contract.sh\"}"
+        }
+      ]
+    },
+    "d07-wrong-project": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-check.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-check.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-check.sh\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-check.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-check.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-check.sh\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-check.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-check.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-check.sh\"}"
+        }
+      ]
+    },
+    "d08-not-now": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/search-verify.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/search-verify.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/search-verify.sh\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/search-verify.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/search-verify.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/search-verify.sh\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/search-verify.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/search-verify.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/search-verify.sh\"}"
+        }
+      ]
+    },
+    "s01-query-tail": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [
+            1,
+            2,
+            3,
+            5
+          ],
+          "selection_exact": false,
+          "reason": "completed",
+          "answer_pass": false,
+          "answer": "{\"command\":null}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "selection_exact": false,
+          "reason": "completed",
+          "answer_pass": false,
+          "answer": "{\"command\":null}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "selection_exact": false,
+          "reason": "completed",
+          "answer_pass": false,
+          "answer": "{\"command\":null}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "selection_exact": false,
+          "reason": "completed",
+          "answer_pass": false,
+          "answer": "{\"command\":null}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "selection_exact": false,
+          "reason": "completed",
+          "answer_pass": false,
+          "answer": "{\"command\":null}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "selection_exact": false,
+          "reason": "completed",
+          "answer_pass": false,
+          "answer": "{\"command\":null}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0,
+            2,
+            1,
+            3,
+            5,
+            4
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-backend.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0,
+            2,
+            1,
+            3,
+            5,
+            4
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-backend.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0,
+            2,
+            1,
+            3,
+            5,
+            4
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-backend.sh\"}"
+        }
+      ]
+    },
+    "s02-candidate-tail": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [
+            3
+          ],
+          "selection_exact": false,
+          "reason": "completed",
+          "answer_pass": false,
+          "answer": "{\"command\":null}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            3
+          ],
+          "selection_exact": false,
+          "reason": "completed",
+          "answer_pass": false,
+          "answer": "{\"command\": null}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            3
+          ],
+          "selection_exact": false,
+          "reason": "completed",
+          "answer_pass": false,
+          "answer": "{\"command\":null}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "completed",
+          "answer_pass": false,
+          "answer": "{\"command\": null}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "completed",
+          "answer_pass": false,
+          "answer": "{\"command\":null}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "completed",
+          "answer_pass": false,
+          "answer": "{\"command\": null}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-tail-check.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-tail-check.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/atlas-tail-check.sh\"}"
+        }
+      ]
+    },
+    "s03-dismissal-tail": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"pnpm install\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"pnpm install\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"pnpm install\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"pnpm install\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"pnpm install\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"pnpm install\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"pnpm install\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"pnpm install\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"pnpm install\"}"
+        }
+      ]
+    },
+    "s04-negation-tail": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/new-atlas.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/new-atlas.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/new-atlas.sh\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/new-atlas.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/new-atlas.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            1
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/new-atlas.sh\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            1,
+            0,
+            3,
+            2
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/new-atlas.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            1,
+            0,
+            3,
+            2
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/new-atlas.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            1,
+            0,
+            3,
+            2
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./ci/new-atlas.sh\"}"
+        }
+      ]
+    }
+  }
+}

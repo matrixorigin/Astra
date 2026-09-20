@@ -1,0 +1,1609 @@
+{
+  "run": "regression",
+  "commit": "0db06a3dba515798f4befa71ea3c930ffb84c5ce",
+  "provenance": {
+    "started_at": "2026-09-20T08:06:01.574713782+00:00",
+    "binary_sha256": "d5087a922703c74c44f2f2a3a8b940a9697d4b4ac3c66376fa417d1be97c1f3b",
+    "sources": {
+      "crates/astra-turn-types/src/judgment.rs": "b138ba976095656389c9f75fa52653cd3e2e57620937448200e742abf37abb6d",
+      "crates/runtime/src/memory_hooks/article_eval.rs": "2ba454f1b501883e60fce561637e7ffbd38cb9148f787e445a89404f8ae1c518",
+      "crates/runtime/src/memory_hooks/relevance.rs": "429354fd65229283129bdb6943c2c17ab7c886b362737ed2c79f0882ef391c42",
+      "crates/runtime/src/turn/llm/client.rs": "b01cb52cc91d41ff5122bb6a1b8851a8909a9f6c1c1f7dcbe8363bf656983a85",
+      "crates/runtime/src/turn/llm/typesafe.rs": "f55fa38125bc3cbc21b1ed13d179c9cb4d05910f7444c7f2b65156e130f8a51b"
+    },
+    "cases_sha256": "db4155af9ff99ba93f6acbaa431c05ff0939c82b615fbda103c9e6dd1a24ad2d",
+    "features": "--no-default-features --features live-provider-tests",
+    "repeat": 3,
+    "scope": "live production memory selector and provider adapters; fixed synthetic retrieval; isolated answer task, no server/DB/tools",
+    "selector_deadline_ms": 3000,
+    "answer_deadline_ms": 20000
+  },
+  "results_sha256": "8d02969bb798544e9468c6a19712697140ea3076dd5469fd6a64cf71f2915d73",
+  "price_basis": "dated official USD price card; reported cache discounts; unknown usage not zero",
+  "price_card": {
+    "schema_version": 1,
+    "checked_on": "2026-09-20",
+    "currency": "USD",
+    "tier": "off_peak",
+    "tier_reason": "Evaluation ran on Sunday; official Flash pricing lists weekends as off-peak.",
+    "unit": "USD per token",
+    "flash": {
+      "input": 1.5e-07,
+      "cache_read": 3e-09,
+      "output": 6e-07
+    },
+    "jev": {
+      "input": 4.2e-08,
+      "cache_read": null,
+      "output": 0
+    },
+    "sources": [
+      "https://api-docs.deepseek.com/quick_start/pricing/",
+      "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/",
+      "https://docs.typesafe.ai/models"
+    ],
+    "model_identity_note": "DeepSeek official documentation says legacy deepseek-v4-flash requests are now served by DeepSeek-V4.1-Flash. Preserve actual response model fields; do not infer a pinned weight revision from the alias.",
+    "limits": "Official-price estimate using provider-reported usage, not an invoice. Unknown failed-call usage is not zero. No currency conversion or local YAML price is used. Unknown JEV cache counters remain unknown."
+  },
+  "prices_per_token": {
+    "jev": {
+      "input": 4.2e-08,
+      "cache_read": null,
+      "output": 0
+    },
+    "flash": {
+      "input": 1.5e-07,
+      "cache_read": 3e-09,
+      "output": 6e-07
+    }
+  },
+  "groups": {
+    "all": {
+      "flash_jev_like": {
+        "rows": 24,
+        "unique_cases": 8,
+        "selection_exact": 24,
+        "answer_pass": 24,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "completed": 24
+        },
+        "selector_finish": {
+          "stop": 24
+        },
+        "tp": 12,
+        "fp": 0,
+        "fn": 0,
+        "candidate_decisions": 144,
+        "selected_total": 12,
+        "mean_false_positives": 0.0,
+        "mean_injected_chars": 116.75,
+        "precision": 1.0,
+        "recall": 1.0,
+        "selector_latency_all": {
+          "n": 24,
+          "p50_ms": 580.5,
+          "p95_ms": 822
+        },
+        "selector_latency_valid": {
+          "n": 24,
+          "p50_ms": 580.5,
+          "p95_ms": 822
+        },
+        "answer_latency": {
+          "n": 24,
+          "p50_ms": 593.0,
+          "p95_ms": 790
+        },
+        "total_latency": {
+          "n": 24,
+          "p50_ms": 1167.0,
+          "p95_ms": 1580
+        },
+        "injected_chars_total": 2802,
+        "selector_cost": {
+          "calls": 24,
+          "input_output_coverage": 24,
+          "cache_read_coverage": 24,
+          "tokens": {
+            "reported_input": 24189,
+            "reported_output": 264,
+            "reported_cache_read": 18688
+          },
+          "list_price_estimate_usd": 0.0010396140000000008,
+          "all_input_cache_miss_scenario_usd": 0.0037867500000000006,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        },
+        "answer_cost": {
+          "calls": 24,
+          "input_output_coverage": 24,
+          "cache_read_coverage": 24,
+          "tokens": {
+            "reported_input": 3363,
+            "reported_output": 258,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.00065925,
+          "all_input_cache_miss_scenario_usd": 0.00065925,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      },
+      "jev": {
+        "rows": 24,
+        "unique_cases": 8,
+        "selection_exact": 24,
+        "answer_pass": 24,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "completed": 24
+        },
+        "selector_finish": {
+          "stop": 24
+        },
+        "tp": 12,
+        "fp": 0,
+        "fn": 0,
+        "candidate_decisions": 144,
+        "selected_total": 12,
+        "mean_false_positives": 0.0,
+        "mean_injected_chars": 116.75,
+        "precision": 1.0,
+        "recall": 1.0,
+        "selector_latency_all": {
+          "n": 24,
+          "p50_ms": 334.5,
+          "p95_ms": 422
+        },
+        "selector_latency_valid": {
+          "n": 24,
+          "p50_ms": 334.5,
+          "p95_ms": 422
+        },
+        "answer_latency": {
+          "n": 24,
+          "p50_ms": 590.5,
+          "p95_ms": 681
+        },
+        "total_latency": {
+          "n": 24,
+          "p50_ms": 920.5,
+          "p95_ms": 1004
+        },
+        "injected_chars_total": 2802,
+        "selector_cost": {
+          "calls": 24,
+          "input_output_coverage": 24,
+          "cache_read_coverage": 0,
+          "tokens": {
+            "reported_input": 29487,
+            "reported_output": 2400
+          },
+          "list_price_estimate_usd": 0.001238454,
+          "all_input_cache_miss_scenario_usd": 0.001238454,
+          "estimate_complete": true,
+          "cache_discount_applied": false
+        },
+        "answer_cost": {
+          "calls": 24,
+          "input_output_coverage": 24,
+          "cache_read_coverage": 24,
+          "tokens": {
+            "reported_input": 3363,
+            "reported_output": 258,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.00065925,
+          "all_input_cache_miss_scenario_usd": 0.00065925,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      },
+      "no_jev": {
+        "rows": 24,
+        "unique_cases": 8,
+        "selection_exact": 12,
+        "answer_pass": 24,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "no_selector": 24
+        },
+        "selector_finish": {},
+        "tp": 6,
+        "fp": 12,
+        "fn": 6,
+        "candidate_decisions": 144,
+        "selected_total": 18,
+        "mean_false_positives": 0.5,
+        "mean_injected_chars": 143.75,
+        "precision": 0.3333333333333333,
+        "recall": 0.5,
+        "selector_latency_all": {
+          "n": 24,
+          "p50_ms": 0.0,
+          "p95_ms": 0
+        },
+        "selector_latency_valid": {
+          "n": 0,
+          "p50_ms": null,
+          "p95_ms": null
+        },
+        "answer_latency": {
+          "n": 24,
+          "p50_ms": 522.0,
+          "p95_ms": 884
+        },
+        "total_latency": {
+          "n": 24,
+          "p50_ms": 522.0,
+          "p95_ms": 884
+        },
+        "injected_chars_total": 3450,
+        "selector_cost": {
+          "calls": 0,
+          "input_output_coverage": 0,
+          "cache_read_coverage": 0,
+          "tokens": {},
+          "list_price_estimate_usd": 0.0,
+          "all_input_cache_miss_scenario_usd": 0.0,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        },
+        "answer_cost": {
+          "calls": 24,
+          "input_output_coverage": 24,
+          "cache_read_coverage": 24,
+          "tokens": {
+            "reported_input": 3528,
+            "reported_output": 258,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.000684,
+          "all_input_cache_miss_scenario_usd": 0.000684,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      }
+    },
+    "core": {
+      "flash_jev_like": {
+        "rows": 24,
+        "unique_cases": 8,
+        "selection_exact": 24,
+        "answer_pass": 24,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "completed": 24
+        },
+        "selector_finish": {
+          "stop": 24
+        },
+        "tp": 12,
+        "fp": 0,
+        "fn": 0,
+        "candidate_decisions": 144,
+        "selected_total": 12,
+        "mean_false_positives": 0.0,
+        "mean_injected_chars": 116.75,
+        "precision": 1.0,
+        "recall": 1.0,
+        "selector_latency_all": {
+          "n": 24,
+          "p50_ms": 580.5,
+          "p95_ms": 822
+        },
+        "selector_latency_valid": {
+          "n": 24,
+          "p50_ms": 580.5,
+          "p95_ms": 822
+        },
+        "answer_latency": {
+          "n": 24,
+          "p50_ms": 593.0,
+          "p95_ms": 790
+        },
+        "total_latency": {
+          "n": 24,
+          "p50_ms": 1167.0,
+          "p95_ms": 1580
+        },
+        "injected_chars_total": 2802,
+        "selector_cost": {
+          "calls": 24,
+          "input_output_coverage": 24,
+          "cache_read_coverage": 24,
+          "tokens": {
+            "reported_input": 24189,
+            "reported_output": 264,
+            "reported_cache_read": 18688
+          },
+          "list_price_estimate_usd": 0.0010396140000000008,
+          "all_input_cache_miss_scenario_usd": 0.0037867500000000006,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        },
+        "answer_cost": {
+          "calls": 24,
+          "input_output_coverage": 24,
+          "cache_read_coverage": 24,
+          "tokens": {
+            "reported_input": 3363,
+            "reported_output": 258,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.00065925,
+          "all_input_cache_miss_scenario_usd": 0.00065925,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      },
+      "jev": {
+        "rows": 24,
+        "unique_cases": 8,
+        "selection_exact": 24,
+        "answer_pass": 24,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "completed": 24
+        },
+        "selector_finish": {
+          "stop": 24
+        },
+        "tp": 12,
+        "fp": 0,
+        "fn": 0,
+        "candidate_decisions": 144,
+        "selected_total": 12,
+        "mean_false_positives": 0.0,
+        "mean_injected_chars": 116.75,
+        "precision": 1.0,
+        "recall": 1.0,
+        "selector_latency_all": {
+          "n": 24,
+          "p50_ms": 334.5,
+          "p95_ms": 422
+        },
+        "selector_latency_valid": {
+          "n": 24,
+          "p50_ms": 334.5,
+          "p95_ms": 422
+        },
+        "answer_latency": {
+          "n": 24,
+          "p50_ms": 590.5,
+          "p95_ms": 681
+        },
+        "total_latency": {
+          "n": 24,
+          "p50_ms": 920.5,
+          "p95_ms": 1004
+        },
+        "injected_chars_total": 2802,
+        "selector_cost": {
+          "calls": 24,
+          "input_output_coverage": 24,
+          "cache_read_coverage": 0,
+          "tokens": {
+            "reported_input": 29487,
+            "reported_output": 2400
+          },
+          "list_price_estimate_usd": 0.001238454,
+          "all_input_cache_miss_scenario_usd": 0.001238454,
+          "estimate_complete": true,
+          "cache_discount_applied": false
+        },
+        "answer_cost": {
+          "calls": 24,
+          "input_output_coverage": 24,
+          "cache_read_coverage": 24,
+          "tokens": {
+            "reported_input": 3363,
+            "reported_output": 258,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.00065925,
+          "all_input_cache_miss_scenario_usd": 0.00065925,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      },
+      "no_jev": {
+        "rows": 24,
+        "unique_cases": 8,
+        "selection_exact": 12,
+        "answer_pass": 24,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "no_selector": 24
+        },
+        "selector_finish": {},
+        "tp": 6,
+        "fp": 12,
+        "fn": 6,
+        "candidate_decisions": 144,
+        "selected_total": 18,
+        "mean_false_positives": 0.5,
+        "mean_injected_chars": 143.75,
+        "precision": 0.3333333333333333,
+        "recall": 0.5,
+        "selector_latency_all": {
+          "n": 24,
+          "p50_ms": 0.0,
+          "p95_ms": 0
+        },
+        "selector_latency_valid": {
+          "n": 0,
+          "p50_ms": null,
+          "p95_ms": null
+        },
+        "answer_latency": {
+          "n": 24,
+          "p50_ms": 522.0,
+          "p95_ms": 884
+        },
+        "total_latency": {
+          "n": 24,
+          "p50_ms": 522.0,
+          "p95_ms": 884
+        },
+        "injected_chars_total": 3450,
+        "selector_cost": {
+          "calls": 0,
+          "input_output_coverage": 0,
+          "cache_read_coverage": 0,
+          "tokens": {},
+          "list_price_estimate_usd": 0.0,
+          "all_input_cache_miss_scenario_usd": 0.0,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        },
+        "answer_cost": {
+          "calls": 24,
+          "input_output_coverage": 24,
+          "cache_read_coverage": 24,
+          "tokens": {
+            "reported_input": 3528,
+            "reported_output": 258,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.000684,
+          "all_input_cache_miss_scenario_usd": 0.000684,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      }
+    },
+    "stress": {},
+    "core_relevance": {
+      "flash_jev_like": {
+        "rows": 6,
+        "unique_cases": 2,
+        "selection_exact": 6,
+        "answer_pass": 6,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "completed": 6
+        },
+        "selector_finish": {
+          "stop": 6
+        },
+        "tp": 6,
+        "fp": 0,
+        "fn": 0,
+        "candidate_decisions": 36,
+        "selected_total": 6,
+        "mean_false_positives": 0.0,
+        "mean_injected_chars": 44.0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "selector_latency_all": {
+          "n": 6,
+          "p50_ms": 580.5,
+          "p95_ms": 831
+        },
+        "selector_latency_valid": {
+          "n": 6,
+          "p50_ms": 580.5,
+          "p95_ms": 831
+        },
+        "answer_latency": {
+          "n": 6,
+          "p50_ms": 567.5,
+          "p95_ms": 790
+        },
+        "total_latency": {
+          "n": 6,
+          "p50_ms": 1221.5,
+          "p95_ms": 1466
+        },
+        "injected_chars_total": 264,
+        "selector_cost": {
+          "calls": 6,
+          "input_output_coverage": 6,
+          "cache_read_coverage": 6,
+          "tokens": {
+            "reported_input": 5001,
+            "reported_output": 72,
+            "reported_cache_read": 2560
+          },
+          "list_price_estimate_usd": 0.0004170299999999999,
+          "all_input_cache_miss_scenario_usd": 0.0007933500000000001,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        },
+        "answer_cost": {
+          "calls": 6,
+          "input_output_coverage": 6,
+          "cache_read_coverage": 6,
+          "tokens": {
+            "reported_input": 576,
+            "reported_output": 63,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.0001242,
+          "all_input_cache_miss_scenario_usd": 0.0001242,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      },
+      "jev": {
+        "rows": 6,
+        "unique_cases": 2,
+        "selection_exact": 6,
+        "answer_pass": 6,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "completed": 6
+        },
+        "selector_finish": {
+          "stop": 6
+        },
+        "tp": 6,
+        "fp": 0,
+        "fn": 0,
+        "candidate_decisions": 36,
+        "selected_total": 6,
+        "mean_false_positives": 0.0,
+        "mean_injected_chars": 44.0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "selector_latency_all": {
+          "n": 6,
+          "p50_ms": 331.0,
+          "p95_ms": 422
+        },
+        "selector_latency_valid": {
+          "n": 6,
+          "p50_ms": 331.0,
+          "p95_ms": 422
+        },
+        "answer_latency": {
+          "n": 6,
+          "p50_ms": 576.5,
+          "p95_ms": 652
+        },
+        "total_latency": {
+          "n": 6,
+          "p50_ms": 935.5,
+          "p95_ms": 981
+        },
+        "injected_chars_total": 264,
+        "selector_cost": {
+          "calls": 6,
+          "input_output_coverage": 6,
+          "cache_read_coverage": 0,
+          "tokens": {
+            "reported_input": 6261,
+            "reported_output": 600
+          },
+          "list_price_estimate_usd": 0.000262962,
+          "all_input_cache_miss_scenario_usd": 0.000262962,
+          "estimate_complete": true,
+          "cache_discount_applied": false
+        },
+        "answer_cost": {
+          "calls": 6,
+          "input_output_coverage": 6,
+          "cache_read_coverage": 6,
+          "tokens": {
+            "reported_input": 576,
+            "reported_output": 63,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.0001242,
+          "all_input_cache_miss_scenario_usd": 0.0001242,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      },
+      "no_jev": {
+        "rows": 6,
+        "unique_cases": 2,
+        "selection_exact": 0,
+        "answer_pass": 6,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "no_selector": 6
+        },
+        "selector_finish": {},
+        "tp": 6,
+        "fp": 12,
+        "fn": 0,
+        "candidate_decisions": 36,
+        "selected_total": 18,
+        "mean_false_positives": 2.0,
+        "mean_injected_chars": 121.5,
+        "precision": 0.3333333333333333,
+        "recall": 1.0,
+        "selector_latency_all": {
+          "n": 6,
+          "p50_ms": 0.0,
+          "p95_ms": 0
+        },
+        "selector_latency_valid": {
+          "n": 0,
+          "p50_ms": null,
+          "p95_ms": null
+        },
+        "answer_latency": {
+          "n": 6,
+          "p50_ms": 562.5,
+          "p95_ms": 782
+        },
+        "total_latency": {
+          "n": 6,
+          "p50_ms": 562.5,
+          "p95_ms": 782
+        },
+        "injected_chars_total": 729,
+        "selector_cost": {
+          "calls": 0,
+          "input_output_coverage": 0,
+          "cache_read_coverage": 0,
+          "tokens": {},
+          "list_price_estimate_usd": 0.0,
+          "all_input_cache_miss_scenario_usd": 0.0,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        },
+        "answer_cost": {
+          "calls": 6,
+          "input_output_coverage": 6,
+          "cache_read_coverage": 6,
+          "tokens": {
+            "reported_input": 684,
+            "reported_output": 63,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.0001404,
+          "all_input_cache_miss_scenario_usd": 0.0001404,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      }
+    },
+    "core_dismissal": {
+      "flash_jev_like": {
+        "rows": 18,
+        "unique_cases": 6,
+        "selection_exact": 18,
+        "answer_pass": 18,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "completed": 18
+        },
+        "selector_finish": {
+          "stop": 18
+        },
+        "tp": 6,
+        "fp": 0,
+        "fn": 0,
+        "candidate_decisions": 108,
+        "selected_total": 6,
+        "mean_false_positives": 0.0,
+        "mean_injected_chars": 141.0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "selector_latency_all": {
+          "n": 18,
+          "p50_ms": 593.0,
+          "p95_ms": 822
+        },
+        "selector_latency_valid": {
+          "n": 18,
+          "p50_ms": 593.0,
+          "p95_ms": 822
+        },
+        "answer_latency": {
+          "n": 18,
+          "p50_ms": 593.0,
+          "p95_ms": 869
+        },
+        "total_latency": {
+          "n": 18,
+          "p50_ms": 1150.0,
+          "p95_ms": 1681
+        },
+        "injected_chars_total": 2538,
+        "selector_cost": {
+          "calls": 18,
+          "input_output_coverage": 18,
+          "cache_read_coverage": 18,
+          "tokens": {
+            "reported_input": 19188,
+            "reported_output": 192,
+            "reported_cache_read": 16128
+          },
+          "list_price_estimate_usd": 0.000622584,
+          "all_input_cache_miss_scenario_usd": 0.0029934000000000002,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        },
+        "answer_cost": {
+          "calls": 18,
+          "input_output_coverage": 18,
+          "cache_read_coverage": 18,
+          "tokens": {
+            "reported_input": 2787,
+            "reported_output": 195,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.0005350500000000001,
+          "all_input_cache_miss_scenario_usd": 0.0005350500000000001,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      },
+      "jev": {
+        "rows": 18,
+        "unique_cases": 6,
+        "selection_exact": 18,
+        "answer_pass": 18,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "completed": 18
+        },
+        "selector_finish": {
+          "stop": 18
+        },
+        "tp": 6,
+        "fp": 0,
+        "fn": 0,
+        "candidate_decisions": 108,
+        "selected_total": 6,
+        "mean_false_positives": 0.0,
+        "mean_injected_chars": 141.0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "selector_latency_all": {
+          "n": 18,
+          "p50_ms": 334.5,
+          "p95_ms": 823
+        },
+        "selector_latency_valid": {
+          "n": 18,
+          "p50_ms": 334.5,
+          "p95_ms": 823
+        },
+        "answer_latency": {
+          "n": 18,
+          "p50_ms": 590.5,
+          "p95_ms": 786
+        },
+        "total_latency": {
+          "n": 18,
+          "p50_ms": 920.5,
+          "p95_ms": 1610
+        },
+        "injected_chars_total": 2538,
+        "selector_cost": {
+          "calls": 18,
+          "input_output_coverage": 18,
+          "cache_read_coverage": 0,
+          "tokens": {
+            "reported_input": 23226,
+            "reported_output": 1800
+          },
+          "list_price_estimate_usd": 0.000975492,
+          "all_input_cache_miss_scenario_usd": 0.000975492,
+          "estimate_complete": true,
+          "cache_discount_applied": false
+        },
+        "answer_cost": {
+          "calls": 18,
+          "input_output_coverage": 18,
+          "cache_read_coverage": 18,
+          "tokens": {
+            "reported_input": 2787,
+            "reported_output": 195,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.0005350500000000001,
+          "all_input_cache_miss_scenario_usd": 0.0005350500000000001,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      },
+      "no_jev": {
+        "rows": 18,
+        "unique_cases": 6,
+        "selection_exact": 12,
+        "answer_pass": 18,
+        "answer_unavailable_or_incomplete": 0,
+        "selection_reason": {
+          "no_selector": 18
+        },
+        "selector_finish": {},
+        "tp": 0,
+        "fp": 0,
+        "fn": 6,
+        "candidate_decisions": 108,
+        "selected_total": 0,
+        "mean_false_positives": 0.0,
+        "mean_injected_chars": 151.16666666666666,
+        "precision": null,
+        "recall": 0.0,
+        "selector_latency_all": {
+          "n": 18,
+          "p50_ms": 0.0,
+          "p95_ms": 0
+        },
+        "selector_latency_valid": {
+          "n": 0,
+          "p50_ms": null,
+          "p95_ms": null
+        },
+        "answer_latency": {
+          "n": 18,
+          "p50_ms": 485.0,
+          "p95_ms": 1005
+        },
+        "total_latency": {
+          "n": 18,
+          "p50_ms": 486.0,
+          "p95_ms": 1005
+        },
+        "injected_chars_total": 2721,
+        "selector_cost": {
+          "calls": 0,
+          "input_output_coverage": 0,
+          "cache_read_coverage": 0,
+          "tokens": {},
+          "list_price_estimate_usd": 0.0,
+          "all_input_cache_miss_scenario_usd": 0.0,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        },
+        "answer_cost": {
+          "calls": 18,
+          "input_output_coverage": 18,
+          "cache_read_coverage": 18,
+          "tokens": {
+            "reported_input": 2844,
+            "reported_output": 195,
+            "reported_cache_read": 0
+          },
+          "list_price_estimate_usd": 0.0005436000000000001,
+          "all_input_cache_miss_scenario_usd": 0.0005436000000000001,
+          "estimate_complete": true,
+          "cache_discount_applied": true
+        }
+      }
+    }
+  },
+  "case_results": {
+    "g01-triage-delay": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/orion-regression.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/orion-regression.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/orion-regression.sh\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/orion-regression.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/orion-regression.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/orion-regression.sh\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/orion-regression.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/orion-regression.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/orion-regression.sh\"}"
+        }
+      ]
+    },
+    "g02-one-translation": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"language\":\"German\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"language\":\"German\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"language\":\"German\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"language\":\"German\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"language\":\"German\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"language\":\"German\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"language\":\"German\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"language\":\"German\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"language\":\"German\"}"
+        }
+      ]
+    },
+    "g03-end-policy": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"orion\":\"JSON\",\"vega\":\"XML\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"orion\":\"JSON\",\"vega\":\"XML\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"orion\":\"JSON\",\"vega\":\"XML\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"orion\":\"JSON\",\"vega\":\"XML\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"orion\":\"JSON\",\"vega\":\"XML\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"orion\":\"JSON\",\"vega\":\"XML\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"orion\":\"JSON\",\"vega\":\"XML\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"orion\":\"JSON\",\"vega\":\"XML\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"orion\":\"JSON\",\"vega\":\"XML\"}"
+        }
+      ]
+    },
+    "g04-preserve-negated-quote": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./release/orion-gate.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./release/orion-gate.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./release/orion-gate.sh\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./release/orion-gate.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./release/orion-gate.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./release/orion-gate.sh\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./release/orion-gate.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./release/orion-gate.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./release/orion-gate.sh\"}"
+        }
+      ]
+    },
+    "g05-wrong-port": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"metrics_port\":9407,\"health_port\":8088}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"metrics_port\":9407,\"health_port\":8088}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"metrics_port\":9407,\"health_port\":8088}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"metrics_port\":9407,\"health_port\":8088}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"metrics_port\":9407,\"health_port\":8088}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"metrics_port\":9407,\"health_port\":8088}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"metrics_port\":9407,\"health_port\":8088}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"metrics_port\":9407,\"health_port\":8088}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"metrics_port\":9407,\"health_port\":8088}"
+        }
+      ]
+    },
+    "g06-review-only": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/orion-contract.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/orion-contract.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/orion-contract.sh\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/orion-contract.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/orion-contract.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/orion-contract.sh\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/orion-contract.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/orion-contract.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [],
+          "selection_exact": true,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./checks/orion-contract.sh\"}"
+        }
+      ]
+    },
+    "g07-telemetry-fact": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"port\":9407}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"port\":9407}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"port\":9407}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"port\":9407}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"port\":9407}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"port\":9407}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0,
+            2,
+            3,
+            1
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"port\":9407}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0,
+            2,
+            3,
+            1
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"port\":9407}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0,
+            2,
+            3,
+            1
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"port\":9407}"
+        }
+      ]
+    },
+    "g08-mixed-language-procedure": {
+      "flash_jev_like": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./drills/shipping-rollback.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./drills/shipping-rollback.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./drills/shipping-rollback.sh\"}"
+        }
+      ],
+      "jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./drills/shipping-rollback.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./drills/shipping-rollback.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0
+          ],
+          "selection_exact": true,
+          "reason": "completed",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./drills/shipping-rollback.sh\"}"
+        }
+      ],
+      "no_jev": [
+        {
+          "repeat": 0,
+          "selected": [
+            0,
+            3
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./drills/shipping-rollback.sh\"}"
+        },
+        {
+          "repeat": 1,
+          "selected": [
+            0,
+            3
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./drills/shipping-rollback.sh\"}"
+        },
+        {
+          "repeat": 2,
+          "selected": [
+            0,
+            3
+          ],
+          "selection_exact": false,
+          "reason": "no_selector",
+          "answer_pass": true,
+          "answer": "{\"command\":\"./drills/shipping-rollback.sh\"}"
+        }
+      ]
+    }
+  }
+}

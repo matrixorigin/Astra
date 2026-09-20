@@ -1,0 +1,10 @@
+# Copy outside the repository, replace placeholders, and restrict permissions.
+# This file is NOT usable credentials. Literal keys are required by the harness.
+- name: jev-1.13.0
+  provider: typesafe
+  base_url: https://api.typesafe.ai
+  api_key: REPLACE_WITH_YOUR_TYPESAFE_KEY
+- name: deepseek-v4-flash
+  provider: openai
+  base_url: https://api.deepseek.com
+  api_key: REPLACE_WITH_YOUR_DEEPSEEK_KEY

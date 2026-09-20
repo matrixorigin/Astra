@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "checked_on": "2026-09-20",
+  "currency": "USD",
+  "tier": "off_peak",
+  "tier_reason": "Evaluation ran on Sunday; official Flash pricing lists weekends as off-peak.",
+  "unit": "USD per token",
+  "flash": {"input": 0.00000015, "cache_read": 0.000000003, "output": 0.0000006},
+  "jev": {"input": 0.000000042, "cache_read": null, "output": 0},
+  "sources": [
+    "https://api-docs.deepseek.com/quick_start/pricing/",
+    "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/",
+    "https://docs.typesafe.ai/models"
+  ],
+  "model_identity_note": "DeepSeek official documentation says legacy deepseek-v4-flash requests are now served by DeepSeek-V4.1-Flash. Preserve actual response model fields; do not infer a pinned weight revision from the alias.",
+  "limits": "Official-price estimate using provider-reported usage, not an invoice. Unknown failed-call usage is not zero. No currency conversion or local YAML price is used. Unknown JEV cache counters remain unknown."
+}

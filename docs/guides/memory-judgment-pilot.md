@@ -156,6 +156,20 @@ existing completion envelope. Memory code applies separate relevance/dismissal
 policies. Ordinary LLMs return fixed question IDs in `true` and `uncertain`
 lists. Memory, request classification, skill selection, and the comparison command share the
 message formatter and strict response normalization in `astra-turn-types`.
+Question IDs are JSON strings, including numeric-looking keys such as `"0"`;
+the shared chat instructions make this explicit rather than accepting numeric
+IDs through coercion. Dismissal questions also state their positive and negative
+criteria explicitly: invalidating a lesson is different from postponing an
+action, changing tasks, or making a current-task exception.
+Memory evidence is keyed by the exact question IDs; questions reference those
+keys instead of requiring the model to count positions in an unlabelled array.
+This preserves identity when a batch contains multi-digit IDs.
+Relevance judges each memory's contribution, not whether that one memory can
+answer the entire task. A requested fact or currently applicable instruction
+is sufficient; another scope, an overridden preference or an explicitly
+excluded detail is not. Positive and negative criteria are shared by both
+backends. The decision remains strictly greater than 0.5; this does not make
+the returned probability a relevance magnitude or relax uncertainty handling.
 Typed completion-proxy operations accept that canonical two-role message
 envelope and derive the minimum output budget from the question IDs before
 provider admission. The caller's `max_tokens` and the selected Offering's

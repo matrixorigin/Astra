@@ -1,3 +1,5 @@
+#[cfg(all(test, feature = "live-provider-tests"))]
+mod article_eval;
 mod inference;
 pub mod relevance;
 

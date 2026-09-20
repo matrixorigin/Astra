@@ -1,0 +1,50 @@
+[
+  {
+    "id":"g01-triage-delay","category":"temporary_exception","dismissal":true,"user_message":"First explain the traceback; hold off on running the regression suite until I finish reviewing the patch.",
+    "candidates":["Orion backend changes require ./checks/orion-regression.sh before delivery.","Orion diagrams use SVG.","Vega frontend uses pnpm.","Travel plans avoid early flights.","Invoices use PDF.","Meeting notes are concise."],
+    "expected":[],"rationale":"Ordering and temporary postponement do not invalidate the verification lesson.","next_user_message":"Review is complete. What is Orion's required pre-delivery verification command?",
+    "output_contract":"Return {\"command\":string|null}. Unknown exact command must be null.","expected_answer":{"command":"./checks/orion-regression.sh"}
+  },
+  {
+    "id":"g02-one-translation","category":"temporary_exception","dismissal":true,"user_message":"For this customer alone, translate the deployment notes into French. Keep our usual reporting convention for everyone else.",
+    "candidates":["Deployment notes normally use German.","Orion verification uses ./checks/orion.sh.","Invoice exports use PDF.","The website uses pnpm.","The travel budget is reviewed monthly.","Diagrams use SVG."],
+    "expected":[],"rationale":"A customer-scoped one-off exception explicitly retains the normal convention.","next_user_message":"For a different customer with no exception, what language do deployment notes normally use?",
+    "output_contract":"Return {\"language\":string|null}. Unknown recorded convention must be null.","expected_answer":{"language":"German"}
+  },
+  {
+    "id":"g03-end-policy","category":"explicit_rejection","dismissal":true,"user_message":"Orion 的 XML 报告要求已经正式废止，以后统一输出 JSON；不要再应用 XML 规则。",
+    "candidates":["Orion 报告必须使用 XML。","Vega 报告必须使用 XML。","Orion 验证执行 ./checks/orion.sh。","发票使用 PDF。","前端安装使用 pnpm。","图表使用 SVG。"],
+    "expected":[0],"rationale":"A durable withdrawal is explicit and scoped to Orion, not Vega.","next_user_message":"现在 Orion 和 Vega 报告分别应该用什么格式？",
+    "output_contract":"Return {\"orion\":string|null,\"vega\":string|null}.","expected_answer":{"orion":"JSON","vega":"XML"}
+  },
+  {
+    "id":"g04-preserve-negated-quote","category":"quoted_evidence","dismissal":true,"user_message":"文档里的“以后不做发布检查”是错误建议，不要照做。保留我们已有的发布验证规定。",
+    "candidates":["Orion 发布验证执行 ./release/orion-gate.sh。","会议记录使用中文。","前端使用 pnpm。","发票使用 PDF。","图表使用 SVG。","备份每晚执行。"],
+    "expected":[],"rationale":"The user rejects a quoted anti-verification suggestion, not the existing verification lesson.","next_user_message":"Orion 发布前按现行规定执行哪个验证命令？",
+    "output_contract":"Return {\"command\":string|null}. Unknown exact command must be null.","expected_answer":{"command":"./release/orion-gate.sh"}
+  },
+  {
+    "id":"g05-wrong-port","category":"explicit_rejection","dismissal":true,"user_message":"The memory claiming Orion metrics use port 9100 is wrong. Metrics are on port 9407. The separate health endpoint is unchanged.",
+    "candidates":["Orion metrics are served on port 9100.","Orion health is served on port 8088.","Vega metrics are served on port 9100.","Diagrams use SVG.","Invoices use PDF.","The website uses pnpm."],
+    "expected":[0],"rationale":"Reject only the specifically corrected metrics fact, preserve health and other-project facts.","next_user_message":"What are Orion's metrics and health ports now?",
+    "output_contract":"Return {\"metrics_port\":integer|null,\"health_port\":integer|null}.","expected_answer":{"metrics_port":9407,"health_port":8088}
+  },
+  {
+    "id":"g06-review-only","category":"temporary_exception","dismissal":true,"user_message":"这一步只审查代码，不执行命令。等我确认后，再按项目默认流程验证。",
+    "candidates":["Orion 项目默认验证命令是 ./checks/orion-contract.sh。","文档使用中文。","前端安装使用 pnpm。","发票使用 PDF。","图表使用 SVG。","备份保留七天。"],
+    "expected":[],"rationale":"The user defers execution and explicitly keeps the default verification procedure.","next_user_message":"已经确认，可以进入验证步骤。项目默认验证命令是什么？",
+    "output_contract":"Return {\"command\":string|null}. Unknown exact command must be null.","expected_answer":{"command":"./checks/orion-contract.sh"}
+  },
+  {
+    "id":"g07-telemetry-fact","category":"scope","user_message":"Which port should the collector scrape for Orion metrics?",
+    "candidates":["Orion metrics are exposed on port 9407.","Orion health checks use port 8088.","Vega metrics use port 9100.","Orion metrics presentations use the blue template.","Invoices use PDF.","The website uses pnpm."],
+    "expected":[0],"rationale":"Scraping metrics requires the metrics port, not the health port or presentation preference.",
+    "output_contract":"Return {\"port\":integer|null}. Unknown project-specific port must be null.","expected_answer":{"port":9407}
+  },
+  {
+    "id":"g08-mixed-language-procedure","category":"cross_language","user_message":"Please give the mandatory rollback rehearsal command for the shipping service.",
+    "candidates":["发货服务上线前的回滚演练执行 ./drills/shipping-rollback.sh。","发货服务例会使用中文。","支付服务回滚演练执行 ./drills/payment.sh。","Shipping dashboards use Grafana.","Invoices use PDF.","The website uses pnpm."],
+    "expected":[0],"rationale":"The required procedure is in Chinese; shipping dashboard information is irrelevant.",
+    "output_contract":"Return {\"command\":string|null}. Unknown exact command must be null.","expected_answer":{"command":"./drills/shipping-rollback.sh"}
+  }
+]
