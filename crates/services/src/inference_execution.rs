@@ -1124,6 +1124,167 @@ pub async fn load_tool_result_projection_decisions(
     Ok(decisions)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolResultProjectionApplicationFact {
+    pub attempt_id: String,
+    pub binding: astra_turn_types::ToolResultProjectionBindingV1,
+}
+
+/// Bounded authoritative provider-wire receipts for one authenticated session.
+/// These immutable rows outlive the diagnostic model-request context window.
+pub async fn load_session_tool_result_projection_applications(
+    pool: &SharedPool,
+    user_id: &str,
+    session_id: &str,
+    max_receipts: usize,
+) -> ServiceResult<(Vec<ToolResultProjectionApplicationFact>, bool, usize)> {
+    validate_identity(user_id, "user_id", 128)?;
+    validate_identity(session_id, "session_id", 64)?;
+    let limit = max_receipts.min(512);
+    // Callers may impose a deadline. A dropped query must not return a
+    // connection with an unfinished MySQL exchange to the shared pool.
+    let mut connection = CancellationSafePoolConnection::acquire(pool.get())
+        .await
+        .map_err(|_| ServiceError::persistence("projection application connection unavailable"))?;
+    let rows = sqlx::query(
+        "SELECT receipt.attempt_id, receipt.freeze_key_sha256, receipt.decision_sha256,
+                receipt.provider_wire_sha256, receipt.receipt_sha256, receipt.receipt_json,
+                receipt.receipt_bytes, receipt.wire_state, decision.decision_json,
+                decision.decision_bytes
+         FROM tool_result_projection_receipts AS receipt
+         LEFT JOIN tool_result_projection_decisions AS decision
+           ON decision.user_id = receipt.user_id
+          AND decision.session_id = receipt.session_id
+          AND decision.freeze_key_sha256 = receipt.freeze_key_sha256
+          AND decision.decision_sha256 = receipt.decision_sha256
+         WHERE receipt.user_id = ? AND receipt.session_id = ?
+         ORDER BY receipt.created_at DESC, receipt.attempt_id DESC
+         LIMIT ?",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(
+        i64::try_from(limit.saturating_add(1))
+            .map_err(|_| ServiceError::invalid("invalid tool-result application capture budget"))?,
+    )
+    .fetch_all(connection.connection_mut())
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "load tool-result projection applications",
+            error,
+        )
+    })?;
+    connection.release();
+    let truncated = rows.len() > limit;
+    let mut facts = Vec::with_capacity(rows.len().min(limit));
+    let mut invalid = 0usize;
+    for row in rows.into_iter().take(limit) {
+        let attempt_id: String = row.try_get("attempt_id").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode application attempt",
+                error,
+            )
+        })?;
+        validate_identity(&attempt_id, "attempt_id", 64)?;
+        let decision_json: Option<String> = row.try_get("decision_json").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode application decision",
+                error,
+            )
+        })?;
+        let Some(decision_json) = decision_json else {
+            invalid = invalid.saturating_add(1);
+            continue;
+        };
+        let receipt_json: String = row.try_get("receipt_json").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode application receipt",
+                error,
+            )
+        })?;
+        let decision_bytes: i64 = row.try_get("decision_bytes").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode application decision bytes",
+                error,
+            )
+        })?;
+        let receipt_bytes: i64 = row.try_get("receipt_bytes").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode application receipt bytes",
+                error,
+            )
+        })?;
+        if usize::try_from(decision_bytes).ok() != Some(decision_json.len())
+            || usize::try_from(receipt_bytes).ok() != Some(receipt_json.len())
+            || decision_json.len() > MAX_TOOL_RESULT_PROJECTION_DECISION_BYTES
+            || receipt_json.len() > MAX_TOOL_RESULT_PROJECTION_RECEIPT_BYTES
+        {
+            return Err(ServiceError::conflict(
+                "invalid durable projection application byte identity",
+            ));
+        }
+        let decision: astra_turn_types::ToolResultProjectionDecisionV1 =
+            serde_json::from_str(&decision_json).map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "parse application decision",
+                    error,
+                )
+            })?;
+        let receipt: astra_turn_types::ToolResultProjectionReceiptV1 =
+            serde_json::from_str(&receipt_json).map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "parse application receipt",
+                    error,
+                )
+            })?;
+        let receipt_hash = format!("{:x}", Sha256::digest(receipt_json.as_bytes()));
+        let wire_state: String = row.try_get("wire_state").unwrap_or_default();
+        let expected_wire_state = match receipt.state {
+            astra_turn_types::ToolResultProjectionWireStateV1::Included => "included",
+            astra_turn_types::ToolResultProjectionWireStateV1::PartiallyIncluded => {
+                "partially_included"
+            }
+            astra_turn_types::ToolResultProjectionWireStateV1::Omitted => "omitted",
+            astra_turn_types::ToolResultProjectionWireStateV1::Unknown => "unknown",
+        };
+        if row
+            .try_get::<String, _>("freeze_key_sha256")
+            .ok()
+            .as_deref()
+            != Some(decision.freeze_key_sha256.as_str())
+            || row.try_get::<String, _>("decision_sha256").ok().as_deref()
+                != Some(decision.decision_sha256.as_str())
+            || row
+                .try_get::<String, _>("provider_wire_sha256")
+                .ok()
+                .as_deref()
+                != Some(receipt.provider_wire_sha256.as_str())
+            || row.try_get::<String, _>("receipt_sha256").ok().as_deref()
+                != Some(receipt_hash.as_str())
+            || wire_state != expected_wire_state
+            || receipt.validate_against(&decision).is_err()
+        {
+            return Err(ServiceError::conflict(
+                "durable projection application metadata mismatch",
+            ));
+        }
+        facts.push(ToolResultProjectionApplicationFact {
+            attempt_id,
+            binding: astra_turn_types::ToolResultProjectionBindingV1 { decision, receipt },
+        });
+    }
+    Ok((facts, truncated, invalid))
+}
+
 fn decode_tool_result_projection_decision(
     row: &sqlx::mysql::MySqlRow,
 ) -> ServiceResult<astra_turn_types::ToolResultProjectionDecisionV1> {

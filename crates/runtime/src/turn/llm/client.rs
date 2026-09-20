@@ -12098,7 +12098,7 @@ mod tests {
             &body,
             LlmProviderProtocol::OpenAiCompatible,
             None,
-            &[decision.clone()],
+            std::slice::from_ref(&decision),
         )
         .unwrap();
         assert_eq!(
