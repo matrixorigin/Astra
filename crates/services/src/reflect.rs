@@ -174,7 +174,9 @@ impl JudgmentUsageSummary {
                 | "memory_feedback"
                 | "verification_judge"
                 | "completion_proxy:turn_intent"
+                | "completion_proxy:tool_result_rerank"
         ) || attempt.purpose == "memory_retrieval_rerank"
+            || attempt.purpose == "tool_result_rerank"
             || attempt.purpose == "verification_judge"
     }
 
@@ -2203,6 +2205,40 @@ mod tests {
         assert!(output.contains("2 captured group(s) omitted from display"));
         assert!(!output.contains("capture truncated"));
         assert!(!output.contains("at least"));
+    }
+
+    #[test]
+    fn tool_result_rerank_attempts_are_visible_to_reflection() {
+        let attempt = ExplainAnalyzeAuxiliaryAttemptV1 {
+            attempt_id: "tool-result-rerank-attempt".into(),
+            provider: "typesafe".into(),
+            offering_id: "judgment-offering".into(),
+            model_name: "jev".into(),
+            purpose: "tool_result_rerank".into(),
+            operation_id: "completion_proxy:tool_result_rerank".into(),
+            usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+            usage: Some(ExplainAnalyzeTokenUsageV1 {
+                basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
+                fresh_input_tokens: Some(40),
+                output_tokens: Some(4),
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+            }),
+        };
+        let supported = JudgmentUsageSummary::supported_attempts(&ExplainAnalyzeAuxiliaryUsageV1 {
+            available: true,
+            truncated: false,
+            attempts: vec![attempt],
+        });
+        assert_eq!(supported.attempts.len(), 1);
+        let summary = JudgmentUsageSummary::from_physical_attempts(&supported);
+        assert_eq!(summary.groups.len(), 1);
+        assert_eq!(
+            summary.groups[0].operation,
+            "completion_proxy:tool_result_rerank"
+        );
+        assert_eq!(summary.groups[0].known_input_tokens, 40);
+        assert_eq!(summary.groups[0].known_output_tokens, 4);
     }
     use crate::model_request_context::{
         ModelRequestCache, ModelRequestCompaction, ModelRequestContextEvent,

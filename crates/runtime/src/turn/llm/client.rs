@@ -7327,6 +7327,7 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         if !matches!(
             purpose,
             astra_turn_types::InferencePurpose::MemoryRetrievalRerank
+                | astra_turn_types::InferencePurpose::ToolResultRerank
                 | astra_turn_types::InferencePurpose::Introspection
                 | astra_turn_types::InferencePurpose::VerificationJudge
         ) || !tools.is_empty()

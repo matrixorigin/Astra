@@ -38,8 +38,8 @@ uses the same ledger at turn scope. Classification confidence and reflection's
 inferred confidence are distinct; neither proves that a direction was applied
 or that Work was delivered.
 The session view covers the supported judgment operations (request admission,
-skill routing, memory relevance/feedback, verification, and completion-proxy
-turn intent), not every auxiliary model call. Routine hint/summary projections
+skill routing, memory relevance/feedback, tool-result selection, verification,
+and completion-proxy turn intent), not every auxiliary model call. Routine hint/summary projections
 bound group detail and report how many groups were omitted.
 
 Runtime introspection also exposes typed `judgment_usage` in its snapshot and

@@ -134,6 +134,9 @@ impl MemoryInferencePort for CliServerMemoryInferenceClient {
             astra_turn_types::InferencePurpose::MemoryRetrievalRerank => {
                 astra_thin_client::CompletionOperation::MemoryRetrievalRerank
             }
+            astra_turn_types::InferencePurpose::ToolResultRerank => {
+                astra_thin_client::CompletionOperation::ToolResultRerank
+            }
             purpose => {
                 return Err(ClassifiedError::new(
                     ErrorKind::InvalidRequest,
