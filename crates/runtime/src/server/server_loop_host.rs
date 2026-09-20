@@ -72,7 +72,6 @@ use crate::turn::prompt_cache::PromptCacheConfig;
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use astra_config::user_profile::WorkLifecycleIntent;
 use astra_core::SharedPool;
-use astra_services::AdmittedModelExecution;
 use astra_services::multi_agent::EdgeDispatchService;
 #[cfg(test)]
 use astra_services::runs::ExecutionTimeBudget;
@@ -80,6 +79,7 @@ use astra_services::runs::{
     RequestedTurnInteractionMode, SkillAutoRouteExecutionPolicy, TurnIntentExecutionPolicy,
 };
 use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
+use astra_services::{AdmittedModelExecution, SessionArtifactStore};
 use astra_services::{SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeError};
 use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal, SharedAgentLiveEventSink,
@@ -5100,6 +5100,12 @@ impl<'a> ExplainAnalyzeProviderAttemptObserver<'a> {
 impl crate::turn::llm::client::ProviderAttemptObserver
     for ExplainAnalyzeProviderAttemptObserver<'_>
 {
+    fn prepared_tool_result_projections(
+        &self,
+    ) -> Vec<crate::turn::llm::client::PreparedToolResultProjection> {
+        self.inner.prepared_tool_result_projections()
+    }
+
     async fn begin_attempt(
         &self,
         wire: &crate::turn::llm::client::ProviderWireRequestIdentity,
@@ -5240,6 +5246,153 @@ impl crate::turn::llm::client::ProviderAttemptObserver
             },
         );
     }
+}
+
+async fn prepare_frozen_tool_result_projections(
+    pool: Option<&SharedPool>,
+    user_id: &str,
+    session_id: &str,
+    messages: &[Value],
+) -> Vec<crate::turn::llm::client::PreparedToolResultProjection> {
+    struct Candidate {
+        freeze_key: String,
+        canonical_identity: String,
+        descriptor: astra_services::session_journal::ToolResultArtifactDescriptor,
+        tool_name: String,
+        baseline_body: String,
+    }
+
+    let Some(pool) = pool else {
+        return Vec::new();
+    };
+    let candidates = messages
+        .iter()
+        .filter_map(|message| {
+            let canonical_identity = astra_turn_core::tool::result::selection::canonical_tool_result_projection_identity(message).ok()?;
+            let descriptor = astra_turn_core::tool_result_storage::tool_result_artifact_descriptor(message)?;
+            let tool_name = message
+                .get(astra_turn_core::tool_result_storage::TOOL_RESULT_TOOL_NAME_FIELD)?
+                .as_str()?
+                .to_string();
+            let baseline_body = message.get("content")?.as_str()?.to_string();
+            let freeze_key = astra_turn_types::tool_result_projection_freeze_key(
+                &descriptor.run_id,
+                &descriptor.call_id,
+                &descriptor.content_sha256,
+                &canonical_identity,
+            );
+            Some(Candidate {
+                freeze_key,
+                canonical_identity,
+                descriptor,
+                tool_name,
+                baseline_body,
+            })
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let freeze_keys = candidates
+        .iter()
+        .map(|candidate| candidate.freeze_key.clone())
+        .collect::<Vec<_>>();
+    let decisions = match astra_services::load_tool_result_projection_decisions(
+        pool,
+        user_id,
+        session_id,
+        &freeze_keys,
+    )
+    .await
+    {
+        Ok(decisions) => decisions,
+        Err(error) => {
+            tracing::warn!(%error, "frozen tool-result projections unavailable; retaining baseline context");
+            return Vec::new();
+        }
+    };
+    let owner = match astra_services::OwnerScope::user(user_id) {
+        Ok(owner) => owner,
+        Err(error) => {
+            tracing::warn!(%error, "tool-result projection owner is invalid; retaining baseline context");
+            return Vec::new();
+        }
+    };
+    let session_dir = match astra_services::local_session_artifact_store()
+        .session_dir_for_owner(&owner, session_id)
+    {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(%error, "tool-result projection artifacts unavailable; retaining baseline context");
+            return Vec::new();
+        }
+    };
+    candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let decision = decisions.get(&candidate.freeze_key)?.clone();
+            if decision.canonical_message_sha256 != candidate.canonical_identity {
+                return None;
+            }
+            let rendered_body = match decision.disposition {
+                astra_turn_types::ToolResultProjectionDispositionV1::Selected => {
+                    match astra_turn_core::tool::result::selection::recover_frozen_tool_result_selection_projection(
+                        &session_dir,
+                        &candidate.tool_name,
+                        &candidate.descriptor,
+                        &decision,
+                    ) {
+                        Ok(projection) => {
+                            if !tool_result_projection_reduces_current_context(
+                                &candidate.baseline_body,
+                                projection.body(),
+                            ) {
+                                tracing::debug!(
+                                    freeze_key = %candidate.freeze_key,
+                                    selected_bytes = projection.body().len(),
+                                    current_baseline_bytes = candidate.baseline_body.len(),
+                                    selected_tokens = crate::prompts::estimate_str_tokens(projection.body()),
+                                    current_baseline_tokens = crate::prompts::estimate_str_tokens(&candidate.baseline_body),
+                                    "frozen tool-result projection does not reduce the current context budget"
+                                );
+                                return crate::turn::llm::client::PreparedToolResultProjection::not_adopted(decision).ok();
+                            }
+                            projection.body().to_string()
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                freeze_key = %candidate.freeze_key,
+                                %error,
+                                "frozen tool-result projection recovery failed; retaining baseline context"
+                            );
+                            return None;
+                        }
+                    }
+                }
+                astra_turn_types::ToolResultProjectionDispositionV1::Baseline => {
+                    candidate.baseline_body
+                }
+            };
+            crate::turn::llm::client::PreparedToolResultProjection::new(
+                decision,
+                rendered_body,
+            )
+            .map_err(|error| {
+                tracing::warn!(
+                    freeze_key = %candidate.freeze_key,
+                    %error,
+                    "frozen tool-result projection is inconsistent; retaining baseline context"
+                );
+            })
+            .ok()
+        })
+        .collect()
+}
+
+fn tool_result_projection_reduces_current_context(baseline: &str, selected: &str) -> bool {
+    selected.len() < baseline.len()
+        && crate::prompts::estimate_str_tokens(selected)
+            <= crate::prompts::estimate_str_tokens(baseline)
 }
 
 fn explain_analyze_token_usage(
@@ -19526,7 +19679,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     "host advanced to the authoritative recovered inference identity"
                 );
             }
-            // All admission awaits are complete. Sample one second-granular
+            let frozen_tool_result_projections = prepare_frozen_tool_result_projections(
+                self.shared_pool.as_ref(),
+                &self.user_id,
+                &self.session_id,
+                &llm_messages,
+            )
+            .await;
+            // All admission and optional projection awaits are complete. Sample one second-granular
             // dispatch budget and derive both the model-visible authority and
             // the hard client timeout from it. No await is allowed between
             // this snapshot and provider dispatch.
@@ -19664,6 +19824,20 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 .cloned();
             if let Err(error) = durable_invocation
                 .bind_provider_canonical_transitions(provider_canonical_transitions)
+            {
+                self.complete_request_preparation_phase_with_context(
+                    state,
+                    request_attempt_started_at,
+                    attempt_in_round,
+                    &mut request_preparation_recorded_attempts,
+                    TurnPhaseOutcome::Failed,
+                    attempt_context_metrics.clone(),
+                );
+                durable_invocation.finish_error(&error).await?;
+                return Err(error);
+            }
+            if let Err(error) = durable_invocation
+                .bind_tool_result_projections(frozen_tool_result_projections)
             {
                 self.complete_request_preparation_phase_with_context(
                     state,
@@ -22088,6 +22262,25 @@ fn canonical_edge_dispatch_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_result_projection_must_reduce_bytes_without_increasing_budget_tokens() {
+        let ascii_baseline = "a".repeat(8_000);
+        let dense_unicode_selection = "界".repeat(1_500);
+        assert!(dense_unicode_selection.len() < ascii_baseline.len());
+        assert!(
+            crate::prompts::estimate_str_tokens(&dense_unicode_selection)
+                > crate::prompts::estimate_str_tokens(&ascii_baseline)
+        );
+        assert!(!tool_result_projection_reduces_current_context(
+            &ascii_baseline,
+            &dense_unicode_selection
+        ));
+        assert!(tool_result_projection_reduces_current_context(
+            &ascii_baseline,
+            &"b".repeat(4_000)
+        ));
+    }
 
     #[test]
     fn server_manifest_identity_uses_admitted_state_when_result_has_no_ids() {

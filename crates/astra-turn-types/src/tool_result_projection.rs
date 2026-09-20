@@ -197,17 +197,12 @@ impl ToolResultProjectionDecisionV1 {
     }
 
     fn compute_freeze_key(&self) -> String {
-        let mut digest = Sha256::new();
-        for value in [
-            self.producer_run_id.as_bytes(),
-            self.producer_call_id.as_bytes(),
-            self.source_sha256.as_bytes(),
-            self.canonical_message_sha256.as_bytes(),
-        ] {
-            digest.update((value.len() as u64).to_be_bytes());
-            digest.update(value);
-        }
-        format!("{:x}", digest.finalize())
+        tool_result_projection_freeze_key(
+            &self.producer_run_id,
+            &self.producer_call_id,
+            &self.source_sha256,
+            &self.canonical_message_sha256,
+        )
     }
 
     fn compute_digest(&self) -> Result<String, &'static str> {
@@ -231,6 +226,29 @@ impl ToolResultProjectionDecisionV1 {
         .map_err(|_| "serialize tool-result projection decision")?;
         Ok(format!("{:x}", Sha256::digest(encoded)))
     }
+}
+
+/// Stable lookup key for a trusted canonical tool-result source before a
+/// frozen decision has been loaded. Callers must obtain every component from
+/// validated runtime metadata, never from provider-visible text.
+#[must_use]
+pub fn tool_result_projection_freeze_key(
+    producer_run_id: &str,
+    producer_call_id: &str,
+    source_sha256: &str,
+    canonical_message_sha256: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    for value in [
+        producer_run_id.as_bytes(),
+        producer_call_id.as_bytes(),
+        source_sha256.as_bytes(),
+        canonical_message_sha256.as_bytes(),
+    ] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    format!("{:x}", digest.finalize())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
