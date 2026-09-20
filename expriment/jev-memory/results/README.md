@@ -23,6 +23,12 @@ contains actual judgment inputs, model responses, selected candidates, native
 probabilities where available, reported usage, and downstream answers. The
 exporter's field allowlist is not a general-purpose privacy scrubber.
 
+Requests are deduplicated by SHA-256. Each `requests[hash]` entry stores only the
+exact serialized `raw` string; obtain its structured view with
+`json.loads(entry["raw"])`. Hash the UTF-8 bytes of that string, not a
+reserialized object. This preserves the original evidence without storing a
+second, derived copy of each request.
+
 ## Before/after optimization
 
 These three baselines support the article's contribution-policy comparison and
@@ -31,19 +37,19 @@ to pool into the final score.
 
 | Baseline | Summary | Complete structured evidence | Compare against |
 | --- | --- | --- | --- |
-| Core and truncation | [main-final.json](2026-09-20/main-final.json) | [main-before-contribution-evidence.json](2026-09-20/main-before-contribution-evidence.json) | `main-contribution.json` |
-| Candidate scale | [scale-final.json](2026-09-20/scale-final.json) | [scale-before-contribution-evidence.json](2026-09-20/scale-before-contribution-evidence.json) | `scale-contribution.json` |
+| Core and truncation | [main-before-contribution.json](2026-09-20/main-before-contribution.json) | [main-before-contribution-evidence.json](2026-09-20/main-before-contribution-evidence.json) | `main-contribution.json` |
+| Candidate scale | [scale-before-contribution.json](2026-09-20/scale-before-contribution.json) | [scale-before-contribution-evidence.json](2026-09-20/scale-before-contribution-evidence.json) | `scale-contribution.json` |
 | Additional generalization checks | [recall-before.json](2026-09-20/recall-before.json) | [recall-before-evidence.json](2026-09-20/recall-before-evidence.json) | `recall-contribution.json` |
 
-The historical `main-final.json` and `scale-final.json` names mean final runs of
-the **previous policy**, not the final results in this package. Names, data, and
-provenance are preserved so existing article links and hashes remain valid.
+Baseline filenames explicitly distinguish the previous policy from the final
+contribution-policy results. Embedded historical run names, measured data, and
+provenance are unchanged; a file rename does not change the measured revision.
 
 From the repository root, compare the core results without paid calls:
 
 ```sh
 python3 expriment/jev-memory/scripts/compare_results.py \
-  expriment/jev-memory/results/2026-09-20/main-final.json \
+  expriment/jev-memory/results/2026-09-20/main-before-contribution.json \
   expriment/jev-memory/results/2026-09-20/main-contribution.json --group core
 ```
 
@@ -75,8 +81,9 @@ it does not rerun downstream answers or establish a threshold for new workloads.
 The published package retains seven summaries and seven all-case evidence
 files: four final suites and three optimization baselines. Unreferenced
 intermediate runs and diagnostic summaries are excluded from the current tree;
-the author retains local archival copies. No rows were removed from the retained
-runs, and their data has not been rewritten.
+the author retains local archival copies. No observations were removed from the
+retained runs. Evidence packaging omits only the redundant parsed request view;
+raw request strings, responses, metrics, and provenance remain unchanged.
 
 New runs go to ignored, private `target/expriment/jev-memory-*` directories and
 never overwrite this snapshot. Review custom inputs and outputs before sharing;

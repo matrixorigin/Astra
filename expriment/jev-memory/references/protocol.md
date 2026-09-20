@@ -85,6 +85,8 @@ added input tokens and costs as well as precision, recall and downstream results
 
 The runner exports `evidence.json` for all cases and repetitions, including
 deduplicated typed requests, actual provider answers and native probabilities.
+Each request stores its original serialized `raw` string; parse it as JSON when
+needed, and use the string's UTF-8 bytes to verify its SHA-256 reference.
 Match its raw-results hash and provenance with `summary-official.json`. The
 export excludes environment and model config; review synthetic inputs before
 publishing. It is not a sanitizer for arbitrary private datasets.

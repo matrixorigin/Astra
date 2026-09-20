@@ -23,10 +23,11 @@ def export(run, price_card):
         selectors = []
         for call in row["selector_calls"]:
             request = next(m["content"] for m in call["messages"] if m["role"] == "user")
-            # Preserve the original serialized payload alongside its parsed view,
-            # so the public reference hash can be checked byte-for-byte.
+            # Keep the exact serialized payload for byte-for-byte hash checks.
+            # A parsed view is derived with json.loads(raw), not stored twice.
+            json.loads(request)  # Reject malformed requests before publication.
             request_id = hashlib.sha256(request.encode()).hexdigest()
-            requests[request_id] = {"raw": request, "parsed": json.loads(request)}
+            requests[request_id] = {"raw": request}
             selectors.append({"request_sha256": request_id,
                               **{key: call[key] for key in ("status", "text", "model", "error_kind",
                                   "elapsed_ms", "usage", "usage_presence", "finish_reason") if key in call}})
