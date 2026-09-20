@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const TOOL_RESULT_PROJECTION_POLICY_VERSION: u32 = 1;
+pub const TOOL_RESULT_PROJECTION_POLICY_VERSION: u32 = 2;
 pub const TOOL_RESULT_PROJECTION_RENDERER_VERSION: u32 = 2;
 const MAX_RANGES: usize = 32;
 const MAX_ID_BYTES: usize = 256;
@@ -52,7 +52,9 @@ pub struct ToolResultProjectionDecisionV1 {
     pub producer_call_id: String,
     pub source_sha256: String,
     pub source_bytes: u64,
-    /// Rationale identity; changing it does not create a second freeze slot.
+    /// Identity of the goal-bound typed judgment request. A changed target
+    /// creates a distinct freeze slot so a projection selected for one goal
+    /// cannot be silently reused for another.
     pub target_sha256: String,
     /// Stable identity of the canonical tool-result message, not the digest
     /// of a continually growing conversation.
@@ -202,6 +204,7 @@ impl ToolResultProjectionDecisionV1 {
             &self.producer_call_id,
             &self.source_sha256,
             &self.canonical_message_sha256,
+            &self.target_sha256,
         )
     }
 
@@ -237,6 +240,7 @@ pub fn tool_result_projection_freeze_key(
     producer_call_id: &str,
     source_sha256: &str,
     canonical_message_sha256: &str,
+    target_sha256: &str,
 ) -> String {
     let mut digest = Sha256::new();
     for value in [
@@ -244,6 +248,7 @@ pub fn tool_result_projection_freeze_key(
         producer_call_id.as_bytes(),
         source_sha256.as_bytes(),
         canonical_message_sha256.as_bytes(),
+        target_sha256.as_bytes(),
     ] {
         digest.update((value.len() as u64).to_be_bytes());
         digest.update(value);
@@ -489,5 +494,24 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn freeze_key_changes_with_semantic_target() {
+        let first = tool_result_projection_freeze_key(
+            "run-1",
+            "call-1",
+            &digest('a'),
+            &digest('b'),
+            &digest('c'),
+        );
+        let second = tool_result_projection_freeze_key(
+            "run-1",
+            "call-1",
+            &digest('a'),
+            &digest('b'),
+            &digest('d'),
+        );
+        assert_ne!(first, second);
     }
 }

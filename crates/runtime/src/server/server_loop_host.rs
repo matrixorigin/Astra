@@ -5248,50 +5248,182 @@ impl crate::turn::llm::client::ProviderAttemptObserver
     }
 }
 
-async fn prepare_frozen_tool_result_projections(
+struct PendingToolResultProjection {
+    canonical_identity: String,
+    descriptor: astra_services::session_journal::ToolResultArtifactDescriptor,
+    tool_name: String,
+    baseline_body: String,
+    projection: astra_turn_core::tool::result::chunks::ToolResultChunkCandidateProjection,
+    request: astra_turn_types::JudgmentRequest,
+    target_sha256: String,
+}
+
+impl PendingToolResultProjection {
+    fn has_complete_judgment_evidence(&self) -> bool {
+        self.projection.scan_complete()
+            && self.request.state["goal_coverage"]["complete"].as_bool() == Some(true)
+    }
+}
+
+struct ToolResultProjectionPreparation {
+    prepared: Vec<crate::turn::llm::client::PreparedToolResultProjection>,
+    pending: Option<PendingToolResultProjection>,
+}
+
+async fn prepare_tool_result_projections(
     pool: Option<&SharedPool>,
     user_id: &str,
     session_id: &str,
+    goal: &str,
     messages: &[Value],
-) -> Vec<crate::turn::llm::client::PreparedToolResultProjection> {
-    struct Candidate {
-        freeze_key: String,
+    cancel_token: Option<Arc<CancellationToken>>,
+) -> Result<ToolResultProjectionPreparation, astra_core::ClassifiedError> {
+    struct SourceCandidate {
         canonical_identity: String,
         descriptor: astra_services::session_journal::ToolResultArtifactDescriptor,
         tool_name: String,
         baseline_body: String,
     }
 
-    let Some(pool) = pool else {
-        return Vec::new();
+    struct Candidate {
+        freeze_key: String,
+        canonical_identity: String,
+        descriptor: astra_services::session_journal::ToolResultArtifactDescriptor,
+        tool_name: String,
+        baseline_body: String,
+        projection: astra_turn_core::tool::result::chunks::ToolResultChunkCandidateProjection,
+        request: astra_turn_types::JudgmentRequest,
+        target_sha256: String,
+    }
+
+    let empty = || ToolResultProjectionPreparation {
+        prepared: Vec::new(),
+        pending: None,
     };
-    let candidates = messages
-        .iter()
-        .filter_map(|message| {
+
+    let Some(pool) = pool else {
+        return Ok(empty());
+    };
+    let owner = match astra_services::OwnerScope::user(user_id) {
+        Ok(owner) => owner,
+        Err(error) => {
+            tracing::warn!(%error, "tool-result projection owner is invalid; retaining baseline context");
+            return Ok(empty());
+        }
+    };
+    let session_dir = match astra_services::local_session_artifact_store()
+        .session_dir_for_owner(&owner, session_id)
+    {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(%error, "tool-result projection artifacts unavailable; retaining baseline context");
+            return Ok(empty());
+        }
+    };
+    let mut source_candidates = Vec::new();
+    let mut source_identities = BTreeSet::new();
+    for message in messages.iter().rev() {
+        let Some((canonical_identity, descriptor, tool_name, baseline_body)) = (|| {
             let canonical_identity = astra_turn_core::tool::result::selection::canonical_tool_result_projection_identity(message).ok()?;
-            let descriptor = astra_turn_core::tool_result_storage::tool_result_artifact_descriptor(message)?;
+            let descriptor =
+                astra_turn_core::tool_result_storage::tool_result_artifact_descriptor(message)?;
             let tool_name = message
                 .get(astra_turn_core::tool_result_storage::TOOL_RESULT_TOOL_NAME_FIELD)?
                 .as_str()?
                 .to_string();
             let baseline_body = message.get("content")?.as_str()?.to_string();
+            Some((canonical_identity, descriptor, tool_name, baseline_body))
+        })() else {
+            continue;
+        };
+        if descriptor.byte_len
+            > astra_turn_core::tool::result::chunks::MAX_TOOL_RESULT_SCAN_BYTES as u64
+            || !source_identities.insert(canonical_identity.clone())
+        {
+            continue;
+        }
+        source_candidates.push(SourceCandidate {
+            canonical_identity,
+            descriptor,
+            tool_name,
+            baseline_body,
+        });
+        if source_candidates.len() == astra_turn_core::tool::result::chunks::MAX_TOOL_RESULT_CHUNKS
+        {
+            break;
+        }
+    }
+    source_candidates.reverse();
+    let goal = goal.to_string();
+    let artifact_session_dir = session_dir.clone();
+    let worker_cancel = cancel_token.clone();
+    let mut preparation_task = tokio::task::spawn_blocking(move || {
+        source_candidates
+            .into_iter()
+            .take_while(|_| {
+                !worker_cancel
+                    .as_ref()
+                    .is_some_and(|token| token.is_cancelled())
+            })
+            .filter_map(|source| {
+            let projection = astra_turn_core::tool_result_storage::read_verified_tool_result_chunk_candidates(
+                &artifact_session_dir,
+                &source.descriptor,
+                astra_turn_core::tool::result::chunks::DEFAULT_TOOL_RESULT_SCAN_BYTES,
+                astra_turn_core::tool::result::chunks::DEFAULT_TOOL_RESULT_CHUNK_BYTES,
+                astra_turn_core::tool::result::chunks::MAX_TOOL_RESULT_CHUNKS,
+            )
+            .ok()??;
+            let request = astra_turn_core::tool::result::selection::build_tool_result_selection_judgment(
+                &goal,
+                &source.tool_name,
+                &source.descriptor,
+                &projection,
+            )
+            .ok()?;
+            let target_sha256 = astra_turn_core::tool::result::selection::tool_result_selection_target_sha256(&goal, &request).ok()?;
             let freeze_key = astra_turn_types::tool_result_projection_freeze_key(
-                &descriptor.run_id,
-                &descriptor.call_id,
-                &descriptor.content_sha256,
-                &canonical_identity,
+                &source.descriptor.run_id,
+                &source.descriptor.call_id,
+                &source.descriptor.content_sha256,
+                &source.canonical_identity,
+                &target_sha256,
             );
             Some(Candidate {
                 freeze_key,
-                canonical_identity,
-                descriptor,
-                tool_name,
-                baseline_body,
+                canonical_identity: source.canonical_identity,
+                descriptor: source.descriptor,
+                tool_name: source.tool_name,
+                baseline_body: source.baseline_body,
+                projection,
+                request,
+                target_sha256,
             })
         })
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>()
+    });
+    let task_result = if let Some(cancel_token) = cancel_token {
+        tokio::select! {
+            result = &mut preparation_task => result,
+            () = cancel_token.cancelled() => {
+                preparation_task.abort();
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::Cancelled,
+                    "tool-result projection preparation cancelled",
+                ));
+            }
+        }
+    } else {
+        preparation_task.await
+    };
+    let candidates = task_result.map_err(|error| {
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            format!("tool-result projection preparation task failed: {error}"),
+        )
+    })?;
     if candidates.is_empty() {
-        return Vec::new();
+        return Ok(empty());
     }
     let freeze_keys = candidates
         .iter()
@@ -5308,33 +5440,30 @@ async fn prepare_frozen_tool_result_projections(
         Ok(decisions) => decisions,
         Err(error) => {
             tracing::warn!(%error, "frozen tool-result projections unavailable; retaining baseline context");
-            return Vec::new();
+            return Ok(empty());
         }
     };
-    let owner = match astra_services::OwnerScope::user(user_id) {
-        Ok(owner) => owner,
-        Err(error) => {
-            tracing::warn!(%error, "tool-result projection owner is invalid; retaining baseline context");
-            return Vec::new();
-        }
-    };
-    let session_dir = match astra_services::local_session_artifact_store()
-        .session_dir_for_owner(&owner, session_id)
-    {
-        Ok(path) => path,
-        Err(error) => {
-            tracing::warn!(%error, "tool-result projection artifacts unavailable; retaining baseline context");
-            return Vec::new();
-        }
-    };
-    candidates
-        .into_iter()
-        .filter_map(|candidate| {
-            let decision = decisions.get(&candidate.freeze_key)?.clone();
-            if decision.canonical_message_sha256 != candidate.canonical_identity {
-                return None;
+    let mut prepared = Vec::new();
+    let mut pending = None;
+    for candidate in candidates.into_iter().rev() {
+        let Some(decision) = decisions.get(&candidate.freeze_key).cloned() else {
+            if pending.is_none() {
+                pending = Some(PendingToolResultProjection {
+                    canonical_identity: candidate.canonical_identity,
+                    descriptor: candidate.descriptor,
+                    tool_name: candidate.tool_name,
+                    baseline_body: candidate.baseline_body,
+                    projection: candidate.projection,
+                    request: candidate.request,
+                    target_sha256: candidate.target_sha256,
+                });
             }
-            let rendered_body = match decision.disposition {
+            continue;
+        };
+        if decision.canonical_message_sha256 != candidate.canonical_identity {
+            continue;
+        }
+        let rendered_body = match decision.disposition {
                 astra_turn_types::ToolResultProjectionDispositionV1::Selected => {
                     match astra_turn_core::tool::result::selection::recover_frozen_tool_result_selection_projection(
                         &session_dir,
@@ -5355,7 +5484,10 @@ async fn prepare_frozen_tool_result_projections(
                                     current_baseline_tokens = crate::prompts::estimate_str_tokens(&candidate.baseline_body),
                                     "frozen tool-result projection does not reduce the current context budget"
                                 );
-                                return crate::turn::llm::client::PreparedToolResultProjection::not_adopted(decision).ok();
+                                if let Ok(projection) = crate::turn::llm::client::PreparedToolResultProjection::not_adopted(decision) {
+                                    prepared.push(projection);
+                                }
+                                continue;
                             }
                             projection.body().to_string()
                         }
@@ -5365,7 +5497,7 @@ async fn prepare_frozen_tool_result_projections(
                                 %error,
                                 "frozen tool-result projection recovery failed; retaining baseline context"
                             );
-                            return None;
+                            continue;
                         }
                     }
                 }
@@ -5373,20 +5505,170 @@ async fn prepare_frozen_tool_result_projections(
                     candidate.baseline_body
                 }
             };
-            crate::turn::llm::client::PreparedToolResultProjection::new(
-                decision,
-                rendered_body,
+        if let Ok(projection) =
+            crate::turn::llm::client::PreparedToolResultProjection::new(decision, rendered_body)
+                .map_err(|error| {
+                    tracing::warn!(
+                        freeze_key = %candidate.freeze_key,
+                        %error,
+                        "frozen tool-result projection is inconsistent; retaining baseline context"
+                    );
+                })
+        {
+            prepared.push(projection);
+        }
+    }
+    Ok(ToolResultProjectionPreparation { prepared, pending })
+}
+
+async fn complete_tool_result_projection_preparation(
+    mut preparation: ToolResultProjectionPreparation,
+    client: Option<&dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
+) -> Result<Vec<crate::turn::llm::client::PreparedToolResultProjection>, astra_core::ClassifiedError>
+{
+    let Some(pending) = preparation.pending.take() else {
+        return Ok(preparation.prepared);
+    };
+    let baseline = |fallback, judgment_invocation_id| {
+        let decision =
+            astra_turn_core::tool::result::selection::baseline_tool_result_projection_decision(
+                &pending.descriptor,
+                &pending.target_sha256,
+                &pending.canonical_identity,
+                judgment_invocation_id,
+                fallback,
+                &pending.baseline_body,
             )
             .map_err(|error| {
-                tracing::warn!(
-                    freeze_key = %candidate.freeze_key,
-                    %error,
-                    "frozen tool-result projection is inconsistent; retaining baseline context"
-                );
-            })
-            .ok()
-        })
-        .collect()
+                astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    format!("invalid baseline tool-result projection: {error}"),
+                )
+            })?;
+        crate::turn::llm::client::PreparedToolResultProjection::new(
+            decision,
+            pending.baseline_body.clone(),
+        )
+    };
+    if !pending.has_complete_judgment_evidence() {
+        preparation.prepared.push(baseline(
+            astra_turn_types::ToolResultProjectionFallbackV1::IncompleteCoverage,
+            None,
+        )?);
+        return Ok(preparation.prepared);
+    }
+    let Some(client) = client else {
+        // Capacity can appear later in the same session. Keep the ordinary
+        // baseline for this request without freezing a permanent semantic
+        // decision that would suppress a future judgment.
+        return Ok(preparation.prepared);
+    };
+    let response = match client
+        .summarize(
+            astra_turn_types::InferencePurpose::ToolResultRerank,
+            &astra_turn_types::judgment_messages(&pending.request),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) if error.kind == astra_core::ErrorKind::Cancelled => return Err(error),
+        Err(error) => {
+            tracing::warn!(%error, "tool-result judgment unavailable; retaining baseline context");
+            // Transport/provider availability is not a semantic decision and
+            // must not be frozen across later requests.
+            return Ok(preparation.prepared);
+        }
+    };
+    let judgment_invocation_id = response
+        .execution
+        .as_ref()
+        .map(|execution| execution.invocation_id.clone());
+    if response.is_ptl_error || response.finish_reason.as_deref() != Some("stop") {
+        // No complete semantic conclusion exists. Preserve this request's
+        // baseline without freezing a failure across later healthy routes.
+        return Ok(preparation.prepared);
+    }
+    let normalized = match astra_turn_types::normalize_judgment_response(
+        &pending.request,
+        &response.text,
+        response
+            .execution
+            .as_ref()
+            .map_or("judgment", |execution| execution.model_name.as_str()),
+    ) {
+        Ok(normalized) => normalized,
+        Err(error) => {
+            tracing::warn!(%error, "invalid tool-result judgment; retaining baseline context");
+            return Ok(preparation.prepared);
+        }
+    };
+    let Some(judgment_invocation_id) = judgment_invocation_id else {
+        // Every reusable model-derived decision, including NoClearMatch and
+        // ProjectionNotSmaller, must be attributable to a real durable
+        // auxiliary execution.
+        return Ok(preparation.prepared);
+    };
+    let recommendation =
+        match astra_turn_core::tool::result::selection::tool_result_selection_recommendation(
+            &pending.projection,
+            &normalized,
+        ) {
+            Ok(recommendation) => recommendation,
+            Err(error) => {
+                tracing::warn!(%error, "inconsistent tool-result judgment; retaining baseline context");
+                return Ok(preparation.prepared);
+            }
+        };
+    if !recommendation.has_clear_match() {
+        preparation.prepared.push(baseline(
+            astra_turn_types::ToolResultProjectionFallbackV1::NoClearMatch,
+            Some(judgment_invocation_id.clone()),
+        )?);
+        return Ok(preparation.prepared);
+    }
+    let rendered =
+        astra_turn_core::tool::result::selection::render_tool_result_selection_projection(
+            &pending.tool_name,
+            &pending.descriptor,
+            &pending.projection,
+            &recommendation,
+            &pending.baseline_body,
+        )
+        .map_err(|error| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                format!("invalid tool-result selection rendering: {error}"),
+            )
+        })?;
+    let Some(rendered) = rendered.filter(|rendered| {
+        tool_result_projection_reduces_current_context(&pending.baseline_body, rendered.body())
+    }) else {
+        preparation.prepared.push(baseline(
+            astra_turn_types::ToolResultProjectionFallbackV1::ProjectionNotSmaller,
+            Some(judgment_invocation_id.clone()),
+        )?);
+        return Ok(preparation.prepared);
+    };
+    let decision =
+        astra_turn_core::tool::result::selection::selected_tool_result_projection_decision(
+            &rendered,
+            &pending.target_sha256,
+            &pending.canonical_identity,
+            judgment_invocation_id,
+        )
+        .map_err(|error| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                format!("invalid selected tool-result projection: {error}"),
+            )
+        })?;
+    preparation
+        .prepared
+        .push(crate::turn::llm::client::PreparedToolResultProjection::new(
+            decision,
+            rendered.body().to_string(),
+        )?);
+    Ok(preparation.prepared)
 }
 
 fn tool_result_projection_reduces_current_context(baseline: &str, selected: &str) -> bool {
@@ -19426,6 +19708,35 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let mut streamed_reasoning = String::new();
         let mut first_stream_update_turn_ms: Option<u64> = None;
         let mut first_visible_text_turn_ms: Option<u64> = None;
+        // Optional tool-result selection is prepared before the primary
+        // logical invocation is admitted. The auxiliary request therefore
+        // cannot leave an open primary attempt while it waits, and every
+        // resulting decision is frozen atomically by the subsequent primary
+        // admission. At most one previously unseen artifact is judged here.
+        let tool_result_projection_preparation = prepare_tool_result_projections(
+            self.shared_pool.as_ref(),
+            &self.user_id,
+            &self.session_id,
+            &state.runtime_decision_user_intent(),
+            &llm_messages,
+            self.client_cancel_token.clone(),
+        )
+        .await?;
+        let tool_result_judgment_client = if let Some(pending) =
+            tool_result_projection_preparation.pending.as_ref()
+            && pending.has_complete_judgment_evidence()
+        {
+            self.judgment_summary_client(state, "tool_result_rerank", &pending.request)
+                .await
+                .ok()
+        } else {
+            None
+        };
+        let prepared_tool_result_projections = complete_tool_result_projection_preparation(
+            tool_result_projection_preparation,
+            tool_result_judgment_client.as_deref(),
+        )
+        .await?;
         // A coordinator's streamed answer prose is provisional while canonical Work
         // has a live binding.  Buffer it until the server has inspected the
         // durable queue below: otherwise a model can visibly claim success,
@@ -19679,13 +19990,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     "host advanced to the authoritative recovered inference identity"
                 );
             }
-            let frozen_tool_result_projections = prepare_frozen_tool_result_projections(
-                self.shared_pool.as_ref(),
-                &self.user_id,
-                &self.session_id,
-                &llm_messages,
-            )
-            .await;
             // All admission and optional projection awaits are complete. Sample one second-granular
             // dispatch budget and derive both the model-visible authority and
             // the hard client timeout from it. No await is allowed between
@@ -19837,7 +20141,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 return Err(error);
             }
             if let Err(error) = durable_invocation
-                .bind_tool_result_projections(frozen_tool_result_projections)
+                .bind_tool_result_projections(prepared_tool_result_projections.clone())
             {
                 self.complete_request_preparation_phase_with_context(
                     state,
@@ -22263,6 +22567,86 @@ fn canonical_edge_dispatch_result(
 mod tests {
     use super::*;
 
+    struct FixedToolResultJudgmentClient {
+        response: astra_turn_core::cloud_summary::SummaryResponse,
+    }
+
+    struct UnexpectedToolResultJudgmentClient;
+
+    #[async_trait::async_trait]
+    impl astra_turn_core::cloud_summary::SummaryLlmClient for UnexpectedToolResultJudgmentClient {
+        async fn summarize(
+            &self,
+            _purpose: astra_turn_types::InferencePurpose,
+            _messages: &[Value],
+        ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, astra_core::ClassifiedError>
+        {
+            panic!("incomplete evidence must not dispatch a judgment")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl astra_turn_core::cloud_summary::SummaryLlmClient for FixedToolResultJudgmentClient {
+        async fn summarize(
+            &self,
+            purpose: astra_turn_types::InferencePurpose,
+            _messages: &[Value],
+        ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, astra_core::ClassifiedError>
+        {
+            assert_eq!(
+                purpose,
+                astra_turn_types::InferencePurpose::ToolResultRerank
+            );
+            Ok(self.response.clone())
+        }
+    }
+
+    fn pending_tool_result_projection_fixture() -> PendingToolResultProjection {
+        let dir = tempfile::tempdir().unwrap();
+        let source = format!("important evidence\n{}", "irrelevant detail\n".repeat(300));
+        let persisted = astra_turn_core::tool_result_storage::persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-selection",
+            "call-selection",
+            "exec",
+            &source,
+        )
+        .unwrap();
+        let projection =
+            astra_turn_core::tool_result_storage::read_verified_tool_result_chunk_candidates(
+                dir.path(),
+                &persisted.descriptor,
+                astra_turn_core::tool::result::chunks::DEFAULT_TOOL_RESULT_SCAN_BYTES,
+                astra_turn_core::tool::result::chunks::DEFAULT_TOOL_RESULT_CHUNK_BYTES,
+                astra_turn_core::tool::result::chunks::MAX_TOOL_RESULT_CHUNKS,
+            )
+            .unwrap()
+            .unwrap();
+        let request =
+            astra_turn_core::tool::result::selection::build_tool_result_selection_judgment(
+                "find important evidence",
+                "exec",
+                &persisted.descriptor,
+                &projection,
+            )
+            .unwrap();
+        let target_sha256 =
+            astra_turn_core::tool::result::selection::tool_result_selection_target_sha256(
+                "find important evidence",
+                &request,
+            )
+            .unwrap();
+        PendingToolResultProjection {
+            canonical_identity: "c".repeat(64),
+            descriptor: persisted.descriptor,
+            tool_name: "exec".into(),
+            baseline_body: source,
+            projection,
+            request,
+            target_sha256,
+        }
+    }
+
     #[test]
     fn tool_result_projection_must_reduce_bytes_without_increasing_budget_tokens() {
         let ascii_baseline = "a".repeat(8_000);
@@ -22280,6 +22664,191 @@ mod tests {
             &ascii_baseline,
             &"b".repeat(4_000)
         ));
+    }
+
+    #[tokio::test]
+    async fn live_tool_result_judgment_selects_exact_chunks_with_actual_invocation() {
+        let pending = pending_tool_result_projection_fixture();
+        let answers = pending
+            .projection
+            .candidates()
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                (
+                    candidate.chunk().id.clone(),
+                    json!({"type": "noul", "noul": if index == 0 { 1.0 } else { 0.0 }}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let client = FixedToolResultJudgmentClient {
+            response: astra_turn_core::cloud_summary::SummaryResponse {
+                text: json!({
+                    "schema_version": 1,
+                    "model": "jev-1.13.0",
+                    "answers": answers,
+                })
+                .to_string(),
+                is_ptl_error: false,
+                finish_reason: Some("stop".into()),
+                usage: serde_json::Map::new(),
+                execution: Some(astra_turn_core::cloud_summary::SummaryExecutionProvenance {
+                    invocation_id: "invocation-actual".into(),
+                    model_name: "jev-1.13.0".into(),
+                    provider: "typesafe".into(),
+                }),
+            },
+        };
+        let prepared = complete_tool_result_projection_preparation(
+            ToolResultProjectionPreparation {
+                prepared: Vec::new(),
+                pending: Some(pending),
+            },
+            Some(&client),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(
+            prepared[0].decision.disposition,
+            astra_turn_types::ToolResultProjectionDispositionV1::Selected
+        );
+        assert_eq!(
+            prepared[0].decision.judgment_invocation_id.as_deref(),
+            Some("invocation-actual")
+        );
+        assert_eq!(prepared[0].decision.selected_ranges.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tool_result_selection_without_judgment_keeps_baseline_without_freezing() {
+        let pending = pending_tool_result_projection_fixture();
+        let prepared = complete_tool_result_projection_preparation(
+            ToolResultProjectionPreparation {
+                prepared: Vec::new(),
+                pending: Some(pending),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(prepared.is_empty());
+    }
+
+    #[tokio::test]
+    async fn incomplete_goal_coverage_freezes_baseline_without_calling_judge() {
+        let mut pending = pending_tool_result_projection_fixture();
+        pending.request.state["goal_coverage"]["complete"] = json!(false);
+        let prepared = complete_tool_result_projection_preparation(
+            ToolResultProjectionPreparation {
+                prepared: Vec::new(),
+                pending: Some(pending),
+            },
+            Some(&UnexpectedToolResultJudgmentClient),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(
+            prepared[0].decision.fallback,
+            Some(astra_turn_types::ToolResultProjectionFallbackV1::IncompleteCoverage)
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_or_invalid_judgment_keeps_baseline_without_freezing() {
+        for response in [
+            astra_turn_core::cloud_summary::SummaryResponse {
+                text: String::new(),
+                is_ptl_error: true,
+                finish_reason: None,
+                usage: serde_json::Map::new(),
+                execution: None,
+            },
+            astra_turn_core::cloud_summary::SummaryResponse {
+                text: "truncated".into(),
+                is_ptl_error: false,
+                finish_reason: Some("length".into()),
+                usage: serde_json::Map::new(),
+                execution: Some(astra_turn_core::cloud_summary::SummaryExecutionProvenance {
+                    invocation_id: "invocation-length".into(),
+                    model_name: "judge".into(),
+                    provider: "provider".into(),
+                }),
+            },
+            astra_turn_core::cloud_summary::SummaryResponse {
+                text: "not-json".into(),
+                is_ptl_error: false,
+                finish_reason: Some("stop".into()),
+                usage: serde_json::Map::new(),
+                execution: Some(astra_turn_core::cloud_summary::SummaryExecutionProvenance {
+                    invocation_id: "invocation-invalid".into(),
+                    model_name: "judge".into(),
+                    provider: "provider".into(),
+                }),
+            },
+        ] {
+            let prepared = complete_tool_result_projection_preparation(
+                ToolResultProjectionPreparation {
+                    prepared: Vec::new(),
+                    pending: Some(pending_tool_result_projection_fixture()),
+                },
+                Some(&FixedToolResultJudgmentClient { response }),
+            )
+            .await
+            .unwrap();
+            assert!(prepared.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn unattributed_model_decisions_are_not_frozen() {
+        for (has_match, tiny_baseline) in [(false, false), (true, true)] {
+            let mut pending = pending_tool_result_projection_fixture();
+            if tiny_baseline {
+                pending.baseline_body = "tiny baseline".into();
+            }
+            let answers = pending
+                .projection
+                .candidates()
+                .iter()
+                .enumerate()
+                .map(|(index, candidate)| {
+                    (
+                        candidate.chunk().id.clone(),
+                        json!({"type": "noul", "noul": if has_match && index == 0 { 1.0 } else { 0.0 }}),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            let client = FixedToolResultJudgmentClient {
+                response: astra_turn_core::cloud_summary::SummaryResponse {
+                    text: json!({
+                        "schema_version": 1,
+                        "model": "judge",
+                        "answers": answers,
+                    })
+                    .to_string(),
+                    is_ptl_error: false,
+                    finish_reason: Some("stop".into()),
+                    usage: serde_json::Map::new(),
+                    execution: None,
+                },
+            };
+            let prepared = complete_tool_result_projection_preparation(
+                ToolResultProjectionPreparation {
+                    prepared: Vec::new(),
+                    pending: Some(pending),
+                },
+                Some(&client),
+            )
+            .await
+            .unwrap();
+
+            assert!(prepared.is_empty());
+        }
     }
 
     #[test]
