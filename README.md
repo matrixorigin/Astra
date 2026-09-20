@@ -66,6 +66,12 @@ TypeScript SDK sharing one agent backbone. Bring any model endpoint.
 
 <sub>Illustrative recorded-event replay through the real Web component. Tree is the default; Timeline and Graph are optional. Missing failure explanations and unmeasured I/O time are explicitly identified.</sub>
 
+**Watch it on a real Work (90 seconds).** A long migration in the CLI: the
+context window Astra keeps for it, what it cut and why, and the Explain Analyze
+tree behind the answer.
+
+https://github.com/user-attachments/assets/c008be26-4320-413c-9ad6-100aefcfa728
+
 ### Pick the layer you need
 
 All three can run models and tools. The difference is what each system makes
