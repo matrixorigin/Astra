@@ -1,19 +1,19 @@
 ---
 source: crates/astra-cli/src/tui/context_panel/view.rs
-assertion_line: 2267
+assertion_line: 2483
 expression: "render_panel(&b, 80, 14)"
 ---
 ┌ Context window (22% · low) ──────────────────────────────────────────────────┐
 │  21.7k / 100.0k tokens  current prompt (21.7%)                               │
 │  Tab focus · Enter close · j/k scroll · Esc close                            │
 │                                                                              │
-│  ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁   ⛁ System prompt     2.0k  ( 2.0%)                     │
-│  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Tools             4.0k  ( 4.0%)                     │
-│  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Memory             500  ( 0.5%)                     │
-│  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ History          15.0k  (15.0%)                     │
-│  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Current turn       200  ( 0.2%)                     │
-│                        ⛶ Free space       78.3k  (78.3%)                     │
-│                                                                              │
-│                                                                              │
-│                                                                              │
+│  ▄▄▄                               CONTEXT PLAN                              │
+│  ███  ---------------------------------------------------------------------  │
+│  ███  Assemble Request  (est tokens=21700 steps=5)  (never measured)         │
+│  ███    ->  System Prompt  (est tokens=2000)  (never measured)               │
+│  ███          Skills: 0   Repository Memories: 0   Session Snapshot: none    │
+│  ███    ->  Tool Surface  (est tokens=4000 tools=0)  (never measured)        │
+│  ███          Loaded: 0   Deferred: 0   Per-tool Sum: 0   Time: 0 ms         │
+│  ███    ->  Memory Retrieval  (est tokens=500)  (never measured)             │
+│  ███          Candidates Considered: 0   Selected: 0   Time: 0 ms            │
 └──────────────────────────────────────────────────────────────────────────────┘

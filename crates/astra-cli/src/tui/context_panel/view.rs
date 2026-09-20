@@ -1,8 +1,9 @@
 //! Rendering layer for the `/context` panel.
 //!
-//! Visual grammar: a grid on the left (one glyph ≈ 2 % of the
-//! context window) paired with a category legend on the right,
-//! then nested sub-sections below for tools / memory / skills /
+//! Visual grammar: the context window drawn to scale as a column on
+//! the left, paired with the assembly plan on the right — one node per
+//! step, reported the way a query planner reports — then nested
+//! sub-sections below for tools / memory / skills /
 //! system-prompt sections.  Everything
 //! goes through `build_lines(breakdown, width)` which produces a
 //! `Vec<Line<'static>>` — the wrapping view renders whatever slice
@@ -16,23 +17,23 @@
 //! Approximate shape:
 //!
 //! ```text
-//! ┌ Context window (45% · low) ────────────────────────────────────┐
-//! │ model · 45.2k / 100k tokens (45%)                              │
-//! │                                                                │
-//! │ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛶ ⛶ ⛶ ⛶     ⛁ System         3.2k   (3.2%)      │
-//! │ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛶ ⛶ ⛶     ⛁ Tools         14.1k  (14.1%)      │
-//! │ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶     ⛁ Memory         2.0k   (2.0%)      │
-//! │ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶     ⛁ History       24.9k  (24.9%)      │
-//! │ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶     ⛁ Current turn   1.0k   (1.0%)      │
-//! │                           ⛶ Free          54.8k  (54.8%)      │
-//! │                                                                │
-//! │ Tools · /tool                                                  │
-//! │   └ read_file           1.2k tokens                            │
-//! │   └ write_file          0.9k tokens                            │
-//! │                                                                │
-//! │ Memory · /memory                                               │
-//! │   └ "project memory…"   0.4k tokens  (rel 0.91)                │
-//! └────────────────────────────────────────────────────────────────┘
+//! ┌ Context window (50% · low) ─────────────────────────────────────────┐
+//! │ 12,908 / 25,600 tokens  current prompt (50.4%)                      │
+//! │                                                                     │
+//! │ ███                        CONTEXT PLAN                             │
+//! │ ███  -----------------------------------------------------------   │
+//! │ ███  Assemble Request  (est tokens=10528 steps=5)  (actual …)       │
+//! │ ███    ->  System Prompt  (est tokens=7252)  (never measured)       │
+//! │ ███          Skills: 0   Repository Memories: 0   Snapshot: none    │
+//! │ ▆▆▆    ->  Tool Surface  (est tokens=2070 tools=22)  (never …)      │
+//! │ ███          Loaded: 22   Deferred: 0   Per-tool Sum: 3489          │
+//! │ ▇▇▇    ->  History Assembly  (est tokens=1166 turns=2)              │
+//! │ ███          Retained: 2   Compressed: 0   Dropped: 0               │
+//! │ ███  Window: 25600 usable   Free: 12692   Unaccounted: 2380         │
+//! │                                                                     │
+//! │ Tools · /tool                                                       │
+//! │   └ read_file           1.2k tokens                                 │
+//! └─────────────────────────────────────────────────────────────────────┘
 //! ```
 
 use std::ops::Range;
@@ -44,16 +45,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 
 use super::model::{
-    Category, CategoryKind, ContextBreakdown, HistoryEvidenceSource, HistorySummary, MemoryItem,
+    CategoryKind, ContextBreakdown, HistoryEvidenceSource, HistorySummary, MemoryItem,
     PressureBand, Section, SkillItem, ToolItem, TurnDetail,
 };
-
-/// Grid geometry. The grid lives in the left column of the two-pane
-/// top section. 5 rows × 10 cols = 50 glyphs — each glyph therefore
-/// represents 2 % of the budget.
-pub(crate) const GRID_ROWS: usize = 5;
-pub(crate) const GRID_COLS: usize = 10;
-pub(crate) const GRID_CELLS: usize = GRID_ROWS * GRID_COLS;
 
 /// Preview body rows rendered under each item when the section is
 /// expanded (but not drilled). Kept stable across selection so
@@ -269,8 +263,8 @@ pub(crate) fn desired_height(b: &ContextBreakdown) -> u16 {
     if !b.has_observable_data() {
         return 3;
     }
-    // Top block: GRID_ROWS side-by-side with the legend, plus header,
-    // blank, sections.  We want the full breakdown to be visible
+    // Top block: the to-scale column side-by-side with the plan, plus
+    // header, blank, sections.  We want the full breakdown to be visible
     // where it fits without scrolling, capped so the composer stays
     // reachable on small terminals.
     const MIN: u16 = 12;
@@ -535,146 +529,345 @@ fn header_line(b: &ContextBreakdown) -> Line<'static> {
     ])
 }
 
-// ─── Top block: grid + legend ─────────────────────────────────────
+// ─── Top block: the window column beside the assembly plan ────────
 
-/// Build the side-by-side grid+legend rows.
-///
-/// The grid column is 2 × GRID_COLS display cells wide (each glyph
-/// is one char + one space, leaving a visible gap between cells).
-/// The legend column takes whatever remains and right-pads with
-/// blanks so lines stay the exact inner width — otherwise Ratatui's
-/// Paragraph would interpret the shorter line as wrapped content
-/// and re-layout on resize.
+/// Width of the to-scale column, in terminal cells.
+const COLUMN_WIDTH: usize = 3;
+
+/// Block glyphs filled from the bottom of the cell, 1/8 through 8/8.
+const EIGHTHS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+
+/// The assembly steps the plan reports, in the order the request is built.
+const PLAN_STEPS: [CategoryKind; 5] = [
+    CategoryKind::System,
+    CategoryKind::Tools,
+    CategoryKind::Memory,
+    CategoryKind::History,
+    CategoryKind::UserMessage,
+];
+
+/// Build the top block: the context window drawn to scale on the left,
+/// the assembly plan beside it. The two describe the same request — the
+/// column shows how much of the window each step took, the plan shows
+/// what each step did.
 fn top_block_lines(b: &ContextBreakdown, inner_width: u16) -> Vec<Line<'static>> {
-    let grid_width: usize = GRID_COLS * 2;
-    let legend_gap: usize = 2;
-    let legend_width = (inner_width as usize)
-        .saturating_sub(grid_width + legend_gap + 2 /* leading indent */)
+    const INDENT: usize = 2;
+    const GAP: usize = 2;
+    let plan_width = (inner_width as usize)
+        .saturating_sub(INDENT + COLUMN_WIDTH + GAP)
         .max(24);
 
-    let grid_cells = render_grid_cells(b);
-    let legend_rows = legend_lines(b, legend_width);
+    let plan = plan_lines(b, plan_width);
+    let column = column_cells(b, plan.len());
 
-    let row_count = GRID_ROWS.max(legend_rows.len());
-    let mut out = Vec::with_capacity(row_count);
-    for row_idx in 0..row_count {
-        let mut spans: Vec<Span<'static>> = Vec::with_capacity(GRID_COLS + 4);
-        spans.push(Span::raw("  "));
-        if row_idx < GRID_ROWS {
-            for col in 0..GRID_COLS {
-                let cell = &grid_cells[row_idx * GRID_COLS + col];
-                spans.push(cell.clone());
+    plan.into_iter()
+        .zip(column)
+        .map(|(line, cell)| {
+            let mut spans = Vec::with_capacity(line.spans.len() + 3);
+            spans.push(Span::raw(" ".repeat(INDENT)));
+            spans.push(cell);
+            spans.push(Span::raw(" ".repeat(GAP)));
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// Which steps own a cell of the column, as indices into the step list
+/// (the categories in request order, with free space last).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnCell {
+    Empty,
+    Whole(usize),
+    /// `{ top, bottom, eighths }` — two steps share the cell and the
+    /// lower one fills `eighths` of it.
+    Split {
+        top: usize,
+        bottom: usize,
+        eighths: usize,
+    },
+}
+
+/// Lay out one column of the context window to scale, top-down in the
+/// order the request is assembled and closing with free space.
+///
+/// A terminal cell carries two colours — foreground and background —
+/// and the block glyphs divide it into eighths, so a boundary between
+/// two neighbouring steps lands on the nearest eighth of a row. Where
+/// three steps would share one cell the thinnest is not drawn: it is
+/// below what a character cell can express. The plan beside the column
+/// still reports it, so nothing is silently lost.
+///
+/// Layout is kept separate from styling so the geometry can be checked
+/// without a theme in scope.
+fn column_layout(b: &ContextBreakdown, rows: usize) -> Vec<ColumnCell> {
+    let units = (rows * 8) as f64;
+    let limit = if b.limit == 0 { 1.0 } else { b.limit as f64 };
+
+    // Step bounds in eighth-of-a-row units; free space closes the column.
+    let mut bounds: Vec<(f64, f64)> = Vec::with_capacity(b.categories.len() + 1);
+    let mut cursor = 0.0_f64;
+    for cat in &b.categories {
+        let span = cat.tokens as f64 / limit * units;
+        bounds.push((cursor, cursor + span));
+        cursor += span;
+    }
+    bounds.push((cursor, units));
+
+    (0..rows)
+        .map(|row| {
+            let (lo, hi) = ((row * 8) as f64, ((row + 1) * 8) as f64);
+            let mut cover: Vec<(usize, f64, f64)> = bounds
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, &(start, end))| {
+                    let (s, e) = (start.max(lo), end.min(hi));
+                    (e - s > f64::EPSILON).then_some((idx, s, e))
+                })
+                .collect();
+            match cover.len() {
+                0 => ColumnCell::Empty,
+                1 => ColumnCell::Whole(cover[0].0),
+                _ => {
+                    // Keep the two thickest slices — they are the only two
+                    // this cell can show — then order them top to bottom.
+                    cover.sort_by(|a, b| (b.2 - b.1).total_cmp(&(a.2 - a.1)));
+                    cover.truncate(2);
+                    cover.sort_by(|a, b| a.1.total_cmp(&b.1));
+                    ColumnCell::Split {
+                        top: cover[0].0,
+                        bottom: cover[1].0,
+                        eighths: ((cover[1].2 - cover[1].1).round() as usize).clamp(1, 8),
+                    }
+                }
             }
-        } else {
-            // Pad out the space the grid would have occupied so
-            // later rows still line up under the legend.
-            spans.push(Span::raw(" ".repeat(grid_width)));
-        }
-        spans.push(Span::raw("  "));
-        if row_idx < legend_rows.len() {
-            spans.extend(legend_rows[row_idx].spans.iter().cloned());
-        }
-        out.push(Line::from(spans));
-    }
-    out
+        })
+        .collect()
 }
 
-/// A single grid cell (glyph + trailing space). Glyph choice: a
-/// filled block `⛁` for consumed tokens, empty `⛶` for free
-/// space. Coloured by the category that owns the cell.
-fn render_grid_cells(b: &ContextBreakdown) -> Vec<Span<'static>> {
-    let mut out = Vec::with_capacity(GRID_CELLS);
-    // Fill the cells category-by-category proportionally. Rounding
-    // matters on small panels — we use a running "emitted" counter
-    // and compute each category's share relative to what's left so
-    // the totals always add up to GRID_CELLS without drift.
-    let mut remaining_cells = GRID_CELLS;
-    let mut remaining_tokens: u64 = b.limit as u64;
-    for cat in &b.categories {
-        if remaining_cells == 0 {
-            break;
-        }
-        let share = (cat.tokens as u64 * remaining_cells as u64)
-            .checked_div(remaining_tokens)
-            .unwrap_or(0)
-            .min(remaining_cells as u64) as usize;
-        for _ in 0..share {
-            out.push(grid_glyph(true, cat.kind.color()));
-        }
-        remaining_cells -= share;
-        remaining_tokens = remaining_tokens.saturating_sub(cat.tokens as u64);
-    }
-    // Remaining cells are free space.
+/// Paint [`column_layout`] with each step's colour; free space takes the
+/// dim tone the rest of the panel uses for what is not there yet.
+fn column_cells(b: &ContextBreakdown, rows: usize) -> Vec<Span<'static>> {
+    let free = crate::tui::theme::current().dim;
+    let color = |idx: usize| b.categories.get(idx).map_or(free, |c| c.kind.color());
+
+    column_layout(b, rows)
+        .into_iter()
+        .map(|cell| match cell {
+            ColumnCell::Empty => Span::raw(" ".repeat(COLUMN_WIDTH)),
+            ColumnCell::Whole(idx) => {
+                Span::styled("█".repeat(COLUMN_WIDTH), Style::default().fg(color(idx)))
+            }
+            ColumnCell::Split {
+                top,
+                bottom,
+                eighths,
+            } => Span::styled(
+                EIGHTHS[eighths - 1].repeat(COLUMN_WIDTH),
+                Style::default().fg(color(bottom)).bg(color(top)),
+            ),
+        })
+        .collect()
+}
+
+/// The `CONTEXT PLAN` block, laid out the way a query planner reports:
+/// one node per assembly step, each carrying the estimate the assembler
+/// worked from and then what was actually measured, with the step's own
+/// facts hanging underneath.
+///
+/// Only the request total is ever measured — the provider reports it for
+/// the request that just completed. No step is measured on the wire, so
+/// each one says `(never measured)` rather than letting its estimate pass
+/// for a measurement. `Unaccounted` is the difference between the steps'
+/// estimates and the measured total; it is shown, not absorbed.
+fn plan_lines(b: &ContextBreakdown, width: usize) -> Vec<Line<'static>> {
     let theme = crate::tui::theme::current();
-    for _ in 0..remaining_cells {
-        out.push(grid_glyph(false, theme.dim));
-    }
-    out
-}
+    let dim = Style::default().fg(theme.dim);
+    let mut out: Vec<Line<'static>> = Vec::new();
 
-fn grid_glyph(filled: bool, color: Color) -> Span<'static> {
-    let ch = if filled { "⛁ " } else { "⛶ " };
-    Span::styled(ch, Style::default().fg(color))
-}
-
-fn legend_lines(b: &ContextBreakdown, width: usize) -> Vec<Line<'static>> {
-    // Label width: widest category label, capped so narrow terminals
-    // still fit a reasonable token column.
-    let label_width = CategoryKind::System.label().len().max(
-        b.categories
-            .iter()
-            .map(|c| c.kind.label().len())
-            .max()
-            .unwrap_or(10),
-    );
-    let label_width = label_width.min(width.saturating_sub(18).max(8));
-
-    let mut out = Vec::with_capacity(b.categories.len() + 1);
-    for cat in &b.categories {
-        out.push(legend_row(cat, label_width));
-    }
-    if b.free_space_tokens > 0 {
-        out.push(free_space_row(b.free_space_tokens, b.limit, label_width));
-    }
-    out
-}
-
-fn legend_row(cat: &Category, label_width: usize) -> Line<'static> {
-    let theme = crate::tui::theme::current();
-    let mark = Span::styled("⛁ ", Style::default().fg(cat.kind.color()));
-    let label = Span::styled(
-        format!("{:<w$}", cat.kind.label(), w = label_width),
-        Style::default().fg(cat.kind.color()),
-    );
-    let tokens = Span::styled(
-        format!("  {:>7}", fmt_tokens(cat.tokens)),
+    const TITLE: &str = "CONTEXT PLAN";
+    out.push(Line::from(Span::styled(
+        format!(
+            "{}{TITLE}",
+            " ".repeat(width.saturating_sub(TITLE.len()) / 2)
+        ),
         Style::default().add_modifier(Modifier::BOLD),
-    );
-    let pct = Span::styled(
-        format!("  ({:>4.1}%)", cat.pct_of_limit),
-        Style::default().fg(theme.dim),
-    );
-    Line::from(vec![mark, label, tokens, pct])
+    )));
+    out.push(Line::from(Span::styled(
+        "-".repeat(width.saturating_sub(2)),
+        dim,
+    )));
+
+    let estimated: u32 = b.categories.iter().map(|c| c.tokens).sum();
+    let measured = if b.plan.total_measured {
+        format!("(actual tokens={} source=provider)", b.total_used)
+    } else {
+        "(never measured)".to_string()
+    };
+    out.push(plan_node(
+        0,
+        "Assemble Request",
+        &format!("(est tokens={estimated} steps={})", PLAN_STEPS.len()),
+        &measured,
+        width,
+    ));
+
+    for kind in PLAN_STEPS {
+        let tokens = step_tokens(b, kind);
+        out.push(plan_node(
+            2,
+            step_name(kind),
+            &step_estimate(b, kind, tokens),
+            "(never measured)",
+            width,
+        ));
+        if let Some(detail) = step_detail(b, kind) {
+            out.push(Line::from(Span::styled(
+                fit(format!("        {detail}"), width),
+                dim,
+            )));
+        }
+    }
+
+    out.push(plan_node(
+        2,
+        "Compaction",
+        &format!(
+            "(freed={} stages={})",
+            b.compaction.tokens_saved(),
+            b.compaction.stages.len()
+        ),
+        "",
+        width,
+    ));
+    if b.compression_triggered {
+        out.push(Line::from(Span::styled(
+            format!(
+                "        Triggered: yes   Stages Recorded: {}",
+                b.compaction.stages.len()
+            ),
+            dim,
+        )));
+    }
+
+    let mut footer = vec![Span::styled(
+        format!("Window: {} usable   Free: {}", b.limit, b.free_space_tokens),
+        dim,
+    )];
+    let unaccounted = b.total_used.saturating_sub(estimated);
+    if unaccounted > 0 {
+        footer.push(Span::styled(
+            format!("   Unaccounted: {unaccounted}"),
+            Style::default().fg(theme.warn),
+        ));
+    }
+    out.push(Line::from(footer));
+
+    out
 }
 
-fn free_space_row(free_tokens: u32, limit: u32, label_width: usize) -> Line<'static> {
-    let theme = crate::tui::theme::current();
-    let pct = if limit == 0 {
-        0.0
+/// Clip to `width` display cells, ellipsis included — `truncate_preview`
+/// counts its ellipsis on top of the budget, which would overflow a panel
+/// sized to the cell.
+fn fit(s: String, width: usize) -> String {
+    if s.chars().count() <= width {
+        s
     } else {
-        free_tokens as f64 / limit as f64 * 100.0
-    };
-    let mark = Span::styled("⛶ ", Style::default().fg(theme.dim));
-    let label = Span::styled(
-        format!("{:<w$}", "Free space", w = label_width),
-        Style::default().add_modifier(Modifier::DIM),
-    );
-    let tokens = Span::styled(
-        format!("  {:>7}", fmt_tokens(free_tokens)),
-        Style::default().add_modifier(Modifier::DIM),
-    );
-    let pct_span = Span::styled(format!("  ({pct:>4.1}%)"), Style::default().fg(theme.dim));
-    Line::from(vec![mark, label, tokens, pct_span])
+        truncate_preview(&s, width.saturating_sub(1))
+    }
+}
+
+/// One plan node: `->  Name  (estimate)  (measurement)`.
+///
+/// The measurement group is dropped before the node itself is truncated.
+/// On a narrow panel the step and its estimate are what matter; the
+/// repeated reminder that nothing measured it can go.
+fn plan_node(
+    indent: usize,
+    name: &str,
+    estimate: &str,
+    measurement: &str,
+    width: usize,
+) -> Line<'static> {
+    let theme = crate::tui::theme::current();
+    let arrow = if indent == 0 { "" } else { "->  " };
+    let head = format!("{:indent$}{arrow}{name}  {estimate}", "");
+    if measurement.is_empty() {
+        return Line::from(Span::raw(fit(head, width)));
+    }
+    let tail = format!("  {measurement}");
+    if head.chars().count() + tail.chars().count() <= width {
+        Line::from(vec![
+            Span::raw(head),
+            Span::styled(tail, Style::default().fg(theme.dim)),
+        ])
+    } else {
+        Line::from(Span::raw(fit(head, width)))
+    }
+}
+
+fn step_name(kind: CategoryKind) -> &'static str {
+    match kind {
+        CategoryKind::System => "System Prompt",
+        CategoryKind::Tools => "Tool Surface",
+        CategoryKind::Memory => "Memory Retrieval",
+        CategoryKind::History => "History Assembly",
+        CategoryKind::UserMessage => "Current Turn",
+    }
+}
+
+/// Categories carrying no tokens are filtered out of the breakdown, but a
+/// step that ran and produced nothing is still part of the plan — so the
+/// plan reads a missing category as zero rather than skipping the node.
+fn step_tokens(b: &ContextBreakdown, kind: CategoryKind) -> u32 {
+    b.categories
+        .iter()
+        .find(|c| c.kind == kind)
+        .map_or(0, |c| c.tokens)
+}
+
+fn step_estimate(b: &ContextBreakdown, kind: CategoryKind, tokens: u32) -> String {
+    match kind {
+        CategoryKind::Tools => {
+            format!("(est tokens={tokens} tools={})", b.plan.tools_available)
+        }
+        CategoryKind::History => {
+            format!("(est tokens={tokens} turns={})", b.history.total_turns)
+        }
+        _ => format!("(est tokens={tokens})"),
+    }
+}
+
+/// The facts a step recorded about its own work. `Per-tool Sum` is a
+/// second opinion on the Tools estimate: when the two disagree the panel
+/// reports both rather than choosing one.
+fn step_detail(b: &ContextBreakdown, kind: CategoryKind) -> Option<String> {
+    let p = &b.plan;
+    match kind {
+        CategoryKind::System => Some(format!(
+            "Skills: {}   Repository Memories: {}   Session Snapshot: {}",
+            p.skills_injected,
+            p.repository_memories,
+            if p.session_snapshot {
+                "present"
+            } else {
+                "none"
+            }
+        )),
+        CategoryKind::Tools => Some(format!(
+            "Loaded: {}   Deferred: {}   Per-tool Sum: {}   Time: {} ms",
+            p.tools_available, p.deferred_available, p.tool_tokens_sum, p.tool_surface_latency_ms
+        )),
+        CategoryKind::Memory => Some(format!(
+            "Candidates Considered: {}   Selected: {}   Time: {} ms",
+            p.memory_candidates, p.memory_selected, p.memory_latency_ms
+        )),
+        CategoryKind::History => Some(format!(
+            "Retained: {}   Compressed: {}   Dropped: {}",
+            b.history.retained, b.history.compressed, b.history.dropped
+        )),
+        CategoryKind::UserMessage => None,
+    }
 }
 
 // ─── Sub-sections ─────────────────────────────────────────────────
@@ -2272,6 +2465,21 @@ mod tests {
         TokenBudgetTrace, TurnCompression, TurnRetention, VisibleTool,
     };
 
+    /// Flatten rendered lines the way a terminal shows them: spans run
+    /// together, one line per row.
+    fn lines_to_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn trace(
         max: u32,
         sys: u32,
@@ -2522,9 +2730,9 @@ mod tests {
 
     #[test]
     fn build_lines_includes_free_space_when_budget_remains() {
-        // System/Tools/History consume a fraction of the budget —
-        // the legend must include a "Free space" row covering the
-        // remainder so the user sees how much headroom they have.
+        // System/Tools/History consume a fraction of the budget — the
+        // plan footer must report the remainder so the user sees how
+        // much headroom they have.
         let b = ContextBreakdown::from_trace(&trace(100_000, 2_000, 8_000, 0, 1_000, 200));
         let lines = build_lines(&b, 80);
         let text: String = lines
@@ -2532,16 +2740,13 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(
-            text.contains("Free space"),
-            "free space row missing: {text}"
-        );
+        assert!(text.contains("Free: 88800"), "free space missing: {text}");
     }
 
     #[test]
-    fn build_lines_omits_free_space_when_over_budget() {
-        // total_used > max: free_space_tokens clamps at 0 which
-        // means the legend skips the row (model invariant).
+    fn build_lines_reports_no_free_space_when_over_budget() {
+        // total_used > max: free_space_tokens clamps at 0, and the
+        // footer says so rather than going quiet (model invariant).
         let mut t = trace(100_000, 50_000, 60_000, 10_000, 10_000, 1_000);
         t.token_budget.total_used = 150_000;
         let b = ContextBreakdown::from_trace(&t);
@@ -2551,7 +2756,10 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(!text.contains("Free space"), "should be hidden: {text}");
+        assert!(
+            text.contains("Free: 0"),
+            "should report no headroom: {text}"
+        );
     }
 
     #[test]
@@ -3512,7 +3720,7 @@ mod tests {
             .join(" ");
         assert!(!text.contains("Tools · /tool"));
         assert!(!text.contains("Memory · /memory"));
-        assert!(!text.contains("Skills"));
+        assert!(!text.contains("Skills · "));
     }
 
     #[test]
@@ -3527,10 +3735,107 @@ mod tests {
     }
 
     #[test]
-    fn grid_uses_fifty_cells() {
+    fn column_has_one_cell_per_plan_row() {
         let b = ContextBreakdown::from_trace(&trace(100_000, 10_000, 0, 0, 0, 0));
-        let cells = render_grid_cells(&b);
-        assert_eq!(cells.len(), GRID_CELLS);
-        assert_eq!(cells.len(), 50, "5 × 10 grid: one glyph ≈ 2% of budget");
+        for rows in [1, 5, 14, 30] {
+            assert_eq!(column_layout(&b, rows).len(), rows);
+            assert_eq!(column_cells(&b, rows).len(), rows);
+        }
+    }
+
+    #[test]
+    fn column_is_drawn_to_scale() {
+        // System prompt takes exactly half the window, so it owns exactly
+        // the top half of the column and free space owns the rest.
+        let b = ContextBreakdown::from_trace(&trace(100_000, 50_000, 0, 0, 0, 0));
+        let free = b.categories.len();
+        assert_eq!(
+            column_layout(&b, 10),
+            [
+                vec![ColumnCell::Whole(0); 5],
+                vec![ColumnCell::Whole(free); 5]
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn boundary_cell_carries_both_neighbours() {
+        // A quarter of the window over ten rows puts the boundary 2.5 rows
+        // down — mid-cell, so that cell holds both steps and splits at the
+        // nearest eighth.
+        let b = ContextBreakdown::from_trace(&trace(100_000, 25_000, 0, 0, 0, 0));
+        let layout = column_layout(&b, 10);
+        assert_eq!(
+            layout[2],
+            ColumnCell::Split {
+                top: 0,
+                bottom: b.categories.len(),
+                eighths: 4,
+            }
+        );
+        // Painting it uses both of the cell's colours.
+        let cells = column_cells(&b, 10);
+        assert!(cells[2].style.fg.is_some() && cells[2].style.bg.is_some());
+    }
+
+    #[test]
+    fn column_drops_only_what_a_cell_cannot_hold() {
+        // Three steps inside one cell: the thinnest cannot be drawn, and
+        // the cell keeps the two that can.
+        let b = ContextBreakdown::from_trace(&trace(1_000, 500, 0, 0, 480, 20));
+        let layout = column_layout(&b, 1);
+        assert!(
+            matches!(layout[0], ColumnCell::Split { top: 0, bottom, .. } if bottom == 1),
+            "expected the two thickest steps, got {:?}",
+            layout[0]
+        );
+    }
+
+    #[test]
+    fn plan_reports_every_step_even_when_it_cost_nothing() {
+        // Memory contributed no tokens, so it is not a category — but it
+        // still ran, and a plan that omits it cannot be read as complete.
+        let b = ContextBreakdown::from_trace(&trace(100_000, 10_000, 500, 0, 200, 50));
+        let text = lines_to_text(&plan_lines(&b, 100));
+        for step in PLAN_STEPS {
+            assert!(text.contains(step_name(step)), "missing {step:?}: {text}");
+        }
+        assert!(text.contains("Memory Retrieval  (est tokens=0"));
+    }
+
+    #[test]
+    fn plan_never_passes_an_estimate_off_as_a_measurement() {
+        let b = ContextBreakdown::from_trace(&trace(100_000, 10_000, 500, 0, 200, 50));
+        let text = lines_to_text(&plan_lines(&b, 100));
+        assert_eq!(
+            text.matches("(never measured)").count(),
+            PLAN_STEPS.len() + 1,
+            "every step plus the unmeasured total: {text}"
+        );
+    }
+
+    #[test]
+    fn plan_shows_what_the_steps_do_not_account_for() {
+        let mut t = trace(100_000, 10_000, 500, 0, 200, 50);
+        // The provider measured more than the steps add up to.
+        t.token_budget.total_used += 2_380;
+        t.token_budget.usage_source = astra_turn_types::ContextWindowUsageSource::ProviderReported;
+        let b = ContextBreakdown::from_trace(&t);
+        let text = lines_to_text(&plan_lines(&b, 100));
+        assert!(text.contains("source=provider"), "{text}");
+        assert!(text.contains("Unaccounted: 2380"), "{text}");
+    }
+
+    #[test]
+    fn plan_keeps_the_step_when_the_panel_is_too_narrow_for_the_measurement() {
+        let b = ContextBreakdown::from_trace(&trace(100_000, 10_000, 500, 0, 200, 50));
+        let narrow = lines_to_text(&plan_lines(&b, 40));
+        assert!(narrow.contains("System Prompt"), "{narrow}");
+        assert!(!narrow.contains("(never measured)"), "{narrow}");
+        for line in plan_lines(&b, 40) {
+            let width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            assert!(width <= 40, "line overflows 40 cols: {line:?}");
+        }
     }
 }

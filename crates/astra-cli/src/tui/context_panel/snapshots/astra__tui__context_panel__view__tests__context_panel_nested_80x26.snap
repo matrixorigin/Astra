@@ -1,18 +1,26 @@
 ---
 source: crates/astra-cli/src/tui/context_panel/view.rs
-assertion_line: 2428
+assertion_line: 2644
 expression: "render_panel(&b, 80, 26)"
 ---
 ┌ Context window (32% · low) ──────────────────────────────────────────────────┐
 │  32.5k / 100.0k tokens  current prompt (32.5%)                               │
 │  Tab focus · Enter close · j/k scroll · Esc close                            │
 │                                                                              │
-│  ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁   ⛁ System prompt     4.0k  ( 4.0%)                     │
-│  ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛶ ⛶ ⛶ ⛶   ⛁ Tools             6.0k  ( 6.0%)                     │
-│  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Memory            2.0k  ( 2.0%)                     │
-│  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ History          20.0k  (20.0%)                     │
-│  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Current turn       500  ( 0.5%)                     │
-│                        ⛶ Free space       67.5k  (67.5%)                     │
+│  ▄▄▄                               CONTEXT PLAN                              │
+│  ▃▃▃  ---------------------------------------------------------------------  │
+│  ███  Assemble Request  (est tokens=32500 steps=5)  (never measured)         │
+│  ███    ->  System Prompt  (est tokens=4000)  (never measured)               │
+│  ▄▄▄          Skills: 1   Repository Memories: 0   Session Snapshot: none    │
+│  ███    ->  Tool Surface  (est tokens=6000 tools=0)  (never measured)        │
+│  ███          Loaded: 0   Deferred: 0   Per-tool Sum: 2100   Time: 0 ms      │
+│  ███    ->  Memory Retrieval  (est tokens=2000)  (never measured)            │
+│  ███          Candidates Considered: 0   Selected: 1   Time: 0 ms            │
+│  ███    ->  History Assembly  (est tokens=20000 turns=0)  (never measured)   │
+│  ███          Retained: 0   Compressed: 0   Dropped: 0                       │
+│  ███    ->  Current Turn  (est tokens=500)  (never measured)                 │
+│  ███    ->  Compaction  (freed=0 stages=0)                                   │
+│  ███  Window: 100000 usable   Free: 67500                                    │
 │                                                                              │
 │   System prompt                                                              │
 │    └ Persona   1.5k tokens                                                   │
@@ -20,12 +28,4 @@ expression: "render_panel(&b, 80, 26)"
 │    └ User preferences   200 tokens                                           │
 │                                                                              │
 │   Tools · /tool                                                              │
-│    └ read_file   1.2k tokens                                                 │
-│    └ write_file   900 tokens                                                 │
-│                                                                              │
-│   Skills · /skills                                                           │
-│    └ review_changes   650 tokens                                             │
-│                                                                              │
-│   Memory · /memory                                                           │
-│    └ "User prefers terse answers"   400 tokens  (rel 0.91)                   │
 └──────────────────────────────────────────────────────────────────────────────┘

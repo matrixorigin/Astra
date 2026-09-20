@@ -1016,11 +1016,12 @@ mod tests {
     #[test]
     fn scroll_to_focus_noop_when_heading_already_visible() {
         // Regression: Tab cycling from the first focused section
-        // used to unconditionally re-scroll, pushing the
-        // grid/legend off-screen even when the target heading was
-        // already fully visible.
+        // used to unconditionally re-scroll, pushing the column and
+        // plan off-screen even when the target heading was already
+        // fully visible. The viewport has to be tall enough to hold
+        // the top block for that premise to hold at all.
         let mut v = ContextPanelView::new(big_breakdown());
-        prime_viewport(&v, 80, 24);
+        prime_viewport(&v, 80, 40);
         v.handle_key(press(KeyCode::Tab));
         let first_scroll = v.scroll;
         // Tab to next focus; heading of the next section is still

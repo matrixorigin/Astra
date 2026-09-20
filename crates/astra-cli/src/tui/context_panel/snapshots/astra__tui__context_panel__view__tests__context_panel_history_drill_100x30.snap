@@ -1,16 +1,25 @@
 ---
 source: crates/astra-cli/src/tui/context_panel/view.rs
-assertion_line: 2367
+assertion_line: 2583
 expression: buffer_to_string(&buf)
 ---
   2.0k / 100.0k tokens  current prompt (2.0%)
   Esc back · j/k scroll
 
-  ⛁ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ System prompt     2.0k  ( 2.0%)
-  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛶ Free space       98.0k  (98.0%)
-  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶
-  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶
-  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶
+  ▆▆▆                                          CONTEXT PLAN
+  ███  -------------------------------------------------------------------------------------------
+  ███  Assemble Request  (est tokens=2000 steps=5)  (never measured)
+  ███    ->  System Prompt  (est tokens=2000)  (never measured)
+  ███          Skills: 0   Repository Memories: 0   Session Snapshot: none
+  ███    ->  Tool Surface  (est tokens=0 tools=0)  (never measured)
+  ███          Loaded: 0   Deferred: 0   Per-tool Sum: 0   Time: 0 ms
+  ███    ->  Memory Retrieval  (est tokens=0)  (never measured)
+  ███          Candidates Considered: 0   Selected: 0   Time: 0 ms
+  ███    ->  History Assembly  (est tokens=0 turns=1)  (never measured)
+  ███          Retained: 1   Compressed: 0   Dropped: 0
+  ███    ->  Current Turn  (est tokens=0)  (never measured)
+  ███    ->  Compaction  (freed=0 stages=0)
+  ███  Window: 100000 usable   Free: 98000
 
  ▼ History · conversation turns
     Esc back · drill: turn #0 assistant   4.2k tokens  [tools]
