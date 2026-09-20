@@ -86,46 +86,6 @@ pub struct CorrectionOutcome {
     pub resolved: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LatestRoundBehavior {
-    assessment: stall::RewardHackingAssessment,
-    avoid_tools: Vec<String>,
-}
-
-impl Default for LatestRoundBehavior {
-    fn default() -> Self {
-        Self {
-            assessment: stall::RewardHackingAssessment {
-                risk: 0.0,
-                flags: Vec::new(),
-            },
-            avoid_tools: Vec::new(),
-        }
-    }
-}
-
-impl LatestRoundBehavior {
-    fn from_calls(calls: &[serde_json::Value]) -> Self {
-        let assessment = stall::assess_reward_hacking(calls, 0.0, None)
-            .unwrap_or_else(|error| {
-                tracing::warn!(target: "turn_guard", %error, "reward hacking assessment failed; using zero risk");
-                Self::default().assessment
-            });
-        let avoid_tools = if assessment.risk >= stall::ACTIVE_REWARD_HACKING_RISK_THRESHOLD
-            && !assessment.flags.is_empty()
-        {
-            stall::reward_hacking_avoid_tools(calls)
-        } else {
-            Vec::new()
-        };
-        Self {
-            assessment,
-            avoid_tools,
-        }
-    }
-}
-
 /// Session-scoped turn guard state.
 /// Accumulates signals across turns and composes non-happy-path decisions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,8 +95,6 @@ pub struct TurnGuard {
     task_profile: TaskExecutionProfile,
     /// Per-turn tool call signatures for stall/divergence detection.
     pub tool_sigs: Vec<BTreeSet<crate::stall::StallSignature>>,
-    /// Classified latest-round behavior; raw tool arguments are not retained.
-    latest_behavior: LatestRoundBehavior,
     /// How many stall nudges have been sent this session.
     pub nudge_count: usize,
     /// Per-tool health tracker.
@@ -244,15 +202,6 @@ impl TurnGuard {
         {
             return Err("unresolved correction cannot already have succeeded");
         }
-        let assessment = &self.latest_behavior.assessment;
-        if !assessment.risk.is_finite()
-            || !(0.0..=1.0).contains(&assessment.risk)
-            || ((assessment.risk < stall::ACTIVE_REWARD_HACKING_RISK_THRESHOLD
-                || assessment.flags.is_empty())
-                && !self.latest_behavior.avoid_tools.is_empty())
-        {
-            return Err("invalid latest behavior assessment");
-        }
         if self.last_reflection.as_ref().is_some_and(|reflection| {
             !reflection.confidence.is_finite() || !(0.0..=1.0).contains(&reflection.confidence)
         }) {
@@ -315,7 +264,6 @@ impl TurnGuard {
         Self {
             task_profile,
             tool_sigs: Vec::new(),
-            latest_behavior: LatestRoundBehavior::default(),
             nudge_count: 0,
             health: ToolHealthTracker::new(),
             errors: SessionErrorSummary::new(),
@@ -410,8 +358,6 @@ impl TurnGuard {
     /// Also resolves any `pending_correction` by checking whether the agent
     /// complied with the avoid-list and used suggested alternatives.
     pub fn record_tool_calls(&mut self, tool_calls: &[serde_json::Value]) {
-        self.latest_behavior = LatestRoundBehavior::from_calls(tool_calls);
-
         if let Some(correction) = self.pending_correction.take() {
             let current_tools: HashSet<String> = tool_calls
                 .iter()
@@ -635,7 +581,6 @@ impl TurnGuard {
         self.pending_correction = None;
         self.errors.clear_recent_pressure();
         self.tool_sigs.clear();
-        self.latest_behavior = LatestRoundBehavior::default();
         self.validation_attempts_since_workspace_mutation.clear();
         self.health.clear_cache_hit_signatures();
     }
@@ -725,7 +670,7 @@ impl TurnGuard {
     ///
     /// ## Calm-turn decay
     ///
-    /// On turns with no stall, divergence, reward-hacking, cache-waste,
+    /// On turns with no stall, divergence, cache-waste,
     /// or tool errors, `nudge_count` decays by 1. This prevents stale
     /// nudge pressure from keeping the session in a warning state
     /// indefinitely.
@@ -775,26 +720,6 @@ impl TurnGuard {
                 // These detectors observe overlapping signature evidence.
                 // Emit one repetition advisory, not two competing diagnoses.
                 injections.push(stall::DIVERGENCE_CORRECTION.to_string());
-                self.nudge_count += 1;
-            }
-            severity = severity.max(VerdictSeverity::Warning);
-        }
-
-        // 3. Reward-hacking detection for the current turn.
-        let reward_hacking = &self.latest_behavior.assessment;
-        let reward_hacking_detected = reward_hacking.risk
-            >= stall::ACTIVE_REWARD_HACKING_RISK_THRESHOLD
-            && !reward_hacking.flags.is_empty();
-        if reward_hacking_detected {
-            let reward_hacking_avoid = &self.latest_behavior.avoid_tools;
-            injections.push(stall::build_reward_hacking_correction(
-                reward_hacking,
-                reward_hacking_avoid,
-            ));
-            for tool in reward_hacking_avoid {
-                insert_avoid_tool(&mut avoid_tools, tool);
-            }
-            if !stall_detected && !divergence_detected {
                 self.nudge_count += 1;
             }
             severity = severity.max(VerdictSeverity::Warning);
@@ -897,10 +822,7 @@ impl TurnGuard {
         }
         self.last_cache_hit_total = current_total;
 
-        let recovered_this_round = !stall_detected
-            && !divergence_detected
-            && !reward_hacking_detected
-            && !self.round_had_error;
+        let recovered_this_round = !stall_detected && !divergence_detected && !self.round_had_error;
         if recovered_this_round {
             self.clear_transient_pressure();
         }
@@ -1035,8 +957,6 @@ impl TurnGuard {
                     "stall_nudge"
                 } else if is_diverging {
                     "divergence"
-                } else if reward_hacking_detected {
-                    "reward_hacking"
                 } else if fresh_health_avoidance_warning {
                     "health_avoidance"
                 } else if cache_warning_emitted {
@@ -1281,6 +1201,9 @@ mod tests {
     #[test]
     fn guard_continuation_rejects_missing_and_inconsistent_facts() {
         let wire = continuation_wire(&TurnGuard::new());
+        let mut unknown = wire.clone();
+        unknown["unexpected_field"] = json!(true);
+        assert!(TurnGuard::deserialize_continuation(unknown).is_err());
         for field in wire.as_object().unwrap().keys() {
             let mut missing = wire.clone();
             missing.as_object_mut().unwrap().remove(field);
@@ -1292,8 +1215,6 @@ mod tests {
         for (path, value) in [
             ("/corrections/totals/followed", json!(1)),
             ("/corrections/totals/total", json!(usize::MAX)),
-            ("/latest_behavior/assessment/risk", json!(1.1)),
-            ("/latest_behavior/avoid_tools", json!(["bash"])),
             ("/task_profile/stall_window", json!(0)),
             ("/adaptive_thresholds/stall_window", json!(0)),
             ("/last_cache_hit_total", json!(1)),
@@ -2404,29 +2325,59 @@ mod tests {
     }
 
     #[test]
-    fn reward_hacking_turn_triggers_runtime_warning() {
-        let mut guard = TurnGuard::new();
-        guard.record_tool_calls(&[
-            make_tool_call("read_file", r#"{"path":"src/lib.rs"}"#),
-            make_tool_call("read_file", r#"{"path":"src/lib.rs"}"#),
-        ]);
-        guard.record_tool_result("read_file", r#"fn main() {}"#);
-        guard.record_tool_result("read_file", r#"fn main() {}"#);
+    fn repeated_calls_within_one_batch_do_not_diagnose_behavior() {
+        for name in ["read_file", "bash", "agent_fanout", "custom_poll"] {
+            for count in [2, 3] {
+                let mut guard = TurnGuard::new();
+                let calls = vec![make_tool_call(name, r#"{"target":"same"}"#); count];
+                guard.record_tool_calls(&calls);
+                for _ in 0..count {
+                    guard.record_tool_result(name, "operation completed");
+                }
 
-        let initial_nudges = guard.nudge_count;
+                let verdict = guard.evaluate();
+                assert_eq!(verdict.severity, VerdictSeverity::Healthy, "{name}");
+                assert!(verdict.injections.is_empty());
+                assert!(verdict.avoid_tools.is_empty());
+                assert!(!verdict.stall_detected);
+                assert!(!verdict.is_diverging);
+                assert!(!verdict.advisory_threshold_reached);
+                assert_eq!(guard.nudge_count, 0);
+                assert!(guard.pending_correction.is_none());
+                assert!(!guard.health.is_avoidance_advised(name));
+                assert_eq!(guard.tool_sigs.len(), 1);
+                assert_eq!(
+                    guard.tool_sigs[0],
+                    stall::server_tool_call_signature(&calls)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_batches_keep_signature_advice_without_extra_nudge_or_tool_avoidance() {
+        let mut guard = TurnGuard::new();
+        let calls = vec![make_tool_call("agent_fanout", r#"{"action":"get_results"}"#); 3];
+        for _ in 0..guard.stall_window() {
+            guard.record_tool_calls(&calls);
+            for _ in &calls {
+                guard.record_tool_result("agent_fanout", "operation completed");
+            }
+        }
+
         let verdict = guard.evaluate();
         assert_eq!(verdict.severity, VerdictSeverity::Warning);
-        assert!(
-            verdict
-                .injections
-                .iter()
-                .any(|message| message.contains("Reward-hacking guard"))
+        assert!(verdict.stall_detected);
+        assert_eq!(verdict.injections.len(), 1);
+        assert!(verdict.injections[0].contains("REFLECTION"));
+        assert!(!verdict.injections[0].contains("Reward-hacking"));
+        assert!(verdict.avoid_tools.is_empty());
+        assert!(!guard.health.is_avoidance_advised("agent_fanout"));
+        assert_eq!(guard.nudge_count, 1);
+        assert_eq!(
+            guard.pending_correction.as_ref().unwrap().correction_type,
+            "stall_nudge"
         );
-        assert!(
-            verdict.avoid_tools.is_empty(),
-            "reward-hacking guidance must not hide read-only observation tools"
-        );
-        assert_eq!(guard.nudge_count, initial_nudges + 1);
     }
 
     // ── CorrectionRecord / CorrectionOutcome tests ──

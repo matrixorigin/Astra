@@ -923,14 +923,14 @@ fn evaluate_policy_boundary(
         && entries.len() < general_entry_limit
     {
         entries.push(RuntimePolicyFeedbackEntry {
-            signal: RuntimePolicySignal::RedundantReads,
+            signal: RuntimePolicySignal::ReadCoverageOverlap,
             stage: stage(
-                RuntimePolicySignal::RedundantReads,
+                RuntimePolicySignal::ReadCoverageOverlap,
                 saturating_u32(redundant_reads),
             ),
             observed_at_round: completed_rounds,
             evidence_count: saturating_u32(redundant_reads),
-            recommendation: RuntimePolicyRecommendation::ReuseKnownContent,
+            recommendation: RuntimePolicyRecommendation::ReviewReadCoverage,
         });
     }
     if unresolved_outcomes > 0 && entries.len() < general_entry_limit {
@@ -1049,7 +1049,7 @@ fn evaluate_policy_boundary(
     // evaluator, and the guidance still permits one materially different
     // decisive check before synthesis.
     let prior_low_yield_converged = prior_entries.iter().any(|entry| {
-        entry.signal == RuntimePolicySignal::LowYieldRoundChurn
+        entry.signal == RuntimePolicySignal::RoundActivity
             && entry.stage == RuntimePolicyStage::Converge
     });
     let cadence_observed = sequential_single_call_streak >= thresholds.llm_round_churn;
@@ -1094,7 +1094,7 @@ fn evaluate_policy_boundary(
         && entries.len() < RuntimePolicyFeedbackSet::MAX_ENTRIES
     {
         entries.push(RuntimePolicyFeedbackEntry {
-            signal: RuntimePolicySignal::LowYieldRoundChurn,
+            signal: RuntimePolicySignal::RoundActivity,
             stage: if sticky_convergence || cadence_is_corroborated || ignored_search_advisory {
                 RuntimePolicyStage::Converge
             } else {
@@ -1102,7 +1102,7 @@ fn evaluate_policy_boundary(
             },
             observed_at_round: completed_rounds,
             evidence_count: completed_rounds,
-            recommendation: RuntimePolicyRecommendation::SynthesizeAndDecide,
+            recommendation: RuntimePolicyRecommendation::ReviewTaskProgress,
         });
     }
     state.prior_active_failure_operations = active_failure_operations;
@@ -1288,19 +1288,15 @@ fn saturating_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
-/// Whether the persisted policy evidence has crossed the low-yield
-/// convergence boundary for its current typed subject.
-///
-/// The feedback itself remains advisory to the model. This predicate is kept
-/// as a typed projection for telemetry and callers that want to explain why a
-/// synthesis recommendation was emitted; it must not be used as an execution
-/// veto by the scheduler.
-pub fn feedback_requires_convergence(set: &RuntimePolicyFeedbackSet) -> bool {
+/// Test projection of persistent activity for the current subject, not a
+/// semantic assessment of progress or an execution veto.
+#[cfg(test)]
+fn feedback_has_persistent_round_activity(set: &RuntimePolicyFeedbackSet) -> bool {
     let RuntimePolicyFeedbackSet::Evaluated { entries, .. } = set else {
         return false;
     };
     entries.iter().any(|entry| {
-        entry.signal == RuntimePolicySignal::LowYieldRoundChurn
+        entry.signal == RuntimePolicySignal::RoundActivity
             && entry.stage == RuntimePolicyStage::Converge
     })
 }
@@ -1352,7 +1348,7 @@ pub fn policy_advisory_payload(set: &RuntimePolicyFeedbackSet) -> Option<serde_j
         })
         .collect::<Vec<_>>();
     Some(serde_json::json!({
-        "schema": "runtime_policy_feedback.v2",
+        "schema": format!("runtime_policy_feedback.v{}", RuntimePolicyFeedbackSet::SCHEMA_VERSION),
         "revision": revision,
         "subject": subject,
         "entries": projected_entries,
@@ -1371,11 +1367,8 @@ fn recommendation_text(
         (RuntimePolicyRecommendation::TestExactHypothesis, RuntimePolicyStage::Converge) => {
             "The same exploration family persisted after prior feedback. Stop repeating it; use the evidence already present to decide the hypothesis, or run one materially different decisive check."
         }
-        (RuntimePolicyRecommendation::ReuseKnownContent, RuntimePolicyStage::Observe) => {
-            "Overlapping unchanged content is already available. Reuse it, or read only a precise unseen range when that range is the named evidence gap."
-        }
-        (RuntimePolicyRecommendation::ReuseKnownContent, RuntimePolicyStage::Converge) => {
-            "Overlapping reads persisted after prior feedback. Do not reread known content; decide from it or inspect only one precise unseen range that directly resolves the active subject."
+        (RuntimePolicyRecommendation::ReviewReadCoverage, _) => {
+            "Recorded reads cover overlapping ranges. This does not establish unchanged content or current context coverage. Check whether another read serves an unmet requirement; reuse prior results only when available and sufficient."
         }
         (RuntimePolicyRecommendation::DiagnoseToolOutcomes, RuntimePolicyStage::Observe) => {
             "Some tool calls failed. Treat each failure as scoped evidence: stop retrying the same operation, use a known-good alternative, and continue the task's next authorized mutation when its prerequisites are sufficient. Do not claim the affected Work item is delivered until its outcome is directly evidenced; report blocked/failed only when the failure prevents the requested result."
@@ -1401,11 +1394,8 @@ fn recommendation_text(
         (RuntimePolicyRecommendation::ChangeValidationStrategy, RuntimePolicyStage::Converge) => {
             "Validation retry churn persisted. Do not rerun equivalent checks; use authoritative CI/artifacts or fix the prerequisite, and state the resulting confidence boundary."
         }
-        (RuntimePolicyRecommendation::SynthesizeAndDecide, RuntimePolicyStage::Observe) => {
-            "Low-yield rounds detected. Name the leading hypothesis and one falsifier internally, reuse the evidence already collected, then take a decisive action that closes a still-unmet user predicate. For an authorized change, make the needed mutation before running the complete unmodified project acceptance harness from a fresh process. Do not repeat equivalent probes or narrate the plan back to the user."
-        }
-        (RuntimePolicyRecommendation::SynthesizeAndDecide, RuntimePolicyStage::Converge) => {
-            "Low-yield work persisted after prior feedback. Stop new exploration and stop restating the plan. Use the evidence now: complete the remaining authorized mutation, run the complete unmodified acceptance harness after the final mutation, or answer with the exact unresolved boundary. Any further tool call must directly close a named user predicate and must not repeat an existing probe."
+        (RuntimePolicyRecommendation::ReviewTaskProgress, _) => {
+            "Recorded activity crossed the review threshold. Round count alone does not measure progress. Compare observed results with the user's requirements; continue needed work or report the result and unresolved gaps."
         }
     }
 }
@@ -1718,7 +1708,7 @@ mod tests {
         };
         assert_eq!(revision, 2);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].signal, RuntimePolicySignal::RedundantReads);
+        assert_eq!(entries[0].signal, RuntimePolicySignal::ReadCoverageOverlap);
         assert_eq!(entries[0].stage, RuntimePolicyStage::Observe);
 
         records.push(executed("read_file", r#"{"path":"a.rs"}"#, 4));
@@ -1849,11 +1839,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(signals.contains(&RuntimePolicySignal::UnresolvedToolOutcomes));
         for forbidden in [
-            RuntimePolicySignal::RedundantReads,
+            RuntimePolicySignal::ReadCoverageOverlap,
             RuntimePolicySignal::ExplorationFamilyChurn,
             RuntimePolicySignal::ValidationRetryChurn,
             RuntimePolicySignal::SearchFanout,
-            RuntimePolicySignal::LowYieldRoundChurn,
+            RuntimePolicySignal::RoundActivity,
         ] {
             assert!(
                 !signals.contains(&forbidden),
@@ -1874,7 +1864,7 @@ mod tests {
         assert!(
             entries(&first)
                 .iter()
-                .any(|entry| entry.signal == RuntimePolicySignal::RedundantReads)
+                .any(|entry| entry.signal == RuntimePolicySignal::ReadCoverageOverlap)
         );
 
         records.push(failed(
@@ -1890,7 +1880,7 @@ mod tests {
         assert!(
             entries(&after_failed_mutation)
                 .iter()
-                .any(|entry| entry.signal == RuntimePolicySignal::RedundantReads),
+                .any(|entry| entry.signal == RuntimePolicySignal::ReadCoverageOverlap),
             "a failed mutation must not invalidate successful read evidence"
         );
     }
@@ -2003,7 +1993,7 @@ mod tests {
             Some(RuntimePolicyStage::Observe),
             "{feedback:?}"
         );
-        assert!(!feedback_requires_convergence(&feedback));
+        assert!(!feedback_has_persistent_round_activity(&feedback));
     }
 
     #[test]
@@ -2052,7 +2042,7 @@ mod tests {
         assert_eq!(
             entries(&observed)
                 .iter()
-                .find(|entry| entry.signal == RuntimePolicySignal::LowYieldRoundChurn)
+                .find(|entry| entry.signal == RuntimePolicySignal::RoundActivity)
                 .map(|entry| entry.stage),
             Some(RuntimePolicyStage::Observe)
         );
@@ -2069,7 +2059,7 @@ mod tests {
         assert_eq!(
             entries(&still_observed)
                 .iter()
-                .find(|entry| entry.signal == RuntimePolicySignal::LowYieldRoundChurn)
+                .find(|entry| entry.signal == RuntimePolicySignal::RoundActivity)
                 .map(|entry| entry.stage),
             Some(RuntimePolicyStage::Observe)
         );
@@ -2086,7 +2076,7 @@ mod tests {
         assert_eq!(
             entries(&still_advisory)
                 .iter()
-                .find(|entry| entry.signal == RuntimePolicySignal::LowYieldRoundChurn)
+                .find(|entry| entry.signal == RuntimePolicySignal::RoundActivity)
                 .map(|entry| entry.stage),
             Some(RuntimePolicyStage::Observe)
         );
@@ -2145,7 +2135,7 @@ mod tests {
         assert!(
             entries(&feedback)
                 .iter()
-                .all(|entry| entry.signal != RuntimePolicySignal::LowYieldRoundChurn)
+                .all(|entry| entry.signal != RuntimePolicySignal::RoundActivity)
         );
     }
 
@@ -2180,7 +2170,7 @@ mod tests {
         assert_eq!(
             entries(&observed)
                 .iter()
-                .find(|entry| entry.signal == RuntimePolicySignal::LowYieldRoundChurn)
+                .find(|entry| entry.signal == RuntimePolicySignal::RoundActivity)
                 .map(|entry| entry.stage),
             Some(RuntimePolicyStage::Observe)
         );
@@ -2200,7 +2190,7 @@ mod tests {
         assert_eq!(
             entries(&corroborator_converged)
                 .iter()
-                .find(|entry| entry.signal == RuntimePolicySignal::LowYieldRoundChurn)
+                .find(|entry| entry.signal == RuntimePolicySignal::RoundActivity)
                 .map(|entry| entry.stage),
             Some(RuntimePolicyStage::Observe),
             "a newly converged corroborator does not immediately promote cadence"
@@ -2219,7 +2209,7 @@ mod tests {
         assert_eq!(
             entries(&converged)
                 .iter()
-                .find(|entry| entry.signal == RuntimePolicySignal::LowYieldRoundChurn)
+                .find(|entry| entry.signal == RuntimePolicySignal::RoundActivity)
                 .map(|entry| entry.stage),
             Some(RuntimePolicyStage::Converge)
         );
@@ -2240,7 +2230,7 @@ mod tests {
         assert_eq!(
             entries(&observed)
                 .iter()
-                .find(|entry| entry.signal == RuntimePolicySignal::LowYieldRoundChurn)
+                .find(|entry| entry.signal == RuntimePolicySignal::RoundActivity)
                 .map(|entry| entry.stage),
             Some(RuntimePolicyStage::Observe)
         );
@@ -2258,7 +2248,7 @@ mod tests {
         assert_eq!(
             entries(&after_failure)
                 .iter()
-                .find(|entry| entry.signal == RuntimePolicySignal::LowYieldRoundChurn)
+                .find(|entry| entry.signal == RuntimePolicySignal::RoundActivity)
                 .map(|entry| entry.stage),
             Some(RuntimePolicyStage::Observe),
             "one late failed hypothesis is an alert, not a scheduler verdict"
@@ -2275,7 +2265,7 @@ mod tests {
         assert_eq!(
             entries(&recovered)
                 .iter()
-                .find(|entry| entry.signal == RuntimePolicySignal::LowYieldRoundChurn)
+                .find(|entry| entry.signal == RuntimePolicySignal::RoundActivity)
                 .map(|entry| entry.stage),
             Some(RuntimePolicyStage::Observe)
         );
@@ -2306,7 +2296,7 @@ mod tests {
                 .unwrap()
                 .expect("late failure boundary is evaluated");
             assert!(
-                !feedback_requires_convergence(&feedback),
+                !feedback_has_persistent_round_activity(&feedback),
                 "weak or newly converged failure evidence needs another boundary"
             );
         }
@@ -2315,7 +2305,7 @@ mod tests {
         let recovered = evaluate_tool_boundary(&mut state, subject, &records, 16)
             .unwrap()
             .expect("same-tool recovery is evaluated");
-        assert!(!feedback_requires_convergence(&recovered));
+        assert!(!feedback_has_persistent_round_activity(&recovered));
         assert!(
             entries(&recovered)
                 .iter()
@@ -2338,7 +2328,7 @@ mod tests {
             }
             let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, round).unwrap();
             assert!(
-                !feedback_requires_convergence(state.latest()),
+                !feedback_has_persistent_round_activity(state.latest()),
                 "healthy serial progress must retain its execution budget at round {round}"
             );
         }
@@ -2346,7 +2336,7 @@ mod tests {
         assert_eq!(
             entries(latest)
                 .iter()
-                .find(|entry| entry.signal == RuntimePolicySignal::LowYieldRoundChurn)
+                .find(|entry| entry.signal == RuntimePolicySignal::RoundActivity)
                 .map(|entry| entry.stage),
             Some(RuntimePolicyStage::Observe)
         );
@@ -2384,7 +2374,7 @@ mod tests {
             assert!(
                 entries(feedback)
                     .iter()
-                    .all(|entry| entry.signal != RuntimePolicySignal::LowYieldRoundChurn),
+                    .all(|entry| entry.signal != RuntimePolicySignal::RoundActivity),
                 "one old, never-reobserved recoverable failure must not turn healthy rounds into synthesis pressure at round {round}"
             );
         }
@@ -2405,7 +2395,7 @@ mod tests {
         assert!(
             entries(&reobserved)
                 .iter()
-                .any(|entry| entry.signal == RuntimePolicySignal::LowYieldRoundChurn)
+                .any(|entry| entry.signal == RuntimePolicySignal::RoundActivity)
         );
     }
 
@@ -2434,7 +2424,7 @@ mod tests {
                 .map(|entry| entry.stage),
             Some(RuntimePolicyStage::Observe)
         );
-        assert!(!feedback_requires_convergence(&observed));
+        assert!(!feedback_has_persistent_round_activity(&observed));
 
         records.push(executed(
             "read_file",
@@ -2470,7 +2460,7 @@ mod tests {
             Some(RuntimePolicyStage::Converge)
         );
         assert!(
-            !feedback_requires_convergence(&persisted),
+            !feedback_has_persistent_round_activity(&persisted),
             "search shape alone is never an execution veto"
         );
     }
@@ -2501,7 +2491,7 @@ mod tests {
             evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 1)
                 .unwrap()
                 .expect("new search evidence converges the advisory");
-        assert!(!feedback_requires_convergence(&converged));
+        assert!(!feedback_has_persistent_round_activity(&converged));
 
         records.push(executed(
             "read_file",
@@ -2513,7 +2503,7 @@ mod tests {
                 .unwrap()
                 .expect("first precise inspection is evaluated");
         assert!(
-            !feedback_requires_convergence(&one_precise_followup),
+            !feedback_has_persistent_round_activity(&one_precise_followup),
             "one exact follow-up after the advisory must remain allowed"
         );
 
@@ -2526,7 +2516,7 @@ mod tests {
             .unwrap()
             .expect("continued inspection after the allowance changes guidance");
         assert!(
-            feedback_requires_convergence(&ignored),
+            feedback_has_persistent_round_activity(&ignored),
             "a second inspection-only boundary should produce decision guidance"
         );
     }
@@ -2570,7 +2560,7 @@ mod tests {
         let acted = evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 3)
             .unwrap()
             .expect("decisive action updates feedback");
-        assert!(!feedback_requires_convergence(&acted));
+        assert!(!feedback_has_persistent_round_activity(&acted));
 
         for offset in 4..=5 {
             records.push(executed(
@@ -2583,7 +2573,7 @@ mod tests {
                     .unwrap()
                     .expect("post-action inspection is evaluated");
             assert!(
-                !feedback_requires_convergence(&feedback),
+                !feedback_has_persistent_round_activity(&feedback),
                 "historical fan-out must not immediately re-arm ignored-advisory state"
             );
         }
@@ -2621,7 +2611,7 @@ mod tests {
         let first = evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 2)
             .unwrap()
             .expect("introspection boundary is evaluated");
-        assert!(!feedback_requires_convergence(&first));
+        assert!(!feedback_has_persistent_round_activity(&first));
 
         records.push(executed(
             "read_file",
@@ -2631,7 +2621,7 @@ mod tests {
         let ignored = evaluate_tool_boundary(&mut state, subject, &records, threshold + 3)
             .unwrap()
             .expect("continued inspection is evaluated");
-        assert!(feedback_requires_convergence(&ignored));
+        assert!(feedback_has_persistent_round_activity(&ignored));
     }
 
     #[test]
@@ -2653,21 +2643,21 @@ mod tests {
         let converged = evaluate_tool_boundary(&mut state, subject.clone(), &records, 2)
             .unwrap()
             .expect("second search boundary converges");
-        assert!(!feedback_requires_convergence(&converged));
+        assert!(!feedback_has_persistent_round_activity(&converged));
 
         records.push(executed("list_dir", r#"{"path":"src"}"#, 3));
         let grace = evaluate_tool_boundary(&mut state, subject.clone(), &records, 3).unwrap();
         assert!(
             grace
                 .as_ref()
-                .is_none_or(|feedback| !feedback_requires_convergence(feedback)),
+                .is_none_or(|feedback| !feedback_has_persistent_round_activity(feedback)),
             "one directory inspection remains allowed"
         );
         records.push(executed("read_file", r#"{"path":"src/followup.rs"}"#, 4));
         let ignored = evaluate_tool_boundary(&mut state, subject, &records, 4)
             .unwrap()
             .expect("second observation advances guidance");
-        assert!(feedback_requires_convergence(&ignored));
+        assert!(feedback_has_persistent_round_activity(&ignored));
     }
 
     #[test]
@@ -2725,7 +2715,7 @@ mod tests {
         let ignored = evaluate_tool_boundary(&mut state, subject, &records, threshold + 4)
             .unwrap()
             .expect("next authoritative inspection consumes the active watch");
-        assert!(feedback_requires_convergence(&ignored));
+        assert!(feedback_has_persistent_round_activity(&ignored));
     }
 
     #[test]
@@ -2817,7 +2807,7 @@ mod tests {
         assert!(
             feedback
                 .as_ref()
-                .is_none_or(|set| !feedback_requires_convergence(set))
+                .is_none_or(|set| !feedback_has_persistent_round_activity(set))
         );
     }
 
@@ -2857,7 +2847,7 @@ mod tests {
                 evaluate_tool_boundary(&mut state, RuntimePolicySubject::Run, &[record], 1)
                     .unwrap()
                     .expect("second inspection advances ignored-advisory guidance");
-            assert!(feedback_requires_convergence(&feedback));
+            assert!(feedback_has_persistent_round_activity(&feedback));
             assert_eq!(state.search_converged_followup_inspections, Some(2));
         }
     }
@@ -2962,7 +2952,7 @@ mod tests {
             .unwrap();
             let current = feedback.as_ref().unwrap_or_else(|| state.latest());
             assert!(
-                !feedback_requires_convergence(current),
+                !feedback_has_persistent_round_activity(current),
                 "an advisory the model never received cannot be classified as ignored"
             );
         }
@@ -3046,7 +3036,7 @@ mod tests {
             evaluate_tool_boundary_with_thresholds(&mut state, subject, &records, 4, thresholds)
                 .unwrap()
                 .expect("ignored guidance reserves a projection slot");
-        assert!(feedback_requires_convergence(&ignored));
+        assert!(feedback_has_persistent_round_activity(&ignored));
     }
 
     #[test]
@@ -3085,7 +3075,7 @@ mod tests {
         .unwrap();
         assert!(state.search_converged_followup_inspections.is_none());
         let current = reset.as_ref().unwrap_or_else(|| state.latest());
-        assert!(!feedback_requires_convergence(current));
+        assert!(!feedback_has_persistent_round_activity(current));
 
         for round in 5..=69 {
             records.push(executed(
@@ -3133,7 +3123,7 @@ mod tests {
             .unwrap();
         }
         assert!(
-            feedback_requires_convergence(state.latest()),
+            feedback_has_persistent_round_activity(state.latest()),
             "a fresh post-action fan-out cycle must be independently trackable"
         );
     }
@@ -3151,7 +3141,7 @@ mod tests {
             .unwrap()
             .expect("persistent failure cadence converges");
         assert!(
-            feedback_requires_convergence(&converged),
+            feedback_has_persistent_round_activity(&converged),
             "unexpected feedback: {converged:?}"
         );
 
@@ -3168,7 +3158,7 @@ mod tests {
             .unwrap()
             .expect("failed batch is authoritative failure evidence");
         assert!(
-            feedback_requires_convergence(&still_converged),
+            feedback_has_persistent_round_activity(&still_converged),
             "more failures cannot masquerade as recovery"
         );
     }
@@ -3215,7 +3205,7 @@ mod tests {
             records.push(failed("tool-a", "{}", round, "execution_error"));
             let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, round).unwrap();
         }
-        assert!(feedback_requires_convergence(state.latest()));
+        assert!(feedback_has_persistent_round_activity(state.latest()));
 
         records.push(failed("tool-b", "{}", 12, "execution_error"));
         records.push(executed("tool-a", "{}", 13));
@@ -3223,7 +3213,7 @@ mod tests {
             .unwrap()
             .expect("old cause recovery and new cause are evaluated together");
         assert!(
-            !feedback_requires_convergence(&demoted),
+            !feedback_has_persistent_round_activity(&demoted),
             "a first failure of tool-b cannot inherit tool-a's authority"
         );
     }
@@ -3240,7 +3230,7 @@ mod tests {
             records.push(failed("tool-a", "{}", round, "execution_error"));
             let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, round).unwrap();
         }
-        assert!(feedback_requires_convergence(state.latest()));
+        assert!(feedback_has_persistent_round_activity(state.latest()));
 
         for round in 12..=14 {
             records.push(failed("tool-b", "{}", round, "execution_error"));
@@ -3251,7 +3241,7 @@ mod tests {
             .unwrap()
             .expect("tool-a recovery changes the captured cause set");
         assert!(
-            feedback_requires_convergence(&b_remains),
+            feedback_has_persistent_round_activity(&b_remains),
             "tool-b independently persisted and still needs recovery"
         );
 
@@ -3259,7 +3249,7 @@ mod tests {
         let recovered = evaluate_tool_boundary(&mut state, subject, &records, 16)
             .unwrap()
             .expect("all independently captured causes recovered");
-        assert!(!feedback_requires_convergence(&recovered));
+        assert!(!feedback_has_persistent_round_activity(&recovered));
     }
 
     #[test]
@@ -3286,7 +3276,7 @@ mod tests {
         assert_eq!(
             entries(&observed)
                 .iter()
-                .find(|entry| entry.signal == RuntimePolicySignal::LowYieldRoundChurn)
+                .find(|entry| entry.signal == RuntimePolicySignal::RoundActivity)
                 .map(|entry| entry.stage),
             None,
             "one never-reobserved recoverable failure is not low-yield corroboration"
@@ -3304,7 +3294,7 @@ mod tests {
         assert_eq!(
             entries(&grace)
                 .iter()
-                .find(|entry| entry.signal == RuntimePolicySignal::LowYieldRoundChurn)
+                .find(|entry| entry.signal == RuntimePolicySignal::RoundActivity)
                 .map(|entry| entry.stage),
             Some(RuntimePolicyStage::Observe)
         );
@@ -3321,7 +3311,7 @@ mod tests {
         assert_eq!(
             entries(&converged)
                 .iter()
-                .find(|entry| entry.signal == RuntimePolicySignal::LowYieldRoundChurn)
+                .find(|entry| entry.signal == RuntimePolicySignal::RoundActivity)
                 .map(|entry| entry.stage),
             Some(RuntimePolicyStage::Converge)
         );
@@ -3341,7 +3331,7 @@ mod tests {
         assert_eq!(
             entries(&still_converged)
                 .iter()
-                .find(|entry| entry.signal == RuntimePolicySignal::LowYieldRoundChurn)
+                .find(|entry| entry.signal == RuntimePolicySignal::RoundActivity)
                 .map(|entry| entry.stage),
             Some(RuntimePolicyStage::Converge),
             "window aging must not masquerade as outcome recovery"
@@ -3354,12 +3344,12 @@ mod tests {
         assert_eq!(
             entries(&recovered)
                 .iter()
-                .find(|entry| entry.signal == RuntimePolicySignal::LowYieldRoundChurn)
+                .find(|entry| entry.signal == RuntimePolicySignal::RoundActivity)
                 .map(|entry| entry.stage),
             Some(RuntimePolicyStage::Observe),
             "authoritative same-tool recovery must demote scheduler pressure"
         );
-        assert!(!feedback_requires_convergence(&recovered));
+        assert!(!feedback_has_persistent_round_activity(&recovered));
     }
 
     #[test]
@@ -3454,31 +3444,54 @@ mod tests {
 
     #[test]
     fn observe_feedback_is_actionable_without_becoming_execution_control() {
-        let synthesis = recommendation_text(
-            RuntimePolicyRecommendation::SynthesizeAndDecide,
-            RuntimePolicyStage::Observe,
-        );
-        assert!(synthesis.contains("leading hypothesis"));
-        assert!(synthesis.contains("one falsifier"));
-        assert!(synthesis.contains("still-unmet user predicate"));
-        assert!(synthesis.contains("complete unmodified project acceptance harness"));
-        assert!(synthesis.contains("authorized change"));
-        assert!(synthesis.contains("Do not repeat equivalent probes"));
-        assert!(synthesis.contains("narrate the plan"));
-        assert!(synthesis.len() <= 500, "dynamic advisory must stay compact");
-
-        let converge = recommendation_text(
-            RuntimePolicyRecommendation::SynthesizeAndDecide,
-            RuntimePolicyStage::Converge,
-        );
-        assert!(converge.contains("Stop new exploration"));
-        assert!(converge.contains("stop restating the plan"));
-        assert!(converge.contains("remaining authorized mutation"));
-        assert!(converge.contains("after the final mutation"));
-        assert!(converge.contains("complete unmodified acceptance harness"));
-        assert!(converge.contains("exact unresolved boundary"));
-        assert!(converge.contains("directly close a named user predicate"));
-        assert!(converge.len() <= 500, "dynamic advisory must stay compact");
+        for stage in [RuntimePolicyStage::Observe, RuntimePolicyStage::Converge] {
+            let set = RuntimePolicyFeedbackSet::Evaluated {
+                schema_version: RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+                revision: 1,
+                evaluated_at_round: 12,
+                subject: work_subject("review"),
+                entries: vec![
+                    RuntimePolicyFeedbackEntry {
+                        signal: RuntimePolicySignal::RoundActivity,
+                        stage,
+                        observed_at_round: 12,
+                        evidence_count: 12,
+                        recommendation: RuntimePolicyRecommendation::ReviewTaskProgress,
+                    },
+                    RuntimePolicyFeedbackEntry {
+                        signal: RuntimePolicySignal::ReadCoverageOverlap,
+                        stage,
+                        observed_at_round: 12,
+                        evidence_count: 4,
+                        recommendation: RuntimePolicyRecommendation::ReviewReadCoverage,
+                    },
+                ],
+            };
+            let payload = policy_advisory_payload(&set).expect("advisory projection");
+            let activity = &payload["entries"][0];
+            assert_eq!(activity["signal"], "round_activity");
+            assert_eq!(activity["recommendation"], "review_task_progress");
+            assert_eq!(activity["evidence_count"], 12);
+            assert!(
+                activity["instruction"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Round count alone does not measure progress")
+            );
+            let overlap = &payload["entries"][1];
+            assert_eq!(overlap["signal"], "read_coverage_overlap");
+            assert_eq!(overlap["recommendation"], "review_read_coverage");
+            assert!(
+                overlap["instruction"]
+                    .as_str()
+                    .unwrap()
+                    .contains("does not establish unchanged content or current context coverage")
+            );
+            for entry in payload["entries"].as_array().unwrap() {
+                let instruction = entry["instruction"].as_str().unwrap();
+                assert!(instruction.len() <= 500);
+            }
+        }
 
         let outcomes = recommendation_text(
             RuntimePolicyRecommendation::DiagnoseToolOutcomes,
@@ -3581,11 +3594,11 @@ mod tests {
             evaluated_at_round: 9,
             subject: work_subject("item-7"),
             entries: vec![RuntimePolicyFeedbackEntry {
-                signal: RuntimePolicySignal::RedundantReads,
+                signal: RuntimePolicySignal::ReadCoverageOverlap,
                 stage: RuntimePolicyStage::Converge,
                 observed_at_round: 9,
                 evidence_count: 12,
-                recommendation: RuntimePolicyRecommendation::ReuseKnownContent,
+                recommendation: RuntimePolicyRecommendation::ReviewReadCoverage,
             }],
         };
 

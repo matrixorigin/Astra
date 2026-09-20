@@ -5392,11 +5392,11 @@ mod tests {
             evaluated_at_round: 12,
             subject: RuntimePolicySubject::Run,
             entries: vec![RuntimePolicyFeedbackEntry {
-                signal: RuntimePolicySignal::LowYieldRoundChurn,
+                signal: RuntimePolicySignal::RoundActivity,
                 stage: RuntimePolicyStage::Converge,
                 observed_at_round: 12,
                 evidence_count: 12,
-                recommendation: RuntimePolicyRecommendation::SynthesizeAndDecide,
+                recommendation: RuntimePolicyRecommendation::ReviewTaskProgress,
             }],
         };
 

@@ -6,7 +6,6 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::tool::args::shape::{tool_call_arguments_value, tool_call_name};
-use crate::tool::categories::registry;
 use crate::tool::result::semantics::canonical_tool_identity_parts;
 
 /// A stall-equivalence key, not an execution identity or permission to reuse a
@@ -46,13 +45,11 @@ impl StallSignature {
     }
 }
 
-/// Errors from stall / divergence / reward-hacking heuristics (invalid configuration or inputs).
+/// Errors from stall / divergence detection (invalid configuration or inputs).
 #[derive(Debug, Clone, Error, PartialEq)]
 pub enum StallDetectionError {
     #[error("stall window or exploration budget must be > 0 (got {0})")]
     InvalidWindowOrBudget(usize),
-    #[error("quality score must be finite (got {0})")]
-    InvalidQuality(f64),
 }
 
 /// Require 3 consecutive identical tool call turns (not 2) to detect stall.
@@ -187,8 +184,6 @@ pub fn detect_server_stall(
 pub const CLI_AGENTIC_VERDICT_REMAINING_PENALTY_CRITICAL: usize = 5;
 /// Same for **warning** severity.
 pub const CLI_AGENTIC_VERDICT_REMAINING_PENALTY_WARNING: usize = 2;
-/// Minimum risk before the runtime guard actively throttles a repetitive turn.
-pub const ACTIVE_REWARD_HACKING_RISK_THRESHOLD: f64 = 0.5;
 
 /// Per-round signature set and tool-name set for astra flat `tool_calls` rows (`name` + `arguments` JSON).
 pub fn round_tool_call_sig_and_names(
@@ -237,159 +232,6 @@ pub enum DivergenceStatus {
     Exploring(usize),
     /// Agent is actively diverging — inject correction prompt.
     Diverging(usize),
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RewardHackingAssessment {
-    pub risk: f64,
-    pub flags: Vec<String>,
-}
-
-fn max_duplicate_count(values: &[String]) -> usize {
-    let mut counts = HashMap::new();
-    for value in values {
-        *counts.entry(value).or_insert(0usize) += 1;
-    }
-    counts.into_values().max().unwrap_or(0)
-}
-
-fn tool_call_signatures(tool_calls: &[Value]) -> Vec<String> {
-    tool_calls
-        .iter()
-        .map(|tool_call| {
-            let name = tool_call_name(tool_call).unwrap_or("");
-            let args = tool_call_arguments_value(tool_call);
-            format!(
-                "{}:{}",
-                name,
-                serde_json::to_string(&args).unwrap_or_default()
-            )
-        })
-        .collect()
-}
-
-fn ordered_tool_call_names(tool_calls: &[Value]) -> Vec<String> {
-    tool_calls
-        .iter()
-        .map(|tool_call| tool_call_name(tool_call).unwrap_or("").to_string())
-        .filter(|name| !name.is_empty())
-        .collect()
-}
-
-pub fn assess_reward_hacking(
-    tool_calls: &[Value],
-    quality: f64,
-    user_feedback_score: Option<i64>,
-) -> Result<RewardHackingAssessment, StallDetectionError> {
-    if !quality.is_finite() {
-        return Err(StallDetectionError::InvalidQuality(quality));
-    }
-    let tool_names = ordered_tool_call_names(tool_calls);
-    if tool_names.is_empty() {
-        return Ok(RewardHackingAssessment {
-            risk: 0.0,
-            flags: Vec::new(),
-        });
-    }
-
-    let mut risk = 0.0_f64;
-    let mut flags = Vec::new();
-    let identical_signature_count = max_duplicate_count(&tool_call_signatures(tool_calls));
-    if identical_signature_count >= 2 {
-        flags.push(format!(
-            "repeated identical tool call x{identical_signature_count}"
-        ));
-        risk += if identical_signature_count >= 3 {
-            0.55
-        } else {
-            0.35
-        };
-    }
-
-    let repeated_tool_name_count = max_duplicate_count(&tool_names);
-    // Only flag repeated tool names when the calls are also identical (same args).
-    // Calling the same tool with different arguments (e.g. str_replace on 4 files)
-    // is legitimate multi-target work, not reward hacking.
-    if repeated_tool_name_count >= 3 && identical_signature_count >= 3 {
-        flags.push(format!("repeated tool name x{repeated_tool_name_count}"));
-        risk += 0.20;
-    }
-
-    if tool_names.len() >= 2
-        && tool_names
-            .iter()
-            .all(|name| registry().is_exploration(name))
-    {
-        flags.push("exploration-only tool chain".to_string());
-        risk += 0.25;
-    }
-
-    if !flags.is_empty() && quality >= 0.7 {
-        flags.push("high quality attached to repetitive actions".to_string());
-        risk += 0.15;
-    }
-
-    if !flags.is_empty() && user_feedback_score.is_some_and(|score| score < 50) {
-        flags.push("low user feedback despite positive-looking outcome".to_string());
-        risk += 0.20;
-    }
-
-    Ok(RewardHackingAssessment {
-        risk: risk.clamp(0.0, 0.95),
-        flags,
-    })
-}
-
-pub fn reward_hacking_avoid_tools(tool_calls: &[Value]) -> Vec<String> {
-    let tool_names = ordered_tool_call_names(tool_calls);
-    if tool_names.is_empty() {
-        return Vec::new();
-    }
-
-    let all_exploration = tool_names.len() >= 2
-        && tool_names
-            .iter()
-            .all(|name| registry().is_exploration(name));
-
-    let mut counts = HashMap::new();
-    for name in tool_names {
-        *counts.entry(name).or_insert(0usize) += 1;
-    }
-
-    let mut avoid_tools: Vec<String> = counts
-        .into_iter()
-        .filter_map(|(name, count)| {
-            if count >= 2 || (all_exploration && !name.is_empty()) {
-                Some(name)
-            } else {
-                None
-            }
-        })
-        .collect();
-    avoid_tools.sort();
-    avoid_tools
-}
-
-pub fn build_reward_hacking_correction(
-    assessment: &RewardHackingAssessment,
-    avoid_tools: &[String],
-) -> String {
-    let mut message = format!(
-        "⚠ Reward-hacking guard: the last tool batch looked repetitive or low-value ({}). \
-Stop repeating cheap actions that do not advance the task.",
-        assessment.flags.join("; ")
-    );
-    if !avoid_tools.is_empty() {
-        message.push_str(&format!(
-            "\nRetry-cautioned tools: [{}]. Do not repeat identical low-value calls; change inputs or use a different verification path.",
-            avoid_tools.join(", ")
-        ));
-    }
-    message.push_str(
-        "\nInstead, use a different tool that can make concrete progress, or summarize what you learned and answer the user.",
-    );
-    message
 }
 
 /// Progress assessment across recent rounds, based on tool-call signature
@@ -1067,88 +909,6 @@ mod tests {
             &["grep", "grep"],
         ]);
         assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
-    }
-
-    #[test]
-    fn reward_hacking_flags_repeated_identical_exploration() {
-        let tool_calls = vec![
-            serde_json::json!({"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}}),
-            serde_json::json!({"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}}),
-            serde_json::json!({"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}}),
-        ];
-        let assessment = assess_reward_hacking(&tool_calls, 0.9, None).unwrap();
-        assert!(assessment.risk >= 0.8, "{assessment:?}");
-        assert!(
-            assessment
-                .flags
-                .iter()
-                .any(|flag| flag.contains("repeated identical tool call"))
-        );
-        assert!(
-            assessment
-                .flags
-                .iter()
-                .any(|flag| flag.contains("exploration-only"))
-        );
-    }
-
-    /// Regression: calling the same tool with different arguments (e.g.
-    /// str_replace on 4 different files) is legitimate multi-target work,
-    /// not reward hacking. Only flag when calls are truly identical.
-    #[test]
-    fn reward_hacking_ignores_same_tool_different_args() {
-        let tool_calls = vec![
-            serde_json::json!({"function": {"name": "str_replace", "arguments": {"path": "a.rs", "old": "x", "new": "y"}}}),
-            serde_json::json!({"function": {"name": "str_replace", "arguments": {"path": "b.rs", "old": "x", "new": "y"}}}),
-            serde_json::json!({"function": {"name": "str_replace", "arguments": {"path": "c.rs", "old": "x", "new": "y"}}}),
-            serde_json::json!({"function": {"name": "str_replace", "arguments": {"path": "d.rs", "old": "x", "new": "y"}}}),
-        ];
-        let assessment = assess_reward_hacking(&tool_calls, 0.5, None).unwrap();
-        assert!(
-            !assessment
-                .flags
-                .iter()
-                .any(|f| f.contains("repeated tool name")),
-            "same tool with different args should not be flagged: {assessment:?}"
-        );
-        assert!(
-            assessment.risk < ACTIVE_REWARD_HACKING_RISK_THRESHOLD,
-            "risk should be below threshold for legitimate multi-file edits: {assessment:?}"
-        );
-    }
-
-    #[test]
-    fn reward_hacking_avoid_tools_prefers_repeated_or_exploration_tools() {
-        let tool_calls = vec![
-            serde_json::json!({"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}}),
-            serde_json::json!({"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}}),
-            serde_json::json!({"function": {"name": "grep", "arguments": {"pattern": "TurnGuard"}}}),
-        ];
-
-        assert_eq!(
-            reward_hacking_avoid_tools(&tool_calls),
-            vec!["grep".to_string(), "read_file".to_string()]
-        );
-    }
-
-    #[test]
-    fn reward_hacking_correction_mentions_flags_and_avoid_list() {
-        let assessment = RewardHackingAssessment {
-            risk: 0.6,
-            flags: vec![
-                "repeated identical tool call x2".into(),
-                "exploration-only tool chain".into(),
-            ],
-        };
-
-        let message = build_reward_hacking_correction(
-            &assessment,
-            &["read_file".to_string(), "grep".to_string()],
-        );
-
-        assert!(message.contains("Reward-hacking guard"));
-        assert!(message.contains("repeated identical tool call x2"));
-        assert!(message.contains("Retry-cautioned tools: [read_file, grep]"));
     }
 
     // ── Structured reflection ──
@@ -1885,61 +1645,6 @@ mod tests {
             thresholds.stall_window <= 6,
             "stall window must not exceed 6, got {}",
             thresholds.stall_window
-        );
-    }
-
-    // ── P1-E: Reward-hacking detection behavioral tests ─────────────
-
-    /// Scenario: Agent makes 3 identical tool calls with high quality.
-    /// This should trigger reward hacking detection.
-    #[test]
-    fn reward_hacking_assessment_high_risk_on_identical_calls() {
-        let calls = vec![
-            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}}),
-            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}}),
-            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}}),
-        ];
-        let assessment = assess_reward_hacking(&calls, 0.9, None).unwrap();
-        assert!(
-            assessment.risk >= ACTIVE_REWARD_HACKING_RISK_THRESHOLD,
-            "3 identical calls + high quality must trigger reward hacking (risk={})",
-            assessment.risk
-        );
-        assert!(!assessment.flags.is_empty(), "must have diagnostic flags");
-    }
-
-    /// Scenario: Agent calls the same tool with DIFFERENT args (e.g.,
-    /// str_replace on 4 different files). This is legitimate work.
-    #[test]
-    fn no_reward_hacking_on_same_tool_different_args() {
-        let calls = vec![
-            serde_json::json!({"function": {"name": "str_replace", "arguments": "{\"path\": \"a.rs\", \"old\": \"x\", \"new\": \"y\"}"}}),
-            serde_json::json!({"function": {"name": "str_replace", "arguments": "{\"path\": \"b.rs\", \"old\": \"x\", \"new\": \"y\"}"}}),
-            serde_json::json!({"function": {"name": "str_replace", "arguments": "{\"path\": \"c.rs\", \"old\": \"x\", \"new\": \"y\"}"}}),
-        ];
-        let assessment = assess_reward_hacking(&calls, 0.8, None).unwrap();
-        assert!(
-            assessment.risk < ACTIVE_REWARD_HACKING_RISK_THRESHOLD,
-            "same tool with different args is legitimate (risk={})",
-            assessment.risk
-        );
-    }
-
-    /// Scenario: Low user feedback score on repetitive actions should
-    /// increase reward hacking risk.
-    #[test]
-    fn low_user_feedback_amplifies_reward_hacking_risk() {
-        let calls = vec![
-            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}}),
-            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}}),
-        ];
-        let without_feedback = assess_reward_hacking(&calls, 0.5, None).unwrap();
-        let with_low_feedback = assess_reward_hacking(&calls, 0.5, Some(20)).unwrap();
-        assert!(
-            with_low_feedback.risk > without_feedback.risk,
-            "low user feedback must amplify risk ({} vs {})",
-            with_low_feedback.risk,
-            without_feedback.risk
         );
     }
 

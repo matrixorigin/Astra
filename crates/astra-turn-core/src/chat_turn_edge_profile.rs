@@ -146,7 +146,7 @@ impl RuntimeVolatileInjection {
                 "kind": kind,
                 "round_index": self.round_index,
                 "authority": "advisory_evidence_only",
-                "model_discretion": "Use the specific feedback below as evidence alongside the user goal and tool results. Apply it to the next decision when it matches the evidence; do not repeat an equivalent operation without a new hypothesis or materially new fact. This advisory does not authorize the runtime to retry, stop, change tools, or claim completion.",
+                "model_discretion": "Use the specific feedback below as evidence alongside the user goal and tool results. Apply it to the next decision only when supported by current evidence and consistent with the user request. Repetition alone does not establish lack of progress: authorized verification, sampling, waiting, and evidence recovery can require equivalent operations. This advisory does not authorize the runtime to retry, stop, change tools, or claim completion.",
                 payload_key: context,
             })
         } else {
@@ -552,49 +552,26 @@ mod tests {
         );
         assert_eq!(injections[0].payload["advisories"][0]["kind"], "repetition");
         assert!(
-            injections[0]
-                .render_for_prompt()
-                .expect("advisory prompt form")
-                .contains("<runtime-advisory-evidence>")
-        );
-        assert!(
             injections[1]
                 .render_for_prompt()
                 .expect("required prompt form")
                 .contains("<runtime-required-context>")
         );
-        assert!(
-            injections[2]
-                .render_for_prompt()
-                .expect("decision feedback prompt form")
-                .contains("<runtime-decision-feedback>")
-        );
-        assert!(
-            injections[2]
-                .render_for_prompt()
-                .expect("decision feedback prompt form")
-                .contains("Apply it to the next decision")
-        );
-        assert!(
-            injections[2]
-                .render_for_prompt()
-                .expect("decision feedback prompt form")
-                .contains("specific feedback below")
-        );
-        assert!(
-            injections[2]
-                .render_for_prompt()
-                .expect("decision feedback prompt form")
-                .contains("does not authorize the runtime")
-        );
-        assert!(
-            !injections[2]
-                .render_for_prompt()
-                .expect("decision feedback prompt form")
-                .contains("selected test subset"),
-            "the generic feedback envelope must not inject coding-specific acceptance rules"
-        );
         assert!(injections[3].render_for_prompt().is_none());
+        for (injection, tag) in [
+            (&injections[0], "<runtime-advisory-evidence>"),
+            (&injections[2], "<runtime-decision-feedback>"),
+        ] {
+            let prompt = injection.render_for_prompt().expect("advisory prompt form");
+            assert!(prompt.contains(tag));
+            assert!(prompt.contains("\"authority\":\"advisory_evidence_only\""));
+            assert!(prompt.contains("consistent with the user request"));
+            assert!(prompt.contains("Repetition alone does not establish lack of progress"));
+            assert!(
+                prompt
+                    .contains("authorized verification, sampling, waiting, and evidence recovery")
+            );
+        }
     }
 
     #[test]

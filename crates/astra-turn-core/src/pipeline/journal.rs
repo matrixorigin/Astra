@@ -116,12 +116,12 @@ mod tests {
             evaluated_at_round: 3,
             subject: crate::context_feedback::RuntimePolicySubject::Run,
             entries: vec![crate::context_feedback::RuntimePolicyFeedbackEntry {
-                signal: crate::context_feedback::RuntimePolicySignal::RedundantReads,
+                signal: crate::context_feedback::RuntimePolicySignal::ReadCoverageOverlap,
                 stage: crate::context_feedback::RuntimePolicyStage::Observe,
                 observed_at_round: 3,
                 evidence_count: 8,
                 recommendation:
-                    crate::context_feedback::RuntimePolicyRecommendation::ReuseKnownContent,
+                    crate::context_feedback::RuntimePolicyRecommendation::ReviewReadCoverage,
             }],
         };
         let evt = PipelineJournalEvent::from_feedback(&fb);
