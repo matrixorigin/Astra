@@ -53,6 +53,7 @@ pub mod token_estimate;
 mod tool_idempotency;
 mod tool_invocation;
 mod tool_result_projection;
+mod tool_result_selection_observation;
 mod turn_provenance;
 mod user_intent;
 mod verification_frontier;
@@ -217,6 +218,7 @@ pub use tool_result_projection::{
     ToolResultProjectionReceiptV1, ToolResultProjectionWireStateV1,
     tool_result_projection_freeze_key,
 };
+pub use tool_result_selection_observation::*;
 pub use turn_provenance::{
     TURN_MESSAGE_PROVENANCE_FIELD, TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
     TurnMessageProvenanceError, TurnMessageProvenanceV1, clear_turn_message_provenance,
