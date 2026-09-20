@@ -39,6 +39,93 @@ pub struct ToolResultChunkProjection {
     pub chunks: Vec<ToolResultChunk>,
 }
 
+/// One judgment candidate whose text is an exact slice of the verified
+/// persisted artifact. The content is transient request material, not a new
+/// durable copy or a generated summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResultChunkCandidate {
+    chunk: ToolResultChunk,
+    content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResultChunkCandidateProjection {
+    chunker_version: u32,
+    source_bytes: u64,
+    scanned_bytes: u64,
+    scan_complete: bool,
+    candidates: Vec<ToolResultChunkCandidate>,
+}
+
+impl ToolResultChunkCandidate {
+    #[must_use]
+    pub fn chunk(&self) -> &ToolResultChunk {
+        &self.chunk
+    }
+
+    #[must_use]
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+}
+
+impl ToolResultChunkCandidateProjection {
+    #[must_use]
+    pub fn chunker_version(&self) -> u32 {
+        self.chunker_version
+    }
+
+    #[must_use]
+    pub fn source_bytes(&self) -> u64 {
+        self.source_bytes
+    }
+
+    #[must_use]
+    pub fn scanned_bytes(&self) -> u64 {
+        self.scanned_bytes
+    }
+
+    #[must_use]
+    pub fn scan_complete(&self) -> bool {
+        self.scan_complete
+    }
+
+    #[must_use]
+    pub fn candidates(&self) -> &[ToolResultChunkCandidate] {
+        &self.candidates
+    }
+}
+
+impl ToolResultChunkProjection {
+    fn with_source(self, source: &str) -> Result<ToolResultChunkCandidateProjection, &'static str> {
+        let candidates = self
+            .chunks
+            .into_iter()
+            .map(|chunk| {
+                let start = usize::try_from(chunk.start_byte)
+                    .map_err(|_| "tool-result chunk start is outside the source")?;
+                let end = usize::try_from(chunk.end_byte)
+                    .map_err(|_| "tool-result chunk end is outside the source")?;
+                let content = source
+                    .get(start..end)
+                    .ok_or("tool-result chunk is outside the verified source")?
+                    .to_string();
+                Ok::<ToolResultChunkCandidate, &'static str>(ToolResultChunkCandidate {
+                    chunk,
+                    content,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ToolResultChunkCandidateProjection {
+            chunker_version: self.chunker_version,
+            source_bytes: self.source_bytes,
+            scanned_bytes: self.scanned_bytes,
+            scan_complete: self.scan_complete,
+            candidates,
+        })
+    }
+}
+
 /// Build a bounded index over a verified prefix of the content named by
 /// `descriptor`.
 ///
@@ -137,7 +224,17 @@ pub(crate) fn project_tool_result_chunks(
     })
 }
 
-fn chunk_id(
+pub(crate) fn project_tool_result_chunk_candidates(
+    descriptor: &astra_services::session_journal::ToolResultArtifactDescriptor,
+    window: &crate::tool_result_storage::PersistedToolResultWindow,
+    target_chunk_bytes: usize,
+    max_chunks: usize,
+) -> Result<ToolResultChunkCandidateProjection, &'static str> {
+    project_tool_result_chunks(descriptor, window, target_chunk_bytes, max_chunks)?
+        .with_source(&window.content)
+}
+
+pub(super) fn chunk_id(
     descriptor: &astra_services::session_journal::ToolResultArtifactDescriptor,
     start: usize,
     end: usize,
@@ -197,6 +294,34 @@ mod tests {
             .collect::<String>();
         assert_eq!(rebuilt, source);
         assert!(first.chunks.iter().all(|chunk| chunk.line_complete));
+    }
+
+    #[test]
+    fn judgment_candidates_are_exact_verified_source_slices() {
+        let source = "alpha\nbeta\ngamma\n";
+        let descriptor = descriptor(source);
+        let candidates = project_tool_result_chunk_candidates(
+            &descriptor,
+            &window(source, source.len()),
+            11,
+            10,
+        )
+        .unwrap();
+        assert!(candidates.scan_complete);
+        assert_eq!(
+            candidates
+                .candidates
+                .iter()
+                .map(|candidate| candidate.content.as_str())
+                .collect::<String>(),
+            source
+        );
+        for candidate in candidates.candidates {
+            assert_eq!(
+                candidate.content,
+                source[candidate.chunk.start_byte as usize..candidate.chunk.end_byte as usize]
+            );
+        }
     }
 
     #[test]

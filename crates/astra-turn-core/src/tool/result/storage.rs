@@ -1129,6 +1129,40 @@ pub fn read_verified_tool_result_chunk_projection(
     .map_err(ToString::to_string)
 }
 
+/// Verify one owner-scoped artifact and expose bounded exact-source
+/// candidates suitable for a typed relevance judgment. Candidate content is
+/// never reconstructed from a display summary.
+pub fn read_verified_tool_result_chunk_candidates(
+    session_dir: &Path,
+    descriptor: &astra_services::session_journal::ToolResultArtifactDescriptor,
+    scan_bytes: usize,
+    target_chunk_bytes: usize,
+    max_chunks: usize,
+) -> Result<Option<crate::tool::result::chunks::ToolResultChunkCandidateProjection>, String> {
+    if !descriptor.document_kind.is_result() {
+        return Err("runtime guidance is not eligible for tool-result selection".to_string());
+    }
+    if scan_bytes == 0 || scan_bytes > crate::tool::result::chunks::MAX_TOOL_RESULT_SCAN_BYTES {
+        return Err(format!(
+            "scan_bytes must be between 1 and {}",
+            crate::tool::result::chunks::MAX_TOOL_RESULT_SCAN_BYTES
+        ));
+    }
+    let Some(window) =
+        read_verified_persisted_result_window(session_dir, descriptor, 0, scan_bytes)?
+    else {
+        return Ok(None);
+    };
+    crate::tool::result::chunks::project_tool_result_chunk_candidates(
+        descriptor,
+        &window,
+        target_chunk_bytes,
+        max_chunks,
+    )
+    .map(Some)
+    .map_err(ToString::to_string)
+}
+
 /// Return the greatest UTF-8 boundary at or before `offset` without loading
 /// the whole artifact.  A UTF-8 scalar is at most four bytes, so at most three
 /// one-byte probes are required.  The caller has already checked that
@@ -2141,6 +2175,19 @@ mod tests {
         assert_eq!(projection.chunks[0].start_byte, 0);
         assert_eq!(projection.chunks[0].end_byte, 4);
 
+        let candidates = read_verified_tool_result_chunk_candidates(
+            owner.path(),
+            &persisted.descriptor,
+            1,
+            1,
+            2,
+        )
+        .unwrap()
+        .expect("owner can read exact judgment candidates");
+        assert_eq!(candidates.candidates().len(), 1);
+        assert_eq!(candidates.candidates()[0].content(), "😀");
+        assert_eq!(candidates.candidates()[0].chunk(), &projection.chunks[0]);
+
         assert!(
             read_verified_tool_result_chunk_projection(
                 other.path(),
@@ -2152,6 +2199,18 @@ mod tests {
             .unwrap()
             .is_none(),
             "the same descriptor does not cross its session store boundary"
+        );
+        assert!(
+            read_verified_tool_result_chunk_candidates(
+                other.path(),
+                &persisted.descriptor,
+                1024,
+                128,
+                4,
+            )
+            .unwrap()
+            .is_none(),
+            "candidate content does not cross its session store boundary"
         );
     }
 
