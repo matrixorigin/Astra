@@ -34,9 +34,9 @@ pub enum ToolResultChunkDisposition {
 pub struct ToolResultSelectionRecommendation {
     /// Source-ordered chunks safe to use for an optional projection. This is
     /// empty when there is no clear relevant match, requiring baseline use.
-    pub selected_chunk_ids: Vec<String>,
-    pub dispositions: BTreeMap<String, ToolResultChunkDisposition>,
-    pub has_clear_match: bool,
+    selected_chunk_ids: Vec<String>,
+    dispositions: BTreeMap<String, ToolResultChunkDisposition>,
+    has_clear_match: bool,
 }
 
 impl ToolResultSelectionRecommendation {
@@ -44,6 +44,97 @@ impl ToolResultSelectionRecommendation {
     pub fn can_replace_optional_baseline_body(&self) -> bool {
         self.has_clear_match && !self.selected_chunk_ids.is_empty()
     }
+
+    #[must_use]
+    pub fn selected_chunk_ids(&self) -> &[String] {
+        &self.selected_chunk_ids
+    }
+
+    #[must_use]
+    pub fn dispositions(&self) -> &BTreeMap<String, ToolResultChunkDisposition> {
+        &self.dispositions
+    }
+
+    #[must_use]
+    pub fn has_clear_match(&self) -> bool {
+        self.has_clear_match
+    }
+}
+
+/// Render a smaller exact-source body while retaining the immutable recovery
+/// handle. Incomplete scans and non-reducing projections keep the caller's
+/// existing head/tail baseline so unexamined tail evidence is never erased.
+pub fn render_tool_result_selection_projection(
+    tool_name: &str,
+    descriptor: &astra_services::session_journal::ToolResultArtifactDescriptor,
+    projection: &ToolResultChunkCandidateProjection,
+    recommendation: &ToolResultSelectionRecommendation,
+    baseline: &str,
+) -> Result<Option<String>, &'static str> {
+    validate_projection(descriptor, projection)?;
+    if !projection.scan_complete() || !recommendation.can_replace_optional_baseline_body() {
+        return Ok(None);
+    }
+    let selected = recommendation
+        .selected_chunk_ids()
+        .iter()
+        .collect::<BTreeSet<_>>();
+    if selected.len() != recommendation.selected_chunk_ids().len()
+        || recommendation
+            .dispositions()
+            .keys()
+            .collect::<BTreeSet<_>>()
+            != projection
+                .candidates()
+                .iter()
+                .map(|candidate| &candidate.chunk().id)
+                .collect::<BTreeSet<_>>()
+    {
+        return Err("tool-result selection recommendation does not match its projection");
+    }
+    let mut body = String::new();
+    for candidate in projection.candidates() {
+        if !selected.contains(&candidate.chunk().id) {
+            continue;
+        }
+        let chunk = candidate.chunk();
+        body.push_str(&format!(
+            "--- original bytes [{}..{}), lines {}..{}{} ---\n",
+            chunk.start_byte,
+            chunk.end_byte,
+            chunk.start_line,
+            chunk.end_line,
+            if chunk.line_complete {
+                ""
+            } else {
+                ", partial line"
+            }
+        ));
+        body.push_str(candidate.content());
+        if !candidate.content().ends_with('\n') {
+            body.push('\n');
+        }
+    }
+    let handle = super::storage::session_tool_result_artifact_uri_for_descriptor(descriptor);
+    let rendered = format!(
+        "<tool-result-selection>\n\
+         Tool: {}\n\
+         Artifact handle: {}\n\
+         Selected exact source: {} of {} chunks from {} bytes.\n\
+         Unselected source remains in the artifact; reading it requires a currently authorized recovery capability.\n\n\
+         {}\
+         </tool-result-selection>",
+        truncate_chars(tool_name, MAX_TOOL_NAME_CHARS),
+        handle,
+        selected.len(),
+        projection.candidates().len(),
+        projection.source_bytes(),
+        body,
+    );
+    if rendered.len() >= baseline.len() {
+        return Ok(None);
+    }
+    Ok(Some(rendered))
 }
 
 /// Build a bounded judgment over exact chunks from one verified artifact.
@@ -334,8 +425,8 @@ mod tests {
         let selected = tool_result_selection_recommendation(&projection, &response).unwrap();
         assert!(selected.can_replace_optional_baseline_body());
         assert_eq!(
-            selected.selected_chunk_ids,
-            vec![ids[1].clone(), ids[2].clone()]
+            selected.selected_chunk_ids(),
+            &[ids[1].clone(), ids[2].clone()]
         );
     }
 
@@ -361,7 +452,7 @@ mod tests {
         };
         let selected = tool_result_selection_recommendation(&projection, &response).unwrap();
         assert!(!selected.can_replace_optional_baseline_body());
-        assert!(selected.selected_chunk_ids.is_empty());
+        assert!(selected.selected_chunk_ids().is_empty());
 
         let mut invalid = response;
         invalid.response.answers.remove(&ids[2]);
@@ -370,5 +461,56 @@ mod tests {
             .answers
             .insert("other".into(), JudgmentAnswer::Noul { noul: 1.0 });
         assert!(tool_result_selection_recommendation(&projection, &invalid).is_err());
+    }
+
+    #[test]
+    fn projection_is_smaller_exact_source_with_recovery_or_keeps_baseline() {
+        let (descriptor, projection) = fixture();
+        let ids = projection
+            .candidates()
+            .iter()
+            .map(|candidate| candidate.chunk().id.clone())
+            .collect::<Vec<_>>();
+        let response = NormalizedJudgmentResponse {
+            response: JudgmentResponse {
+                schema_version: 1,
+                model: "judge".into(),
+                answers: BTreeMap::from([
+                    (ids[0].clone(), JudgmentAnswer::Noul { noul: 0.0 }),
+                    (ids[1].clone(), JudgmentAnswer::Noul { noul: 1.0 }),
+                    (ids[2].clone(), JudgmentAnswer::Noul { noul: 0.0 }),
+                ]),
+            },
+            provenance: JudgmentResponseProvenance::DiscreteDecision,
+        };
+        let recommendation = tool_result_selection_recommendation(&projection, &response).unwrap();
+        let baseline = "baseline preview and navigation ".repeat(100);
+        let rendered = render_tool_result_selection_projection(
+            "exec",
+            &descriptor,
+            &projection,
+            &recommendation,
+            &baseline,
+        )
+        .unwrap()
+        .expect("one selected chunk reduces the baseline");
+        assert!(rendered.contains("beta\n"));
+        assert!(!rendered.contains("alpha\n"));
+        assert!(!rendered.contains("gamma\n"));
+        assert!(rendered.contains("artifact://session/tool-result/"));
+        assert!(rendered.len() < baseline.len());
+
+        assert_eq!(
+            render_tool_result_selection_projection(
+                "exec",
+                &descriptor,
+                &projection,
+                &recommendation,
+                "tiny baseline",
+            )
+            .unwrap(),
+            None,
+            "selection must not expand the request"
+        );
     }
 }
