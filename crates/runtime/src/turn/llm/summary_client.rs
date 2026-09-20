@@ -359,7 +359,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
             temperature_provenance = policy.temperature_provenance.as_str(),
             "resolved auxiliary generation policy"
         );
-        let result = match &self.execution {
+        let (result, execution_provenance) = match &self.execution {
             SummaryExecution::Durable(execution) => {
                 let DurableSummaryExecution {
                     ledger,
@@ -422,11 +422,18 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                         collisions += 1;
                         continue;
                     }
-                    break outcome.into_result();
+                    let execution_provenance = outcome.invocation_id().map(|invocation_id| {
+                        astra_turn_core::cloud_summary::SummaryExecutionProvenance {
+                            invocation_id: invocation_id.to_string(),
+                            model_name: self.route.model_name.clone(),
+                            provider: self.route.provider.clone(),
+                        }
+                    });
+                    break (outcome.into_result(), execution_provenance);
                 }
             }
             #[cfg(test)]
-            SummaryExecution::Direct => {
+            SummaryExecution::Direct => (
                 crate::turn::llm::client::call_llm_nonstream_no_tool_choice(
                     global_llm_client(),
                     LlmCall {
@@ -442,8 +449,9 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                     },
                     auxiliary_execution_budget(purpose, llm_nonstream_timeout()),
                 )
-                .await
-            }
+                .await,
+                None,
+            ),
         };
         match result {
             // A no-tool provider response that nevertheless contains a native
@@ -457,6 +465,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                     is_ptl_error: false,
                     finish_reason: result.effective_finish_reason.or(result.finish_reason),
                     usage: result.usage,
+                    execution: execution_provenance,
                 })
             }
             Ok(result) => Ok(SummaryResponse {
@@ -464,6 +473,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                 is_ptl_error: false,
                 finish_reason: result.effective_finish_reason.or(result.finish_reason),
                 usage: result.usage,
+                execution: execution_provenance,
             }),
             Err(error) if error.kind == astra_core::ErrorKind::ContextWindow => {
                 Ok(SummaryResponse {
@@ -471,6 +481,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                     is_ptl_error: true,
                     finish_reason: None,
                     usage: serde_json::Map::new(),
+                    execution: None,
                 })
             }
             Err(error) => Err(error),
@@ -492,6 +503,7 @@ mod tests {
     struct RecoverFirstAdmissionPersistence {
         inner: super::super::durable::TestInferenceLedgerPersistence,
         admitted_logical_attempts: std::sync::Mutex<Vec<u32>>,
+        admitted_invocation_ids: std::sync::Mutex<Vec<String>>,
         recover_attempt_zero: std::sync::atomic::AtomicBool,
         admission_conflicts: AtomicU32,
         cursor_barrier: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
@@ -557,6 +569,10 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(plan.logical_attempt());
+            self.admitted_invocation_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(plan.invocation_id().to_string());
             if self.recover_attempt_zero.load(Ordering::Acquire) && plan.logical_attempt() == 0 {
                 // Model a committed N admission whose acknowledgement never
                 // reached the caller. Foreground recovery closes N and retries
@@ -771,6 +787,13 @@ mod tests {
         assert!(classification.into_not_required().is_ok());
         assert_eq!(response.usage["input_tokens"], 123);
         assert_eq!(response.usage["output_tokens"], 19);
+        let provenance = response.execution.expect("durable execution provenance");
+        assert_eq!(provenance.model_name, "configured-jev");
+        assert_eq!(provenance.provider, "typesafe");
+        assert_eq!(
+            provenance.invocation_id,
+            persistence.admitted_invocation_ids.lock().unwrap()[0]
+        );
         assert_eq!(
             *persistence.admitted_logical_attempts.lock().unwrap(),
             vec![0]
@@ -1607,6 +1630,20 @@ mod tests {
 
         assert_eq!(repaired.text, r#"{"summary":"repaired"}"#);
         assert_eq!(provider_requests.load(Ordering::SeqCst), 2);
+        let admitted_invocation_ids = persistence
+            .admitted_invocation_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            malformed.execution.as_ref().unwrap().invocation_id,
+            admitted_invocation_ids[1],
+            "the first response must name recovered N+1 rather than requested N"
+        );
+        assert_eq!(
+            repaired.execution.as_ref().unwrap().invocation_id,
+            admitted_invocation_ids[2]
+        );
         assert_eq!(
             *persistence
                 .admitted_logical_attempts

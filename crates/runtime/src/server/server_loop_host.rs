@@ -23649,6 +23649,7 @@ mod tests {
                 is_ptl_error: false,
                 finish_reason: Some("stop".to_string()),
                 usage: serde_json::Map::new(),
+                execution: None,
             })
         }
     }
@@ -23730,6 +23731,7 @@ mod tests {
                             is_ptl_error,
                             finish_reason: finish_reason.map(str::to_string),
                             usage: serde_json::Map::new(),
+                            execution: None,
                         },
                     )])),
                 }),
@@ -23758,6 +23760,7 @@ mod tests {
                 output_tokens,
             }
             .to_json_map(),
+            execution: None,
         }
     }
 
@@ -24418,6 +24421,7 @@ mod tests {
                     is_ptl_error: true,
                     finish_reason: Some("stop".into()),
                     usage: Default::default(),
+                    execution: None,
                 })
             } else {
                 Err(astra_core::ClassifiedError::new(

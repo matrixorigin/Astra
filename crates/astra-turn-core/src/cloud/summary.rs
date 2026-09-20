@@ -151,6 +151,17 @@ pub struct SummaryResponse {
     /// Provider-reported usage for this inference. Auxiliary inference is part
     /// of the durable turn budget and must not disappear at this abstraction.
     pub usage: Map<String, Value>,
+    /// Actual durable execution that produced this response. Absence means
+    /// the adapter cannot prove an admitted invocation and must never be
+    /// replaced with a requested attempt or generated correlation ID.
+    pub execution: Option<SummaryExecutionProvenance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryExecutionProvenance {
+    pub invocation_id: String,
+    pub model_name: String,
+    pub provider: String,
 }
 
 /// Abstraction over the LLM API for summary generation.
@@ -412,6 +423,7 @@ pub mod test_support {
                     is_ptl_error: false,
                     finish_reason: Some("stop".to_string()),
                     usage: Map::new(),
+                    execution: None,
                 })],
                 call_count: Arc::new(AtomicUsize::new(0)),
                 purposes: Arc::new(Mutex::new(Vec::new())),
@@ -427,12 +439,14 @@ pub mod test_support {
                         is_ptl_error: true,
                         finish_reason: None,
                         usage: Map::new(),
+                        execution: None,
                     }),
                     Ok(SummaryResponse {
                         text: success_text.to_string(),
                         is_ptl_error: false,
                         finish_reason: Some("stop".to_string()),
                         usage: Map::new(),
+                        execution: None,
                     }),
                 ],
                 call_count: Arc::new(AtomicUsize::new(0)),
@@ -448,6 +462,7 @@ pub mod test_support {
                     is_ptl_error: true,
                     finish_reason: None,
                     usage: Map::new(),
+                    execution: None,
                 })],
                 call_count: Arc::new(AtomicUsize::new(0)),
                 purposes: Arc::new(Mutex::new(Vec::new())),

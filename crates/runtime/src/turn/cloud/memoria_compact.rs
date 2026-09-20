@@ -2296,6 +2296,7 @@ mod tests {
                     is_ptl_error: false,
                     finish_reason: Some("stop".to_string()),
                     usage: serde_json::Map::new(),
+                    execution: None,
                 }),
                 None => Err(astra_core::ClassifiedError::new(
                     astra_core::ErrorKind::Network,

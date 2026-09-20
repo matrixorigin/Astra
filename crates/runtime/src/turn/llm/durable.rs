@@ -113,6 +113,7 @@ impl DurableInferenceRunAuthority {
 
 pub(crate) struct DurableInferenceCallOutcome {
     logical_attempt: u32,
+    invocation_id: Option<String>,
     result: Result<LlmCallResult, astra_core::ClassifiedError>,
 }
 
@@ -120,6 +121,13 @@ impl DurableInferenceCallOutcome {
     #[must_use]
     pub(crate) fn logical_attempt(&self) -> u32 {
         self.logical_attempt
+    }
+
+    /// Actual durable invocation admitted for this call. This can differ from
+    /// the originally requested logical attempt after foreground recovery.
+    #[must_use]
+    pub(crate) fn invocation_id(&self) -> Option<&str> {
+        self.invocation_id.as_deref()
     }
 
     pub(crate) fn into_result(self) -> Result<LlmCallResult, astra_core::ClassifiedError> {
@@ -3141,11 +3149,13 @@ impl DurableInferenceLedger {
             Err(failure) => {
                 return DurableInferenceCallOutcome {
                     logical_attempt: failure.logical_attempt,
+                    invocation_id: None,
                     result: Err(failure.error),
                 };
             }
         };
         let logical_attempt = invocation.logical_attempt();
+        let invocation_id = invocation.invocation_id().to_string();
         let result = async {
             let owner_lease = invocation.owner_lease.clone();
             let attempt_observer = invocation.attempt_observer_arc();
@@ -3215,6 +3225,7 @@ impl DurableInferenceLedger {
         .await;
         DurableInferenceCallOutcome {
             logical_attempt,
+            invocation_id: Some(invocation_id),
             result,
         }
     }
@@ -3244,11 +3255,13 @@ impl DurableInferenceLedger {
             Err(failure) => {
                 return DurableInferenceCallOutcome {
                     logical_attempt: failure.logical_attempt,
+                    invocation_id: None,
                     result: Err(failure.error),
                 };
             }
         };
         let logical_attempt = invocation.logical_attempt();
+        let invocation_id = invocation.invocation_id().to_string();
         let result = async {
             let owner_cancel = invocation.owner_lease.cancel.clone();
             let attempt_observer = invocation.attempt_observer_arc();
@@ -3309,6 +3322,7 @@ impl DurableInferenceLedger {
         .await;
         DurableInferenceCallOutcome {
             logical_attempt,
+            invocation_id: Some(invocation_id),
             result,
         }
     }
@@ -3539,6 +3553,10 @@ pub(crate) struct DurableProviderAttemptFact {
 }
 
 impl DurableInferenceInvocation {
+    pub(crate) fn invocation_id(&self) -> &str {
+        self.plan.invocation_id()
+    }
+
     /// Authoritative logical attempt selected by durable admission.
     ///
     /// This can be exactly one greater than the requested attempt when the
