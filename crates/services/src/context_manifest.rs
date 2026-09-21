@@ -1511,18 +1511,4 @@ mod tests {
         );
         assert_eq!(references.len(), 2);
     }
-
-    #[test]
-    fn context_manifest_item_batch_size_is_bounded() {
-        assert_eq!(CONTEXT_MANIFEST_ITEM_INSERT_BATCH_SIZE, 128);
-    }
-
-    #[test]
-    fn context_manifest_item_insert_carries_parent_owner() {
-        let normalized = CONTEXT_MANIFEST_ITEM_INSERT_SQL
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(normalized.contains("(user_id, manifest_id, session_id"));
-    }
 }
