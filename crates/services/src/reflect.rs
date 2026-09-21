@@ -150,11 +150,17 @@ pub struct JudgmentUsageGroup {
     pub provider: String,
     pub offering_id: String,
     pub model: String,
+    #[serde(default)]
+    pub purpose: String,
     pub operation: String,
     pub attempts: usize,
     pub exact_usage_attempts: usize,
     pub known_input_tokens: u128,
     pub known_output_tokens: u128,
+    #[serde(default)]
+    pub input_observed: bool,
+    #[serde(default)]
+    pub output_observed: bool,
     pub input_incomplete: bool,
     pub output_incomplete: bool,
 }
@@ -197,7 +203,7 @@ impl JudgmentUsageSummary {
                 omitted_groups: 0,
             };
         }
-        let mut groups: BTreeMap<(String, String, String, String), JudgmentUsageGroup> =
+        let mut groups: BTreeMap<(String, String, String, String, String), JudgmentUsageGroup> =
             BTreeMap::new();
         for attempt in &facts.attempts {
             if !Self::supports_attempt(attempt) {
@@ -207,17 +213,21 @@ impl JudgmentUsageSummary {
                 attempt.provider.clone(),
                 attempt.offering_id.clone(),
                 attempt.model_name.clone(),
+                attempt.purpose.clone(),
                 attempt.operation_id.clone(),
             );
             let group = groups.entry(key).or_insert_with(|| JudgmentUsageGroup {
                 provider: attempt.provider.clone(),
                 offering_id: attempt.offering_id.clone(),
                 model: attempt.model_name.clone(),
+                purpose: attempt.purpose.clone(),
                 operation: attempt.operation_id.clone(),
                 attempts: 0,
                 exact_usage_attempts: 0,
                 known_input_tokens: 0,
                 known_output_tokens: 0,
+                input_observed: false,
+                output_observed: false,
                 input_incomplete: facts.truncated,
                 output_incomplete: facts.truncated,
             });
@@ -238,6 +248,7 @@ impl JudgmentUsageSummary {
             if let Some(parts) = input_parts {
                 for part in parts {
                     if let Some(value) = part {
+                        group.input_observed = true;
                         group.known_input_tokens += u128::from(value);
                     } else {
                         group.input_incomplete = true;
@@ -247,6 +258,7 @@ impl JudgmentUsageSummary {
                 group.input_incomplete = true;
             }
             if let Some(output) = usage.and_then(|u| u.output_tokens) {
+                group.output_observed = true;
                 group.known_output_tokens += u128::from(output);
             } else {
                 group.output_incomplete = true;
@@ -274,6 +286,126 @@ impl JudgmentUsageSummary {
         )
     }
 
+    /// Short session-retrospective projection. The full grouped report stays
+    /// in the structured fields and is available through the detailed view;
+    /// the summary should not make users reconstruct a conclusion from every
+    /// physical attempt.
+    pub fn render_compact(&self) -> String {
+        let scope = if self.scope.is_local() {
+            "run-scoped capture"
+        } else {
+            "session ledger at read time"
+        };
+        if self.coverage != "available" && self.coverage != "capture_truncated" {
+            return format!("Judgment usage · {scope} · unavailable; not evidence of zero calls");
+        }
+        if self.groups.is_empty() {
+            let state = if self.coverage == "capture_truncated" || self.capture_incomplete {
+                "no calls captured; total unknown"
+            } else {
+                "no auxiliary calls observed"
+            };
+            return format!("Judgment usage · {scope} · {state}");
+        }
+        // Offering IDs remain in the structured/forensic projection. The
+        // default summary combines equivalent provider/model/purpose groups.
+        let mut display_groups = BTreeMap::<
+            (&str, &str, &str, &str),
+            (usize, usize, u128, u128, bool, bool, bool, bool),
+        >::new();
+        for group in &self.groups {
+            let values = display_groups
+                .entry((
+                    &group.provider,
+                    &group.model,
+                    &group.operation,
+                    &group.purpose,
+                ))
+                .or_insert((0, 0, 0, 0, false, false, true, true));
+            values.0 = values.0.saturating_add(group.attempts);
+            values.1 = values.1.saturating_add(group.exact_usage_attempts);
+            values.2 = values.2.saturating_add(group.known_input_tokens);
+            values.3 = values.3.saturating_add(group.known_output_tokens);
+            values.4 |= group.input_observed;
+            values.5 |= group.output_observed;
+            values.6 &= !group.input_incomplete;
+            values.7 &= !group.output_incomplete;
+        }
+        let groups = display_groups
+            .into_iter()
+            .map(
+                |(
+                    (provider, model, operation, purpose),
+                    (
+                        attempts,
+                        exact_attempts,
+                        known_input,
+                        known_output,
+                        input_observed,
+                        output_observed,
+                        input_complete,
+                        output_complete,
+                    ),
+                )| {
+                    let calls = if attempts == 1 {
+                        "1 call".to_string()
+                    } else {
+                        format!("{} calls", attempts)
+                    };
+                    let input = if !input_observed {
+                        "unknown".to_string()
+                    } else if self.coverage == "capture_truncated"
+                        || self.capture_incomplete
+                        || !input_complete
+                    {
+                        format!("at least {known_input}")
+                    } else {
+                        known_input.to_string()
+                    };
+                    let output = if !output_observed {
+                        "unknown".to_string()
+                    } else if self.coverage == "capture_truncated"
+                        || self.capture_incomplete
+                        || !output_complete
+                    {
+                        format!("at least {known_output}")
+                    } else {
+                        known_output.to_string()
+                    };
+                    format!(
+                        "{} ({}) · {} · {} · in {} · out {} · usage {}/{} exact",
+                        crate::judgment_presentation::provider_label(provider),
+                        model,
+                        crate::judgment_presentation::purpose_label(operation, purpose),
+                        calls,
+                        input,
+                        output,
+                        exact_attempts,
+                        attempts,
+                    )
+                },
+            )
+            .collect::<Vec<_>>()
+            .join("; ");
+        let mut line = format!("Judgment usage · {scope} · {groups}");
+        if self.coverage == "capture_truncated" {
+            line.push_str(" · capture truncated; counts are lower bounds");
+        } else if self.capture_incomplete {
+            line.push_str(" · capture incomplete; counts are lower bounds");
+        }
+        if self
+            .groups
+            .iter()
+            .any(|group| group.input_incomplete || group.output_incomplete)
+        {
+            line.push_str(" · some token usage is incomplete");
+        }
+        if self.omitted_groups > 0 {
+            line.push_str(" · some detail hidden");
+        }
+        line
+    }
+
     fn render_usage(&self) -> String {
         let truncated = self.coverage == "capture_truncated";
         if self.coverage != "available" && !truncated {
@@ -291,8 +423,10 @@ impl JudgmentUsageSummary {
         // Offering IDs remain available in the structured groups for forensic
         // attribution. The user-facing summary combines offerings that used
         // the same provider/model/operation so identical lines do not pile up.
-        let mut display_groups =
-            BTreeMap::<(String, String, String), (usize, usize, u128, u128, bool, bool)>::new();
+        let mut display_groups = BTreeMap::<
+            (String, String, String),
+            (usize, usize, u128, u128, bool, bool, bool, bool),
+        >::new();
         for group in &self.groups {
             let values = display_groups
                 .entry((
@@ -305,8 +439,10 @@ impl JudgmentUsageSummary {
             values.1 = values.1.saturating_add(group.exact_usage_attempts);
             values.2 = values.2.saturating_add(group.known_input_tokens);
             values.3 = values.3.saturating_add(group.known_output_tokens);
-            values.4 |= group.input_incomplete;
-            values.5 |= group.output_incomplete;
+            values.4 |= group.input_observed;
+            values.5 |= group.output_observed;
+            values.6 |= group.input_incomplete;
+            values.7 |= group.output_incomplete;
         }
         let mut lines = Vec::with_capacity(display_groups.len());
         for ((provider, model, operation), values) in display_groups {
@@ -315,15 +451,21 @@ impl JudgmentUsageSummary {
                 exact_attempts,
                 known_input,
                 known_output,
+                input_observed,
+                output_observed,
                 input_partial,
                 output_partial,
             ) = values;
-            let input = if truncated || self.capture_incomplete || input_partial {
+            let input = if !input_observed {
+                "unknown".into()
+            } else if truncated || self.capture_incomplete || input_partial {
                 format!("at least {known_input}")
             } else {
                 known_input.to_string()
             };
-            let output = if truncated || self.capture_incomplete || output_partial {
+            let output = if !output_observed {
+                "unknown".into()
+            } else if truncated || self.capture_incomplete || output_partial {
                 format!("at least {known_output}")
             } else {
                 known_output.to_string()
@@ -1834,14 +1976,14 @@ impl ReflectService for DatabaseReflectService {
             summary.push_str(&model_request_summary.render());
         }
         summary.push(' ');
-        summary.push_str(&judgment_usage.render());
+        summary.push_str(&judgment_usage.render_compact());
         if let Some(semantics) = &semantic_judgments {
             summary.push(' ');
-            summary.push_str(&semantics.render());
+            summary.push_str(&semantics.render_compact());
         }
         if let Some(judgments) = &tool_result_judgments {
             summary.push(' ');
-            summary.push_str(&judgments.render());
+            summary.push_str(&judgments.render_compact());
         }
         if let Some(llm_latency_summary) = llm_latency_summary {
             summary.push(' ');
@@ -2207,6 +2349,11 @@ mod tests {
         );
         assert!(group.input_incomplete && group.output_incomplete);
         assert!(summary.render().contains("at least 120"));
+        let compact = summary.render_compact();
+        assert_eq!(compact.matches("Request classification").count(), 1);
+        assert!(compact.contains("Request classification"), "{compact}");
+        assert!(compact.contains("3 calls"), "{compact}");
+        assert!(compact.contains("in at least 120"), "{compact}");
         let unavailable =
             JudgmentUsageSummary::from_physical_attempts(&ExplainAnalyzeAuxiliaryUsageV1 {
                 available: false,
@@ -2215,6 +2362,16 @@ mod tests {
             });
         assert_eq!(unavailable.coverage, "unavailable");
         assert!(unavailable.render().contains("unavailable"));
+
+        let unknown =
+            JudgmentUsageSummary::from_physical_attempts(&ExplainAnalyzeAuxiliaryUsageV1 {
+                available: true,
+                truncated: false,
+                attempts: vec![facts.attempts[1].clone()],
+            });
+        let compact = unknown.render_compact();
+        assert!(compact.contains("in unknown · out unknown"), "{compact}");
+        assert!(!compact.contains("at least 0"), "{compact}");
     }
 
     #[test]

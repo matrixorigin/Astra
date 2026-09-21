@@ -47,7 +47,8 @@ pub(crate) fn render(
 
     writer.push(&overview_card(&graph, delivery_degraded));
 
-    let mut auxiliary_lines = crate::explain_analyze_report::auxiliary_usage_lines(&graph);
+    let mut auxiliary_lines =
+        crate::explain_analyze_report::auxiliary_usage_lines_with_detail(&graph, verbose);
     auxiliary_lines.extend(crate::explain_analyze_report::auxiliary_details_lines(
         &graph,
     ));

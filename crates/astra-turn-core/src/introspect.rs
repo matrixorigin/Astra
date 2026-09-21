@@ -149,6 +149,10 @@ pub struct JudgmentUsageSnapshot {
     /// truncation. None means ledger coverage is unavailable, not zero usage.
     pub known_input_tokens: Option<u128>,
     pub known_output_tokens: Option<u128>,
+    #[serde(default)]
+    pub input_observed: bool,
+    #[serde(default)]
+    pub output_observed: bool,
     pub input_complete: bool,
     pub output_complete: bool,
     pub omitted_attempts: usize,
@@ -165,10 +169,16 @@ pub struct JudgmentUsageGroup {
     pub provider: String,
     pub offering_id: String,
     pub model: String,
+    #[serde(default)]
+    pub purpose: String,
     pub operation: String,
     pub attempts: usize,
     pub known_input_tokens: u128,
     pub known_output_tokens: u128,
+    #[serde(default)]
+    pub input_observed: bool,
+    #[serde(default)]
+    pub output_observed: bool,
     pub input_complete: bool,
     pub output_complete: bool,
 }
@@ -199,6 +209,8 @@ impl JudgmentUsageSnapshot {
             .count();
         let mut known_input_tokens = 0_u128;
         let mut known_output_tokens = 0_u128;
+        let mut input_observed = false;
+        let mut output_observed = false;
         let mut input_complete = !facts.truncated;
         let mut output_complete = !facts.truncated;
         let mut groups = std::collections::BTreeMap::new();
@@ -208,16 +220,20 @@ impl JudgmentUsageSnapshot {
                     attempt.provider.clone(),
                     attempt.offering_id.clone(),
                     attempt.model_name.clone(),
+                    attempt.purpose.clone(),
                     attempt.operation_id.clone(),
                 ))
                 .or_insert_with(|| JudgmentUsageGroup {
                     provider: attempt.provider.clone(),
                     offering_id: attempt.offering_id.clone(),
                     model: attempt.model_name.clone(),
+                    purpose: attempt.purpose.clone(),
                     operation: attempt.operation_id.clone(),
                     attempts: 0,
                     known_input_tokens: 0,
                     known_output_tokens: 0,
+                    input_observed: false,
+                    output_observed: false,
                     input_complete: !facts.truncated,
                     output_complete: !facts.truncated,
                 });
@@ -229,6 +245,8 @@ impl JudgmentUsageSnapshot {
                 usage.and_then(|u| u.cache_creation_tokens),
             ] {
                 if let Some(value) = value {
+                    input_observed = true;
+                    group.input_observed = true;
                     known_input_tokens += u128::from(value);
                     group.known_input_tokens += u128::from(value);
                 } else {
@@ -237,6 +255,8 @@ impl JudgmentUsageSnapshot {
                 }
             }
             if let Some(value) = usage.and_then(|u| u.output_tokens) {
+                output_observed = true;
+                group.output_observed = true;
                 known_output_tokens += u128::from(value);
                 group.known_output_tokens += u128::from(value);
             } else {
@@ -254,6 +274,8 @@ impl JudgmentUsageSnapshot {
             attempts_without_complete_usage: Some(incomplete),
             known_input_tokens: Some(known_input_tokens),
             known_output_tokens: Some(known_output_tokens),
+            input_observed,
+            output_observed,
             input_complete,
             output_complete,
             attempts: facts.attempts,
@@ -333,25 +355,27 @@ impl JudgmentUsageSnapshot {
         if self.capture_incomplete {
             out.push_str(" capture_incomplete=true; missing historical attempts unknown; totals are lower bounds, independent of truncation");
         }
-        let total = |known: Option<u128>, complete: bool| match known {
+        let total = |known: Option<u128>, observed: bool, complete: bool| match known {
             None => "unknown".into(),
+            Some(_) if !observed => "unknown".into(),
             Some(value) if complete => value.to_string(),
             Some(value) => format!("at_least_{value} (incomplete)"),
         };
         out.push_str(&format!(
             " total_input={} total_output={} input_complete={} output_complete={} omitted_groups={}",
-            total(self.known_input_tokens, self.input_complete),
-            total(self.known_output_tokens, self.output_complete),
+            total(self.known_input_tokens, self.input_observed, self.input_complete),
+            total(self.known_output_tokens, self.output_observed, self.output_complete),
             self.input_complete,
             self.output_complete,
             self.omitted_groups,
         ));
         for group in &self.groups {
             out.push_str(&format!(
-                "\n- group provider={} offering={} model={} operation={} attempts={} input={} output={} input_complete={} output_complete={}",
-                group.provider, group.offering_id, group.model, group.operation, group.attempts,
-                total(Some(group.known_input_tokens), group.input_complete),
-                total(Some(group.known_output_tokens), group.output_complete),
+                "\n- group provider={} offering={} model={} operation={} purpose={} attempts={} input={} output={} input_complete={} output_complete={}",
+                group.provider, group.offering_id, group.model, group.operation, group.purpose,
+                group.attempts,
+                total(Some(group.known_input_tokens), group.input_observed, group.input_complete),
+                total(Some(group.known_output_tokens), group.output_observed, group.output_complete),
                 group.input_complete, group.output_complete,
             ));
         }
@@ -388,6 +412,130 @@ impl JudgmentUsageSnapshot {
             ));
         }
         out
+    }
+
+    /// Short projection for the default introspect/reflect view. The detailed
+    /// physical attempt list remains available at diagnostic/forensic depth.
+    pub fn render_compact(&self) -> String {
+        let scope = if self.scope.is_local() {
+            "run-scoped capture"
+        } else {
+            "session ledger at read time"
+        };
+        if self.coverage != JudgmentUsageCoverage::Available
+            && self.coverage != JudgmentUsageCoverage::CaptureTruncated
+        {
+            return format!("Judgment usage · {scope} · unavailable; not evidence of zero calls");
+        }
+        if self.groups.is_empty() {
+            let state = if self.coverage == JudgmentUsageCoverage::CaptureTruncated
+                || self.capture_incomplete
+            {
+                "no calls captured; total unknown"
+            } else {
+                "no auxiliary calls observed"
+            };
+            return format!("Judgment usage · {scope} · {state}");
+        }
+        // Offering IDs remain in the structured/forensic projection. The
+        // default line combines equivalent provider/model/purpose groups so
+        // one logical judgment does not appear as duplicate rows.
+        let mut display_groups = std::collections::BTreeMap::<
+            (&str, &str, &str, &str),
+            (usize, u128, u128, bool, bool, bool, bool),
+        >::new();
+        for group in &self.groups {
+            let values = display_groups
+                .entry((
+                    &group.provider,
+                    &group.model,
+                    &group.operation,
+                    &group.purpose,
+                ))
+                .or_insert((0, 0, 0, false, false, true, true));
+            values.0 = values.0.saturating_add(group.attempts);
+            values.1 = values.1.saturating_add(group.known_input_tokens);
+            values.2 = values.2.saturating_add(group.known_output_tokens);
+            values.3 |= group.input_observed;
+            values.4 |= group.output_observed;
+            values.5 &= group.input_complete;
+            values.6 &= group.output_complete;
+        }
+        let groups = display_groups
+            .into_iter()
+            .map(
+                |(
+                    (provider, model, operation, purpose),
+                    (
+                        attempts,
+                        known_input,
+                        known_output,
+                        input_observed,
+                        output_observed,
+                        input_complete,
+                        output_complete,
+                    ),
+                )| {
+                    let calls = if attempts == 1 {
+                        "1 call".to_string()
+                    } else {
+                        format!("{} calls", attempts)
+                    };
+                    let input = if !input_observed {
+                        "unknown".to_string()
+                    } else if self.coverage == JudgmentUsageCoverage::CaptureTruncated
+                        || self.capture_incomplete
+                        || !input_complete
+                    {
+                        format!("at least {known_input}")
+                    } else {
+                        known_input.to_string()
+                    };
+                    let output = if !output_observed {
+                        "unknown".to_string()
+                    } else if self.coverage == JudgmentUsageCoverage::CaptureTruncated
+                        || self.capture_incomplete
+                        || !output_complete
+                    {
+                        format!("at least {known_output}")
+                    } else {
+                        known_output.to_string()
+                    };
+                    format!(
+                        "{} ({}) · {} · {} · in {} · out {}",
+                        astra_services::judgment_presentation::provider_label(provider),
+                        model,
+                        astra_services::judgment_presentation::purpose_label(operation, purpose),
+                        calls,
+                        input,
+                        output,
+                    )
+                },
+            )
+            .collect::<Vec<_>>();
+        let mut line = format!("Judgment usage · {scope} · {}", groups.join("; "));
+        if self.coverage == JudgmentUsageCoverage::CaptureTruncated {
+            line.push_str(" · capture truncated; counts are lower bounds");
+        } else if self.capture_incomplete {
+            line.push_str(" · capture incomplete; counts are lower bounds");
+        }
+        if self
+            .attempts_without_complete_usage
+            .is_some_and(|count| count > 0)
+        {
+            line.push_str(" · some token usage is incomplete");
+        }
+        if self.omitted_groups > 0 || self.omitted_attempts > 0 {
+            line.push_str(" · some detail hidden");
+        }
+        line
+    }
+
+    pub fn render_for_depth(&self, depth: ObservationDepth) -> String {
+        match depth {
+            ObservationDepth::Hint | ObservationDepth::Summary => self.render_compact(),
+            ObservationDepth::Diagnostic | ObservationDepth::Forensic => self.render(),
+        }
     }
 }
 
@@ -715,17 +863,17 @@ pub fn render_introspect_request(
         }
     };
     let body = if let Some(usage) = judgment_usage_view(snapshot, request) {
-        format!("{body}\n\n{}", usage.render())
+        format!("{body}\n\n{}", usage.render_for_depth(request.depth))
     } else {
         body
     };
     let body = if let Some(semantics) = semantic_judgment_view(snapshot, request) {
-        format!("{body}\n\n{}", semantics.render())
+        format!("{body}\n\n{}", semantics.render_for_depth(request.depth))
     } else {
         body
     };
     let body = if let Some(judgments) = tool_result_judgment_view(snapshot, request) {
-        format!("{body}\n\n{}", judgments.render())
+        format!("{body}\n\n{}", judgments.render_for_depth(request.depth))
     } else {
         body
     };
@@ -1882,7 +2030,9 @@ mod tests {
             assert_eq!(view.coverage, expected);
             assert!(view.counts.is_none());
             assert!(view.capture_incomplete);
-            assert!(render_introspect_request(&snapshot, &request).contains(&view.render()));
+            assert!(
+                render_introspect_request(&snapshot, &request).contains(&view.render_compact())
+            );
             assert!(
                 report
                     .observations
@@ -1936,12 +2086,12 @@ mod tests {
             .iter()
             .find(|item| item.kind == "tool_result_judgment")
             .expect("tool-result judgment observation");
-        assert!(observation.summary.contains("jev-1.13.0 via jet"));
+        assert!(observation.summary.contains("model jet (jev-1.13.0)"));
         assert!(observation.summary.contains("1 included"));
         let text_request = IntrospectRequest::from_args(&serde_json::json!({}));
         let text = render_introspect_request(&snapshot, &text_request);
-        assert!(text.contains("Tool-result judgment:"));
-        assert!(text.contains("jev-1.13.0 via jet"));
+        assert!(text.contains("Tool-result selection ·"));
+        assert!(text.contains("model jet (jev-1.13.0)"));
 
         let receipt_only = IntrospectSnapshot {
             tool_result_judgments: Some(ToolResultJudgmentView {
@@ -2030,7 +2180,14 @@ mod tests {
             report
                 .evidence
                 .iter()
-                .any(|e| e.summary.contains("actual-offering"))
+                .any(|e| e.summary.contains("actual-model"))
+        );
+        assert!(
+            report
+                .evidence
+                .iter()
+                .all(|e| !e.summary.contains("actual-offering")),
+            "compact evidence must not dump offering identifiers"
         );
         let wire = serde_json::to_value(report).unwrap();
         assert_eq!(
@@ -2067,6 +2224,14 @@ mod tests {
         assert_eq!(deepseek.attempts, 1);
         assert_eq!(deepseek.known_input_tokens, 0);
         assert!(!deepseek.input_complete);
+        let compact = usage.render_compact();
+        assert!(
+            compact.contains(
+                "deepseek (actual-model) · Request classification · 1 call · in unknown · out unknown"
+            ),
+            "{compact}"
+        );
+        assert!(!compact.contains("at least 0"), "{compact}");
         assert!(usage.render().contains("group provider=jev"));
         let mut facts = judgment_facts(4);
         facts.attempts[1].offering_id = "different-offering".into();
@@ -2173,7 +2338,8 @@ mod tests {
             IntrospectRequest::from_args(&serde_json::json!({"horizon":"turn", "depth":"hint"}));
         let text = render_introspect_request(&snapshot, &request);
         assert!(text.contains("session ledger at read time"));
-        assert!(text.contains("omitted_attempts=1"));
+        assert!(text.contains("actual-provider"));
+        assert!(!text.contains("omitted_attempts="));
         assert!(text.contains("actual-provider"));
     }
 
@@ -2216,7 +2382,7 @@ mod tests {
         let empty = JudgmentUsageSnapshot::from_ledger(empty);
         assert_eq!(empty.coverage, JudgmentUsageCoverage::CaptureTruncated);
         assert!(!empty.output_complete);
-        assert!(empty.render().contains("total_output=at_least_0"));
+        assert!(empty.render().contains("total_output=unknown"));
     }
 
     #[test]

@@ -207,7 +207,7 @@ pub fn build_introspect_report(
             facet: request.facet.as_str().into(),
             kind: "semantic_judgment_trace".into(),
             severity: "info".into(),
-            summary: semantics.render(),
+            summary: semantics.render_for_depth(request.depth),
             // Coverage and captured stages do not establish outcome confidence.
             confidence: ObservationConfidence {
                 classification: None,
@@ -229,7 +229,7 @@ pub fn build_introspect_report(
                 facet: request.facet.as_str().into(),
                 kind: "judgment_physical_usage".into(),
                 severity: "info".into(),
-                summary: usage.render(),
+                summary: usage.render_for_depth(request.depth),
                 confidence: ObservationConfidence::evidence(1.0),
                 evidence_refs: vec![RUNTIME_SNAPSHOT_REF.into()],
             });
@@ -241,7 +241,9 @@ pub fn build_introspect_report(
         } else {
             "\nsource=inference_provider_attempts; "
         });
-        evidence[0].summary.push_str(&usage.render());
+        // Keep the shared evidence unit compact even for forensic reports;
+        // the structured observation carries the bounded detail separately.
+        evidence[0].summary.push_str(&usage.render_compact());
     }
     if let Some(judgments) = &tool_result_judgments
         && (judgments.evaluation_coverage
@@ -255,7 +257,7 @@ pub fn build_introspect_report(
             facet: request.facet.as_str().into(),
             kind: "tool_result_judgment".into(),
             severity: "info".into(),
-            summary: judgments.render(),
+            summary: judgments.render_for_depth(request.depth),
             confidence: ObservationConfidence::evidence(1.0),
             evidence_refs: vec![RUNTIME_SNAPSHOT_REF.into()],
         });

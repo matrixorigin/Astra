@@ -691,7 +691,9 @@ fn render_graph(
         }
     }
     if !live {
-        for summary in crate::explain_analyze_report::auxiliary_usage_lines(graph) {
+        for summary in
+            crate::explain_analyze_report::auxiliary_usage_lines_with_detail(graph, verbose)
+        {
             let _ = push_wrapped_detail(
                 &mut lines,
                 &summary,

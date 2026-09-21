@@ -148,7 +148,9 @@ impl ToolResultJudgmentView {
                 .map(|m| {
                     format!(
                         "{} via {} ({} observed invocation(s))",
-                        m.model, m.provider, m.observed_invocations
+                        m.model,
+                        crate::judgment_presentation::provider_label(&m.provider),
+                        m.observed_invocations
                     )
                 })
                 .collect::<Vec<_>>()
@@ -161,19 +163,153 @@ impl ToolResultJudgmentView {
         if self.application_coverage == ToolResultJudgmentCoverage::SourceUnavailable {
             line.push_str(". Application evidence unavailable");
         }
-        if matches!(
-            self.evaluation_coverage,
-            ToolResultJudgmentCoverage::CaptureIncomplete
-                | ToolResultJudgmentCoverage::CaptureTruncated
-        ) || matches!(
-            self.application_coverage,
-            ToolResultJudgmentCoverage::CaptureIncomplete
-                | ToolResultJudgmentCoverage::CaptureTruncated
-        ) {
-            line.push_str(". A bounded source was truncated; counts are lower bounds");
+        if let Some(note) = coverage_note(CoverageSubject::Evaluation, self.evaluation_coverage) {
+            line.push_str(&format!(". {note}"));
+        }
+        if let Some(note) = coverage_note(CoverageSubject::Application, self.application_coverage) {
+            line.push_str(&format!(". {note}"));
         }
         line.push('.');
         line
+    }
+
+    /// Short, actionable projection for the default introspect/reflect view.
+    /// Detailed counts and identities remain available from [`Self::render`]
+    /// and the structured report.
+    pub fn render_compact(&self) -> String {
+        let terminal_results = self
+            .evaluations
+            .saturating_sub(self.terminal_missing)
+            .saturating_sub(self.conflicting);
+        let evaluation = match self.evaluation_coverage {
+            ToolResultJudgmentCoverage::NotObserved => {
+                "evaluation not observed in this view".to_string()
+            }
+            ToolResultJudgmentCoverage::SourceExcluded => "evaluation excluded".to_string(),
+            ToolResultJudgmentCoverage::SourceUnavailable => "evaluation unavailable".to_string(),
+            _ => {
+                let mut parts = Vec::new();
+                if terminal_results > 0 {
+                    parts.push(format!("{terminal_results} terminal results"));
+                }
+                if self.selected > 0 {
+                    parts.push(format!("{} selected", self.selected));
+                }
+                if self.baseline > 0 {
+                    parts.push(format!("{} kept baseline", self.baseline));
+                }
+                if self.not_dispatched > 0 {
+                    parts.push(format!("{} skipped", self.not_dispatched));
+                }
+                if self.unavailable > 0 {
+                    parts.push(format!("{} unavailable", self.unavailable));
+                }
+                if self.terminal_missing > 0 {
+                    parts.push(format!(
+                        "{} started; terminal result unknown",
+                        self.terminal_missing
+                    ));
+                }
+                if self.conflicting > 0 {
+                    parts.push(format!("{} conflicting", self.conflicting));
+                }
+                if parts.is_empty() {
+                    parts.push("no terminal result captured".into());
+                }
+                parts.join(" · ")
+            }
+        };
+        let application = match self.application_coverage {
+            ToolResultJudgmentCoverage::NotObserved => "application unknown".to_string(),
+            ToolResultJudgmentCoverage::SourceExcluded => "application excluded".to_string(),
+            ToolResultJudgmentCoverage::SourceUnavailable => "application unavailable".to_string(),
+            _ => {
+                let a = &self.applications;
+                let mut parts = Vec::new();
+                if a.included > 0 {
+                    parts.push(format!("{} included", a.included));
+                }
+                if a.partially_included > 0 {
+                    parts.push(format!("{} partial", a.partially_included));
+                }
+                if a.omitted > 0 {
+                    parts.push(format!("{} omitted", a.omitted));
+                }
+                if a.unknown > 0 {
+                    parts.push(format!("{} unknown", a.unknown));
+                }
+                if a.invalid_or_conflicting > 0 {
+                    parts.push(format!("{} invalid/conflicting", a.invalid_or_conflicting));
+                }
+                if parts.is_empty() {
+                    "application not observed".to_string()
+                } else {
+                    format!("application {}", parts.join(", "))
+                }
+            }
+        };
+        let mut line = format!("Tool-result selection · {evaluation} · {application}");
+        if let Some(model) = self.models.first() {
+            let identity = format!(
+                "{} ({})",
+                crate::judgment_presentation::provider_label(&model.provider),
+                model.model
+            );
+            line.push_str(&format!(" · model {identity}"));
+            if self.models.len() > 1 {
+                line.push_str(&format!(" +{} other model(s)", self.models.len() - 1));
+            }
+        }
+        if self.evaluation_coverage == ToolResultJudgmentCoverage::NotObserved
+            && self.application_coverage == ToolResultJudgmentCoverage::NotObserved
+        {
+            line.push_str(" · not evidence of zero calls");
+        }
+        if let Some(note) = coverage_note(CoverageSubject::Evaluation, self.evaluation_coverage) {
+            line.push_str(&format!(" · {note}"));
+        }
+        if let Some(note) = coverage_note(CoverageSubject::Application, self.application_coverage) {
+            line.push_str(&format!(" · {note}"));
+        }
+        line
+    }
+
+    pub fn render_for_depth(&self, depth: astra_core::ObservationDepth) -> String {
+        match depth {
+            astra_core::ObservationDepth::Hint | astra_core::ObservationDepth::Summary => {
+                self.render_compact()
+            }
+            astra_core::ObservationDepth::Diagnostic | astra_core::ObservationDepth::Forensic => {
+                self.render()
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CoverageSubject {
+    Evaluation,
+    Application,
+}
+
+fn coverage_note(
+    subject: CoverageSubject,
+    coverage: ToolResultJudgmentCoverage,
+) -> Option<&'static str> {
+    match coverage {
+        ToolResultJudgmentCoverage::CaptureIncomplete => Some(match subject {
+            CoverageSubject::Evaluation => "evaluation evidence incomplete; some facts are missing",
+            CoverageSubject::Application => {
+                "application evidence incomplete; some receipts are missing"
+            }
+        }),
+        ToolResultJudgmentCoverage::CaptureTruncated => Some(match subject {
+            CoverageSubject::Evaluation => "evaluation capture truncated; counts are lower bounds",
+            CoverageSubject::Application => {
+                "application capture truncated; counts are lower bounds"
+            }
+        }),
+        _ => None,
     }
 }
 
@@ -707,6 +843,10 @@ mod tests {
         assert_eq!(view.models[0].model, "jev-1.13.0");
         assert_eq!(view.models[0].observed_invocations, 1);
         assert!(view.render().contains("jev-1.13.0 via jet"));
+        let compact = view.render_compact();
+        assert!(compact.contains("2 terminal results"), "{compact}");
+        assert!(compact.contains("2 selected"), "{compact}");
+        assert!(!compact.contains("2 evaluated"), "{compact}");
     }
 
     #[test]
@@ -742,6 +882,12 @@ mod tests {
         assert_eq!(view.evaluations, 2);
         assert_eq!(view.not_dispatched, 0);
         assert_eq!(view.unavailable, 0);
+        let compact = view.render_compact();
+        assert!(
+            compact.contains("1 started; terminal result unknown"),
+            "{compact}"
+        );
+        assert!(compact.contains("1 conflicting"), "{compact}");
     }
 
     #[test]
@@ -887,6 +1033,44 @@ mod tests {
         .render();
         assert!(applications_missing.contains("Application evidence unavailable"));
         assert!(!applications_missing.contains("none observed"));
+
+        let incomplete = ToolResultJudgmentView {
+            evaluation_coverage: ToolResultJudgmentCoverage::CaptureIncomplete,
+            ..Default::default()
+        }
+        .render();
+        assert!(incomplete.contains("evaluation evidence incomplete"));
+        assert!(!incomplete.contains("evaluation capture truncated"));
+
+        let truncated = ToolResultJudgmentView {
+            evaluation_coverage: ToolResultJudgmentCoverage::CaptureTruncated,
+            ..Default::default()
+        }
+        .render();
+        assert!(truncated.contains("evaluation capture truncated"));
+        assert!(!truncated.contains("evaluation evidence incomplete"));
+
+        let mixed = ToolResultJudgmentView {
+            evaluation_coverage: ToolResultJudgmentCoverage::Available,
+            evaluations: 5,
+            selected: 1,
+            baseline: 1,
+            not_dispatched: 1,
+            unavailable: 1,
+            terminal_missing: 1,
+            ..Default::default()
+        }
+        .render_compact();
+        for expected in [
+            "4 terminal results",
+            "1 selected",
+            "1 kept baseline",
+            "1 skipped",
+            "1 unavailable",
+            "1 started; terminal result unknown",
+        ] {
+            assert!(mixed.contains(expected), "missing {expected}: {mixed}");
+        }
     }
 
     #[tokio::test]
