@@ -112,6 +112,8 @@ pub enum SessionContextCoordinatorError {
     Invalid(String),
     #[error("writer authority was fenced by a newer epoch")]
     Fenced,
+    #[error("session is being deleted or is no longer writable")]
+    SessionLifecycleFenced,
     #[error("writer lease or turn reservation expired")]
     Expired,
     #[error("idempotency key was reused for a different request")]
@@ -726,6 +728,7 @@ impl DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_execution_turn_adoption", source))?;
+        admit_session_lifecycle_write(&mut tx, &source.key).await?;
         let locked = crate::runs::lock_claimed_execution_handoff_tx(
             &mut tx,
             claim,
@@ -2453,6 +2456,8 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_activate_fork", source))?;
+        admit_session_lifecycle_writes(&mut tx, [&manifest.parent_key, &manifest.child_key])
+            .await?;
         let row = sqlx::query(
             "SELECT manifest_json, state FROM session_forks
              WHERE isolation_domain = ? AND owner_user_id = ? AND fork_id = ?
@@ -2842,6 +2847,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_renew_turn_authority", source))?;
+        admit_session_lifecycle_write(&mut tx, &lease.key).await?;
         let now = database_now_ms(&mut tx).await?;
         let mut state = lock_database_state(&mut tx, &lease.key).await?;
         let validation = validate_active_lease(&state, lease, now)
@@ -2911,6 +2917,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_release_writer", source))?;
+        admit_session_lifecycle_write(&mut tx, &lease.key).await?;
         let mut state = lock_database_state(&mut tx, &lease.key).await?;
         let outcome = if state.active_writer.as_ref().is_some_and(|active| {
             active.lease_id == lease.lease_id && active.writer_epoch == lease.writer_epoch
@@ -2974,6 +2981,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_transfer_writer", source))?;
+        admit_session_lifecycle_write(&mut tx, &request.key).await?;
         let now = database_now_ms(&mut tx).await?;
         let expires_at = checked_expiry(now, ttl)?;
         let mut state = lock_database_state(&mut tx, &request.key).await?;
@@ -3219,6 +3227,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_reserve_turn", source))?;
+        admit_session_lifecycle_write(&mut tx, &lease.key).await?;
         let (mut state, now) = lock_database_state_at_now(&mut tx, &lease.key).await?;
         validate_execution_binding_generation_in_tx(
             &mut tx,
@@ -3719,6 +3728,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_commit_turn", source))?;
+        admit_session_lifecycle_write(&mut tx, &reservation.key).await?;
         let (mut state, now) = lock_database_state_at_now(&mut tx, &reservation.key).await?;
         if let Some(last) = state.last_commit.clone()
             && last.idempotency_key == idempotency_key
@@ -4659,6 +4669,7 @@ async fn ensure_database_state(
     key: &SessionKeyV1,
     epochs: AuthorityEpochsV1,
 ) -> Result<(), SessionContextCoordinatorError> {
+    admit_session_lifecycle_write(tx, key).await?;
     sqlx::query(
         "INSERT IGNORE INTO session_context_heads
          (isolation_domain, owner_user_id, session_id, branch_id,
@@ -4681,6 +4692,61 @@ async fn ensure_database_state(
     .execute(&mut **tx)
     .await
     .map_err(|source| database_error("ensure_context_head", source))?;
+    Ok(())
+}
+
+/// Admit a coordinator transaction before it locks or mutates any
+/// session-owned child row. Session deletion takes this same lifecycle fence
+/// before deleting children, so an already-admitted writer commits before the
+/// delete or observes the durable deletion state and rolls back as one unit.
+async fn admit_session_lifecycle_write(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+) -> Result<(), SessionContextCoordinatorError> {
+    match crate::storage::lock_agent_session_write_fence_state(
+        tx,
+        &key.session_id,
+        &key.owner_user_id,
+    )
+    .await
+    .map_err(|source| database_error("lock_session_lifecycle_fence", source))?
+    {
+        crate::storage::AgentSessionWriteFenceState::Writable => Ok(()),
+        crate::storage::AgentSessionWriteFenceState::PendingDelete
+        | crate::storage::AgentSessionWriteFenceState::CompletedDelete => {
+            Err(SessionContextCoordinatorError::SessionLifecycleFenced)
+        }
+        crate::storage::AgentSessionWriteFenceState::Missing => Err(database_error(
+            "lock_session_lifecycle_fence",
+            sqlx::Error::Protocol(
+                "session lifecycle fence disappeared before it could be locked".into(),
+            ),
+        )),
+    }
+}
+
+/// Fork activation touches two sessions. Acquire their shared lifecycle
+/// fences in a deterministic owner/session order before locking fork or
+/// manifest rows, otherwise two cross-session activations could deadlock.
+pub(crate) async fn admit_session_lifecycle_writes(
+    tx: &mut Transaction<'_, MySql>,
+    mut keys: [&SessionKeyV1; 2],
+) -> Result<(), SessionContextCoordinatorError> {
+    keys.sort_unstable_by(|left, right| {
+        (
+            &left.owner_user_id,
+            &left.session_id,
+            &left.isolation_domain,
+        )
+            .cmp(&(
+                &right.owner_user_id,
+                &right.session_id,
+                &right.isolation_domain,
+            ))
+    });
+    for key in keys {
+        admit_session_lifecycle_write(tx, key).await?;
+    }
     Ok(())
 }
 
@@ -5922,6 +5988,7 @@ struct AuthorityAuditFact<'a> {
 fn authority_error_outcome(error: &SessionContextCoordinatorError) -> &'static str {
     match error {
         SessionContextCoordinatorError::Fenced => "stale_fenced",
+        SessionContextCoordinatorError::SessionLifecycleFenced => "session_lifecycle_fenced",
         SessionContextCoordinatorError::Expired => "expired",
         SessionContextCoordinatorError::IdempotencyMismatch => "idempotency_mismatch",
         SessionContextCoordinatorError::Unauthorized => "unauthorized",

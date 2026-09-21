@@ -1499,6 +1499,31 @@ pub async fn lock_agent_session_write_fence<T>(
 where
     T: TransactionConnection,
 {
+    match lock_agent_session_write_fence_state(tx, session_id, user_id).await? {
+        AgentSessionWriteFenceState::Writable => Ok(()),
+        AgentSessionWriteFenceState::PendingDelete
+        | AgentSessionWriteFenceState::CompletedDelete => Err(sqlx::Error::Protocol(
+            "session has a durable deletion fence".into(),
+        )),
+        AgentSessionWriteFenceState::Missing => Err(sqlx::Error::Protocol(
+            "session lifecycle fence disappeared before it could be locked".into(),
+        )),
+    }
+}
+
+/// Lock the durable lifecycle fence and retain the state for callers that
+/// need to distinguish an ordinary writable session from deletion admission.
+/// The insert-and-lock sequence is the same as
+/// [`lock_agent_session_write_fence`]; exposing the typed state keeps callers
+/// from matching storage error strings.
+pub async fn lock_agent_session_write_fence_state<T>(
+    tx: &mut T,
+    session_id: &str,
+    user_id: &str,
+) -> Result<AgentSessionWriteFenceState, sqlx::Error>
+where
+    T: TransactionConnection,
+{
     // Session creation/backfill establishes the fence before normal child
     // writes. Fast-path the common case so every manifest/event write does not
     // pay an INSERT IGNORE round trip. If this transaction inserted the fence,
@@ -1524,17 +1549,7 @@ where
         }
         state => state,
     };
-
-    match state {
-        AgentSessionWriteFenceState::Writable => Ok(()),
-        AgentSessionWriteFenceState::PendingDelete
-        | AgentSessionWriteFenceState::CompletedDelete => Err(sqlx::Error::Protocol(
-            "session has a durable deletion fence".into(),
-        )),
-        AgentSessionWriteFenceState::Missing => Err(sqlx::Error::Protocol(
-            "session lifecycle fence disappeared before it could be locked".into(),
-        )),
-    }
+    Ok(state)
 }
 
 pub async fn add_agent_session_event_count_or_create<T>(

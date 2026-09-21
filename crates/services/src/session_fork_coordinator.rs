@@ -95,6 +95,11 @@ impl DatabaseSessionForkCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_prepare_fork", source))?;
+        crate::session_context_coordinator::admit_session_lifecycle_writes(
+            &mut tx,
+            [&request.parent_key, &request.child_key],
+        )
+        .await?;
 
         if let Some(row) = sqlx::query(
             "SELECT request_hash, manifest_json FROM session_forks
@@ -274,6 +279,34 @@ impl DatabaseSessionForkCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_abort_fork", source))?;
+        let child_row = sqlx::query(
+            "SELECT child_session_id, child_branch_id FROM session_forks
+             WHERE isolation_domain = ? AND owner_user_id = ? AND fork_id = ?",
+        )
+        .bind(&parent_key.isolation_domain)
+        .bind(&parent_key.owner_user_id)
+        .bind(fork_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| database_error("load_abort_fork_participants", source))?
+        .ok_or(SessionForkCoordinatorError::NotFound)?;
+        let child_session_id: String = child_row
+            .try_get("child_session_id")
+            .map_err(|source| database_error("decode_abort_fork_child_session", source))?;
+        let child_branch_id: String = child_row
+            .try_get("child_branch_id")
+            .map_err(|source| database_error("decode_abort_fork_child_branch", source))?;
+        let child_key = SessionKeyV1::owner_session(
+            parent_key.isolation_domain.clone(),
+            parent_key.owner_user_id.clone(),
+            child_session_id,
+            child_branch_id,
+        );
+        crate::session_context_coordinator::admit_session_lifecycle_writes(
+            &mut tx,
+            [parent_key, &child_key],
+        )
+        .await?;
         let row = lock_fork(&mut tx, parent_key, fork_id).await?;
         let mut manifest: SessionForkManifestV1 =
             decode_json_row(&row, "manifest_json", "fork_manifest")?;
@@ -723,13 +756,6 @@ async fn insert_fork_child_session(
     tx: &mut Transaction<'_, MySql>,
     manifest: &SessionForkManifestV1,
 ) -> Result<(), SessionForkCoordinatorError> {
-    crate::storage::lock_agent_session_write_fence(
-        tx,
-        &manifest.child_key.session_id,
-        &manifest.child_key.owner_user_id,
-    )
-    .await
-    .map_err(|source| database_error("lock_fork_child_session_fence", source))?;
     let metadata = serde_json::json!({
         "fork_id": manifest.fork_id,
         "fork_parent_session_id": manifest.parent_key.session_id,
