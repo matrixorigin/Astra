@@ -90,13 +90,12 @@ pub struct IntrospectSnapshot {
     #[serde(default)]
     pub step_latency: Vec<StepLatencySnapshotEntry>,
     /// Currently-pending volatile injections scheduled for the next LLM
-    /// call (tool-health warnings, working-set snapshots, stall nudges,
-    /// …). Lets the agent answer "what runtime nudges am I about to
-    /// see?". Feeds `facet=volatile`.
+    /// call (policy advisories, working-set snapshots, …). Lets the agent
+    /// inspect pending runtime feedback. Feeds `facet=volatile`.
     #[serde(default)]
     pub volatile_pending: Vec<VolatileSnapshotEntry>,
-    /// Current stall / loop-guard telemetry — nudge count, event log,
-    /// circuit breaker state. Feeds `facet=stall`.
+    /// Current stall / loop-guard events and advisory labels.
+    /// Feeds `facet=stall` alongside circuit-breaker state.
     #[serde(default)]
     pub stall_state: StallSnapshotSummary,
     /// Per-channel freshness of runtime-injected prompt signals
@@ -428,7 +427,7 @@ pub struct StepLatencySnapshotEntry {
 /// Single entry in the volatile lane at introspect time.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VolatileSnapshotEntry {
-    /// Kind as a short string ("WorkingSet", "StallNudge", …). Keeps the
+    /// Kind as a short string ("WorkingSet", "PolicyAdvisory", …). Keeps the
     /// core crate dependency-free from the runtime's `VolatileKind`.
     pub kind: String,
     /// Content preview — full text (the renderers may truncate at
@@ -441,12 +440,11 @@ pub struct VolatileSnapshotEntry {
 /// Stall / loop-guard state at introspect time.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StallSnapshotSummary {
-    pub nudge_count: u32,
     pub events: Vec<String>,
     /// Total circuit-breaker introspection emissions this turn.
     pub introspection_count: u32,
-    /// Correction labels fired this turn (e.g. "execution_escalation",
-    /// "parallel_batching_force", "cache_waste_corrective", …).
+    /// Advisory labels emitted this turn; these are observations, not
+    /// evidence that a correction was required or ignored.
     #[serde(default)]
     pub advisory_signals: Vec<String>,
 }
@@ -721,8 +719,6 @@ pub fn render_introspect_request(
     } else {
         body
     };
-    let boundary = "## Observation Boundary\n\
-snapshot_cutoff=before_current_introspect_execution; the selecting round may list `introspect` as requested/in-flight, and calls made after this snapshot are absent. Judgment usage, evaluation traces, and application receipts carry independent source scopes and capture/read cutoffs. Treat counts and states as scoped observations, not final session totals.";
     let body = if let Some(semantics) = semantic_judgment_view(snapshot, request) {
         format!("{body}\n\n{}", semantics.render())
     } else {
@@ -733,6 +729,34 @@ snapshot_cutoff=before_current_introspect_execution; the selecting round may lis
     } else {
         body
     };
+    let evidence_revision = observation::evidence_revision(snapshot, &live_request);
+    let boundary_prefix = format!(
+        "## Observation Boundary\n\
+snapshot_cutoff=before_current_introspect_execution; the selecting round may list `introspect` as requested/in-flight, and calls made after this snapshot are absent. Judgment usage, evaluation traces, and application receipts carry independent source scopes and capture/read cutoffs. Treat counts and states as scoped observations, not final session totals. evidence_revision={evidence_revision} covered_facets="
+    );
+    let candidate_facets = observation::text_covered_facets(&live_request).join(",");
+    let candidate_boundary = format!("{boundary_prefix}{candidate_facets}");
+    let candidate_output = if historical_horizon {
+        format!(
+            "## Introspect Live Projection\nrequested_horizon={} coverage=recent-only; use reflect for persisted causal evidence.\n\n{}\n\n{}",
+            request.horizon.as_str(),
+            candidate_boundary,
+            body
+        )
+    } else {
+        format!("{candidate_boundary}\n\n{body}")
+    };
+    // A text boundary is front-loaded and can outlive the body when the
+    // downstream model sanitizer truncates the result. Only claim coverage
+    // when the complete marked result fits that same model budget.
+    let covered_facets = if candidate_output.chars().count()
+        <= crate::tool::result::sanitize::INTROSPECT_MODEL_RESULT_CHARS
+    {
+        candidate_facets
+    } else {
+        String::new()
+    };
+    let boundary = format!("{boundary_prefix}{covered_facets}");
     if historical_horizon {
         format!(
             "## Introspect Live Projection\nrequested_horizon={} coverage=recent-only; use reflect for persisted causal evidence.\n\n{}\n\n{}",
@@ -743,6 +767,77 @@ snapshot_cutoff=before_current_introspect_execution; the selecting round may lis
     } else {
         format!("{boundary}\n\n{body}")
     }
+}
+
+/// Extract the source-owned evidence revision from either the structured JSON
+/// report or the bounded text projection.  Dynamic rendered counters are not
+/// used as an identity fallback: if the marker is absent, the caller must
+/// treat the delivered evidence as unmeasurable.
+pub(crate) fn extract_evidence_revision(result: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(result) {
+        if let Some(revision) = value
+            .get("evidence_revision")
+            .and_then(|value| value.as_str())
+        {
+            return valid_evidence_revision(revision).map(str::to_string);
+        }
+    }
+
+    result.lines().find_map(|line| {
+        let marker = "evidence_revision=";
+        let start = line.find(marker)? + marker.len();
+        let revision = line[start..].split_whitespace().next()?;
+        valid_evidence_revision(revision).map(str::to_string)
+    })
+}
+
+pub(crate) fn extract_covered_facets(result: &str) -> Option<Vec<String>> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(result) {
+        if let Some(facets) = value
+            .get("covered_facets")
+            .and_then(|value| value.as_array())
+        {
+            if facets.iter().any(|facet| !facet.is_string()) {
+                return None;
+            }
+            let parsed = facets
+                .iter()
+                .filter_map(|facet| facet.as_str())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            // An empty marker is meaningful: the report was bounded before
+            // it could claim facet coverage.  Keep the distinction from a
+            // missing marker so equality-only repeat detection can still
+            // identify an identical delivery without treating it as useful
+            // cross-facet coverage.
+            return Some(parsed);
+        }
+    }
+
+    result.lines().find_map(|line| {
+        let marker = "covered_facets=";
+        let start = line.find(marker)? + marker.len();
+        let token = line[start..].split_whitespace().next().unwrap_or("");
+        let facets = token
+            .split(',')
+            .filter(|facet| !facet.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        Some(facets)
+    })
+}
+
+fn valid_evidence_revision(value: &str) -> Option<&str> {
+    let (version, digest) = value.split_once(':')?;
+    if version != "v1"
+        || digest.len() != 64
+        || !digest
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(value)
 }
 
 fn render_edge_local_unavailable(request: &IntrospectRequest) -> String {
@@ -1374,14 +1469,18 @@ pub fn render_volatile_pending(s: &IntrospectSnapshot) -> String {
 pub fn render_stall_state(s: &IntrospectSnapshot) -> String {
     let st = &s.stall_state;
     let any_advisory = !st.advisory_signals.is_empty();
-    if st.nudge_count == 0 && st.events.is_empty() && !any_advisory {
-        return "## Stall / Loop-Guard\n(Healthy — no nudges or advisory signals this turn.)"
+    if st.events.is_empty()
+        && st.introspection_count == 0
+        && !any_advisory
+        && s.circuit_breaker.is_none()
+    {
+        return "## Stall / Loop-Guard\n(No events or advisory signals recorded this turn.)"
             .to_string();
     }
     let mut out = String::from("## Stall / Loop-Guard\n");
     out.push_str(&format!(
-        "Soft nudges: {} | Circuit-breaker introspections: {}\n",
-        st.nudge_count, st.introspection_count,
+        "Circuit-breaker introspections: {}\n",
+        st.introspection_count,
     ));
     if !st.events.is_empty() {
         out.push_str("\n### Recent stall events\n");
@@ -1645,6 +1744,49 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    #[test]
+    fn evidence_revision_parser_accepts_json_and_text_but_fails_closed() {
+        let revision = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let json = serde_json::json!({"evidence_revision": revision}).to_string();
+        assert_eq!(extract_evidence_revision(&json).as_deref(), Some(revision));
+        assert_eq!(
+            extract_evidence_revision(&format!(
+                "## Observation Boundary\nevidence_revision={revision}"
+            ))
+            .as_deref(),
+            Some(revision)
+        );
+        assert!(extract_evidence_revision("evidence_revision=v1:short").is_none());
+        assert!(extract_evidence_revision("dynamic counters only").is_none());
+    }
+
+    #[test]
+    fn covered_facets_parser_accepts_structured_and_text_boundaries() {
+        let json = serde_json::json!({
+            "covered_facets": ["session", "recent", "errors"]
+        })
+        .to_string();
+        assert_eq!(
+            extract_covered_facets(&json),
+            Some(vec![
+                "session".to_string(),
+                "recent".to_string(),
+                "errors".to_string()
+            ])
+        );
+        assert_eq!(
+            extract_covered_facets(
+                "## Observation Boundary\nevidence_revision=v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa covered_facets=session,recent"
+            ),
+            Some(vec!["session".to_string(), "recent".to_string()])
+        );
+        assert_eq!(extract_covered_facets("covered_facets="), Some(Vec::new()));
+        assert_eq!(
+            extract_covered_facets(r#"{"covered_facets":["overview", 1]}"#),
+            None
+        );
+    }
 
     #[test]
     fn semantic_judgment_detail_has_one_bounded_report_owner() {
@@ -2222,6 +2364,7 @@ mod tests {
             .as_mut()
             .expect("runtime feedback")
             .policy_feedback = RuntimePolicyFeedbackSet::Evaluated {
+            recovery: None,
             schema_version: RuntimePolicyFeedbackSet::SCHEMA_VERSION,
             revision: 4,
             evaluated_at_round: 8,
@@ -2921,31 +3064,44 @@ mod tests {
 
         let snap = IntrospectSnapshot {
             volatile_pending: vec![VolatileSnapshotEntry {
-                kind: "StallNudge".into(),
-                content: "⚠ REFLECTION: same read_file 3 times in a row".into(),
+                kind: "PolicyAdvisory".into(),
+                content: "Repeated operation observed; result freshness is unknown.".into(),
                 round_index: 2,
             }],
             ..Default::default()
         };
         let out = render_volatile_pending(&snap);
-        assert!(out.contains("StallNudge"));
+        assert!(out.contains("PolicyAdvisory"));
         assert!(out.contains("round 2"));
     }
 
     #[test]
-    fn render_stall_state_healthy_and_triggered() {
+    fn render_stall_state_empty_and_observed() {
         let healthy = IntrospectSnapshot::default();
-        assert!(render_stall_state(&healthy).contains("Healthy"));
+        assert!(render_stall_state(&healthy).contains("No events"));
 
         let mut snap = IntrospectSnapshot::default();
-        snap.stall_state.nudge_count = 2;
         snap.stall_state.introspection_count = 1;
         snap.stall_state.advisory_signals = vec!["parallel_batching_force".into()];
         snap.stall_state.events = vec!["sig_stall @ turn 5".into()];
         let out = render_stall_state(&snap);
-        assert!(out.contains("Soft nudges: 2"));
+        assert!(out.contains("Circuit-breaker introspections: 1"));
         assert!(out.contains("sig_stall @ turn 5"));
         assert!(out.contains("parallel_batching_force"));
+    }
+
+    #[test]
+    fn stall_introspection_count_is_visible_without_events_or_advisories() {
+        let snapshot = IntrospectSnapshot {
+            stall_state: StallSnapshotSummary {
+                introspection_count: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(render_stall_state(&snapshot).contains("Circuit-breaker introspections: 2"));
+        let wire = serde_json::to_value(&snapshot.stall_state).unwrap();
+        assert!(wire.get("nudge_count").is_none());
     }
 
     #[test]
@@ -2959,11 +3115,10 @@ mod tests {
             ..Default::default()
         });
         snap.volatile_pending.push(VolatileSnapshotEntry {
-            kind: "StallNudge".into(),
-            content: "⚠ stall nudge".into(),
+            kind: "PolicyAdvisory".into(),
+            content: "Repeated operation observed.".into(),
             round_index: 0,
         });
-        snap.stall_state.nudge_count = 1;
         snap.injection_freshness = vec![ChannelFreshness {
             channel: InjectionChannel::Lessons,
             status: ChannelStatus::Fresh { rounds_alive: 0 },
@@ -3197,10 +3352,6 @@ mod tests {
     #[test]
     fn render_stall_with_circuit_breaker() {
         let snap = IntrospectSnapshot {
-            stall_state: StallSnapshotSummary {
-                nudge_count: 1,
-                ..Default::default()
-            },
             circuit_breaker: Some(CircuitBreakerSnapshot {
                 state: "recovering".into(),
                 failure_count: 5,

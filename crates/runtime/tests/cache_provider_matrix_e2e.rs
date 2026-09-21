@@ -589,7 +589,7 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
         let mut state = make_test_loop_state();
         state.max_turn_input_tokens = 200_000;
         state.push_volatile(
-            astra_runtime::turn::agentic_loop::host::VolatileKind::StallNudge,
+            astra_runtime::turn::agentic_loop::host::VolatileKind::ContextPressure,
             "runtime advisory round 1",
         );
 
@@ -615,7 +615,7 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
 
         // Round 2: append (assistant_tc, tool_result) and rerun.
         state.push_volatile(
-            astra_runtime::turn::agentic_loop::host::VolatileKind::StallNudge,
+            astra_runtime::turn::agentic_loop::host::VolatileKind::ContextPressure,
             "runtime advisory round 2",
         );
         state.messages.push(json!({
@@ -639,7 +639,7 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
         // from the legacy tail behavior because both first diverge at the
         // initial runtime snapshot.
         state.push_volatile(
-            astra_runtime::turn::agentic_loop::host::VolatileKind::StallNudge,
+            astra_runtime::turn::agentic_loop::host::VolatileKind::ContextPressure,
             "runtime advisory round 3",
         );
         state.messages.push(json!({
@@ -1170,8 +1170,8 @@ async fn matrix_volatile_lane_keeps_history_clean() {
 
         // Simulate multiple advisory producers in one prepare cycle.
         state.push_volatile(
-            VolatileKind::StallNudge,
-            "⚠ REFLECTION: same read_file called 3 times in a row",
+            VolatileKind::ContextPressure,
+            "Context pressure observed in this request",
         );
         state.push_volatile(
             VolatileKind::ToolBatchCoaching,
@@ -1213,7 +1213,7 @@ async fn matrix_volatile_lane_keeps_history_clean() {
             .join("\n");
         if suppresses_volatile {
             assert!(
-                !runtime_text.contains("⚠ REFLECTION")
+                !runtime_text.contains("Context pressure observed")
                     && !runtime_text.contains("✓ 2 tools executed")
                     && !runtime_text.contains("runtime behavior evidence"),
                 "[{label}] required-only delivery must suppress every non-authoritative volatile class; got {runtime_text:?}",
@@ -1221,7 +1221,7 @@ async fn matrix_volatile_lane_keeps_history_clean() {
             );
         } else {
             assert!(
-                runtime_text.contains("⚠ REFLECTION")
+                runtime_text.contains("Context pressure observed")
                     && runtime_text.contains("✓ 2 tools executed")
                     && runtime_text.contains("runtime behavior evidence"),
                 "[{label}] runtime evidence must use system messages; got {runtime_text:?}",

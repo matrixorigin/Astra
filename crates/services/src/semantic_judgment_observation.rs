@@ -70,7 +70,7 @@ fn checked_request_judgment_result(
                     Mutation::ReadOnly => RequestJudgmentMutationV1::ReadOnly,
                     Mutation::MayMutate => RequestJudgmentMutationV1::MayMutate,
                     Mutation::MustMutate => RequestJudgmentMutationV1::MustMutate,
-                    Mutation::Unknown => return Err(invalid),
+                    Mutation::Unknown => RequestJudgmentMutationV1::Unknown,
                 },
                 scope: match c.mutation_completion_scope {
                     Scope::Unknown => RequestJudgmentScopeV1::Unknown,

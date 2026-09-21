@@ -2343,7 +2343,8 @@ mod tests {
             cache_break_detected: None,
             policy_feedback:
                 astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::Evaluated {
-                    schema_version: 2,
+                    recovery: None,
+                    schema_version: astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
                     revision: 1,
                     evaluated_at_round: 1,
                     subject: astra_turn_core::context_feedback::RuntimePolicySubject::Run,

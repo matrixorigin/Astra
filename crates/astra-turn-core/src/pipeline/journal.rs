@@ -111,7 +111,8 @@ mod tests {
     fn feedback_event_fields() {
         let mut fb = crate::introspect::test_runtime_feedback(3, 3, 7);
         fb.policy_feedback = crate::context_feedback::RuntimePolicyFeedbackSet::Evaluated {
-            schema_version: 1,
+            schema_version: crate::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+            recovery: None,
             revision: 2,
             evaluated_at_round: 3,
             subject: crate::context_feedback::RuntimePolicySubject::Run,

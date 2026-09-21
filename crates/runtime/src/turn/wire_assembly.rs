@@ -4257,12 +4257,8 @@ mod tests {
         let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
             kind: crate::turn::agentic_loop::host::VolatileKind::PolicyAdvisory,
             payload: json!({
-                "schema": "policy_advisory.v1",
-                "advisories": [{
-                    "kind": "stall",
-                    "severity": "warning",
-                    "recommendation": "consider changing approach"
-                }]
+                "schema": "test_advisory",
+                "evidence": "consider changing approach"
             }),
             round_index: 2,
             attempt_leased: false,
@@ -4285,7 +4281,7 @@ mod tests {
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[1]["role"], "system");
         let runtime_text = message_text(&msgs[1]);
-        assert!(runtime_text.contains("policy_advisory.v1"));
+        assert!(runtime_text.contains("test_advisory"));
         assert!(runtime_text.contains("consider changing approach"));
         assert!(runtime_text.contains("<runtime-decision-feedback>"));
         assert!(runtime_text.contains("\"kind\":\"policy_advisory\""));

@@ -1262,28 +1262,18 @@ fn build_introspect_snapshot_with_tool_admission(
         .map(|(name, turn)| format!("{name} @ turn {turn}"))
         .collect();
     let stall_state = astra_turn_core::introspect::StallSnapshotSummary {
-        nudge_count: state.stall.nudge_count,
         events,
         introspection_count: state.stall.introspection_count,
         advisory_signals: {
             let mut corrections = Vec::new();
-            if state.stall.execution_escalation_advisory_emitted {
-                corrections.push("execution_escalation".to_string());
-            }
             if state.stall.work_evidence_advisory_emitted {
                 corrections.push("work_evidence_sufficiency".to_string());
             }
             if state.stall.parallel_batching_advisory_emitted {
                 corrections.push("parallel_batching".to_string());
             }
-            if state.stall.repetition_advisory_emitted {
-                corrections.push("identical_signature_repetition".to_string());
-            }
             if state.stall.cache_waste_advisory_emitted {
                 corrections.push("cache_waste".to_string());
-            }
-            if state.stall.observation_reuse_advisory_emitted {
-                corrections.push("observation_reuse".to_string());
             }
             corrections
         },
@@ -1357,9 +1347,6 @@ fn build_introspect_snapshot_with_tool_admission(
     let forced = &stall_state.advisory_signals;
     if !forced.is_empty() {
         alerts.push(format!("advisory_signals: {}", forced.join(", ")));
-    }
-    if stall_state.nudge_count > 0 {
-        alerts.push(format!("stall_nudge_count={}", stall_state.nudge_count));
     }
     let recent_tool_failures = state.turn_guard.health.recent_errors(10).len();
     if recent_tool_failures > 0 {
@@ -1892,10 +1879,6 @@ pub struct StallTrackingState {
     /// descendant is dead; once such a receipt crosses the Edge/server
     /// boundary, later records must not silently clear the uncertainty.
     pub workspace_observation_quarantine: Option<WorkspaceObservationQuarantineV1>,
-    /// Whether a mid-loop execution escalation was injected after a mutating
-    /// task accumulated enough read-only tool calls without producing any
-    /// workspace mutation. One-shot per turn.
-    pub execution_escalation_advisory_emitted: bool,
     /// Whether the runtime asked the currently owned WorkItem to reassess
     /// evidence sufficiency after a sustained read-only evidence path. This
     /// is advisory only: long investigations retain full execution authority.
@@ -1905,9 +1888,6 @@ pub struct StallTrackingState {
     /// when the model has produced a long streak of consecutive single-tool
     /// rounds despite the soft prompt-layer nudge. One-shot per turn.
     pub parallel_batching_advisory_emitted: bool,
-    /// Whether exact-signature repetition was surfaced as advisory evidence
-    /// this turn. One-shot; never stops the loop.
-    pub repetition_advisory_emitted: bool,
     /// Monotonic count of circuit-breaker introspection (self-check) prompts
     /// injected this turn. Used for post-turn telemetry so operators can see
     /// how often the breaker nudged the model on long read-only sessions.
@@ -1922,18 +1902,6 @@ pub struct StallTrackingState {
     /// identical tool calls that are served from cache instead of reusing
     /// the earlier result. One-shot per turn.
     pub cache_waste_advisory_emitted: bool,
-    /// Whether a typed introspect/reflect request was repeated in a
-    /// contiguous observation-only tail without an intervening tool state
-    /// transition. One-shot per turn; this never suppresses observation
-    /// authority or reuses a potentially stale result.
-    pub observation_reuse_advisory_emitted: bool,
-    /// Index into `tool_call_records` at the current user-turn boundary.
-    /// Observation reuse is meaningful only within one turn; older records
-    /// remain available for audit but cannot seed a fresh guard decision.
-    pub observation_reuse_record_floor: usize,
-    /// How many stall correction nudges have been injected this loop.
-    /// Limits nudge frequency (at most one per stall type per session).
-    pub nudge_count: u32,
     /// Anomaly-based circuit breaker for the agentic loop.
     /// Replaces the old countdown-based round budget phase1/phase2 logic.
     pub circuit_breaker: astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker,
@@ -1950,12 +1918,6 @@ pub struct StallTrackingState {
 }
 
 impl StallTrackingState {
-    /// Start a fresh user-turn view without dropping the session audit ledger.
-    pub fn begin_fresh_user_turn(&mut self) {
-        self.observation_reuse_advisory_emitted = false;
-        self.observation_reuse_record_floor = self.tool_call_records.len();
-    }
-
     /// Whether *any* mid-loop advisory has already fired this turn. Guards
     /// use this to enforce the "one behavioral advisory per turn"
     /// invariant — stacking two guidance messages confuses the model and
@@ -1968,11 +1930,8 @@ impl StallTrackingState {
     #[inline]
     pub fn any_behavior_advisory_emitted(&self) -> bool {
         self.parallel_batching_advisory_emitted
-            || self.repetition_advisory_emitted
             || self.cache_waste_advisory_emitted
-            || self.execution_escalation_advisory_emitted
             || self.work_evidence_advisory_emitted
-            || self.observation_reuse_advisory_emitted
     }
 
     /// Whether any advisory was already emitted. Guards use this only to avoid
@@ -2619,10 +2578,6 @@ pub const RECENT_ROUNDS_RING_CAPACITY: usize = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VolatileKind {
-    /// Stall-reflection evidence (`build_stall_reflection`).
-    StallNudge,
-    /// Execution-pattern evidence for mutating-task read-only churn.
-    ExecutionEscalation,
     /// Observation that a tool batch executed in parallel.
     ToolBatchCoaching,
     /// Authoritative budget/turn/round context. Actual budget enforcement is
@@ -2770,9 +2725,7 @@ impl VolatileKind {
                 VolatileDeliveryClass::DecisionFeedback
             }
             Self::SelfStatus => VolatileDeliveryClass::TelemetryOnly,
-            Self::StallNudge
-            | Self::ExecutionEscalation
-            | Self::ToolBatchCoaching
+            Self::ToolBatchCoaching
             | Self::CircuitBreaker
             | Self::ContextPressure
             | Self::StopHookEvidence => VolatileDeliveryClass::AdvisoryEvidence,
@@ -14253,7 +14206,7 @@ mod parallel_execution_tests {
         // slate. Stale corrections leaking across rounds would bloat the
         // wire and break cache prefix.
         let mut state = make_state();
-        state.push_volatile(VolatileKind::StallNudge, "stale nudge from round 1");
+        state.push_volatile(VolatileKind::PolicyAdvisory, "stale advisory from round 1");
         let drained = state.take_volatile_pending();
         assert_eq!(drained.len(), 1, "precondition: one volatile queued");
         assert!(
@@ -14288,11 +14241,11 @@ mod parallel_execution_tests {
 
     #[test]
     fn different_volatile_kinds_coexist_on_wire() {
-        // Different kinds (StallNudge vs ContextPressure) are NOT singletons
+        // Different kinds (PolicyAdvisory vs ContextPressure) are NOT singletons
         // relative to each other — they coexist so the model sees all
         // runtime signals. Only same-kind pushes replace.
         let mut state = make_state();
-        state.push_volatile(VolatileKind::StallNudge, "stall warning");
+        state.push_volatile(VolatileKind::PolicyAdvisory, "policy evidence");
         state.push_volatile(VolatileKind::ContextPressure, "pressure 70");
         assert_eq!(
             state.volatile_pending.len(),

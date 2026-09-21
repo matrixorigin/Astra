@@ -198,6 +198,7 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("mo_query", RO, MO),
     // ── Agent info / reflection (read-only) ──────────────────────────
     tool("get_agent_info", RO, C),
+    tool("introspect", RO, C),
     tool("reflect", RO, C),
     tool("inspect_work_plan", RO, C.union(OR)),
     tool("inspect_work_criteria", RO, C.union(OR)),
@@ -1510,6 +1511,15 @@ mod tests {
             "consultative tools must be restrictable for stall avoidance"
         );
         assert!(c.exploration, "consultative tools count as exploration");
+    }
+
+    #[test]
+    fn classify_introspect_is_read_only_and_parallelizable() {
+        let c = classify_name("introspect");
+        assert_eq!(c.category, ToolCategory::ReadOnly);
+        assert!(c.parallelizable);
+        assert!(c.compactable);
+        assert!(!c.approval_required);
     }
 
     #[test]

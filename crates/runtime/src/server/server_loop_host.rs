@@ -1330,22 +1330,26 @@ fn auxiliary_llm_policy_label() -> &'static str {
     AuxiliaryLlmPolicy::from_env().as_label()
 }
 
-/// Work admission is the semantic lifecycle classifier. The adaptive default
-/// starts one bounded decision beside every eligible unbound primary Auto
-/// turn. `boundary_only` is the explicit lower-latency opt-out that waits for
-/// an effect/topology boundary. A provider `start_work` carrier is a typed
-/// payload; any available decision is settled before canonical admission.
-/// With no configured judge or no usable result, normal typed admission remains.
+/// Work admission is the semantic lifecycle classifier. The capacity-aware
+/// default spends a bounded decision at an existing typed effect/topology
+/// boundary, where the result has an immediate admission consumer. It does
+/// not speculate beside an ordinary unbound primary turn. `always` is the
+/// explicit high-frequency mode for deployments that want that speculation;
+/// `boundary_only` additionally suppresses unrelated optional auxiliaries.
+/// A provider `start_work` carrier is a typed payload; any available decision
+/// is settled before canonical admission. With no configured judge or no
+/// usable result, normal typed admission remains.
 fn should_skip_work_admission_judge(
     admission_boundary: bool,
-    _topology_boundary: bool,
+    topology_boundary: bool,
 ) -> Option<&'static str> {
     match AuxiliaryLlmPolicy::from_env() {
-        AuxiliaryLlmPolicy::BoundaryOnly if admission_boundary => None,
+        AuxiliaryLlmPolicy::BoundaryOnly if admission_boundary || topology_boundary => None,
         AuxiliaryLlmPolicy::BoundaryOnly => Some("ordinary_primary_turn"),
         AuxiliaryLlmPolicy::Disabled => Some("disabled"),
         AuxiliaryLlmPolicy::Always => None,
-        AuxiliaryLlmPolicy::CapacityAware => None,
+        AuxiliaryLlmPolicy::CapacityAware if admission_boundary || topology_boundary => None,
+        AuxiliaryLlmPolicy::CapacityAware => Some("ordinary_primary_turn"),
     }
 }
 
@@ -8598,13 +8602,12 @@ impl ServerAgenticLoopHost {
         skill_revision
     }
 
-    /// Start the built-in Work classifier for a primary turn or for a typed
-    /// executable boundary. The adaptive default starts the primary-turn
-    /// decision when capacity permits; an explicit `boundary_only` policy
-    /// keeps ordinary text on the single-request path. The boundary call is
-    /// always the fallback before a tool/control effect is admitted. Both
-    /// paths share the same bounded typed decision and never inspect prompt
-    /// text.
+    /// Start the built-in Work classifier for a typed executable boundary.
+    /// CapacityAware and BoundaryOnly both keep an ordinary unbound primary
+    /// turn on the single-request path; Always is the explicit speculative
+    /// mode. The boundary call is the fallback before a tool/control effect is
+    /// admitted. All paths share the same bounded typed decision and never
+    /// inspect prompt text.
     async fn start_work_admission_preflight(
         &mut self,
         state: &AgenticLoopState,
@@ -18675,11 +18678,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             return outcome;
         }
 
-        // Auto starts bounded semantic admission in parallel with the primary
-        // request. CapacityAware is the documented default; BoundaryOnly is
-        // the explicit policy that waits for a typed provider boundary. If no
-        // durable inference material is available, action and completion both
-        // fail closed below.
+        // Auto may start bounded semantic admission in parallel with the
+        // primary request only in the explicit Always policy. The default
+        // waits until a typed provider boundary has an immediate admission
+        // consumer. If no durable inference material is available, action
+        // and completion both fail closed below.
         if self
             .start_work_admission_preflight(state, false, false)
             .await
@@ -48975,7 +48978,7 @@ mod tests {
 
         #[test]
         #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-        fn auxiliary_llm_policy_defaults_to_outer_work_admission() {
+        fn auxiliary_llm_policy_defaults_to_boundary_work_admission() {
             let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
             let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
 
@@ -48985,8 +48988,8 @@ mod tests {
             );
             assert_eq!(
                 should_skip_work_admission_judge(false, false),
-                None,
-                "default Auto must start one outer semantic sidecar"
+                Some("ordinary_primary_turn"),
+                "the default must not speculate beside an ordinary primary turn"
             );
             assert_eq!(should_skip_work_admission_judge(true, false), None);
             assert_eq!(should_skip_work_admission_judge(true, true), None);
@@ -49010,19 +49013,20 @@ mod tests {
                 Some("ordinary_primary_turn")
             );
             assert_eq!(should_skip_work_admission_judge(true, false), None);
+            assert_eq!(should_skip_work_admission_judge(false, true), None);
         }
 
         #[test]
         #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-        fn capacity_aware_starts_outer_work_admission_even_with_provider_quota() {
+        fn capacity_aware_waits_for_a_work_boundary_even_with_provider_quota() {
             let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "capacity_aware");
             let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
             let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
 
             assert_eq!(
                 should_skip_work_admission_judge(false, false),
-                None,
-                "capacity admission must reject explicitly, not silently downgrade Auto"
+                Some("ordinary_primary_turn"),
+                "capacity-aware Work admission must wait for an existing boundary"
             );
             assert_eq!(should_skip_work_admission_judge(true, false), None);
             assert_eq!(
@@ -49030,6 +49034,7 @@ mod tests {
                 None,
                 "fanout remains one of the structural ambiguities the Work judge resolves"
             );
+            assert_eq!(should_skip_work_admission_judge(false, true), None);
 
             let _disabled = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "disabled");
             assert_eq!(
@@ -49206,7 +49211,9 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn ordinary_primary_turn_marks_missing_work_admission_unavailable() {
+        #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+        async fn ordinary_primary_turn_defers_work_admission_without_a_boundary() {
+            let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
             let mut host = ServerAgenticLoopHostBuilder::new(
                 mock_matrixone(),
                 mock_encryptor(),
@@ -49225,10 +49232,10 @@ mod tests {
             );
             assert!(
                 host.pending_work_admission_judge.is_none(),
-                "missing admitted model material cannot create a judge task"
+                "an ordinary primary turn must not create a speculative judge task"
             );
-            assert!(host.work_admission_attempted);
-            assert!(host.work_admission_unavailable);
+            assert!(!host.work_admission_attempted);
+            assert!(!host.work_admission_unavailable);
         }
 
         #[tokio::test]

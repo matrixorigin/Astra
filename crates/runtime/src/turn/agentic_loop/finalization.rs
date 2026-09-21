@@ -980,12 +980,9 @@ fn reset_per_turn_advisory_state(state: &mut AgenticLoopState) {
             state.stall.work_unit_observations.observe(&observation);
         }
     }
-    state.stall.execution_escalation_advisory_emitted = false;
     state.stall.work_evidence_advisory_emitted = false;
     state.stall.parallel_batching_advisory_emitted = false;
-    state.stall.repetition_advisory_emitted = false;
     state.stall.cache_waste_advisory_emitted = false;
-    state.stall.begin_fresh_user_turn();
     state.stall.active_policy_feedback = Default::default();
     state.stall.runtime_policy_evaluation = Default::default();
     state.hooks.completion_settlement = Default::default();

@@ -223,11 +223,6 @@ pub struct BudgetPolicyConfig {
     /// Absolute ceiling: budget never exceeds this regardless of expansions.
     #[serde(default = "default_max_ceiling")]
     pub max_ceiling: u32,
-
-    /// Inject a corrective signal after this many consecutive rounds with
-    /// zero observable outcome.
-    #[serde(default = "default_reflect_after_consecutive_zero")]
-    pub reflect_after_consecutive_zero: u32,
 }
 
 fn default_expand_after_consecutive_outcomes() -> u32 {
@@ -239,9 +234,6 @@ fn default_expand_factor() -> f64 {
 fn default_max_ceiling() -> u32 {
     1000
 }
-fn default_reflect_after_consecutive_zero() -> u32 {
-    3
-}
 
 impl Default for BudgetPolicyConfig {
     fn default() -> Self {
@@ -249,7 +241,6 @@ impl Default for BudgetPolicyConfig {
             expand_after_consecutive_outcomes: default_expand_after_consecutive_outcomes(),
             expand_factor: default_expand_factor(),
             max_ceiling: default_max_ceiling(),
-            reflect_after_consecutive_zero: default_reflect_after_consecutive_zero(),
         }
     }
 }
@@ -3138,7 +3129,6 @@ mod tests {
                 expand_after_consecutive_outcomes: 4,
                 expand_factor: 2.0,
                 max_ceiling: 1200,
-                reflect_after_consecutive_zero: 5,
             }),
             explain: ExplainConfig {
                 live_rows: Some(3),
@@ -3221,7 +3211,6 @@ mod tests {
         assert_eq!(budget_policy.expand_after_consecutive_outcomes, 4);
         assert!((budget_policy.expand_factor - 2.0).abs() < f64::EPSILON);
         assert_eq!(budget_policy.max_ceiling, 1200);
-        assert_eq!(budget_policy.reflect_after_consecutive_zero, 5);
     }
 
     #[test]

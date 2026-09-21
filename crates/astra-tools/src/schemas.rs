@@ -2040,7 +2040,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "introspect",
-                "description": "Read bounded live runtime/session observations or a persisted tool-result artifact. Use before auditing current token/cache pressure, latency, tool health/errors, rounds, traces, stall/noise, working memory, or lifecycle/resume state. Start with facet=overview and depth=summary; use hint for a quick check. Escalate depth or target another facet only for a concrete evidence gap or a requested deep audit. Live horizons are not historical truth; use reflect for persisted causal evidence. With artifact, read the session-scoped handle from offset for max_bytes.",
+                "description": "Read bounded live/runtime observations or a persisted tool-result artifact. Start with facet=overview and depth=summary; use hint for quick checks. Do not repeat an identical introspect request unless state or a requested deep audit changed; a cached repeat adds no evidence. Live horizons are not historical truth; use reflect for persisted causal evidence. `urn:astra:observation:*` and `urn:astra:evidence:*` are citations, not artifact handles. Use `artifact://session/tool-result/<opaque_token>` for artifacts; omit it for live state.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2052,9 +2052,9 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "source_policy": {"type": "string", "enum": ["auto","live_only","live_first","durable_first","local_only","cloud_only"], "description": "Source preference; unavailable coverage is reported."},
                         "include_context": {"type": "boolean", "description": "Include available observed prompt/context facts."},
                         "format": {"type": "string", "enum": ["text","json"], "description": "Output format; default text."},
-                        "artifact": {"type": "string", "description": "Session-scoped artifact handle; when set, read it instead of live state."},
+                        "artifact": {"type": "string", "description": "Artifact handle only: `artifact://session/tool-result/<opaque_token>`; observation/evidence URNs are citations, not handles."},
                         "offset": {"type": "integer", "minimum": 0, "description": "Artifact byte offset; default 0."},
-                        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 65536, "description": "Artifact window bytes; default 8192, max 65536."}
+                        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 65536, "description": "Artifact window bytes."}
                     },
                     "additionalProperties": false
                 }
@@ -3302,6 +3302,9 @@ mod tests {
         assert!(description.contains("depth=summary"));
         assert!(!description.contains("depth=diagnostic"));
         assert!(description.contains("requested deep audit"));
+        assert!(description.contains("cached repeat adds no evidence"));
+        assert!(description.contains("urn:astra:observation:*"));
+        assert!(description.contains("artifact://session/tool-result/<opaque_token>"));
         let properties = introspect["function"]["parameters"]["properties"]
             .as_object()
             .expect("introspect parameters properties must be an object");

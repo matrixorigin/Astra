@@ -78,6 +78,35 @@ pub fn journal_record_cross_turn_cache_hit(
     args_preview: Option<String>,
     cached_body: Option<&str>,
 ) -> ToolCallRecord {
+    journal_record_cross_turn_cache_hit_with_evidence(
+        tool_call_id,
+        name,
+        output_len,
+        args_preview,
+        cached_body,
+        None,
+        None,
+    )
+}
+
+/// Record a cross-turn cache hit together with the bounded, model-visible
+/// request/result identity needed by the online observation evaluator.
+///
+/// `cached_body` is presentation-only and may describe a suppressed request;
+/// `delivered_body` is set only when the cached result was actually returned to
+/// the model. Keeping those lanes separate prevents a suppression message from
+/// masquerading as delivered evidence.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn journal_record_cross_turn_cache_hit_with_evidence(
+    tool_call_id: String,
+    name: String,
+    output_len: u32,
+    args_preview: Option<String>,
+    cached_body: Option<&str>,
+    args_full: Option<String>,
+    delivered_body: Option<&str>,
+) -> ToolCallRecord {
     let preview = format_cross_turn_cache_hit_preview(output_len, cached_body);
     ToolCallRecord {
         tool_call_id: Some(tool_call_id),
@@ -93,6 +122,13 @@ pub fn journal_record_cross_turn_cache_hit(
         surgically_removed: None,
         original_tool_name: None,
         result_class: Some(NOOP_OR_CACHED_RESULT_CLASS.to_string()),
+        args_full,
+        runtime_model_result_full: delivered_body
+            .filter(|body| !body.is_empty())
+            .map(ToString::to_string),
+        result_full: delivered_body
+            .filter(|body| !body.is_empty())
+            .map(bounded_journal_result),
         disposition: Some(ToolCallDisposition::Reused),
         ..Default::default()
     }
@@ -435,6 +471,48 @@ mod tests {
         assert!(
             preview.contains("fn main"),
             "preview should include a snippet of the cached content for forensics: {preview:?}"
+        );
+    }
+
+    #[test]
+    fn cache_hit_evidence_keeps_delivery_identity_separate_from_preview() {
+        let record = journal_record_cross_turn_cache_hit_with_evidence(
+            "call-cache".into(),
+            "introspect".into(),
+            120,
+            Some("overview".into()),
+            Some("suppressed or preview text"),
+            Some(r#"{"facet":"overview"}"#.into()),
+            Some(
+                r#"{"evidence_revision":"v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","covered_facets":[]}"#,
+            ),
+        );
+        assert_eq!(record.effective_disposition(), ToolCallDisposition::Reused);
+        assert_eq!(record.args_full.as_deref(), Some(r#"{"facet":"overview"}"#));
+        assert!(
+            record.result_full.is_some(),
+            "delivered cache evidence is retained"
+        );
+        assert_eq!(
+            record.runtime_model_result_full.as_deref(),
+            Some(
+                r#"{"evidence_revision":"v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","covered_facets":[]}"#
+            ),
+            "live evidence must retain the delivered body separately from its bounded durable form"
+        );
+
+        let suppressed = journal_record_cross_turn_cache_hit_with_evidence(
+            "call-suppressed".into(),
+            "introspect".into(),
+            80,
+            Some("overview".into()),
+            Some("repeated cache hit suppressed"),
+            Some(r#"{"facet":"overview"}"#.into()),
+            None,
+        );
+        assert!(
+            suppressed.result_full.is_none(),
+            "a suppression message must not masquerade as delivered observation evidence"
         );
     }
 

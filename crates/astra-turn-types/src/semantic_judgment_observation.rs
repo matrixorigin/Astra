@@ -149,6 +149,7 @@ pub enum RequestJudgmentMutationV1 {
     ReadOnly,
     MayMutate,
     MustMutate,
+    Unknown,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -274,6 +275,7 @@ impl SemanticJudgmentFactV1 {
                         RequestJudgmentMutationV1::ReadOnly => "read-only work",
                         RequestJudgmentMutationV1::MayMutate => "work may make changes",
                         RequestJudgmentMutationV1::MustMutate => "changes required",
+                        RequestJudgmentMutationV1::Unknown => "mutation intent unknown",
                     }
                 };
                 format!("Classify request · {outcome}")

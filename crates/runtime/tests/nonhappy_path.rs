@@ -125,35 +125,33 @@ mod turn_guard_integration {
         assert!(!verdict.advisory_threshold_reached);
     }
 
-    /// Proves: stall + tool health compose correctly
+    /// Signature repetition must not amplify independent tool-health recovery.
     #[test]
     fn stall_and_health_compose() {
-        let mut guard = TurnGuard::new();
-
-        // 3 consecutive failures on a dedicated tool → health avoidance.
-        // Shell command failures do not poison the generic shell surface.
-        guard.record_tool_result("write_file", "Error: permission denied");
-        guard.record_tool_result("write_file", "Error: permission denied");
-        guard.record_tool_result("write_file", "Error: permission denied");
-
-        // Same tool call three times → stall (window=3)
+        let mut repeated = TurnGuard::new();
+        let mut baseline = TurnGuard::new();
+        for guard in [&mut repeated, &mut baseline] {
+            for _ in 0..3 {
+                guard.record_tool_result("write_file", "Error: permission denied");
+            }
+        }
         let calls = [tool_call(
             "write_file",
             r#"{"path":"x.rs","content":"same"}"#,
         )];
-        guard.record_tool_calls(&calls);
-        guard.record_tool_calls(&calls);
-        guard.record_tool_calls(&calls);
-
-        let verdict = guard.evaluate();
-        assert!(verdict.severity >= VerdictSeverity::Warning);
-        // Both stall nudge AND health warning should be present
-        assert!(
-            verdict.injections.len() >= 2,
-            "Should have both stall nudge and health warning, got: {:?}",
-            verdict.injections
-        );
-        assert!(verdict.avoid_tools.contains(&"write_file".to_string()));
+        for _ in 0..3 {
+            repeated.record_tool_calls(&calls);
+        }
+        let actual = repeated.evaluate();
+        let expected = baseline.evaluate();
+        assert!(actual.stall_detected);
+        assert!(actual.severity >= VerdictSeverity::Warning);
+        assert!(actual.avoid_tools.contains(&"write_file".to_string()));
+        assert_eq!(actual.severity, expected.severity);
+        assert_eq!(actual.injections, expected.injections);
+        assert_eq!(actual.avoid_tools, expected.avoid_tools);
+        assert_eq!(repeated.nudge_count, baseline.nudge_count);
+        assert_eq!(repeated.recovery_evidence(), baseline.recovery_evidence());
     }
 
     /// Proves: escalation reaches critical after multiple nudges
@@ -733,104 +731,68 @@ mod chat_stream_turnguard_e2e {
 
     // ── Stall scenarios ──
 
-    /// Exact same tool call repeatedly → stall evidence emitted without
-    /// consuming the explicit turn budget. AvoidTools remains advisory.
+    /// Legitimate repeated validation/read batches retain facts, not penalties.
     #[test]
-    fn identical_tool_call_stall_full_flow() {
-        let mut guard = TurnGuard::new();
-        let mut restricted = HashSet::new();
-
-        let call = tc("bash", r#"{"command":"ls -la"}"#);
-        guard.record_tool_calls(std::slice::from_ref(&call));
-        guard.record_tool_result("bash", "file1.rs\nfile2.rs");
-        let v1 = guard.evaluate();
-        assert_eq!(v1.severity, VerdictSeverity::Healthy);
-
-        // Repeat exact same call twice more (need 3 for window=3)
-        guard.record_tool_calls(std::slice::from_ref(&call));
-        guard.record_tool_result("bash", "file1.rs\nfile2.rs");
-        guard.record_tool_calls(std::slice::from_ref(&call));
-        guard.record_tool_result("bash", "file1.rs\nfile2.rs");
-        let v2 = guard.evaluate();
-
-        // Stall must be detected
-        assert!(v2.severity >= VerdictSeverity::Warning, "stall expected");
-        assert!(!v2.injections.is_empty(), "stall nudge expected");
-        assert!(
-            v2.injections.iter().any(|m| m.contains("REFLECTION")),
-            "should contain structured reflection"
-        );
-
-        let (remaining, events, _) = observe_verdict(&v2, 25, &mut restricted);
-        assert_eq!(
-            remaining, 25,
-            "behavior advisories must not consume turn budget"
-        );
-        assert!(!events.is_empty());
-
-        // Third identical call pushes count to 3 → tool gets added to avoid list
-        guard.record_tool_calls(std::slice::from_ref(&call));
-        guard.record_tool_result("bash", "file1.rs\nfile2.rs");
-        let v3 = guard.evaluate();
-        assert!(
-            v3.avoid_tools.contains(&"bash".to_string()),
-            "3+ occurrences should add tool to avoid list"
-        );
+    fn repeated_successful_batches_preserve_budget_without_guard_pressure() {
+        for batch in [
+            vec![tc("bash", r#"{"command":"cargo check"}"#)],
+            vec![
+                tc("read_file", r#"{"path":"a.rs"}"#),
+                tc("read_file", r#"{"path":"b.rs"}"#),
+                tc("read_file", r#"{"path":"c.rs"}"#),
+            ],
+        ] {
+            let mut guard = TurnGuard::new();
+            let mut restricted = HashSet::new();
+            for round in 1..=24 {
+                guard.record_tool_calls(&batch);
+                for call in &batch {
+                    let name = call["function"]["name"].as_str().unwrap();
+                    guard.record_tool_result(name, "successful observation");
+                }
+                let verdict = guard.evaluate();
+                assert_eq!(verdict.stall_detected, round >= 3);
+                assert_eq!(verdict.severity, VerdictSeverity::Healthy);
+                assert!(verdict.injections.is_empty());
+                assert!(verdict.avoid_tools.is_empty());
+                assert_eq!(guard.nudge_count, 0);
+                assert_eq!(guard.recovery_evidence(), None);
+                let (remaining, events, threshold) = observe_verdict(&verdict, 25, &mut restricted);
+                assert_eq!(remaining, 25);
+                assert!(events.is_empty());
+                assert!(!threshold);
+                assert!(restricted.is_empty());
+            }
+            assert!(guard.evaluate().is_diverging);
+        }
     }
 
-    /// Stall recovery: after stall nudge, using a DIFFERENT tool resets stall state.
+    /// A changed observation breaks exact repetition without a correction cycle.
     #[test]
-    fn stall_recovery_with_different_tool() {
+    fn distinct_read_breaks_signature_repetition() {
         let mut guard = TurnGuard::new();
+        let call = tc("read_file", r#"{"path":"config.yaml"}"#);
+        for _ in 0..3 {
+            guard.record_tool_calls(std::slice::from_ref(&call));
+            guard.record_tool_result("read_file", "key: value");
+        }
+        let repeated = guard.evaluate();
+        assert!(repeated.stall_detected);
+        assert_eq!(repeated.severity, VerdictSeverity::Healthy);
+        assert!(repeated.injections.is_empty());
 
-        // Turn 1-3: stall (need 3 identical calls for window=3)
-        let call = tc("bash", r#"{"command":"cat config.yaml"}"#);
-        guard.record_tool_calls(std::slice::from_ref(&call));
-        guard.record_tool_result("bash", "key: value");
-        guard.record_tool_calls(std::slice::from_ref(&call));
-        guard.record_tool_result("bash", "key: value");
-        guard.record_tool_calls(std::slice::from_ref(&call));
-        guard.record_tool_result("bash", "key: value");
-        let v = guard.evaluate();
-        assert!(v.severity >= VerdictSeverity::Warning);
-
-        // Turn 3: different productive tool
-        guard.record_tool_calls(&[tc("write_file", r#"{"path":"x","content":"y"}"#)]);
-        guard.record_tool_result("write_file", r#"{"ok":true}"#);
-        let v = guard.evaluate();
-        // Should not be a stall anymore (different tool call)
-        // Severity may still be elevated due to escalation from the nudge count,
-        // but the stall-specific REFLECTION injection should not fire again
-        let has_stall_reflection = v.injections.iter().any(|m| m.contains("REFLECTION"));
-        assert!(
-            !has_stall_reflection,
-            "stall should not re-fire after recovery"
-        );
+        guard.record_tool_calls(&[tc("read_file", r#"{"path":"README.md"}"#)]);
+        guard.record_tool_result("read_file", "# README");
+        let changed = guard.evaluate();
+        assert!(!changed.stall_detected);
+        assert!(!changed.is_diverging);
+        assert_eq!(changed.severity, VerdictSeverity::Healthy);
+        assert!(changed.injections.is_empty());
+        assert!(changed.avoid_tools.is_empty());
+        assert_eq!(guard.nudge_count, 0);
     }
 
     // ── Divergence scenarios ──
-
-    /// P2.5: exact-signature loop → DIVERGENCE_CORRECTION injected.
-    #[test]
-    fn exploration_divergence_triggers_correction() {
-        let mut guard = TurnGuard::new();
-
-        // Genuine loop: same tool + identical args repeated 5 times.
-        for _ in 0..5 {
-            guard.record_tool_calls(&[tc("bash", r#"{"command":"find . -name *.rs"}"#)]);
-            guard.record_tool_result("bash", "src/main.rs\nsrc/lib.rs");
-        }
-
-        let v = guard.evaluate();
-        assert!(
-            v.injections
-                .iter()
-                .any(|m| m.contains("same tool calls") || m.contains("same arguments")),
-            "divergence correction should fire on exact-sig loop: {:?}",
-            v.injections
-        );
-        assert!(v.severity >= VerdictSeverity::Warning);
-    }
 
     /// P2.5: diverse exploration tools across many rounds → Healthy.
     #[test]
@@ -851,18 +813,14 @@ mod chat_stream_turnguard_e2e {
             guard.record_tool_result(tool, "ok");
         }
         let v = guard.evaluate();
-        assert!(
-            !v.injections
-                .iter()
-                .any(|m| m.contains("same tool calls") || m.contains("STOP exploring")),
-            "diverse exploration must NOT trigger divergence: {:?}",
-            v.injections
-        );
+        assert!(!v.is_diverging);
+        assert_eq!(v.severity, VerdictSeverity::Healthy);
+        assert!(v.injections.is_empty());
     }
 
-    /// Productive tool breaks divergence streak.
+    /// Distinct calls remain observationally diverse regardless of tool category.
     #[test]
-    fn productive_tool_breaks_divergence() {
+    fn mixed_read_and_write_calls_remain_diverse() {
         let mut guard = TurnGuard::new();
 
         // 2 exploration rounds
@@ -871,16 +829,14 @@ mod chat_stream_turnguard_e2e {
         guard.record_tool_calls(&[tc("read_file", r#"{"path":"a.rs"}"#)]);
         guard.record_tool_result("read_file", "code");
 
-        // Productive tool (non-exploration)
+        // A distinct write call, not a privileged "productive" category.
         guard.record_tool_calls(&[tc("write_file", r#"{"path":"a.rs","content":"new"}"#)]);
         guard.record_tool_result("write_file", r#"{"ok":true}"#);
 
         let v = guard.evaluate();
-        let has_divergence = v
-            .injections
-            .iter()
-            .any(|m| m.contains("same tool calls") || m.contains("STOP exploring"));
-        assert!(!has_divergence, "productive tool should break divergence");
+        assert!(!v.is_diverging);
+        assert_eq!(v.severity, VerdictSeverity::Healthy);
+        assert!(v.injections.is_empty());
     }
 
     // ── Tool health scenarios ──
@@ -992,13 +948,13 @@ mod chat_stream_turnguard_e2e {
         guard.record_tool_result("write_file", r#"{"output":"ok"}"#);
         assert!(!guard.health.is_avoidance_advised("write_file"));
 
-        // Next evaluation should not list write_file in avoid (from health)
-        // Note: it might still appear from escalation/stall — we test health specifically
+        // Recovery clears health caution; signature observations cannot restore it.
         let health_avoidance_tools = guard.health.health_avoidance_tools();
         assert!(
             !health_avoidance_tools.contains(&"write_file"),
             "rehabilitated tool not in health avoidance list"
         );
+        assert!(guard.evaluate().avoid_tools.is_empty());
     }
 
     /// Multiple tools fail independently → each tracked separately.
@@ -1068,60 +1024,6 @@ mod chat_stream_turnguard_e2e {
     }
 
     // ── Escalation evidence strength ──
-
-    /// Full escalation path: normal → warning → critical → advisory_threshold_reached.
-    /// Now Critical requires nudges + errors (pure nudges stay at Warning).
-    #[test]
-    fn escalation_path_to_advisory_threshold_reached() {
-        let mut guard = TurnGuard::new();
-        let mut restricted = HashSet::new();
-        let mut budget = 25usize;
-
-        // Phase 1: first stall (need 3 identical calls for window=3)
-        let call = tc("bash", r#"{"command":"echo hi"}"#);
-        guard.record_tool_calls(std::slice::from_ref(&call));
-        guard.record_tool_calls(std::slice::from_ref(&call));
-        guard.record_tool_calls(std::slice::from_ref(&call));
-        let v = guard.evaluate();
-        assert_eq!(guard.nudge_count, 1);
-        let (b, _, _) = observe_verdict(&v, budget, &mut restricted);
-        budget = b;
-        assert_eq!(budget, 25, "warning evidence must preserve explicit budget");
-
-        // Phase 2: more stalls to accumulate nudges
-        for _ in 0..3 {
-            guard.record_tool_calls(std::slice::from_ref(&call));
-            let v = guard.evaluate();
-            let (b, _, _) = observe_verdict(&v, budget, &mut restricted);
-            budget = b;
-        }
-        assert!(guard.nudge_count >= 3);
-
-        // Phase 3: pure nudges → only Warning (not Critical without errors)
-        let v = guard.evaluate();
-        assert!(
-            !v.advisory_threshold_reached,
-            "pure nudges without errors must remain below the strong-advisory threshold"
-        );
-
-        // Phase 4: add tool errors to couple with nudges → first Critical evidence
-        guard.record_tool_result("bash", "error: no such file");
-        guard.record_tool_result("bash", "error: not found");
-        guard.record_tool_result("bash", "Error: unexpected failure");
-        let v = guard.evaluate();
-        assert_eq!(v.severity, VerdictSeverity::Critical);
-        assert!(
-            !v.advisory_threshold_reached,
-            "first Critical remains below the strong-advisory threshold"
-        );
-
-        // Phase 5: second consecutive Critical → stronger advisory evidence
-        let v2 = guard.evaluate();
-        assert!(
-            v2.advisory_threshold_reached,
-            "second consecutive Critical reaches the strong-advisory threshold"
-        );
-    }
 
     /// Critical observations increase evidence strength without restricting tools.
     #[test]
@@ -1202,44 +1104,6 @@ mod chat_stream_turnguard_e2e {
         assert_eq!(r, 3);
     }
 
-    // ── Nudge-ignore detection ──
-
-    /// If stall nudge says to change approach for bash (after 3+ occurrences),
-    /// but next turn uses bash again → retry-caution warning injected without
-    /// implying the tool is disabled.
-    #[test]
-    fn nudge_ignore_detection() {
-        let mut guard = TurnGuard::new();
-
-        // Turn 1-3: stall on bash (3 identical calls → retry caution includes bash)
-        let bash_call = tc("bash", r#"{"command":"ls"}"#);
-        guard.record_tool_calls(std::slice::from_ref(&bash_call));
-        guard.record_tool_calls(std::slice::from_ref(&bash_call));
-        guard.record_tool_calls(std::slice::from_ref(&bash_call));
-        let v = guard.evaluate();
-        assert!(v.severity >= VerdictSeverity::Warning);
-        assert!(
-            v.avoid_tools.contains(&"bash".to_string()),
-            "3 occurrences should add bash to avoid list"
-        );
-
-        // Turn 4: ignore the advice, use bash again (different args → not same signature)
-        guard.record_tool_calls(&[tc("bash", r#"{"command":"cat README.md"}"#)]);
-        guard.record_tool_result("bash", "# README\ncontent");
-        let v = guard.evaluate();
-
-        // Should detect nudge-ignore while preserving the "not disabled" tool model.
-        let has_nudge_ignore_warning = v.injections.iter().any(|m| {
-            m.contains("prior correction asked you to change approach")
-                && m.contains("[bash]")
-                && m.contains("tools are not disabled unless a restricted_tool result says so")
-        });
-        assert!(
-            has_nudge_ignore_warning,
-            "should warn when LLM ignores nudge advice"
-        );
-    }
-
     // ── Cross-session health restore ──
 
     /// TurnGuard created with pre-existing health data preserves health avoidance.
@@ -1270,67 +1134,40 @@ mod chat_stream_turnguard_e2e {
 
     // ── Mixed multi-turn scenario ──
 
-    /// Full 6-turn mixed scenario: success → error → stall → recovery → diverge → productive.
+    /// Repeated failed operations preserve recovery evidence until actual success.
     #[test]
-    fn mixed_six_turn_realistic_session() {
+    fn repeated_failed_tool_recovers_without_signature_pressure() {
         let mut guard = TurnGuard::new();
         let mut restricted = HashSet::new();
-        let mut budget = 25usize;
+        let call = tc("write_file", r#"{"path":"x.rs","content":"updated"}"#);
 
-        // Turn 1: successful git
-        guard.record_tool_calls(&[tc("bash", r#"{"command":"git log -5 --oneline"}"#)]);
-        guard.record_tool_result("bash", r#"[{"sha":"a1b2c3"}]"#);
-        let v = guard.evaluate();
-        assert_eq!(v.severity, VerdictSeverity::Healthy);
+        for _ in 0..3 {
+            guard.record_tool_calls(std::slice::from_ref(&call));
+            guard.record_tool_result("write_file", "Error: permission denied");
+            guard.evaluate();
+        }
+        let evidence = guard.recovery_evidence().expect("current failure evidence");
+        assert!(evidence.cautioned_tools.contains(&"write_file".to_string()));
+        assert!(evidence.error_pressure > 0);
 
-        // Turn 2: mo_query fails
-        guard.record_tool_calls(&[tc("mo_query", r#"{"sql":"SELECT 1"}"#)]);
-        guard.record_tool_result("mo_query", "Error: connection refused");
-        let v = guard.evaluate();
-        // One error is not enough for warning escalation
-        assert!(v.severity <= VerdictSeverity::Info);
-
-        // Turn 3: mo_query fails again (same call, but window=3 needs one more)
-        guard.record_tool_calls(&[tc("mo_query", r#"{"sql":"SELECT 1"}"#)]);
-        guard.record_tool_result("mo_query", "Error: connection refused");
-        let v = guard.evaluate();
-        // 2 identical calls → below window=3, no stall yet
-        // But 2 errors may push toward warning via error count
-        assert!(v.severity <= VerdictSeverity::Info);
-
-        // Turn 3b: third identical mo_query → stall detected!
-        guard.record_tool_calls(&[tc("mo_query", r#"{"sql":"SELECT 1"}"#)]);
-        guard.record_tool_result("mo_query", "Error: connection refused");
-        let v = guard.evaluate();
-        assert!(
-            v.severity >= VerdictSeverity::Warning,
-            "stall on failing tool after 3 identical calls"
-        );
-        let (b, _, _) = observe_verdict(&v, budget, &mut restricted);
-        budget = b;
-
-        // Turn 4: recovery — different tool, success
-        guard.record_tool_calls(&[tc("web_search", r#"{"query":"Astra open pull requests"}"#)]);
-        guard.record_tool_result("web_search", r#"[{"id":42}]"#);
-        let v = guard.evaluate();
-        // May still have escalation warning from nudge_count=1, but no new stall
-        let has_stall = v.injections.iter().any(|m| m.contains("REFLECTION"));
-        assert!(!has_stall, "no stall after recovery");
-
-        // Turn 5: exploration (bash)
-        guard.record_tool_calls(&[tc("bash", r#"{"command":"find . -name *.rs"}"#)]);
-        guard.record_tool_result("bash", "src/main.rs");
-
-        // Turn 6: more exploration (read_file) — could trigger divergence depending on history
-        guard.record_tool_calls(&[tc("read_file", r#"{"path":"src/main.rs"}"#)]);
-        guard.record_tool_result("read_file", "fn main() {}");
-        let v = guard.evaluate();
-
-        assert_eq!(budget, 25, "behavior evidence must not consume budget");
-        assert!(
-            !v.advisory_threshold_reached,
-            "mixed session should remain below the strong-advisory threshold"
-        );
+        // Retry the same operation successfully: repetition cannot retain old pressure.
+        for _ in 0..4 {
+            guard.record_tool_calls(std::slice::from_ref(&call));
+            guard.record_tool_result("write_file", r#"{"written":true}"#);
+            let verdict = guard.evaluate();
+            assert!(verdict.stall_detected);
+            assert_eq!(verdict.severity, VerdictSeverity::Healthy);
+            assert!(verdict.injections.is_empty());
+            assert!(verdict.avoid_tools.is_empty());
+            let (remaining, events, threshold) = observe_verdict(&verdict, 25, &mut restricted);
+            assert_eq!(remaining, 25);
+            assert!(events.is_empty());
+            assert!(!threshold);
+        }
+        assert_eq!(guard.recovery_evidence(), None);
+        assert_eq!(guard.nudge_count, 0);
+        assert_eq!(guard.errors.total_errors, 3);
+        assert!(restricted.is_empty());
     }
 
     // ── Injection message format contract ──
@@ -1340,11 +1177,13 @@ mod chat_stream_turnguard_e2e {
     fn injection_messages_are_valid_for_conversation() {
         let mut guard = TurnGuard::new();
 
-        // Trigger stall
-        let call = tc("bash", r#"{"command":"echo test"}"#);
-        guard.record_tool_calls(std::slice::from_ref(&call));
-        guard.record_tool_calls(std::slice::from_ref(&call));
+        // Exercise a real tool-health warning rather than a signature-only nudge.
+        for _ in 0..3 {
+            guard.record_tool_result("write_file", "Error: permission denied");
+        }
         let v = guard.evaluate();
+        assert!(v.severity >= VerdictSeverity::Warning);
+        assert!(!v.injections.is_empty());
 
         for msg in &v.injections {
             // Must be non-empty
@@ -1384,62 +1223,6 @@ mod chat_stream_turnguard_e2e {
         assert!(
             restricted.is_empty(),
             "soft health avoid guidance must not accumulate into restricted_tools"
-        );
-    }
-
-    /// Verdict with empty injections and Healthy severity → skip in chat_stream
-    /// (the `continue` condition: injections.is_empty OR severity < Warning).
-    #[test]
-    fn healthy_verdict_does_not_trigger_skip() {
-        let v = TurnVerdict {
-            injections: vec![],
-            avoid_tools: vec![],
-            severity: VerdictSeverity::Healthy,
-            advisory_threshold_reached: false,
-            stall_detected: false,
-            is_diverging: false,
-        };
-        // chat_stream only skips (continues) when BOTH injections non-empty AND severity >= Warning
-        let should_skip = !v.injections.is_empty() && v.severity >= VerdictSeverity::Warning;
-        assert!(
-            !should_skip,
-            "healthy verdict should NOT trigger skip/continue"
-        );
-    }
-
-    /// Info severity with injections → does NOT trigger skip (only Warning+ does).
-    #[test]
-    fn info_severity_with_injections_no_skip() {
-        let v = TurnVerdict {
-            injections: vec!["info note".into()],
-            avoid_tools: vec![],
-            severity: VerdictSeverity::Info,
-            advisory_threshold_reached: false,
-            stall_detected: false,
-            is_diverging: false,
-        };
-        let should_skip = !v.injections.is_empty() && v.severity >= VerdictSeverity::Warning;
-        assert!(
-            !should_skip,
-            "Info+injections should inject but NOT skip the turn"
-        );
-    }
-
-    /// Warning severity with injections → triggers skip (LLM re-evaluates with nudge).
-    #[test]
-    fn warning_severity_with_injections_triggers_skip() {
-        let v = TurnVerdict {
-            injections: vec!["stall detected".into()],
-            avoid_tools: vec![],
-            severity: VerdictSeverity::Warning,
-            advisory_threshold_reached: false,
-            stall_detected: false,
-            is_diverging: false,
-        };
-        let should_skip = !v.injections.is_empty() && v.severity >= VerdictSeverity::Warning;
-        assert!(
-            should_skip,
-            "Warning+injections should skip to next LLM call"
         );
     }
 
