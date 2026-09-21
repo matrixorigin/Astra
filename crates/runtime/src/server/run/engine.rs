@@ -1160,56 +1160,36 @@ impl RunEngine {
                 policy.next_renewal_at(tokio::time::Instant::now(), fence_deadline);
             let mut ownership_lost = false;
             'heartbeat: loop {
-                tokio::select! {
-                    biased;
-                    _ = &mut stop_rx => break,
-                    _ = tokio::time::sleep_until(fence_deadline) => {
-                        ownership_lost = true;
-                        break;
-                    }
-                    changed = lease_updates.changed() => {
-                        if changed.is_err() {
+                let mut renewal_due = false;
+                let operation_guard = loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut stop_rx => break 'heartbeat,
+                        _ = tokio::time::sleep_until(fence_deadline) => {
                             ownership_lost = true;
-                            break;
+                            break 'heartbeat;
                         }
-                        let state = *lease_updates.borrow_and_update();
-                        if !state.active {
-                            break;
+                        changed = lease_updates.changed() => {
+                            if changed.is_err() {
+                                ownership_lost = true;
+                                break 'heartbeat;
+                            }
+                            let state = *lease_updates.borrow_and_update();
+                            if !state.active {
+                                break 'heartbeat;
+                            }
+                            fence_deadline = state.deadline;
+                            next_renewal = policy.next_renewal_at(
+                                tokio::time::Instant::now(),
+                                fence_deadline,
+                            );
+                            renewal_due = false;
                         }
-                        fence_deadline = state.deadline;
-                        next_renewal = policy.next_renewal_at(
-                            tokio::time::Instant::now(),
-                            fence_deadline,
-                        );
-                        continue;
+                        _ = tokio::time::sleep_until(next_renewal), if !renewal_due => {
+                            renewal_due = true;
+                        }
+                        guard = heartbeat_authority.operation.lock(), if renewal_due => break guard,
                     }
-                    _ = tokio::time::sleep_until(next_renewal) => {}
-                }
-
-                let operation_guard = tokio::select! {
-                    biased;
-                    _ = &mut stop_rx => break,
-                    _ = tokio::time::sleep_until(fence_deadline) => {
-                        ownership_lost = true;
-                        break;
-                    }
-                    changed = lease_updates.changed() => {
-                        if changed.is_err() {
-                            ownership_lost = true;
-                            break;
-                        }
-                        let state = *lease_updates.borrow_and_update();
-                        if !state.active {
-                            break;
-                        }
-                        fence_deadline = state.deadline;
-                        next_renewal = policy.next_renewal_at(
-                            tokio::time::Instant::now(),
-                            fence_deadline,
-                        );
-                        continue;
-                    }
-                    guard = heartbeat_authority.operation.lock() => guard,
                 };
 
                 let current = heartbeat_authority.current_state();
