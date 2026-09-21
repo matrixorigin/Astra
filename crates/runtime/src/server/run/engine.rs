@@ -49,10 +49,9 @@ use astra_services::{
         AtomicRunUserIntentAdmissionTransition, AtomicRunUserIntentAdmissionTransitionRequest,
         AtomicRunUserIntentApply, AtomicRunUserIntentApplyRequest, DurableCancellationOrigin,
         DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord, DurableRunEventDelta,
-        DurableRunGuidanceAdmissionRecord, DurableRunInteractionAttachmentGuard,
-        DurableRunInteractionKind, DurableRunInteractionProjection,
-        DurableRunInteractionResolveOutcome, DurableRunListPage, DurableRunRecord,
-        DurableRunStartClaim, DurableRunStatusKind, DurableRunStatusSnapshot,
+        DurableRunInteractionAttachmentGuard, DurableRunInteractionKind,
+        DurableRunInteractionProjection, DurableRunInteractionResolveOutcome, DurableRunListPage,
+        DurableRunRecord, DurableRunStartClaim, DurableRunStatusKind, DurableRunStatusSnapshot,
         DurableRunUserIntentControlDelta, DurableRunWorkScope, DurableWorkItemRunBinding,
         DurableWorkRunBinding, GuardedRunStatusTransition, GuardedRunStatusTransitionRequest,
         RUN_RECOVERY_CLAIM_BATCH_SIZE, RequestedTurnInteractionMode, ResolvedModelSelection,
@@ -2126,17 +2125,6 @@ impl RunEngine {
     ) -> Result<Option<serde_json::Value>, String> {
         self.store
             .load_run_event_by_idempotency_key(user_id, run_id, event_type, idempotency_key)
-            .await
-    }
-
-    pub async fn load_run_guidance_admission(
-        &self,
-        user_id: &str,
-        run_id: &str,
-        intent_id: &str,
-    ) -> Result<Option<DurableRunGuidanceAdmissionRecord>, String> {
-        self.store
-            .load_run_guidance_admission(user_id, run_id, intent_id)
             .await
     }
 
@@ -6374,6 +6362,43 @@ mod tests {
                 return Err("load failed".into());
             }
             self.inner.load_run_control(user_id, run_id).await
+        }
+
+        async fn load_latest_terminal_cancellation_origin(
+            &self,
+            user_id: &str,
+            run_id: &str,
+        ) -> Result<Option<astra_services::runs::DurableCancellationOrigin>, String> {
+            self.inner
+                .load_latest_terminal_cancellation_origin(user_id, run_id)
+                .await
+        }
+
+        async fn has_unsettled_user_intent(
+            &self,
+            user_id: &str,
+            run_id: &str,
+        ) -> Result<Option<bool>, String> {
+            self.inner.has_unsettled_user_intent(user_id, run_id).await
+        }
+
+        async fn load_run_status_snapshot(
+            &self,
+            user_id: &str,
+            run_id: &str,
+        ) -> Result<Option<astra_services::runs::DurableRunStatusSnapshot>, String> {
+            self.inner.load_run_status_snapshot(user_id, run_id).await
+        }
+
+        async fn load_run_delegation_projection_target(
+            &self,
+            user_id: &str,
+            run_id: &str,
+        ) -> Result<Option<astra_services::runs::DurableRunDelegationProjectionTarget>, String>
+        {
+            self.inner
+                .load_run_delegation_projection_target(user_id, run_id)
+                .await
         }
 
         async fn load_run_interaction_projection(

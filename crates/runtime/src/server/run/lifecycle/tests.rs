@@ -7790,6 +7790,24 @@ impl RunStateStore for FaultInjectedRunStateStore {
         self.inner.load_run_control(user_id, run_id).await
     }
 
+    async fn load_latest_terminal_cancellation_origin(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<astra_services::runs::DurableCancellationOrigin>, String> {
+        self.inner
+            .load_latest_terminal_cancellation_origin(user_id, run_id)
+            .await
+    }
+
+    async fn has_unsettled_user_intent(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<bool>, String> {
+        self.inner.has_unsettled_user_intent(user_id, run_id).await
+    }
+
     async fn claim_run_start(
         &self,
         record: DurableRunRecord,
@@ -7844,6 +7862,16 @@ impl RunStateStore for FaultInjectedRunStateStore {
             .expect("status snapshot counter lock")
             .status_snapshot_calls += 1;
         self.inner.load_run_status_snapshot(user_id, run_id).await
+    }
+
+    async fn load_run_delegation_projection_target(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<astra_services::runs::DurableRunDelegationProjectionTarget>, String> {
+        self.inner
+            .load_run_delegation_projection_target(user_id, run_id)
+            .await
     }
 
     async fn load_run_interaction_event(

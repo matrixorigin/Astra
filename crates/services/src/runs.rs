@@ -2690,20 +2690,6 @@ fn execution_owner_cancellation_terminal_event(
     })
 }
 
-/// Fixed-size facts required to admit one active-run user intent.
-///
-/// This deliberately excludes the run event log. A long run may contain tens
-/// of thousands of provider/tool events, none of which may make guidance
-/// admission O(N). The only relevant control facts are the exact retry
-/// identity, the latest settlement fence, and current execution liveness.
-#[derive(Clone, Debug, PartialEq)]
-pub struct DurableRunGuidanceAdmissionRecord {
-    pub run: DurableRunRecord,
-    pub duplicate_intent: Option<serde_json::Value>,
-    pub settlement_fenced: bool,
-    pub owner_lease_live: bool,
-}
-
 /// Immutable request for one linearized current-run guidance admission.
 ///
 /// Shared stores must decide every field below while holding the durable run
@@ -4803,12 +4789,7 @@ pub trait RunStateStore: Send + Sync {
         &self,
         user_id: &str,
         run_id: &str,
-    ) -> Result<Option<DurableCancellationOrigin>, String> {
-        Ok(self
-            .load_run(user_id, run_id)
-            .await?
-            .and_then(|run| latest_typed_terminal_cancellation_origin(&run.events)))
-    }
+    ) -> Result<Option<DurableCancellationOrigin>, String>;
 
     /// Return whether a run has an accepted user intent that has not yet been
     /// applied or returned. Implementations should keep this on the control
@@ -4819,12 +4800,7 @@ pub trait RunStateStore: Send + Sync {
         &self,
         user_id: &str,
         run_id: &str,
-    ) -> Result<Option<bool>, String> {
-        Ok(self
-            .load_run(user_id, run_id)
-            .await?
-            .map(|run| run_events_have_unsettled_user_intent(&run.events)))
-    }
+    ) -> Result<Option<bool>, String>;
 
     async fn request_run_cancellation(
         &self,
@@ -4890,50 +4866,6 @@ pub trait RunStateStore: Send + Sync {
         Ok(false)
     }
 
-    async fn load_run_guidance_admission(
-        &self,
-        user_id: &str,
-        run_id: &str,
-        intent_id: &str,
-    ) -> Result<Option<DurableRunGuidanceAdmissionRecord>, String> {
-        let Some(mut run) = self.load_run(user_id, run_id).await? else {
-            return Ok(None);
-        };
-        let idempotency_key = format!("user_intent:{intent_id}");
-        let duplicate_intent = run.events.iter().enumerate().find_map(|(position, event)| {
-            if extract_event_type(event) != "user_intent"
-                || extract_optional_string(event, "idempotency_key").as_deref()
-                    != Some(idempotency_key.as_str())
-            {
-                return None;
-            }
-            let mut event = event.clone();
-            if let Some(object) = event.as_object_mut() {
-                object
-                    .entry("index".to_string())
-                    .or_insert_with(|| serde_json::json!(position));
-            }
-            Some(event)
-        });
-        let mut settlement_fenced = false;
-        for event in &run.events {
-            match extract_event_type(event).as_str() {
-                "user_intent_settlement_fenced" => settlement_fenced = true,
-                "user_intent_admission_reopened" => settlement_fenced = false,
-                _ => {}
-            }
-        }
-        let owner_lease_live =
-            run.owner_pod_id.is_some() && in_memory_action_owner_lease_is_active(&run)?;
-        run.events.clear();
-        Ok(Some(DurableRunGuidanceAdmissionRecord {
-            duplicate_intent,
-            settlement_fenced,
-            owner_lease_live,
-            run,
-        }))
-    }
-
     /// Atomically admit one immutable current-run guidance event.
     ///
     /// Implementations must serialize this operation with settlement fencing
@@ -4988,12 +4920,7 @@ pub trait RunStateStore: Send + Sync {
         &self,
         user_id: &str,
         run_id: &str,
-    ) -> Result<Option<DurableRunStatusSnapshot>, String> {
-        let Some(run) = self.load_run(user_id, run_id).await? else {
-            return Ok(None);
-        };
-        Ok(Some(run_status_snapshot_from_run(&run)))
-    }
+    ) -> Result<Option<DurableRunStatusSnapshot>, String>;
 
     /// Load only the bounded identity needed by delegation projection.
     /// Shared stores should override this with a metadata-only lookup.
@@ -5001,17 +4928,7 @@ pub trait RunStateStore: Send + Sync {
         &self,
         user_id: &str,
         run_id: &str,
-    ) -> Result<Option<DurableRunDelegationProjectionTarget>, String> {
-        let Some(run) = self.load_run(user_id, run_id).await? else {
-            return Ok(None);
-        };
-        Ok(Some(DurableRunDelegationProjectionTarget {
-            user_id: run.user_id,
-            parent_run_id: run.parent_run_id,
-            delegation_id: run.delegation_id,
-            agent_id: run.agent_id,
-        }))
-    }
+    ) -> Result<Option<DurableRunDelegationProjectionTarget>, String>;
 
     /// Load durable events strictly after an event-index cursor together with
     /// the current run status. This is the cross-process live-attach primitive.
@@ -5040,13 +4957,7 @@ pub trait RunStateStore: Send + Sync {
         &self,
         user_id: &str,
         run_id: &str,
-    ) -> Result<Option<DurableRunControlRecord>, String> {
-        Ok(self
-            .load_run(user_id, run_id)
-            .await?
-            .as_ref()
-            .map(DurableRunControlRecord::from))
-    }
+    ) -> Result<Option<DurableRunControlRecord>, String>;
 
     async fn load_run_controls(
         &self,
@@ -15644,60 +15555,6 @@ impl RunStateStore for DatabaseRunStateStore {
         row.map(|row| decode_run_event_payload(&row, run_id))
             .transpose()
             .map_err(|error| error.to_string())
-    }
-
-    async fn load_run_guidance_admission(
-        &self,
-        user_id: &str,
-        run_id: &str,
-        intent_id: &str,
-    ) -> Result<Option<DurableRunGuidanceAdmissionRecord>, String> {
-        let Some(run) = self
-            .load_run_metadata_for_user(user_id, run_id)
-            .await
-            .map_err(|error| error.to_string())?
-        else {
-            return Ok(None);
-        };
-        let idempotency_key = format!("user_intent:{intent_id}");
-        let duplicate_intent = self
-            .load_run_event_by_idempotency_key(user_id, run_id, "user_intent", &idempotency_key)
-            .await?;
-        let latest_fence = sqlx::query(
-            "SELECT event_type FROM agent_run_events
-             WHERE user_id = ? AND run_id = ?
-               AND event_type IN ('user_intent_settlement_fenced',
-                                  'user_intent_admission_reopened')
-             ORDER BY event_idx DESC LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(run_id)
-        .fetch_optional(self.pool.get())
-        .await
-        .map_err(|source| db_error("load_run_guidance_fence", run_id, source).to_string())?;
-        let settlement_fenced = latest_fence
-            .as_ref()
-            .and_then(|row| row.try_get::<String, _>("event_type").ok())
-            .as_deref()
-            == Some("user_intent_settlement_fenced");
-        let owner_lease_live: i64 = sqlx::query_scalar(
-            "SELECT CAST(CASE
-                 WHEN owner_pod_id IS NOT NULL
-                  AND owner_lease_expires_at >= NOW(6)
-                 THEN 1 ELSE 0 END AS SIGNED)
-             FROM agent_runs WHERE user_id = ? AND run_id = ?",
-        )
-        .bind(user_id)
-        .bind(run_id)
-        .fetch_one(self.pool.get())
-        .await
-        .map_err(|source| db_error("load_run_guidance_owner_lease", run_id, source).to_string())?;
-        Ok(Some(DurableRunGuidanceAdmissionRecord {
-            run,
-            duplicate_intent,
-            settlement_fenced,
-            owner_lease_live: owner_lease_live == 1,
-        }))
     }
 
     async fn admit_run_guidance(
@@ -36885,96 +36742,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn atomic_guidance_rechecks_fence_after_a_stale_snapshot_barrier() {
-        let store = std::sync::Arc::new(InMemoryRunStateStore::new());
-        store
-            .insert_run(durable_run_record("guidance-fence-barrier"))
-            .await
-            .unwrap();
-        let snapshot_observed = std::sync::Arc::new(tokio::sync::Barrier::new(2));
-        let fence_committed = std::sync::Arc::new(tokio::sync::Barrier::new(2));
-        let submitter = {
-            let store = store.clone();
-            let snapshot_observed = snapshot_observed.clone();
-            let fence_committed = fence_committed.clone();
-            tokio::spawn(async move {
-                let stale = store
-                    .load_run_guidance_admission(
-                        "u1",
-                        "guidance-fence-barrier",
-                        "intent-after-fence",
-                    )
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert!(!stale.settlement_fenced);
-                snapshot_observed.wait().await;
-                fence_committed.wait().await;
-                let event = user_intent_event("intent-after-fence");
-                store
-                    .admit_run_guidance(guidance_admission_request(
-                        "guidance-fence-barrier",
-                        "intent-after-fence",
-                        &event,
-                        true,
-                    ))
-                    .await
-                    .unwrap()
-            })
-        };
-        snapshot_observed.wait().await;
-        store
-            .append_event(
-                "u1",
-                "s1",
-                "guidance-fence-barrier",
-                make_event("user_intent_settlement_fenced", json!({})),
-            )
-            .await
-            .unwrap();
-        fence_committed.wait().await;
-        assert_eq!(
-            submitter.await.unwrap(),
-            AtomicRunGuidanceAdmission::SettlementFenced
-        );
-        let run = store
-            .load_run("u1", "guidance-fence-barrier")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            !run.events
-                .iter()
-                .any(|event| extract_event_type(event) == "user_intent")
-        );
-    }
-
-    #[tokio::test]
-    async fn atomic_guidance_rechecks_lease_after_a_stale_snapshot_barrier() {
-        let store = std::sync::Arc::new(InMemoryRunStateStore::new());
-        let mut run = durable_run_record("guidance-lease-barrier");
+    async fn atomic_guidance_rejects_expired_consumer_lease() {
+        let store = InMemoryRunStateStore::new();
+        let mut run = durable_run_record("guidance-expired-lease");
         run.owner_pod_id = Some("local-owner".to_string());
         run.owner_lease_expires_at =
-            Some((chrono::Utc::now() + chrono::Duration::minutes(2)).to_rfc3339());
+            Some((chrono::Utc::now() - chrono::Duration::minutes(2)).to_rfc3339());
         store.insert_run(run).await.unwrap();
-        let snapshot = store
-            .load_run_guidance_admission("u1", "guidance-lease-barrier", "intent-after-expiry")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(snapshot.owner_lease_live);
-        {
-            let mut runs = store.runs.write().await;
-            runs.get_mut("guidance-lease-barrier")
-                .unwrap()
-                .owner_lease_expires_at =
-                Some((chrono::Utc::now() - chrono::Duration::minutes(2)).to_rfc3339());
-        }
+
         let event = user_intent_event("intent-after-expiry");
         assert!(matches!(
             store
                 .admit_run_guidance(guidance_admission_request(
-                    "guidance-lease-barrier",
+                    "guidance-expired-lease",
                     "intent-after-expiry",
                     &event,
                     false,
@@ -36984,15 +36764,11 @@ mod tests {
             AtomicRunGuidanceAdmission::ConsumerNotLive { .. }
         ));
         let run = store
-            .load_run("u1", "guidance-lease-barrier")
+            .load_run("u1", "guidance-expired-lease")
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            !run.events
-                .iter()
-                .any(|event| extract_event_type(event) == "user_intent")
-        );
+        assert!(run.events.is_empty());
     }
 
     #[tokio::test]
@@ -41359,51 +41135,6 @@ mod tests {
         assert!(USER_INTENT_CONTROL_DELTA_SELECT_SQL.contains("event_idx <= ?"));
         assert!(USER_INTENT_CONTROL_DELTA_SELECT_SQL.contains("ORDER BY event_idx ASC LIMIT ?"));
         assert!(!USER_INTENT_CONTROL_DELTA_SELECT_SQL.contains("SELECT *"));
-    }
-
-    #[tokio::test]
-    async fn guidance_admission_snapshot_excludes_large_unrelated_event_history() {
-        let store = InMemoryRunStateStore::new();
-        let mut run = durable_run_record("guidance-large-tail");
-        run.events = (0..34_000)
-            .map(|index| make_event("agent_progress", json!({"index": index})))
-            .collect();
-        run.events.push(json!({
-            "event_type": "user_intent",
-            "idempotency_key": "user_intent:intent-exact",
-            "data": {
-                "intent_id": "intent-exact",
-                "delivery": "guide_current_run",
-                "input": {"content": "wait"}
-            }
-        }));
-        run.events.push(make_event(
-            "user_intent_settlement_fenced",
-            json!({"reason": "terminal settlement"}),
-        ));
-        run.last_event_idx = run.events.len() as i64 - 1;
-        store.insert_run(run).await.unwrap();
-
-        let snapshot = store
-            .load_run_guidance_admission("u1", "guidance-large-tail", "intent-exact")
-            .await
-            .unwrap()
-            .expect("guidance admission snapshot");
-
-        assert!(snapshot.run.events.is_empty(), "control snapshot is O(1)");
-        assert!(snapshot.settlement_fenced);
-        assert!(
-            !snapshot.owner_lease_live,
-            "a process-local run without a durable owner lease is not cross-process live"
-        );
-        assert_eq!(
-            snapshot
-                .duplicate_intent
-                .as_ref()
-                .and_then(|event| event.get("index"))
-                .and_then(serde_json::Value::as_i64),
-            Some(34_000)
-        );
     }
 
     #[tokio::test]
