@@ -2609,7 +2609,7 @@ impl crate::state_sync::MatrixOneSyncService {
                 return Err(err);
             }
         };
-        let mut tx = match connection.connection_mut().begin().await {
+        let mut tx = match connection.begin().await {
             Ok(tx) => tx,
             Err(e) => {
                 let err = format!("push_context_trace_signal begin transaction: {e}");

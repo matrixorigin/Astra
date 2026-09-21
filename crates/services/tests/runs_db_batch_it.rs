@@ -77,6 +77,19 @@ fn durable_run_record(run_id: String, user_id: String, session_id: String) -> Du
     }
 }
 
+fn durable_run_record_with_events(
+    run_id: String,
+    user_id: String,
+    session_id: String,
+    agent_id: &str,
+    events: Vec<serde_json::Value>,
+) -> DurableRunRecord {
+    let mut record = durable_run_record(run_id, user_id, session_id);
+    record.agent_id = Some(agent_id.to_string());
+    record.events = events;
+    record
+}
+
 async fn insert_run_fixture(
     pool: &SharedPool,
     store: &DatabaseRunStateStore,
@@ -260,45 +273,13 @@ async fn batch_write_stores_and_loads_events() {
         })
         .collect();
 
-    let record = astra_services::runs::DurableRunRecord {
-        run_id: run_id.clone(),
-        user_id: user_id.clone(),
-        session_id: session_id.clone(),
-        parent_run_id: None,
-        root_run_id: None,
-        ancestor_path: None,
-        depth: 0,
-        delegation_id: None,
-        agent_id: Some("batch-test-agent".into()),
-        retry_of: None,
-        retry_scope: None,
-        status: "running".into(),
-        waiting_for: None,
-        owner_pod_id: None,
-        owner_lease_expires_at: None,
-        run_generation: 1,
-        last_event_idx: 0,
-        checkpoint_version: None,
-        checkpoint_json: None,
-        error_code: None,
-        error_message: None,
-        retry_count: 0,
-        total_prompt_tokens: 0,
-        total_completion_tokens: 0,
-        total_tool_calls: 0,
-        agent_binding_id: None,
-        agent_binding_name: None,
-        agent_binding_schema_version: None,
-        model_offering_id: None,
-        resolved_model_name: None,
-        runtime_profile: None,
-        start_request_fingerprint: None,
-        work_binding: None,
-        events: events.clone(),
-        created_at: String::new(),
-        updated_at: String::new(),
-    };
-
+    let record = durable_run_record_with_events(
+        run_id.clone(),
+        user_id.clone(),
+        session_id.clone(),
+        "batch-test-agent",
+        events.clone(),
+    );
     insert_run_fixture(&_pool, store.as_ref(), record).await;
 
     // load_run returns a record without events (events stored separately in agent_run_events).
@@ -337,45 +318,13 @@ async fn batch_write_preserves_event_idx_ordering() {
         make_event("run_finished", json!({})),
     ];
 
-    let record = astra_services::runs::DurableRunRecord {
-        run_id: run_id.clone(),
-        user_id: user_id.clone(),
-        session_id: session_id.clone(),
-        parent_run_id: None,
-        root_run_id: None,
-        ancestor_path: None,
-        depth: 0,
-        delegation_id: None,
-        agent_id: Some("bwo-agent".into()),
-        retry_of: None,
-        retry_scope: None,
-        status: "running".into(),
-        waiting_for: None,
-        owner_pod_id: None,
-        owner_lease_expires_at: None,
-        run_generation: 1,
-        last_event_idx: 0,
-        checkpoint_version: None,
-        checkpoint_json: None,
-        error_code: None,
-        error_message: None,
-        retry_count: 0,
-        total_prompt_tokens: 0,
-        total_completion_tokens: 0,
-        total_tool_calls: 0,
-        agent_binding_id: None,
-        agent_binding_name: None,
-        agent_binding_schema_version: None,
-        model_offering_id: None,
-        resolved_model_name: None,
-        runtime_profile: None,
-        start_request_fingerprint: None,
-        work_binding: None,
-        events: events.clone(),
-        created_at: String::new(),
-        updated_at: String::new(),
-    };
-
+    let record = durable_run_record_with_events(
+        run_id.clone(),
+        user_id.clone(),
+        session_id.clone(),
+        "bwo-agent",
+        events.clone(),
+    );
     insert_run_fixture(&_pool, store.as_ref(), record).await;
 
     // Read event_idx from DB
@@ -432,45 +381,13 @@ async fn batch_write_idempotency_dedup_skips_duplicates() {
         make_idempotent_event("tool_result", "bwid-key-3", json!({"output": "A"})),
     ];
 
-    let record = astra_services::runs::DurableRunRecord {
-        run_id: run_id.clone(),
-        user_id: user_id.clone(),
-        session_id: session_id.clone(),
-        parent_run_id: None,
-        root_run_id: None,
-        ancestor_path: None,
-        depth: 0,
-        delegation_id: None,
-        agent_id: Some("bwid-agent".into()),
-        retry_of: None,
-        retry_scope: None,
-        status: "running".into(),
-        waiting_for: None,
-        owner_pod_id: None,
-        owner_lease_expires_at: None,
-        run_generation: 1,
-        last_event_idx: 0,
-        checkpoint_version: None,
-        checkpoint_json: None,
-        error_code: None,
-        error_message: None,
-        retry_count: 0,
-        total_prompt_tokens: 0,
-        total_completion_tokens: 0,
-        total_tool_calls: 0,
-        agent_binding_id: None,
-        agent_binding_name: None,
-        agent_binding_schema_version: None,
-        model_offering_id: None,
-        resolved_model_name: None,
-        runtime_profile: None,
-        start_request_fingerprint: None,
-        work_binding: None,
-        events: events.clone(),
-        created_at: String::new(),
-        updated_at: String::new(),
-    };
-
+    let record = durable_run_record_with_events(
+        run_id.clone(),
+        user_id.clone(),
+        session_id.clone(),
+        "bwid-agent",
+        events.clone(),
+    );
     insert_run_fixture(&_pool, store.as_ref(), record).await;
 
     // Now try to append the same events again via append_events_batch
@@ -1104,44 +1021,8 @@ async fn single_event_append_uses_batch_path() {
     let run_id = format!("bwse-run-{}", uuid::Uuid::new_v4());
 
     // Insert the run first.
-    let record = astra_services::runs::DurableRunRecord {
-        run_id: run_id.clone(),
-        user_id: user_id.clone(),
-        session_id: session_id.clone(),
-        parent_run_id: None,
-        root_run_id: None,
-        ancestor_path: None,
-        depth: 0,
-        delegation_id: None,
-        agent_id: Some("bwse-agent".into()),
-        retry_of: None,
-        retry_scope: None,
-        status: "running".into(),
-        waiting_for: None,
-        owner_pod_id: None,
-        owner_lease_expires_at: None,
-        run_generation: 1,
-        last_event_idx: 0,
-        checkpoint_version: None,
-        checkpoint_json: None,
-        error_code: None,
-        error_message: None,
-        retry_count: 0,
-        total_prompt_tokens: 0,
-        total_completion_tokens: 0,
-        total_tool_calls: 0,
-        agent_binding_id: None,
-        agent_binding_name: None,
-        agent_binding_schema_version: None,
-        model_offering_id: None,
-        resolved_model_name: None,
-        runtime_profile: None,
-        start_request_fingerprint: None,
-        work_binding: None,
-        events: vec![],
-        created_at: String::new(),
-        updated_at: String::new(),
-    };
+    let mut record = durable_run_record(run_id.clone(), user_id.clone(), session_id.clone());
+    record.agent_id = Some("bwse-agent".to_string());
     insert_run_fixture(&_pool, store.as_ref(), record).await;
 
     // Append single events (this should use the batch path internally).
@@ -1203,49 +1084,16 @@ async fn concurrent_append_no_event_idx_gaps() {
     let run_id = format!("concurrent_gap_{}", uuid::Uuid::new_v4());
     let user_id = "test_user".to_string();
     let session_id = format!("sess_c_{}", uuid::Uuid::new_v4());
-    let agent_id = Some("agent_0".to_string());
-
     insert_run_fixture(
         &_pool,
         store.as_ref(),
-        astra_services::runs::DurableRunRecord {
-            run_id: run_id.clone(),
-            user_id: user_id.clone(),
-            session_id: session_id.clone(),
-            parent_run_id: None,
-            root_run_id: None,
-            ancestor_path: None,
-            depth: 0,
-            delegation_id: None,
-            agent_id: agent_id.clone(),
-            retry_of: None,
-            retry_scope: None,
-            status: "running".to_string(),
-            waiting_for: None,
-            owner_pod_id: None,
-            owner_lease_expires_at: None,
-            run_generation: 1,
-            last_event_idx: -1,
-            checkpoint_version: None,
-            checkpoint_json: None,
-            error_code: None,
-            error_message: None,
-            retry_count: 0,
-            total_prompt_tokens: 0,
-            total_completion_tokens: 0,
-            total_tool_calls: 0,
-            agent_binding_id: None,
-            agent_binding_name: None,
-            agent_binding_schema_version: None,
-            model_offering_id: None,
-            resolved_model_name: None,
-            runtime_profile: None,
-            start_request_fingerprint: None,
-            work_binding: None,
-            events: vec![],
-            created_at: String::new(),
-            updated_at: String::new(),
-        },
+        durable_run_record_with_events(
+            run_id.clone(),
+            user_id.clone(),
+            session_id.clone(),
+            "agent_0",
+            Vec::new(),
+        ),
     )
     .await;
 
@@ -1320,49 +1168,16 @@ async fn large_batch_50_events_contiguous() {
     let run_id = format!("large_batch_{}", uuid::Uuid::new_v4());
     let user_id = "test_user".to_string();
     let session_id = format!("sess_c_{}", uuid::Uuid::new_v4());
-    let agent_id = Some("agent_0".to_string());
-
     insert_run_fixture(
         &_pool,
         store.as_ref(),
-        astra_services::runs::DurableRunRecord {
-            run_id: run_id.clone(),
-            user_id: user_id.clone(),
-            session_id: session_id.clone(),
-            parent_run_id: None,
-            root_run_id: None,
-            ancestor_path: None,
-            depth: 0,
-            delegation_id: None,
-            agent_id: agent_id.clone(),
-            retry_of: None,
-            retry_scope: None,
-            status: "running".to_string(),
-            waiting_for: None,
-            owner_pod_id: None,
-            owner_lease_expires_at: None,
-            run_generation: 1,
-            last_event_idx: -1,
-            checkpoint_version: None,
-            checkpoint_json: None,
-            error_code: None,
-            error_message: None,
-            retry_count: 0,
-            total_prompt_tokens: 0,
-            total_completion_tokens: 0,
-            total_tool_calls: 0,
-            agent_binding_id: None,
-            agent_binding_name: None,
-            agent_binding_schema_version: None,
-            model_offering_id: None,
-            resolved_model_name: None,
-            runtime_profile: None,
-            start_request_fingerprint: None,
-            work_binding: None,
-            events: vec![],
-            created_at: String::new(),
-            updated_at: String::new(),
-        },
+        durable_run_record_with_events(
+            run_id.clone(),
+            user_id.clone(),
+            session_id.clone(),
+            "agent_0",
+            Vec::new(),
+        ),
     )
     .await;
 
@@ -1422,49 +1237,16 @@ async fn dedup_preserves_non_keyed_events() {
     let run_id = format!("mix_dedup_{}", uuid::Uuid::new_v4());
     let user_id = "test_user".to_string();
     let session_id = format!("sess_c_{}", uuid::Uuid::new_v4());
-    let agent_id = Some("agent_0".to_string());
-
     insert_run_fixture(
         &_pool,
         store.as_ref(),
-        astra_services::runs::DurableRunRecord {
-            run_id: run_id.clone(),
-            user_id: user_id.clone(),
-            session_id: session_id.clone(),
-            parent_run_id: None,
-            root_run_id: None,
-            ancestor_path: None,
-            depth: 0,
-            delegation_id: None,
-            agent_id: agent_id.clone(),
-            retry_of: None,
-            retry_scope: None,
-            status: "running".to_string(),
-            waiting_for: None,
-            owner_pod_id: None,
-            owner_lease_expires_at: None,
-            run_generation: 1,
-            last_event_idx: -1,
-            checkpoint_version: None,
-            checkpoint_json: None,
-            error_code: None,
-            error_message: None,
-            retry_count: 0,
-            total_prompt_tokens: 0,
-            total_completion_tokens: 0,
-            total_tool_calls: 0,
-            agent_binding_id: None,
-            agent_binding_name: None,
-            agent_binding_schema_version: None,
-            model_offering_id: None,
-            resolved_model_name: None,
-            runtime_profile: None,
-            start_request_fingerprint: None,
-            work_binding: None,
-            events: vec![],
-            created_at: String::new(),
-            updated_at: String::new(),
-        },
+        durable_run_record_with_events(
+            run_id.clone(),
+            user_id.clone(),
+            session_id.clone(),
+            "agent_0",
+            Vec::new(),
+        ),
     )
     .await;
 
@@ -1534,45 +1316,8 @@ async fn append_event_delegates_to_append_events_batch() {
     let session_id = format!("ae-session-{}", uuid::Uuid::new_v4());
     let run_id = format!("ae-run-{}", uuid::Uuid::new_v4());
 
-    let record = astra_services::runs::DurableRunRecord {
-        run_id: run_id.clone(),
-        user_id: user_id.clone(),
-        session_id: session_id.clone(),
-        parent_run_id: None,
-        root_run_id: None,
-        ancestor_path: None,
-        depth: 0,
-        delegation_id: None,
-        agent_id: Some("agent-ae".into()),
-        retry_of: None,
-        retry_scope: None,
-        status: "running".into(),
-        waiting_for: None,
-        owner_pod_id: None,
-        owner_lease_expires_at: None,
-        run_generation: 1,
-        last_event_idx: 0,
-        checkpoint_version: None,
-        checkpoint_json: None,
-        error_code: None,
-        error_message: None,
-        retry_count: 0,
-        total_prompt_tokens: 0,
-        total_completion_tokens: 0,
-        total_tool_calls: 0,
-        agent_binding_id: None,
-        agent_binding_name: None,
-        agent_binding_schema_version: None,
-        model_offering_id: None,
-        resolved_model_name: None,
-        runtime_profile: None,
-        start_request_fingerprint: None,
-        work_binding: None,
-        events: vec![],
-        created_at: chrono::Utc::now().to_rfc3339(),
-        updated_at: chrono::Utc::now().to_rfc3339(),
-    };
-
+    let mut record = durable_run_record(run_id.clone(), user_id.clone(), session_id.clone());
+    record.agent_id = Some("agent-ae".to_string());
     // Use the RunStateStore trait method (not DatabaseRunStateStore directly)
     insert_run_fixture(&_pool, store.as_ref(), record).await;
 
@@ -1617,44 +1362,13 @@ async fn insert_ignore_toctou_dedup_and_index_accounting() {
         make_idempotent_event("tool_call", "tctou-k2", json!({"name": "ls"})),
     ];
 
-    let record = astra_services::runs::DurableRunRecord {
-        run_id: run_id.clone(),
-        user_id: user_id.clone(),
-        session_id: session_id.clone(),
-        parent_run_id: None,
-        root_run_id: None,
-        ancestor_path: None,
-        depth: 0,
-        delegation_id: None,
-        agent_id: Some("tctou-agent".into()),
-        retry_of: None,
-        retry_scope: None,
-        status: "running".into(),
-        waiting_for: None,
-        owner_pod_id: None,
-        owner_lease_expires_at: None,
-        run_generation: 1,
-        last_event_idx: 0,
-        checkpoint_version: None,
-        checkpoint_json: None,
-        error_code: None,
-        error_message: None,
-        retry_count: 0,
-        total_prompt_tokens: 0,
-        total_completion_tokens: 0,
-        total_tool_calls: 0,
-        agent_binding_id: None,
-        agent_binding_name: None,
-        agent_binding_schema_version: None,
-        model_offering_id: None,
-        resolved_model_name: None,
-        runtime_profile: None,
-        start_request_fingerprint: None,
-        work_binding: None,
-        events: events.clone(),
-        created_at: String::new(),
-        updated_at: String::new(),
-    };
+    let record = durable_run_record_with_events(
+        run_id.clone(),
+        user_id.clone(),
+        session_id.clone(),
+        "tctou-agent",
+        events.clone(),
+    );
     insert_run_fixture(&_pool, store.as_ref(), record).await;
 
     let count_before: i64 =

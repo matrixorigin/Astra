@@ -275,7 +275,7 @@ async fn record_artifact_retention_backlog_warning(
     let ingestion_write_id = Uuid::new_v4().to_string();
     let mut connection =
         astra_services::CancellationSafePoolConnection::acquire(pool.get()).await?;
-    let mut tx = connection.connection_mut().begin().await?;
+    let mut tx = connection.begin().await?;
     astra_services::storage::admit_session_event_write(&mut tx, "system", "system", true).await?;
     let insert_result = sqlx::query(
         "INSERT INTO agent_events

@@ -18,6 +18,7 @@ use astra_services::{
 };
 use astra_turn_types::PermissionMode;
 use serial_test::serial;
+use std::sync::Arc;
 use uuid::Uuid;
 
 const TEST_OWNER_POD_ID: &str = "run-persistence-cancel-owner";
@@ -126,13 +127,15 @@ async fn cancelled_run_event_append_closes_its_physical_checkout() {
     let session_id = format!("run-cancel-session-{suffix}");
     let run_id = format!("run-cancel-run-{suffix}");
     seed_run(pool, &user_id, &session_id, &run_id).await;
-    let store =
-        DatabaseRunStateStore::new(shared_pool.clone()).with_owner_pod_id(TEST_OWNER_POD_ID);
+    let store = Arc::new(
+        DatabaseRunStateStore::new(shared_pool.clone()).with_owner_pod_id(TEST_OWNER_POD_ID),
+    );
 
-    // The append acquires the session lifecycle fence first and then blocks on
-    // this run row. Cancelling it at that point must close its checkout; merely
-    // returning the connection to the pool would preserve the open transaction
-    // and strand the lifecycle fence.
+    // The append acquires the session lifecycle fence before it can mutate the
+    // run. The blocker makes the run-row mutation unable to complete. We do
+    // not rely on a timing-sensitive claim that the task has already reached a
+    // particular SQL statement: the test first proves that it owns a guarded
+    // checkout, then cancels it and verifies that checkout is safe to replace.
     let mut run_blocker = pool.begin().await.expect("begin run row blocker");
     sqlx::query(
         "SELECT run_id FROM agent_runs
@@ -151,15 +154,44 @@ async fn cancelled_run_event_append_closes_its_physical_checkout() {
         "idempotency_key": format!("append-probe-{suffix}"),
         "data": {},
     });
+    let append_store = Arc::clone(&store);
+    let append_user_id = user_id.clone();
+    let append_session_id = session_id.clone();
+    let append_run_id = run_id.clone();
+    let append_event = event.clone();
+    let append = tokio::spawn(async move {
+        append_store
+            .append_events_batch(
+                &append_user_id,
+                &append_session_id,
+                &append_run_id,
+                std::slice::from_ref(&append_event),
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            // The blocker and held checkouts leave exactly one capacity unit
+            // for the append. Observing a full pool with no idle connection
+            // proves the append acquired its guarded checkout before it is
+            // cancelled; it cannot be a false positive caused by waiting for
+            // pool capacity. The run-row blocker keeps the operation from
+            // completing while this observation is made.
+            if pool.size() as usize >= max_connections && pool.num_idle() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("append must acquire its checkout before cancellation");
+    append.abort();
     assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            store
-                .append_events_batch(&user_id, &session_id, &run_id, std::slice::from_ref(&event),),
-        )
-        .await
-        .is_err(),
-        "run event append must still be blocked when its caller cancels"
+        append
+            .await
+            .expect_err("cancelled append task must not complete")
+            .is_cancelled(),
+        "run event append must be cancelled while owning its guarded checkout"
     );
 
     let value: i64 = tokio::time::timeout(
@@ -176,10 +208,13 @@ async fn cancelled_run_event_append_closes_its_physical_checkout() {
         .rollback()
         .await
         .expect("release run row blocker");
-    store
-        .append_events_batch(&user_id, &session_id, &run_id, std::slice::from_ref(&event))
-        .await
-        .expect("retry append after cancellation");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        store.append_events_batch(&user_id, &session_id, &run_id, std::slice::from_ref(&event)),
+    )
+    .await
+    .expect("retry append after cancellation must not hang")
+    .expect("retry append after cancellation");
 
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }

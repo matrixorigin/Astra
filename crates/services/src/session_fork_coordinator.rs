@@ -15,7 +15,7 @@ use astra_turn_types::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
-use sqlx::{Connection, MySql, Row, Transaction};
+use sqlx::{MySql, Row, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -92,7 +92,6 @@ impl DatabaseSessionForkCoordinator {
             .await
             .map_err(|source| database_error("acquire_prepare_fork_connection", source))?;
         let mut tx = connection
-            .connection_mut()
             .begin()
             .await
             .map_err(|source| database_error("begin_prepare_fork", source))?;
@@ -268,7 +267,13 @@ impl DatabaseSessionForkCoordinator {
         validate_key_and_id(parent_key, fork_id)?;
         validate_duration(grace, MAX_ABORT_GRACE, "retention grace")?;
         validate_text("abort detail", detail, MAX_REASON_BYTES)?;
-        let mut tx = self.begin("begin_abort_fork").await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_abort_fork", source))?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|source| database_error("begin_abort_fork", source))?;
         let row = lock_fork(&mut tx, parent_key, fork_id).await?;
         let mut manifest: SessionForkManifestV1 =
             decode_json_row(&row, "manifest_json", "fork_manifest")?;
@@ -277,6 +282,7 @@ impl DatabaseSessionForkCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_abort_retry", source))?;
+            connection.release();
             return Ok(manifest);
         }
         if manifest.state != SessionForkStateV1::Prepared {
@@ -319,6 +325,7 @@ impl DatabaseSessionForkCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_abort_fork", source))?;
+        connection.release();
         Ok(manifest)
     }
 
@@ -394,7 +401,13 @@ impl DatabaseSessionForkCoordinator {
                 "cleanup limit must be between 1 and 10000".into(),
             ));
         }
-        let mut tx = self.begin("begin_release_fork_pins").await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_release_fork_pins", source))?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|source| database_error("begin_release_fork_pins", source))?;
         let now = database_now_ms(&mut tx).await?;
         let result = sqlx::query(
             "DELETE FROM conversation_manifest_pins
@@ -409,6 +422,7 @@ impl DatabaseSessionForkCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_release_fork_pins", source))?;
+        connection.release();
         Ok(result.rows_affected())
     }
 
@@ -425,7 +439,13 @@ impl DatabaseSessionForkCoordinator {
                 "cleanup limit must be between 1 and 10000".into(),
             ));
         }
-        let mut tx = self.begin("begin_collect_orphan_manifests").await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_collect_orphan_manifests", source))?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|source| database_error("begin_collect_orphan_manifests", source))?;
         let now = database_now_ms(&mut tx).await?;
         let result = sqlx::query(
             "DELETE FROM conversation_manifest_nodes
@@ -468,6 +488,7 @@ impl DatabaseSessionForkCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_collect_orphan_manifests", source))?;
+        connection.release();
         Ok(result.rows_affected())
     }
 
@@ -559,7 +580,13 @@ impl DatabaseSessionForkCoordinator {
                 "cleanup limit must be between 1 and 10000".into(),
             ));
         }
-        let mut tx = self.begin("begin_collect_orphan_forks").await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_collect_orphan_forks", source))?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|source| database_error("begin_collect_orphan_forks", source))?;
         let rows = sqlx::query(
             "SELECT isolation_domain, owner_user_id, fork_id
              FROM session_forks
@@ -624,19 +651,9 @@ impl DatabaseSessionForkCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_collect_orphan_forks", source))?;
+        connection.release();
         u64::try_from(rows.len())
             .map_err(|_| SessionForkCoordinatorError::Invalid("cleanup count overflow".into()))
-    }
-
-    async fn begin(
-        &self,
-        operation: &'static str,
-    ) -> Result<Transaction<'_, MySql>, SessionForkCoordinatorError> {
-        self.pool
-            .get()
-            .begin()
-            .await
-            .map_err(|source| database_error(operation, source))
     }
 }
 

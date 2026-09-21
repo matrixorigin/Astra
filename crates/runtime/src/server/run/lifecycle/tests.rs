@@ -206,8 +206,8 @@ fn typed_subrun_workspace_intent_and_completion_profile_cannot_contradict() {
 }
 
 use crate::server::run::lifecycle::persistence::{
-    build_tool_trace_events, extract_prev_assistant_text, extract_session_state_compact,
-    messages_for_csl_persist, redact_trace_value, transcript_page_bounds, transcript_page_seq,
+    build_tool_trace_events, extract_session_state_compact, messages_for_csl_persist,
+    redact_trace_value, transcript_page_bounds, transcript_page_seq,
 };
 use astra_services::runs::{
     DatabaseRunStateStore, DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord,
@@ -4205,7 +4205,7 @@ fn agent_live_event_to_work_surface_sse_maps_output_and_terminal() {
     assert_eq!(signal["executor"]["executor_id"], "edge-macbook-1");
 }
 
-// ── extract_prev_assistant_text + implicit feedback wiring ──
+// ── implicit feedback wiring ──
 
 #[test]
 fn trace_redaction_removes_nested_secrets_and_truncates_long_text() {
@@ -4442,57 +4442,6 @@ fn unexecuted_tool_trace_events_preserve_canonical_terminal_dispositions() {
     assert_eq!(events[3].metadata["disposition"], "reused");
     assert_eq!(events[5].metadata["disposition"], "suppressed");
     assert_eq!(events[7].metadata["disposition"], "deferred");
-}
-
-#[test]
-fn extract_prev_assistant_text_picks_latest_assistant_string() {
-    let messages = vec![
-        serde_json::json!({"role": "user", "content": "hi"}),
-        serde_json::json!({"role": "assistant", "content": "first answer"}),
-        serde_json::json!({"role": "user", "content": "follow up"}),
-        serde_json::json!({"role": "assistant", "content": "latest answer"}),
-    ];
-    assert_eq!(
-        extract_prev_assistant_text(&messages).as_deref(),
-        Some("latest answer")
-    );
-}
-
-#[test]
-fn extract_prev_assistant_text_handles_content_parts_array() {
-    let messages = vec![
-        serde_json::json!({"role": "user", "content": "hi"}),
-        serde_json::json!({
-            "role": "assistant",
-            "content": [
-                {"type": "text", "text": "part one"},
-                {"type": "text", "text": "part two"},
-            ],
-        }),
-    ];
-    assert_eq!(
-        extract_prev_assistant_text(&messages).as_deref(),
-        Some("part one\npart two")
-    );
-}
-
-#[test]
-fn extract_prev_assistant_text_returns_none_when_no_assistant_turn() {
-    let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
-    assert!(extract_prev_assistant_text(&messages).is_none());
-}
-
-#[test]
-fn extract_prev_assistant_text_skips_empty_assistant_bodies() {
-    let messages = vec![
-        serde_json::json!({"role": "assistant", "content": "real answer"}),
-        serde_json::json!({"role": "user", "content": "ok"}),
-        serde_json::json!({"role": "assistant", "content": "   "}),
-    ];
-    assert_eq!(
-        extract_prev_assistant_text(&messages).as_deref(),
-        Some("real answer")
-    );
 }
 
 #[test]

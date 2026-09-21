@@ -2,7 +2,7 @@ use astra_core::{SharedPool, matrixone_statement_with_null_shape};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sqlx::{Acquire, Row};
+use sqlx::Row;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -715,7 +715,6 @@ impl DatabaseStateProjectionStore {
                 source,
             })?;
         let mut tx = connection
-            .connection_mut()
             .begin()
             .await
             .map_err(|source| StateProjectionError::Database {
@@ -931,16 +930,21 @@ impl DatabaseStateProjectionStore {
             })?;
         let payload_hash = content_hash(&payload_json);
         let item_id = bounded_state_item_id("delegation", &[&record.delegation_id]);
-        let mut tx =
-            self.pool
-                .get()
-                .begin()
-                .await
-                .map_err(|source| StateProjectionError::Database {
-                    operation: "begin_delegation_projection",
-                    entity: record.delegation_id.clone(),
-                    source,
-                })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| StateProjectionError::Database {
+                operation: "acquire_delegation_projection",
+                entity: record.delegation_id.clone(),
+                source,
+            })?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|source| StateProjectionError::Database {
+                operation: "begin_delegation_projection",
+                entity: record.delegation_id.clone(),
+                source,
+            })?;
 
         let delegation_insert_sql = matrixone_statement_with_null_shape(
             "INSERT INTO session_delegations
@@ -1038,7 +1042,9 @@ impl DatabaseStateProjectionStore {
                 operation: "commit_delegation_projection",
                 entity: item_id,
                 source,
-            })
+            })?;
+        connection.release();
+        Ok(())
     }
 
     pub async fn bubble_up_finding(
@@ -1050,16 +1056,21 @@ impl DatabaseStateProjectionStore {
         summary: &str,
         targets: &[BubbleUpTarget],
     ) -> Result<(), StateProjectionError> {
-        let mut tx =
-            self.pool
-                .get()
-                .begin()
-                .await
-                .map_err(|source| StateProjectionError::Database {
-                    operation: "begin_bubble_up",
-                    entity: source_run_id.to_string(),
-                    source,
-                })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| StateProjectionError::Database {
+                operation: "acquire_bubble_up",
+                entity: source_run_id.to_string(),
+                source,
+            })?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|source| StateProjectionError::Database {
+                operation: "begin_bubble_up",
+                entity: source_run_id.to_string(),
+                source,
+            })?;
         for (idx, target) in targets.iter().enumerate() {
             let item_key = format!("bubble:{source_run_id}:{}", target.depth);
             let item_id = bounded_bubble_state_item_id(source_run_id, target.depth);
@@ -1134,7 +1145,9 @@ impl DatabaseStateProjectionStore {
                 operation: "commit_bubble_up",
                 entity: source_run_id.to_string(),
                 source,
-            })
+            })?;
+        connection.release();
+        Ok(())
     }
 
     pub async fn load_user_anchor_memory(
@@ -1215,7 +1228,6 @@ impl DatabaseStateProjectionStore {
                 source,
             })?;
         let mut tx = connection
-            .connection_mut()
             .begin()
             .await
             .map_err(|source| StateProjectionError::Database {
@@ -1516,16 +1528,21 @@ impl DatabaseStateProjectionStore {
                 entity: old_run_id.to_string(),
                 source: sqlx::Error::RowNotFound,
             })?;
-        let mut tx =
-            self.pool
-                .get()
-                .begin()
-                .await
-                .map_err(|source| StateProjectionError::Database {
-                    operation: "begin_retry_supersede",
-                    entity: old_run_id.to_string(),
-                    source,
-                })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| StateProjectionError::Database {
+                operation: "acquire_retry_supersede",
+                entity: old_run_id.to_string(),
+                source,
+            })?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|source| StateProjectionError::Database {
+                operation: "begin_retry_supersede",
+                entity: old_run_id.to_string(),
+                source,
+            })?;
         let supersede = sqlx::query(
             "UPDATE agent_runs
              SET status = 'superseded', updated_at = NOW(6)
@@ -1577,7 +1594,9 @@ impl DatabaseStateProjectionStore {
                 operation: "commit_retry_supersede",
                 entity: old_run_id.to_string(),
                 source,
-            })
+            })?;
+        connection.release();
+        Ok(())
     }
 
     async fn has_artifact_grant(

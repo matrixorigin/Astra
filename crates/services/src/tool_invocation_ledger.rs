@@ -16,7 +16,7 @@ use astra_turn_types::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{Connection, MySql, Row, Transaction};
+use sqlx::{MySql, Row, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -113,19 +113,30 @@ impl DatabaseToolInvocationLedger {
                 source,
             }
         })?;
-        let mut tx = self.pool.get().begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.begin().await?;
         if let Some(record) = load_record_in_tx(&mut tx, identity).await? {
             if !record.fingerprint.same_tool_and_arguments(fingerprint) {
-                let _ = rollback(tx, "prepare identity conflict").await;
+                if rollback(tx, "prepare identity conflict").await.is_ok() {
+                    connection.release();
+                }
                 return Err(ToolInvocationLedgerStoreError::IdentityConflict {
                     identity: Box::new(identity.clone()),
                 });
             }
             tx.commit().await?;
+            connection.release();
             return Ok(ToolInvocationPrepareOutcome::Existing(record));
         }
         if let Err(error) = lock_executable_run(&mut tx, identity).await {
-            let _ = rollback(tx, "prepare run admission denied").await;
+            if rollback(tx, "prepare run admission denied").await.is_ok() {
+                connection.release();
+            } else {
+                // Archive recovery needs another checkout. A failed rollback
+                // leaves this physical connection untrusted, so close it
+                // before starting that independent read.
+                drop(connection);
+            }
             if matches!(
                 &error,
                 ToolInvocationLedgerStoreError::RunNotExecutable { .. }
@@ -176,12 +187,15 @@ impl DatabaseToolInvocationLedger {
             }
         })?;
         if !record.fingerprint.same_tool_and_arguments(fingerprint) {
-            let _ = rollback(tx, "prepare identity conflict").await;
+            if rollback(tx, "prepare identity conflict").await.is_ok() {
+                connection.release();
+            }
             return Err(ToolInvocationLedgerStoreError::IdentityConflict {
                 identity: Box::new(identity.clone()),
             });
         }
         tx.commit().await?;
+        connection.release();
 
         Ok(if inserted {
             ToolInvocationPrepareOutcome::Prepared(record)
@@ -401,7 +415,7 @@ impl DatabaseToolInvocationLedger {
         // acquired so an aborted task cannot strand that fence in the shared
         // pool.
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
-        let mut tx = connection.connection_mut().begin().await?;
+        let mut tx = connection.begin().await?;
         crate::storage::admit_session_event_write(&mut tx, session_id, user_id, false).await?;
         let run_status = lock_terminal_run(&mut tx, user_id, session_id, run_id).await?;
         let completion_source = ToolInvocationCompletionSource::run_closure(&run_status)?;
@@ -635,7 +649,8 @@ impl DatabaseToolInvocationLedger {
         session_id: &str,
         run_id: &str,
     ) -> Result<ToolInvocationCompactionOutcome, ToolInvocationLedgerStoreError> {
-        let mut tx = self.pool.get().begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.begin().await?;
         let _run_status = lock_terminal_run(&mut tx, user_id, session_id, run_id).await?;
         let non_terminal_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tool_invocation_ledger
@@ -695,6 +710,7 @@ impl DatabaseToolInvocationLedger {
             .fetch_one(&mut *tx)
             .await?;
             tx.commit().await?;
+            connection.release();
             return Ok(ToolInvocationCompactionOutcome {
                 archived_records: 0,
                 remaining_records: u64::try_from(remaining_records).map_err(|_| {
@@ -883,6 +899,7 @@ impl DatabaseToolInvocationLedger {
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
+        connection.release();
         Ok(ToolInvocationCompactionOutcome {
             archived_records: chunk.records.len(),
             remaining_records: u64::try_from(remaining_records).map_err(|_| {
@@ -987,7 +1004,7 @@ impl DatabaseToolInvocationLedger {
         validate_lease_input(owner_id, lease_duration_ms)?;
         let lease_duration_us = lease_duration_us(lease_duration_ms)?;
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
-        let mut tx = connection.connection_mut().begin().await?;
+        let mut tx = connection.begin().await?;
         // Check Work's provider generation before granting Run action
         // authority. Provider switching must first clear the active Session
         // slot and unresolved invocation ledger, so a live dispatch cannot be
@@ -1282,7 +1299,7 @@ impl DatabaseToolInvocationLedger {
         original_commit_error: sqlx::Error,
     ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
-        let mut tx = connection.connection_mut().begin().await?;
+        let mut tx = connection.begin().await?;
         validate_execution_binding_generation_in_tx(
             &mut tx,
             identity,
@@ -1411,7 +1428,8 @@ impl DatabaseToolInvocationLedger {
     ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
         validate_lease_input(owner_id, lease_duration_ms)?;
         let lease_duration_us = lease_duration_us(lease_duration_ms)?;
-        let mut tx = self.pool.get().begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.begin().await?;
         sqlx::query(
             "UPDATE tool_invocation_ledger
              SET dispatch_lease_expires_at =
@@ -1437,6 +1455,7 @@ impl DatabaseToolInvocationLedger {
         })?;
         ensure_dispatched_owner(identity, &record, owner_id)?;
         tx.commit().await?;
+        connection.release();
         Ok(record)
     }
 
@@ -1447,7 +1466,8 @@ impl DatabaseToolInvocationLedger {
         &self,
         identity: &ToolInvocationIdentity,
     ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
-        let mut tx = self.pool.get().begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.begin().await?;
         sqlx::query(
             "UPDATE tool_invocation_ledger
              SET state = 'outcome_unknown', dispatch_certainty = 'unknown',
@@ -1470,6 +1490,7 @@ impl DatabaseToolInvocationLedger {
             }
         })?;
         tx.commit().await?;
+        connection.release();
         Ok(record)
     }
 
@@ -1479,7 +1500,8 @@ impl DatabaseToolInvocationLedger {
         owner_id: &str,
     ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
         ToolInvocationDispatchLease::new(owner_id, 1)?;
-        let mut tx = self.pool.get().begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.begin().await?;
         let updated = sqlx::query(
             "UPDATE tool_invocation_ledger
              SET state = 'outcome_unknown', dispatch_certainty = 'unknown',
@@ -1503,7 +1525,9 @@ impl DatabaseToolInvocationLedger {
             }
         })?;
         if updated != 1 {
-            let _ = rollback(tx, "mark-outcome-unknown mismatch").await;
+            if rollback(tx, "mark-outcome-unknown mismatch").await.is_ok() {
+                connection.release();
+            }
             ensure_dispatched_owner(identity, &record, owner_id)?;
             return Err(ToolInvocationLedgerStoreError::StateMismatch {
                 identity: identity.clone(),
@@ -1512,6 +1536,7 @@ impl DatabaseToolInvocationLedger {
             });
         }
         tx.commit().await?;
+        connection.release();
         Ok(record)
     }
 
@@ -1539,7 +1564,8 @@ impl DatabaseToolInvocationLedger {
                 source,
             }
         })?;
-        let mut tx = self.pool.get().begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.begin().await?;
         let (owner_predicate, owner_id) = completion_owner(expected, owner_id, identity)?;
         let query = format!(
             "UPDATE tool_invocation_ledger
@@ -1589,13 +1615,16 @@ impl DatabaseToolInvocationLedger {
                     identity: identity.clone(),
                 },
             };
-            let _ = rollback(tx, "compare-and-complete mismatch").await;
+            if rollback(tx, "compare-and-complete mismatch").await.is_ok() {
+                connection.release();
+            }
             return Err(mismatch);
         }
         let record = record.ok_or_else(|| ToolInvocationLedgerStoreError::NotFound {
             identity: identity.clone(),
         })?;
         tx.commit().await?;
+        connection.release();
         Ok(record)
     }
 
@@ -1626,7 +1655,8 @@ impl DatabaseToolInvocationLedger {
                     source,
                 }
             })?;
-        let mut tx = self.pool.get().begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.begin().await?;
         let updated = sqlx::query(
             "UPDATE tool_invocation_ledger
              SET state = 'succeeded', dispatch_certainty = 'not_dispatched',
@@ -1659,13 +1689,19 @@ impl DatabaseToolInvocationLedger {
                     identity: identity.clone(),
                 },
             };
-            let _ = rollback(tx, "semantic-cache-completion mismatch").await;
+            if rollback(tx, "semantic-cache-completion mismatch")
+                .await
+                .is_ok()
+            {
+                connection.release();
+            }
             return Err(error);
         }
         let record = record.ok_or_else(|| ToolInvocationLedgerStoreError::NotFound {
             identity: identity.clone(),
         })?;
         tx.commit().await?;
+        connection.release();
         Ok(record)
     }
 }

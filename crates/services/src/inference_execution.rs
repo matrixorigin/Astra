@@ -1265,14 +1265,21 @@ async fn insert_recovered_model_request_terminal_tx(
     Ok(())
 }
 
-async fn rollback_inference_tx(tx: sqlx::Transaction<'_, sqlx::MySql>, operation: &'static str) {
-    if let Err(error) = tx.rollback().await {
-        tracing::warn!(
-            target: "astra_services::inference_execution",
-            operation,
-            %error,
-            "inference transaction rollback failed"
-        );
+async fn rollback_inference_tx(
+    tx: sqlx::Transaction<'_, sqlx::MySql>,
+    operation: &'static str,
+) -> bool {
+    match tx.rollback().await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                target: "astra_services::inference_execution",
+                operation,
+                %error,
+                "inference transaction rollback failed"
+            );
+            false
+        }
     }
 }
 
@@ -1679,7 +1686,7 @@ pub async fn admit_inference_invocation(
         connection.release();
         return Err(existing_invocation_error(plan, &persisted));
     }
-    let mut tx = connection.connection_mut().begin().await.map_err(|error| {
+    let mut tx = connection.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin inference admission",
@@ -1696,8 +1703,11 @@ pub async fn admit_inference_invocation(
     .await;
 
     if let Err(error) = write_result {
-        rollback_inference_tx(tx, "admit_inference_invocation").await;
-        drop(connection);
+        if rollback_inference_tx(tx, "admit_inference_invocation").await {
+            connection.release();
+        } else {
+            drop(connection);
+        }
         match load_invocation_admission_fact_cancellation_safe(db, plan).await {
             Ok(Some(persisted)) => return Err(existing_invocation_error(plan, &persisted)),
             Ok(None) => return Err(error),
@@ -1913,7 +1923,7 @@ pub async fn settle_uncertain_inference_admission(
                 error,
             )
         })?;
-    let mut tx = connection.connection_mut().begin().await.map_err(|error| {
+    let mut tx = connection.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin inference admission recovery",
@@ -1923,8 +1933,9 @@ pub async fn settle_uncertain_inference_admission(
     let scope_authority = match lock_invocation_scope_authority(&mut tx, &plan.input).await {
         Ok(authority) => authority,
         Err(error) => {
-            rollback_inference_tx(tx, "settle_uncertain_inference_admission").await;
-            drop(connection);
+            if rollback_inference_tx(tx, "settle_uncertain_inference_admission").await {
+                connection.release();
+            }
             return Err(error);
         }
     };
@@ -3053,7 +3064,7 @@ pub async fn admit_inference_invocation_with_first_provider_attempt(
                 error,
             )
         })?;
-    let mut tx = connection.connection_mut().begin().await.map_err(|error| {
+    let mut tx = connection.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin combined inference admission",
@@ -3070,8 +3081,12 @@ pub async fn admit_inference_invocation_with_first_provider_attempt(
     }
     .await;
     if let Err(error) = write_result {
-        rollback_inference_tx(tx, "admit_inference_invocation_with_first_provider_attempt").await;
-        drop(connection);
+        if rollback_inference_tx(tx, "admit_inference_invocation_with_first_provider_attempt").await
+        {
+            connection.release();
+        } else {
+            drop(connection);
+        }
         let mut reconciliation = match CancellationSafePoolConnection::acquire(db).await {
             Ok(connection) => connection,
             Err(read_error) => {
@@ -3477,7 +3492,16 @@ pub async fn renew_inference_invocation_owner(
     // heartbeat already in flight can therefore observe zero updated rows even
     // though no owner transfer occurred. Re-read the row under a write lock so
     // terminal completion is distinguished from lease expiry or a newer owner.
-    let mut tx = pool.get().begin().await.map_err(|error| {
+    let mut connection = CancellationSafePoolConnection::acquire(pool.get())
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "acquire inference owner renewal resolution connection",
+                error,
+            )
+        })?;
+    let mut tx = connection.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin inference owner renewal resolution",
@@ -3531,10 +3555,13 @@ pub async fn renew_inference_invocation_owner(
                     error,
                 )
             })?;
+            connection.release();
             Ok(outcome)
         }
         Err(error) => {
-            rollback_inference_tx(tx, "resolve inference owner renewal").await;
+            if rollback_inference_tx(tx, "resolve inference owner renewal").await {
+                connection.release();
+            }
             Err(error)
         }
     }
@@ -3566,7 +3593,7 @@ pub async fn begin_inference_provider_attempt(
             attempt.attempt_id, persisted.status
         )));
     }
-    let mut tx = connection.connection_mut().begin().await.map_err(|error| {
+    let mut tx = connection.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin inference provider attempt admission",
@@ -3575,7 +3602,9 @@ pub async fn begin_inference_provider_attempt(
     })?;
     let authority = lock_invocation_scope_authority(&mut tx, &attempt.invocation_input).await?;
     if authority != InvocationScopeAuthority::Live {
-        rollback_inference_tx(tx, "begin_inference_provider_attempt_scope_authority").await;
+        if rollback_inference_tx(tx, "begin_inference_provider_attempt_scope_authority").await {
+            connection.release();
+        }
         return Err(unavailable_scope_error(
             &attempt.invocation_input,
             authority,
@@ -3634,7 +3663,9 @@ pub async fn begin_inference_provider_attempt(
     })?
     .is_some();
     if settlement_pending {
-        rollback_inference_tx(tx, "begin_provider_attempt_settlement_pending").await;
+        if rollback_inference_tx(tx, "begin_provider_attempt_settlement_pending").await {
+            connection.release();
+        }
         return Err(ServiceError::conflict(format!(
             "inference invocation {} has a durable settlement decision; provider delivery must not be repeated",
             attempt.invocation_id
@@ -3658,7 +3689,9 @@ pub async fn begin_inference_provider_attempt(
     })?
     .is_some();
     if provider_attempt_open {
-        rollback_inference_tx(tx, "begin_provider_attempt_already_open").await;
+        if rollback_inference_tx(tx, "begin_provider_attempt_already_open").await {
+            connection.release();
+        }
         return Err(ServiceError::conflict(format!(
             "inference invocation {} already has an open provider attempt; concurrent provider delivery is forbidden",
             attempt.invocation_id
@@ -3719,7 +3752,9 @@ pub async fn begin_inference_provider_attempt(
         Ok(result) if result.rows_affected() == 1 => {
             if let Err(error) = advance_inference_canonical_transition_head(&mut tx, attempt).await
             {
-                rollback_inference_tx(tx, "advance inference canonical transition head").await;
+                if rollback_inference_tx(tx, "advance inference canonical transition head").await {
+                    connection.release();
+                }
                 return Err(error);
             }
             if let Err(error) = insert_model_request_context_event(
@@ -3730,7 +3765,9 @@ pub async fn begin_inference_provider_attempt(
             )
             .await
             {
-                rollback_inference_tx(tx, "record accepted model request context").await;
+                if rollback_inference_tx(tx, "record accepted model request context").await {
+                    connection.release();
+                }
                 return Err(error);
             }
             let error = match tx.commit().await {
@@ -3773,8 +3810,11 @@ pub async fn begin_inference_provider_attempt(
             attempt.invocation_id, attempt.attempt_id
         ))),
         Err(error) => {
-            rollback_inference_tx(tx, "begin_inference_provider_attempt").await;
-            drop(connection);
+            if rollback_inference_tx(tx, "begin_inference_provider_attempt").await {
+                connection.release();
+            } else {
+                drop(connection);
+            }
             if let Some(persisted) =
                 load_provider_attempt_fact_cancellation_safe(db, attempt).await?
             {
@@ -3848,17 +3888,13 @@ pub async fn load_inference_canonical_transitions_for_session(
                 error,
             )
         })?;
-    let mut recovery_tx = recovery_connection
-        .connection_mut()
-        .begin()
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "begin canonical transition WAL recovery snapshot",
-                error,
-            )
-        })?;
+    let mut recovery_tx = recovery_connection.begin().await.map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "begin canonical transition WAL recovery snapshot",
+            error,
+        )
+    })?;
     match crate::storage::admit_session_event_write(&mut recovery_tx, session_id, user_id, false)
         .await
     {
@@ -4453,7 +4489,7 @@ pub async fn retire_inference_canonical_transitions_through_turn(
                 error,
             )
         })?;
-    let mut tx = connection.connection_mut().begin().await.map_err(|error| {
+    let mut tx = connection.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin inference canonical transition retirement",
@@ -4787,7 +4823,7 @@ pub async fn finish_successful_inference_provider_attempt_and_invocation(
                 error,
             )
         })?;
-    let mut tx = connection.connection_mut().begin().await.map_err(|error| {
+    let mut tx = connection.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin combined successful inference settlement",
@@ -4872,8 +4908,11 @@ pub async fn finish_successful_inference_provider_attempt_and_invocation(
     })?;
 
     if attempt_update.rows_affected() != 1 {
-        rollback_inference_tx(tx, "classify combined successful inference settlement").await;
-        drop(connection);
+        if rollback_inference_tx(tx, "classify combined successful inference settlement").await {
+            connection.release();
+        } else {
+            drop(connection);
+        }
         return if combined_successful_settlement_is_durable_cancellation_safe(
             db,
             plan,
@@ -4936,7 +4975,9 @@ pub async fn finish_successful_inference_provider_attempt_and_invocation(
         )
     })?;
     if invocation_update.rows_affected() != 1 {
-        rollback_inference_tx(tx, "finish combined successful inference settlement").await;
+        if rollback_inference_tx(tx, "finish combined successful inference settlement").await {
+            connection.release();
+        }
         return Err(ServiceError::conflict(format!(
             "inference invocation {} is unavailable for combined successful settlement",
             plan.invocation_id
@@ -5035,7 +5076,7 @@ pub async fn finish_inference_provider_attempt(
         // A successful physical response is final. Persist its recovery debt in
         // the same transaction, so a crash cannot leave a successful response
         // invisible to the logical lifecycle without an explicit recovery fact.
-        let mut tx = connection.connection_mut().begin().await.map_err(|error| {
+        let mut tx = connection.begin().await.map_err(|error| {
             ServiceError::with_source(
                 ServiceErrorKind::Persistence,
                 "begin successful inference provider terminal",
@@ -5059,8 +5100,11 @@ pub async fn finish_inference_provider_attempt(
                     "finish inference provider attempt",
                     error,
                 );
-                rollback_inference_tx(tx, "finish successful inference provider attempt").await;
-                drop(connection);
+                if rollback_inference_tx(tx, "finish successful inference provider attempt").await {
+                    connection.release();
+                } else {
+                    drop(connection);
+                }
                 return recover_provider_terminal_after_unknown_write(
                     db,
                     attempt,
@@ -5084,7 +5128,9 @@ pub async fn finish_inference_provider_attempt(
             )
             .await
         {
-            rollback_inference_tx(tx, "record successful inference settlement debt").await;
+            if rollback_inference_tx(tx, "record successful inference settlement debt").await {
+                connection.release();
+            }
             return Err(error);
         }
         if result.rows_affected() == 1
@@ -5096,7 +5142,9 @@ pub async fn finish_inference_provider_attempt(
             )
             .await
         {
-            rollback_inference_tx(tx, "record successful model request context").await;
+            if rollback_inference_tx(tx, "record successful model request context").await {
+                connection.release();
+            }
             return Err(error);
         }
         if let Err(error) = tx.commit().await {
@@ -5119,7 +5167,7 @@ pub async fn finish_inference_provider_attempt(
         }
         result
     } else {
-        let mut tx = connection.connection_mut().begin().await.map_err(|error| {
+        let mut tx = connection.begin().await.map_err(|error| {
             ServiceError::with_source(
                 ServiceErrorKind::Persistence,
                 "begin inference provider terminal",
@@ -5146,7 +5194,9 @@ pub async fn finish_inference_provider_attempt(
                     )
                     .await
                 {
-                    rollback_inference_tx(tx, "record terminal model request context").await;
+                    if rollback_inference_tx(tx, "record terminal model request context").await {
+                        connection.release();
+                    }
                     return Err(error);
                 }
                 if let Err(error) = tx.commit().await {
@@ -5175,8 +5225,11 @@ pub async fn finish_inference_provider_attempt(
                     "finish inference provider attempt",
                     error,
                 );
-                rollback_inference_tx(tx, "finish inference provider attempt").await;
-                drop(connection);
+                if rollback_inference_tx(tx, "finish inference provider attempt").await {
+                    connection.release();
+                } else {
+                    drop(connection);
+                }
                 return recover_provider_terminal_after_unknown_write(
                     db,
                     attempt,
@@ -5720,7 +5773,7 @@ async fn record_inference_settlement_debt(
                 error,
             )
         })?;
-    let mut tx = connection.connection_mut().begin().await.map_err(|error| {
+    let mut tx = connection.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin inference settlement debt",
@@ -6851,7 +6904,8 @@ async fn recover_expired_inference_invocation(
     user_id: &str,
     invocation_id: &str,
 ) -> Result<u64, sqlx::Error> {
-    let mut tx = db.begin().await?;
+    let mut connection = CancellationSafePoolConnection::acquire(db).await?;
+    let mut tx = connection.begin().await?;
     let Some(invocation) = sqlx::query(
         "SELECT status, owner_token, owner_generation,
                 IF(owner_lease_expires_at <= NOW(6), 1, 0) AS lease_expired
@@ -6865,12 +6919,14 @@ async fn recover_expired_inference_invocation(
     .await?
     else {
         tx.rollback().await?;
+        connection.release();
         return Ok(0);
     };
     let status = invocation.try_get::<String, _>("status")?;
     let lease_expired = invocation.try_get::<i64, _>("lease_expired")? == 1;
     if status != "admitted" || !lease_expired {
         tx.rollback().await?;
+        connection.release();
         return Ok(0);
     }
     let old_owner_token = invocation.try_get::<String, _>("owner_token")?;
@@ -6891,6 +6947,7 @@ async fn recover_expired_inference_invocation(
     .is_some();
     if settlement_exists {
         tx.rollback().await?;
+        connection.release();
         return Ok(0);
     }
 
@@ -7052,9 +7109,11 @@ async fn recover_expired_inference_invocation(
     .await?;
     if updated.rows_affected() != 1 {
         tx.rollback().await?;
+        connection.release();
         return Ok(0);
     }
     tx.commit().await?;
+    connection.release();
     Ok(1)
 }
 
@@ -7344,7 +7403,7 @@ pub async fn finish_inference_invocation(
                 error,
             )
         })?;
-    let mut tx = connection.connection_mut().begin().await.map_err(|error| {
+    let mut tx = connection.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin inference terminal commit",
@@ -7428,8 +7487,11 @@ pub async fn finish_inference_invocation(
     .await;
 
     if let Err(error) = write_result {
-        rollback_inference_tx(tx, "finish_inference_invocation").await;
-        drop(connection);
+        if rollback_inference_tx(tx, "finish_inference_invocation").await {
+            connection.release();
+        } else {
+            drop(connection);
+        }
         if let Some(existing) = existing_terminal_fingerprint_cancellation_safe(db, plan).await? {
             return if existing == fingerprint {
                 Ok(())

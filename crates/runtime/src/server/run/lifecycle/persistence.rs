@@ -529,7 +529,6 @@ impl PostLoopPersistContext {
             .await
             .map_err(|error| error.to_string())?;
         let mut tx = connection
-            .connection_mut()
             .begin()
             .await
             .map_err(|error| error.to_string())?;
@@ -1109,7 +1108,7 @@ async fn persist_server_loop_canonical_append_inner(
             return Err(msg);
         }
     };
-    let mut tx = match connection.connection_mut().begin().await {
+    let mut tx = match connection.begin().await {
         Ok(tx) => tx,
         Err(error) => {
             let msg = format!("failed to begin MO transaction: {}", error);
@@ -3780,41 +3779,6 @@ fn truncate_for_audit(text: &str, max_chars: usize) -> String {
         let truncated: String = text.chars().take(max_chars).collect();
         format!("{truncated}…")
     }
-}
-
-/// Walk `messages` (chronological) and return the content of the latest
-/// assistant entry, if any. Kept for tests that exercise implicit-feedback
-/// detection against assistant history.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn extract_prev_assistant_text(messages: &[serde_json::Value]) -> Option<String> {
-    for msg in messages.iter().rev() {
-        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-        if role != "assistant" {
-            continue;
-        }
-        if let Some(text) = msg.get("content").and_then(|v| v.as_str()) {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-        if let Some(arr) = msg.get("content").and_then(|v| v.as_array()) {
-            let mut buf = String::new();
-            for part in arr {
-                if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                    if !buf.is_empty() {
-                        buf.push('\n');
-                    }
-                    buf.push_str(t);
-                }
-            }
-            let trimmed = buf.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
 }
 
 pub(crate) fn build_run_turn_complete_event_with_interruption(

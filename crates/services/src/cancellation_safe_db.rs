@@ -1,4 +1,4 @@
-use sqlx::{MySql, pool::PoolConnection};
+use sqlx::{Connection, MySql, pool::PoolConnection};
 
 /// A checked-out shared-pool connection that is reusable only after its
 /// caller explicitly proves the MySQL protocol is synchronized.
@@ -23,6 +23,10 @@ impl CancellationSafePoolConnection {
         self.connection
             .as_deref_mut()
             .expect("cancellation-safe connection already released")
+    }
+
+    pub async fn begin(&mut self) -> Result<sqlx::Transaction<'_, MySql>, sqlx::Error> {
+        self.connection_mut().begin().await
     }
 
     pub fn release(mut self) {
