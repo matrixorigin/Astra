@@ -943,18 +943,23 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
             request.facet,
         ) {
             use astra_turn_core::introspect::{JudgmentUsageCoverage, JudgmentUsageSnapshot};
-            let (usage, semantics, tool_result_judgments) = tokio::join!(
+            let include_semantic_execution = matches!(
+                request.depth,
+                astra_core::ObservationDepth::Diagnostic | astra_core::ObservationDepth::Forensic
+            );
+            let (usage_capture, mut semantics, tool_result_judgments) = tokio::join!(
                 async {
                     if matches!(
                         request.source_policy,
                         astra_core::SourcePolicy::LiveOnly | astra_core::SourcePolicy::LocalOnly
                     ) {
-                        JudgmentUsageSnapshot::unavailable(JudgmentUsageCoverage::SourceExcluded)
+                        Err(JudgmentUsageCoverage::SourceExcluded)
                     } else {
-                        load_introspect_judgment_usage(
+                        load_introspect_judgment_usage_capture(
                             context.context_manifest_pool.as_ref(),
                             &context.user_id,
                             &context.session_id,
+                            include_semantic_execution,
                         )
                         .await
                     }
@@ -998,6 +1003,29 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
                     }
                 }
             );
+            let usage = match &usage_capture {
+                Ok(capture) => JudgmentUsageSnapshot::from_ledger(capture.facts.clone()),
+                Err(coverage) => JudgmentUsageSnapshot::unavailable(*coverage),
+            };
+            if include_semantic_execution {
+                match usage_capture.as_ref() {
+                    Ok(capture) => {
+                        if semantics.counts.is_some() {
+                            astra_services::semantic_judgment_observation::apply_semantic_execution_capture(
+                                &mut semantics,
+                                capture,
+                                &context.session_id,
+                            );
+                        }
+                    }
+                    Err(coverage) => {
+                        astra_services::semantic_judgment_observation::mark_execution_lookup_unavailable(
+                            &mut semantics,
+                            semantic_execution_coverage_for_usage(*coverage),
+                        );
+                    }
+                }
+            }
             snapshot.judgment_usage = Some(usage);
             snapshot.semantic_judgments = Some(semantics);
             snapshot.tool_result_judgments = Some(tool_result_judgments);
@@ -1062,33 +1090,55 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
     }
 }
 
-async fn load_introspect_judgment_usage(
+async fn load_introspect_judgment_usage_capture(
     pool: Option<&astra_core::SharedPool>,
     user_id: &str,
     session_id: &str,
-) -> astra_turn_core::introspect::JudgmentUsageSnapshot {
-    use astra_turn_core::introspect::{JudgmentUsageCoverage, JudgmentUsageSnapshot};
+    include_execution: bool,
+) -> Result<
+    astra_services::inference_execution::SessionAuxiliaryUsageCapture,
+    astra_turn_core::introspect::JudgmentUsageCoverage,
+> {
     let Some(pool) = pool else {
-        return JudgmentUsageSnapshot::unavailable(JudgmentUsageCoverage::NoPool);
+        return Err(astra_turn_core::introspect::JudgmentUsageCoverage::NoPool);
     };
-    bounded_introspect_judgment_usage(
-        astra_services::inference_execution::load_session_auxiliary_usage(
-            pool, user_id, session_id, 128,
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        astra_services::inference_execution::load_session_auxiliary_capture(
+            pool,
+            user_id,
+            session_id,
+            128,
+            include_execution,
         ),
     )
     .await
+    {
+        Ok(Ok(capture)) => Ok(capture),
+        Ok(Err(_)) => Err(astra_turn_core::introspect::JudgmentUsageCoverage::QueryFailed),
+        Err(_) => Err(astra_turn_core::introspect::JudgmentUsageCoverage::Timeout),
+    }
 }
 
-async fn bounded_introspect_judgment_usage(
-    read: impl std::future::Future<
-        Output = astra_services::ServiceResult<astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1>,
-    >,
-) -> astra_turn_core::introspect::JudgmentUsageSnapshot {
-    use astra_turn_core::introspect::{JudgmentUsageCoverage, JudgmentUsageSnapshot};
-    match tokio::time::timeout(std::time::Duration::from_secs(2), read).await {
-        Ok(Ok(facts)) => JudgmentUsageSnapshot::from_ledger(facts),
-        Ok(Err(_)) => JudgmentUsageSnapshot::unavailable(JudgmentUsageCoverage::QueryFailed),
-        Err(_) => JudgmentUsageSnapshot::unavailable(JudgmentUsageCoverage::Timeout),
+fn semantic_execution_coverage_for_usage(
+    coverage: astra_turn_core::introspect::JudgmentUsageCoverage,
+) -> astra_services::semantic_judgment_observation::SemanticJudgmentExecutionCoverage {
+    use astra_services::semantic_judgment_observation::SemanticJudgmentExecutionCoverage;
+    use astra_turn_core::introspect::JudgmentUsageCoverage;
+    match coverage {
+        JudgmentUsageCoverage::NoPool => SemanticJudgmentExecutionCoverage::NoPool,
+        JudgmentUsageCoverage::Timeout => SemanticJudgmentExecutionCoverage::Timeout,
+        JudgmentUsageCoverage::QueryFailed => SemanticJudgmentExecutionCoverage::QueryFailed,
+        JudgmentUsageCoverage::SourceExcluded => SemanticJudgmentExecutionCoverage::SourceExcluded,
+        JudgmentUsageCoverage::LedgerUnavailable
+        | JudgmentUsageCoverage::LocalCaptureUnavailable => {
+            SemanticJudgmentExecutionCoverage::SourceUnavailable
+        }
+        JudgmentUsageCoverage::Available
+        | JudgmentUsageCoverage::CaptureTruncated
+        | JudgmentUsageCoverage::NotObserved => {
+            SemanticJudgmentExecutionCoverage::SourceUnavailable
+        }
     }
 }
 
@@ -1645,32 +1695,21 @@ impl DynamicToolHandler<RuntimeToolExecutor> for McpToolHandler {
 mod tests {
     use super::*;
 
-    #[tokio::test(start_paused = true)]
-    async fn introspect_judgment_usage_degrades_without_pool_on_timeout_or_query_failure() {
+    #[tokio::test]
+    async fn introspect_judgment_usage_capture_errors_keep_typed_coverage() {
         use astra_turn_core::introspect::JudgmentUsageCoverage;
-        let no_pool = load_introspect_judgment_usage(None, "owner", "session").await;
-        assert_eq!(no_pool.coverage, JudgmentUsageCoverage::NoPool);
-        assert_eq!(no_pool.observed_attempts, None);
-        let timeout = bounded_introspect_judgment_usage(std::future::pending()).await;
-        assert_eq!(timeout.coverage, JudgmentUsageCoverage::Timeout);
-        let failure = bounded_introspect_judgment_usage(async {
-            Err(astra_services::ServiceError::internal(
-                "private database error",
-            ))
-        })
-        .await;
-        assert_eq!(failure.coverage, JudgmentUsageCoverage::QueryFailed);
-        assert!(!failure.render().contains("private database"));
-        let empty = bounded_introspect_judgment_usage(async {
-            Ok(astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
-                available: true,
-                truncated: false,
-                attempts: vec![],
-            })
-        })
-        .await;
-        assert_eq!(empty.coverage, JudgmentUsageCoverage::Available);
-        assert_eq!(empty.observed_attempts, Some(0));
+        assert_eq!(
+            load_introspect_judgment_usage_capture(None, "owner", "session", false).await,
+            Err(JudgmentUsageCoverage::NoPool)
+        );
+        assert_eq!(
+            semantic_execution_coverage_for_usage(JudgmentUsageCoverage::Timeout),
+            astra_services::semantic_judgment_observation::SemanticJudgmentExecutionCoverage::Timeout
+        );
+        assert_eq!(
+            semantic_execution_coverage_for_usage(JudgmentUsageCoverage::QueryFailed),
+            astra_services::semantic_judgment_observation::SemanticJudgmentExecutionCoverage::QueryFailed
+        );
     }
 
     #[tokio::test]

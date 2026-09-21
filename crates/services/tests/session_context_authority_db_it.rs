@@ -895,19 +895,15 @@ async fn session_lifecycle_fence_serializes_delete_and_late_writer() {
         "late writer must not create an operation receipt"
     );
 
-    for table in [
-        "session_deletion_tombstones",
-        "agent_session_lifecycle_fences",
-    ] {
-        sqlx::query(&format!(
-            "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
-        ))
-        .bind(&owner_id)
-        .bind(&session_id)
-        .execute(&pool)
-        .await
-        .expect("clean lifecycle race fence fixture");
-    }
+    sqlx::query(
+        "DELETE FROM agent_session_lifecycle_fences
+         WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&owner_id)
+    .bind(&session_id)
+    .execute(&pool)
+    .await
+    .expect("clean lifecycle race fence fixture");
 }
 
 #[tokio::test]

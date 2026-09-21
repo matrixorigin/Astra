@@ -105,18 +105,6 @@ pub struct ToolResultJudgmentModel {
     pub observed_invocations: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolResultJudgmentTrigger {
-    NotRecorded,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolResultJudgmentEffect {
-    Unknown,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResultJudgmentApplication {
     pub coverage: ToolResultJudgmentCoverage,
@@ -147,9 +135,7 @@ pub struct ToolResultJudgmentExplanation {
     pub correlation: astra_turn_types::ToolResultSelectionCorrelationV1,
     pub coverage: astra_turn_types::ToolResultSelectionCoverageV1,
     pub outcome: astra_turn_types::ToolResultSelectionOutcomeV1,
-    pub trigger: ToolResultJudgmentTrigger,
     pub application: ToolResultJudgmentApplication,
-    pub effect: ToolResultJudgmentEffect,
     #[serde(default, skip_serializing_if = "is_false")]
     pub provenance_conflict: bool,
 }
@@ -967,14 +953,12 @@ fn push_explanation(
         correlation: observation.correlation.clone(),
         coverage: observation.coverage.clone(),
         outcome: observation.outcome.clone(),
-        trigger: ToolResultJudgmentTrigger::NotRecorded,
         application: application_for_explanation(
             &observation.outcome,
             receipts,
             conflicting_decisions,
             application_coverage,
         ),
-        effect: ToolResultJudgmentEffect::Unknown,
         provenance_conflict: outcome_invocation_id(&observation.outcome)
             .is_some_and(|invocation_id| invocation_conflicts.contains(invocation_id)),
     });
@@ -1509,14 +1493,6 @@ mod tests {
         assert_eq!(matched.explanations.len(), 1);
         assert_eq!(matched.explanations[0].application.matched_receipts, 1);
         assert_eq!(matched.explanations[0].application.included, 1);
-        assert_eq!(
-            matched.explanations[0].trigger,
-            ToolResultJudgmentTrigger::NotRecorded
-        );
-        assert_eq!(
-            matched.explanations[0].effect,
-            ToolResultJudgmentEffect::Unknown
-        );
         assert!(matched.render().contains("downstream effect unknown"));
 
         let mut invocation_mismatch = selected_observation.clone();

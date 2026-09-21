@@ -12,7 +12,7 @@ use astra_turn_types::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{MySql, QueryBuilder, Row};
+use sqlx::Row;
 
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
 use crate::session_journal::TraceSpanBuilder;
@@ -22,8 +22,6 @@ pub const SEMANTIC_JUDGMENT_TRACE_NAME: &str = "semantic_judgment";
 pub const MAX_SEMANTIC_JUDGMENT_CANDIDATES: usize = 512;
 // Includes the escaped 8-KiB typed attribute and the ordinary trace envelope.
 pub const MAX_SEMANTIC_JUDGMENT_TRACE_BYTES: usize = 32_768;
-const MAX_SEMANTIC_JUDGMENT_EXECUTION_IDS: usize = 128;
-const MAX_SEMANTIC_JUDGMENT_EXECUTION_ROWS: usize = 1_024;
 const MAX_SEMANTIC_JUDGMENT_EXECUTION_ATTEMPTS: usize = 8;
 
 /// Redacted projection of the canonical parser result, never a second classifier.
@@ -607,8 +605,6 @@ pub enum SemanticJudgmentExecutionAssociation {
     /// The invocation and at least one physical provider attempt agree with
     /// the semantic observation's immutable scope.
     Matched,
-    /// The invocation/route exists, but no physical provider attempt exists.
-    InvocationOnly,
     /// No exact invocation row was found for the captured identity.
     NotCaptured,
     /// The bounded lookup was cut off before this identity could be resolved.
@@ -1227,22 +1223,6 @@ impl SemanticJudgmentExecutionExplanation {
                 }
                 label
             }
-            SemanticJudgmentExecutionAssociation::InvocationOnly => {
-                match (&self.model_name, &self.provider) {
-                    (Some(model), Some(provider)) => format!(
-                        "execution admitted · model={model} · provider={provider} · no provider attempt captured"
-                    ),
-                    (Some(model), None) => {
-                        format!("execution admitted · model={model} · no provider attempt captured")
-                    }
-                    (None, Some(provider)) => {
-                        format!(
-                            "execution admitted · provider={provider} · no provider attempt captured"
-                        )
-                    }
-                    (None, None) => "execution admitted · no provider attempt captured".to_owned(),
-                }
-            }
             SemanticJudgmentExecutionAssociation::NotCaptured => {
                 "execution not captured in this lookup".to_owned()
             }
@@ -1270,228 +1250,41 @@ pub fn semantic_judgment_facet_enabled(facet: astra_core::ObservationFacet) -> b
     )
 }
 
-#[derive(Clone, Debug)]
-struct SemanticJudgmentExecutionLedgerRow {
-    invocation_id: String,
-    invocation_session_id: Option<String>,
-    run_id: Option<String>,
-    turn_index: Option<i64>,
-    round_index: Option<i64>,
-    route_session_id: Option<String>,
-    route_run_id: Option<String>,
-    route_provider: Option<String>,
-    resolved_model_name: Option<String>,
-    upstream_model_name: Option<String>,
-    attempt_id: Option<String>,
-    attempt_index: Option<i64>,
-    attempt_session_id: Option<String>,
-    attempt_run_id: Option<String>,
-    attempt_provider: Option<String>,
-    attempt_protocol: Option<String>,
-    attempt_status: Option<String>,
-    attempt_invalid: bool,
-}
-
-#[derive(Clone, Debug, Default)]
-struct SemanticJudgmentExecutionLookup {
-    rows: Vec<SemanticJudgmentExecutionLedgerRow>,
-    truncated: bool,
-}
-
-fn execution_model_name(row: &SemanticJudgmentExecutionLedgerRow) -> Option<String> {
-    row.resolved_model_name
-        .as_deref()
-        .filter(|name| !name.is_empty())
-        .or_else(|| {
-            row.upstream_model_name
-                .as_deref()
-                .filter(|name| !name.is_empty())
-        })
+fn execution_model_name(resolved: &str, upstream: &str) -> Option<String> {
+    [resolved, upstream]
+        .into_iter()
+        .find(|name| !name.is_empty())
         .map(str::to_owned)
 }
 
-async fn load_semantic_judgment_execution_rows(
-    pool: &SharedPool,
-    user_id: &str,
-    session_id: &str,
-    invocation_ids: &[String],
-) -> ServiceResult<SemanticJudgmentExecutionLookup> {
-    if invocation_ids.is_empty() {
-        return Ok(SemanticJudgmentExecutionLookup::default());
-    }
-    let mut connection = CancellationSafePoolConnection::acquire(pool.get())
-        .await
-        .map_err(|_| ServiceError::persistence("semantic execution connection unavailable"))?;
-    let mut query = QueryBuilder::<MySql>::new(
-        "SELECT i.invocation_id, i.session_id AS invocation_session_id, \
-         i.run_id, i.turn_index, i.round_index, \
-         r.session_id AS route_session_id, r.run_id AS route_run_id, \
-         r.provider AS route_provider, \
-         r.resolved_model_name, r.upstream_model_name, \
-         a.attempt_id, a.attempt_index, a.session_id AS attempt_session_id, \
-         a.run_id AS attempt_run_id, a.provider AS attempt_provider, \
-         a.provider_protocol AS attempt_protocol, a.status AS attempt_status \
-         FROM inference_invocations i \
-         LEFT JOIN inference_routes r ON r.user_id = i.user_id AND r.route_id = i.route_id \
-         LEFT JOIN inference_provider_attempts a \
-           ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id \
-         WHERE i.user_id = ",
-    );
-    query
-        .push_bind(user_id)
-        .push(" AND i.session_id = ")
-        .push_bind(session_id)
-        .push(" AND i.invocation_id IN (");
-    for (index, invocation_id) in invocation_ids.iter().enumerate() {
-        if index > 0 {
-            query.push(", ");
-        }
-        query.push_bind(invocation_id);
-    }
-    query
-        .push(") ORDER BY i.invocation_id, a.attempt_index LIMIT ")
-        .push_bind((MAX_SEMANTIC_JUDGMENT_EXECUTION_ROWS + 1) as i64);
-    let rows = query
-        .build()
-        .fetch_all(connection.connection_mut())
-        .await
-        .map_err(|_| ServiceError::persistence("semantic execution lookup unavailable"))?;
-    connection.release();
-    let truncated = rows.len() > MAX_SEMANTIC_JUDGMENT_EXECUTION_ROWS;
-    let mut projected = Vec::with_capacity(rows.len().min(MAX_SEMANTIC_JUDGMENT_EXECUTION_ROWS));
-    for row in rows.into_iter().take(MAX_SEMANTIC_JUDGMENT_EXECUTION_ROWS) {
-        let attempt_id = row
-            .try_get::<Option<String>, _>("attempt_id")
-            .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?;
-        let attempt_index = row
-            .try_get::<Option<i64>, _>("attempt_index")
-            .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?;
-        let attempt_session_id = row
-            .try_get::<Option<String>, _>("attempt_session_id")
-            .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?;
-        let attempt_run_id = row
-            .try_get::<Option<String>, _>("attempt_run_id")
-            .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?;
-        let attempt_provider = row
-            .try_get::<Option<String>, _>("attempt_provider")
-            .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?;
-        let attempt_protocol = row
-            .try_get::<Option<String>, _>("attempt_protocol")
-            .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?;
-        let attempt_status = row
-            .try_get::<Option<String>, _>("attempt_status")
-            .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?;
-        let has_attempt = attempt_id.is_some();
-        let attempt_invalid = has_attempt
-            && (attempt_index.is_none_or(|index| u32::try_from(index).is_err())
-                || attempt_provider.is_none()
-                || attempt_protocol.is_none()
-                || attempt_status.is_none());
-        projected.push(SemanticJudgmentExecutionLedgerRow {
-            invocation_id: row
-                .try_get("invocation_id")
-                .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?,
-            invocation_session_id: row
-                .try_get("invocation_session_id")
-                .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?,
-            run_id: row
-                .try_get("run_id")
-                .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?,
-            turn_index: row
-                .try_get("turn_index")
-                .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?,
-            round_index: row
-                .try_get("round_index")
-                .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?,
-            route_session_id: row
-                .try_get("route_session_id")
-                .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?,
-            route_run_id: row
-                .try_get("route_run_id")
-                .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?,
-            route_provider: row
-                .try_get("route_provider")
-                .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?,
-            resolved_model_name: row
-                .try_get("resolved_model_name")
-                .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?,
-            upstream_model_name: row
-                .try_get("upstream_model_name")
-                .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?,
-            attempt_id,
-            attempt_index,
-            attempt_session_id,
-            attempt_run_id,
-            attempt_provider,
-            attempt_protocol,
-            attempt_status,
-            attempt_invalid,
-        });
-    }
-    Ok(SemanticJudgmentExecutionLookup {
-        rows: projected,
-        truncated,
-    })
-}
-
-fn unavailable_execution_explanation(
-    observation: &SemanticJudgmentTraceObservation,
-    association: SemanticJudgmentExecutionAssociation,
-) -> Option<SemanticJudgmentExecutionExplanation> {
-    let SemanticJudgmentInvocationV1::Known { invocation_id } =
-        &observation.observation.correlation.invocation
-    else {
-        return None;
-    };
-    Some(SemanticJudgmentExecutionExplanation {
-        run_id: observation.observation.correlation.run_id.clone(),
-        turn: observation.observation.correlation.turn,
-        round: observation.observation.correlation.round,
-        evaluation_span_id: observation
-            .observation
-            .correlation
-            .evaluation_span_id
-            .clone(),
-        stage: observation.observation.fact.stage,
-        invocation_id: Some(invocation_id.clone()),
-        association,
-        provider: None,
-        model_name: None,
-        attempts: vec![],
-        attempts_truncated: false,
-    })
-}
-
-fn apply_semantic_judgment_execution_lookup(
+/// Reuse a caller's bounded physical-attempt read for detailed semantic
+/// explanations. This is a pure projection: it cannot acquire a pool
+/// connection or issue a second ledger query.
+pub fn apply_semantic_execution_capture(
     view: &mut SemanticJudgmentView,
-    lookup: SemanticJudgmentExecutionLookup,
+    capture: &crate::inference_execution::SessionAuxiliaryUsageCapture,
     session_id: &str,
 ) {
-    let known_ids = view
-        .observations
-        .iter()
-        .filter_map(
-            |observation| match &observation.observation.correlation.invocation {
-                SemanticJudgmentInvocationV1::Known { invocation_id } => {
-                    Some(invocation_id.clone())
-                }
-                SemanticJudgmentInvocationV1::Unavailable => None,
-            },
-        )
-        .collect::<BTreeSet<_>>();
-    if known_ids.is_empty() {
+    let has_known_invocation = view.observations.iter().any(|observation| {
+        match &observation.observation.correlation.invocation {
+            SemanticJudgmentInvocationV1::Known { .. } => true,
+            SemanticJudgmentInvocationV1::Unavailable => false,
+        }
+    });
+    if !has_known_invocation {
         view.execution_coverage = SemanticJudgmentExecutionCoverage::NotObserved;
         view.execution_explanations.clear();
         return;
     }
-    let mut rows_by_invocation = BTreeMap::<String, Vec<SemanticJudgmentExecutionLedgerRow>>::new();
-    for row in lookup.rows {
-        rows_by_invocation
-            .entry(row.invocation_id.clone())
+    let mut facts_by_invocation =
+        BTreeMap::<String, Vec<&crate::inference_execution::AuxiliaryExecutionAttemptFact>>::new();
+    for fact in &capture.execution {
+        facts_by_invocation
+            .entry(fact.invocation_id.clone())
             .or_default()
-            .push(row);
+            .push(fact);
     }
-    view.execution_coverage = if lookup.truncated {
+    view.execution_coverage = if capture.facts.truncated {
         SemanticJudgmentExecutionCoverage::LookupIncomplete
     } else {
         SemanticJudgmentExecutionCoverage::LookupComplete
@@ -1505,62 +1298,73 @@ fn apply_semantic_judgment_execution_lookup(
             else {
                 return None;
             };
-            let Some(rows) = rows_by_invocation.get(invocation_id) else {
+            let Some(facts) = facts_by_invocation.get(invocation_id) else {
                 return unavailable_execution_explanation(
                     observation,
-                    if lookup.truncated {
+                    if capture.facts.truncated {
                         SemanticJudgmentExecutionAssociation::LookupIncomplete
                     } else {
                         SemanticJudgmentExecutionAssociation::NotCaptured
                     },
                 );
             };
-            let first = rows.first()?;
+            let first = facts.first()?;
             let correlation = &observation.observation.correlation;
-            let scope_conflict = rows.iter().any(|row| {
-                row.run_id.as_deref() != Some(correlation.run_id.as_str())
-                    || row.turn_index != Some(i64::from(correlation.turn))
-                    || row.round_index != Some(i64::from(correlation.round))
+            let scope_conflict = facts.iter().any(|fact| {
+                fact.invocation_run_id.as_deref() != Some(correlation.run_id.as_str())
+                    || fact.invocation_turn != Some(i64::from(correlation.turn))
+                    || fact.invocation_round != Some(i64::from(correlation.round))
             });
             let route_provider = first.route_provider.clone();
-            let model_name = execution_model_name(first);
-            let attempts = rows
+            let model_name =
+                execution_model_name(&first.resolved_model_name, &first.upstream_model_name);
+            let attempt_invalid = facts.iter().any(|fact| {
+                u32::try_from(fact.attempt_index).is_err()
+                    || fact.attempt_id.is_empty()
+                    || fact.attempt_provider.is_empty()
+                    || fact.attempt_protocol.is_empty()
+                    || fact.attempt_status.is_empty()
+            });
+            let attempts = facts
                 .iter()
-                .filter_map(|row| {
+                .filter_map(|fact| {
                     Some(SemanticJudgmentExecutionAttempt {
-                        attempt_id: row.attempt_id.clone()?,
-                        attempt_index: u32::try_from(row.attempt_index?).ok()?,
-                        provider: row.attempt_provider.clone()?,
-                        model_name: execution_model_name(row)?,
-                        protocol: row.attempt_protocol.clone()?,
-                        status: row.attempt_status.clone()?,
+                        attempt_id: (!fact.attempt_id.is_empty())
+                            .then(|| fact.attempt_id.clone())?,
+                        attempt_index: u32::try_from(fact.attempt_index).ok()?,
+                        provider: (!fact.attempt_provider.is_empty())
+                            .then(|| fact.attempt_provider.clone())?,
+                        model_name: execution_model_name(
+                            &fact.resolved_model_name,
+                            &fact.upstream_model_name,
+                        )?,
+                        protocol: (!fact.attempt_protocol.is_empty())
+                            .then(|| fact.attempt_protocol.clone())?,
+                        status: (!fact.attempt_status.is_empty())
+                            .then(|| fact.attempt_status.clone())?,
                     })
                 })
                 .take(MAX_SEMANTIC_JUDGMENT_EXECUTION_ATTEMPTS)
                 .collect::<Vec<_>>();
-            let route_conflict = rows.iter().any(|row| {
-                row.attempt_id.is_some()
-                    && (row.attempt_provider != route_provider
-                        || execution_model_name(row) != model_name)
+            let route_conflict = facts.iter().any(|fact| {
+                fact.attempt_provider != first.route_provider.as_deref().unwrap_or_default()
+                    || execution_model_name(&fact.resolved_model_name, &fact.upstream_model_name)
+                        != model_name
             });
-            let attempt_invalid = rows.iter().any(|row| row.attempt_invalid);
-            let identity_conflict = rows.iter().any(|row| {
-                row.invocation_session_id.as_deref() != Some(session_id)
-                    || row.route_session_id.as_deref() != Some(session_id)
-                    || row.route_run_id != row.run_id
-                    || (row.attempt_id.is_some()
-                        && (row.attempt_session_id.as_deref() != Some(session_id)
-                            || row.attempt_run_id != row.run_id))
-            }) || route_provider.is_none()
+            let identity_conflict = facts.iter().any(|fact| {
+                fact.invocation_session_id.as_deref() != Some(session_id)
+                    || fact.route_session_id.as_deref() != Some(session_id)
+                    || fact.route_run_id != fact.invocation_run_id
+                    || fact.attempt_session_id.as_deref() != Some(session_id)
+                    || fact.attempt_run_id != fact.invocation_run_id
+            }) || route_provider.as_deref().is_none_or(str::is_empty)
                 || model_name.is_none();
-            let attempts_truncated = lookup.truncated
-                || rows.len() > MAX_SEMANTIC_JUDGMENT_EXECUTION_ATTEMPTS
+            let attempts_truncated = capture.facts.truncated
+                || facts.len() > MAX_SEMANTIC_JUDGMENT_EXECUTION_ATTEMPTS
                 || attempt_invalid;
             let association =
                 if scope_conflict || identity_conflict || route_conflict || attempt_invalid {
                     SemanticJudgmentExecutionAssociation::Conflicting
-                } else if attempts.is_empty() {
-                    SemanticJudgmentExecutionAssociation::InvocationOnly
                 } else {
                     SemanticJudgmentExecutionAssociation::Matched
                 };
@@ -1599,7 +1403,35 @@ fn apply_semantic_judgment_execution_lookup(
         .collect();
 }
 
-fn mark_execution_lookup_unavailable(
+fn unavailable_execution_explanation(
+    observation: &SemanticJudgmentTraceObservation,
+    association: SemanticJudgmentExecutionAssociation,
+) -> Option<SemanticJudgmentExecutionExplanation> {
+    let SemanticJudgmentInvocationV1::Known { invocation_id } =
+        &observation.observation.correlation.invocation
+    else {
+        return None;
+    };
+    Some(SemanticJudgmentExecutionExplanation {
+        run_id: observation.observation.correlation.run_id.clone(),
+        turn: observation.observation.correlation.turn,
+        round: observation.observation.correlation.round,
+        evaluation_span_id: observation
+            .observation
+            .correlation
+            .evaluation_span_id
+            .clone(),
+        stage: observation.observation.fact.stage,
+        invocation_id: Some(invocation_id.clone()),
+        association,
+        provider: None,
+        model_name: None,
+        attempts: vec![],
+        attempts_truncated: false,
+    })
+}
+
+pub fn mark_execution_lookup_unavailable(
     view: &mut SemanticJudgmentView,
     coverage: SemanticJudgmentExecutionCoverage,
 ) {
@@ -1616,53 +1448,9 @@ fn mark_execution_lookup_unavailable(
         .collect();
 }
 
-async fn enrich_semantic_judgment_execution(
-    pool: &SharedPool,
-    user_id: &str,
-    session_id: &str,
-    view: &mut SemanticJudgmentView,
-) {
-    let all_invocation_ids = view
-        .observations
-        .iter()
-        .filter_map(
-            |observation| match &observation.observation.correlation.invocation {
-                SemanticJudgmentInvocationV1::Known { invocation_id } => {
-                    Some(invocation_id.clone())
-                }
-                SemanticJudgmentInvocationV1::Unavailable => None,
-            },
-        )
-        .collect::<BTreeSet<_>>();
-    let lookup_truncated = all_invocation_ids.len() > MAX_SEMANTIC_JUDGMENT_EXECUTION_IDS;
-    let invocation_ids = all_invocation_ids
-        .into_iter()
-        .take(MAX_SEMANTIC_JUDGMENT_EXECUTION_IDS)
-        .collect::<Vec<_>>();
-    if invocation_ids.is_empty() {
-        return;
-    }
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        load_semantic_judgment_execution_rows(pool, user_id, session_id, &invocation_ids),
-    )
-    .await
-    {
-        Ok(Ok(mut lookup)) => {
-            lookup.truncated |= lookup_truncated;
-            apply_semantic_judgment_execution_lookup(view, lookup, session_id);
-        }
-        Ok(Err(_)) => {
-            mark_execution_lookup_unavailable(view, SemanticJudgmentExecutionCoverage::QueryFailed)
-        }
-        Err(_) => {
-            mark_execution_lookup_unavailable(view, SemanticJudgmentExecutionCoverage::Timeout)
-        }
-    }
-}
-
-/// One shared optional read policy for all consumers. Read both this and the
-/// separate usage ledger concurrently when a consumer requests both views.
+/// One shared optional read policy for all consumers. This loads semantic
+/// trace evidence only; callers that already read the auxiliary physical
+/// capture may apply that capture through the pure projection above.
 pub async fn load_semantic_judgment_view(
     pool: Option<&SharedPool>,
     user_id: &str,
@@ -1691,19 +1479,12 @@ pub async fn load_semantic_judgment_view(
         }
         Err(_) => return SemanticJudgmentView::unavailable(SemanticJudgmentCoverage::Timeout),
     };
-    // Bound the semantic detail before the optional ledger read. The default
-    // path therefore does not query or serialize hidden execution identities.
-    let mut view = SemanticJudgmentView::from_capture(capture).bounded(depth);
-    if matches!(
-        depth,
-        astra_core::ObservationDepth::Diagnostic | astra_core::ObservationDepth::Forensic
-    ) {
-        // This function owns its shorter timeout and only changes execution
-        // coverage on timeout/failure, so captured classification is retained.
-        enrich_semantic_judgment_execution(pool, user_id, session_id, &mut view).await;
-    } else {
-        view.defer_execution_lookup();
-    }
+    let view = SemanticJudgmentView::from_capture(capture).bounded(depth);
+    // Physical execution is deliberately deferred here. The introspect and
+    // reflect callers already perform one bounded auxiliary read; they attach
+    // its request-local detail without opening a second database path.
+    let mut view = view;
+    view.defer_execution_lookup();
     view
 }
 
@@ -1763,82 +1544,67 @@ mod tests {
         })
     }
 
-    fn execution_row(
+    fn execution_fact(
         invocation_id: &str,
         run_id: &str,
         turn: u32,
         round: u32,
-        attempt: Option<(&str, u32, &str, &str, &str)>,
-    ) -> SemanticJudgmentExecutionLedgerRow {
-        let (attempt_id, attempt_index, provider, protocol, status) = attempt
-            .map(|(id, index, provider, protocol, status)| {
-                (
-                    Some(id.into()),
-                    Some(i64::from(index)),
-                    Some(provider.into()),
-                    Some(protocol.into()),
-                    Some(status.into()),
-                )
-            })
-            .unwrap_or((None, None, None, None, None));
-        let attempt_session_id = attempt_id.as_ref().map(|_| "session-1".into());
-        let attempt_run_id = attempt_id.as_ref().map(|_| run_id.into());
-        SemanticJudgmentExecutionLedgerRow {
+        attempt: (&str, u32, &str, &str, &str),
+    ) -> crate::inference_execution::AuxiliaryExecutionAttemptFact {
+        let (attempt_id, attempt_index, provider, protocol, status) = attempt;
+        crate::inference_execution::AuxiliaryExecutionAttemptFact {
             invocation_id: invocation_id.into(),
             invocation_session_id: Some("session-1".into()),
-            run_id: Some(run_id.into()),
-            turn_index: Some(i64::from(turn)),
-            round_index: Some(i64::from(round)),
+            invocation_run_id: Some(run_id.into()),
+            invocation_turn: Some(i64::from(turn)),
+            invocation_round: Some(i64::from(round)),
             route_session_id: Some("session-1".into()),
             route_run_id: Some(run_id.into()),
             route_provider: Some("deepseek".into()),
-            resolved_model_name: Some("deepseek-flash".into()),
-            upstream_model_name: Some("deepseek-chat".into()),
-            attempt_id,
-            attempt_index,
-            attempt_session_id,
-            attempt_run_id,
-            attempt_provider: provider,
-            attempt_protocol: protocol,
-            attempt_status: status,
-            attempt_invalid: false,
+            attempt_id: attempt_id.into(),
+            attempt_index: i64::from(attempt_index),
+            attempt_session_id: Some("session-1".into()),
+            attempt_run_id: Some(run_id.into()),
+            attempt_provider: provider.into(),
+            attempt_protocol: protocol.into(),
+            attempt_status: status.into(),
+            resolved_model_name: "deepseek-flash".into(),
+            upstream_model_name: "deepseek-chat".into(),
         }
     }
 
     #[test]
     fn semantic_execution_projection_requires_exact_scope_and_keeps_status_distinct() {
         let initial = known_observation(RequestJudgmentStageV1::Initial, "eval-1", "inv-1");
-        let clarification =
-            known_observation(RequestJudgmentStageV1::Clarification, "eval-1", "inv-only");
         let missing = known_observation(RequestJudgmentStageV1::Initial, "eval-2", "inv-missing");
         let conflict = known_observation(RequestJudgmentStageV1::Initial, "eval-3", "inv-2");
-        let mut view = semantic_view(vec![initial, clarification, missing, conflict]);
-        apply_semantic_judgment_execution_lookup(
-            &mut view,
-            SemanticJudgmentExecutionLookup {
-                rows: vec![
-                    execution_row(
-                        "inv-1",
-                        "run-1",
-                        2,
-                        3,
-                        Some(("attempt-1", 0, "deepseek", "openai_compatible", "succeeded")),
-                    ),
-                    execution_row("inv-only", "run-1", 2, 3, None),
-                    // Same opaque invocation id is not accepted when its
-                    // immutable run scope disagrees with the observation.
-                    execution_row(
-                        "inv-2",
-                        "other-run",
-                        2,
-                        3,
-                        Some(("attempt-2", 0, "deepseek", "openai_compatible", "succeeded")),
-                    ),
-                ],
+        let mut view = semantic_view(vec![initial, missing, conflict]);
+        let capture = crate::inference_execution::SessionAuxiliaryUsageCapture {
+            facts: ExplainAnalyzeAuxiliaryUsageV1 {
+                available: true,
                 truncated: false,
+                attempts: Vec::new(),
             },
-            "session-1",
-        );
+            execution: vec![
+                execution_fact(
+                    "inv-1",
+                    "run-1",
+                    2,
+                    3,
+                    ("attempt-1", 0, "deepseek", "openai_compatible", "succeeded"),
+                ),
+                // Same opaque invocation id is not accepted when its
+                // immutable run scope disagrees with the observation.
+                execution_fact(
+                    "inv-2",
+                    "other-run",
+                    2,
+                    3,
+                    ("attempt-2", 0, "deepseek", "openai_compatible", "succeeded"),
+                ),
+            ],
+        };
+        apply_semantic_execution_capture(&mut view, &capture, "session-1");
 
         assert_eq!(
             view.execution_coverage,
@@ -1856,20 +1622,6 @@ mod tests {
         assert_eq!(matched.model_name.as_deref(), Some("deepseek-flash"));
         assert_eq!(matched.provider.as_deref(), Some("deepseek"));
         assert_eq!(matched.attempts[0].status, "succeeded");
-
-        let invocation_only = view
-            .execution_explanations
-            .iter()
-            .find(|explanation| explanation.invocation_id.as_deref() == Some("inv-only"))
-            .unwrap();
-        assert_eq!(
-            invocation_only.association,
-            SemanticJudgmentExecutionAssociation::InvocationOnly
-        );
-        assert_eq!(
-            invocation_only.model_name.as_deref(),
-            Some("deepseek-flash")
-        );
 
         let conflicting = view
             .execution_explanations
@@ -1907,20 +1659,21 @@ mod tests {
     fn semantic_execution_projection_does_not_claim_complete_attempt_history() {
         let observation = known_observation(RequestJudgmentStageV1::Initial, "eval-1", "inv-1");
         let mut view = semantic_view(vec![observation]);
-        apply_semantic_judgment_execution_lookup(
-            &mut view,
-            SemanticJudgmentExecutionLookup {
-                rows: vec![execution_row(
-                    "inv-1",
-                    "run-1",
-                    2,
-                    3,
-                    Some(("attempt-1", 0, "deepseek", "openai_compatible", "succeeded")),
-                )],
+        let capture = crate::inference_execution::SessionAuxiliaryUsageCapture {
+            facts: ExplainAnalyzeAuxiliaryUsageV1 {
+                available: true,
                 truncated: true,
+                attempts: Vec::new(),
             },
-            "session-1",
-        );
+            execution: vec![execution_fact(
+                "inv-1",
+                "run-1",
+                2,
+                3,
+                ("attempt-1", 0, "deepseek", "openai_compatible", "succeeded"),
+            )],
+        };
+        apply_semantic_execution_capture(&mut view, &capture, "session-1");
         assert_eq!(
             view.execution_coverage,
             SemanticJudgmentExecutionCoverage::LookupIncomplete
@@ -1933,6 +1686,84 @@ mod tests {
     }
 
     #[test]
+    fn semantic_execution_capture_projects_the_canonical_auxiliary_read() {
+        let observation = known_observation(RequestJudgmentStageV1::Initial, "eval-1", "inv-1");
+        let mut view = semantic_view(vec![observation]);
+        let capture = crate::inference_execution::SessionAuxiliaryUsageCapture {
+            facts: ExplainAnalyzeAuxiliaryUsageV1 {
+                available: true,
+                truncated: false,
+                attempts: Vec::new(),
+            },
+            execution: vec![crate::inference_execution::AuxiliaryExecutionAttemptFact {
+                invocation_id: "inv-1".into(),
+                invocation_session_id: Some("session-1".into()),
+                invocation_run_id: Some("run-1".into()),
+                invocation_turn: Some(2),
+                invocation_round: Some(3),
+                route_session_id: Some("session-1".into()),
+                route_run_id: Some("run-1".into()),
+                route_provider: Some("deepseek".into()),
+                attempt_id: "attempt-1".into(),
+                attempt_index: 0,
+                attempt_session_id: Some("session-1".into()),
+                attempt_run_id: Some("run-1".into()),
+                attempt_provider: "deepseek".into(),
+                attempt_protocol: "openai_compatible".into(),
+                attempt_status: "succeeded".into(),
+                resolved_model_name: "deepseek-flash".into(),
+                upstream_model_name: "deepseek-chat".into(),
+            }],
+        };
+        apply_semantic_execution_capture(&mut view, &capture, "session-1");
+
+        assert_eq!(
+            view.execution_coverage,
+            SemanticJudgmentExecutionCoverage::LookupComplete
+        );
+        let explanation = &view.execution_explanations[0];
+        assert_eq!(
+            explanation.association,
+            SemanticJudgmentExecutionAssociation::Matched
+        );
+        assert_eq!(explanation.provider.as_deref(), Some("deepseek"));
+        assert_eq!(explanation.model_name.as_deref(), Some("deepseek-flash"));
+        assert_eq!(explanation.attempts[0].model_name, "deepseek-flash");
+    }
+
+    #[test]
+    fn semantic_execution_capture_rejects_out_of_range_attempt_index() {
+        let observation = known_observation(RequestJudgmentStageV1::Initial, "eval-1", "inv-1");
+        let mut fact = execution_fact(
+            "inv-1",
+            "run-1",
+            2,
+            3,
+            ("attempt-1", 0, "deepseek", "openai_compatible", "succeeded"),
+        );
+        fact.attempt_index = i64::from(u32::MAX) + 1;
+        let mut view = semantic_view(vec![observation]);
+        let capture = crate::inference_execution::SessionAuxiliaryUsageCapture {
+            facts: ExplainAnalyzeAuxiliaryUsageV1 {
+                available: true,
+                truncated: false,
+                attempts: Vec::new(),
+            },
+            execution: vec![fact],
+        };
+
+        apply_semantic_execution_capture(&mut view, &capture, "session-1");
+
+        let explanation = &view.execution_explanations[0];
+        assert_eq!(
+            explanation.association,
+            SemanticJudgmentExecutionAssociation::Conflicting
+        );
+        assert!(explanation.attempts.is_empty());
+        assert!(explanation.attempts_truncated);
+    }
+
+    #[test]
     fn semantic_execution_projection_keeps_full_observation_identity() {
         let first = known_observation(RequestJudgmentStageV1::Initial, "shared-eval", "inv-1");
         let mut second = known_observation(RequestJudgmentStageV1::Initial, "shared-eval", "inv-2");
@@ -1940,17 +1771,30 @@ mod tests {
         second.observation.correlation.turn = 7;
         second.observation.correlation.round = 8;
         let mut view = semantic_view(vec![first.clone(), second.clone()]);
-        apply_semantic_judgment_execution_lookup(
-            &mut view,
-            SemanticJudgmentExecutionLookup {
-                rows: vec![
-                    execution_row("inv-1", "run-1", 2, 3, None),
-                    execution_row("inv-2", "run-2", 7, 8, None),
-                ],
+        let capture = crate::inference_execution::SessionAuxiliaryUsageCapture {
+            facts: ExplainAnalyzeAuxiliaryUsageV1 {
+                available: true,
                 truncated: false,
+                attempts: Vec::new(),
             },
-            "session-1",
-        );
+            execution: vec![
+                execution_fact(
+                    "inv-1",
+                    "run-1",
+                    2,
+                    3,
+                    ("attempt-1", 0, "deepseek", "openai_compatible", "succeeded"),
+                ),
+                execution_fact(
+                    "inv-2",
+                    "run-2",
+                    7,
+                    8,
+                    ("attempt-2", 0, "deepseek", "openai_compatible", "succeeded"),
+                ),
+            ],
+        };
+        apply_semantic_execution_capture(&mut view, &capture, "session-1");
         assert_eq!(view.execution_explanations.len(), 2);
         assert_eq!(
             view.execution_explanation(&first)

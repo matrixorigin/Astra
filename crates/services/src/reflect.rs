@@ -1694,45 +1694,52 @@ impl ReflectService for DatabaseReflectService {
             None
         };
 
-        let (judgment_usage, semantic_judgments, tool_result_judgments) = tokio::join!(
+        let include_semantic_execution = matches!(
+            request.depth,
+            astra_core::ObservationDepth::Diagnostic | astra_core::ObservationDepth::Forensic
+        );
+        let (physical_capture, mut semantic_judgments, tool_result_judgments) = tokio::join!(
             async {
-                if let Some(shared_pool) = self.pool.as_ref() {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        crate::inference_execution::load_session_auxiliary_usage(
-                            shared_pool,
-                            user_id,
-                            session_id,
-                            512,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(Ok(facts)) => JudgmentUsageSummary::from_physical_attempts(&facts),
-                        outcome => {
-                            tracing::warn!(
-                                target: "astra_services::reflect",
-                                user_id = %user_id,
-                                session_id = %session_id,
-                                ?outcome,
-                                "judgment physical-attempt facts unavailable during reflection"
-                            );
-                            JudgmentUsageSummary {
-                                scope: JudgmentUsageScope::default(),
-                                capture_incomplete: false,
-                                coverage: "unavailable".into(),
-                                groups: Vec::new(),
-                                omitted_groups: 0,
-                            }
-                        }
+                let Some(shared_pool) = self.pool.as_ref() else {
+                    return Err(
+                        crate::semantic_judgment_observation::SemanticJudgmentExecutionCoverage::NoPool,
+                    );
+                };
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    crate::inference_execution::load_session_auxiliary_capture(
+                        shared_pool,
+                        user_id,
+                        session_id,
+                        512,
+                        include_semantic_execution,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(capture)) => Ok(capture),
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            target: "astra_services::reflect",
+                            user_id = %user_id,
+                            session_id = %session_id,
+                            %error,
+                            "judgment physical-attempt facts unavailable during reflection"
+                        );
+                        Err(
+                            crate::semantic_judgment_observation::SemanticJudgmentExecutionCoverage::QueryFailed,
+                        )
                     }
-                } else {
-                    JudgmentUsageSummary {
-                        scope: JudgmentUsageScope::default(),
-                        capture_incomplete: false,
-                        coverage: "unavailable".into(),
-                        groups: Vec::new(),
-                        omitted_groups: 0,
+                    Err(_) => {
+                        tracing::warn!(
+                            target: "astra_services::reflect",
+                            user_id = %user_id,
+                            session_id = %session_id,
+                            "judgment physical-attempt facts timed out during reflection"
+                        );
+                        Err(
+                            crate::semantic_judgment_observation::SemanticJudgmentExecutionCoverage::Timeout,
+                        )
                     }
                 }
             },
@@ -1791,6 +1798,36 @@ impl ReflectService for DatabaseReflectService {
                 })
             },
         );
+
+        let judgment_usage = physical_capture
+            .as_ref()
+            .ok()
+            .map(|capture| JudgmentUsageSummary::from_physical_attempts(&capture.facts))
+            .unwrap_or_else(|| JudgmentUsageSummary {
+                scope: JudgmentUsageScope::default(),
+                capture_incomplete: false,
+                coverage: "unavailable".into(),
+                groups: Vec::new(),
+                omitted_groups: 0,
+            });
+        if include_semantic_execution {
+            if let Some(view) = semantic_judgments.as_mut() {
+                if view.counts.is_some() {
+                    match physical_capture.as_ref() {
+                        Ok(capture) => {
+                            crate::semantic_judgment_observation::apply_semantic_execution_capture(
+                                view, capture, session_id,
+                            );
+                        }
+                        Err(coverage) => {
+                            crate::semantic_judgment_observation::mark_execution_lookup_unavailable(
+                                view, *coverage,
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         // `agent_events.meta_duration_ms` is the durable timing projection
         // for model rounds. Keep this optional like cache-context telemetry so
