@@ -2169,6 +2169,10 @@ fn classification_response_failure(
 struct ClassificationObservation {
     fact: astra_turn_types::SemanticJudgmentFactV1,
     diagnostic: Option<Value>,
+    /// Actual durable execution returned by the summary adapter for this
+    /// stage. This stays beside the redacted semantic fact; the persisted
+    /// trace only carries the bounded invocation identity.
+    execution: Option<astra_turn_core::cloud_summary::SummaryExecutionProvenance>,
     interrupted: bool,
 }
 
@@ -2189,6 +2193,7 @@ impl ClassificationObservationGuard {
             astra_services::TurnIntentJudgeError,
         >,
         received_failure: Option<astra_turn_types::SemanticJudgmentUnavailableReasonV1>,
+        execution: Option<astra_turn_core::cloud_summary::SummaryExecutionProvenance>,
     ) {
         self.completed = true;
         let diagnostic = match result {
@@ -2215,6 +2220,7 @@ impl ClassificationObservationGuard {
             observations.push(ClassificationObservation {
                 fact,
                 diagnostic,
+                execution,
                 interrupted: false,
             });
         }
@@ -2241,6 +2247,7 @@ impl Drop for ClassificationObservationGuard {
                     },
                 },
                 diagnostic: None,
+                execution: None,
                 interrupted: true,
             });
         }
@@ -2690,6 +2697,7 @@ impl SummaryClientWorkAdmissionJudge {
             completed: false,
         };
         let mut received_failure = None;
+        let mut initial_execution = None;
         let initial = async {
             let response = self
                 .summarize(
@@ -2698,12 +2706,16 @@ impl SummaryClientWorkAdmissionJudge {
                     &astra_services::work_admission_classification_messages(&request),
                 )
                 .await?;
+            // Capture the durable identity before validating or parsing the
+            // response. A malformed/failed structured result can still have
+            // consumed a real provider invocation.
+            initial_execution = response.execution.clone();
             received_failure = classification_response_failure(&response);
             Self::require_completed(&response)?;
             astra_services::parse_work_admission_classification(&request, &response.text)
         }
         .await;
-        initial_observation.complete(&initial, received_failure);
+        initial_observation.complete(&initial, received_failure, initial_execution);
         let classification = match initial {
             Err(error @ astra_services::TurnIntentJudgeError::Uncertain { .. }) => {
                 let Some(clarification) =
@@ -2728,6 +2740,7 @@ impl SummaryClientWorkAdmissionJudge {
                     completed: false,
                 };
                 let mut received_failure = None;
+                let mut clarification_execution = None;
                 let result = async {
                     let clarified = self
                         .summarize(
@@ -2736,6 +2749,7 @@ impl SummaryClientWorkAdmissionJudge {
                             &astra_services::work_admission_classification_messages(&clarification),
                         )
                         .await?;
+                    clarification_execution = clarified.execution.clone();
                     received_failure = classification_response_failure(&clarified);
                     Self::require_completed(&clarified)?;
                     astra_services::parse_work_admission_clarification(
@@ -2745,7 +2759,11 @@ impl SummaryClientWorkAdmissionJudge {
                     )
                 }
                 .await;
-                clarification_observation.complete(&result, received_failure);
+                clarification_observation.complete(
+                    &result,
+                    received_failure,
+                    clarification_execution,
+                );
                 result?
             }
             result => result?,
@@ -3611,6 +3629,18 @@ fn bounded_explain_analyze_text(value: &str) -> String {
     label
 }
 
+fn bounded_explain_component(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let suffix = "…";
+    let mut boundary = max_bytes.saturating_sub(suffix.len());
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    format!("{}{}", &value[..boundary], suffix)
+}
+
 #[derive(Clone)]
 struct ExplainAnalyzeContext {
     run_id: String,
@@ -3927,6 +3957,14 @@ pub struct ServerAgenticLoopHost {
     /// Final typed result adopted (or rejected) at the Work-admission
     /// settlement boundary. Classification observations remain separate.
     work_admission_explain_admission: Option<astra_turn_types::ExplainAnalyzeAdmissionSettlementV1>,
+    /// Live-only provenance used to enrich Explain nodes. The persisted
+    /// semantic trace remains the bounded observation plus invocation ID;
+    /// this map is drained with the pending observations and cannot cross a
+    /// turn or session.
+    pending_classification_executions: BTreeMap<
+        (String, astra_turn_types::RequestJudgmentStageV1),
+        Option<astra_turn_core::cloud_summary::SummaryExecutionProvenance>,
+    >,
     /// The optional semantic sidecar gets at most one attempt per user turn.
     /// An unavailable classifier is not retried inside the same user turn.
     /// Absence or failure leaves primary typed proposals on normal admission.
@@ -7009,6 +7047,7 @@ impl ServerAgenticLoopHostBuilder {
             work_admission_classification_correlation: None,
             pending_classification_observations: Vec::new(),
             work_admission_explain_admission: None,
+            pending_classification_executions: BTreeMap::new(),
             work_admission_attempted: false,
             work_admission_unavailable: false,
             work_admission_unavailable_reason: None,
@@ -8885,6 +8924,29 @@ impl ServerAgenticLoopHost {
         })
     }
 
+    /// Keep the live Explain node useful when a real auxiliary execution is
+    /// known, without turning the node label into an implementation dump.
+    /// The invocation identity remains in the semantic trace and physical
+    /// usage ledger; this label is only the user-facing model/provider hint.
+    fn classification_explain_label(
+        fact: &astra_turn_types::SemanticJudgmentFactV1,
+        execution: Option<&astra_turn_core::cloud_summary::SummaryExecutionProvenance>,
+    ) -> String {
+        let Some(execution) = execution else {
+            return fact.presentation_label();
+        };
+        let stage = match fact.stage {
+            astra_turn_types::RequestJudgmentStageV1::Initial => "initial",
+            astra_turn_types::RequestJudgmentStageV1::Clarification => "clarification",
+        };
+        let model = bounded_explain_component(&execution.model_name, 48);
+        let provider = bounded_explain_component(&execution.provider, 32);
+        let result = bounded_explain_component(&fact.result.presentation_label(), 48);
+        bounded_explain_analyze_text(&format!(
+            "Classify request · {stage} · model={model} · provider={provider} · {result}"
+        ))
+    }
+
     async fn reconcile_work_admission_skill_revision(
         &mut self,
         state: &mut AgenticLoopState,
@@ -9417,6 +9479,7 @@ impl ServerAgenticLoopHost {
                         result: astra_turn_types::RequestJudgmentResultV1::NotDispatched { reason },
                     },
                 },
+                None,
             );
         }
     }
@@ -9436,12 +9499,20 @@ impl ServerAgenticLoopHost {
                     delivery: astra_turn_types::SemanticJudgmentDeliveryV1::Unresolved,
                 };
             }
+            let execution = observation.execution;
+            let mut correlation = correlation.clone();
+            if let Some(execution) = execution.as_ref() {
+                correlation.invocation = astra_turn_types::SemanticJudgmentInvocationV1::Known {
+                    invocation_id: execution.invocation_id.clone(),
+                };
+            }
             self.queue_classification_observation(
                 astra_turn_types::SemanticJudgmentObservationV1 {
                     schema_version: astra_turn_types::SEMANTIC_JUDGMENT_SCHEMA_VERSION,
-                    correlation: correlation.clone(),
+                    correlation,
                     fact: observation.fact,
                 },
+                execution,
             );
         }
     }
@@ -9449,15 +9520,36 @@ impl ServerAgenticLoopHost {
     fn queue_classification_observation(
         &mut self,
         observation: astra_turn_types::SemanticJudgmentObservationV1,
+        execution: Option<astra_turn_core::cloud_summary::SummaryExecutionProvenance>,
     ) {
         // C3 is bounded, best-effort telemetry. Never retain provider text or
         // let observation pressure alter admission/control state.
         if self.pending_classification_observations.len() < 32 && observation.validate().is_ok() {
+            let key = (
+                observation.correlation.evaluation_span_id.clone(),
+                observation.fact.stage,
+            );
+            match self.pending_classification_executions.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(execution);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    if entry.get() != &execution {
+                        // The same logical stage must not silently switch
+                        // execution identities. Leave its live label
+                        // unqualified. The persisted invocation identity and
+                        // physical ledger remain the authorities for any
+                        // later conflict/coverage projection.
+                        entry.insert(None);
+                    }
+                }
+            }
             self.pending_classification_observations.push(observation);
         }
     }
 
     fn flush_classification_observations(&mut self, state: &mut AgenticLoopState) {
+        let executions = std::mem::take(&mut self.pending_classification_executions);
         for observation in std::mem::take(&mut self.pending_classification_observations) {
             if state.current_session_id.as_deref() != Some(self.session_id.as_str())
                 || state.current_run_id.as_deref() != Some(observation.correlation.run_id.as_str())
@@ -9490,12 +9582,18 @@ impl ServerAgenticLoopHost {
                 continue;
             };
             let now = Instant::now();
+            let execution = executions
+                .get(&(
+                    observation.correlation.evaluation_span_id.clone(),
+                    observation.fact.stage,
+                ))
+                .and_then(Option::as_ref);
             let node = ExplainAnalyzeNode::new(
                 &context,
                 format!("{}/judgment/{span_id}", context.root_node_id),
                 Some(context.root_node_id.clone()),
                 astra_turn_types::ExplainAnalyzeNodeKindV1::Preparation,
-                observation.fact.presentation_label(),
+                Self::classification_explain_label(&observation.fact, execution),
                 now,
                 Some(observation.correlation.round),
                 None,
@@ -25848,6 +25946,25 @@ mod tests {
         }
     }
 
+    fn summary_response_with_execution(
+        text: &str,
+        invocation_id: &str,
+        model_name: &str,
+        provider: &str,
+    ) -> astra_turn_core::cloud_summary::SummaryResponse {
+        astra_turn_core::cloud_summary::SummaryResponse {
+            text: text.to_string(),
+            is_ptl_error: false,
+            finish_reason: Some("stop".to_string()),
+            usage: serde_json::Map::new(),
+            execution: Some(astra_turn_core::cloud_summary::SummaryExecutionProvenance {
+                invocation_id: invocation_id.to_string(),
+                model_name: model_name.to_string(),
+                provider: provider.to_string(),
+            }),
+        }
+    }
+
     #[tokio::test]
     async fn work_admission_domain_valid_verbose_task_needs_no_repair() {
         for length in [167, 235] {
@@ -25956,6 +26073,7 @@ mod tests {
                         },
                     },
                     diagnostic: Some(json!({"uncertain_fields":["required"]})),
+                    execution: None,
                     interrupted: false,
                 }),
         );
@@ -26217,6 +26335,126 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn request_classification_keeps_stage_local_execution_provenance() {
+        let mut uncertain: Value = serde_json::from_str(&classification_response(false)).unwrap();
+        uncertain["answers"]["required"]["noul"] = json!(0.21);
+        let judge = SummaryClientWorkAdmissionJudge::new(Box::new(UsageSequencedSummaryClient {
+            responses: std::sync::Mutex::new(
+                [
+                    Ok(summary_response_with_execution(
+                        &uncertain.to_string(),
+                        "invocation-initial",
+                        "deepseek-flash",
+                        "deepseek",
+                    )),
+                    Ok(summary_response_with_execution(
+                        &classification_response(false),
+                        "invocation-clarification",
+                        "fallback-llm",
+                        "openai-compatible",
+                    )),
+                ]
+                .into(),
+            ),
+        }));
+        let planner = SummaryClientWorkAdmissionJudge::new(Box::new(PendingClassificationClient));
+
+        assert!(
+            judge
+                .classify_and_plan(&planner, &Default::default())
+                .await
+                .is_ok()
+        );
+        let observations = judge.classification_observations.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(
+            observations[0]
+                .execution
+                .as_ref()
+                .map(|execution| execution.invocation_id.as_str()),
+            Some("invocation-initial")
+        );
+        assert_eq!(
+            observations[1]
+                .execution
+                .as_ref()
+                .map(|execution| execution.invocation_id.as_str()),
+            Some("invocation-clarification")
+        );
+        drop(observations);
+
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-provenance".into(),
+            "s-provenance".into(),
+        )
+        .build();
+        host.work_admission_classification_correlation =
+            Some(astra_turn_types::SemanticJudgmentCorrelationV1 {
+                run_id: "run-provenance".into(),
+                turn: 1,
+                round: 0,
+                owner_generation: Some(1),
+                evaluation_span_id: "evaluation-provenance".into(),
+                invocation: astra_turn_types::SemanticJudgmentInvocationV1::Unavailable,
+            });
+        host.retain_classification_observations(
+            std::mem::take(&mut *judge.classification_observations.lock().unwrap()),
+            astra_turn_types::SemanticJudgmentUnavailableReasonV1::ExecutionError,
+        );
+        assert_eq!(host.pending_classification_observations.len(), 2);
+        let invocations = host
+            .pending_classification_observations
+            .iter()
+            .map(|observation| match &observation.correlation.invocation {
+                astra_turn_types::SemanticJudgmentInvocationV1::Known { invocation_id } => {
+                    invocation_id.as_str()
+                }
+                astra_turn_types::SemanticJudgmentInvocationV1::Unavailable => "unavailable",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            invocations,
+            vec!["invocation-initial", "invocation-clarification"]
+        );
+        let initial_execution = host
+            .pending_classification_executions
+            .get(&(
+                "evaluation-provenance".into(),
+                astra_turn_types::RequestJudgmentStageV1::Initial,
+            ))
+            .and_then(Option::as_ref)
+            .expect("initial execution provenance");
+        assert_eq!(initial_execution.model_name, "deepseek-flash");
+        assert_eq!(initial_execution.provider, "deepseek");
+        let clarification_execution = host
+            .pending_classification_executions
+            .get(&(
+                "evaluation-provenance".into(),
+                astra_turn_types::RequestJudgmentStageV1::Clarification,
+            ))
+            .and_then(Option::as_ref)
+            .expect("clarification execution provenance");
+        assert_eq!(clarification_execution.model_name, "fallback-llm");
+        assert_eq!(clarification_execution.provider, "openai-compatible");
+        let label = ServerAgenticLoopHost::classification_explain_label(
+            &host.pending_classification_observations[0].fact,
+            Some(initial_execution),
+        );
+        assert!(label.contains("model=deepseek-flash"), "{label}");
+        assert!(label.contains("provider=deepseek"), "{label}");
+        assert!(label.len() <= 160, "{} bytes", label.len());
+
+        // A scope mismatch must discard the trace and its live-only
+        // provenance together; neither can survive into a later turn.
+        let mut state = create_test_state();
+        host.flush_classification_observations(&mut state);
+        assert!(host.pending_classification_observations.is_empty());
+        assert!(host.pending_classification_executions.is_empty());
     }
 
     #[tokio::test]

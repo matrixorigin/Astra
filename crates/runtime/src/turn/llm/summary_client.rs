@@ -549,7 +549,11 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                     is_ptl_error: true,
                     finish_reason: None,
                     usage: serde_json::Map::new(),
-                    execution: None,
+                    // The durable outcome can identify the invocation even
+                    // when the provider rejected the request for context
+                    // length. Keep that identity for semantic diagnostics;
+                    // it does not turn the failed response into a decision.
+                    execution: execution_provenance,
                 })
             }
             Err(error) => Err(error),
