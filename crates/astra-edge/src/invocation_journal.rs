@@ -431,15 +431,14 @@ impl EdgeInvocationJournal {
         {
             return Err(JournalError::TooLarge);
         }
-        if let Some(record) = self.state.records.get(request_id).cloned() {
+        if let Some(mut record) = self.state.records.get(request_id).cloned() {
             if !record.matches(identity, tool, args) {
                 return Err(JournalError::IdentityConflict {
                     request_id: request_id.to_string(),
                 });
             }
-            let mut updated = record.clone();
-            updated.delivery_generation = delivery_generation;
-            self.commit_record(request_id.to_string(), Some(updated))
+            record.delivery_generation = delivery_generation;
+            self.commit_record(request_id.to_string(), Some(record))
                 .await?;
             let record = &self.state.records[request_id];
             let outcome = match record.state {
@@ -644,8 +643,8 @@ impl EdgeInvocationJournal {
         let mutation = JournalMutation {
             contract_version: JOURNAL_VERSION.to_string(),
             sequence,
-            request_id: request_id.clone(),
-            record: record.clone(),
+            request_id,
+            record,
         };
         let mut line = serde_json::to_vec(&mutation).map_err(|error| JournalError::Corrupt {
             path: self.wal_path.clone(),
@@ -672,6 +671,9 @@ impl EdgeInvocationJournal {
                 path: self.wal_path.clone(),
                 source,
             })?;
+        let JournalMutation {
+            request_id, record, ..
+        } = mutation;
         match record {
             Some(record) => {
                 self.state.records.insert(request_id, record);

@@ -520,7 +520,7 @@ fn metadata_string_array(metadata: &Value, field: &str) -> Result<Vec<String>, S
         .collect()
 }
 
-fn validate_storage_integrity(artifact: &StoredSessionArtifact) -> Result<(), String> {
+fn validate_storage_integrity(artifact: &StoredSessionArtifact) -> Result<Vec<u8>, String> {
     let metadata = artifact
         .metadata
         .as_ref()
@@ -570,7 +570,7 @@ fn validate_storage_integrity(artifact: &StoredSessionArtifact) -> Result<(), St
                 .to_string(),
         );
     }
-    Ok(())
+    Ok(bytes)
 }
 
 fn validate_capture_projection(
@@ -629,6 +629,21 @@ fn validate_snapshot_payload<'a>(
     expected_run_id: Option<&str>,
     expected_owner_generation: Option<u64>,
 ) -> Result<&'a str, String> {
+    validate_snapshot_payload_with_bytes(
+        artifact,
+        reader_session_id,
+        expected_run_id,
+        expected_owner_generation,
+    )
+    .map(|(status, _)| status)
+}
+
+fn validate_snapshot_payload_with_bytes<'a>(
+    artifact: &'a StoredSessionArtifact,
+    reader_session_id: &str,
+    expected_run_id: Option<&str>,
+    expected_owner_generation: Option<u64>,
+) -> Result<(&'a str, Vec<u8>), String> {
     if artifact.status.as_deref() != Some("active") {
         return Err(format!(
             "server Explain Analyze artifact is not active (storage status: {})",
@@ -641,7 +656,7 @@ fn validate_snapshot_payload<'a>(
         );
     }
     let status = envelope_status(artifact)?;
-    validate_storage_integrity(artifact)?;
+    let bytes = validate_storage_integrity(artifact)?;
     let content = &artifact.content;
     if content.get("session_id").and_then(Value::as_str) != Some(reader_session_id) {
         return Err(
@@ -696,7 +711,7 @@ fn validate_snapshot_payload<'a>(
         if !events.is_empty() {
             return Err("unavailable Explain Analyze artifact contains runtime facts".to_string());
         }
-        return Ok(status);
+        return Ok((status, bytes));
     }
     if events.is_empty() {
         return Err("readable Explain Analyze artifact contains no runtime facts".to_string());
@@ -715,7 +730,7 @@ fn validate_snapshot_payload<'a>(
         facts.push(fact);
     }
     validate_capture_projection(content, status, &facts)?;
-    Ok(status)
+    Ok((status, bytes))
 }
 
 pub(crate) fn unavailable_context_notice(reason: &str) -> String {
@@ -899,12 +914,10 @@ pub(crate) async fn resolve_request(
         if artifact.artifact_kind != ARTIFACT_KIND {
             return Err("artifact handle does not name a server Explain Analyze snapshot".to_string());
         }
-        let status = validate_snapshot_payload(&artifact, session_id, None, None)?;
+        let (status, bytes) = validate_snapshot_payload_with_bytes(&artifact, session_id, None, None)?;
         if status == "unavailable" {
             return Err("the latest Explain Analyze capture is unavailable".to_string());
         }
-        let bytes = serde_json::to_vec_pretty(&artifact.content)
-            .map_err(|error| format!("encode Explain Analyze artifact window: {error}"))?;
         let content = String::from_utf8(bytes)
             .map_err(|error| format!("Explain Analyze artifact is not valid UTF-8: {error}"))?;
         let (window, total_bytes, next_offset) = read_window(&content, offset, max_bytes)?;
