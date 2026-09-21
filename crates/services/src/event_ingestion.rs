@@ -50,7 +50,7 @@ use crate::observation_capture::{
 use astra_core::canonical_names::{
     metadata_duration_ms, metadata_tool_call_id, metadata_tool_name, normalize_optional_name,
 };
-use astra_core::{matrixone_null_shape_comment, matrixone_statement_with_null_shape};
+use astra_core::matrixone_null_shape_comment;
 
 const SESSION_END_EVENT_TYPE: &str = "session_end";
 pub const MIN_INGESTION_BATCH_SIZE: usize = 1;
@@ -2104,34 +2104,61 @@ async fn read_back_ingestion_captures(
     Ok(readbacks)
 }
 
-fn bind_ingestion_event<'q>(
-    mut query: sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments>,
-    values: &'q IngestionEventInsertValues<'q>,
-    ingestion_write_id: &'q str,
-) -> sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments> {
-    let event = values.event;
-    query = query
-        .bind(&event.event_id)
-        .bind(&event.session_id)
-        .bind(&event.user_id)
-        .bind(&event.event_type)
-        .bind(&event.content)
-        .bind(&values.token_usage_json)
-        .bind(&event.llm_model_used)
-        .bind(&values.skill_name)
-        .bind(&values.metadata_json)
-        .bind(&values.created_at)
-        .bind(&event.parent_event_id)
-        .bind(&event.causal_chain_id)
-        .bind(&values.tool_call_id)
-        .bind(&values.meta_tool_name)
-        .bind(values.meta_duration_ms)
-        .bind(values.token_input)
-        .bind(values.token_output)
-        .bind(values.token_total)
-        .bind(&values.payload_hash)
-        .bind(ingestion_write_id);
-    query
+const INGESTION_EVENT_INSERT_PREFIX: &str = "INSERT IGNORE INTO agent_events \
+     (event_id, session_id, user_id, event_type, content, \
+      token_usage, llm_model_used, skill_name, metadata, \
+      created_at, parent_event_id, causal_chain_id, \
+      tool_call_id, meta_tool_name, meta_duration_ms, \
+      token_input, token_output, token_total, payload_hash, \
+      ingestion_write_id) ";
+
+async fn insert_ingestion_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    values: &[&IngestionEventInsertValues<'_>],
+    ingestion_write_id: &str,
+    operation: &str,
+) -> Result<u64, String> {
+    if values.is_empty() {
+        return Ok(0);
+    }
+
+    let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(INGESTION_EVENT_INSERT_PREFIX);
+    builder.push_values(values.iter().copied(), |mut row, values| {
+        let event = values.event;
+        row.push_bind(&event.event_id)
+            .push_bind(&event.session_id)
+            .push_bind(&event.user_id)
+            .push_bind(&event.event_type)
+            .push_bind(&event.content)
+            .push_bind(&values.token_usage_json)
+            .push_bind(&event.llm_model_used)
+            .push_bind(&values.skill_name)
+            .push_bind(&values.metadata_json)
+            .push_bind(&values.created_at)
+            .push_bind(&event.parent_event_id)
+            .push_bind(&event.causal_chain_id)
+            .push_bind(&values.tool_call_id)
+            .push_bind(&values.meta_tool_name)
+            .push_bind(values.meta_duration_ms)
+            .push_bind(values.token_input)
+            .push_bind(values.token_output)
+            .push_bind(values.token_total)
+            .push_bind(&values.payload_hash)
+            .push_bind(ingestion_write_id);
+    });
+    builder.push(matrixone_null_shape_comment(
+        values
+            .iter()
+            .copied()
+            .flat_map(IngestionEventInsertValues::nullable_shape),
+    ));
+
+    builder
+        .build()
+        .execute(&mut **tx)
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(|error| format!("{operation}: {error}"))
 }
 
 /// Cloneable process-local aggregate budget for ingestion DB attempts.
@@ -2861,76 +2888,31 @@ impl EventIngestionWorker {
 
         let mut reported_rows_inserted = 0_i64;
         if !plain_events.is_empty() {
-            let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
-                "INSERT IGNORE INTO agent_events \
-                     (event_id, session_id, user_id, event_type, content, \
-                      token_usage, llm_model_used, skill_name, metadata, \
-                      created_at, parent_event_id, causal_chain_id, \
-                      tool_call_id, meta_tool_name, meta_duration_ms, \
-                      token_input, token_output, token_total, payload_hash, \
-                      ingestion_write_id) ",
-            );
-            builder.push_values(plain_events.iter(), |mut row, values| {
-                let event = values.event;
-                row.push_bind(&event.event_id)
-                    .push_bind(&event.session_id)
-                    .push_bind(&event.user_id)
-                    .push_bind(&event.event_type)
-                    .push_bind(&event.content)
-                    .push_bind(&values.token_usage_json)
-                    .push_bind(&event.llm_model_used)
-                    .push_bind(&values.skill_name)
-                    .push_bind(&values.metadata_json)
-                    .push_bind(&values.created_at)
-                    .push_bind(&event.parent_event_id)
-                    .push_bind(&event.causal_chain_id)
-                    .push_bind(&values.tool_call_id)
-                    .push_bind(&values.meta_tool_name)
-                    .push_bind(values.meta_duration_ms)
-                    .push_bind(values.token_input)
-                    .push_bind(values.token_output)
-                    .push_bind(values.token_total)
-                    .push_bind(&values.payload_hash)
-                    .push_bind(&ingestion_write_id);
-            });
-            builder.push(matrixone_null_shape_comment(
-                plain_events
-                    .iter()
-                    .flat_map(|values| values.nullable_shape()),
-            ));
-
-            let insert_result = builder
-                .build()
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| format!("batch insert ({user_id}/{session_id}): {e}"))?;
+            let inserted_rows = insert_ingestion_rows(
+                &mut tx,
+                &plain_events,
+                &ingestion_write_id,
+                &format!("batch insert ({user_id}/{session_id})"),
+            )
+            .await?;
             add_inserted_rows(
                 &mut reported_rows_inserted,
-                insert_result.rows_affected(),
+                inserted_rows,
                 "event_ingestion.batch_insert",
             )?;
         }
 
         for values in plain_session_end_events.into_iter().chain(parented_events) {
-            let insert_sql = matrixone_statement_with_null_shape(
-                "INSERT IGNORE INTO agent_events \
-                     (event_id, session_id, user_id, event_type, content, \
-                      token_usage, llm_model_used, skill_name, metadata, \
-                      created_at, parent_event_id, causal_chain_id, \
-                      tool_call_id, meta_tool_name, meta_duration_ms, \
-                      token_input, token_output, token_total, payload_hash, \
-                      ingestion_write_id) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                values.nullable_shape(),
-            );
-            let insert_result =
-                bind_ingestion_event(sqlx::query(&insert_sql), values, &ingestion_write_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| format!("event insert ({user_id}/{session_id}): {e}"))?;
+            let inserted_rows = insert_ingestion_rows(
+                &mut tx,
+                std::slice::from_ref(&values),
+                &ingestion_write_id,
+                &format!("event insert ({user_id}/{session_id})"),
+            )
+            .await?;
             add_inserted_rows(
                 &mut reported_rows_inserted,
-                insert_result.rows_affected(),
+                inserted_rows,
                 "event_ingestion.single_insert",
             )?;
         }
