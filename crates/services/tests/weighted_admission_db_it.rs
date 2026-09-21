@@ -965,7 +965,9 @@ async fn release_timeout_can_be_retried_after_gate_unblocks() {
     let mut controller = DatabaseWeightedAdmissionController::new(pool.clone(), limits(2))
         .expect("valid admission limits");
     let recovery_controller = controller.clone();
-    controller.with_admission_wait_timeout(Duration::from_millis(100));
+    // Keep the fault-injection budget bounded without making a healthy
+    // multi-query reservation depend on a 100ms database latency threshold.
+    controller.with_admission_wait_timeout(Duration::from_secs(1));
     let permit = controller
         .try_reserve(
             &key("release-timeout-owner"),
@@ -987,13 +989,13 @@ async fn release_timeout_can_be_retried_after_gate_unblocks() {
     .await
     .expect("hold durable admission gate for release");
 
-    let first = tokio::time::timeout(Duration::from_secs(1), permit.release())
+    let first = tokio::time::timeout(Duration::from_secs(5), permit.release())
         .await
         .expect("release timeout must finish")
         .expect_err("release blocked on the gate must report its timeout");
     assert!(matches!(
         first,
-        DistributedAdmissionError::AdmissionTimeout { .. }
+        DistributedAdmissionError::AdmissionTimeout { timeout_ms: 1000 }
     ));
 
     gate_holder
