@@ -46531,6 +46531,11 @@ mod tests {
             Some("system")
         );
         assert_eq!(
+            llm_events[0]["metadata"]["request_projection_authority"].as_str(),
+            Some("planned_pre_client_projection_v1"),
+            "the journal must identify its canonical pre-client request projection"
+        );
+        assert_eq!(
             captured_summary_roles
                 .last()
                 .and_then(|entry| entry["role"].as_str()),
@@ -46571,12 +46576,14 @@ mod tests {
                 >= 1,
             "the canonical journal request must retain at least one system message"
         );
-        assert!(captured_request_messages.iter().any(|message| {
-            message["role"] == "user"
-                && message["content"]
-                    .as_str()
-                    .is_some_and(|text| text.starts_with("<astra-runtime-context>\n"))
-        }));
+        assert!(
+            captured_request_messages.iter().any(|message| {
+                message["role"] == "system"
+                    && message[crate::turn::wire_assembly::RUNTIME_SYSTEM_CONTEXT_MARKER].as_bool()
+                        == Some(true)
+            }),
+            "the canonical journal must retain the runtime system context marker"
+        );
         assert_eq!(
             llm_events[1]["metadata"]["response"]["outcome"].as_str(),
             Some("success_stop")

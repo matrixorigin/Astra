@@ -3004,6 +3004,7 @@ fn session_context_http_error(
             error_response(StatusCode::NOT_FOUND, error.to_string())
         }
         astra_services::SessionContextCoordinatorError::Fenced
+        | astra_services::SessionContextCoordinatorError::SessionLifecycleFenced
         | astra_services::SessionContextCoordinatorError::Expired => {
             error_response(StatusCode::CONFLICT, error.to_string())
         }

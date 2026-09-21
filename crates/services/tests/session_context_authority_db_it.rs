@@ -7,6 +7,7 @@ use astra_services::{
     AcquireWriterAndReserveTurnOutcome, AcquireWriterOutcome, BeginSessionExecutionSwitchV1,
     DatabaseSessionContextCoordinator, ReserveTurnOutcome, SessionContextCoordinator,
     SessionContextCoordinatorError, SessionExecutionBindingStateV1, SessionExecutionBindingV1,
+    SessionService,
 };
 use astra_turn_types::{
     ActorContextV1, ActorKindV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION,
@@ -659,6 +660,253 @@ async fn execution_read_is_non_mutating_during_an_active_turn() {
         .execute(pool.get())
         .await
         .expect("clean execution read session fixture");
+    }
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_lifecycle_fence_rejects_context_admission_before_child_locks() {
+    let pool = common::setup_pool().await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let owner_id = format!("lifecycle-fence-owner-{suffix}");
+    let session_id = format!("lifecycle-fence-session-{suffix}");
+    let key = SessionKeyV1::owner_session("server", &owner_id, &session_id, "main");
+    sqlx::query(
+        "INSERT INTO agent_sessions
+         (session_id, user_id, status, event_count, created_at, updated_at, last_active_at)
+         VALUES (?, ?, 'active', 0, NOW(6), NOW(6), NOW(6))",
+    )
+    .bind(&session_id)
+    .bind(&owner_id)
+    .execute(pool.get())
+    .await
+    .expect("create lifecycle fence fixture session");
+
+    let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+    coordinator
+        .load_or_initialize_execution_binding(
+            &key,
+            &SessionExecutionBindingV1::server_work_default(format!(
+                "lifecycle-fence-work-{suffix}"
+            )),
+        )
+        .await
+        .expect("initialize lifecycle fence fixture");
+    let actor = ActorContextV1::owner_user(
+        &owner_id,
+        "lifecycle-fence-db-it",
+        ActorKindV1::Server,
+        SessionSurfaceV1::Server,
+        None,
+        AuthorityEpochsV1::default(),
+    );
+
+    sqlx::query(
+        "UPDATE agent_session_lifecycle_fences
+         SET delete_requested_at = NOW(6), updated_at = NOW(6)
+         WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&owner_id)
+    .bind(&session_id)
+    .execute(pool.get())
+    .await
+    .expect("mark lifecycle fence pending");
+    assert!(matches!(
+        coordinator
+            .acquire_writer(&key, None, &actor, Duration::from_secs(30), "fenced-writer")
+            .await,
+        Err(SessionContextCoordinatorError::SessionLifecycleFenced)
+    ));
+
+    sqlx::query(
+        "UPDATE agent_session_lifecycle_fences
+         SET database_deleted_at = NOW(6), updated_at = NOW(6)
+         WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&owner_id)
+    .bind(&session_id)
+    .execute(pool.get())
+    .await
+    .expect("mark lifecycle fence completed");
+    assert!(matches!(
+        coordinator
+            .acquire_writer(
+                &key,
+                None,
+                &actor,
+                Duration::from_secs(30),
+                "completed-fenced-writer",
+            )
+            .await,
+        Err(SessionContextCoordinatorError::SessionLifecycleFenced)
+    ));
+
+    let receipt_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_context_operation_receipts
+         WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?",
+    )
+    .bind(&key.isolation_domain)
+    .bind(&owner_id)
+    .bind(&session_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("count fenced receipts");
+    assert_eq!(
+        receipt_count, 0,
+        "fenced admission must not create receipts"
+    );
+
+    for table in [
+        "session_execution_workspace_claims",
+        "session_execution_bindings",
+        "session_context_operation_receipts",
+        "session_context_authority_events",
+        "session_context_heads",
+    ] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?"
+        ))
+        .bind(&key.isolation_domain)
+        .bind(&owner_id)
+        .bind(&session_id)
+        .execute(pool.get())
+        .await
+        .expect("clean lifecycle fence context fixture");
+    }
+    for table in ["agent_session_lifecycle_fences", "agent_sessions"] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
+        ))
+        .bind(&owner_id)
+        .bind(&session_id)
+        .execute(pool.get())
+        .await
+        .expect("clean lifecycle fence session fixture");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_lifecycle_fence_serializes_delete_and_late_writer() {
+    let (shared, settings) = common::setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let owner_id = format!("lifecycle-race-owner-{suffix}");
+    let session_id = format!("lifecycle-race-session-{suffix}");
+    let key = SessionKeyV1::owner_session("server", &owner_id, &session_id, "main");
+    sqlx::query(
+        "INSERT INTO agent_sessions
+         (session_id, user_id, status, event_count, created_at, updated_at, last_active_at)
+         VALUES (?, ?, 'active', 0, NOW(6), NOW(6), NOW(6))",
+    )
+    .bind(&session_id)
+    .bind(&owner_id)
+    .execute(&pool)
+    .await
+    .expect("create lifecycle race fixture session");
+
+    let coordinator = DatabaseSessionContextCoordinator::new(shared.clone());
+    coordinator
+        .load_or_initialize_execution_binding(
+            &key,
+            &SessionExecutionBindingV1::server_work_default(format!(
+                "lifecycle-race-work-{suffix}"
+            )),
+        )
+        .await
+        .expect("initialize lifecycle race fixture");
+
+    // Hold the exact fence used by a coordinator writer. The real delete path
+    // must wait here rather than deleting child rows out from under the
+    // admitted transaction.
+    let mut admitted_writer = pool.begin().await.expect("begin admitted writer");
+    astra_services::storage::lock_agent_session_write_fence(
+        &mut admitted_writer,
+        &session_id,
+        &owner_id,
+    )
+    .await
+    .expect("admit writer lifecycle fence");
+
+    let delete_session_id = session_id.clone();
+    let delete_owner_id = owner_id.clone();
+    let mut delete_task = tokio::spawn(async move {
+        astra_services::DatabaseSessionService::new(settings)
+            .with_pool(shared)
+            .delete_session(delete_session_id, delete_owner_id)
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut delete_task)
+            .await
+            .is_err(),
+        "delete must wait for an already-admitted writer fence"
+    );
+    admitted_writer
+        .commit()
+        .await
+        .expect("commit admitted writer before delete");
+    tokio::time::timeout(Duration::from_secs(5), delete_task)
+        .await
+        .expect("delete must finish after the writer fence is released")
+        .expect("delete task must not panic")
+        .expect("delete session after admitted writer");
+
+    let actor = ActorContextV1::owner_user(
+        &owner_id,
+        "lifecycle-race-db-it",
+        ActorKindV1::Server,
+        SessionSurfaceV1::Server,
+        None,
+        AuthorityEpochsV1::default(),
+    );
+    assert!(matches!(
+        coordinator
+            .acquire_writer(&key, None, &actor, Duration::from_secs(30), "late-writer")
+            .await,
+        Err(SessionContextCoordinatorError::SessionLifecycleFenced)
+    ));
+    let head_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_context_heads
+         WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?",
+    )
+    .bind(&key.isolation_domain)
+    .bind(&owner_id)
+    .bind(&session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count deleted context heads");
+    let receipt_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_context_operation_receipts
+         WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?",
+    )
+    .bind(&key.isolation_domain)
+    .bind(&owner_id)
+    .bind(&session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count deleted context receipts");
+    assert_eq!(
+        head_count, 0,
+        "late writer must not recreate the context head"
+    );
+    assert_eq!(
+        receipt_count, 0,
+        "late writer must not create an operation receipt"
+    );
+
+    for table in [
+        "session_deletion_tombstones",
+        "agent_session_lifecycle_fences",
+    ] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
+        ))
+        .bind(&owner_id)
+        .bind(&session_id)
+        .execute(&pool)
+        .await
+        .expect("clean lifecycle race fence fixture");
     }
 }
 
