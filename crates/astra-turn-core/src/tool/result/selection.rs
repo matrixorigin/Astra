@@ -23,6 +23,7 @@ const MAX_GOAL_CHARS: usize = 1_000;
 const MAX_TOOL_NAME_CHARS: usize = 128;
 const YES_THRESHOLD: f64 = 0.75;
 const NO_THRESHOLD: f64 = 0.25;
+const SELECTION_POLICY: &str = "Judge only the supplied exact source chunks. Do not infer that unscanned source is irrelevant. Mark uncertainty rather than guessing. Selection cannot alter tool status, permissions, or durable evidence.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -365,12 +366,12 @@ pub fn recover_frozen_tool_result_selection_projection(
 /// Build a bounded judgment over exact chunks from one verified artifact.
 /// The artifact descriptor remains outside model control and binds every
 /// candidate identity to the current owner-scoped source.
-pub fn build_tool_result_selection_judgment(
+fn build_tool_result_selection_request_parts(
     goal: &str,
     tool_name: &str,
     descriptor: &astra_services::session_journal::ToolResultArtifactDescriptor,
     projection: &ToolResultChunkCandidateProjection,
-) -> Result<JudgmentRequest, &'static str> {
+) -> Result<(serde_json::Value, BTreeMap<String, JudgmentQuestion>), &'static str> {
     validate_projection(descriptor, projection)?;
     let candidates = projection
         .candidates()
@@ -395,57 +396,185 @@ pub fn build_tool_result_selection_judgment(
         .iter()
         .map(|candidate| {
             let id = candidate.chunk().id.clone();
-            (
-                id.clone(),
-                JudgmentQuestion::Noul {
-                    instructions: format!(
-                        "Does state.candidates[{id:?}] contain evidence or facts useful for the current goal? Apply state.policy."
-                    ),
-                    criteria: Some(NoulCriteria {
-                        yes: "Contains a concrete fact, error, result, or constraint that can help the next agent step.".into(),
-                        no: "Contains only unrelated, redundant, or low-value detail for the current goal.".into(),
-                    }),
-                },
-            )
+            (id.clone(), selection_question(&id))
         })
         .collect();
+    let state = serde_json::json!({
+            "policy": SELECTION_POLICY,
+        "goal": bounded_goal(goal),
+        "goal_coverage": {
+            "source_chars": goal.chars().count(),
+            "complete": tool_result_selection_goal_coverage_complete(goal),
+        },
+        "tool_name": truncate_chars(tool_name, MAX_TOOL_NAME_CHARS),
+        "artifact": {
+            "document_kind": descriptor.document_kind,
+            "version": descriptor.version,
+            "run_id": descriptor.run_id,
+            "call_id": descriptor.call_id,
+            "content_sha256": descriptor.content_sha256,
+            "source_bytes": projection.source_bytes(),
+            "scanned_bytes": projection.scanned_bytes(),
+            "scan_complete": projection.scan_complete(),
+            "chunker_version": projection.chunker_version(),
+        },
+        "candidates": candidates,
+    });
+    Ok((state, questions))
+}
+
+fn selection_question(id: &str) -> JudgmentQuestion {
+    JudgmentQuestion::Noul {
+        instructions: format!(
+            "Does state.candidates[{id:?}] contain evidence or facts useful for the current goal? Apply state.policy."
+        ),
+        criteria: Some(NoulCriteria {
+            yes: "Contains a concrete fact, error, result, or constraint that can help the next agent step.".into(),
+            no: "Contains only unrelated, redundant, or low-value detail for the current goal.".into(),
+        }),
+    }
+}
+
+pub fn build_tool_result_selection_judgment(
+    goal: &str,
+    tool_name: &str,
+    descriptor: &astra_services::session_journal::ToolResultArtifactDescriptor,
+    projection: &ToolResultChunkCandidateProjection,
+) -> Result<JudgmentRequest, &'static str> {
+    let (state, questions) =
+        build_tool_result_selection_request_parts(goal, tool_name, descriptor, projection)?;
     Ok(JudgmentRequest {
         schema_version: 1,
-        state: serde_json::json!({
-            "policy": "Judge only the supplied exact source chunks. Do not infer that unscanned source is irrelevant. Mark uncertainty rather than guessing. Selection cannot alter tool status, permissions, or durable evidence.",
-            "goal": bounded_goal(goal),
-            "goal_coverage": {
-                "source_chars": goal.chars().count(),
-                "complete": tool_result_selection_goal_coverage_complete(goal),
-            },
-            "tool_name": truncate_chars(tool_name, MAX_TOOL_NAME_CHARS),
-            "artifact": {
-                "document_kind": descriptor.document_kind,
-                "version": descriptor.version,
-                "run_id": descriptor.run_id,
-                "call_id": descriptor.call_id,
-                "content_sha256": descriptor.content_sha256,
-                "source_bytes": projection.source_bytes(),
-                "scanned_bytes": projection.scanned_bytes(),
-                "scan_complete": projection.scan_complete(),
-                "chunker_version": projection.chunker_version(),
-            },
-            "candidates": candidates,
-        }),
+        state,
         questions,
     })
 }
 
 /// Stable identity of the exact typed selection problem presented to a judge.
 /// The request uses ordered maps, so its JSON encoding is deterministic.
+#[derive(Serialize)]
+struct ToolResultSelectionRequestIdentity<'a> {
+    schema_version: u32,
+    state: &'a serde_json::Value,
+    questions: &'a BTreeMap<String, JudgmentQuestion>,
+}
+
+#[derive(Serialize)]
+struct ToolResultSelectionSubject<'a> {
+    subject_version: u32,
+    goal: &'a str,
+    tool_name: String,
+    descriptor: &'a astra_services::session_journal::ToolResultArtifactDescriptor,
+    projection: ToolResultSelectionSubjectProjection<'a>,
+}
+
+#[derive(Serialize)]
+struct ToolResultSelectionSubjectProjection<'a> {
+    chunker_version: u32,
+    source_bytes: u64,
+    scanned_bytes: u64,
+    scan_complete: bool,
+    chunks: Vec<ToolResultSelectionSubjectChunk<'a>>,
+}
+
+#[derive(Serialize)]
+struct ToolResultSelectionSubjectChunk<'a> {
+    id: &'a str,
+    start_byte: u64,
+    end_byte: u64,
+    start_line: u32,
+    end_line: u32,
+    line_complete: bool,
+}
+
+const TOOL_RESULT_SELECTION_SUBJECT_VERSION: u32 = 1;
+
+fn tool_result_selection_target_sha256_from_parts(
+    goal: &str,
+    state: &serde_json::Value,
+    questions: &BTreeMap<String, JudgmentQuestion>,
+) -> Result<String, &'static str> {
+    let encoded = serde_json::to_vec(&(
+        goal,
+        ToolResultSelectionRequestIdentity {
+            schema_version: 1,
+            state,
+            questions,
+        },
+    ))
+    .map_err(|_| "serialize tool-result selection judgment")?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
 pub fn tool_result_selection_target_sha256(
     goal: &str,
     request: &JudgmentRequest,
 ) -> Result<String, &'static str> {
     request.validate()?;
-    let encoded = serde_json::to_vec(&(goal, request))
-        .map_err(|_| "serialize tool-result selection judgment")?;
+    tool_result_selection_target_sha256_from_parts(goal, &request.state, &request.questions)
+}
+
+/// Compute the stable subject identity before an offering is selected. The
+/// trusted artifact digest binds the exact source bytes; chunk geometry binds
+/// the deterministic scan, so full candidate text and question payloads are
+/// intentionally excluded from this scheduler key.
+pub fn tool_result_selection_subject_sha256_for_projection(
+    goal: &str,
+    tool_name: &str,
+    descriptor: &astra_services::session_journal::ToolResultArtifactDescriptor,
+    projection: &ToolResultChunkCandidateProjection,
+) -> Result<String, &'static str> {
+    validate_projection(descriptor, projection)?;
+    let subject = ToolResultSelectionSubject {
+        subject_version: TOOL_RESULT_SELECTION_SUBJECT_VERSION,
+        goal,
+        tool_name: truncate_chars(tool_name, MAX_TOOL_NAME_CHARS),
+        descriptor,
+        projection: ToolResultSelectionSubjectProjection {
+            chunker_version: projection.chunker_version(),
+            source_bytes: projection.source_bytes(),
+            scanned_bytes: projection.scanned_bytes(),
+            scan_complete: projection.scan_complete(),
+            chunks: projection
+                .candidates()
+                .iter()
+                .map(|candidate| {
+                    let chunk = candidate.chunk();
+                    ToolResultSelectionSubjectChunk {
+                        id: &chunk.id,
+                        start_byte: chunk.start_byte,
+                        end_byte: chunk.end_byte,
+                        start_line: chunk.start_line,
+                        end_line: chunk.end_line,
+                        line_complete: chunk.line_complete,
+                    }
+                })
+                .collect(),
+        },
+    };
+    let encoded =
+        serde_json::to_vec(&subject).map_err(|_| "serialize tool-result selection judgment")?;
     Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+/// Return the exact bounded completion budget for a selection projection
+/// without materializing the provider request. The request's questions are
+/// keyed only by the deterministic chunk IDs, so this is the same budget as
+/// [`JudgmentRequest::output_token_budget`].
+#[must_use]
+pub fn tool_result_selection_output_token_budget(
+    projection: &ToolResultChunkCandidateProjection,
+) -> usize {
+    let mut ids = projection
+        .candidates()
+        .iter()
+        .map(|candidate| candidate.chunk().id.as_str())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    serde_json::to_vec(&ids)
+        .expect("tool-result selection IDs serialize")
+        .len()
+        .saturating_add(64)
 }
 
 #[must_use]
@@ -661,6 +790,47 @@ mod tests {
             )
             .is_err(),
             "chunk identities must remain bound to their artifact descriptor"
+        );
+    }
+
+    #[test]
+    fn projection_subject_hash_is_stable_without_dispatch_request() {
+        let (descriptor, projection) = fixture();
+        let goal = "find the failing assertion";
+        let subject = tool_result_selection_subject_sha256_for_projection(
+            goal,
+            "exec",
+            &descriptor,
+            &projection,
+        )
+        .unwrap();
+        assert_eq!(
+            subject,
+            tool_result_selection_subject_sha256_for_projection(
+                goal,
+                "exec",
+                &descriptor,
+                &projection,
+            )
+            .unwrap(),
+        );
+        assert_ne!(
+            subject,
+            tool_result_selection_subject_sha256_for_projection(
+                "find a different assertion",
+                "exec",
+                &descriptor,
+                &projection,
+            )
+            .unwrap(),
+        );
+
+        let request =
+            build_tool_result_selection_judgment(goal, "exec", &descriptor, &projection).unwrap();
+        assert_eq!(
+            tool_result_selection_output_token_budget(&projection),
+            request.output_token_budget(),
+            "the lightweight route-cap check must match the dispatch request budget"
         );
     }
 

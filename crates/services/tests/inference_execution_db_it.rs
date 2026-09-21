@@ -17,6 +17,7 @@ use astra_services::{
     declare_inference_attempt_settlement, declare_inference_settlement,
     finish_inference_invocation, finish_inference_provider_attempt,
     finish_successful_inference_provider_attempt_and_invocation,
+    load_existing_inference_operation_ids_for_route,
     load_inference_canonical_transitions_for_session, load_tool_result_projection_decisions,
     next_inference_logical_attempt_pair_base, plan_inference_invocation,
     plan_inference_provider_attempt, reconcile_inference_settlements,
@@ -3346,6 +3347,146 @@ async fn orphaned_settlement_debt_is_quarantined_out_of_the_active_batch() {
     );
 
     cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn selection_subject_gate_is_scoped_to_owner_session_and_route() {
+    let shared_pool = common::setup_pool().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("selection-gate-user-{suffix}");
+    let session_id = format!("selection-gate-session-{suffix}");
+    let run_id = format!("selection-gate-run-{suffix}");
+    let other_session_id = format!("selection-gate-other-session-{suffix}");
+    let other_run_id = format!("selection-gate-other-run-{suffix}");
+    let other_user_id = format!("selection-gate-other-user-{suffix}");
+    let other_user_run_id = format!("selection-gate-other-user-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+    seed_run(pool, &user_id, &other_session_id, &other_run_id).await;
+    seed_run(pool, &other_user_id, &session_id, &other_user_run_id).await;
+
+    let selection_input = |owner: &str,
+                           session: &str,
+                           run: &str,
+                           operation_id: &str,
+                           offering_id: &str,
+                           model: &str| {
+        InferenceInvocationInput {
+            user_id: owner.to_string(),
+            scope: InferenceInvocationScope::Run {
+                session_id: session.to_string(),
+                run_id: run.to_string(),
+                turn: 1,
+                round: 0,
+                operation_id: operation_id.to_string(),
+                logical_attempt: 0,
+            },
+            offering_id: offering_id.to_string(),
+            resolved_model_name: model.to_string(),
+            upstream_model_name: model.to_string(),
+            provider: "typesafe".to_string(),
+            purpose: InferencePurpose::ToolResultRerank,
+            execution_placement: ModelExecutionPlacement::Server,
+            access_kind: ModelAccessKind::SelfHosted,
+            run_authority: run_authority(),
+        }
+    };
+
+    let subject_a = "a".repeat(64);
+    let primary_plan = plan_inference_invocation(selection_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        &subject_a,
+        "selection-gate-offering",
+        "selection-gate-model",
+    ))
+    .expect("plan primary selection subject");
+    admit_inference_invocation(&shared_pool, &primary_plan)
+        .await
+        .expect("admit primary selection subject");
+
+    let other_session_subject = "b".repeat(64);
+    let other_session_plan = plan_inference_invocation(selection_input(
+        &user_id,
+        &other_session_id,
+        &other_run_id,
+        &other_session_subject,
+        "selection-gate-offering",
+        "selection-gate-model",
+    ))
+    .expect("plan other-session selection subject");
+    admit_inference_invocation(&shared_pool, &other_session_plan)
+        .await
+        .expect("admit other-session selection subject");
+
+    let other_route_subject = "c".repeat(64);
+    let other_route_plan = plan_inference_invocation(selection_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        &other_route_subject,
+        "selection-gate-other-offering",
+        "selection-gate-other-model",
+    ))
+    .expect("plan other-route selection subject");
+    admit_inference_invocation(&shared_pool, &other_route_plan)
+        .await
+        .expect("admit other-route selection subject");
+
+    let other_user_subject = "d".repeat(64);
+    let other_user_plan = plan_inference_invocation(selection_input(
+        &other_user_id,
+        &session_id,
+        &other_user_run_id,
+        &other_user_subject,
+        "selection-gate-offering",
+        "selection-gate-model",
+    ))
+    .expect("plan other-user selection subject");
+    admit_inference_invocation(&shared_pool, &other_user_plan)
+        .await
+        .expect("admit other-user selection subject");
+
+    let lookup = selection_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        "tool_result_rerank",
+        "selection-gate-offering",
+        "selection-gate-model",
+    );
+    let existing = load_existing_inference_operation_ids_for_route(&shared_pool, &lookup)
+        .await
+        .expect("load selection subject gate");
+    assert_eq!(
+        existing,
+        std::collections::BTreeSet::from([subject_a.clone()]),
+        "the retry gate must not cross session, route, or user boundaries"
+    );
+
+    let other_user_lookup = selection_input(
+        &other_user_id,
+        &session_id,
+        &other_user_run_id,
+        "tool_result_rerank",
+        "selection-gate-offering",
+        "selection-gate-model",
+    );
+    let other_user_existing =
+        load_existing_inference_operation_ids_for_route(&shared_pool, &other_user_lookup)
+            .await
+            .expect("load other-user selection subject gate");
+    assert_eq!(
+        other_user_existing,
+        std::collections::BTreeSet::from([other_user_subject])
+    );
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+    cleanup(pool, &user_id, &other_session_id, &other_run_id).await;
+    cleanup(pool, &other_user_id, &session_id, &other_user_run_id).await;
 }
 
 #[tokio::test]

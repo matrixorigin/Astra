@@ -609,6 +609,11 @@ pub struct ModelRequestCompaction {
 pub struct ModelRequestContextSeed {
     pub topology: ModelRequestTopology,
     pub rollout_stage: ModelRequestRolloutStage,
+    /// Physical execution round used only for diagnostics. Durable inference
+    /// identity may intentionally use a canonical round so a content-addressed
+    /// auxiliary subject cannot be retried by moving to another provider round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_round: Option<u32>,
     /// Catalog-provided family used for low-cardinality aggregation. It is
     /// never inferred by substring matching the provider model name.
     pub model_family: Option<String>,
@@ -635,6 +640,7 @@ impl ModelRequestContextSeed {
         Self {
             topology: ModelRequestTopology::ServerOnly,
             rollout_stage: ModelRequestRolloutStage::Shadow,
+            execution_round: None,
             model_family: None,
             actor_id: None,
             execution_principal: None,

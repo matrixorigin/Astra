@@ -52,9 +52,10 @@ pub struct ToolResultProjectionDecisionV1 {
     pub producer_call_id: String,
     pub source_sha256: String,
     pub source_bytes: u64,
-    /// Identity of the goal-bound typed judgment request. A changed target
+    /// Identity of the goal-bound typed selection subject. A changed target
     /// creates a distinct freeze slot so a projection selected for one goal
-    /// cannot be silently reused for another.
+    /// cannot be silently reused for another. The subject is derived from
+    /// trusted artifact and chunk geometry, not from provider request text.
     pub target_sha256: String,
     /// Stable identity of the canonical tool-result message, not the digest
     /// of a continually growing conversation.
