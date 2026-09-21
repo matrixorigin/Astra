@@ -61,7 +61,7 @@ describe("ExplainAnalyzePanel", () => {
     expect(usage.textContent).not.toContain("requests reported");
   });
 
-  it("shows memory candidate decisions and distinguishes selection from injection", () => {
+  it("shows memory candidate decisions and distinguishes selection from request projection", () => {
     const consoleError = vi.spyOn(console, "error");
     render(<ExplainAnalyzePanel events={[{
       ...identity, event_id: "context:finish", node_id: "context", kind: "context_assembly",
@@ -79,7 +79,7 @@ describe("ExplainAnalyzePanel", () => {
     fireEvent.click(screen.getByRole("button", { name: /Inspect Assemble context sources/ }));
     expect(screen.getByText("Candidate 1")).toBeTruthy();
     expect(screen.getByText(/selected · model score 90.00%/)).toBeTruthy();
-    expect(screen.getByText(/final prompt injection not measured/)).toBeTruthy();
+    expect(screen.getByText(/final request projection unavailable/)).toBeTruthy();
     expect(consoleError).not.toHaveBeenCalled();
     consoleError.mockRestore();
   });
