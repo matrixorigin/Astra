@@ -881,7 +881,10 @@ impl SemanticJudgmentView {
             let source = match self.coverage {
                 SemanticJudgmentCoverage::SourceExcluded => "excluded by source policy",
                 SemanticJudgmentCoverage::SourceUnavailable => "source unavailable",
-                SemanticJudgmentCoverage::NoPool => "no provider pool",
+                // `NoPool` means the observation storage pool is absent. It
+                // says nothing about whether a judgment/provider was
+                // available to the run.
+                SemanticJudgmentCoverage::NoPool => "observation storage unavailable",
                 SemanticJudgmentCoverage::Timeout => "timed out",
                 SemanticJudgmentCoverage::QueryFailed => "query failed",
                 SemanticJudgmentCoverage::NotObserved => "not observed",
@@ -1803,6 +1806,12 @@ mod tests {
         )
         .await;
         assert_eq!(absent.coverage, SemanticJudgmentCoverage::NoPool);
+        assert!(
+            absent
+                .render_compact()
+                .contains("observation storage unavailable")
+        );
+        assert!(!absent.render_compact().contains("no provider pool"));
         let failed = bounded_semantic_judgment_view(
             async { Err(ServiceError::internal("PRIVATE")) },
             Depth::Hint,
