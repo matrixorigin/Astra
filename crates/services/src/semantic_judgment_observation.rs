@@ -7,12 +7,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use astra_core::SharedPool;
 use astra_turn_types::{
-    SEMANTIC_JUDGMENT_ID_MAX_BYTES, SEMANTIC_JUDGMENT_TRACE_ATTR, SemanticJudgmentObservationV1,
-    SemanticJudgmentValidationError,
+    SEMANTIC_JUDGMENT_ID_MAX_BYTES, SEMANTIC_JUDGMENT_TRACE_ATTR, SemanticJudgmentInvocationV1,
+    SemanticJudgmentObservationV1, SemanticJudgmentValidationError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::Row;
+use sqlx::{MySql, QueryBuilder, Row};
 
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
 use crate::session_journal::TraceSpanBuilder;
@@ -22,6 +22,9 @@ pub const SEMANTIC_JUDGMENT_TRACE_NAME: &str = "semantic_judgment";
 pub const MAX_SEMANTIC_JUDGMENT_CANDIDATES: usize = 512;
 // Includes the escaped 8-KiB typed attribute and the ordinary trace envelope.
 pub const MAX_SEMANTIC_JUDGMENT_TRACE_BYTES: usize = 32_768;
+const MAX_SEMANTIC_JUDGMENT_EXECUTION_IDS: usize = 128;
+const MAX_SEMANTIC_JUDGMENT_EXECUTION_ROWS: usize = 1_024;
+const MAX_SEMANTIC_JUDGMENT_EXECUTION_ATTEMPTS: usize = 8;
 
 /// Redacted projection of the canonical parser result, never a second classifier.
 /// Runtime control diagnostics remain with their existing owner. In particular,
@@ -558,6 +561,73 @@ pub enum SemanticJudgmentCoverage {
     SourceUnavailable,
 }
 
+/// Coverage of the separate physical-execution lookup. This is deliberately
+/// independent from semantic trace capture: a captured judgment can have no
+/// usable invocation identity, and a ledger lookup can fail without erasing
+/// the captured judgment itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticJudgmentExecutionCoverage {
+    #[default]
+    NotObserved,
+    /// The current observation depth intentionally did not request a ledger
+    /// lookup. This is not a claim that no physical execution exists.
+    Deferred,
+    LookupComplete,
+    LookupIncomplete,
+    SourceExcluded,
+    NoPool,
+    Timeout,
+    QueryFailed,
+    SourceUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticJudgmentExecutionAssociation {
+    /// The invocation and at least one physical provider attempt agree with
+    /// the semantic observation's immutable scope.
+    Matched,
+    /// The invocation/route exists, but no physical provider attempt exists.
+    InvocationOnly,
+    /// No exact invocation row was found for the captured identity.
+    NotCaptured,
+    /// The bounded lookup was cut off before this identity could be resolved.
+    LookupIncomplete,
+    /// The identity or route/attempt facts disagree, so no model is trusted.
+    Conflicting,
+    /// The exact ledger lookup was unavailable.
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticJudgmentExecutionAttempt {
+    pub attempt_id: String,
+    pub attempt_index: u32,
+    pub provider: String,
+    pub model_name: String,
+    pub protocol: String,
+    pub status: String,
+}
+
+/// Physical execution evidence attached to one semantic stage. This carries
+/// identity and bounded attempt status only; token accounting remains owned by
+/// the canonical usage projection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticJudgmentExecutionExplanation {
+    pub run_id: String,
+    pub turn: u32,
+    pub round: u32,
+    pub evaluation_span_id: String,
+    pub stage: astra_turn_types::RequestJudgmentStageV1,
+    pub invocation_id: Option<String>,
+    pub association: SemanticJudgmentExecutionAssociation,
+    pub provider: Option<String>,
+    pub model_name: Option<String>,
+    pub attempts: Vec<SemanticJudgmentExecutionAttempt>,
+    pub attempts_truncated: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticJudgmentStageCounts {
     pub evaluated: usize,
@@ -642,7 +712,9 @@ pub fn project_local_semantic_judgments(
     }
     capture.gaps.sort();
     capture.gaps.dedup();
-    let mut view = SemanticJudgmentView::from_capture(capture).bounded(depth);
+    let mut view = SemanticJudgmentView::from_capture(capture);
+    view.mark_execution_unavailable();
+    let mut view = view.bounded(depth);
     view.scope = SemanticJudgmentScope::LocalJournalAtRead;
     view
 }
@@ -653,13 +725,19 @@ pub fn project_local_semantic_judgments(
 pub struct SemanticJudgmentView {
     pub scope: SemanticJudgmentScope,
     pub coverage: SemanticJudgmentCoverage,
+    #[serde(default)]
+    pub execution_coverage: SemanticJudgmentExecutionCoverage,
     pub capture_incomplete: bool,
     pub capture_truncated: bool,
     pub counts: Option<SemanticJudgmentStageCounts>,
     pub capture_gaps: Vec<SemanticJudgmentCaptureGap>,
     pub capture_omitted_observations: usize,
     pub omitted_details: usize,
+    #[serde(default)]
+    pub execution_omitted: usize,
     pub observations: Vec<SemanticJudgmentTraceObservation>,
+    #[serde(default)]
+    pub execution_explanations: Vec<SemanticJudgmentExecutionExplanation>,
 }
 
 impl Default for SemanticJudgmentView {
@@ -670,16 +748,33 @@ impl Default for SemanticJudgmentView {
 
 impl SemanticJudgmentView {
     pub fn unavailable(coverage: SemanticJudgmentCoverage) -> Self {
+        let execution_coverage = match coverage {
+            SemanticJudgmentCoverage::SourceExcluded => {
+                SemanticJudgmentExecutionCoverage::SourceExcluded
+            }
+            SemanticJudgmentCoverage::NoPool => SemanticJudgmentExecutionCoverage::NoPool,
+            SemanticJudgmentCoverage::Timeout => SemanticJudgmentExecutionCoverage::Timeout,
+            SemanticJudgmentCoverage::QueryFailed => SemanticJudgmentExecutionCoverage::QueryFailed,
+            SemanticJudgmentCoverage::SourceUnavailable => {
+                SemanticJudgmentExecutionCoverage::SourceUnavailable
+            }
+            SemanticJudgmentCoverage::NotObserved | SemanticJudgmentCoverage::CaptureIncomplete => {
+                SemanticJudgmentExecutionCoverage::NotObserved
+            }
+        };
         Self {
             scope: SemanticJudgmentScope::SessionTraceAtRead,
             coverage,
+            execution_coverage,
             capture_incomplete: true,
             capture_truncated: false,
             counts: None,
             capture_gaps: vec![],
             capture_omitted_observations: 0,
             omitted_details: 0,
+            execution_omitted: 0,
             observations: vec![],
+            execution_explanations: vec![],
         }
     }
 
@@ -720,13 +815,37 @@ impl SemanticJudgmentView {
         Self {
             scope: SemanticJudgmentScope::SessionTraceAtRead,
             coverage: SemanticJudgmentCoverage::CaptureIncomplete,
+            execution_coverage: SemanticJudgmentExecutionCoverage::NotObserved,
             capture_incomplete: true,
             capture_truncated: capture.truncated,
             counts: Some(counts),
             capture_gaps: capture.gaps,
             capture_omitted_observations: capture.omitted_observations,
             omitted_details: 0,
+            execution_omitted: 0,
             observations: capture.observations,
+            execution_explanations: vec![],
+        }
+    }
+
+    /// Local journal facts may retain the typed invocation identity but do not
+    /// authorize a server-ledger lookup. Preserve that distinction explicitly.
+    fn mark_execution_unavailable(&mut self) {
+        mark_execution_lookup_unavailable(
+            self,
+            SemanticJudgmentExecutionCoverage::SourceUnavailable,
+        );
+    }
+
+    fn defer_execution_lookup(&mut self) {
+        if self.observations.iter().any(|observation| {
+            matches!(
+                &observation.observation.correlation.invocation,
+                SemanticJudgmentInvocationV1::Known { .. }
+            )
+        }) {
+            self.execution_coverage = SemanticJudgmentExecutionCoverage::Deferred;
+            self.execution_explanations.clear();
         }
     }
 
@@ -741,7 +860,36 @@ impl SemanticJudgmentView {
             ObservationDepth::Forensic => 32,
         };
         self.omitted_details += self.observations.len().saturating_sub(limit);
+        let visible_keys = self
+            .observations
+            .iter()
+            .take(limit)
+            .map(|observation| {
+                (
+                    observation.observation.correlation.run_id.clone(),
+                    observation.observation.correlation.turn,
+                    observation.observation.correlation.round,
+                    observation
+                        .observation
+                        .correlation
+                        .evaluation_span_id
+                        .clone(),
+                    observation.observation.fact.stage,
+                )
+            })
+            .collect::<BTreeSet<_>>();
         self.observations.truncate(limit);
+        let before = self.execution_explanations.len();
+        self.execution_explanations.retain(|explanation| {
+            visible_keys.contains(&(
+                explanation.run_id.clone(),
+                explanation.turn,
+                explanation.round,
+                explanation.evaluation_span_id.clone(),
+                explanation.stage,
+            ))
+        });
+        self.execution_omitted += before.saturating_sub(self.execution_explanations.len());
         self
     }
 
@@ -797,7 +945,7 @@ impl SemanticJudgmentView {
             .take(limit)
             .map(|observation| {
                 let result = &observation.observation.fact.result;
-                format!(
+                let mut label = format!(
                     "{}: {}",
                     stage_label(observation.observation.fact.stage),
                     if detailed {
@@ -805,9 +953,48 @@ impl SemanticJudgmentView {
                     } else {
                         result.presentation_label()
                     }
-                )
+                );
+                if let Some(execution) = self.execution_explanation(observation) {
+                    label.push_str(" · ");
+                    label.push_str(&execution.render_label());
+                }
+                bounded_render_label(label)
             })
             .collect()
+    }
+
+    fn execution_explanation(
+        &self,
+        observation: &SemanticJudgmentTraceObservation,
+    ) -> Option<&SemanticJudgmentExecutionExplanation> {
+        self.execution_explanations.iter().find(|explanation| {
+            explanation.run_id == observation.observation.correlation.run_id
+                && explanation.turn == observation.observation.correlation.turn
+                && explanation.round == observation.observation.correlation.round
+                && explanation.evaluation_span_id
+                    == observation.observation.correlation.evaluation_span_id
+                && explanation.stage == observation.observation.fact.stage
+        })
+    }
+
+    fn execution_coverage_note(&self) -> Option<&'static str> {
+        match self.execution_coverage {
+            SemanticJudgmentExecutionCoverage::LookupIncomplete => {
+                Some("execution lookup incomplete")
+            }
+            SemanticJudgmentExecutionCoverage::SourceExcluded => {
+                Some("execution lookup excluded by source policy")
+            }
+            SemanticJudgmentExecutionCoverage::NoPool => Some("execution ledger unavailable"),
+            SemanticJudgmentExecutionCoverage::Timeout => Some("execution lookup timed out"),
+            SemanticJudgmentExecutionCoverage::QueryFailed => Some("execution lookup failed"),
+            SemanticJudgmentExecutionCoverage::SourceUnavailable => {
+                Some("execution identity unavailable from this source")
+            }
+            SemanticJudgmentExecutionCoverage::Deferred => Some("execution details deferred"),
+            SemanticJudgmentExecutionCoverage::NotObserved
+            | SemanticJudgmentExecutionCoverage::LookupComplete => None,
+        }
     }
 
     pub fn render(&self) -> String {
@@ -857,6 +1044,16 @@ impl SemanticJudgmentView {
                 " · {} detail(s) hidden but included in counts",
                 self.omitted_details
             ));
+        }
+        if self.execution_omitted > 0 {
+            rendered.push_str(&format!(
+                " · {} execution detail(s) hidden",
+                self.execution_omitted
+            ));
+        }
+        if let Some(note) = self.execution_coverage_note() {
+            rendered.push_str(" · ");
+            rendered.push_str(note);
         }
         let captured = self.captured_result_labels(3, true);
         if !captured.is_empty() {
@@ -939,6 +1136,13 @@ impl SemanticJudgmentView {
         if self.capture_omitted_observations > 0 || self.omitted_details > 0 {
             line.push_str(" · some detail hidden");
         }
+        if self.execution_omitted > 0 {
+            line.push_str(" · execution detail hidden");
+        }
+        if let Some(note) = self.execution_coverage_note() {
+            line.push_str(" · ");
+            line.push_str(note);
+        }
         if self.observations.len() > captured.len() {
             line.push_str(&format!(
                 " · {} other captured result(s) hidden",
@@ -971,6 +1175,71 @@ fn stage_label(stage: astra_turn_types::RequestJudgmentStageV1) -> &'static str 
     }
 }
 
+fn bounded_render_label(label: String) -> String {
+    const MAX_BYTES: usize = 320;
+    if label.len() <= MAX_BYTES {
+        return label;
+    }
+    let suffix = "...";
+    let mut end = MAX_BYTES - suffix.len();
+    while !label.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &label[..end], suffix)
+}
+
+impl SemanticJudgmentExecutionExplanation {
+    fn render_label(&self) -> String {
+        match self.association {
+            SemanticJudgmentExecutionAssociation::Matched => {
+                let mut label = match (&self.model_name, &self.provider) {
+                    (Some(model), Some(provider)) => {
+                        format!("execution model={model} · provider={provider}")
+                    }
+                    (Some(model), None) => format!("execution model={model}"),
+                    (None, Some(provider)) => format!("execution provider={provider}"),
+                    (None, None) => "execution matched".to_owned(),
+                };
+                if self.attempts.len() > 1 {
+                    label.push_str(&format!(" · {} attempts", self.attempts.len()));
+                }
+                if self.attempts_truncated {
+                    label.push_str(" · attempts incomplete");
+                }
+                label
+            }
+            SemanticJudgmentExecutionAssociation::InvocationOnly => {
+                match (&self.model_name, &self.provider) {
+                    (Some(model), Some(provider)) => format!(
+                        "execution admitted · model={model} · provider={provider} · no provider attempt captured"
+                    ),
+                    (Some(model), None) => {
+                        format!("execution admitted · model={model} · no provider attempt captured")
+                    }
+                    (None, Some(provider)) => {
+                        format!(
+                            "execution admitted · provider={provider} · no provider attempt captured"
+                        )
+                    }
+                    (None, None) => "execution admitted · no provider attempt captured".to_owned(),
+                }
+            }
+            SemanticJudgmentExecutionAssociation::NotCaptured => {
+                "execution not captured in this lookup".to_owned()
+            }
+            SemanticJudgmentExecutionAssociation::LookupIncomplete => {
+                "execution evidence incomplete".to_owned()
+            }
+            SemanticJudgmentExecutionAssociation::Conflicting => {
+                "execution evidence conflicts".to_owned()
+            }
+            SemanticJudgmentExecutionAssociation::Unavailable => {
+                "execution association unavailable".to_owned()
+            }
+        }
+    }
+}
+
 pub fn semantic_judgment_facet_enabled(facet: astra_core::ObservationFacet) -> bool {
     use astra_core::ObservationFacet;
     matches!(
@@ -980,6 +1249,397 @@ pub fn semantic_judgment_facet_enabled(facet: astra_core::ObservationFacet) -> b
             | ObservationFacet::Recent
             | ObservationFacet::Trace
     )
+}
+
+#[derive(Clone, Debug)]
+struct SemanticJudgmentExecutionLedgerRow {
+    invocation_id: String,
+    invocation_session_id: Option<String>,
+    run_id: Option<String>,
+    turn_index: Option<i64>,
+    round_index: Option<i64>,
+    route_session_id: Option<String>,
+    route_run_id: Option<String>,
+    route_provider: Option<String>,
+    resolved_model_name: Option<String>,
+    upstream_model_name: Option<String>,
+    attempt_id: Option<String>,
+    attempt_index: Option<i64>,
+    attempt_session_id: Option<String>,
+    attempt_run_id: Option<String>,
+    attempt_provider: Option<String>,
+    attempt_protocol: Option<String>,
+    attempt_status: Option<String>,
+    attempt_invalid: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SemanticJudgmentExecutionLookup {
+    rows: Vec<SemanticJudgmentExecutionLedgerRow>,
+    truncated: bool,
+}
+
+fn execution_model_name(row: &SemanticJudgmentExecutionLedgerRow) -> Option<String> {
+    row.resolved_model_name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            row.upstream_model_name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+        })
+        .map(str::to_owned)
+}
+
+async fn load_semantic_judgment_execution_rows(
+    pool: &SharedPool,
+    user_id: &str,
+    session_id: &str,
+    invocation_ids: &[String],
+) -> ServiceResult<SemanticJudgmentExecutionLookup> {
+    if invocation_ids.is_empty() {
+        return Ok(SemanticJudgmentExecutionLookup::default());
+    }
+    let mut connection = CancellationSafePoolConnection::acquire(pool.get())
+        .await
+        .map_err(|_| ServiceError::persistence("semantic execution connection unavailable"))?;
+    let mut query = QueryBuilder::<MySql>::new(
+        "SELECT i.invocation_id, i.session_id AS invocation_session_id, \
+         i.run_id, i.turn_index, i.round_index, \
+         r.session_id AS route_session_id, r.run_id AS route_run_id, \
+         r.provider AS route_provider, \
+         r.resolved_model_name, r.upstream_model_name, \
+         a.attempt_id, a.attempt_index, a.session_id AS attempt_session_id, \
+         a.run_id AS attempt_run_id, a.provider AS attempt_provider, \
+         a.provider_protocol AS attempt_protocol, a.status AS attempt_status \
+         FROM inference_invocations i \
+         LEFT JOIN inference_routes r ON r.user_id = i.user_id AND r.route_id = i.route_id \
+         LEFT JOIN inference_provider_attempts a \
+           ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id \
+         WHERE i.user_id = ",
+    );
+    query
+        .push_bind(user_id)
+        .push(" AND i.session_id = ")
+        .push_bind(session_id)
+        .push(" AND i.invocation_id IN (");
+    for (index, invocation_id) in invocation_ids.iter().enumerate() {
+        if index > 0 {
+            query.push(", ");
+        }
+        query.push_bind(invocation_id);
+    }
+    query
+        .push(") ORDER BY i.invocation_id, a.attempt_index LIMIT ")
+        .push_bind((MAX_SEMANTIC_JUDGMENT_EXECUTION_ROWS + 1) as i64);
+    let rows = query
+        .build()
+        .fetch_all(connection.connection_mut())
+        .await
+        .map_err(|_| ServiceError::persistence("semantic execution lookup unavailable"))?;
+    connection.release();
+    let truncated = rows.len() > MAX_SEMANTIC_JUDGMENT_EXECUTION_ROWS;
+    let mut projected = Vec::with_capacity(rows.len().min(MAX_SEMANTIC_JUDGMENT_EXECUTION_ROWS));
+    for row in rows.into_iter().take(MAX_SEMANTIC_JUDGMENT_EXECUTION_ROWS) {
+        let attempt_id = row
+            .try_get::<Option<String>, _>("attempt_id")
+            .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?;
+        let attempt_index = row
+            .try_get::<Option<i64>, _>("attempt_index")
+            .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?;
+        let attempt_session_id = row
+            .try_get::<Option<String>, _>("attempt_session_id")
+            .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?;
+        let attempt_run_id = row
+            .try_get::<Option<String>, _>("attempt_run_id")
+            .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?;
+        let attempt_provider = row
+            .try_get::<Option<String>, _>("attempt_provider")
+            .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?;
+        let attempt_protocol = row
+            .try_get::<Option<String>, _>("attempt_protocol")
+            .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?;
+        let attempt_status = row
+            .try_get::<Option<String>, _>("attempt_status")
+            .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?;
+        let has_attempt = attempt_id.is_some();
+        let attempt_invalid = has_attempt
+            && (attempt_index.is_none_or(|index| u32::try_from(index).is_err())
+                || attempt_provider.is_none()
+                || attempt_protocol.is_none()
+                || attempt_status.is_none());
+        projected.push(SemanticJudgmentExecutionLedgerRow {
+            invocation_id: row
+                .try_get("invocation_id")
+                .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?,
+            invocation_session_id: row
+                .try_get("invocation_session_id")
+                .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?,
+            run_id: row
+                .try_get("run_id")
+                .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?,
+            turn_index: row
+                .try_get("turn_index")
+                .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?,
+            round_index: row
+                .try_get("round_index")
+                .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?,
+            route_session_id: row
+                .try_get("route_session_id")
+                .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?,
+            route_run_id: row
+                .try_get("route_run_id")
+                .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?,
+            route_provider: row
+                .try_get("route_provider")
+                .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?,
+            resolved_model_name: row
+                .try_get("resolved_model_name")
+                .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?,
+            upstream_model_name: row
+                .try_get("upstream_model_name")
+                .map_err(|_| ServiceError::persistence("semantic execution row unavailable"))?,
+            attempt_id,
+            attempt_index,
+            attempt_session_id,
+            attempt_run_id,
+            attempt_provider,
+            attempt_protocol,
+            attempt_status,
+            attempt_invalid,
+        });
+    }
+    Ok(SemanticJudgmentExecutionLookup {
+        rows: projected,
+        truncated,
+    })
+}
+
+fn unavailable_execution_explanation(
+    observation: &SemanticJudgmentTraceObservation,
+    association: SemanticJudgmentExecutionAssociation,
+) -> Option<SemanticJudgmentExecutionExplanation> {
+    let SemanticJudgmentInvocationV1::Known { invocation_id } =
+        &observation.observation.correlation.invocation
+    else {
+        return None;
+    };
+    Some(SemanticJudgmentExecutionExplanation {
+        run_id: observation.observation.correlation.run_id.clone(),
+        turn: observation.observation.correlation.turn,
+        round: observation.observation.correlation.round,
+        evaluation_span_id: observation
+            .observation
+            .correlation
+            .evaluation_span_id
+            .clone(),
+        stage: observation.observation.fact.stage,
+        invocation_id: Some(invocation_id.clone()),
+        association,
+        provider: None,
+        model_name: None,
+        attempts: vec![],
+        attempts_truncated: false,
+    })
+}
+
+fn apply_semantic_judgment_execution_lookup(
+    view: &mut SemanticJudgmentView,
+    lookup: SemanticJudgmentExecutionLookup,
+    session_id: &str,
+) {
+    let known_ids = view
+        .observations
+        .iter()
+        .filter_map(
+            |observation| match &observation.observation.correlation.invocation {
+                SemanticJudgmentInvocationV1::Known { invocation_id } => {
+                    Some(invocation_id.clone())
+                }
+                SemanticJudgmentInvocationV1::Unavailable => None,
+            },
+        )
+        .collect::<BTreeSet<_>>();
+    if known_ids.is_empty() {
+        view.execution_coverage = SemanticJudgmentExecutionCoverage::NotObserved;
+        view.execution_explanations.clear();
+        return;
+    }
+    let mut rows_by_invocation = BTreeMap::<String, Vec<SemanticJudgmentExecutionLedgerRow>>::new();
+    for row in lookup.rows {
+        rows_by_invocation
+            .entry(row.invocation_id.clone())
+            .or_default()
+            .push(row);
+    }
+    view.execution_coverage = if lookup.truncated {
+        SemanticJudgmentExecutionCoverage::LookupIncomplete
+    } else {
+        SemanticJudgmentExecutionCoverage::LookupComplete
+    };
+    view.execution_explanations = view
+        .observations
+        .iter()
+        .filter_map(|observation| {
+            let SemanticJudgmentInvocationV1::Known { invocation_id } =
+                &observation.observation.correlation.invocation
+            else {
+                return None;
+            };
+            let Some(rows) = rows_by_invocation.get(invocation_id) else {
+                return unavailable_execution_explanation(
+                    observation,
+                    if lookup.truncated {
+                        SemanticJudgmentExecutionAssociation::LookupIncomplete
+                    } else {
+                        SemanticJudgmentExecutionAssociation::NotCaptured
+                    },
+                );
+            };
+            let first = rows.first()?;
+            let correlation = &observation.observation.correlation;
+            let scope_conflict = rows.iter().any(|row| {
+                row.run_id.as_deref() != Some(correlation.run_id.as_str())
+                    || row.turn_index != Some(i64::from(correlation.turn))
+                    || row.round_index != Some(i64::from(correlation.round))
+            });
+            let route_provider = first.route_provider.clone();
+            let model_name = execution_model_name(first);
+            let attempts = rows
+                .iter()
+                .filter_map(|row| {
+                    Some(SemanticJudgmentExecutionAttempt {
+                        attempt_id: row.attempt_id.clone()?,
+                        attempt_index: u32::try_from(row.attempt_index?).ok()?,
+                        provider: row.attempt_provider.clone()?,
+                        model_name: execution_model_name(row)?,
+                        protocol: row.attempt_protocol.clone()?,
+                        status: row.attempt_status.clone()?,
+                    })
+                })
+                .take(MAX_SEMANTIC_JUDGMENT_EXECUTION_ATTEMPTS)
+                .collect::<Vec<_>>();
+            let route_conflict = rows.iter().any(|row| {
+                row.attempt_id.is_some()
+                    && (row.attempt_provider != route_provider
+                        || execution_model_name(row) != model_name)
+            });
+            let attempt_invalid = rows.iter().any(|row| row.attempt_invalid);
+            let identity_conflict = rows.iter().any(|row| {
+                row.invocation_session_id.as_deref() != Some(session_id)
+                    || row.route_session_id.as_deref() != Some(session_id)
+                    || row.route_run_id != row.run_id
+                    || (row.attempt_id.is_some()
+                        && (row.attempt_session_id.as_deref() != Some(session_id)
+                            || row.attempt_run_id != row.run_id))
+            }) || route_provider.is_none()
+                || model_name.is_none();
+            let attempts_truncated = lookup.truncated
+                || rows.len() > MAX_SEMANTIC_JUDGMENT_EXECUTION_ATTEMPTS
+                || attempt_invalid;
+            let association =
+                if scope_conflict || identity_conflict || route_conflict || attempt_invalid {
+                    SemanticJudgmentExecutionAssociation::Conflicting
+                } else if attempts.is_empty() {
+                    SemanticJudgmentExecutionAssociation::InvocationOnly
+                } else {
+                    SemanticJudgmentExecutionAssociation::Matched
+                };
+            let attempts = if association == SemanticJudgmentExecutionAssociation::Conflicting {
+                // A conflicting row does not prove that its physical details
+                // belong to this observation. Do not leak them through the
+                // structured projection.
+                Vec::new()
+            } else {
+                attempts
+            };
+            Some(SemanticJudgmentExecutionExplanation {
+                run_id: correlation.run_id.clone(),
+                turn: correlation.turn,
+                round: correlation.round,
+                evaluation_span_id: correlation.evaluation_span_id.clone(),
+                stage: observation.observation.fact.stage,
+                invocation_id: Some(invocation_id.clone()),
+                association,
+                provider: (!scope_conflict
+                    && !identity_conflict
+                    && !route_conflict
+                    && !attempt_invalid)
+                    .then_some(route_provider.clone())
+                    .flatten(),
+                model_name: (!scope_conflict
+                    && !identity_conflict
+                    && !route_conflict
+                    && !attempt_invalid)
+                    .then_some(model_name.clone())
+                    .flatten(),
+                attempts,
+                attempts_truncated,
+            })
+        })
+        .collect();
+}
+
+fn mark_execution_lookup_unavailable(
+    view: &mut SemanticJudgmentView,
+    coverage: SemanticJudgmentExecutionCoverage,
+) {
+    view.execution_coverage = coverage;
+    view.execution_explanations = view
+        .observations
+        .iter()
+        .filter_map(|observation| {
+            unavailable_execution_explanation(
+                observation,
+                SemanticJudgmentExecutionAssociation::Unavailable,
+            )
+        })
+        .collect();
+}
+
+async fn enrich_semantic_judgment_execution(
+    pool: &SharedPool,
+    user_id: &str,
+    session_id: &str,
+    view: &mut SemanticJudgmentView,
+) {
+    let all_invocation_ids = view
+        .observations
+        .iter()
+        .filter_map(
+            |observation| match &observation.observation.correlation.invocation {
+                SemanticJudgmentInvocationV1::Known { invocation_id } => {
+                    Some(invocation_id.clone())
+                }
+                SemanticJudgmentInvocationV1::Unavailable => None,
+            },
+        )
+        .collect::<BTreeSet<_>>();
+    let lookup_truncated = all_invocation_ids.len() > MAX_SEMANTIC_JUDGMENT_EXECUTION_IDS;
+    let invocation_ids = all_invocation_ids
+        .into_iter()
+        .take(MAX_SEMANTIC_JUDGMENT_EXECUTION_IDS)
+        .collect::<Vec<_>>();
+    if invocation_ids.is_empty() {
+        return;
+    }
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        load_semantic_judgment_execution_rows(pool, user_id, session_id, &invocation_ids),
+    )
+    .await
+    {
+        Ok(Ok(mut lookup)) => {
+            lookup.truncated |= lookup_truncated;
+            apply_semantic_judgment_execution_lookup(view, lookup, session_id);
+        }
+        Ok(Err(_)) => {
+            mark_execution_lookup_unavailable(view, SemanticJudgmentExecutionCoverage::QueryFailed)
+        }
+        Err(_) => {
+            mark_execution_lookup_unavailable(view, SemanticJudgmentExecutionCoverage::Timeout)
+        }
+    }
 }
 
 /// One shared optional read policy for all consumers. Read both this and the
@@ -1000,22 +1660,32 @@ pub async fn load_semantic_judgment_view(
     let Some(pool) = pool else {
         return SemanticJudgmentView::unavailable(SemanticJudgmentCoverage::NoPool);
     };
-    bounded_semantic_judgment_view(
+    let capture = match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
         load_semantic_judgment_observations(pool, user_id, session_id, 128, 128),
-        depth,
     )
     .await
-}
-
-async fn bounded_semantic_judgment_view(
-    read: impl std::future::Future<Output = ServiceResult<SemanticJudgmentCapture>>,
-    depth: astra_core::ObservationDepth,
-) -> SemanticJudgmentView {
-    match tokio::time::timeout(std::time::Duration::from_secs(2), read).await {
-        Ok(Ok(capture)) => SemanticJudgmentView::from_capture(capture).bounded(depth),
-        Ok(Err(_)) => SemanticJudgmentView::unavailable(SemanticJudgmentCoverage::QueryFailed),
-        Err(_) => SemanticJudgmentView::unavailable(SemanticJudgmentCoverage::Timeout),
+    {
+        Ok(Ok(capture)) => capture,
+        Ok(Err(_)) => {
+            return SemanticJudgmentView::unavailable(SemanticJudgmentCoverage::QueryFailed);
+        }
+        Err(_) => return SemanticJudgmentView::unavailable(SemanticJudgmentCoverage::Timeout),
+    };
+    // Bound the semantic detail before the optional ledger read. The default
+    // path therefore does not query or serialize hidden execution identities.
+    let mut view = SemanticJudgmentView::from_capture(capture).bounded(depth);
+    if matches!(
+        depth,
+        astra_core::ObservationDepth::Diagnostic | astra_core::ObservationDepth::Forensic
+    ) {
+        // This function owns its shorter timeout and only changes execution
+        // coverage on timeout/failure, so captured classification is retained.
+        enrich_semantic_judgment_execution(pool, user_id, session_id, &mut view).await;
+    } else {
+        view.defer_execution_lookup();
     }
+    view
 }
 
 #[cfg(test)]
@@ -1042,6 +1712,275 @@ mod tests {
                 },
             },
         }
+    }
+
+    fn known_observation(
+        stage: RequestJudgmentStageV1,
+        evaluation_span_id: &str,
+        invocation_id: &str,
+    ) -> SemanticJudgmentTraceObservation {
+        let mut observation = observation();
+        observation.correlation.evaluation_span_id = evaluation_span_id.into();
+        observation.correlation.invocation = SemanticJudgmentInvocationV1::Known {
+            invocation_id: invocation_id.into(),
+        };
+        observation.fact.stage = stage;
+        SemanticJudgmentTraceObservation {
+            observation_span_id: format!("span-{evaluation_span_id}-{invocation_id}"),
+            observation,
+        }
+    }
+
+    fn semantic_view(observations: Vec<SemanticJudgmentTraceObservation>) -> SemanticJudgmentView {
+        SemanticJudgmentView::from_capture(SemanticJudgmentCapture {
+            available: true,
+            capture_incomplete: true,
+            truncated: false,
+            candidates_scanned: observations.len(),
+            duplicate_observations: 0,
+            omitted_observations: 0,
+            observations,
+            gaps: vec![SemanticJudgmentCaptureGap::TraceMayBeDropped],
+        })
+    }
+
+    fn execution_row(
+        invocation_id: &str,
+        run_id: &str,
+        turn: u32,
+        round: u32,
+        attempt: Option<(&str, u32, &str, &str, &str)>,
+    ) -> SemanticJudgmentExecutionLedgerRow {
+        let (attempt_id, attempt_index, provider, protocol, status) = attempt
+            .map(|(id, index, provider, protocol, status)| {
+                (
+                    Some(id.into()),
+                    Some(i64::from(index)),
+                    Some(provider.into()),
+                    Some(protocol.into()),
+                    Some(status.into()),
+                )
+            })
+            .unwrap_or((None, None, None, None, None));
+        let attempt_session_id = attempt_id.as_ref().map(|_| "session-1".into());
+        let attempt_run_id = attempt_id.as_ref().map(|_| run_id.into());
+        SemanticJudgmentExecutionLedgerRow {
+            invocation_id: invocation_id.into(),
+            invocation_session_id: Some("session-1".into()),
+            run_id: Some(run_id.into()),
+            turn_index: Some(i64::from(turn)),
+            round_index: Some(i64::from(round)),
+            route_session_id: Some("session-1".into()),
+            route_run_id: Some(run_id.into()),
+            route_provider: Some("deepseek".into()),
+            resolved_model_name: Some("deepseek-flash".into()),
+            upstream_model_name: Some("deepseek-chat".into()),
+            attempt_id,
+            attempt_index,
+            attempt_session_id,
+            attempt_run_id,
+            attempt_provider: provider,
+            attempt_protocol: protocol,
+            attempt_status: status,
+            attempt_invalid: false,
+        }
+    }
+
+    #[test]
+    fn semantic_execution_projection_requires_exact_scope_and_keeps_status_distinct() {
+        let initial = known_observation(RequestJudgmentStageV1::Initial, "eval-1", "inv-1");
+        let clarification =
+            known_observation(RequestJudgmentStageV1::Clarification, "eval-1", "inv-only");
+        let missing = known_observation(RequestJudgmentStageV1::Initial, "eval-2", "inv-missing");
+        let conflict = known_observation(RequestJudgmentStageV1::Initial, "eval-3", "inv-2");
+        let mut view = semantic_view(vec![initial, clarification, missing, conflict]);
+        apply_semantic_judgment_execution_lookup(
+            &mut view,
+            SemanticJudgmentExecutionLookup {
+                rows: vec![
+                    execution_row(
+                        "inv-1",
+                        "run-1",
+                        2,
+                        3,
+                        Some(("attempt-1", 0, "deepseek", "openai_compatible", "succeeded")),
+                    ),
+                    execution_row("inv-only", "run-1", 2, 3, None),
+                    // Same opaque invocation id is not accepted when its
+                    // immutable run scope disagrees with the observation.
+                    execution_row(
+                        "inv-2",
+                        "other-run",
+                        2,
+                        3,
+                        Some(("attempt-2", 0, "deepseek", "openai_compatible", "succeeded")),
+                    ),
+                ],
+                truncated: false,
+            },
+            "session-1",
+        );
+
+        assert_eq!(
+            view.execution_coverage,
+            SemanticJudgmentExecutionCoverage::LookupComplete
+        );
+        let matched = view
+            .execution_explanations
+            .iter()
+            .find(|explanation| explanation.invocation_id.as_deref() == Some("inv-1"))
+            .unwrap();
+        assert_eq!(
+            matched.association,
+            SemanticJudgmentExecutionAssociation::Matched
+        );
+        assert_eq!(matched.model_name.as_deref(), Some("deepseek-flash"));
+        assert_eq!(matched.provider.as_deref(), Some("deepseek"));
+        assert_eq!(matched.attempts[0].status, "succeeded");
+
+        let invocation_only = view
+            .execution_explanations
+            .iter()
+            .find(|explanation| explanation.invocation_id.as_deref() == Some("inv-only"))
+            .unwrap();
+        assert_eq!(
+            invocation_only.association,
+            SemanticJudgmentExecutionAssociation::InvocationOnly
+        );
+        assert_eq!(
+            invocation_only.model_name.as_deref(),
+            Some("deepseek-flash")
+        );
+
+        let conflicting = view
+            .execution_explanations
+            .iter()
+            .find(|explanation| explanation.invocation_id.as_deref() == Some("inv-2"))
+            .unwrap();
+        assert_eq!(
+            conflicting.association,
+            SemanticJudgmentExecutionAssociation::Conflicting
+        );
+        assert!(conflicting.model_name.is_none());
+        assert!(conflicting.attempts.is_empty());
+        let serialized = serde_json::to_string(conflicting).unwrap();
+        assert!(!serialized.contains("attempt-2"));
+        assert!(!serialized.contains("deepseek"));
+
+        let not_captured = view
+            .execution_explanations
+            .iter()
+            .find(|explanation| explanation.invocation_id.as_deref() == Some("inv-missing"))
+            .unwrap();
+        assert_eq!(
+            not_captured.association,
+            SemanticJudgmentExecutionAssociation::NotCaptured
+        );
+        assert!(view.render().contains("model=deepseek-flash"));
+        assert!(
+            view.captured_result_labels(4, true)
+                .join("; ")
+                .contains("execution evidence conflicts")
+        );
+    }
+
+    #[test]
+    fn semantic_execution_projection_does_not_claim_complete_attempt_history() {
+        let observation = known_observation(RequestJudgmentStageV1::Initial, "eval-1", "inv-1");
+        let mut view = semantic_view(vec![observation]);
+        apply_semantic_judgment_execution_lookup(
+            &mut view,
+            SemanticJudgmentExecutionLookup {
+                rows: vec![execution_row(
+                    "inv-1",
+                    "run-1",
+                    2,
+                    3,
+                    Some(("attempt-1", 0, "deepseek", "openai_compatible", "succeeded")),
+                )],
+                truncated: true,
+            },
+            "session-1",
+        );
+        assert_eq!(
+            view.execution_coverage,
+            SemanticJudgmentExecutionCoverage::LookupIncomplete
+        );
+        assert!(view.execution_explanations[0].attempts_truncated);
+        assert!(
+            view.render_compact()
+                .contains("execution lookup incomplete")
+        );
+    }
+
+    #[test]
+    fn semantic_execution_projection_keeps_full_observation_identity() {
+        let first = known_observation(RequestJudgmentStageV1::Initial, "shared-eval", "inv-1");
+        let mut second = known_observation(RequestJudgmentStageV1::Initial, "shared-eval", "inv-2");
+        second.observation.correlation.run_id = "run-2".into();
+        second.observation.correlation.turn = 7;
+        second.observation.correlation.round = 8;
+        let mut view = semantic_view(vec![first.clone(), second.clone()]);
+        apply_semantic_judgment_execution_lookup(
+            &mut view,
+            SemanticJudgmentExecutionLookup {
+                rows: vec![
+                    execution_row("inv-1", "run-1", 2, 3, None),
+                    execution_row("inv-2", "run-2", 7, 8, None),
+                ],
+                truncated: false,
+            },
+            "session-1",
+        );
+        assert_eq!(view.execution_explanations.len(), 2);
+        assert_eq!(
+            view.execution_explanation(&first)
+                .and_then(|explanation| explanation.invocation_id.as_deref()),
+            Some("inv-1")
+        );
+        assert_eq!(
+            view.execution_explanation(&second)
+                .and_then(|explanation| explanation.invocation_id.as_deref()),
+            Some("inv-2")
+        );
+    }
+
+    #[test]
+    fn semantic_execution_lookup_legacy_view_defaults_to_unobserved() {
+        let legacy = json!({
+            "scope": "session_trace_at_read",
+            "coverage": "capture_incomplete",
+            "capture_incomplete": true,
+            "capture_truncated": false,
+            "counts": null,
+            "capture_gaps": [],
+            "capture_omitted_observations": 0,
+            "omitted_details": 0,
+            "observations": []
+        });
+        let view: SemanticJudgmentView = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            view.execution_coverage,
+            SemanticJudgmentExecutionCoverage::NotObserved
+        );
+        assert!(view.execution_explanations.is_empty());
+        assert_eq!(view.execution_omitted, 0);
+    }
+
+    #[test]
+    fn semantic_execution_lookup_can_be_deferred_without_claiming_zero_calls() {
+        let mut view = semantic_view(vec![known_observation(
+            RequestJudgmentStageV1::Initial,
+            "eval-1",
+            "inv-1",
+        )]);
+        view.defer_execution_lookup();
+        assert_eq!(
+            view.execution_coverage,
+            SemanticJudgmentExecutionCoverage::Deferred
+        );
+        assert!(view.execution_explanations.is_empty());
+        assert!(view.render_compact().contains("execution details deferred"));
     }
 
     fn decided() -> RequestJudgmentResultV1 {
@@ -1812,30 +2751,32 @@ mod tests {
                 .contains("observation storage unavailable")
         );
         assert!(!absent.render_compact().contains("no provider pool"));
-        let failed = bounded_semantic_judgment_view(
-            async { Err(ServiceError::internal("PRIVATE")) },
-            Depth::Hint,
-        )
-        .await;
+        let failed = SemanticJudgmentView::unavailable(SemanticJudgmentCoverage::QueryFailed);
         assert_eq!(failed.coverage, SemanticJudgmentCoverage::QueryFailed);
         assert!(!failed.render().contains("PRIVATE"));
         let empty =
-            bounded_semantic_judgment_view(async { Ok(project(vec![], 128, 128)) }, Depth::Summary)
-                .await;
+            SemanticJudgmentView::from_capture(project(vec![], 128, 128)).bounded(Depth::Summary);
         assert_eq!(empty.coverage, SemanticJudgmentCoverage::CaptureIncomplete);
         assert!(empty.counts.is_some() && empty.capture_incomplete);
         assert_ne!(empty, absent);
     }
 
-    #[tokio::test]
-    async fn semantic_judgment_view_timeout_is_optional_and_bounded() {
-        let view = bounded_semantic_judgment_view(
-            std::future::pending(),
-            astra_core::ObservationDepth::Hint,
-        )
-        .await;
-        assert_eq!(view.coverage, SemanticJudgmentCoverage::Timeout);
-        assert!(view.counts.is_none());
+    #[test]
+    fn semantic_execution_lookup_failure_preserves_captured_classification() {
+        let mut view = semantic_view(vec![known_observation(
+            RequestJudgmentStageV1::Initial,
+            "eval-1",
+            "inv-1",
+        )]);
+        let counts = view.counts.clone();
+        mark_execution_lookup_unavailable(&mut view, SemanticJudgmentExecutionCoverage::Timeout);
+        assert_eq!(view.counts, counts);
+        assert_eq!(view.observations.len(), 1);
+        assert_eq!(
+            view.execution_coverage,
+            SemanticJudgmentExecutionCoverage::Timeout
+        );
+        assert!(view.render().contains("execution lookup timed out"));
     }
 
     #[test]
