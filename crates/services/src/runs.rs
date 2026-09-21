@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{Acquire, Executor, MySql, Row};
+use sqlx::{Acquire, Executor, MySql, QueryBuilder, Row, Transaction};
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -1580,6 +1580,9 @@ pub struct DurableRunInteractionAttachmentGuard {
 pub struct RecoveryClaim {
     pub run: DurableRunRecord,
     pub claimed_from_generation: u64,
+    /// Whether the canonical checkpoint history contains the newest valid
+    /// graceful resume checkpoint for this claimed run.
+    pub has_graceful_resume_checkpoint: bool,
 }
 
 /// The immutable checkpoint associated with one recovery ownership transition.
@@ -6867,7 +6870,7 @@ fn session_execution_slot_owner_reclaimable(
         && slot_is_stale
 }
 
-fn checkpoint_metadata(
+pub(crate) fn checkpoint_metadata(
     run_id: &str,
     checkpoint_json: &str,
 ) -> Result<(String, String, String), String> {
@@ -6925,6 +6928,13 @@ fn checkpoint_metadata(
             format!("checkpoint:{run_id}:{checkpoint_kind}:{hash}")
         });
     Ok((checkpoint_kind, checkpoint_version, idempotency_key))
+}
+
+pub fn is_graceful_resume_checkpoint(checkpoint_version: &str, checkpoint_json: &str) -> bool {
+    matches!(
+        checkpoint_metadata("recovery", checkpoint_json),
+        Ok((kind, version, _)) if kind == "resume" && version == checkpoint_version
+    )
 }
 
 fn checkpoint_write_is_authorized(
@@ -10083,9 +10093,27 @@ impl RunStateStore for InMemoryRunStateStore {
                     run.last_event_idx += 1;
                 }
                 run.updated_at = chrono::Utc::now().to_rfc3339();
+                let has_graceful_resume_checkpoint = checkpoints
+                    .get(&run_id)
+                    .and_then(|rows| {
+                        rows.iter()
+                            .filter(|checkpoint| checkpoint.checkpoint_kind == "resume")
+                            .max_by(|left, right| {
+                                left.created_at
+                                    .cmp(&right.created_at)
+                                    .then_with(|| left.checkpoint_id.cmp(&right.checkpoint_id))
+                            })
+                    })
+                    .is_some_and(|checkpoint| {
+                        is_graceful_resume_checkpoint(
+                            &checkpoint.checkpoint_version,
+                            &checkpoint.checkpoint_json,
+                        )
+                    });
                 claimed.push(RecoveryClaim {
                     run: run.clone(),
                     claimed_from_generation: generation,
+                    has_graceful_resume_checkpoint,
                 });
             }
         }
@@ -10556,6 +10584,92 @@ const RUN_STATUS_BINDING_SELECT_SQL: &str = "SELECT payload_json, event_idx FROM
 const RUN_STATUS_ACCOUNTING_SELECT_SQL: &str = "SELECT payload_json FROM agent_run_events
      WHERE user_id = ? AND run_id = ? AND event_type = ?
      ORDER BY event_idx DESC LIMIT 1";
+
+async fn attach_graceful_resume_checkpoint_flags(
+    tx: &mut Transaction<'_, MySql>,
+    claims: &mut [RecoveryClaim],
+) -> Result<(), String> {
+    if claims.is_empty() {
+        return Ok(());
+    }
+
+    let mut query = QueryBuilder::<MySql>::new(
+        "SELECT checkpoint.user_id, checkpoint.run_id,
+                checkpoint.checkpoint_version, checkpoint.checkpoint_json
+         FROM run_checkpoints AS checkpoint
+         WHERE checkpoint.checkpoint_kind = 'resume' AND (",
+    );
+    for (index, claim) in claims.iter().enumerate() {
+        if index > 0 {
+            query.push(" OR ");
+        }
+        query
+            .push("(checkpoint.user_id = ")
+            .push_bind(&claim.run.user_id)
+            .push(" AND checkpoint.run_id = ")
+            .push_bind(&claim.run.run_id)
+            .push(")");
+    }
+    query.push(
+        ") AND NOT EXISTS (
+             SELECT 1
+             FROM run_checkpoints AS newer
+             WHERE newer.user_id = checkpoint.user_id
+               AND newer.run_id = checkpoint.run_id
+               AND newer.checkpoint_kind = 'resume'
+               AND (newer.created_at > checkpoint.created_at
+                    OR (newer.created_at = checkpoint.created_at
+                        AND newer.checkpoint_id > checkpoint.checkpoint_id))
+         )",
+    );
+    let rows = query
+        .build()
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|error| format!("load latest resume checkpoints for recovery: {error}"))?;
+    let flags = rows
+        .into_iter()
+        .map(|row| {
+            let user_id: String = row
+                .try_get("user_id")
+                .map_err(|error| format!("decode resume checkpoint user: {error}"))?;
+            let run_id: String = row
+                .try_get("run_id")
+                .map_err(|error| format!("decode resume checkpoint run: {error}"))?;
+            let checkpoint_version: String = row
+                .try_get("checkpoint_version")
+                .map_err(|error| format!("decode resume checkpoint version: {error}"))?;
+            let checkpoint_json: String = row
+                .try_get("checkpoint_json")
+                .map_err(|error| format!("decode resume checkpoint payload: {error}"))?;
+            Ok::<_, String>((
+                (user_id, run_id),
+                is_graceful_resume_checkpoint(&checkpoint_version, &checkpoint_json),
+            ))
+        })
+        .collect::<Result<std::collections::HashMap<_, _>, String>>()?;
+    for claim in claims {
+        claim.has_graceful_resume_checkpoint = flags
+            .get(&(claim.run.user_id.clone(), claim.run.run_id.clone()))
+            .copied()
+            .unwrap_or(false);
+    }
+    Ok(())
+}
+
+/// Recovery candidates must be ordered by the session locks acquired by
+/// `load_run_metadata_for_exact_session_tx`. The same order is also the key
+/// used to recover a candidate's predecessor from the locked batch.
+fn compare_recovery_candidate_order(
+    left: &DurableRunRecord,
+    right: &DurableRunRecord,
+) -> std::cmp::Ordering {
+    (&left.user_id, &left.session_id, &left.run_id).cmp(&(
+        &right.user_id,
+        &right.session_id,
+        &right.run_id,
+    ))
+}
 
 impl DatabaseRunStateStore {
     #[allow(clippy::too_many_arguments)]
@@ -13736,13 +13850,7 @@ impl DatabaseRunStateStore {
                 db_error("begin_run_recovery_claim", "active", source).to_string()
             })?;
         let mut candidates = candidates;
-        candidates.sort_by(|left, right| {
-            (&left.user_id, &left.session_id, &left.run_id).cmp(&(
-                &right.user_id,
-                &right.session_id,
-                &right.run_id,
-            ))
-        });
+        candidates.sort_by(compare_recovery_candidate_order);
         let mut locked_candidates = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             let Some(current) = self
@@ -13877,22 +13985,18 @@ impl DatabaseRunStateStore {
             .into_iter()
             .map(|run| {
                 let previous = candidates
-                    .binary_search_by(|candidate| {
-                        (&candidate.user_id, &candidate.session_id, &candidate.run_id).cmp(&(
-                            &run.user_id,
-                            &run.session_id,
-                            &run.run_id,
-                        ))
-                    })
+                    .binary_search_by(|candidate| compare_recovery_candidate_order(candidate, &run))
                     .ok()
                     .and_then(|index| candidates.get(index))
                     .ok_or_else(|| "run recovery readback has no locked predecessor".to_string())?;
                 Ok(RecoveryClaim {
                     claimed_from_generation: previous.run_generation,
                     run,
+                    has_graceful_resume_checkpoint: false,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
+        attach_graceful_resume_checkpoint_flags(&mut tx, &mut records).await?;
         for receipt in &mut records {
             let run = &mut receipt.run;
             let Some(identity) = execution_handoff_checkpoint_identity(run)? else {
@@ -13926,13 +14030,7 @@ impl DatabaseRunStateStore {
                 }
             });
             let predecessor = candidates
-                .binary_search_by(|previous| {
-                    (&previous.user_id, &previous.session_id, &previous.run_id).cmp(&(
-                        &run.user_id,
-                        &run.session_id,
-                        &run.run_id,
-                    ))
-                })
+                .binary_search_by(|previous| compare_recovery_candidate_order(previous, run))
                 .map_err(|_| "recovery predecessor disappeared")?;
             let previous = &candidates[predecessor];
             let adoption = tail.as_ref().and_then(ExecutionHandoffAdoption::from_event);
@@ -18998,46 +19096,30 @@ impl RunStateStore for DatabaseRunStateStore {
         run_id: &str,
         checkpoint_kind: Option<&str>,
     ) -> Result<Option<DurableRunCheckpointRecord>, String> {
-        let Some(_run) = self
-            .load_run_metadata_for_user(user_id, run_id)
-            .await
-            .map_err(|e| e.to_string())?
-        else {
-            return Ok(None);
-        };
-
-        let row = if let Some(checkpoint_kind) = checkpoint_kind {
-            sqlx::query(
-                "SELECT checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
-                        checkpoint_version, idempotency_key, checkpoint_json,
-                        DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
-                 FROM run_checkpoints
-                 WHERE user_id = ? AND run_id = ? AND checkpoint_kind = ?
-                 ORDER BY created_at DESC, checkpoint_id DESC
-                 LIMIT 1",
-            )
-            .bind(user_id)
-            .bind(run_id)
-            .bind(checkpoint_kind)
+        let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "SELECT checkpoint.checkpoint_id, checkpoint.run_id, checkpoint.user_id,
+                    checkpoint.session_id, checkpoint.node_seq, checkpoint.checkpoint_kind,
+                    checkpoint.checkpoint_version, checkpoint.idempotency_key,
+                    checkpoint.checkpoint_json,
+                    DATE_FORMAT(checkpoint.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
+             FROM run_checkpoints AS checkpoint
+             INNER JOIN agent_runs AS run
+               ON run.user_id = checkpoint.user_id AND run.run_id = checkpoint.run_id
+             WHERE checkpoint.user_id = ",
+        );
+        query.push_bind(user_id);
+        query.push(" AND checkpoint.run_id = ");
+        query.push_bind(run_id);
+        if let Some(checkpoint_kind) = checkpoint_kind {
+            query.push(" AND checkpoint.checkpoint_kind = ");
+            query.push_bind(checkpoint_kind);
+        }
+        query.push(" ORDER BY checkpoint.created_at DESC, checkpoint.checkpoint_id DESC LIMIT 1");
+        let row = query
+            .build()
             .fetch_optional(self.pool.get())
             .await
-            .map_err(|source| db_error("load_latest_checkpoint", run_id, source).to_string())?
-        } else {
-            sqlx::query(
-                "SELECT checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
-                        checkpoint_version, idempotency_key, checkpoint_json,
-                        DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
-                 FROM run_checkpoints
-                 WHERE user_id = ? AND run_id = ?
-                 ORDER BY created_at DESC, checkpoint_id DESC
-                 LIMIT 1",
-            )
-            .bind(user_id)
-            .bind(run_id)
-            .fetch_optional(self.pool.get())
-            .await
-            .map_err(|source| db_error("load_latest_checkpoint", run_id, source).to_string())?
-        };
+            .map_err(|source| db_error("load_latest_checkpoint", run_id, source).to_string())?;
         row.map(|row| decode_run_checkpoint_record_from_row(&row))
             .transpose()
             .map_err(|e| e.to_string())
@@ -26083,6 +26165,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn recovery_candidate_order_is_session_first_for_lock_and_lookup_keys() {
+        let mut candidates = vec![
+            {
+                let mut run = durable_run_record("recovery-key-run-a");
+                run.session_id = "recovery-key-session-z".into();
+                run
+            },
+            {
+                let mut run = durable_run_record("recovery-key-run-b");
+                run.session_id = "recovery-key-session-a".into();
+                run
+            },
+        ];
+        candidates.sort_by(compare_recovery_candidate_order);
+
+        assert_eq!(candidates[0].session_id, "recovery-key-session-a");
+        assert_eq!(candidates[1].session_id, "recovery-key-session-z");
+        for candidate in &candidates {
+            assert!(
+                candidates
+                    .binary_search_by(|previous| {
+                        compare_recovery_candidate_order(previous, candidate)
+                    })
+                    .is_ok(),
+                "every locked candidate must be addressable by the same key"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn in_memory_interaction_resolution_fails_closed_for_attachment_guard() {
         let store = InMemoryRunStateStore::new();
@@ -29950,6 +30062,254 @@ mod tests {
         for candidate in candidates {
             cleanup_database_run_fixture(&pool, &user_id, &candidate.run_id).await;
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_recovery_handoff_predecessor_lookup_uses_session_first_order() {
+        let _claim_test_guard = MATRIXONE_RECOVERY_CLAIM_IT_LOCK.lock().await;
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let nonce = Uuid::new_v4();
+        let user_id = format!("recovery-order-user-{nonce}");
+        let fixtures = [
+            (
+                format!("recovery-order-a-{nonce}"),
+                format!("recovery-order-session-z-{nonce}"),
+                "a",
+            ),
+            (
+                format!("recovery-order-b-{nonce}"),
+                format!("recovery-order-session-a-{nonce}"),
+                "b",
+            ),
+        ];
+        let mut candidates = Vec::with_capacity(fixtures.len());
+        for (run_id, session_id, label) in &fixtures {
+            insert_active_database_session_fixture(&pool, &user_id, session_id).await;
+            let mut run = durable_run_record(run_id);
+            run.user_id = user_id.clone();
+            run.session_id = session_id.clone();
+            store.insert_run(run).await.expect("insert handoff run");
+
+            let checkpoint_json = json!({
+                "version": "execution_handoff_v1",
+                "producer_run_id": run_id,
+                "producer_owner_generation": 0,
+                "heavy": {"case": label},
+            })
+            .to_string();
+            sqlx::query(
+                "UPDATE agent_runs
+                 SET checkpoint_version = 'execution_handoff_v1', checkpoint_json = ?
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?",
+            )
+            .bind(&checkpoint_json)
+            .bind(&user_id)
+            .bind(session_id)
+            .bind(run_id)
+            .execute(pool.get())
+            .await
+            .expect("persist current handoff snapshot");
+            sqlx::query(
+                "INSERT INTO run_checkpoints
+                 (checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
+                  checkpoint_version, idempotency_key, checkpoint_json, created_at)
+                 VALUES (?, ?, ?, ?, 0, 'execution_handoff', 'execution_handoff_v1', ?, ?, NOW(6))",
+            )
+            .bind(format!("ckpt-{label}-{nonce}"))
+            .bind(run_id)
+            .bind(&user_id)
+            .bind(session_id)
+            .bind(format!("checkpoint:{run_id}:execution_handoff:0"))
+            .bind(&checkpoint_json)
+            .execute(pool.get())
+            .await
+            .expect("persist immutable handoff checkpoint");
+
+            candidates.push(
+                store
+                    .load_run(&user_id, run_id)
+                    .await
+                    .expect("load handoff candidate")
+                    .expect("handoff candidate exists"),
+            );
+        }
+
+        // The run IDs sort as a,b while the session IDs sort as a,z. The
+        // handoff path must still find both locked predecessors and commit the
+        // whole batch rather than rolling back on the first binary-search miss.
+        let claims = store
+            .claim_run_recovery_candidates(candidates, true)
+            .await
+            .expect("claim handoff candidates");
+        assert_eq!(claims.len(), fixtures.len());
+        for (run_id, session_id, _) in &fixtures {
+            let claim = claims
+                .iter()
+                .find(|claim| claim.run.run_id == *run_id)
+                .expect("handoff candidate was claimed");
+            assert_eq!(claim.run.session_id, *session_id);
+            assert_eq!(claim.claimed_from_generation, 0);
+            assert_eq!(claim.run.run_generation, 1);
+            assert_eq!(claim.run.last_event_idx, 1);
+            let event_type: String = sqlx::query_scalar(
+                "SELECT event_type FROM agent_run_events
+                 WHERE user_id = ? AND run_id = ? AND event_idx = 1",
+            )
+            .bind(&user_id)
+            .bind(run_id)
+            .fetch_one(pool.get())
+            .await
+            .expect("load committed handoff claim event");
+            assert_eq!(event_type, "execution_handoff_claimed");
+        }
+
+        for (run_id, session_id, _) in &fixtures {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+            sqlx::query(
+                "DELETE FROM agent_session_execution_slots
+                 WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(&user_id)
+            .bind(session_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup handoff execution slot");
+            sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+                .bind(&user_id)
+                .bind(session_id)
+                .execute(pool.get())
+                .await
+                .expect("cleanup handoff session");
+            sqlx::query(
+                "DELETE FROM agent_session_lifecycle_fences
+                 WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(&user_id)
+            .bind(session_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup handoff lifecycle fence");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_concurrent_recovery_claims_use_session_first_lock_order() {
+        let _claim_test_guard = MATRIXONE_RECOVERY_CLAIM_IT_LOCK.lock().await;
+        let (_, pool) = setup_database_run_state_store_it().await;
+        let nonce = Uuid::new_v4();
+        let user_id = format!("recovery-lock-order-user-{nonce}");
+        let session_a = format!("rls-a-{nonce}");
+        let session_b = format!("rls-b-{nonce}");
+        let fixtures = [
+            (format!("recovery-lock-order-a-{nonce}"), session_b.clone()),
+            (format!("recovery-lock-order-b-{nonce}"), session_a.clone()),
+            (format!("recovery-lock-order-c-{nonce}"), session_a.clone()),
+            (format!("recovery-lock-order-d-{nonce}"), session_b.clone()),
+        ];
+        insert_active_database_session_fixture(&pool, &user_id, &session_a).await;
+        insert_active_database_session_fixture(&pool, &user_id, &session_b).await;
+        let fixture_store = DatabaseRunStateStore::new(pool.clone())
+            .with_owner_pod_id(format!("recovery-lock-order-fixture-{nonce}"));
+        for (run_id, session_id) in &fixtures {
+            let mut run = durable_run_record(run_id);
+            run.user_id = user_id.clone();
+            run.session_id = session_id.clone();
+            // Child runs do not own the root session execution slot. This
+            // permits the two concurrent claimants to contend on the shared
+            // session fences while claiming disjoint run rows.
+            run.parent_run_id = Some(format!("recovery-lock-order-parent-{nonce}"));
+            run.agent_id = Some("recovery-lock-order-child".into());
+            fixture_store
+                .insert_run(run)
+                .await
+                .expect("insert lock-order recovery run");
+        }
+        sqlx::query(
+            "UPDATE agent_runs
+             SET owner_pod_id = NULL, owner_lease_expires_at = NULL
+             WHERE user_id = ?",
+        )
+        .bind(&user_id)
+        .execute(pool.get())
+        .await
+        .expect("release fixture recovery ownership");
+
+        let candidates_a = vec![
+            fixture_store
+                .load_run(&user_id, &fixtures[0].0)
+                .await
+                .expect("load first lock-order candidate")
+                .expect("first lock-order candidate exists"),
+            fixture_store
+                .load_run(&user_id, &fixtures[2].0)
+                .await
+                .expect("load third lock-order candidate")
+                .expect("third lock-order candidate exists"),
+        ];
+        let candidates_b = vec![
+            fixture_store
+                .load_run(&user_id, &fixtures[1].0)
+                .await
+                .expect("load second lock-order candidate")
+                .expect("second lock-order candidate exists"),
+            fixture_store
+                .load_run(&user_id, &fixtures[3].0)
+                .await
+                .expect("load fourth lock-order candidate")
+                .expect("fourth lock-order candidate exists"),
+        ];
+        let owner_a = DatabaseRunStateStore::new(pool.clone())
+            .with_owner_pod_id(format!("recovery-lock-order-owner-a-{nonce}"));
+        let owner_b = DatabaseRunStateStore::new(pool.clone())
+            .with_owner_pod_id(format!("recovery-lock-order-owner-b-{nonce}"));
+        let (left, right) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                owner_a.claim_run_recovery_candidates(candidates_a, true),
+                owner_b.claim_run_recovery_candidates(candidates_b, true),
+            )
+        })
+        .await
+        .expect("concurrent recovery claims must not deadlock");
+        let left = left.expect("first concurrent recovery claim");
+        let right = right.expect("second concurrent recovery claim");
+        assert_eq!(left.len(), 2);
+        assert_eq!(right.len(), 2);
+        assert!(left.iter().all(|claim| {
+            claim.run.run_id == fixtures[0].0 || claim.run.run_id == fixtures[2].0
+        }));
+        assert!(right.iter().all(|claim| {
+            claim.run.run_id == fixtures[1].0 || claim.run.run_id == fixtures[3].0
+        }));
+        assert!(
+            left.iter().chain(&right).all(|claim| {
+                claim.run.run_generation == 1 && claim.claimed_from_generation == 0
+            })
+        );
+
+        for (run_id, session_id) in &fixtures {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+            sqlx::query(
+                "DELETE FROM agent_session_execution_slots
+                 WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(&user_id)
+            .bind(session_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup lock-order execution slot");
+        }
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup lock-order sessions");
+        sqlx::query("DELETE FROM agent_session_lifecycle_fences WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup lock-order lifecycle fences");
     }
 
     #[tokio::test]

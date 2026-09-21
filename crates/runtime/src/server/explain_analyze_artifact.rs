@@ -31,7 +31,6 @@ tokio::task_local! {
 #[cfg(test)]
 #[derive(Clone, Default)]
 struct ArtifactFetchCounters {
-    total: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     discovery: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     recovery: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -57,9 +56,9 @@ where
     (
         output,
         ArtifactFetchCounts {
-            total: load(&counters.total),
             discovery: load(&counters.discovery),
             recovery: load(&counters.recovery),
+            total: load(&counters.discovery) + load(&counters.recovery),
         },
     )
 }
@@ -75,7 +74,6 @@ fn record_artifact_fetch(purpose: ArtifactFetchPurpose) {
     ARTIFACT_FETCHES
         .try_with(|counters| {
             use std::sync::atomic::Ordering;
-            counters.total.fetch_add(1, Ordering::Relaxed);
             match purpose {
                 ArtifactFetchPurpose::Discovery => {
                     counters.discovery.fetch_add(1, Ordering::Relaxed);

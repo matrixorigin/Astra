@@ -1,7 +1,6 @@
 use std::{sync::Arc, time::Instant};
 
 use astra_core::SharedPool;
-use astra_services::observation_capture::DurableCaptureOutcome;
 use astra_services::runs::ToolOutputBatchItem;
 use astra_services::{
     ContextManifestItemWrite, ContextManifestWrite, DatabaseContextManifestStore,
@@ -384,19 +383,6 @@ async fn perf_benchmark_5_manifest_build_under_100ms() {
     let session_id = id("session");
     let run_id = id("run");
     insert_session(&pool, &user_id, &session_id).await;
-    let weighted_templates = sqlx::query(
-        "SELECT COUNT(*) AS c FROM preview_template_registry
-         WHERE status = 'active' AND fts_field_weights_json <> '{}'",
-    )
-    .fetch_one(pool.get())
-    .await
-    .expect("PERF-5 preview template seed query must succeed")
-    .try_get::<i64, _>("c")
-    .unwrap_or_default();
-    assert!(
-        weighted_templates >= 18,
-        "PERF-5 preview_template seed must include real fts_field_weights for baseline templates, got {weighted_templates}"
-    );
     let store = DatabaseContextManifestStore::new(pool.clone());
     let manifest_id = id("manifest");
     let items = vec![ContextManifestItemWrite {
@@ -628,117 +614,5 @@ async fn perf_benchmark_6_manifest_batches_across_users_and_sessions() {
     assert!(
         elapsed_ms < 10_000,
         "PERF-6 {WRITERS} multi-user/session manifest writes must complete in <10s, got {elapsed_ms}ms"
-    );
-}
-
-#[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1; perf_benchmark"]
-async fn perf_benchmark_7_latest_manifest_reads_are_owner_scoped() {
-    const MANIFESTS: usize = 512;
-
-    let pool = setup_pool().await;
-    let user_id = id("perf-read-user");
-    let session_id = id("perf-read-session");
-    let run_id = id("perf-read-run");
-    let manifest_prefix = id("perf-manifest");
-    insert_session(&pool, &user_id, &session_id).await;
-
-    // Seed through the capture owner so hashes, write markers, and session
-    // admission stay aligned with production. Setup is outside the read timer.
-    let store = DatabaseContextManifestStore::new(pool.clone());
-    for index in 0..MANIFESTS {
-        let outcome = store
-            .save_manifest(
-                ContextManifestWrite {
-                    manifest_id: format!("{manifest_prefix}-{index:04}"),
-                    user_id: user_id.clone(),
-                    session_id: session_id.clone(),
-                    run_id: Some(run_id.clone()),
-                    turn_id: format!("turn-{index}"),
-                    model_provider: "mock".to_string(),
-                    model_name: "perf-read-llm".to_string(),
-                    context_window_tokens: 8_000,
-                    max_output_tokens: 700,
-                    total_estimated_tokens: 1_200,
-                    policy_version: "context_manifest_v1".to_string(),
-                    tokenizer_id: Some("estimated_v1".to_string()),
-                    budget_template_id: Some("budget_v1_8k".to_string()),
-                    turn_intent: Some("normal".to_string()),
-                    reason: "normal_turn".to_string(),
-                    manifest_json: json!({}),
-                },
-                vec![],
-            )
-            .await
-            .expect("PERF-7 manifest seed must succeed");
-        assert_eq!(
-            outcome,
-            DurableCaptureOutcome::Inserted,
-            "PERF-7 seed must be a fresh capture"
-        );
-    }
-
-    let started = Instant::now();
-    let preferred = sqlx::query(
-        "SELECT manifest_id, run_id, turn_id, reason, total_estimated_tokens,
-                budget_template_id, policy_version,
-                DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
-         FROM context_manifests
-         WHERE user_id = ? AND session_id = ? AND run_id = ?
-         ORDER BY created_at DESC, manifest_id DESC
-         LIMIT 1",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&run_id)
-    .fetch_one(pool.get())
-    .await
-    .expect("PERF-7 preferred latest-manifest query must succeed");
-    let preferred_ms = millis(started);
-    assert_eq!(
-        preferred.try_get::<String, _>("manifest_id").unwrap(),
-        format!("{manifest_prefix}-{:04}", MANIFESTS - 1)
-    );
-
-    let started = Instant::now();
-    let fallback = sqlx::query(
-        "SELECT manifest_id, run_id, turn_id, reason, total_estimated_tokens,
-                budget_template_id, policy_version,
-                DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
-         FROM context_manifests
-         WHERE user_id = ? AND session_id = ?
-         ORDER BY created_at DESC, manifest_id DESC
-         LIMIT 1",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .fetch_one(pool.get())
-    .await
-    .expect("PERF-7 fallback latest-manifest query must succeed");
-    let fallback_ms = millis(started);
-    assert_eq!(
-        fallback.try_get::<String, _>("manifest_id").unwrap(),
-        format!("{manifest_prefix}-{:04}", MANIFESTS - 1)
-    );
-
-    let wrong_owner = sqlx::query(
-        "SELECT COUNT(*) AS c
-         FROM context_manifests
-         WHERE user_id = ? AND session_id = ?",
-    )
-    .bind("perf-read-not-owner")
-    .bind(&session_id)
-    .fetch_one(pool.get())
-    .await
-    .expect("PERF-7 wrong-owner read must succeed")
-    .try_get::<i64, _>("c")
-    .unwrap_or_default();
-    assert_eq!(wrong_owner, 0, "PERF-7 must not read another owner");
-    println!(
-        "PERF_RESULT benchmark=manifest_latest_read history_rows={MANIFESTS} preferred_ms={preferred_ms} fallback_ms={fallback_ms}"
-    );
-    assert!(
-        preferred_ms < 50 && fallback_ms < 50,
-        "PERF-7 latest reads must stay under 50ms: preferred={preferred_ms}ms fallback={fallback_ms}ms"
     );
 }

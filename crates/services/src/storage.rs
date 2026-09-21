@@ -121,7 +121,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-20-v83";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-21-v84";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -3794,6 +3794,125 @@ async fn backfill_conversation_manifest_segments(
     }
 }
 
+/// Move pre-`run_checkpoints` snapshots into canonical checkpoint history.
+///
+/// The run row is locked while its snapshot is read and inserted. That lock is
+/// the same serialization point used by checkpoint writes, so a concurrent
+/// writer cannot commit a newer snapshot before this historical row is given
+/// its source timestamp.
+async fn backfill_legacy_checkpoints(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
+    const BATCH_SIZE: i64 = 128;
+    let mut last_key: Option<(String, String)> = None;
+
+    loop {
+        let mut select = QueryBuilder::<MySql>::new(
+            "SELECT user_id, run_id
+             FROM agent_runs
+             WHERE checkpoint_version IS NOT NULL
+               AND checkpoint_json IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM run_checkpoints AS canonical
+                   WHERE canonical.user_id = agent_runs.user_id
+                     AND canonical.run_id = agent_runs.run_id
+               )",
+        );
+        if let Some((last_user_id, last_run_id)) = &last_key {
+            select
+                .push(" AND (user_id > ")
+                .push_bind(last_user_id)
+                .push(" OR (user_id = ")
+                .push_bind(last_user_id)
+                .push(" AND run_id > ")
+                .push_bind(last_run_id)
+                .push("))");
+        }
+        select
+            .push(" ORDER BY user_id, run_id LIMIT ")
+            .push_bind(BATCH_SIZE);
+        let rows = select.build().fetch_all(pool).await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        for key_row in &rows {
+            let user_id: String = key_row.try_get("user_id")?;
+            let run_id: String = key_row.try_get("run_id")?;
+            let mut tx = pool.begin().await?;
+            let Some(row) = query(
+                "SELECT session_id, last_event_idx, checkpoint_json, updated_at
+                 FROM agent_runs
+                 WHERE user_id = ? AND run_id = ?
+                   AND checkpoint_version IS NOT NULL
+                   AND checkpoint_json IS NOT NULL
+                 FOR UPDATE",
+            )
+            .bind(&user_id)
+            .bind(&run_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            else {
+                tx.rollback().await?;
+                continue;
+            };
+            // The paging query is only an optimization. Recheck after locking
+            // the run because a canonical writer may have committed since the
+            // page was read.
+            let has_canonical_history: Option<i64> = query_scalar(
+                "SELECT 1 FROM run_checkpoints
+                 WHERE user_id = ? AND run_id = ? LIMIT 1",
+            )
+            .bind(&user_id)
+            .bind(&run_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if has_canonical_history.is_some() {
+                tx.commit().await?;
+                continue;
+            }
+            let session_id: String = row.try_get("session_id")?;
+            let node_seq: i64 = row.try_get("last_event_idx")?;
+            let checkpoint_json: String = row.try_get("checkpoint_json")?;
+            let created_at: chrono::NaiveDateTime = row.try_get("updated_at")?;
+            let (checkpoint_kind, checkpoint_version, idempotency_key) =
+                match crate::runs::checkpoint_metadata(&run_id, &checkpoint_json) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "astra_services::storage",
+                            run_id = %run_id,
+                            error = %error,
+                            "skipping malformed legacy checkpoint during schema migration"
+                        );
+                        tx.commit().await?;
+                        continue;
+                    }
+                };
+            query(
+                "INSERT INTO run_checkpoints
+                 (checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
+                  checkpoint_version, idempotency_key, checkpoint_json, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(format!("ckpt-legacy-{}", Uuid::now_v7()))
+            .bind(run_id)
+            .bind(user_id)
+            .bind(session_id)
+            .bind(node_seq.max(0))
+            .bind(checkpoint_kind)
+            .bind(checkpoint_version)
+            .bind(idempotency_key)
+            .bind(checkpoint_json)
+            .bind(created_at)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+        }
+
+        let last_row = rows.last().expect("non-empty legacy checkpoint batch");
+        last_key = Some((last_row.try_get("user_id")?, last_row.try_get("run_id")?));
+    }
+}
+
 async fn ensure_core_schema_while_leased(
     settings: &MatrixOneSettings,
     pool: sqlx::Pool<MySql>,
@@ -5195,6 +5314,7 @@ async fn ensure_core_schema_while_leased(
         "ALTER TABLE run_checkpoints ADD INDEX idx_run_checkpoints_session_kind_created (user_id, session_id, checkpoint_kind, created_at)",
     )
     .await?;
+    backfill_legacy_checkpoints(&pool).await?;
 
     core_schema_create!(pool, "run_display_projections",
         "CREATE TABLE IF NOT EXISTS run_display_projections (
