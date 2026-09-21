@@ -2881,6 +2881,58 @@ async fn session_artifact_persist_uses_microsecond_created_at_for_latest_orderin
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_artifact_commit_and_reload_reuses_a_one_connection_pool() {
+    let (_, mut settings) = setup_pool_and_settings().await;
+    settings.db_pool_min_connections = 0;
+    settings.db_pool_max_connections = 1;
+    let shared = SharedPool::new(&settings)
+        .await
+        .expect("create one-connection artifact pool");
+    let pool = shared.get().clone();
+    let user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let artifact_id = Uuid::new_v4().to_string();
+
+    cleanup_restore_fixture_for_owner(&pool, &user_id, std::slice::from_ref(&session_id)).await;
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'artifact-one-connection', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("insert one-connection artifact session");
+
+    let store = DatabaseSessionArtifactStore::new(settings).with_pool(shared);
+    let persisted = store
+        .persist_json_artifact(astra_services::SessionArtifactJsonRecord {
+            artifact_id: artifact_id.clone(),
+            session_id: session_id.clone(),
+            user_id: user_id.clone(),
+            artifact_kind: "llm_capture".into(),
+            source: Some("one-connection-regression".into()),
+            turn: Some(1),
+            round: Some(0),
+            content: serde_json::json!({"marker": "committed"}),
+            metadata: None,
+            references: Vec::new(),
+        })
+        .await
+        .expect("persist artifact and reload it after commit");
+    assert_eq!(persisted.artifact_id, artifact_id);
+    let reloaded = store
+        .load_json_artifact(&user_id, &session_id, &artifact_id)
+        .await
+        .expect("reload artifact with the same one-connection pool")
+        .expect("persisted artifact exists");
+    assert_eq!(reloaded.content["marker"], "committed");
+
+    cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn session_artifact_and_durable_reference_persist_atomically() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();

@@ -4,6 +4,7 @@
 //! makes entry, byte, and fill limits hard across runtime processes without a
 //! second eventually-consistent budget counter.
 
+use crate::CancellationSafePoolConnection;
 use astra_core::SharedPool;
 use astra_turn_types::{
     SemanticReadCacheKey, SemanticReadCacheLimits, SemanticReadCacheLookup, SemanticReadObservation,
@@ -47,7 +48,8 @@ impl DatabaseSemanticReadObservationStore {
                 source,
             }
         })?;
-        let mut tx = self.pool.get().begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.begin().await?;
         lock_cache_budget(&mut tx, user_id, session_id).await?;
         sqlx::query(
             "DELETE FROM semantic_read_observations
@@ -65,12 +67,14 @@ impl DatabaseSemanticReadObservationStore {
                 Err(error) => {
                     remove_entry_in_tx(&mut tx, user_id, session_id, &key.key_id).await?;
                     tx.commit().await?;
+                    connection.release();
                     return Err(error);
                 }
             };
             if stored_key != *key {
                 remove_entry_in_tx(&mut tx, user_id, session_id, &key.key_id).await?;
                 tx.commit().await?;
+                connection.release();
                 return Err(SemanticReadObservationStoreError::CacheKeyCollisionRemoved);
             }
             match row.state.as_str() {
@@ -80,6 +84,7 @@ impl DatabaseSemanticReadObservationStore {
                         Err(error) => {
                             remove_entry_in_tx(&mut tx, user_id, session_id, &key.key_id).await?;
                             tx.commit().await?;
+                            connection.release();
                             return Err(error);
                         }
                     };
@@ -96,6 +101,7 @@ impl DatabaseSemanticReadObservationStore {
                     .execute(&mut *tx)
                     .await?;
                     tx.commit().await?;
+                    connection.release();
                     return Ok(SemanticReadCacheLookup::Hit(Box::new(observation)));
                 }
                 "filling" => {
@@ -104,10 +110,12 @@ impl DatabaseSemanticReadObservationStore {
                         Err(error) => {
                             remove_entry_in_tx(&mut tx, user_id, session_id, &key.key_id).await?;
                             tx.commit().await?;
+                            connection.release();
                             return Err(error);
                         }
                     };
                     tx.commit().await?;
+                    connection.release();
                     return Ok(SemanticReadCacheLookup::FillInProgress {
                         lease_expires_at_epoch_ms: expires_at,
                     });
@@ -115,6 +123,7 @@ impl DatabaseSemanticReadObservationStore {
                 other => {
                     remove_entry_in_tx(&mut tx, user_id, session_id, &key.key_id).await?;
                     tx.commit().await?;
+                    connection.release();
                     return Err(SemanticReadObservationStoreError::InvalidStateRemoved(
                         other.to_string(),
                     ));
@@ -137,6 +146,7 @@ impl DatabaseSemanticReadObservationStore {
         )?;
         if in_flight >= self.limits.max_in_flight_fills as u64 {
             tx.commit().await?;
+            connection.release();
             return Ok(SemanticReadCacheLookup::FillCapacityExceeded);
         }
 
@@ -158,6 +168,7 @@ impl DatabaseSemanticReadObservationStore {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        connection.release();
         Ok(SemanticReadCacheLookup::FillClaimed)
     }
 
@@ -184,7 +195,8 @@ impl DatabaseSemanticReadObservationStore {
                 source,
             }
         })?;
-        let mut tx = self.pool.get().begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.begin().await?;
         lock_cache_budget(&mut tx, user_id, session_id).await?;
         let row = load_entry_in_tx(&mut tx, user_id, session_id, &key.key_id)
             .await?
@@ -194,12 +206,14 @@ impl DatabaseSemanticReadObservationStore {
             Err(error) => {
                 remove_entry_in_tx(&mut tx, user_id, session_id, &key.key_id).await?;
                 tx.commit().await?;
+                connection.release();
                 return Err(error);
             }
         };
         if stored_key != *key {
             remove_entry_in_tx(&mut tx, user_id, session_id, &key.key_id).await?;
             tx.commit().await?;
+            connection.release();
             return Err(SemanticReadObservationStoreError::CacheKeyCollisionRemoved);
         }
         ensure_active_fill(&row, fill_owner)?;
@@ -207,6 +221,7 @@ impl DatabaseSemanticReadObservationStore {
         if observation_bytes > self.limits.max_ready_bytes {
             remove_entry_in_tx(&mut tx, user_id, session_id, &key.key_id).await?;
             tx.commit().await?;
+            connection.release();
             return Err(
                 SemanticReadObservationStoreError::ObservationExceedsStoreCapacity {
                     observation_bytes,
@@ -253,6 +268,7 @@ impl DatabaseSemanticReadObservationStore {
             return Err(SemanticReadObservationStoreError::FillOwnerOrLeaseMismatch);
         }
         tx.commit().await?;
+        connection.release();
         Ok(())
     }
 
@@ -303,7 +319,8 @@ impl DatabaseSemanticReadObservationStore {
     ) -> Result<(), SemanticReadObservationStoreError> {
         validate_owner(fill_owner)?;
         key.validate()?;
-        let mut tx = self.pool.get().begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.begin().await?;
         lock_cache_budget(&mut tx, user_id, session_id).await?;
         let deleted = sqlx::query(
             "DELETE FROM semantic_read_observations
@@ -322,6 +339,7 @@ impl DatabaseSemanticReadObservationStore {
             return Err(SemanticReadObservationStoreError::FillOwnerOrLeaseMismatch);
         }
         tx.commit().await?;
+        connection.release();
         Ok(())
     }
 }

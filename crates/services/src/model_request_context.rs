@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 
 use astra_core::SharedPool;
 
-use crate::{ServiceError, ServiceErrorKind, ServiceResult};
+use crate::{CancellationSafePoolConnection, ServiceError, ServiceErrorKind, ServiceResult};
 
 pub const MODEL_REQUEST_CONTEXT_SCHEMA: &str = "model_request_context_v2";
 pub(crate) const MODEL_REQUEST_CONTEXT_RETENTION_DAYS: u32 = 30;
@@ -281,7 +281,16 @@ pub(crate) async fn expire_model_request_context_events(
         return Ok(0);
     }
 
-    let mut tx = pool.get().begin().await.map_err(|error| {
+    let mut connection = CancellationSafePoolConnection::acquire(pool.get())
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "acquire model request context expiry connection",
+                error,
+            )
+        })?;
+    let mut tx = connection.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin model request context expiry",
@@ -349,6 +358,7 @@ pub(crate) async fn expire_model_request_context_events(
                 error,
             )
         })?;
+        connection.release();
         return Ok(0);
     }
     let provider_attempts_to_mark = expired_attempt_keys
@@ -386,6 +396,7 @@ pub(crate) async fn expire_model_request_context_events(
             error,
         )
     })?;
+    connection.release();
     Ok(rows_deleted)
 }
 

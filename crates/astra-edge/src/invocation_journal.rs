@@ -15,9 +15,6 @@ const MAX_JOURNAL_STATE_BYTES: usize = 192 * 1024 * 1024;
 const MAX_WAL_BYTES: usize = 256 * 1024 * 1024;
 const WAL_COMPACTION_ENTRY_THRESHOLD: usize = 4_096;
 const WAL_COMPACTION_BYTE_THRESHOLD: usize = 8 * 1024 * 1024;
-// Read-time integrity limit of the published journal format. New writes use
-// MAX_EDGE_MESSAGE_BYTES for the complete wire envelope instead.
-const LEGACY_MAX_RESULT_BODY_BYTES: usize = 256 * 1024;
 const _: () = {
     assert!(MAX_RECORDS >= 512);
     assert!(MAX_JOURNAL_STATE_BYTES <= 256 * 1024 * 1024);
@@ -930,21 +927,6 @@ fn validate_record(
             detail: format!("record {request_id} crossed dispatch without an execution generation"),
         });
     }
-    if let Some(result) = &record.result {
-        let result_bytes = serde_json::to_vec(result).map_err(|error| JournalError::Corrupt {
-            path: path.to_path_buf(),
-            detail: format!("record {request_id} result cannot be serialized: {error}"),
-        })?;
-        if result_bytes.len() > LEGACY_MAX_RESULT_BODY_BYTES {
-            return Err(JournalError::Corrupt {
-                path: path.to_path_buf(),
-                detail: format!(
-                    "record {request_id} result is {} bytes; maximum is {LEGACY_MAX_RESULT_BODY_BYTES}",
-                    result_bytes.len()
-                ),
-            });
-        }
-    }
     Ok(())
 }
 
@@ -1085,18 +1067,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_body_bounded_outbox_is_repaired_durably_before_replay() {
+    async fn oversized_persisted_result_is_repaired_durably_before_replay() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal.json");
-        let identity = identity("legacy");
+        let identity = identity("oversized");
         let id = identity.storage_key();
         let result = DurableEdgeResult {
-            output: "x".repeat(262_000),
+            // Keep this above the removed legacy body-only limit as well as
+            // above the authoritative full-envelope limit.
+            output: "x".repeat(262_200),
             is_error: false,
             duration_ms: 1,
             tool_result_fields: None,
         };
-        assert!(serde_json::to_vec(&result).unwrap().len() < LEGACY_MAX_RESULT_BODY_BYTES);
         let record = DurableInvocationRecord {
             identity,
             delivery_generation: 1,

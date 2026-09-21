@@ -405,37 +405,39 @@ async fn resolve_one_shot_model(
     restored_model: Option<&str>,
     fallback_model: Option<&str>,
 ) -> Result<ResolvedOneShotModel, String> {
-    let model = if let Some(model) =
+    let Some(requested_model) =
         effective_one_shot_model(explicit_model, restored_model, fallback_model)
-    {
-        Some(model.to_string())
-    } else {
-        match session_runtime::resolve_server_default_model(api, token).await {
-            session_runtime::ServerDefaultModel::Selected(selection) => Some(selection.name),
-            session_runtime::ServerDefaultModel::NoModels => None,
-            session_runtime::ServerDefaultModel::Unavailable(error) => {
-                return Err(error.to_string());
+    else {
+        return match session_runtime::resolve_server_default_model(api, token).await {
+            session_runtime::ServerDefaultModel::Selected(selection) => {
+                // The default resolver already validated the Offering against
+                // the authoritative Model Access projection. Do not fetch the
+                // model catalog a second time just to recover the same id.
+                Ok(ResolvedOneShotModel {
+                    model: Some(selection.name),
+                    offering_id: Some(selection.offering_id),
+                })
             }
-        }
+            session_runtime::ServerDefaultModel::NoModels => Ok(ResolvedOneShotModel {
+                model: None,
+                offering_id: None,
+            }),
+            session_runtime::ServerDefaultModel::Unavailable(error) => Err(error.to_string()),
+        };
     };
-    let Some(model) = model else {
-        return Ok(ResolvedOneShotModel {
-            model: None,
-            offering_id: None,
-        });
-    };
+
     let selection = session_runtime::resolve_server_model_selection(
         api,
         token,
-        &model,
+        requested_model,
         astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
     )
     .await
-    .map_err(|error| format!("failed to resolve selected model '{model}': {error}"))?;
+    .map_err(|error| format!("failed to resolve selected model '{requested_model}': {error}"))?;
     Ok(ResolvedOneShotModel {
         // Preserve the caller's thinking suffix and spelling in the turn
         // payload; the shared resolver owns the canonical Offering identity.
-        model: Some(model),
+        model: Some(requested_model.to_string()),
         offering_id: Some(selection.offering_id),
     })
 }
@@ -653,6 +655,57 @@ mod exact_model_resolution_tests {
             "{error}"
         );
         assert!(!error.contains("missing_model_selection"));
+    }
+
+    #[tokio::test]
+    async fn default_model_resolution_reuses_the_authoritative_offering() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/model-access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accesses": [],
+                "offerings": [{
+                    "offering_id": "offer-default",
+                    "access_id": "self-hosted",
+                    "access_kind": "self_hosted",
+                    "access_label": "Self-hosted",
+                    "execution_placement": "server",
+                    "name": "default-model",
+                    "provider": "openai",
+                    "description": null,
+                    "is_active": true,
+                    "context_window": 128000,
+                    "max_completion_tokens": null,
+                    "architecture": null,
+                    "thinking_capability": null
+                }],
+                "default_offering_id": "offer-default",
+                "default_resolution": {
+                    "state": "selected",
+                    "offering_id": "offer-default",
+                    "source": "astra",
+                    "scope": "effective_catalog"
+                },
+                "next_cursor": null,
+                "limit": 50,
+                "total": 1,
+                "catalog_revision": "sha256:test",
+                "observed_at": "2026-09-21T00:00:00Z"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("client");
+
+        let resolved = resolve_one_shot_model(&api, "token", None, None, None)
+            .await
+            .expect("default model should resolve");
+
+        assert_eq!(resolved.model.as_deref(), Some("default-model"));
+        assert_eq!(resolved.offering_id.as_deref(), Some("offer-default"));
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/model-access");
     }
 }
 

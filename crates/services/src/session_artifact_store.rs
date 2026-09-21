@@ -769,7 +769,8 @@ impl DatabaseSessionArtifactStore {
         let metadata_json = record.metadata.as_ref().map(Value::to_string);
         let turn = encode_counter(record.turn, SessionArtifactStoreError::TurnOverflow)?;
         let round = encode_counter(record.round, SessionArtifactStoreError::RoundOverflow)?;
-        let mut tx = pool.begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(&pool).await?;
+        let mut tx = connection.begin().await?;
         query(
             "INSERT INTO session_artifacts \
              (artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
@@ -858,6 +859,7 @@ impl DatabaseSessionArtifactStore {
         }
         update.execute(&mut *tx).await?;
         tx.commit().await?;
+        connection.release();
 
         let stored = self
             .load_json_artifact(&record.user_id, &record.session_id, &record.artifact_id)
@@ -1362,7 +1364,8 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
             .map(|metadata| metadata.to_string());
         let retention_until = (!record.references.is_empty())
             .then(|| (chrono::Utc::now() + chrono::Duration::days(30)).naive_utc());
-        let mut tx = pool.begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(&pool).await?;
+        let mut tx = connection.begin().await?;
         query(
             "INSERT INTO session_artifacts \
              (artifact_id, session_id, user_id, artifact_kind, source, turn, round, content_json, metadata, retention_until, created_at) \
@@ -1402,6 +1405,7 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
             .await?;
         }
         tx.commit().await?;
+        connection.release();
 
         let row = query(
             "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
@@ -1480,7 +1484,8 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         let initial_metadata = record.metadata.as_ref().map(Value::to_string);
         let initial_turn = encode_counter(record.turn, SessionArtifactStoreError::TurnOverflow)?;
         let initial_round = encode_counter(record.round, SessionArtifactStoreError::RoundOverflow)?;
-        let mut tx = pool.begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(&pool).await?;
+        let mut tx = connection.begin().await?;
 
         // Claim the stable identity before locking it. Concurrent first
         // writers serialize on the unique key; subsequent writers serialize
@@ -1589,6 +1594,7 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        connection.release();
 
         self.load_json_artifact(&record.user_id, &record.session_id, &record.artifact_id)
             .await?
@@ -1620,7 +1626,8 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         let pool = self.get_pool().await?;
         self.require_owned_session(&pool, user_id, session_id)
             .await?;
-        let mut tx = pool.begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(&pool).await?;
+        let mut tx = connection.begin().await?;
         let row = query(
             "SELECT status FROM session_artifacts \
              WHERE user_id = ? AND session_id = ? AND artifact_id = ? FOR UPDATE",
@@ -1673,6 +1680,7 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        connection.release();
         Ok(inserted)
     }
 
@@ -2471,10 +2479,12 @@ impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
                 artifact_id: artifact_id.to_string(),
             });
         }
-        let mut tx = pool.begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(&pool).await?;
+        let mut tx = connection.begin().await?;
         let chunks = load_content_chunk_refs(&mut tx, user_id, session_id, artifact_id).await?;
         let stored_chunks = load_and_verify_content_chunks(&mut tx, user_id, &chunks).await?;
         tx.commit().await?;
+        connection.release();
         if envelope.content.chunk_count != stored_chunks.len() as u64 {
             return Err(SessionArtifactStoreError::ByteArtifactContentUnavailable {
                 artifact_id: artifact_id.to_string(),

@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::{Connection, MySql, QueryBuilder, Row, Transaction};
+use sqlx::{MySql, QueryBuilder, Row, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -786,9 +786,10 @@ impl DatabaseSessionContextCoordinator {
         hash_field(&mut identity, &source.reservation_id);
         let idempotency_key = format!("adopt:{:x}", identity.finalize());
         validate_idempotency_key(&idempotency_key)?;
-        let mut tx = self
-            .pool
-            .get()
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_execution_turn_adoption", source))?;
+        let mut tx = connection
             .begin()
             .await
             .map_err(|source| database_error("begin_execution_turn_adoption", source))?;
@@ -901,6 +902,7 @@ impl DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_execution_adoption_retry", source))?;
+            connection.release();
             return Ok(AdoptedExecutionHandoff {
                 receipt,
                 checkpoint: locked.checkpoint,
@@ -962,6 +964,7 @@ impl DatabaseSessionContextCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_execution_turn_adoption", source))?;
+        connection.release();
         Ok(AdoptedExecutionHandoff {
             receipt,
             checkpoint: locked.checkpoint,
@@ -984,7 +987,6 @@ impl DatabaseSessionContextCoordinator {
             .await
             .map_err(|source| database_error("acquire_execution_idle_proof", source))?;
         let mut tx = connection
-            .connection_mut()
             .begin()
             .await
             .map_err(|source| database_error("begin_execution_idle_proof", source))?;
@@ -1018,7 +1020,6 @@ impl DatabaseSessionContextCoordinator {
             .await
             .map_err(|source| database_error("acquire_terminal_writer_release", source))?;
         let mut tx = connection
-            .connection_mut()
             .begin()
             .await
             .map_err(|source| database_error("begin_terminal_writer_release", source))?;
@@ -1152,9 +1153,10 @@ impl DatabaseSessionContextCoordinator {
             owner_branch_id: branch_id.clone(),
             blocker,
         };
-        let mut tx = self
-            .pool
-            .get()
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_idle_workspace_release", source))?;
+        let mut tx = connection
             .begin()
             .await
             .map_err(|source| database_error("begin_idle_workspace_release", source))?;
@@ -1189,6 +1191,7 @@ impl DatabaseSessionContextCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_idle_workspace_release", source))?;
+        connection.release();
         Ok(())
     }
 
@@ -1233,9 +1236,10 @@ impl DatabaseSessionContextCoordinator {
             .unwrap_or_else(|| initial.clone());
         self.release_idle_execution_workspace_claim(key, &target)
             .await?;
-        let mut tx = self
-            .pool
-            .get()
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_execution_binding_initialize", source))?;
+        let mut tx = connection
             .begin()
             .await
             .map_err(|source| database_error("begin_execution_binding_initialize", source))?;
@@ -1267,6 +1271,7 @@ impl DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_execution_binding_existing", source))?;
+            connection.release();
             return Ok(binding);
         }
 
@@ -1306,6 +1311,7 @@ impl DatabaseSessionContextCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_execution_binding_initialize", source))?;
+        connection.release();
         Ok(binding)
     }
 
@@ -1354,9 +1360,10 @@ impl DatabaseSessionContextCoordinator {
 
         self.release_idle_execution_workspace_claim(key, next)
             .await?;
-        let mut tx = self
-            .pool
-            .get()
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_execution_binding_cas", source))?;
+        let mut tx = connection
             .begin()
             .await
             .map_err(|source| database_error("begin_execution_binding_cas", source))?;
@@ -1461,6 +1468,7 @@ impl DatabaseSessionContextCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_execution_binding_cas", source))?;
+        connection.release();
         Ok(next.clone())
     }
 
@@ -1496,9 +1504,10 @@ impl DatabaseSessionContextCoordinator {
         let request_hash = execution_switch_request_hash(key, request)?;
         self.release_idle_execution_workspace_claim(key, &request.target)
             .await?;
-        let mut tx = self
-            .pool
-            .get()
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_execution_switch", source))?;
+        let mut tx = connection
             .begin()
             .await
             .map_err(|source| database_error("begin_execution_switch", source))?;
@@ -1517,6 +1526,7 @@ impl DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_execution_switch_idempotent", source))?;
+            connection.release();
             return Ok(existing);
         }
 
@@ -1592,6 +1602,7 @@ impl DatabaseSessionContextCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_execution_switch_begin", source))?;
+        connection.release();
         Ok(receipt)
     }
 
@@ -1621,9 +1632,10 @@ impl DatabaseSessionContextCoordinator {
                 "execution switch failure code must be at most 128 bytes".into(),
             ));
         }
-        let mut tx = self
-            .pool
-            .get()
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_execution_switch_complete", source))?;
+        let mut tx = connection
             .begin()
             .await
             .map_err(|source| database_error("begin_execution_switch_complete", source))?;
@@ -1638,6 +1650,7 @@ impl DatabaseSessionContextCoordinator {
             tx.commit().await.map_err(|source| {
                 database_error("commit_execution_switch_terminal_retry", source)
             })?;
+            connection.release();
             return Ok(receipt);
         }
         if receipt.attempt != expected_attempt
@@ -1690,6 +1703,7 @@ impl DatabaseSessionContextCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_execution_switch_complete", source))?;
+        connection.release();
         Ok(receipt)
     }
 
@@ -1706,9 +1720,10 @@ impl DatabaseSessionContextCoordinator {
         key.validate()
             .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
         validate_idempotency_key(operation_id)?;
-        let mut tx = self
-            .pool
-            .get()
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_execution_switch_retry", source))?;
+        let mut tx = connection
             .begin()
             .await
             .map_err(|source| database_error("begin_execution_switch_retry", source))?;
@@ -1727,6 +1742,7 @@ impl DatabaseSessionContextCoordinator {
             tx.commit().await.map_err(|source| {
                 database_error("commit_execution_switch_retry_idempotent", source)
             })?;
+            connection.release();
             return Ok(receipt);
         }
         if receipt.completed_generation != Some(expected_generation) {
@@ -1786,6 +1802,7 @@ impl DatabaseSessionContextCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_execution_switch_retry", source))?;
+        connection.release();
         Ok(receipt)
     }
 
@@ -1802,10 +1819,13 @@ impl DatabaseSessionContextCoordinator {
             .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
         validate_idempotency_key(operation_id)?;
         validate_idempotency_key(controller_attachment_id)?;
-        let mut tx =
-            self.pool.get().begin().await.map_err(|source| {
-                database_error("begin_authorize_execution_switch_retry", source)
-            })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_authorize_execution_switch_retry", source))?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|source| database_error("begin_authorize_execution_switch_retry", source))?;
         ensure_database_state(&mut tx, key, AuthorityEpochsV1::default()).await?;
         let (_state, now) = lock_database_state_at_now(&mut tx, key).await?;
         let receipt = load_execution_switch_in_tx(&mut tx, key, operation_id, true)
@@ -1817,6 +1837,7 @@ impl DatabaseSessionContextCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_authorize_execution_switch_retry", source))?;
+        connection.release();
         Ok(receipt)
     }
 
@@ -2408,7 +2429,6 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .await
             .map_err(|source| database_error("acquire_load_active_writer", source))?;
         let mut tx = connection
-            .connection_mut()
             .begin()
             .await
             .map_err(|source| database_error("begin_load_active_writer", source))?;
@@ -2493,9 +2513,10 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         manifest: &SessionForkManifestV1,
     ) -> Result<SessionContextHeadV1, SessionContextCoordinatorError> {
         validate_prepared_fork(manifest)?;
-        let mut tx = self
-            .pool
-            .get()
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_activate_fork", source))?;
+        let mut tx = connection
             .begin()
             .await
             .map_err(|source| database_error("begin_activate_fork", source))?;
@@ -2559,6 +2580,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_active_fork_replay", source))?;
+            connection.release();
             return Ok(head);
         }
         if stored_state != "prepared" || stored != *manifest {
@@ -2674,6 +2696,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_activate_fork", source))?;
+        connection.release();
         Ok(child_head)
     }
 
@@ -2691,9 +2714,10 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .validate_for(key)
             .map_err(|_| SessionContextCoordinatorError::Unauthorized)?;
         validate_optional_cursor(key, expected_cursor)?;
-        let mut tx = self
-            .pool
-            .get()
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_writer", source))?;
+        let mut tx = connection
             .begin()
             .await
             .map_err(|source| database_error("begin_acquire_writer", source))?;
@@ -2726,6 +2750,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_acquire_replay", source))?;
+            connection.release();
             return Ok(AcquireWriterOutcome::AlreadyAcquired(receipt.lease));
         }
         if let Some(active) = state.active_writer.clone()
@@ -2748,6 +2773,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_acquire_retry", source))?;
+            connection.release();
             return Ok(AcquireWriterOutcome::AlreadyAcquired(active.clone()));
         }
         if state.head.as_ref().map(|head| &head.cursor) != expected_cursor {
@@ -2775,6 +2801,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_acquire_cursor_conflict", source))?;
+            connection.release();
             return Ok(outcome);
         }
         if state
@@ -2805,6 +2832,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_acquire_lease_conflict", source))?;
+            connection.release();
             return Ok(outcome);
         }
         if actor.authority_epochs != state.authority_epochs {
@@ -2824,6 +2852,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_acquire_fenced_audit", source))?;
+            connection.release();
             return Err(SessionContextCoordinatorError::Fenced);
         }
         archive_database_state_receipts(&mut tx, &state).await?;
@@ -2860,6 +2889,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_acquire_writer", source))?;
+        connection.release();
         Ok(AcquireWriterOutcome::Acquired(lease))
     }
 
@@ -2869,9 +2899,10 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         ttl: Duration,
     ) -> Result<ConversationWriterLeaseV1, SessionContextCoordinatorError> {
         validate_ttl(ttl, MAX_LEASE_TTL)?;
-        let mut tx = self
-            .pool
-            .get()
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_renew_writer", source))?;
+        let mut tx = connection
             .begin()
             .await
             .map_err(|source| database_error("begin_renew_writer", source))?;
@@ -2893,6 +2924,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_renew_writer_audit", source))?;
+            connection.release();
             return Err(error);
         }
         let renewed = state.active_writer.as_mut().expect("validated lease");
@@ -2915,6 +2947,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_renew_writer", source))?;
+        connection.release();
         Ok(renewed)
     }
 
@@ -2927,9 +2960,10 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         validate_ttl(ttl, MAX_LEASE_TTL)?;
         validate_ttl(ttl, MAX_RESERVATION_TTL)?;
         validate_reservation_request(reservation, lease, &lease.expected_cursor)?;
-        let mut tx = self
-            .pool
-            .get()
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_renew_turn_authority", source))?;
+        let mut tx = connection
             .begin()
             .await
             .map_err(|source| database_error("begin_renew_turn_authority", source))?;
@@ -2954,6 +2988,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_renew_turn_authority_audit", source))?;
+            connection.release();
             return Err(error);
         }
         let expires_at_unix_ms = checked_expiry(now, ttl)?;
@@ -2983,6 +3018,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_renew_turn_authority", source))?;
+        connection.release();
         Ok(RenewedTurnAuthority {
             writer_lease,
             turn_reservation,
@@ -2993,9 +3029,10 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         &self,
         lease: &ConversationWriterLeaseV1,
     ) -> Result<(), SessionContextCoordinatorError> {
-        let mut tx = self
-            .pool
-            .get()
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_release_writer", source))?;
+        let mut tx = connection
             .begin()
             .await
             .map_err(|source| database_error("begin_release_writer", source))?;
@@ -3022,6 +3059,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_release_fenced_audit", source))?;
+            connection.release();
             return Err(SessionContextCoordinatorError::Fenced);
         } else {
             "already_released"
@@ -3042,6 +3080,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_release_writer", source))?;
+        connection.release();
         Ok(())
     }
 
@@ -3053,9 +3092,10 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         validate_writer_transfer_request(request)?;
         validate_ttl(ttl, MAX_LEASE_TTL)?;
         let request_hash = writer_transfer_request_hash(request);
-        let mut tx = self
-            .pool
-            .get()
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_transfer_writer", source))?;
+        let mut tx = connection
             .begin()
             .await
             .map_err(|source| database_error("begin_transfer_writer", source))?;
@@ -3088,6 +3128,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_transfer_replay", source))?;
+            connection.release();
             return Ok(TransferWriterOutcome::AlreadyTransferred(receipt.lease));
         }
         if state.head.as_ref().map(|head| &head.cursor) != request.expected_cursor.as_ref() {
@@ -3109,6 +3150,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_transfer_cursor_conflict", source))?;
+            connection.release();
             return Ok(outcome);
         }
         if request
@@ -3136,6 +3178,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit().await.map_err(|source| {
                 database_error("commit_transfer_writer_epoch_conflict", source)
             })?;
+            connection.release();
             return Ok(outcome);
         }
         if request.target_actor.authority_epochs != state.authority_epochs {
@@ -3155,6 +3198,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_transfer_fenced", source))?;
+            connection.release();
             return Err(SessionContextCoordinatorError::Fenced);
         }
         if request.mode == SessionHandoffModeV1::Graceful {
@@ -3184,6 +3228,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 tx.commit()
                     .await
                     .map_err(|source| database_error("commit_transfer_source_conflict", source))?;
+                connection.release();
                 return Ok(outcome);
             }
             if state
@@ -3212,6 +3257,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 tx.commit()
                     .await
                     .map_err(|source| database_error("commit_transfer_active_turn", source))?;
+                connection.release();
                 return Ok(outcome);
             }
         }
@@ -3271,6 +3317,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_transfer_writer", source))?;
+        connection.release();
         Ok(TransferWriterOutcome::Transferred(lease))
     }
 
@@ -3290,9 +3337,10 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             expected_execution_binding_generation,
         )
         .await?;
-        let mut tx = self
-            .pool
-            .get()
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_reserve_turn", source))?;
+        let mut tx = connection
             .begin()
             .await
             .map_err(|source| database_error("begin_reserve_turn", source))?;
@@ -3329,6 +3377,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_reservation_replay", source))?;
+            connection.release();
             return Ok(ReserveTurnOutcome::AlreadyReserved(receipt.reservation));
         }
         if let Some(active) = state.active_reservation.clone()
@@ -3357,6 +3406,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 tx.commit()
                     .await
                     .map_err(|source| database_error("commit_reservation_expiry_fence", source))?;
+                connection.release();
                 return Err(SessionContextCoordinatorError::Expired);
             }
             let expires_at = refreshed_live_expiry(
@@ -3388,6 +3438,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_reservation_retry", source))?;
+            connection.release();
             return Ok(ReserveTurnOutcome::AlreadyReserved(refreshed));
         }
         if let Err(error) = validate_active_lease(&state, lease, now) {
@@ -3407,6 +3458,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_reserve_turn_audit", source))?;
+            connection.release();
             return Err(error);
         }
         if state.head.as_ref().map(|head| &head.cursor) != expected_cursor {
@@ -3429,6 +3481,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_reservation_conflict", source))?;
+            connection.release();
             return Ok(outcome);
         }
         if state
@@ -3455,6 +3508,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_active_reservation_conflict", source))?;
+            connection.release();
             return Ok(outcome);
         }
         if let Some(previous) = &state.active_reservation {
@@ -3491,6 +3545,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_reserve_turn", source))?;
+        connection.release();
         Ok(ReserveTurnOutcome::Reserved(reservation))
     }
 
@@ -3514,9 +3569,10 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
 
         self.release_idle_claim_for_current_binding(key, expected_execution_binding_generation)
             .await?;
-        let mut tx = self
-            .pool
-            .get()
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_and_reserve_turn", source))?;
+        let mut tx = connection
             .begin()
             .await
             .map_err(|source| database_error("begin_acquire_and_reserve_turn", source))?;
@@ -3565,6 +3621,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 tx.commit().await.map_err(|source| {
                     database_error("commit_acquire_and_reserve_conflict", source)
                 })?;
+                connection.release();
                 return Ok(AcquireWriterAndReserveTurnOutcome::WriterConflict {
                     current_head,
                     active_lease_expires_at_unix_ms,
@@ -3596,6 +3653,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 tx.commit().await.map_err(|source| {
                     database_error("commit_acquire_and_reserve_conflict", source)
                 })?;
+                connection.release();
                 return Ok(AcquireWriterAndReserveTurnOutcome::WriterConflict {
                     current_head,
                     active_lease_expires_at_unix_ms,
@@ -3618,6 +3676,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 tx.commit().await.map_err(|source| {
                     database_error("commit_acquire_and_reserve_fenced", source)
                 })?;
+                connection.release();
                 return Err(SessionContextCoordinatorError::Fenced);
             }
             archive_database_state_receipts(&mut tx, &state).await?;
@@ -3663,6 +3722,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 tx.commit().await.map_err(|source| {
                     database_error("commit_acquire_and_reserve_expiry_fence", source)
                 })?;
+                connection.release();
                 return Err(SessionContextCoordinatorError::Expired);
             }
             let expires_at = refreshed_live_expiry(
@@ -3702,6 +3762,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 tx.commit().await.map_err(|source| {
                     database_error("commit_acquire_and_reserve_conflict", source)
                 })?;
+                connection.release();
                 return Ok(AcquireWriterAndReserveTurnOutcome::ReservationConflict {
                     lease,
                     current_head,
@@ -3754,6 +3815,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_acquire_and_reserve_turn", source))?;
+        connection.release();
         Ok(AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation })
     }
 
@@ -3775,9 +3837,10 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                     .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?,
             );
         }
-        let mut tx = self
-            .pool
-            .get()
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_commit_turn", source))?;
+        let mut tx = connection
             .begin()
             .await
             .map_err(|source| database_error("begin_commit_turn", source))?;
@@ -3802,6 +3865,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_turn_retry", source))?;
+            connection.release();
             return Ok(CoordinatorMutationV1::AlreadyApplied {
                 cursor: last.cursor.clone(),
             });
@@ -3835,6 +3899,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 tx.commit()
                     .await
                     .map_err(|source| database_error("commit_turn_replay", source))?;
+                connection.release();
                 return Ok(CoordinatorMutationV1::AlreadyApplied {
                     cursor: receipt.cursor,
                 });
@@ -3855,6 +3920,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_turn_rejection_audit", source))?;
+            connection.release();
             return Err(error);
         }
         if state.head.as_ref().map(|head| &head.cursor) != reservation.expected_cursor.as_ref() {
@@ -3875,6 +3941,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_turn_conflict", source))?;
+            connection.release();
             return Ok(CoordinatorMutationV1::Conflict {
                 current_cursor,
                 safe_options: vec![
@@ -3939,6 +4006,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_turn", source))?;
+        connection.release();
         Ok(CoordinatorMutationV1::Applied { cursor })
     }
 
@@ -3948,9 +4016,10 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         ttl: Duration,
     ) -> Result<TurnReservationV1, SessionContextCoordinatorError> {
         validate_ttl(ttl, MAX_RESERVATION_TTL)?;
-        let mut tx = self
-            .pool
-            .get()
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_renew_turn_reservation", source))?;
+        let mut tx = connection
             .begin()
             .await
             .map_err(|source| database_error("begin_renew_turn_reservation", source))?;
@@ -3972,6 +4041,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_renew_turn_audit", source))?;
+            connection.release();
             return Err(error);
         }
         let lease_expiry = state
@@ -4002,6 +4072,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_renew_turn_reservation", source))?;
+        connection.release();
         Ok(renewed)
     }
 
@@ -4012,9 +4083,10 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
     ) -> Result<(), SessionContextCoordinatorError> {
         key.validate()
             .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
-        let mut tx = self
-            .pool
-            .get()
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_advance_authority", source))?;
+        let mut tx = connection
             .begin()
             .await
             .map_err(|source| database_error("begin_advance_authority", source))?;
@@ -4042,6 +4114,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_advance_epochs_audit", source))?;
+            connection.release();
             return Err(error);
         }
         let outcome = if epochs != state.authority_epochs {
@@ -4073,6 +4146,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_advance_authority", source))?;
+        connection.release();
         Ok(())
     }
 }

@@ -797,68 +797,22 @@ pub(crate) async fn resolve_server_model_selection(
     purpose: astra_core::model_wire::purpose::ModelCatalogPurpose,
 ) -> Result<ServerModelSelection, String> {
     let (catalog, _) = load_server_model_catalog(api, token, purpose).await?;
-    resolve_server_model_selection_from_catalog(api, token, model, &catalog).await
+    resolve_server_model_selection_from_catalog(model, &catalog)
 }
 
 /// Resolve an explicit selector against the complete authoritative catalog.
 /// The server catalog is paginated but this function only receives the fully
 /// drained projection, so a missing entry is a definitive admission failure.
-pub(crate) async fn resolve_server_model_selection_from_catalog(
-    api: &astra_thin_client::ThinClient,
-    token: &str,
+pub(crate) fn resolve_server_model_selection_from_catalog(
     model: &str,
     catalog: &[ModelListItemResponse],
 ) -> Result<ServerModelSelection, String> {
     if let Some(selection) = model_selection_for_name_from_catalog(catalog, model) {
         return Ok(selection);
     }
-    let _ = (api, token);
     Err(format!(
         "model '{model}' is not an active Server Offering in the authoritative catalog"
     ))
-}
-
-fn model_selection_from_exact_response(
-    requested_model: &str,
-    body: &str,
-) -> Result<ServerModelSelection, String> {
-    let response: serde_json::Value = serde_json::from_str(body)
-        .map_err(|error| format!("exact model response was not valid JSON: {error}"))?;
-    let name = response
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .filter(|name| !name.trim().is_empty())
-        .ok_or_else(|| "exact model response omitted name".to_string())?;
-    if name != requested_model {
-        return Err(format!(
-            "exact model response name mismatch: requested '{requested_model}', got '{name}'"
-        ));
-    }
-    if !response
-        .get("is_active")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(format!(
-            "model '{requested_model}' is not an active Server Offering"
-        ));
-    }
-    let offering_id = response
-        .get("model_id")
-        .and_then(serde_json::Value::as_str)
-        .filter(|offering_id| !offering_id.trim().is_empty())
-        .ok_or_else(|| "exact model response omitted model_id".to_string())?;
-    let context_window = response
-        .get("context_window")
-        .and_then(serde_json::Value::as_i64)
-        .and_then(|value| u32::try_from(value).ok())
-        .filter(|value| *value > 0);
-
-    Ok(ServerModelSelection {
-        name: name.to_string(),
-        context_window,
-        offering_id: offering_id.to_string(),
-    })
 }
 
 pub(crate) async fn resolve_server_offering_selection(
@@ -2253,9 +2207,9 @@ mod tests {
         current_access_token, current_git_root, default_model_selection_from_access,
         ensure_state_default_model, fetch_server_model_catalog, fresh_access_token, git_root_from,
         initialize_session_state, load_server_model_access, model_default_invalid_reason_message,
-        model_selection_for_name_from_catalog, model_selection_from_exact_response,
-        pending_recovery_status_line, resolve_server_default_model, resolve_server_model_selection,
-        restore_history_from_journal, restore_session_state_from_journal, restored_journal_state,
+        model_selection_for_name_from_catalog, pending_recovery_status_line,
+        resolve_server_default_model, resolve_server_model_selection, restore_history_from_journal,
+        restore_session_state_from_journal, restored_journal_state,
         should_keep_credentials_on_refresh_error, style_banner_text,
     };
     use crate::cli::cli_config::cli_utils::{
@@ -2466,32 +2420,6 @@ mod tests {
         .expect("active Offering");
         assert_eq!(selection.offering_id, "offer-deepseek-pro");
         assert_eq!(selection.context_window, Some(1_000_000));
-    }
-
-    #[test]
-    fn exact_model_selection_requires_canonical_active_identity() {
-        let resolved = model_selection_from_exact_response(
-            "overflow-model",
-            r#"{"name":"overflow-model","model_id":"offer-201","is_active":true,"context_window":200000}"#,
-        )
-        .expect("active exact model should resolve");
-        assert_eq!(resolved.name, "overflow-model");
-        assert_eq!(resolved.offering_id, "offer-201");
-        assert_eq!(resolved.context_window, Some(200_000));
-
-        let inactive = model_selection_from_exact_response(
-            "overflow-model",
-            r#"{"name":"overflow-model","model_id":"offer-201","is_active":false}"#,
-        )
-        .expect_err("inactive exact model must fail closed");
-        assert!(inactive.contains("not an active"), "{inactive}");
-
-        let mismatch = model_selection_from_exact_response(
-            "overflow-model",
-            r#"{"name":"other-model","model_id":"offer-202","is_active":true}"#,
-        )
-        .expect_err("path/name mismatch must fail closed");
-        assert!(mismatch.contains("name mismatch"), "{mismatch}");
     }
 
     #[tokio::test]

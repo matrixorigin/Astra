@@ -266,10 +266,8 @@ pub(crate) async fn handle_slash_command(
                             // missing entry is therefore a definitive
                             // admission failure, not a first-page omission.
                             match session_runtime::resolve_server_model_selection_from_catalog(
-                                api, tok, arg, &models,
-                            )
-                            .await
-                            {
+                                arg, &models,
+                            ) {
                                 Ok(selection) => {
                                     selected_offering_id = Some(selection.offering_id);
                                     selected_model_name = Some(arg.to_string());

@@ -8,6 +8,8 @@
 //! Durable conversation history remains available until the user deletes the
 //! session through the normal API.
 
+use crate::CancellationSafePoolConnection;
+
 /// Bounded work configuration for runtime-storage maintenance.
 #[derive(Debug, Clone)]
 pub struct RuntimeMaintenancePolicy {
@@ -252,7 +254,8 @@ async fn expire_session_attachments(
     pool: &astra_core::SharedPool,
     batch_limit: u32,
 ) -> Result<u64, sqlx::Error> {
-    let mut tx = pool.get().begin().await?;
+    let mut connection = CancellationSafePoolConnection::acquire(pool.get()).await?;
+    let mut tx = connection.begin().await?;
     let database_now_ms = crate::db_row::database_now_unix_ms(&mut tx).await?;
     let rows_affected = sqlx::query(
         "DELETE FROM session_attachments
@@ -266,6 +269,7 @@ async fn expire_session_attachments(
     .await?
     .rows_affected();
     tx.commit().await?;
+    connection.release();
     Ok(rows_affected)
 }
 

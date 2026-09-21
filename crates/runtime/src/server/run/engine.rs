@@ -1237,7 +1237,6 @@ impl RunEngine {
                         Ok(Ok(true)) => {
                             // The update may commit at any point during the
                             // request. Anchoring to its start is conservative:
-                            // local authority can never outlive the database
                             // lease, while every later attempt owns a fresh
                             // and independent timeout budget.
                             fence_deadline = policy.fence_deadline(renewal_started_at);

@@ -2,6 +2,7 @@ mod common;
 
 use std::{sync::Arc, time::Duration};
 
+use astra_core::SharedPool;
 use astra_services::{
     AcquireWriterAndReserveTurnOutcome, AcquireWriterOutcome, BeginSessionExecutionSwitchV1,
     DatabaseSessionContextCoordinator, ReserveTurnOutcome, SessionContextCoordinator,
@@ -13,7 +14,187 @@ use astra_turn_types::{
     CoordinatorMutationV1, SESSION_ATTACHMENT_SCHEMA_VERSION, SessionAttachmentModeV1,
     SessionAttachmentV1, SessionKeyV1, SessionPlacementV1, SessionSurfaceV1,
 };
+use serial_test::serial;
 use uuid::Uuid;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live MatrixOne (ASTRA_TEST_DB_IT=1)"]
+#[serial]
+async fn cancelled_session_authority_lock_releases_its_physical_checkout() {
+    let observer_pool = common::setup_pool().await;
+    let (_, mut settings) = common::setup_pool_and_settings().await;
+    settings.db_pool_min_connections = 0;
+    settings.db_pool_max_connections = 2;
+    let shared_pool = SharedPool::new(&settings)
+        .await
+        .expect("create two-connection cancellation pool");
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let owner_id = format!("authority-cancel-owner-{suffix}");
+    let session_id = format!("authority-cancel-session-{suffix}");
+    let key = SessionKeyV1::owner_session("server", &owner_id, &session_id, "main");
+    let coordinator = DatabaseSessionContextCoordinator::new(shared_pool.clone());
+    coordinator
+        .load_or_initialize_execution_binding(
+            &key,
+            &SessionExecutionBindingV1::server_work_default(format!(
+                "authority-cancel-work-{suffix}"
+            )),
+        )
+        .await
+        .expect("initialize cancellation fixture");
+    let actor = ActorContextV1::owner_user(
+        &owner_id,
+        "authority-cancellation-db-it",
+        ActorKindV1::Server,
+        SessionSurfaceV1::Server,
+        None,
+        AuthorityEpochsV1::default(),
+    );
+
+    let mut blocker = pool.begin().await.expect("begin session-head blocker");
+    let blocker_connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(&mut *blocker)
+        .await
+        .expect("read blocker connection id");
+    sqlx::query(
+        "SELECT head_json FROM session_context_heads
+         WHERE isolation_domain = ? AND owner_user_id = ?
+           AND session_id = ? AND branch_id = ? FOR UPDATE",
+    )
+    .bind(&key.isolation_domain)
+    .bind(&key.owner_user_id)
+    .bind(&key.session_id)
+    .bind(&key.branch_id)
+    .fetch_one(&mut *blocker)
+    .await
+    .expect("hold the canonical session-head lock");
+
+    // The blocker owns one of the two pool slots. Prime the only other slot
+    // and record its server identity before the coordinator starts; observing
+    // that exact connection avoids mistaking another test's query for the
+    // cancelled operation.
+    let worker_connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(pool)
+        .await
+        .expect("identify the coordinator connection slot");
+
+    let blocked = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let key = key.clone();
+        let actor = actor.clone();
+        async move {
+            coordinator
+                .acquire_writer(
+                    &key,
+                    None,
+                    &actor,
+                    Duration::from_secs(30),
+                    "blocked-writer",
+                )
+                .await
+        }
+    });
+    let database_name = settings.database.clone();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut observed_wait = false;
+    let mut last_processlist = Vec::new();
+    let mut observation_error = None;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let processlist = tokio::time::timeout(
+            remaining,
+            sqlx::query_as::<_, (u64, Option<String>)>(
+                "SELECT conn_id, info FROM information_schema.processlist
+                 WHERE db = ? AND conn_id = ?
+                   AND info IS NOT NULL",
+            )
+            .bind(&database_name)
+            .bind(worker_connection_id)
+            .fetch_all(observer_pool.get()),
+        )
+        .await;
+        let processlist = match processlist {
+            Ok(Ok(processlist)) => processlist,
+            Ok(Err(error)) => {
+                observation_error = Some(format!("processlist query failed: {error}"));
+                break;
+            }
+            Err(_) => {
+                observation_error = Some("processlist query exceeded its deadline".into());
+                break;
+            }
+        };
+        last_processlist = processlist;
+        if last_processlist.iter().any(|(_, info)| {
+            info.as_deref()
+                .is_some_and(|info| info.contains("session_context_heads"))
+        }) {
+            observed_wait = true;
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let _ =
+            tokio::time::timeout(remaining, tokio::time::sleep(Duration::from_millis(10))).await;
+    }
+
+    blocked.abort();
+    let blocked_result = blocked.await;
+    let replacement_connection_id = tokio::time::timeout(
+        Duration::from_secs(1),
+        sqlx::query_scalar::<_, u64>("SELECT CONNECTION_ID()").fetch_one(pool),
+    )
+    .await;
+
+    blocker
+        .rollback()
+        .await
+        .expect("release the canonical session-head blocker");
+    for table in [
+        "session_execution_bindings",
+        "session_context_operation_receipts",
+        "session_context_authority_events",
+        "session_context_heads",
+    ] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?"
+        ))
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .execute(pool)
+        .await
+        .expect("clean cancellation fixture");
+    }
+
+    assert!(
+        observation_error.is_none(),
+        "processlist observation must finish before its deadline: error={observation_error:?}"
+    );
+    assert!(
+        observed_wait,
+        "cancellation regression must observe the exact coordinator connection waiting on the locked session head; worker_connection_id={worker_connection_id}, blocker_connection_id={blocker_connection_id}, processlist={last_processlist:?}"
+    );
+    assert!(
+        blocked_result
+            .as_ref()
+            .is_err_and(|error| error.is_cancelled()),
+        "blocked coordinator must be externally cancellable: result={blocked_result:?}"
+    );
+    let replacement_connection_id = replacement_connection_id
+        .expect("a replacement checkout must remain available after cancellation")
+        .expect("replacement checkout health query");
+    assert_ne!(
+        replacement_connection_id, worker_connection_id,
+        "cancellation must close the physical connection instead of returning it to the pool"
+    );
+}
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]

@@ -175,33 +175,6 @@ fn valid_runtime_process_authorization(
         })
 }
 
-fn decode_edge_server_message(raw: &str) -> Result<EdgeServerMessage, serde_json::Error> {
-    let value = serde_json::from_str::<Value>(raw)?;
-    if value.get("type").and_then(Value::as_str) == Some("edge_tool_request") {
-        const TOOL_REQUEST_FIELDS: &[&str] = &[
-            "type",
-            "request_id",
-            "identity",
-            "delivery_generation",
-            "tool",
-            "args",
-            "runtime_process_authorization",
-            "runtime_process_authorization_required",
-            "timeout_secs",
-        ];
-        if value.as_object().is_some_and(|object| {
-            object
-                .keys()
-                .any(|key| !TOOL_REQUEST_FIELDS.contains(&key.as_str()))
-        }) {
-            return Err(<serde_json::Error as serde::de::Error>::custom(
-                "edge_tool_request contains an unsupported field",
-            ));
-        }
-    }
-    serde_json::from_value(value)
-}
-
 struct InFlightEdgeInvocation {
     generation: u64,
     cancel: CancellationToken,
@@ -1118,7 +1091,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                             frame_len = text.len(),
                             "edge received server text frame"
                         );
-                        match decode_edge_server_message(&text) {
+                        match serde_json::from_str::<EdgeServerMessage>(&text) {
                             Ok(EdgeServerMessage::ToolRequest {
                                 request_id,
                                 identity,
@@ -1913,49 +1886,6 @@ mod tests {
             true,
             Some(&context)
         ));
-    }
-
-    #[test]
-    fn edge_tool_request_rejects_unknown_protocol_fields() {
-        let raw = serde_json::json!({
-            "type": "edge_tool_request",
-            "request_id": "request-1",
-            "identity": {
-                "user_id": "user-1",
-                "session_id": "session-1",
-                "run_id": "run-1",
-                "turn_chain_id": "turn-1",
-                "invocation_id": "call-1"
-            },
-            "delivery_generation": 1,
-            "tool": "bash",
-            "args": {"command": "pwd"},
-            "timeout_secs": 120,
-            "unsupported_field": true
-        });
-        assert!(decode_edge_server_message(&raw.to_string()).is_err());
-    }
-
-    #[test]
-    fn new_edge_rejects_old_server_file_transfer_request_at_upgrade_boundary() {
-        let raw = serde_json::json!({
-            "type": "edge_tool_request",
-            "request_id": "request-legacy-transfer",
-            "identity": {
-                "user_id": "user-1",
-                "session_id": "session-1",
-                "run_id": "run-1",
-                "turn_chain_id": "turn-1",
-                "invocation_id": "call-1"
-            },
-            "delivery_generation": 1,
-            "tool": "bash",
-            "args": {"command": "pwd"},
-            "runtime_file_transfer_v2": {},
-            "timeout_secs": 120
-        });
-
-        assert!(decode_edge_server_message(&raw.to_string()).is_err());
     }
 
     #[test]
