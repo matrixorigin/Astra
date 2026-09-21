@@ -416,7 +416,16 @@ mod tests {
         let output = tool_result_content_for_model("introspect", &raw);
         let projected: Value = serde_json::from_str(&output).unwrap();
         assert!(output.chars().count() <= INTROSPECT_MODEL_RESULT_CHARS);
-        assert_eq!(projected["summary"], report.summary);
+        let expected_summary = if report.summary.chars().count() > 360 {
+            format!("{}…", report.summary.chars().take(360).collect::<String>())
+        } else {
+            report.summary.clone()
+        };
+        assert_eq!(projected["summary"], expected_summary);
+        assert_eq!(
+            projected["projection_budget"]["summary_shortened"],
+            report.summary.chars().count() > 360
+        );
         if raw.chars().count() > INTROSPECT_MODEL_RESULT_CHARS {
             assert_eq!(projected["schema"], "astra-introspect-model-projection-v1");
             assert_eq!(projected["projection_budget"]["truncated"], true);
@@ -489,7 +498,16 @@ mod tests {
         let projected: Value = serde_json::from_str(&output)
             .expect("bounded introspection must remain structured JSON");
         assert!(output.chars().count() <= INTROSPECT_MODEL_RESULT_CHARS);
-        assert_eq!(projected["summary"], report.summary);
+        let expected_summary = if report.summary.chars().count() > 360 {
+            format!("{}…", report.summary.chars().take(360).collect::<String>())
+        } else {
+            report.summary.clone()
+        };
+        assert_eq!(projected["summary"], expected_summary);
+        assert_eq!(
+            projected["projection_budget"]["summary_shortened"],
+            report.summary.chars().count() > 360
+        );
         assert_eq!(projected["projection_budget"]["truncated"], true);
         assert_eq!(
             serde_json::from_str::<Value>(&tool_result_content_for_model_unbounded(
