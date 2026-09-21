@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::task::JoinSet;
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config, connect_async,
     tungstenite::Message, tungstenite::client::IntoClientRequest,
@@ -1061,6 +1062,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
     let (completed_tx, mut completed_rx) = mpsc::channel::<CompletedEdgeInvocation>(1_024);
     let execution_budget = EdgeExecutionBudget::new();
     let mut invocations = EdgeInvocationTracker::default();
+    let mut tasks = JoinSet::new();
     let journal_path = edge_invocation_journal_path_in_root(
         &config.edge_id,
         &workspace,
@@ -1101,8 +1103,14 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
         "Edge agent ready — waiting for tool calls"
     );
 
+    let connection_result = async {
     loop {
         tokio::select! {
+            joined = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Err(error)) = joined {
+                    return Err(Box::new(error) as Box<dyn std::error::Error>);
+                }
+            }
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
@@ -1227,7 +1235,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                 let executor = executor.clone();
                                 let completed_tx = completed_tx.clone();
                                 tracing::info!(tool = %tool, request_id = %request_id, generation = delivery_generation, "Executing tool");
-                                tokio::spawn(async move {
+                                tasks.spawn(async move {
                                     let _execution_permit = execution_permit;
                                     let start = Instant::now();
                                     let execution = async {
@@ -1238,6 +1246,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                                 executor.as_ref(),
                                                 &tool_args,
                                                 process_authorization,
+                                                &cancel,
                                             )
                                             .await
                                         } else {
@@ -1249,17 +1258,17 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                             ).await
                                         }
                                     };
+                                    // The executor owns asynchronous subprocess cleanup.
+                                    // Dropping its future on cancellation strands children.
+                                    tokio::pin!(execution);
                                     let result = tokio::select! {
-                                        _ = cancel.cancelled() => {
-                                            astra_tools::cancelled_tool_result(&tool, true)
-                                        },
-                                        result = tokio::time::timeout(Duration::from_secs(timeout_secs), execution) => {
-                                            match result {
-                                                Ok(result) => result,
-                                                Err(_) => astra_tools::ToolResult::error(
-                                                    format!("Tool '{tool}' timed out after {timeout_secs}s")
-                                                ),
-                                            }
+                                        result = &mut execution => result,
+                                        _ = tokio::time::sleep(Duration::from_secs(timeout_secs)) => {
+                                            cancel.cancel();
+                                            let _ = execution.await;
+                                            astra_tools::ToolResult::error(
+                                                format!("Tool '{tool}' timed out after {timeout_secs}s")
+                                            )
                                         }
                                     };
                                     let completion = CompletedEdgeInvocation {
@@ -1317,6 +1326,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                         tracing::info!("Connection closed");
                         break;
                     }
+                    Some(Err(error)) => return Err(error.into()),
                     _ => {}
                 }
             }
@@ -1329,24 +1339,10 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                     );
                     continue;
                 }
-                let result = journal
-                    .complete(
-                        &completed.request_id,
-                        completed.generation,
-                        DurableEdgeResult::from_tool_result(completed.result, completed.duration_ms),
-                    )
-                    .await?;
-                tracing::info!(
-                    request_id = %completed.request_id,
-                    generation = completed.generation,
-                    duration_ms = completed.duration_ms,
-                    is_error = result.is_error,
-                    output_len = result.output.len(),
-                    "Tool execution complete"
-                );
+                let request_id = persist_completion(&mut journal, completed).await?;
                 let record = journal.pending_results()?.into_iter().find(|pending| {
-                    pending.request_id == completed.request_id
-                }).ok_or_else(|| format!("durable edge result {} disappeared before delivery", completed.request_id))?;
+                    pending.request_id == request_id
+                }).ok_or_else(|| format!("durable edge result {request_id} disappeared before delivery"))?;
                 let result_msg = record.result.client_message(
                     record.request_id,
                     record.identity,
@@ -1364,15 +1360,99 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
         }
     }
 
-    invocations.cancel_all();
-
     Ok(())
+    }.await;
+
+    // Every exit (including journal and socket errors) settles this connection's
+    // executions before reconnect can acquire the journal and dispatch again.
+    invocations.cancel_all();
+    // A failed append may have left a partial WAL record. Do not append again
+    // until open() has validated/recovered it. Other connection failures do
+    // not prevent preserving the results produced during cancellation.
+    let journal_writable = !matches!(
+        connection_result
+            .as_ref()
+            .err()
+            .and_then(|error| error.downcast_ref::<JournalError>()),
+        Some(JournalError::Io { .. } | JournalError::Corrupt { .. })
+    );
+    drop(completed_tx);
+    let cleanup_result = settle_invocations(
+        &mut tasks,
+        &mut completed_rx,
+        &mut journal,
+        journal_writable,
+    )
+    .await;
+    if let Err(error) = &cleanup_result {
+        tracing::error!(component = "edge", operation = "settle_invocations", stage = "cleanup", error = %error, "Edge invocation cleanup failed");
+    }
+    connection_result.and(cleanup_result)
+}
+
+async fn persist_completion(
+    journal: &mut EdgeInvocationJournal,
+    completed: CompletedEdgeInvocation,
+) -> Result<String, JournalError> {
+    let result = journal
+        .complete(
+            &completed.request_id,
+            completed.generation,
+            DurableEdgeResult::from_tool_result(completed.result, completed.duration_ms),
+        )
+        .await?;
+    tracing::info!(
+        request_id = %completed.request_id,
+        generation = completed.generation,
+        duration_ms = completed.duration_ms,
+        is_error = result.is_error,
+        output_len = result.output.len(),
+        "Tool execution complete"
+    );
+    Ok(completed.request_id)
+}
+
+async fn settle_invocations(
+    tasks: &mut JoinSet<()>,
+    completed_rx: &mut mpsc::Receiver<CompletedEdgeInvocation>,
+    journal: &mut EdgeInvocationJournal,
+    mut journal_writable: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut failure: Option<Box<dyn std::error::Error>> = None;
+    // Spawned tasks continue running while we receive. Drain before joining:
+    // queued completions have already released their execution permits, so
+    // even a queue larger than the concurrency budget can fill up.
+    // The connection must drop its sender before calling this function.
+    while let Some(completed) = completed_rx.recv().await {
+        if journal_writable {
+            let request_id = completed.request_id.clone();
+            if let Err(error) = persist_completion(journal, completed).await {
+                tracing::error!(component = "edge", operation = "settle_invocations", stage = "persist_result", request_id = %request_id, error = %error, "Failed to persist completion during connection cleanup");
+                journal_writable = false;
+                failure = Some(Box::new(error));
+            }
+        }
+    }
+    while let Some(joined) = tasks.join_next().await {
+        if let Err(error) = joined {
+            tracing::error!(component = "edge", operation = "settle_invocations", stage = "join", error = %error, "Edge invocation task failed during cleanup");
+            if failure.is_none() {
+                failure = Some(Box::new(error));
+            }
+        }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() {
+    // The release builds CLI and Edge together, unifying ring and aws-lc
+    // features. Select the Edge provider before constructing any TLS client.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Edge installs its TLS provider before any TLS client");
     // Image-managed runners have no MOI installation marker and remain outside
     // the local update lifecycle. Local managed Edge holds a lease until exit.
     let executable = std::env::current_exe().expect("current executable");
@@ -1497,6 +1577,325 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cleanup_drains_a_full_completion_queue_and_preserves_results() {
+        assert_cleanup_drains(false).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_drains_senders_even_when_persistence_fails() {
+        assert_cleanup_drains(true).await;
+    }
+
+    async fn assert_cleanup_drains(fail_first_completion: bool) {
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("journal.json");
+        let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut tasks = JoinSet::new();
+        for i in 0..4 {
+            let identity = astra_server_types::edge_ws_protocol::ToolInvocationIdentity::new(
+                "user",
+                "session",
+                "run",
+                "turn",
+                format!("completion-{i}"),
+            )
+            .unwrap();
+            let request_id = identity.storage_key();
+            journal
+                .prepare(
+                    &request_id,
+                    &identity,
+                    1,
+                    "bash",
+                    &serde_json::json!({}),
+                    true,
+                )
+                .await
+                .unwrap();
+            let completion = CompletedEdgeInvocation {
+                request_id: if fail_first_completion && i == 0 {
+                    "missing-record".into()
+                } else {
+                    request_id
+                },
+                generation: 1,
+                result: astra_tools::ToolResult::text(format!("finished-{i}")),
+                duration_ms: i,
+            };
+            if i == 0 {
+                tx.send(completion).await.unwrap();
+            } else {
+                let tx = tx.clone();
+                tasks.spawn(async move {
+                    tx.send(completion).await.unwrap();
+                });
+            }
+        }
+        assert_eq!(rx.len(), 1);
+        drop(tx);
+        let settled = tokio::time::timeout(
+            Duration::from_secs(5),
+            settle_invocations(&mut tasks, &mut rx, &mut journal, true),
+        )
+        .await
+        .unwrap();
+        assert!(tasks.is_empty());
+        if fail_first_completion {
+            let error = settled.unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<JournalError>(),
+                Some(JournalError::Corrupt { .. })
+            ));
+            assert_eq!(
+                journal.status().running,
+                4,
+                "stop appending after integrity failure"
+            );
+            drop(journal);
+            let restored = EdgeInvocationJournal::open(path).await.unwrap();
+            let pending = restored.pending_results().unwrap();
+            assert_eq!(pending.len(), 4);
+            assert!(pending.iter().all(
+                |result| result.result.tool_result_fields.as_ref().unwrap()["outcome_certainty"]
+                    == "unknown"
+            ));
+            return;
+        }
+        settled.unwrap();
+        drop(journal);
+        let restored = EdgeInvocationJournal::open(path).await.unwrap();
+        let mut outputs = restored
+            .pending_results()
+            .unwrap()
+            .into_iter()
+            .map(|pending| {
+                assert!(!pending.result.is_error);
+                pending.result.output
+            })
+            .collect::<Vec<_>>();
+        outputs.sort();
+        assert_eq!(
+            outputs,
+            ["finished-0", "finished-1", "finished-2", "finished-3"]
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_errors_cancel_and_reap_parallel_tools_before_returning() {
+        assert_connection_cleanup(false).await;
+    }
+
+    #[tokio::test]
+    async fn managed_connection_errors_cancel_and_reap_parallel_tools() {
+        assert_connection_cleanup(true).await;
+    }
+
+    async fn assert_connection_cleanup(managed: bool) {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = EdgeConfig {
+            server_url: format!("ws://{}/edge/ws", listener.local_addr().unwrap()),
+            token_manager: token_manager::TokenManager::new(
+                "test-token".into(),
+                None,
+                state.path().join("token"),
+            ),
+            workspace_dir: workspace.path().to_owned(),
+            edge_id: "cleanup-test".into(),
+            materialization_id: "cleanup-materialization".into(),
+            reconnect: false,
+            invocation_journal_root: Some(state.path().to_owned()),
+        };
+        let server = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            assert!(ws.next().await.unwrap().unwrap().is_text());
+            ws.send(Message::Text(
+                serde_json::to_string(&EdgeServerMessage::AuthOk {
+                    user_id: "user".into(),
+                    interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.into(),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            for i in 0..2 {
+                let identity = astra_server_types::edge_ws_protocol::ToolInvocationIdentity::new(
+                    "user",
+                    "session",
+                    "run",
+                    "turn",
+                    format!("call-{i}"),
+                )
+                .unwrap();
+                let request = EdgeServerMessage::ToolRequest {
+                    request_id: identity.storage_key(), identity: Box::new(identity), delivery_generation: 1,
+                    tool: "bash".into(), args: serde_json::json!({"command": format!("touch started-{i}; sleep 2; touch leaked-{i}")}),
+                    runtime_process_authorization: managed.then(|| Box::new(astra_server_types::edge_ws_protocol::RuntimeProcessAuthorizationContext { authorization: "Bearer test-grant".into() })), runtime_process_authorization_required: managed, timeout_secs: 30,
+                };
+                ws.send(Message::Text(
+                    serde_json::to_string(&request).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !(workspace.path().join("started-0").exists()
+                    || workspace.path().join("started-1").exists())
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("one shell started; the other invocation may wait for its workspace lease");
+            // An identity too large for even a terminal response forces an
+            // error return from journal admission while both tools are active.
+            let identity = astra_server_types::edge_ws_protocol::ToolInvocationIdentity::new(
+                "user",
+                "session",
+                "run",
+                "turn",
+                "x".repeat(300_000),
+            )
+            .unwrap();
+            ws.send(Message::Text(
+                serde_json::to_string(&EdgeServerMessage::ToolRequest {
+                    request_id: identity.storage_key(),
+                    identity: Box::new(identity),
+                    delivery_generation: 1,
+                    tool: "bash".into(),
+                    args: serde_json::json!({"command":"touch should-not-run"}),
+                    runtime_process_authorization: None,
+                    runtime_process_authorization_required: false,
+                    timeout_secs: 30,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            while ws.next().await.is_some_and(|message| message.is_ok()) {}
+        };
+        let (_, result) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(server, run_edge_connection(&config))
+        })
+        .await
+        .unwrap();
+        assert!(result.is_err());
+
+        // The next connection must recover the abandoned journal entries,
+        // replay their actual cancellation results, and never repeat effects.
+        let recovery_server = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let auth = ws.next().await.unwrap().unwrap();
+            let EdgeClientMessage::Auth {
+                materialization_id,
+                interaction_api_major,
+                ..
+            } = serde_json::from_str(auth.to_text().unwrap()).unwrap()
+            else {
+                panic!("expected registration on reconnect");
+            };
+            assert_eq!(materialization_id, config.materialization_id);
+            assert_eq!(
+                interaction_api_major,
+                astra_server_types::AGENT_INTERACTION_API_MAJOR
+            );
+            ws.send(Message::Text(
+                serde_json::to_string(&EdgeServerMessage::AuthOk {
+                    user_id: "user".into(),
+                    interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.into(),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            let mut replayed = std::collections::BTreeSet::new();
+            while replayed.len() < 2 {
+                let frame = ws.next().await.unwrap().unwrap();
+                let message: EdgeClientMessage =
+                    serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                if let EdgeClientMessage::ToolResult {
+                    request_id,
+                    identity,
+                    delivery_generation,
+                    is_error,
+                    output,
+                    ..
+                } = message
+                {
+                    assert!(
+                        replayed.insert(request_id.clone()),
+                        "duplicate recovery result"
+                    );
+                    assert_eq!(request_id, identity.storage_key());
+                    assert_eq!(delivery_generation, 1);
+                    assert!(is_error);
+                    // Started Bash returns partial-output cancellation text;
+                    // a waiter cancelled before dispatch returns structured
+                    // cancelled_tool_result. Preserve either owner's evidence.
+                    assert!(
+                        output.contains("cancelled"),
+                        "lost cancellation evidence: {output}"
+                    );
+                    ws.send(Message::Text(
+                        serde_json::to_string(&EdgeServerMessage::ToolResultAck {
+                            request_id,
+                            delivery_generation,
+                        })
+                        .unwrap()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                }
+            }
+            // Ordered after both ACKs, so connection completion also proves
+            // that acknowledgement processing reached durable storage.
+            ws.send(Message::Text(
+                serde_json::to_string(&EdgeServerMessage::Closing {
+                    reason: "recovery test complete".into(),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            while ws.next().await.is_some_and(|message| message.is_ok()) {}
+        };
+        let (_, recovered) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(recovery_server, run_edge_connection(&config))
+        })
+        .await
+        .unwrap();
+        recovered.unwrap();
+        let journal = EdgeInvocationJournal::open(edge_invocation_journal_path_in_root(
+            &config.edge_id,
+            &std::fs::canonicalize(workspace.path()).unwrap(),
+            config.invocation_journal_root.clone(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            journal.status().records,
+            0,
+            "ACKs must remove recovered entries"
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        for name in ["leaked-0", "leaked-1", "should-not-run"] {
+            assert!(
+                !workspace.path().join(name).exists(),
+                "orphan execution: {name}"
+            );
+        }
+    }
 
     #[test]
     fn process_authorization_fails_closed_without_live_credential() {

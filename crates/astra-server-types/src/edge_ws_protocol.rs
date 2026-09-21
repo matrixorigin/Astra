@@ -69,6 +69,10 @@ impl std::fmt::Debug for RuntimeProcessAuthorizationContext {
     }
 }
 
+/// Maximum UTF-8 bytes of a complete serialized Edge WebSocket message,
+/// including identity, delivery generation, metadata and JSON escaping.
+pub const MAX_EDGE_MESSAGE_BYTES: usize = 256 * 1024;
+
 /// Default timeout for tool execution on the edge agent.
 pub const EDGE_TOOL_TIMEOUT_SECS: u64 = 300; // 5 minutes
 

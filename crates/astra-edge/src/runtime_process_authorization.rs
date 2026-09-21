@@ -8,13 +8,15 @@ pub(crate) async fn execute_bash(
     executor: &astra_tools::executor::DefaultToolExecutor,
     args: &Value,
     context: &RuntimeProcessAuthorizationContext,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> ToolResult {
     let environment = vec![(
         MOI_RUNTIME_AUTHORIZATION_ENV.to_string(),
         context.authorization.clone(),
     )];
-    astra_tools::shell_ops::execute_bash_with_environment(executor.context(), args, &environment)
-        .await
+    let mut tool_context = executor.context().clone();
+    tool_context.cancel_token = Some(std::sync::Arc::new(cancel.clone()));
+    astra_tools::shell_ops::execute_bash_with_environment(&tool_context, args, &environment).await
 }
 
 #[cfg(test)]
@@ -43,6 +45,7 @@ mod tests {
             &executor,
             &json!({"command": "printf %s \"$MOI_RUNTIME_AUTHORIZATION\""}),
             &context,
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await;
 

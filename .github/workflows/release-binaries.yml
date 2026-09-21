@@ -107,6 +107,12 @@ jobs:
             -p astra-cli --bin astra \
             -p astra-edge --bin astra-edge
 
+      - name: Probe Edge TLS from the joint build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/probe_edge_tls.py "target/${{ matrix.target }}/release/astra-edge"
+
       - name: Execute client candidates
         shell: bash
         run: |

@@ -140,7 +140,7 @@ pub(crate) async fn edge_ws_handler(
         )
             .into_response();
     };
-    ws.max_message_size(256 * 1024)
+    ws.max_message_size(astra_server_types::edge_ws_protocol::MAX_EDGE_MESSAGE_BYTES)
         .on_failed_upgrade(|error| {
             tracing::warn!(target: "astra::edge_ws", %error, "edge WebSocket upgrade failed");
         })

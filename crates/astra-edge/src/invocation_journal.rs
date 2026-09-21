@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use astra_server_types::edge_ws_protocol::{EdgeClientMessage, ToolInvocationIdentity};
+use astra_server_types::edge_ws_protocol::{
+    EdgeClientMessage, MAX_EDGE_MESSAGE_BYTES, ToolInvocationIdentity,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -13,7 +15,9 @@ const MAX_JOURNAL_STATE_BYTES: usize = 192 * 1024 * 1024;
 const MAX_WAL_BYTES: usize = 256 * 1024 * 1024;
 const WAL_COMPACTION_ENTRY_THRESHOLD: usize = 4_096;
 const WAL_COMPACTION_BYTE_THRESHOLD: usize = 8 * 1024 * 1024;
-const MAX_RESULT_BYTES: usize = 256 * 1024;
+// Read-time integrity limit of the published journal format. New writes use
+// MAX_EDGE_MESSAGE_BYTES for the complete wire envelope instead.
+const LEGACY_MAX_RESULT_BODY_BYTES: usize = 256 * 1024;
 const _: () = {
     assert!(MAX_RECORDS >= 512);
     assert!(MAX_JOURNAL_STATE_BYTES <= 256 * 1024 * 1024);
@@ -346,13 +350,30 @@ impl EdgeInvocationJournal {
                 let mut record = record.clone();
                 record.state = DurableState::OutcomeUnknownAwaitingAck;
                 record.result = Some(DurableEdgeResult::outcome_unknown(
-                    "Edge process restarted after dispatch but before durable completion; the tool outcome is unknown and was not re-executed",
+                    "Edge recovered an invocation dispatched without a durable completion; the tool outcome is unknown and was not re-executed",
                 ));
                 (request_id.clone(), record)
             })
             .collect::<Vec<_>>();
         for (request_id, record) in running {
             journal.commit_record(request_id, Some(record)).await?;
+        }
+        let oversized = journal
+            .state
+            .records
+            .iter()
+            .filter_map(
+                |(id, record)| match wire_result_len(&journal.path, id, record) {
+                    Ok(Some(size)) if size > MAX_EDGE_MESSAGE_BYTES => {
+                        Some(Ok((id.clone(), record.clone())))
+                    }
+                    Err(error) => Some(Err(error)),
+                    _ => None,
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+        for (id, record) in oversized {
+            journal.commit_record(id, Some(record)).await?;
         }
         if journal.should_compact() {
             journal.compact().await?;
@@ -395,6 +416,21 @@ impl EdgeInvocationJournal {
                 request_id: request_id.to_string(),
             });
         }
+        // Refuse identities that cannot carry even a bounded terminal result
+        // before recording dispatch or permitting any side effects.
+        let terminal = DurableEdgeResult::outcome_unknown(
+            "Edge tool result exceeded the transport limit; outcome evidence is unavailable and the tool was not re-executed",
+        ).client_message(request_id.to_owned(), identity.clone(), u64::MAX);
+        if serde_json::to_vec(&terminal)
+            .map_err(|error| JournalError::Corrupt {
+                path: self.path.clone(),
+                detail: error.to_string(),
+            })?
+            .len()
+            > MAX_EDGE_MESSAGE_BYTES
+        {
+            return Err(JournalError::TooLarge);
+        }
         if let Some(record) = self.state.records.get(request_id).cloned() {
             if !record.matches(identity, tool, args) {
                 return Err(JournalError::IdentityConflict {
@@ -405,6 +441,7 @@ impl EdgeInvocationJournal {
             updated.delivery_generation = delivery_generation;
             self.commit_record(request_id.to_string(), Some(updated))
                 .await?;
+            let record = &self.state.records[request_id];
             let outcome = match record.state {
                 DurableState::Running => PrepareOutcome::Active,
                 DurableState::CompletedAwaitingAck | DurableState::OutcomeUnknownAwaitingAck => {
@@ -454,23 +491,6 @@ impl EdgeInvocationJournal {
         delivery_generation: u64,
         result: DurableEdgeResult,
     ) -> Result<DurableEdgeResult, JournalError> {
-        let serialized_result =
-            serde_json::to_vec(&result).map_err(|error| JournalError::Corrupt {
-                path: self.path.clone(),
-                detail: format!("result serialization failed: {error}"),
-            })?;
-        let (state, durable_result) = if serialized_result.len() > MAX_RESULT_BYTES {
-            (
-                DurableState::OutcomeUnknownAwaitingAck,
-                DurableEdgeResult::outcome_unknown(format!(
-                    "Edge tool completed but its {} byte result exceeded the durable {} byte boundary; outcome evidence is unavailable",
-                    serialized_result.len(),
-                    MAX_RESULT_BYTES
-                )),
-            )
-        } else {
-            (DurableState::CompletedAwaitingAck, result)
-        };
         let mut record = self
             .execution_record(request_id, delivery_generation)?
             .clone();
@@ -480,11 +500,14 @@ impl EdgeInvocationJournal {
                 detail: format!("record {request_id} is not running"),
             });
         }
-        record.state = state;
-        record.result = Some(durable_result.clone());
+        record.state = DurableState::CompletedAwaitingAck;
+        record.result = Some(result);
         self.commit_record(request_id.to_string(), Some(record))
             .await?;
-        Ok(durable_result)
+        Ok(self.state.records[request_id]
+            .result
+            .clone()
+            .expect("completed result"))
     }
 
     pub(crate) async fn acknowledge(
@@ -571,6 +594,22 @@ impl EdgeInvocationJournal {
         request_id: String,
         record: Option<DurableInvocationRecord>,
     ) -> Result<(), JournalError> {
+        let record = record.map(|mut record| {
+            if wire_result_len(&self.path, &request_id, &record)?.is_some_and(|size| size > MAX_EDGE_MESSAGE_BYTES) {
+                // A completed tool may have had side effects. Preserve unknown
+                // evidence semantics and never turn this into a retry request.
+                record.result = Some(DurableEdgeResult::outcome_unknown(
+                    "Edge tool result exceeded the transport limit; outcome evidence is unavailable and the tool was not re-executed",
+                ));
+                if record.execution_generation.is_some() {
+                    record.state = DurableState::OutcomeUnknownAwaitingAck;
+                }
+                if wire_result_len(&self.path, &request_id, &record)?.is_some_and(|size| size > MAX_EDGE_MESSAGE_BYTES) {
+                    return Err(JournalError::TooLarge);
+                }
+            }
+            Ok(record)
+        }).transpose()?;
         let old_bytes = self
             .state
             .records
@@ -832,6 +871,29 @@ fn validate_file(path: &Path, state: &JournalFile) -> Result<(), JournalError> {
     Ok(())
 }
 
+fn wire_result_len(
+    path: &Path,
+    request_id: &str,
+    record: &DurableInvocationRecord,
+) -> Result<Option<usize>, JournalError> {
+    record
+        .result
+        .as_ref()
+        .map(|result| {
+            serde_json::to_vec(&result.client_message(
+                request_id.to_owned(),
+                record.identity.clone(),
+                record.delivery_generation,
+            ))
+            .map(|bytes| bytes.len())
+            .map_err(|error| JournalError::Corrupt {
+                path: path.to_path_buf(),
+                detail: format!("result serialization failed: {error}"),
+            })
+        })
+        .transpose()
+}
+
 fn validate_record(
     path: &Path,
     request_id: &str,
@@ -868,11 +930,11 @@ fn validate_record(
             path: path.to_path_buf(),
             detail: format!("record {request_id} result cannot be serialized: {error}"),
         })?;
-        if result_bytes.len() > MAX_RESULT_BYTES {
+        if result_bytes.len() > LEGACY_MAX_RESULT_BODY_BYTES {
             return Err(JournalError::Corrupt {
                 path: path.to_path_buf(),
                 detail: format!(
-                    "record {request_id} result is {} bytes; maximum is {MAX_RESULT_BYTES}",
+                    "record {request_id} result is {} bytes; maximum is {LEGACY_MAX_RESULT_BODY_BYTES}",
                     result_bytes.len()
                 ),
             });
@@ -888,6 +950,187 @@ mod tests {
 
     fn identity(id: &str) -> ToolInvocationIdentity {
         ToolInvocationIdentity::new("user", "session", "run", "turn", id).unwrap()
+    }
+
+    #[tokio::test]
+    async fn full_wire_budget_bounds_results_and_replays_until_ack() {
+        for output in [
+            "x".repeat(262_000),
+            "\"\n".repeat(90_000),
+            "界".repeat(90_000),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("journal.json");
+            let identity = identity("boundary");
+            let id = identity.storage_key();
+            let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
+            journal
+                .prepare(&id, &identity, 1, "bash", &json!({}), true)
+                .await
+                .unwrap();
+            let result = journal
+                .complete(
+                    &id,
+                    1,
+                    DurableEdgeResult {
+                        output,
+                        is_error: false,
+                        duration_ms: 1,
+                        tool_result_fields: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(result.is_error);
+            assert_eq!(
+                result.tool_result_fields.as_ref().unwrap()["outcome_certainty"],
+                "unknown"
+            );
+            let wire = result.client_message(id.clone(), identity.clone(), 1);
+            assert!(serde_json::to_vec(&wire).unwrap().len() <= MAX_EDGE_MESSAGE_BYTES);
+            drop(journal);
+            let mut restored = EdgeInvocationJournal::open(path).await.unwrap();
+            assert!(matches!(
+                restored
+                    .prepare(&id, &identity, u64::MAX, "bash", &json!({}), true)
+                    .await
+                    .unwrap(),
+                PrepareOutcome::Replay(_)
+            ));
+            assert!(!restored.acknowledge(&id, 1).await.unwrap());
+            assert!(restored.acknowledge(&id, u64::MAX).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_wire_boundary_survives_restart_and_bounds_new_delivery_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.json");
+        let identity = identity(&"long-identity".repeat(100));
+        let id = identity.storage_key();
+        let args = json!({"command": "echo once"});
+        let mut result = DurableEdgeResult {
+            output: String::new(),
+            is_error: false,
+            duration_ms: u64::MAX,
+            tool_result_fields: Some(Map::from_iter([(
+                "metadata".into(),
+                json!("\"界\n".repeat(1000)),
+            )])),
+        };
+        let overhead = serde_json::to_vec(&result.client_message(id.clone(), identity.clone(), 1))
+            .unwrap()
+            .len();
+        result.output = "x".repeat(MAX_EDGE_MESSAGE_BYTES - overhead);
+        assert_eq!(
+            serde_json::to_vec(&result.client_message(id.clone(), identity.clone(), 1))
+                .unwrap()
+                .len(),
+            MAX_EDGE_MESSAGE_BYTES
+        );
+        let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
+        assert!(matches!(
+            journal
+                .prepare(&id, &identity, 1, "bash", &args, true)
+                .await
+                .unwrap(),
+            PrepareOutcome::Execute
+        ));
+        assert_eq!(
+            journal.complete(&id, 1, result.clone()).await.unwrap(),
+            result
+        );
+        drop(journal);
+
+        let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
+        assert_eq!(journal.pending_results().unwrap()[0].result, result);
+        // Increasing the generation expands the envelope even when the result
+        // body is unchanged. Bound and persist the new envelope before replay.
+        let PrepareOutcome::Replay(bounded) = journal
+            .prepare(&id, &identity, u64::MAX, "bash", &args, true)
+            .await
+            .unwrap()
+        else {
+            panic!("a completed invocation must never be executed again")
+        };
+        assert!(bounded.is_error);
+        assert_eq!(
+            bounded.tool_result_fields.as_ref().unwrap()["outcome_certainty"],
+            "unknown"
+        );
+        assert!(
+            serde_json::to_vec(&bounded.client_message(id.clone(), identity, u64::MAX))
+                .unwrap()
+                .len()
+                <= MAX_EDGE_MESSAGE_BYTES
+        );
+        assert!(!journal.acknowledge(&id, 1).await.unwrap());
+        drop(journal);
+        let mut journal = EdgeInvocationJournal::open(path).await.unwrap();
+        let pending = journal.pending_results().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].delivery_generation, u64::MAX);
+        assert_eq!(pending[0].result, bounded);
+        assert!(journal.acknowledge(&id, u64::MAX).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn legacy_body_bounded_outbox_is_repaired_durably_before_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.json");
+        let identity = identity("legacy");
+        let id = identity.storage_key();
+        let result = DurableEdgeResult {
+            output: "x".repeat(262_000),
+            is_error: false,
+            duration_ms: 1,
+            tool_result_fields: None,
+        };
+        assert!(serde_json::to_vec(&result).unwrap().len() < LEGACY_MAX_RESULT_BODY_BYTES);
+        let record = DurableInvocationRecord {
+            identity,
+            delivery_generation: 1,
+            execution_generation: Some(1),
+            tool: "bash".into(),
+            canonical_arguments_hash: astra_turn_types::canonical_public_arguments_hash(&json!({})),
+            state: DurableState::CompletedAwaitingAck,
+            result: Some(result),
+        };
+        assert!(wire_result_len(&path, &id, &record).unwrap().unwrap() > MAX_EDGE_MESSAGE_BYTES);
+        let mut state = JournalFile::default();
+        state.records.insert(id.clone(), record);
+        tokio::fs::write(&path, serde_json::to_vec(&state).unwrap())
+            .await
+            .unwrap();
+        let journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
+        assert!(journal.pending_results().unwrap()[0].result.is_error);
+        drop(journal);
+        let mut journal = EdgeInvocationJournal::open(path).await.unwrap();
+        assert!(journal.pending_results().unwrap()[0].result.is_error);
+        assert!(journal.acknowledge(&id, 1).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn oversized_identity_is_rejected_before_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = EdgeInvocationJournal::open(dir.path().join("journal.json"))
+            .await
+            .unwrap();
+        let identity = identity(&"x".repeat(MAX_EDGE_MESSAGE_BYTES));
+        assert!(matches!(
+            journal
+                .prepare(
+                    &identity.storage_key(),
+                    &identity,
+                    1,
+                    "bash",
+                    &json!({}),
+                    true
+                )
+                .await,
+            Err(JournalError::TooLarge)
+        ));
+        assert_eq!(journal.status().records, 0);
     }
 
     #[tokio::test]
