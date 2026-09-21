@@ -299,7 +299,7 @@ async fn execution_binding_is_owner_scoped_fenced_and_quiescent_per_session() {
     let owner_a = format!("execution-binding-owner-a-{suffix}");
     let owner_b = format!("execution-binding-owner-b-{suffix}");
     let shared_session = format!("execution-binding-session-{suffix}");
-    let other_session = format!("execution-binding-other-session-{suffix}");
+    let other_session = format!("execution-other-{suffix}");
     let key_a = SessionKeyV1::owner_session("server", &owner_a, &shared_session, "main");
     let key_a_other = SessionKeyV1::owner_session("server", &owner_a, &other_session, "main");
     // Deliberately reuse the session id across owners to prove the owner key
