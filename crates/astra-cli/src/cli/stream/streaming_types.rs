@@ -37,70 +37,31 @@ impl AttributedTokenUsage {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct UsageLaneAccumulator {
-    fresh_input_tokens: u64,
-    cache_read_tokens: u64,
-    cache_creation_tokens: u64,
-    output_tokens: u64,
-    fresh_reported: bool,
-    cache_read_reported: bool,
-    cache_creation_reported: bool,
-    output_reported: bool,
+    usage: AttributedTokenUsage,
     observed: bool,
 }
 
-impl Default for UsageLaneAccumulator {
-    fn default() -> Self {
-        Self {
-            fresh_input_tokens: 0,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            output_tokens: 0,
-            fresh_reported: false,
-            cache_read_reported: false,
-            cache_creation_reported: false,
-            output_reported: false,
-            observed: false,
-        }
-    }
-}
-
 impl UsageLaneAccumulator {
-    fn add(&mut self, usage: Option<&astra_turn_types::ExplainAnalyzeTokenUsageV1>) {
+    fn add(&mut self, usage: &astra_turn_types::ExplainAnalyzeTokenUsageV1) {
         self.observed = true;
-        let Some(usage) = usage else {
-            return;
-        };
-        if let Some(value) = usage.fresh_input_tokens {
-            self.fresh_reported = true;
-            self.fresh_input_tokens = self.fresh_input_tokens.saturating_add(value);
+        fn add_lane(total: &mut Option<u64>, value: Option<u64>) {
+            if let Some(value) = value {
+                *total = Some(total.unwrap_or_default().saturating_add(value));
+            }
         }
-        if let Some(value) = usage.cache_read_tokens {
-            self.cache_read_reported = true;
-            self.cache_read_tokens = self.cache_read_tokens.saturating_add(value);
-        }
-        if let Some(value) = usage.cache_creation_tokens {
-            self.cache_creation_reported = true;
-            self.cache_creation_tokens = self.cache_creation_tokens.saturating_add(value);
-        }
-        if let Some(value) = usage.output_tokens {
-            self.output_reported = true;
-            self.output_tokens = self.output_tokens.saturating_add(value);
-        }
+        add_lane(&mut self.usage.fresh_input_tokens, usage.fresh_input_tokens);
+        add_lane(&mut self.usage.cache_read_tokens, usage.cache_read_tokens);
+        add_lane(
+            &mut self.usage.cache_creation_tokens,
+            usage.cache_creation_tokens,
+        );
+        add_lane(&mut self.usage.output_tokens, usage.output_tokens);
     }
 
     fn finish(self) -> Option<AttributedTokenUsage> {
-        self.observed.then_some(AttributedTokenUsage {
-            // Preserve known lower-bound lanes even when another physical
-            // attempt omitted that lane. Completeness is carried separately.
-            fresh_input_tokens: self.fresh_reported.then_some(self.fresh_input_tokens),
-            cache_read_tokens: self.cache_read_reported.then_some(self.cache_read_tokens),
-            cache_creation_tokens: self
-                .cache_creation_reported
-                .then_some(self.cache_creation_tokens),
-            output_tokens: self.output_reported.then_some(self.output_tokens),
-        })
+        self.observed.then_some(self.usage)
     }
 }
 
@@ -160,7 +121,7 @@ impl UsageAttribution {
                 && !node.conflicted
                 && let Some(usage) = node.usage.as_ref().filter(|usage| usage.is_valid())
             {
-                primary_accumulator.add(Some(usage));
+                primary_accumulator.add(usage);
             }
             if let Some(model) = provider_attempt_model_name(&node.label) {
                 primary_models.insert(model.to_string());
@@ -185,7 +146,7 @@ impl UsageAttribution {
         let mut auxiliary_sources = BTreeSet::new();
         for attempt in &auxiliary_attempts {
             if let Some(usage) = attempt.usage.as_ref().filter(|usage| usage.is_valid()) {
-                auxiliary_accumulator.add(Some(usage));
+                auxiliary_accumulator.add(usage);
             }
             let source = format_provider_model(&attempt.provider, &attempt.model_name);
             let operation = if attempt.operation_id.trim().is_empty() {

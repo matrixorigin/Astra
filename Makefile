@@ -1246,7 +1246,14 @@ test-ignored-integration:
 				--features astra-runtime/e2e-hooks \
 				--tests --run-ignored only \
 				$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
-				-E '$(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
+				-E 'not test(/perf_benchmark_7_latest_manifest_reads_use_production_reader/) and $(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
+					|| FAILED="$$FAILED runtime-plan-perf"; \
+			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
+				-p astra-runtime \
+				--features astra-runtime/e2e-hooks \
+				--lib --run-ignored only \
+				$(NEXTEST_ONLINE_FLAGS) -j 1 \
+				-E 'test(/perf_benchmark_7_latest_manifest_reads_use_production_reader/)' \
 					|| FAILED="$$FAILED runtime-plan-perf"; \
 		else \
 			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_RUNTIME_ROOT_SECRET=$${ASTRA_RUNTIME_ROOT_SECRET:-test-runtime-root-secret} ASTRA_TEST_E2E_SECRET=$${ASTRA_TEST_E2E_SECRET:-system-matrix-e2e-secret} ASTRA_BACKEND_SERVICE_KEY=$${ASTRA_BACKEND_SERVICE_KEY:-test-service-key-e2e} ASTRA_LLM_RETRY_BASE_MS=$${ASTRA_LLM_RETRY_BASE_MS:-10} ASTRA_DEFAULT_RETRY_AFTER_MS=$${ASTRA_DEFAULT_RETRY_AFTER_MS:-10} ASTRA_BCRYPT_COST=$${ASTRA_BCRYPT_COST:-4} CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
@@ -1254,7 +1261,7 @@ test-ignored-integration:
 				--features astra-runtime/e2e-hooks \
 				--tests --run-ignored only \
 				$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
-				-E 'not binary(perf_benchmarks) and $(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
+				-E 'not binary(perf_benchmarks) and not test(/perf_benchmark_7_latest_manifest_reads_use_production_reader/) and $(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
 					|| FAILED="$$FAILED integration"; \
 			echo "Running online performance benchmarks in an isolated serial lane (blocking unless ASTRA_STRICT_ONLINE_PERF=0)..."; \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
@@ -1263,6 +1270,14 @@ test-ignored-integration:
 				--tests --run-ignored only \
 				$(NEXTEST_ONLINE_FLAGS) -j 1 \
 				-E 'binary(perf_benchmarks)' \
+					|| PERF_FAILED=1; \
+			echo "Running session-handler performance benchmark in an isolated serial lane..."; \
+			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
+				-p astra-runtime \
+				--features astra-runtime/e2e-hooks \
+				--lib --run-ignored only \
+				$(NEXTEST_ONLINE_FLAGS) -j 1 \
+				-E 'test(/perf_benchmark_7_latest_manifest_reads_use_production_reader/)' \
 					|| PERF_FAILED=1; \
 		fi; \
 		if [ -n "$$FAILED" ]; then \
@@ -1313,7 +1328,7 @@ test-online:
 			ASTRA_TEST_DB_IT=1 \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
 				--lib --bins --run-ignored only $(NEXTEST_ONLINE_FLAGS) $$ONLINE_JOBS_FLAG \
-				-E 'not test(/durable_run_event_pressure_probe/) and $(NEXTEST_CLEANUP_PRESSURE_EXCLUSION)' \
+				-E 'not test(/durable_run_event_pressure_probe/) and not test(/perf_benchmark_7_latest_manifest_reads_use_production_reader/) and $(NEXTEST_CLEANUP_PRESSURE_EXCLUSION)' \
 				|| FAILED="$$FAILED astra-runtime-ignored"; \
 		echo "Running astra-turn-core db-store ignored tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
 		ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \

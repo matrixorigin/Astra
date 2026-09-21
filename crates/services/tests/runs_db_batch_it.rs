@@ -681,7 +681,7 @@ async fn checkpoints_isolate_idempotency_and_latest_load_by_owner() {
         "INSERT INTO run_checkpoints
          (checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
           checkpoint_version, idempotency_key, checkpoint_json, created_at)
-         VALUES (?, ?, ?, ?, 99, 'resume', 'checkpoint_v1', ?, ?, '2099-01-01 00:00:00.000000')",
+         VALUES (?, ?, ?, ?, 99, 'resume', 'checkpoint_v1', ?, ?, '2099-01-01 00:00:00.999999')",
     )
     .bind(format!("ckpt-foreign-{}", uuid::Uuid::new_v4()))
     .bind(&run_id)
@@ -741,6 +741,48 @@ async fn checkpoints_isolate_idempotency_and_latest_load_by_owner() {
         "checkpoint idempotency identity must include owner"
     );
 
+    for (checkpoint_id, checkpoint_kind, idempotency_key, checkpoint_json, created_at) in [
+        (
+            "ckpt-owner-z",
+            "resume",
+            "checkpoint:owner:older",
+            r#"{"version":"checkpoint_v1","graceful":true,"source":"older_resume"}"#,
+            "2099-01-01 00:00:00.000001",
+        ),
+        (
+            "ckpt-owner-a",
+            "resume",
+            "checkpoint:owner:newer",
+            r#"{"version":"checkpoint_v1","graceful":true,"source":"newer_resume"}"#,
+            "2099-01-01 00:00:00.000002",
+        ),
+        (
+            "ckpt-owner-latest",
+            "checkpoint",
+            "checkpoint:owner:latest",
+            r#"{"version":"checkpoint_v1","graceful":false,"source":"newer_checkpoint"}"#,
+            "2099-01-01 00:00:00.000003",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO run_checkpoints
+             (checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
+              checkpoint_version, idempotency_key, checkpoint_json, created_at)
+             VALUES (?, ?, ?, ?, 100, ?, 'checkpoint_v1', ?, ?, ?)",
+        )
+        .bind(checkpoint_id)
+        .bind(&run_id)
+        .bind(&owner_user_id)
+        .bind(&owner_session_id)
+        .bind(checkpoint_kind)
+        .bind(idempotency_key)
+        .bind(checkpoint_json)
+        .bind(created_at)
+        .execute(_pool.get())
+        .await
+        .expect("insert owner checkpoint ordering fixture");
+    }
+
     let latest = store
         .load_latest_checkpoint(&owner_user_id, &run_id, Some("resume"))
         .await
@@ -748,9 +790,30 @@ async fn checkpoints_isolate_idempotency_and_latest_load_by_owner() {
         .expect("checkpoint exists");
     assert_eq!(latest.user_id, owner_user_id);
     assert!(
-        latest.checkpoint_json.contains(r#""source":"owner_row""#),
-        "owner latest checkpoint should be returned despite a newer foreign row: {:?}",
         latest
+            .checkpoint_json
+            .contains(r#""source":"newer_resume""#),
+        "owner latest resume checkpoint should use microsecond ordering and ignore foreign rows: {:?}",
+        latest
+    );
+
+    let latest_any_kind = store
+        .load_latest_checkpoint(&owner_user_id, &run_id, None)
+        .await
+        .expect("load latest owner checkpoint of any kind")
+        .expect("checkpoint exists");
+    assert!(
+        latest_any_kind
+            .checkpoint_json
+            .contains(r#""source":"newer_checkpoint""#)
+    );
+
+    assert!(
+        store
+            .load_latest_checkpoint(&foreign_user_id, &run_id, Some("resume"))
+            .await
+            .expect("load foreign orphan checkpoint")
+            .is_none()
     );
 
     let _ = sqlx::query("DELETE FROM run_checkpoints WHERE run_id = ?")
@@ -765,6 +828,98 @@ async fn checkpoints_isolate_idempotency_and_latest_load_by_owner() {
         .bind(&run_id)
         .execute(_pool.get())
         .await;
+}
+
+/// Recovery claims derive the continuation decision from canonical checkpoint
+/// history even when the denormalized run-row snapshot is absent.
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn recovery_claim_reads_canonical_resume_history_without_embedded_snapshot() {
+    let (_pool, store) = setup().await;
+    let user_id = format!("recovery-history-user-{}", uuid::Uuid::new_v4());
+    let session_id = format!("recovery-history-session-{}", uuid::Uuid::new_v4());
+    let run_id = format!("recovery-history-run-{}", uuid::Uuid::new_v4());
+    let malformed_run_id = format!("recovery-history-malformed-{}", uuid::Uuid::new_v4());
+    insert_run_fixture(
+        &_pool,
+        store.as_ref(),
+        durable_run_record(run_id.clone(), user_id.clone(), session_id.clone()),
+    )
+    .await;
+    let mut malformed_record = durable_run_record(
+        malformed_run_id.clone(),
+        user_id.clone(),
+        session_id.clone(),
+    );
+    malformed_record.checkpoint_version = Some("checkpoint_v1".into());
+    malformed_record.checkpoint_json =
+        Some(r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":7}"#.into());
+    insert_run_fixture(&_pool, store.as_ref(), malformed_record).await;
+
+    let checkpoint_json =
+        r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"canonical-only"}"#;
+    for (run_id, checkpoint_id, idempotency_key, checkpoint_json) in [
+        (
+            run_id.as_str(),
+            format!("ckpt-recovery-history-{}", uuid::Uuid::new_v4()),
+            format!("checkpoint:{run_id}:resume:canonical-only"),
+            checkpoint_json.to_string(),
+        ),
+        (
+            malformed_run_id.as_str(),
+            format!("ckpt-recovery-malformed-{}", uuid::Uuid::new_v4()),
+            format!("checkpoint:{malformed_run_id}:resume:malformed"),
+            r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":7}"#.to_string(),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO run_checkpoints
+             (checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
+              checkpoint_version, idempotency_key, checkpoint_json, created_at)
+             VALUES (?, ?, ?, ?, 4, 'resume', 'checkpoint_v1', ?, ?, NOW(6))",
+        )
+        .bind(checkpoint_id)
+        .bind(run_id)
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(idempotency_key)
+        .bind(checkpoint_json)
+        .execute(_pool.get())
+        .await
+        .expect("insert recovery checkpoint fixture");
+    }
+
+    let claims = store
+        .claim_recoverable_active_runs(256)
+        .await
+        .expect("claim recovery candidates");
+    let claim = claims
+        .iter()
+        .find(|claim| claim.run.user_id == user_id && claim.run.run_id == run_id)
+        .expect("canonical-only recovery run should be claimed");
+    assert!(claim.has_graceful_resume_checkpoint);
+    assert!(claim.run.checkpoint_version.is_none());
+    assert!(claim.run.checkpoint_json.is_none());
+
+    let malformed_claim = claims
+        .iter()
+        .find(|claim| claim.run.run_id == malformed_run_id)
+        .expect("malformed canonical recovery run should be claimed");
+    assert!(!malformed_claim.has_graceful_resume_checkpoint);
+
+    for run_id in [run_id.as_str(), malformed_run_id.as_str()] {
+        for statement in [
+            "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        ] {
+            let _ = sqlx::query(statement)
+                .bind(&user_id)
+                .bind(run_id)
+                .execute(_pool.get())
+                .await;
+        }
+    }
 }
 
 /// Owner isolation: dirty tool output rows for another user/session with the
