@@ -18,9 +18,9 @@ use astra_services::{
     finish_inference_invocation, finish_inference_provider_attempt,
     finish_successful_inference_provider_attempt_and_invocation,
     load_existing_inference_operation_ids_for_route,
-    load_inference_canonical_transitions_for_session, load_tool_result_projection_decisions,
-    next_inference_logical_attempt_pair_base, plan_inference_invocation,
-    plan_inference_provider_attempt, reconcile_inference_settlements,
+    load_inference_canonical_transitions_for_session, load_session_auxiliary_capture,
+    load_tool_result_projection_decisions, next_inference_logical_attempt_pair_base,
+    plan_inference_invocation, plan_inference_provider_attempt, reconcile_inference_settlements,
     renew_inference_invocation_owner, retire_inference_canonical_transitions_through_turn,
     settle_uncertain_inference_admission,
 };
@@ -3501,6 +3501,101 @@ async fn selection_subject_gate_is_scoped_to_owner_session_and_route() {
     cleanup(pool, &user_id, &session_id, &run_id).await;
     cleanup(pool, &user_id, &other_session_id, &other_run_id).await;
     cleanup(pool, &other_user_id, &session_id, &other_user_run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn detailed_auxiliary_capture_decodes_multiple_invocations_and_attempts() {
+    let shared_pool = common::setup_pool().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("auxiliary-capture-user-{suffix}");
+    let session_id = format!("auxiliary-capture-session-{suffix}");
+    let run_id = format!("auxiliary-capture-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let terminal = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Cancelled,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("fixture_complete".to_string()),
+        error_message: Some("close auxiliary capture fixture".to_string()),
+    };
+    let mut expected_invocations = std::collections::BTreeSet::new();
+    let mut expected_attempts = std::collections::BTreeSet::new();
+    for round in 0..2 {
+        let plan = plan_inference_invocation(run_input(
+            &user_id,
+            &session_id,
+            &run_id,
+            round,
+            "request_judgment",
+        ))
+        .expect("plan auxiliary capture invocation");
+        expected_invocations.insert(plan.invocation_id().to_string());
+        admit_inference_invocation(&shared_pool, &plan)
+            .await
+            .expect("admit auxiliary capture invocation");
+
+        let first_attempt = provider_attempt(&plan, 0);
+        expected_attempts.insert(first_attempt.attempt_id().to_string());
+        begin_inference_provider_attempt(&shared_pool, &first_attempt)
+            .await
+            .expect("begin first auxiliary capture attempt");
+        finish_inference_provider_attempt(&shared_pool, &first_attempt, &terminal)
+            .await
+            .expect("finish first auxiliary capture attempt");
+
+        if round == 0 {
+            let retry = provider_attempt(&plan, 1);
+            expected_attempts.insert(retry.attempt_id().to_string());
+            begin_inference_provider_attempt(&shared_pool, &retry)
+                .await
+                .expect("begin retry auxiliary capture attempt");
+            finish_inference_provider_attempt(&shared_pool, &retry, &terminal)
+                .await
+                .expect("finish retry auxiliary capture attempt");
+        }
+        finish_inference_invocation(&shared_pool, &plan, &terminal)
+            .await
+            .expect("finish auxiliary capture invocation");
+    }
+
+    let capture = load_session_auxiliary_capture(&shared_pool, &user_id, &session_id, 32, true)
+        .await
+        .expect("decode detailed auxiliary capture");
+    assert!(!capture.facts.truncated);
+    assert_eq!(capture.facts.attempts.len(), expected_attempts.len());
+    assert_eq!(capture.execution.len(), expected_attempts.len());
+    assert_eq!(
+        capture
+            .execution
+            .iter()
+            .map(|fact| fact.invocation_id.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected_invocations
+    );
+    assert_eq!(
+        capture
+            .execution
+            .iter()
+            .map(|fact| fact.attempt_id.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected_attempts
+    );
+    assert!(
+        capture
+            .execution
+            .iter()
+            .all(|fact| fact.attempt_provider == "openai"
+                && fact.attempt_protocol == "openai_compatible"
+                && fact.resolved_model_name == "owner-lease-model"
+                && fact.upstream_model_name == "owner-lease-model")
+    );
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
 }
 
 #[tokio::test]
