@@ -219,6 +219,7 @@ pub use inference_execution::{
     declare_inference_attempt_settlement, declare_inference_settlement,
     finish_inference_invocation, finish_inference_provider_attempt,
     finish_successful_inference_provider_attempt_and_invocation,
+    load_existing_inference_operation_ids_for_route,
     load_inference_canonical_transitions_for_session, load_tool_result_projection_decisions,
     next_inference_logical_attempt_pair_base, plan_inference_invocation,
     plan_inference_provider_attempt, plan_inference_provider_attempt_with_context,

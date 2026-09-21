@@ -939,6 +939,74 @@ pub fn plan_inference_invocation(
 /// reserved for the single foreground ambiguity recovery. This is a cursor
 /// read, not provider authority: concurrent callers are still serialized by
 /// the unique invocation identity at admission and losers must re-read.
+///
+/// Selection callers use the existing inference ledger as a read-side
+/// scheduler: operation IDs are their content-addressed selection subjects,
+/// while the joined route columns keep a route change eligible.
+pub async fn load_existing_inference_operation_ids_for_route(
+    pool: &SharedPool,
+    input: &InferenceInvocationInput,
+) -> ServiceResult<std::collections::BTreeSet<String>> {
+    let _ = plan_inference_invocation(input.clone())?;
+    let rows = sqlx::query(
+        "SELECT invocation.operation_id
+         FROM inference_invocations AS invocation
+         INNER JOIN inference_routes AS route
+           ON route.user_id = invocation.user_id
+          AND route.route_id = invocation.route_id
+         WHERE invocation.user_id = ?
+           AND invocation.scope_kind = ?
+           AND invocation.session_id <=> ?
+           AND invocation.run_id <=> ?
+           AND invocation.harness_run_id <=> ?
+           AND invocation.turn_index <=> ?
+           AND invocation.purpose = ?
+           AND route.offering_id = ?
+           AND route.resolved_model_name = ?
+           AND route.upstream_model_name = ?
+           AND route.provider = ?
+           AND route.execution_placement = ?
+           AND route.access_kind = ?
+           AND route.purpose = ?",
+    )
+    .bind(&input.user_id)
+    .bind(input.scope.kind())
+    .bind(input.scope.session_id())
+    .bind(input.scope.run_id())
+    .bind(input.scope.harness_run_id())
+    .bind(input.scope.turn().map(i64::from))
+    .bind(input.purpose.as_str())
+    .bind(&input.offering_id)
+    .bind(&input.resolved_model_name)
+    .bind(&input.upstream_model_name)
+    .bind(&input.provider)
+    .bind(input.execution_placement.as_str())
+    .bind(input.access_kind.as_str())
+    .bind(input.purpose.as_str())
+    .fetch_all(pool.get())
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "load existing inference selection subjects",
+            error,
+        )
+    })?;
+    rows.into_iter()
+        .map(|row| {
+            let operation_id: String = row.try_get("operation_id").map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "decode existing inference selection subject",
+                    error,
+                )
+            })?;
+            validate_identity(&operation_id, "operation_id", 64)?;
+            Ok(operation_id)
+        })
+        .collect()
+}
+
 pub async fn next_inference_logical_attempt_pair_base(
     pool: &SharedPool,
     input: &InferenceInvocationInput,
@@ -1405,7 +1473,10 @@ fn model_request_event(
             run_id: input.scope.run_id().map(str::to_string),
             harness_run_id: input.scope.harness_run_id().map(str::to_string),
             turn: input.scope.turn(),
-            round: input.scope.round(),
+            round: attempt
+                .request_context
+                .execution_round
+                .or(input.scope.round()),
             logical_attempt: input.scope.logical_attempt(),
             physical_attempt: attempt.attempt_index,
             actor_id: attempt.request_context.actor_id.clone(),
@@ -9042,6 +9113,7 @@ mod tests {
         let mut seed = ModelRequestContextSeed::server_default();
         seed.topology = ModelRequestTopology::CliServer;
         seed.interaction_owner = "cli".to_string();
+        seed.execution_round = Some(7);
         seed.budget.estimated_input_tokens = Some(900);
         seed.cache.current_identity = Some("sha256:stable-prefix".to_string());
         let wire = InferenceProviderWireIdentity::new(
@@ -9081,12 +9153,14 @@ mod tests {
         assert_eq!(route.invocation_id, invocation.invocation_id());
         assert_eq!(route.upstream_model, "provider-model-1");
         assert_eq!(accepted.identity.model, "model-1");
+        assert_eq!(accepted.identity.round, Some(7));
         assert_eq!(route.access_kind, ModelAccessKind::SelfHosted);
         assert_eq!(route.execution_placement, ModelExecutionPlacement::Server);
         assert_eq!(accepted.route, terminal_event.route);
         assert!(accepted.usage.is_none());
         assert!(accepted.usage_status.is_none());
         assert_eq!(terminal_event.identity.physical_attempt, 2);
+        assert_eq!(terminal_event.identity.round, Some(7));
         assert_eq!(accepted.identity.operation_id, "agent_turn");
         assert_eq!(terminal_event.identity.operation_id, "agent_turn");
         assert_eq!(

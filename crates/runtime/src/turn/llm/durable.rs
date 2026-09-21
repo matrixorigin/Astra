@@ -55,6 +55,10 @@ impl DurableInferenceRunAuthority {
         }
     }
 
+    pub(crate) fn admission_authority(&self) -> astra_services::InferenceRunAdmissionAuthority {
+        self.durable.clone()
+    }
+
     fn local_fence_error(&self, stage: &'static str) -> Option<astra_core::ClassifiedError> {
         if self
             .execution_lease_lost
@@ -2758,6 +2762,7 @@ impl DurableInferenceLedger {
             .map_err(|error| service_error("logical attempt cursor", error))
     }
 
+    #[cfg(test)]
     pub(crate) async fn admit(
         &self,
         scope: astra_turn_types::InferenceInvocationScope,
@@ -3135,13 +3140,46 @@ impl DurableInferenceLedger {
         call: LlmCall<'_>,
         timeout: std::time::Duration,
     ) -> DurableInferenceCallOutcome {
+        self.execute_nonstream_with_request_context(
+            client,
+            scope,
+            call,
+            timeout,
+            astra_services::ModelRequestContextSeed::server_default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_nonstream_with_execution_round(
+        &self,
+        client: &reqwest::Client,
+        scope: astra_turn_types::InferenceInvocationScope,
+        call: LlmCall<'_>,
+        timeout: std::time::Duration,
+        execution_round: u32,
+    ) -> DurableInferenceCallOutcome {
+        let mut request_context = astra_services::ModelRequestContextSeed::server_default();
+        request_context.execution_round = Some(execution_round);
+        self.execute_nonstream_with_request_context(client, scope, call, timeout, request_context)
+            .await
+    }
+
+    async fn execute_nonstream_with_request_context(
+        &self,
+        client: &reqwest::Client,
+        scope: astra_turn_types::InferenceInvocationScope,
+        call: LlmCall<'_>,
+        timeout: std::time::Duration,
+        request_context: astra_services::ModelRequestContextSeed,
+    ) -> DurableInferenceCallOutcome {
         let invocation = match self
-            .admit(
+            .admit_with_request_context(
                 scope,
                 call.purpose,
                 call.route.model_name,
                 call.route.wire_model_name.unwrap_or(call.route.model_name),
                 call.route.provider,
+                request_context,
             )
             .await
         {
@@ -3241,13 +3279,40 @@ impl DurableInferenceLedger {
         scope: astra_turn_types::InferenceInvocationScope,
         call: LlmCall<'_>,
     ) -> DurableInferenceCallOutcome {
+        self.execute_stream_no_tool_choice_with_request_context(
+            scope,
+            call,
+            astra_services::ModelRequestContextSeed::server_default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_stream_no_tool_choice_with_execution_round(
+        &self,
+        scope: astra_turn_types::InferenceInvocationScope,
+        call: LlmCall<'_>,
+        execution_round: u32,
+    ) -> DurableInferenceCallOutcome {
+        let mut request_context = astra_services::ModelRequestContextSeed::server_default();
+        request_context.execution_round = Some(execution_round);
+        self.execute_stream_no_tool_choice_with_request_context(scope, call, request_context)
+            .await
+    }
+
+    async fn execute_stream_no_tool_choice_with_request_context(
+        &self,
+        scope: astra_turn_types::InferenceInvocationScope,
+        call: LlmCall<'_>,
+        request_context: astra_services::ModelRequestContextSeed,
+    ) -> DurableInferenceCallOutcome {
         let invocation = match self
-            .admit(
+            .admit_with_request_context(
                 scope,
                 call.purpose,
                 call.route.model_name,
                 call.route.wire_model_name.unwrap_or(call.route.model_name),
                 call.route.provider,
+                request_context,
             )
             .await
         {

@@ -188,6 +188,81 @@ impl InferenceInvocationScope {
             },
         }
     }
+
+    #[must_use]
+    pub fn with_round(&self, round: u32) -> Self {
+        match self {
+            Self::Run {
+                session_id,
+                run_id,
+                turn,
+                operation_id,
+                logical_attempt,
+                ..
+            } => Self::Run {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                turn: *turn,
+                round,
+                operation_id: operation_id.clone(),
+                logical_attempt: *logical_attempt,
+            },
+            Self::Session {
+                session_id,
+                turn: turn_index,
+                operation_id,
+                logical_attempt,
+                ..
+            } => Self::Session {
+                session_id: session_id.clone(),
+                turn: *turn_index,
+                round,
+                operation_id: operation_id.clone(),
+                logical_attempt: *logical_attempt,
+            },
+            Self::HarnessRun { .. } => self.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_operation_id(&self, operation_id: impl Into<String>) -> Self {
+        let operation_id = operation_id.into();
+        match self {
+            Self::Run {
+                session_id,
+                run_id,
+                turn,
+                round,
+                logical_attempt,
+                ..
+            } => Self::Run {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                turn: *turn,
+                round: *round,
+                operation_id,
+                logical_attempt: *logical_attempt,
+            },
+            Self::Session {
+                session_id,
+                turn,
+                round,
+                logical_attempt,
+                ..
+            } => Self::Session {
+                session_id: session_id.clone(),
+                turn: *turn,
+                round: *round,
+                operation_id,
+                logical_attempt: *logical_attempt,
+            },
+            Self::HarnessRun { .. } => Self::HarnessRun {
+                harness_run_id: self.harness_run_id().unwrap_or_default().to_string(),
+                operation_id,
+                logical_attempt: self.logical_attempt(),
+            },
+        }
+    }
 }
 
 /// Policy- and attribution-relevant reason for one logical model invocation.
@@ -304,6 +379,29 @@ mod tests {
                 .expect("deserialize invocation scope"),
             scope
         );
+    }
+
+    #[test]
+    fn selection_identity_can_freeze_round_and_operation_without_changing_owner() {
+        let scope = InferenceInvocationScope::Run {
+            session_id: "session-1".to_string(),
+            run_id: "run-1".to_string(),
+            turn: 4,
+            round: 7,
+            operation_id: "tool_result_rerank".to_string(),
+            logical_attempt: 3,
+        };
+
+        let frozen = scope
+            .with_round(0)
+            .with_operation_id("f".repeat(64))
+            .with_logical_attempt(0);
+        assert_eq!(frozen.session_id(), Some("session-1"));
+        assert_eq!(frozen.run_id(), Some("run-1"));
+        assert_eq!(frozen.turn(), Some(4));
+        assert_eq!(frozen.round(), Some(0));
+        assert_eq!(frozen.logical_attempt(), 0);
+        assert_eq!(frozen.operation_id(), "f".repeat(64));
     }
 
     #[test]
