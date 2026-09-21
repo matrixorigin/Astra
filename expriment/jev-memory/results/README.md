@@ -22,6 +22,9 @@ Each evidence file retains every case and repetition, including mistakes. It
 contains actual judgment inputs, model responses, selected candidates, native
 probabilities where available, reported usage, and downstream answers. The
 exporter's field allowlist is not a general-purpose privacy scrubber.
+Summary files retain aggregate metrics and provenance only; per-case selections
+and answers remain in the corresponding evidence file, which is the canonical
+source for case-level inspection.
 
 Requests are deduplicated by SHA-256. Each `requests[hash]` entry stores only the
 exact serialized `raw` string; obtain its structured view with

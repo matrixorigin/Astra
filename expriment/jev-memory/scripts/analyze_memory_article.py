@@ -136,7 +136,7 @@ def analyze(run, price_card):
                "results_sha256": hashlib.sha256((run / "results.jsonl").read_bytes()).hexdigest(),
                "price_basis": "dated official USD price card; reported cache discounts; unknown usage not zero",
                "price_card": price_card,
-               "prices_per_token": prices, "groups": {}, "case_results": {}}
+               "prices_per_token": prices, "groups": {}}
     groups = {
         "all": rows, "core": [r for r in rows if not r["stress"]],
         "stress": [r for r in rows if r["stress"]],
@@ -150,13 +150,6 @@ def analyze(run, price_card):
     for group, subset in groups.items():
         summary["groups"][group] = {arm: summarize([r for r in subset if r["arm"] == arm], prices)
                                     for arm in sorted({r["arm"] for r in subset})}
-    for cid in cases:
-        summary["case_results"][cid] = {
-            arm: [{"repeat": r["repeat"], "selected": r["selected"],
-                   "selection_exact": r["selection_exact"], "reason": r["selection"]["reason"],
-                   "answer_pass": r["grade"]["pass"], "answer": r["answer"].get("text")}
-                  for r in rows if r["case"] == cid and r["arm"] == arm]
-            for arm in sorted({r["arm"] for r in rows})}
     return summary
 
 
