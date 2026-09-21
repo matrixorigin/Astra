@@ -454,7 +454,7 @@ fn looks_like_url(token: &str) -> bool {
         || token.starts_with("localhost/")
 }
 
-fn split_optional_line_suffix(token: &str) -> (&str, Option<&str>) {
+pub(crate) fn split_optional_line_suffix(token: &str) -> (&str, Option<&str>) {
     let Some((path, suffix)) = token.rsplit_once(':') else {
         return (token, None);
     };
@@ -469,7 +469,7 @@ fn is_file_path_like(path: &str) -> bool {
     is_absolute_path_like(path) || is_relative_path_like(path)
 }
 
-fn is_absolute_path_like(path: &str) -> bool {
+pub(crate) fn is_absolute_path_like(path: &str) -> bool {
     path.starts_with('/')
         && path.len() > 1
         && path
@@ -477,7 +477,7 @@ fn is_absolute_path_like(path: &str) -> bool {
             .all(|c| !c.is_control() && !matches!(c, '\x1b' | '\x07'))
 }
 
-fn is_relative_path_like(path: &str) -> bool {
+pub(crate) fn is_relative_path_like(path: &str) -> bool {
     if !(path.starts_with("./") || path.starts_with("../") || path.contains('/')) {
         return false;
     }

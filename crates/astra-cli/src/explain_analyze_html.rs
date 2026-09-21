@@ -7,10 +7,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use crate::explain_analyze_format::{alpha_label, diagnostic_label, format_ms, format_tokens};
 use astra_turn_types::{
     ExplainAnalyzeEventV1, ExplainAnalyzeGraphV1, ExplainAnalyzeNodeKindV1,
-    ExplainAnalyzeOutcomeV1, ExplainAnalyzeProjectedNodeV1,
-    ExplainAnalyzeProjectionDiagnosticCodeV1, ExplainAnalyzeUsageBasisV1,
+    ExplainAnalyzeOutcomeV1, ExplainAnalyzeProjectedNodeV1, ExplainAnalyzeUsageBasisV1,
 };
 
 const MAX_HTML_BYTES: usize = 1024 * 1024;
@@ -468,21 +468,6 @@ fn clock_labels(graph: &ExplainAnalyzeGraphV1) -> HashMap<String, String> {
     labels
 }
 
-fn alpha_label(mut ordinal: usize) -> String {
-    let mut label = String::new();
-    loop {
-        label.insert(
-            0,
-            char::from(b'A' + u8::try_from(ordinal % 26).unwrap_or(0)),
-        );
-        ordinal /= 26;
-        if ordinal == 0 {
-            return label;
-        }
-        ordinal -= 1;
-    }
-}
-
 fn timeline_interval(node: &ExplainAnalyzeProjectedNodeV1) -> Option<(u64, u64)> {
     let end = node.end_elapsed_ms.or_else(|| {
         node.duration_ms
@@ -908,19 +893,6 @@ fn state_class(state: &str) -> &'static str {
     }
 }
 
-fn diagnostic_label(code: ExplainAnalyzeProjectionDiagnosticCodeV1) -> &'static str {
-    use ExplainAnalyzeProjectionDiagnosticCodeV1::*;
-    match code {
-        ConflictingFact => "conflicting runtime facts",
-        DependencyCycle => "cyclic dependency",
-        InvalidEvent => "invalid runtime fact",
-        MissingDependency => "dependency was not observed",
-        MissingParent => "parent stage was not observed",
-        ParentCycle => "cyclic stage hierarchy",
-        UnresolvedTerminalNode => "stage did not reach a recorded end",
-    }
-}
-
 fn source_label(kind: astra_turn_types::ExplainAnalyzeContextSourceKindV1) -> &'static str {
     use astra_turn_types::ExplainAnalyzeContextSourceKindV1::*;
     match kind {
@@ -939,26 +911,6 @@ fn source_label(kind: astra_turn_types::ExplainAnalyzeContextSourceKindV1) -> &'
         EmergentSkills => "emergent skills",
         EmergentMemory => "emergent memory",
         EmergentSummary => "emergent summary",
-    }
-}
-
-fn format_ms(ms: u64) -> String {
-    if ms >= 1_000 {
-        format!("{:.1}s", ms as f64 / 1_000.0)
-    } else {
-        format!("{ms}ms")
-    }
-}
-
-fn format_tokens(tokens: u64) -> String {
-    if tokens >= 1_000_000 {
-        format!("{:.1}M", tokens as f64 / 1_000_000.0)
-    } else if tokens >= 10_000 {
-        format!("{:.1}k", tokens as f64 / 1_000.0)
-    } else if tokens >= 1_000 {
-        format!("{:.2}k", tokens as f64 / 1_000.0)
-    } else {
-        tokens.to_string()
     }
 }
 

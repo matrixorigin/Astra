@@ -7,11 +7,6 @@ use astra_services::work::{
     WorkRepository, WorkRepositoryError, WorkRevision,
 };
 use sqlx::Row;
-use uuid::Uuid;
-
-fn id(prefix: &str) -> String {
-    format!("{prefix}-{}", Uuid::new_v4())
-}
 
 fn genesis(owner_id: &str, work_id: &str, branch_id: &str, session_id: &str) -> WorkGenesis {
     common::work_genesis(
@@ -19,7 +14,7 @@ fn genesis(owner_id: &str, work_id: &str, branch_id: &str, session_id: &str) -> 
         work_id,
         branch_id,
         session_id,
-        &id("intent"),
+        &common::id("intent"),
         "Repair the failing repository invariant.",
     )
 }
@@ -31,37 +26,8 @@ fn goal_change(owner_id: &str, work_id: &str, goal: &str) -> WorkGoalChange {
         expected_work_revision: WorkRevision::INITIAL,
         expected_goal_revision: GoalRevision::INITIAL,
         goal: WorkGoal::parse(goal).expect("goal"),
-        source_ref: WorkChangeRef::parse(id("event")).expect("goal change ref"),
+        source_ref: WorkChangeRef::parse(common::id("event")).expect("goal change ref"),
         reason: Some(WorkChangeReason::parse("User clarified the outcome.").expect("reason")),
-    }
-}
-
-async fn cleanup_owner(pool: &astra_core::SharedPool, owner_id: &str) {
-    for (table, owner_column) in [
-        ("work_runtime_event_outbox", "owner_id"),
-        ("work_runtime_event_outbox_slots", "owner_id"),
-        ("work_events", "owner_id"),
-        ("work_attention_receipts", "owner_id"),
-        ("work_event_sequences", "owner_id"),
-        ("work_proposals", "owner_id"),
-        ("work_proposal_sequences", "owner_id"),
-        ("work_branches", "owner_id"),
-        ("work_item_edges", "owner_id"),
-        ("work_item_revisions", "owner_id"),
-        ("work_items", "owner_id"),
-        ("work_graph_revisions", "owner_id"),
-        ("work_graph_sequences", "owner_id"),
-        ("work_criterion_sets", "owner_id"),
-        ("work_goal_revisions", "owner_id"),
-        ("works", "owner_id"),
-        ("agent_sessions", "user_id"),
-    ] {
-        let statement = format!("DELETE FROM {table} WHERE {owner_column} = ?");
-        sqlx::query(&statement)
-            .bind(owner_id)
-            .execute(pool.get())
-            .await
-            .unwrap_or_else(|error| panic!("clean {table} for test owner: {error}"));
     }
 }
 
@@ -88,13 +54,11 @@ async fn count_work_rows(
 async fn genesis_is_atomic_owner_scoped_and_materializes_real_roots() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let other_owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    cleanup_owner(&pool, &owner_id).await;
-    cleanup_owner(&pool, &other_owner_id).await;
+    let owner_id = common::id("owner");
+    let other_owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
 
     let created = repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id, &session_id))
@@ -266,8 +230,8 @@ async fn genesis_is_atomic_owner_scoped_and_materializes_real_roots() {
         Err(WorkRepositoryError::Corrupt { .. })
     ));
 
-    cleanup_owner(&pool, &owner_id).await;
-    cleanup_owner(&pool, &other_owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &other_owner_id).await;
 }
 
 #[tokio::test]
@@ -275,20 +239,18 @@ async fn genesis_is_atomic_owner_scoped_and_materializes_real_roots() {
 async fn session_binding_is_owner_scoped_and_same_owner_conflict_rolls_back_every_row() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let first_owner_id = id("owner");
-    let second_owner_id = id("owner");
-    let first_work_id = id("work");
-    let same_owner_work_id = id("work");
-    let cross_owner_work_id = id("work");
-    let session_id = id("session");
-    cleanup_owner(&pool, &first_owner_id).await;
-    cleanup_owner(&pool, &second_owner_id).await;
+    let first_owner_id = common::id("owner");
+    let second_owner_id = common::id("owner");
+    let first_work_id = common::id("work");
+    let same_owner_work_id = common::id("work");
+    let cross_owner_work_id = common::id("work");
+    let session_id = common::id("session");
 
     repository
         .create_genesis(genesis(
             &first_owner_id,
             &first_work_id,
-            &id("branch"),
+            &common::id("branch"),
             &session_id,
         ))
         .await
@@ -298,7 +260,7 @@ async fn session_binding_is_owner_scoped_and_same_owner_conflict_rolls_back_ever
         .create_genesis(genesis(
             &first_owner_id,
             &same_owner_work_id,
-            &id("branch"),
+            &common::id("branch"),
             &session_id,
         ))
         .await
@@ -314,7 +276,7 @@ async fn session_binding_is_owner_scoped_and_same_owner_conflict_rolls_back_ever
         .create_genesis(genesis(
             &second_owner_id,
             &cross_owner_work_id,
-            &id("branch"),
+            &common::id("branch"),
             &session_id,
         ))
         .await
@@ -357,8 +319,8 @@ async fn session_binding_is_owner_scoped_and_same_owner_conflict_rolls_back_ever
         "a different owner has an independent internal session namespace"
     );
 
-    cleanup_owner(&pool, &first_owner_id).await;
-    cleanup_owner(&pool, &second_owner_id).await;
+    common::cleanup_work_owner(&pool, &first_owner_id).await;
+    common::cleanup_work_owner(&pool, &second_owner_id).await;
 }
 
 #[tokio::test]
@@ -366,11 +328,15 @@ async fn session_binding_is_owner_scoped_and_same_owner_conflict_rolls_back_ever
 async fn goal_revision_cas_preserves_branch_basis_and_rejects_stale_or_archived_writes() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
     repository
-        .create_genesis(genesis(&owner_id, &work_id, &id("branch"), &id("session")))
+        .create_genesis(genesis(
+            &owner_id,
+            &work_id,
+            &common::id("branch"),
+            &common::id("session"),
+        ))
         .await
         .expect("Work genesis");
 
@@ -490,7 +456,7 @@ async fn goal_revision_cas_preserves_branch_basis_and_rejects_stale_or_archived_
     assert_eq!(sequence, 2, "failed events must not leave sequence gaps");
 
     let foreign_change = WorkGoalChange {
-        owner_id: WorkOwnerId::parse(id("owner")).expect("foreign owner"),
+        owner_id: WorkOwnerId::parse(common::id("owner")).expect("foreign owner"),
         expected_work_revision: WorkRevision::new(2).expect("Work r2"),
         expected_goal_revision: GoalRevision::new(2).expect("Goal r2"),
         ..goal_change(&owner_id, &work_id, "A foreign owner must observe nothing.")
@@ -521,7 +487,7 @@ async fn goal_revision_cas_preserves_branch_basis_and_rejects_stale_or_archived_
         "an archived Work must not gain a Goal revision"
     );
 
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -529,11 +495,15 @@ async fn goal_revision_cas_preserves_branch_basis_and_rejects_stale_or_archived_
 async fn concurrent_goal_revision_cas_has_one_winner_and_no_orphan_revision() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
     repository
-        .create_genesis(genesis(&owner_id, &work_id, &id("branch"), &id("session")))
+        .create_genesis(genesis(
+            &owner_id,
+            &work_id,
+            &common::id("branch"),
+            &common::id("session"),
+        ))
         .await
         .expect("Work genesis");
 
@@ -575,7 +545,7 @@ async fn concurrent_goal_revision_cas_has_one_winner_and_no_orphan_revision() {
         "genesis plus exactly one winning revision must remain"
     );
 
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -583,11 +553,15 @@ async fn concurrent_goal_revision_cas_has_one_winner_and_no_orphan_revision() {
 async fn event_retention_advances_in_constant_work_at_the_window_boundary() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
     repository
-        .create_genesis(genesis(&owner_id, &work_id, &id("branch"), &id("session")))
+        .create_genesis(genesis(
+            &owner_id,
+            &work_id,
+            &common::id("branch"),
+            &common::id("session"),
+        ))
         .await
         .expect("Work genesis");
 
@@ -661,7 +635,7 @@ async fn event_retention_advances_in_constant_work_at_the_window_boundary() {
         "goal_revised"
     );
 
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -669,13 +643,16 @@ async fn event_retention_advances_in_constant_work_at_the_window_boundary() {
 async fn attention_cursors_are_owner_scoped_monotonic_and_naturally_idempotent() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let other_owner_id = id("owner");
-    let work_id = id("work");
-    cleanup_owner(&pool, &owner_id).await;
-    cleanup_owner(&pool, &other_owner_id).await;
+    let owner_id = common::id("owner");
+    let other_owner_id = common::id("owner");
+    let work_id = common::id("work");
     repository
-        .create_genesis(genesis(&owner_id, &work_id, &id("branch"), &id("session")))
+        .create_genesis(genesis(
+            &owner_id,
+            &work_id,
+            &common::id("branch"),
+            &common::id("session"),
+        ))
         .await
         .expect("Work genesis");
 
@@ -789,8 +766,8 @@ async fn attention_cursors_are_owner_scoped_monotonic_and_naturally_idempotent()
         Err(WorkRepositoryError::NotFound)
     ));
 
-    cleanup_owner(&pool, &owner_id).await;
-    cleanup_owner(&pool, &other_owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &other_owner_id).await;
 }
 
 #[tokio::test]
@@ -798,13 +775,16 @@ async fn attention_cursors_are_owner_scoped_monotonic_and_naturally_idempotent()
 async fn event_pages_are_bounded_contiguous_owner_scoped_and_retention_explicit() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let other_owner_id = id("owner");
-    let work_id = id("work");
-    cleanup_owner(&pool, &owner_id).await;
-    cleanup_owner(&pool, &other_owner_id).await;
+    let owner_id = common::id("owner");
+    let other_owner_id = common::id("owner");
+    let work_id = common::id("work");
     repository
-        .create_genesis(genesis(&owner_id, &work_id, &id("branch"), &id("session")))
+        .create_genesis(genesis(
+            &owner_id,
+            &work_id,
+            &common::id("branch"),
+            &common::id("session"),
+        ))
         .await
         .expect("Work genesis");
     repository
@@ -930,6 +910,6 @@ async fn event_pages_are_bounded_contiguous_owner_scoped_and_retention_explicit(
         })
     ));
 
-    cleanup_owner(&pool, &owner_id).await;
-    cleanup_owner(&pool, &other_owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &other_owner_id).await;
 }

@@ -14,11 +14,6 @@ use astra_services::work::{
     WorkObservationSatisfactionEvidenceRef, WorkOwnerId, WorkRepository, WorkRepositoryError,
     WorkRetentionState, WorkRevision, WorkSubjectRef,
 };
-use uuid::Uuid;
-
-fn id(prefix: &str) -> String {
-    format!("{prefix}-{}", Uuid::new_v4())
-}
 
 fn hash(byte: char) -> WorkContentHash {
     WorkContentHash::parse(format!("sha256:{}", byte.to_string().repeat(64))).expect("hash")
@@ -29,8 +24,8 @@ fn genesis(owner_id: &str, work_id: &str, branch_id: &str) -> WorkGenesis {
         owner_id,
         work_id,
         branch_id,
-        &id("session"),
-        &id("intent"),
+        &common::id("session"),
+        &common::id("intent"),
         "Ship a causally coherent Work observation.",
     )
 }
@@ -52,61 +47,23 @@ fn new_item(item_id: &str, kind: WorkItemKind) -> WorkGraphItemChange {
     })
 }
 
-async fn cleanup_owner(pool: &astra_core::SharedPool, owner_id: &str) {
-    for (table, owner_column) in [
-        ("agent_runs", "user_id"),
-        ("work_runtime_event_outbox", "owner_id"),
-        ("work_runtime_event_outbox_slots", "owner_id"),
-        ("work_events", "owner_id"),
-        ("work_attention_receipts", "owner_id"),
-        ("work_event_sequences", "owner_id"),
-        ("work_current_gap_acceptances", "owner_id"),
-        ("work_acceptance_decisions", "owner_id"),
-        ("work_check_runs", "owner_id"),
-        ("work_proposals", "owner_id"),
-        ("work_proposal_sequences", "owner_id"),
-        ("work_branch_subjects", "owner_id"),
-        ("work_branches", "owner_id"),
-        ("work_item_edges", "owner_id"),
-        ("work_item_revisions", "owner_id"),
-        ("work_items", "owner_id"),
-        ("work_graph_revisions", "owner_id"),
-        ("work_graph_sequences", "owner_id"),
-        ("work_criterion_sets", "owner_id"),
-        ("work_criterion_revisions", "owner_id"),
-        ("work_criteria", "owner_id"),
-        ("work_goal_revisions", "owner_id"),
-        ("works", "owner_id"),
-        ("agent_sessions", "user_id"),
-    ] {
-        let statement = format!("DELETE FROM {table} WHERE {owner_column} = ?");
-        sqlx::query(&statement)
-            .bind(owner_id)
-            .execute(pool.get())
-            .await
-            .unwrap_or_else(|error| panic!("clean {table}: {error}"));
-    }
-}
-
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn declared_work_observation_is_bounded_content_addressed_and_owner_scoped() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let other_owner_id = id("other-owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let first_item = id("milestone");
-    let second_item = id("task");
-    cleanup_owner(&pool, &owner_id).await;
-    cleanup_owner(&pool, &other_owner_id).await;
+    let owner_id = common::id("owner");
+    let other_owner_id = common::id("other-owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let first_item = common::id("milestone");
+    let second_item = common::id("task");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
         .expect("genesis");
 
-    let criterion_id = id("criterion");
+    let criterion_id = common::id("criterion");
     repository
         .accept_criteria(WorkCriteriaChange {
             owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
@@ -122,7 +79,7 @@ async fn declared_work_observation_is_bounded_content_addressed_and_owner_scoped
                     .expect("statement"),
                 },
             })],
-            source_ref: WorkChangeRef::parse(id("criteria-event")).expect("source"),
+            source_ref: WorkChangeRef::parse(common::id("criteria-event")).expect("source"),
             reason: Some(WorkChangeReason::parse("Accepted the review boundary.").expect("reason")),
         })
         .await
@@ -135,7 +92,7 @@ async fn declared_work_observation_is_bounded_content_addressed_and_owner_scoped
             expected_goal_revision: GoalRevision::INITIAL,
             goal: WorkGoal::parse("Expose a bounded and verifiable declared-Work snapshot.")
                 .expect("goal"),
-            source_ref: WorkChangeRef::parse(id("goal-event")).expect("source"),
+            source_ref: WorkChangeRef::parse(common::id("goal-event")).expect("source"),
             reason: Some(
                 WorkChangeReason::parse("Clarified the observable outcome.").expect("reason"),
             ),
@@ -158,7 +115,7 @@ async fn declared_work_observation_is_bounded_content_addressed_and_owner_scoped
                 successor_item_id: WorkItemId::parse(&second_item).expect("successor"),
                 kind: WorkItemEdgeKind::Dependency,
             }],
-            source_ref: WorkChangeRef::parse(id("graph-event")).expect("source"),
+            source_ref: WorkChangeRef::parse(common::id("graph-event")).expect("source"),
             reason: Some(
                 WorkChangeReason::parse("Declared the first ready frontier.").expect("reason"),
             ),
@@ -218,8 +175,8 @@ async fn declared_work_observation_is_bounded_content_addressed_and_owner_scoped
         Err(WorkRepositoryError::NotFound)
     ));
 
-    cleanup_owner(&pool, &owner_id).await;
-    cleanup_owner(&pool, &other_owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &other_owner_id).await;
 }
 
 #[tokio::test]
@@ -227,11 +184,10 @@ async fn declared_work_observation_is_bounded_content_addressed_and_owner_scoped
 async fn delivery_is_ready_only_from_current_exact_evidence_or_acceptance() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let criterion_id = id("criterion");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let criterion_id = common::id("criterion");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
@@ -264,7 +220,7 @@ async fn delivery_is_ready_only_from_current_exact_evidence_or_acceptance() {
                         .expect("command"),
                 },
             })],
-            source_ref: WorkChangeRef::parse(id("criteria-source")).expect("source"),
+            source_ref: WorkChangeRef::parse(common::id("criteria-source")).expect("source"),
             reason: None,
         })
         .await
@@ -289,7 +245,7 @@ async fn delivery_is_ready_only_from_current_exact_evidence_or_acceptance() {
             expected_criteria_set_revision: CriterionSetRevision::INITIAL,
             target_goal_revision: GoalRevision::INITIAL,
             target_criteria_set_revision: CriterionSetRevision::new(2).expect("set r2"),
-            source_ref: WorkChangeRef::parse(id("basis-source")).expect("source"),
+            source_ref: WorkChangeRef::parse(common::id("basis-source")).expect("source"),
         })
         .await
         .expect("adopt current criteria");
@@ -312,7 +268,7 @@ async fn delivery_is_ready_only_from_current_exact_evidence_or_acceptance() {
             graph_revision: GraphRevision::INITIAL,
             subject_ref: subject_ref.clone(),
             subject_revision: hash('a'),
-            source_ref: WorkChangeRef::parse(id("subject-source")).expect("source"),
+            source_ref: WorkChangeRef::parse(common::id("subject-source")).expect("source"),
         })
         .await
         .expect("materialize subject");
@@ -326,7 +282,7 @@ async fn delivery_is_ready_only_from_current_exact_evidence_or_acceptance() {
     );
     assert_eq!(unverified.overview().delivery.remaining_criterion_count, 1);
 
-    let run_id = id("run");
+    let run_id = common::id("run");
     sqlx::query(
         "INSERT INTO agent_runs
          (run_id, user_id, session_id, root_run_id, ancestor_path, depth, status,
@@ -336,7 +292,7 @@ async fn delivery_is_ready_only_from_current_exact_evidence_or_acceptance() {
     )
     .bind(&run_id)
     .bind(&owner_id)
-    .bind(id("run-session"))
+    .bind(common::id("run-session"))
     .bind(&run_id)
     .bind(&run_id)
     .bind(&work_id)
@@ -351,7 +307,7 @@ async fn delivery_is_ready_only_from_current_exact_evidence_or_acceptance() {
     };
     let check_produced_at = chrono::Utc::now();
     let check_expires_at = check_produced_at + chrono::Duration::minutes(10);
-    let check_id = id("check");
+    let check_id = common::id("check");
     repository
         .record_check_run(NewWorkCheckRun {
             owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
@@ -370,7 +326,7 @@ async fn delivery_is_ready_only_from_current_exact_evidence_or_acceptance() {
             subject_revision: hash('a'),
             artifact_digest: Some(hash('b')),
             run_ref: WorkChangeRef::parse(&run_id).expect("run"),
-            invocation_ref: WorkChangeRef::parse(id("invocation")).expect("invocation"),
+            invocation_ref: WorkChangeRef::parse(common::id("invocation")).expect("invocation"),
             verifier_kind: CheckVerifierKind::Test,
             verifier_fingerprint: hash('c'),
             environment_fingerprint: hash('d'),
@@ -382,7 +338,7 @@ async fn delivery_is_ready_only_from_current_exact_evidence_or_acceptance() {
                 CheckEvidenceRef::parse("urn:astra:artifact:cloud:delivery/check")
                     .expect("evidence"),
             ],
-            source_cursor: WorkChangeRef::parse(id("check-source")).expect("source"),
+            source_cursor: WorkChangeRef::parse(common::id("check-source")).expect("source"),
             produced_at: check_produced_at,
             expires_at: Some(check_expires_at),
         })
@@ -428,7 +384,7 @@ async fn delivery_is_ready_only_from_current_exact_evidence_or_acceptance() {
             graph_revision: GraphRevision::INITIAL,
             subject_ref: subject_ref.clone(),
             subject_revision: hash('e'),
-            source_ref: WorkChangeRef::parse(id("subject-advanced")).expect("source"),
+            source_ref: WorkChangeRef::parse(common::id("subject-advanced")).expect("source"),
         })
         .await
         .expect("advance exact subject");
@@ -446,7 +402,7 @@ async fn delivery_is_ready_only_from_current_exact_evidence_or_acceptance() {
         "a prior subject's evidence identity must not leak into the current causal cut"
     );
 
-    let decision_identity = id("decision");
+    let decision_identity = common::id("decision");
     repository
         .accept_gaps(NewWorkAcceptanceDecision {
             owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
@@ -465,7 +421,7 @@ async fn delivery_is_ready_only_from_current_exact_evidence_or_acceptance() {
                 reason: AcceptanceGapReason::MissingEvidence,
                 check_run_refs: Vec::new(),
             }],
-            source_cursor: WorkChangeRef::parse(id("acceptance-source")).expect("source"),
+            source_cursor: WorkChangeRef::parse(common::id("acceptance-source")).expect("source"),
         })
         .await
         .expect("accept exact current gap");
@@ -485,7 +441,7 @@ async fn delivery_is_ready_only_from_current_exact_evidence_or_acceptance() {
             if decision_id.as_str() == decision_identity
     ));
 
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -493,10 +449,9 @@ async fn delivery_is_ready_only_from_current_exact_evidence_or_acceptance() {
 async fn missing_current_source_fails_closed_instead_of_fabricating_partial_facts() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
@@ -517,5 +472,5 @@ async fn missing_current_source_fails_closed_instead_of_fabricating_partial_fact
         Err(WorkRepositoryError::Corrupt { .. })
     ));
 
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }

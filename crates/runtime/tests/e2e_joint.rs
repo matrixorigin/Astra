@@ -34,7 +34,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
 use sqlx::Row;
-use test_support::parse_sse_events;
+use test_support::{parse_sse_events, require_db_it_env};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -44,15 +44,6 @@ const OWNER_B_HTTP_TOKEN: &str = "Bearer e2e-owner-b-token";
 
 static SHARED_BOOTSTRAP: tokio::sync::OnceCell<MatrixOneSettings> =
     tokio::sync::OnceCell::const_new();
-
-fn require_db_it_env() -> astra_core::MatrixOneSettings {
-    let enabled = std::env::var("ASTRA_TEST_DB_IT").unwrap_or_default();
-    assert!(
-        enabled == "1",
-        "set ASTRA_TEST_DB_IT=1 for ignored joint E2E tests; got {enabled:?}"
-    );
-    astra_core::MatrixOneSettings::from_env()
-}
 
 async fn setup_pool() -> SharedPool {
     let settings = SHARED_BOOTSTRAP

@@ -1,3 +1,7 @@
+mod test_support;
+
+use test_support::require_db_it_env;
+
 use astra_runtime::prompts::CompactionTier;
 use astra_services::{
     BASELINE_PREVIEW_TEMPLATES, BUDGET_V1_8K_PROMPT_CAP, BUDGET_V1_8K_TOTAL_CAP, BudgetV1_8k,
@@ -15,15 +19,6 @@ fn agent_event_fixture_payload_hash(payload: serde_json::Value) -> String {
         astra_services::observation_capture::ObservationPayloadDomain::AgentEvent,
         &payload,
     )
-}
-
-fn require_db_it_env() -> astra_core::MatrixOneSettings {
-    assert_eq!(
-        std::env::var("ASTRA_TEST_DB_IT").as_deref(),
-        Ok("1"),
-        "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
-    );
-    astra_core::MatrixOneSettings::from_env()
 }
 
 async fn setup_pool() -> astra_core::SharedPool {

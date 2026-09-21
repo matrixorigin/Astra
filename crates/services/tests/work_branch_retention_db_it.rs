@@ -17,11 +17,6 @@ use astra_turn_types::{
     CanonicalDeltaModeV1, CanonicalTurnDeltaV1, SessionKeyV1, SessionSurfaceV1,
 };
 use sqlx::Row;
-use uuid::Uuid;
-
-fn id(prefix: &str) -> String {
-    format!("{prefix}-{}", Uuid::new_v4())
-}
 
 fn genesis(owner_id: &str, work_id: &str, branch_id: &str, session_id: &str) -> WorkGenesis {
     common::work_genesis(
@@ -29,7 +24,7 @@ fn genesis(owner_id: &str, work_id: &str, branch_id: &str, session_id: &str) -> 
         work_id,
         branch_id,
         session_id,
-        &id("intent"),
+        &common::id("intent"),
         "Deliver a verified result without losing branch history.",
     )
 }
@@ -104,52 +99,18 @@ async fn add_non_delivery_branch(
     .expect("add non-delivery branch fixture");
 }
 
-async fn cleanup_owner(pool: &astra_core::SharedPool, owner_id: &str) {
-    for (table, owner_column) in [
-        ("agent_session_execution_slots", "user_id"),
-        ("session_context_operation_receipts", "owner_user_id"),
-        ("session_context_authority_events", "owner_user_id"),
-        ("session_context_heads", "owner_user_id"),
-        ("work_branch_deletion_operations", "owner_id"),
-        ("work_runtime_event_outbox", "owner_id"),
-        ("work_runtime_event_outbox_slots", "owner_id"),
-        ("work_terminal_cuts", "owner_id"),
-        ("work_item_attempts", "owner_id"),
-        ("work_events", "owner_id"),
-        ("work_event_sequences", "owner_id"),
-        ("work_branches", "owner_id"),
-        ("work_item_edges", "owner_id"),
-        ("work_item_revisions", "owner_id"),
-        ("work_items", "owner_id"),
-        ("work_graph_revisions", "owner_id"),
-        ("work_graph_sequences", "owner_id"),
-        ("work_criterion_sets", "owner_id"),
-        ("work_goal_revisions", "owner_id"),
-        ("works", "owner_id"),
-        ("agent_sessions", "user_id"),
-    ] {
-        let statement = format!("DELETE FROM {table} WHERE {owner_column} = ?");
-        sqlx::query(&statement)
-            .bind(owner_id)
-            .execute(pool.get())
-            .await
-            .unwrap_or_else(|error| panic!("clean {table} for test owner: {error}"));
-    }
-}
-
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authority() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
     let deletion = DatabaseWorkBranchDeletionService::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let delivery_branch_id = id("delivery");
-    let delivery_session_id = id("session");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let delivery_branch_id = common::id("delivery");
+    let delivery_session_id = common::id("session");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
     repository
         .create_genesis(genesis(
             &owner_id,
@@ -248,7 +209,7 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
             &owner_id,
             &work_id,
             &branch_id,
-            &id("delete"),
+            &common::id("delete"),
             1,
             1,
         ))
@@ -283,7 +244,7 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
     )
     .bind(&owner_id)
     .bind(&session_id)
-    .bind(id("run"))
+    .bind(common::id("run"))
     .execute(pool.get())
     .await
     .expect("add active run slot");
@@ -429,7 +390,7 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
         resumed.phase,
         astra_services::work::WorkBranchDeletionPhase::LineageGc
     );
-    let orphan_pin_id = id("orphan-pin");
+    let orphan_pin_id = common::id("orphan-pin");
     sqlx::query(
         "INSERT INTO conversation_manifest_pins
          (isolation_domain, owner_user_id, pin_id, parent_session_id,
@@ -482,7 +443,7 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
         reconciled.phase,
         astra_services::work::WorkBranchDeletionPhase::BranchCleanup
     );
-    let patch_commit_operation_id = id("patch-commit");
+    let patch_commit_operation_id = common::id("patch-commit");
     sqlx::query(
         "INSERT INTO work_patch_commit_operations
          (owner_id, work_id, operation_id, request_id, request_digest,
@@ -498,9 +459,9 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
     .bind(&owner_id)
     .bind(&work_id)
     .bind(&patch_commit_operation_id)
-    .bind(id("patch-commit-request"))
+    .bind(common::id("patch-commit-request"))
     .bind("0".repeat(64))
-    .bind(id("patch-artifact"))
+    .bind(common::id("patch-artifact"))
     .bind(&branch_id)
     .bind(&branch_id)
     .bind("workspace/branch-delete")
@@ -511,11 +472,11 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
     .bind("Astra Test")
     .bind("astra@example.test")
     .bind("server-git-worktree-commit-v1")
-    .bind(id("patch-commit-policy"))
+    .bind(common::id("patch-commit-policy"))
     .execute(pool.get())
     .await
     .expect("insert branch-owned patch commit history");
-    let settled_attempt_id = id("settled-attempt");
+    let settled_attempt_id = common::id("settled-attempt");
     sqlx::query(
         "INSERT INTO work_item_attempts
          (owner_id, work_id, branch_id, work_item_id, work_item_revision,
@@ -527,9 +488,9 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
     .bind(&owner_id)
     .bind(&work_id)
     .bind(&branch_id)
-    .bind(id("settled-item"))
+    .bind(common::id("settled-item"))
     .bind(&settled_attempt_id)
-    .bind(id("settled-run"))
+    .bind(common::id("settled-run"))
     .execute(pool.get())
     .await
     .expect("insert branch-owned attempt settlement");
@@ -623,7 +584,7 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
     assert_eq!(terminal.try_get::<i64, _>("patch_commit_rows").unwrap(), 0);
     assert_eq!(terminal.try_get::<i64, _>("settlement_rows").unwrap(), 0);
     assert_eq!(terminal.try_get::<i64, _>("terminal_cut_rows").unwrap(), 0);
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -633,13 +594,12 @@ async fn branch_deletion_admission_is_single_owner_replayable_and_non_destructiv
     let repository = DatabaseWorkRepository::new(pool.clone());
     let deletion = DatabaseWorkBranchDeletionService::new(pool.clone());
     let concurrent_deletion = DatabaseWorkBranchDeletionService::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let delivery_branch_id = id("delivery");
-    let delivery_session_id = id("session");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let delivery_branch_id = common::id("delivery");
+    let delivery_session_id = common::id("session");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
     repository
         .create_genesis(genesis(
             &owner_id,
@@ -659,7 +619,7 @@ async fn branch_deletion_admission_is_single_owner_replayable_and_non_destructiv
     )
     .await;
 
-    let request = deletion_request(&owner_id, &work_id, &branch_id, &id("delete"), 1, 1);
+    let request = deletion_request(&owner_id, &work_id, &branch_id, &common::id("delete"), 1, 1);
     let (left, right) = tokio::join!(
         deletion.admit(&request),
         concurrent_deletion.admit(&request)
@@ -743,14 +703,14 @@ async fn branch_deletion_admission_is_single_owner_replayable_and_non_destructiv
                 &owner_id,
                 &work_id,
                 &branch_id,
-                &id("delete"),
+                &common::id("delete"),
                 2,
                 2,
             ))
             .await,
         Err(WorkBranchDeletionError::DeletionInProgress)
     ));
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -760,18 +720,17 @@ async fn branch_deletion_recovery_claims_are_bounded_disjoint_and_lease_safe() {
     let repository = DatabaseWorkRepository::new(pool.clone());
     let left = DatabaseWorkBranchDeletionService::new(pool.clone());
     let right = DatabaseWorkBranchDeletionService::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let delivery_branch_id = id("delivery");
-    let first_branch_id = id("branch");
-    let second_branch_id = id("branch");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let delivery_branch_id = common::id("delivery");
+    let first_branch_id = common::id("branch");
+    let second_branch_id = common::id("branch");
     repository
         .create_genesis(genesis(
             &owner_id,
             &work_id,
             &delivery_branch_id,
-            &id("delivery-session"),
+            &common::id("delivery-session"),
         ))
         .await
         .expect("create Work");
@@ -781,7 +740,7 @@ async fn branch_deletion_recovery_claims_are_bounded_disjoint_and_lease_safe() {
         &work_id,
         &delivery_branch_id,
         &first_branch_id,
-        &id("session"),
+        &common::id("session"),
     )
     .await;
     add_non_delivery_branch(
@@ -790,7 +749,7 @@ async fn branch_deletion_recovery_claims_are_bounded_disjoint_and_lease_safe() {
         &work_id,
         &delivery_branch_id,
         &second_branch_id,
-        &id("session"),
+        &common::id("session"),
     )
     .await;
     let first = left
@@ -798,7 +757,7 @@ async fn branch_deletion_recovery_claims_are_bounded_disjoint_and_lease_safe() {
             &owner_id,
             &work_id,
             &first_branch_id,
-            &id("delete"),
+            &common::id("delete"),
             1,
             1,
         ))
@@ -809,7 +768,7 @@ async fn branch_deletion_recovery_claims_are_bounded_disjoint_and_lease_safe() {
             &owner_id,
             &work_id,
             &second_branch_id,
-            &id("delete"),
+            &common::id("delete"),
             2,
             1,
         ))
@@ -888,7 +847,7 @@ async fn branch_deletion_recovery_claims_are_bounded_disjoint_and_lease_safe() {
         left.claim_pending_executions(0).await,
         Err(WorkBranchDeletionError::Invalid(_))
     ));
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -897,15 +856,13 @@ async fn branch_deletion_guard_and_conflicts_do_not_claim_or_remove_the_branch()
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
     let deletion = DatabaseWorkBranchDeletionService::new(pool.clone());
-    let owner_id = id("owner");
-    let other_owner_id = id("owner");
-    let work_id = id("work");
-    let delivery_branch_id = id("delivery");
-    let delivery_session_id = id("session");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    cleanup_owner(&pool, &owner_id).await;
-    cleanup_owner(&pool, &other_owner_id).await;
+    let owner_id = common::id("owner");
+    let other_owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let delivery_branch_id = common::id("delivery");
+    let delivery_session_id = common::id("session");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
     repository
         .create_genesis(genesis(
             &owner_id,
@@ -930,7 +887,7 @@ async fn branch_deletion_guard_and_conflicts_do_not_claim_or_remove_the_branch()
             &owner_id,
             &work_id,
             &delivery_branch_id,
-            &id("delete"),
+            &common::id("delete"),
             1,
             1,
         ))
@@ -946,7 +903,7 @@ async fn branch_deletion_guard_and_conflicts_do_not_claim_or_remove_the_branch()
             &owner_id,
             &work_id,
             &branch_id,
-            &id("delete"),
+            &common::id("delete"),
             2,
             1,
         ))
@@ -963,7 +920,7 @@ async fn branch_deletion_guard_and_conflicts_do_not_claim_or_remove_the_branch()
                 &other_owner_id,
                 &work_id,
                 &branch_id,
-                &id("delete"),
+                &common::id("delete"),
                 1,
                 1,
             ))
@@ -994,8 +951,8 @@ async fn branch_deletion_guard_and_conflicts_do_not_claim_or_remove_the_branch()
         branch.try_get::<String, _>("session_id").unwrap(),
         session_id
     );
-    cleanup_owner(&pool, &owner_id).await;
-    cleanup_owner(&pool, &other_owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &other_owner_id).await;
 }
 
 #[tokio::test]
@@ -1004,13 +961,12 @@ async fn archive_restore_is_atomic_replayable_and_runtime_visible() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
     let concurrent_repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let delivery_branch_id = id("delivery");
-    let delivery_session_id = id("session");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let delivery_branch_id = common::id("delivery");
+    let delivery_session_id = common::id("session");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
     repository
         .create_genesis(genesis(
             &owner_id,
@@ -1030,7 +986,7 @@ async fn archive_restore_is_atomic_replayable_and_runtime_visible() {
     )
     .await;
 
-    let archive_request_id = id("archive");
+    let archive_request_id = common::id("archive");
     let archive = retention_change(
         &owner_id,
         &work_id,
@@ -1103,7 +1059,7 @@ async fn archive_restore_is_atomic_replayable_and_runtime_visible() {
         &owner_id,
         &work_id,
         &branch_id,
-        &id("restore"),
+        &common::id("restore"),
         WorkBranchRetentionKind::Restore,
         2,
         2,
@@ -1143,7 +1099,7 @@ async fn archive_restore_is_atomic_replayable_and_runtime_visible() {
             &owner_id,
             &work_id,
             &branch_id,
-            &id("restore"),
+            &common::id("restore"),
             WorkBranchRetentionKind::Restore,
             3,
             3,
@@ -1172,7 +1128,7 @@ async fn archive_restore_is_atomic_replayable_and_runtime_visible() {
             resource: WorkBranchRetentionBasisResource::RequestPayload
         })
     ));
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -1180,15 +1136,13 @@ async fn archive_restore_is_atomic_replayable_and_runtime_visible() {
 async fn archive_rejects_delivery_active_stale_and_foreign_branches_without_mutation() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let other_owner_id = id("owner");
-    let work_id = id("work");
-    let delivery_branch_id = id("delivery");
-    let delivery_session_id = id("session");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    cleanup_owner(&pool, &owner_id).await;
-    cleanup_owner(&pool, &other_owner_id).await;
+    let owner_id = common::id("owner");
+    let other_owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let delivery_branch_id = common::id("delivery");
+    let delivery_session_id = common::id("session");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
     repository
         .create_genesis(genesis(
             &owner_id,
@@ -1212,7 +1166,7 @@ async fn archive_rejects_delivery_active_stale_and_foreign_branches_without_muta
         &owner_id,
         &work_id,
         &delivery_branch_id,
-        &id("archive"),
+        &common::id("archive"),
         WorkBranchRetentionKind::Archive,
         1,
         1,
@@ -1229,7 +1183,7 @@ async fn archive_rejects_delivery_active_stale_and_foreign_branches_without_muta
     )
     .bind(&owner_id)
     .bind(&session_id)
-    .bind(id("run"))
+    .bind(common::id("run"))
     .execute(pool.get())
     .await
     .expect("own active branch session");
@@ -1237,7 +1191,7 @@ async fn archive_rejects_delivery_active_stale_and_foreign_branches_without_muta
         &owner_id,
         &work_id,
         &branch_id,
-        &id("archive"),
+        &common::id("archive"),
         WorkBranchRetentionKind::Archive,
         1,
         1,
@@ -1257,7 +1211,7 @@ async fn archive_rejects_delivery_active_stale_and_foreign_branches_without_muta
         &owner_id,
         &work_id,
         &branch_id,
-        &id("archive"),
+        &common::id("archive"),
         WorkBranchRetentionKind::Archive,
         2,
         1,
@@ -1272,7 +1226,7 @@ async fn archive_rejects_delivery_active_stale_and_foreign_branches_without_muta
         &other_owner_id,
         &work_id,
         &branch_id,
-        &id("archive"),
+        &common::id("archive"),
         WorkBranchRetentionKind::Archive,
         1,
         1,
@@ -1319,6 +1273,6 @@ async fn archive_rejects_delivery_active_stale_and_foreign_branches_without_muta
         state.try_get::<i64, _>("retention_events").expect("events"),
         0
     );
-    cleanup_owner(&pool, &owner_id).await;
-    cleanup_owner(&pool, &other_owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &other_owner_id).await;
 }

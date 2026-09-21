@@ -97,7 +97,8 @@ pub use inference::{
 };
 pub use memory_ranking::{
     MemoryRetrievalOutcome, PERSISTENT_TYPES, RankableMemory, SESSION_SCOPED_TYPE,
-    freshness_suffix_for, is_persistent_type, partition_by_scope, sort_by_retrieval_score,
+    freshness_suffix_for, is_persistent_type, partition_by_scope, rfc3339_days_ago,
+    sort_by_retrieval_score,
 };
 pub use memory_structure::{
     PERSISTENT_MEMORY_TYPES, PersistentStoreRejection, is_persistent_memory_type,

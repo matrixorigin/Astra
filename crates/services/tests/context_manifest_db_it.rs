@@ -20,11 +20,11 @@ mod common;
 async fn manifest_replay_and_collision_preserve_original_and_tenant_identity() {
     use astra_services::observation_capture::DurableCaptureOutcome;
     let pool = common::setup_pool().await;
-    let user = id("capture-user");
-    let other_user = id("capture-other-user");
-    let session = id("capture-session");
-    let other_session = id("capture-other-session");
-    let manifest_id = id("shared-manifest");
+    let user = common::id("capture-user");
+    let other_user = common::id("capture-other-user");
+    let session = common::id("capture-session");
+    let other_session = common::id("capture-other-session");
+    let manifest_id = common::id("shared-manifest");
     insert_session(&pool, &user, &session).await;
     insert_session(&pool, &other_user, &other_session).await;
     let store = DatabaseContextManifestStore::new(pool.clone());
@@ -134,9 +134,9 @@ async fn manifest_replays_reuse_their_physical_connection() {
     let pool = SharedPool::new(&settings)
         .await
         .expect("create one-connection MatrixOne pool");
-    let user_id = id("replay-connection-user");
-    let session_id = id("replay-connection-session");
-    let manifest_id = id("replay-connection-manifest");
+    let user_id = common::id("replay-connection-user");
+    let session_id = common::id("replay-connection-session");
+    let manifest_id = common::id("replay-connection-manifest");
     insert_session(&pool, &user_id, &session_id).await;
     let store = DatabaseContextManifestStore::new(pool.clone());
     let header = manifest(&manifest_id, &user_id, &session_id, None);
@@ -173,20 +173,16 @@ async fn manifest_replays_reuse_their_physical_connection() {
     }
 }
 
-fn id(prefix: &str) -> String {
-    format!("{prefix}-{}", Uuid::new_v4().simple())
-}
-
 #[tokio::test]
 #[ignore = "requires live MatrixOne (ASTRA_TEST_DB_IT=1)"]
 async fn cross_session_artifact_references_replay_once_with_owner_isolation() {
     use astra_services::observation_capture::DurableCaptureOutcome;
     let pool = common::setup_pool().await;
-    let owner = id("ref-owner");
-    let foreign = id("ref-foreign");
-    let target_session = id("ref-target");
-    let source_session = id("ref-source");
-    let artifact_id = id("ref-artifact");
+    let owner = common::id("ref-owner");
+    let foreign = common::id("ref-foreign");
+    let target_session = common::id("ref-target");
+    let source_session = common::id("ref-source");
+    let artifact_id = common::id("ref-artifact");
     insert_session(&pool, &owner, &target_session).await;
     insert_session(&pool, &owner, &source_session).await;
     insert_session(&pool, &foreign, &source_session).await;
@@ -203,7 +199,7 @@ async fn cross_session_artifact_references_replay_once_with_owner_isolation() {
         .await
         .unwrap();
     }
-    let header = manifest(&id("cross-ref"), &owner, &target_session, None);
+    let header = manifest(&common::id("cross-ref"), &owner, &target_session, None);
     let mut reference = item(&source_session, 0);
     reference.source_table = "session_artifacts".into();
     reference.source_id = artifact_id.clone();
@@ -261,7 +257,7 @@ fn manifest(
         user_id: user_id.to_string(),
         session_id: session_id.to_string(),
         run_id: run_id.map(str::to_string),
-        turn_id: id("turn"),
+        turn_id: common::id("turn"),
         model_provider: "test".to_string(),
         model_name: "manifest-db-it".to_string(),
         context_window_tokens: 8_000,
@@ -325,9 +321,9 @@ fn assert_duplicate_item_insert(error: ContextManifestError) {
 #[ignore = "requires live MatrixOne (ASTRA_TEST_DB_IT=1)"]
 async fn later_item_batch_failure_rolls_back_manifest_and_all_items() {
     let pool = common::setup_pool().await;
-    let user_id = id("manifest-rollback-user");
-    let session_id = id("manifest-rollback-session");
-    let manifest_id = id("manifest-rollback");
+    let user_id = common::id("manifest-rollback-user");
+    let session_id = common::id("manifest-rollback-session");
+    let manifest_id = common::id("manifest-rollback");
     insert_session(&pool, &user_id, &session_id).await;
 
     let mut items = (0..129)
@@ -338,7 +334,7 @@ async fn later_item_batch_failure_rolls_back_manifest_and_all_items() {
     items[128].item_order = 127;
 
     let store = DatabaseContextManifestStore::new(pool.clone());
-    let control_id = id("manifest-multibatch-control");
+    let control_id = common::id("manifest-multibatch-control");
     store
         .save_manifest(
             manifest(&control_id, &user_id, &session_id, None),
@@ -379,12 +375,12 @@ async fn later_item_batch_failure_rolls_back_manifest_and_all_items() {
 #[ignore = "requires live MatrixOne (ASTRA_TEST_DB_IT=1)"]
 async fn artifact_reference_updates_are_exact_and_roll_back_after_later_update_failure() {
     let pool = common::setup_pool().await;
-    let user_id = id("artifact-rollback-user");
-    let session_id = id("artifact-rollback-session");
-    let manifest_id = id("artifact-rollback-manifest");
+    let user_id = common::id("artifact-rollback-user");
+    let session_id = common::id("artifact-rollback-session");
+    let manifest_id = common::id("artifact-rollback-manifest");
     let first_artifact_id = format!("a-{}", Uuid::new_v4().simple());
     let failing_artifact_id = format!("z-{}", Uuid::new_v4().simple());
-    let unaffected_artifact_id = id("unaffected-artifact");
+    let unaffected_artifact_id = common::id("unaffected-artifact");
     insert_session(&pool, &user_id, &session_id).await;
     for (artifact_id, reference_count) in [
         (&first_artifact_id, 7_i64),
@@ -406,7 +402,7 @@ async fn artifact_reference_updates_are_exact_and_roll_back_after_later_update_f
         .expect("insert artifact");
     }
 
-    let control_id = id("artifact-reference-control");
+    let control_id = common::id("artifact-reference-control");
     let mut control_items = vec![
         item(&session_id, 0),
         item(&session_id, 1),
@@ -528,8 +524,8 @@ async fn one_connection_preserves_distinct_nullable_parameter_shapes() {
     let pool = SharedPool::new(&settings)
         .await
         .expect("create one-connection MatrixOne pool");
-    let user_id = id("nullable-user");
-    let session_id = id("nullable-session");
+    let user_id = common::id("nullable-user");
+    let session_id = common::id("nullable-session");
     insert_session(&pool, &user_id, &session_id).await;
     let store = DatabaseContextManifestStore::new(pool.clone());
 
@@ -546,19 +542,24 @@ async fn one_connection_preserves_distinct_nullable_parameter_shapes() {
             .collect::<Vec<_>>()
     };
 
-    let second_id = id("nullable-raw-ref-change");
+    let second_id = common::id("nullable-raw-ref-change");
     let mut second = manifest(&second_id, &user_id, &session_id, Some("run-present"));
     second.tokenizer_id = Some("tokenizer-present".to_string());
     second.budget_template_id = Some("budget-present".to_string());
     second.turn_intent = Some("intent-present".to_string());
-    let third_id = id("nullable-source-hash-change");
+    let third_id = common::id("nullable-source-hash-change");
     let mut third = manifest(&third_id, &user_id, &session_id, Some("run-third"));
     third.tokenizer_id = Some("tokenizer-third".to_string());
     third.budget_template_id = Some("budget-third".to_string());
     third.turn_intent = Some("intent-third".to_string());
     let cases = vec![
         (
-            manifest(&id("nullable-all-none"), &user_id, &session_id, None),
+            manifest(
+                &common::id("nullable-all-none"),
+                &user_id,
+                &session_id,
+                None,
+            ),
             make_items([
                 (None, None),
                 (Some("first-hash-only"), None),
@@ -676,9 +677,9 @@ async fn one_connection_preserves_distinct_nullable_parameter_shapes() {
 #[ignore = "requires live MatrixOne (ASTRA_TEST_DB_IT=1)"]
 async fn pending_delete_fence_rejects_manifest_without_partial_rows() {
     let pool = common::setup_pool().await;
-    let user_id = id("deleting-user");
-    let session_id = id("deleting-session");
-    let manifest_id = id("deleting-manifest");
+    let user_id = common::id("deleting-user");
+    let session_id = common::id("deleting-session");
+    let manifest_id = common::id("deleting-manifest");
     insert_session(&pool, &user_id, &session_id).await;
     let fence = sqlx::query(
         "INSERT INTO agent_session_lifecycle_fences

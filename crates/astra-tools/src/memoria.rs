@@ -1143,7 +1143,7 @@ impl MemoriaToolGateway {
                 .get("observed_at")
                 .or_else(|| item.get("updated_at"))
                 .and_then(Value::as_str)
-                .and_then(parse_rfc3339_days_ago);
+                .and_then(astra_turn_types::rfc3339_days_ago);
             let trust_tier = item
                 .get("trust_tier")
                 .and_then(Value::as_str)
@@ -2398,41 +2398,6 @@ fn memory_feedback_payload(
         feedback["user_id"] = Value::String(user_id.to_string());
     }
     feedback
-}
-
-/// Very small RFC3339-ish parser: returns "days since" for a timestamp
-/// of the form `YYYY-MM-DDTHH:MM:SSZ` (or any prefix with a valid
-/// `YYYY-MM-DD`). Returns `None` on malformed input or future dates.
-fn parse_rfc3339_days_ago(ts: &str) -> Option<i64> {
-    let date_part = ts.get(..10)?;
-    let mut parts = date_part.split('-');
-    let y: i32 = parts.next()?.parse().ok()?;
-    let m: u32 = parts.next()?.parse().ok()?;
-    let d: u32 = parts.next()?.parse().ok()?;
-    let date_days = days_from_civil(y, m, d)?;
-    let now_days = days_from_civil_now()?;
-    let diff = now_days - date_days;
-    if diff < 0 { None } else { Some(diff) }
-}
-
-fn days_from_civil(y: i32, m: u32, d: u32) -> Option<i64> {
-    if !(1..=12).contains(&m) || d == 0 || d > 31 {
-        return None;
-    }
-    let y = if m <= 2 { y - 1 } else { y } as i64;
-    let era = y.div_euclid(400);
-    let yoe = (y - era * 400) as u32;
-    let doy = (153 * if m > 2 { m - 3 } else { m + 9 } as i64 + 2) / 5 + d as i64 - 1;
-    let doe = yoe as i64 * 365 + (yoe / 4) as i64 - (yoe / 100) as i64 + doy;
-    Some(era * 146_097 + doe - 719_468)
-}
-
-fn days_from_civil_now() -> Option<i64> {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs() as i64;
-    Some(secs / 86_400)
 }
 
 /// Build a one-shot Memoria HTTP client + auth header.

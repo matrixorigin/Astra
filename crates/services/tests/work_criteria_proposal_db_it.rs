@@ -8,19 +8,14 @@ use astra_services::work::{
     WorkProposalSourceKind, WorkProposalStatus, WorkRepository, WorkRepositoryError, WorkRevision,
 };
 use sqlx::Row;
-use uuid::Uuid;
-
-fn id(prefix: &str) -> String {
-    format!("{prefix}-{}", Uuid::new_v4())
-}
 
 fn genesis(owner_id: &str, work_id: &str, branch_id: &str) -> astra_services::work::WorkGenesis {
     common::work_genesis(
         owner_id,
         work_id,
         branch_id,
-        &id("session"),
-        &id("intent"),
+        &common::id("session"),
+        &common::id("intent"),
         "Deliver the feature with explicit evidence.",
     )
 }
@@ -54,7 +49,7 @@ fn proposal(
         expected_graph_revision: GraphRevision::INITIAL,
         members,
         source_kind: WorkProposalSourceKind::Model,
-        source_ref: WorkChangeRef::parse(id("model-invocation")).expect("source"),
+        source_ref: WorkChangeRef::parse(common::id("model-invocation")).expect("source"),
     }
 }
 
@@ -96,48 +91,17 @@ fn rejection(
     }
 }
 
-async fn cleanup_owner(pool: &astra_core::SharedPool, owner_id: &str) {
-    for table in [
-        "work_events",
-        "work_attention_receipts",
-        "work_event_sequences",
-        "work_proposals",
-        "work_proposal_sequences",
-        "work_acceptance_decisions",
-        "work_check_runs",
-        "work_branch_subjects",
-        "work_item_edges",
-        "work_item_revisions",
-        "work_items",
-        "work_graph_revisions",
-        "work_graph_sequences",
-        "work_branches",
-        "work_criterion_sets",
-        "work_criterion_revisions",
-        "work_criteria",
-        "work_goal_revisions",
-        "works",
-    ] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE owner_id = ?"))
-            .bind(owner_id)
-            .execute(pool.get())
-            .await
-            .unwrap_or_else(|error| panic!("cleanup {table}: {error}"));
-    }
-}
-
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn criteria_proposal_is_canonical_bounded_discoverable_and_owner_scoped() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
     let concurrent = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let other_owner_id = id("other-owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let proposal_id = id("proposal");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let other_owner_id = common::id("other-owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let proposal_id = common::id("proposal");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
@@ -148,8 +112,11 @@ async fn criteria_proposal_is_canonical_bounded_discoverable_and_owner_scoped() 
         &branch_id,
         &proposal_id,
         vec![
-            new_test_criterion(&id("criterion-b"), "The integration contract passes."),
-            new_test_criterion(&id("criterion-a"), "The domain contract passes."),
+            new_test_criterion(
+                &common::id("criterion-b"),
+                "The integration contract passes.",
+            ),
+            new_test_criterion(&common::id("criterion-a"), "The domain contract passes."),
         ],
     );
     let (left, right) = tokio::join!(
@@ -194,7 +161,7 @@ async fn criteria_proposal_is_canonical_bounded_discoverable_and_owner_scoped() 
     );
     let mut conflicting = input;
     conflicting.members = vec![new_test_criterion(
-        &id("different"),
+        &common::id("different"),
         "A different typed criterion passes.",
     )];
     assert!(matches!(
@@ -216,7 +183,7 @@ async fn criteria_proposal_is_canonical_bounded_discoverable_and_owner_scoped() 
     .expect("counts");
     assert_eq!(counts.try_get::<i64, _>("proposals").unwrap(), 1);
     assert_eq!(counts.try_get::<i64, _>("events").unwrap(), 1);
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -225,11 +192,10 @@ async fn concurrent_acceptance_is_atomic_idempotent_and_keeps_branch_basis_expli
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
     let concurrent = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let criterion_id = id("criterion");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let criterion_id = common::id("criterion");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
@@ -239,7 +205,7 @@ async fn concurrent_acceptance_is_atomic_idempotent_and_keeps_branch_basis_expli
             &owner_id,
             &work_id,
             &branch_id,
-            &id("proposal"),
+            &common::id("proposal"),
             vec![new_test_criterion(
                 &criterion_id,
                 "The targeted repository test passes.",
@@ -247,7 +213,7 @@ async fn concurrent_acceptance_is_atomic_idempotent_and_keeps_branch_basis_expli
         ))
         .await
         .expect("proposal");
-    let command = acceptance(&proposed, &id("accept-action"));
+    let command = acceptance(&proposed, &common::id("accept-action"));
     let (left, right) = tokio::join!(
         repository.accept_criteria_proposal(command.clone()),
         concurrent.accept_criteria_proposal(command)
@@ -302,7 +268,7 @@ async fn concurrent_acceptance_is_atomic_idempotent_and_keeps_branch_basis_expli
     );
     assert_eq!(state.try_get::<i64, _>("definitions").unwrap(), 1);
     assert_eq!(state.try_get::<i64, _>("accepted_events").unwrap(), 1);
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -310,10 +276,9 @@ async fn concurrent_acceptance_is_atomic_idempotent_and_keeps_branch_basis_expli
 async fn stale_acceptance_has_no_residue_but_exact_rejection_remains_available() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
@@ -323,9 +288,9 @@ async fn stale_acceptance_has_no_residue_but_exact_rejection_remains_available()
             &owner_id,
             &work_id,
             &branch_id,
-            &id("proposal"),
+            &common::id("proposal"),
             vec![new_test_criterion(
-                &id("criterion"),
+                &common::id("criterion"),
                 "The stale proposal must not materialize.",
             )],
         ))
@@ -339,14 +304,14 @@ async fn stale_acceptance_has_no_residue_but_exact_rejection_remains_available()
             expected_goal_revision: GoalRevision::INITIAL,
             goal: WorkGoal::parse("Deliver the revised goal with explicit evidence.")
                 .expect("goal"),
-            source_ref: WorkChangeRef::parse(id("goal-action")).expect("source"),
+            source_ref: WorkChangeRef::parse(common::id("goal-action")).expect("source"),
             reason: None,
         })
         .await
         .expect("revise Goal");
     assert!(matches!(
         repository
-            .accept_criteria_proposal(acceptance(&proposed, &id("stale-accept")))
+            .accept_criteria_proposal(acceptance(&proposed, &common::id("stale-accept")))
             .await,
         Err(WorkRepositoryError::InvalidWorkProposalBasis { .. })
     ));
@@ -366,7 +331,7 @@ async fn stale_acceptance_has_no_residue_but_exact_rejection_remains_available()
     assert_eq!(residue.try_get::<i64, _>("sets").unwrap(), 1);
 
     let rejected = repository
-        .reject_criteria_proposal(rejection(&proposed, &id("reject-action")))
+        .reject_criteria_proposal(rejection(&proposed, &common::id("reject-action")))
         .await
         .expect("reject stale proposal explicitly");
     assert_eq!(rejected.status, WorkProposalStatus::Rejected);
@@ -408,7 +373,7 @@ async fn stale_acceptance_has_no_residue_but_exact_rejection_remains_available()
     .try_get::<i64, _>("count")
     .unwrap();
     assert_eq!(event_count, 1);
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -416,12 +381,11 @@ async fn stale_acceptance_has_no_residue_but_exact_rejection_remains_available()
 async fn acceptance_event_conflict_rolls_back_work_criteria_and_proposal() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let proposal_id = id("proposal");
-    let resolution_ref = id("accept-action");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let proposal_id = common::id("proposal");
+    let resolution_ref = common::id("accept-action");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
@@ -433,7 +397,7 @@ async fn acceptance_event_conflict_rolls_back_work_criteria_and_proposal() {
             &branch_id,
             &proposal_id,
             vec![new_test_criterion(
-                &id("criterion"),
+                &common::id("criterion"),
                 "The transaction either commits completely or not at all.",
             )],
         ))
@@ -497,5 +461,5 @@ async fn acceptance_event_conflict_rolls_back_work_criteria_and_proposal() {
     assert_eq!(state.try_get::<i64, _>("sets").unwrap(), 1);
     assert_eq!(state.try_get::<i64, _>("definitions").unwrap(), 0);
     assert_eq!(state.try_get::<i64, _>("last_event_seq").unwrap(), 2);
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }

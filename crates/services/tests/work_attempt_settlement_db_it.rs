@@ -15,11 +15,6 @@ use astra_services::{
         WorkRepository, WorkTaskGraphQuery,
     },
 };
-use uuid::Uuid;
-
-fn id(prefix: &str) -> String {
-    format!("{prefix}-{}", Uuid::new_v4())
-}
 
 fn task(item_id: &str) -> WorkGraphItemChange {
     WorkGraphItemChange::New(NewWorkItem {
@@ -34,13 +29,13 @@ fn task(item_id: &str) -> WorkGraphItemChange {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn one_primary_run_executes_multiple_attempts_without_child_run_identity_aliasing() {
     let pool = common::setup_pool().await;
-    let owner_id = id("primary-attempt-owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    let run_id = id("root-run");
-    let task_a = id("task-a");
-    let task_b = id("task-b");
+    let owner_id = common::id("primary-attempt-owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
+    let run_id = common::id("root-run");
+    let task_a = common::id("task-a");
+    let task_b = common::id("task-b");
     let repository = DatabaseWorkRepository::new(pool.clone());
     repository
         .create_genesis(common::work_genesis(
@@ -48,7 +43,7 @@ async fn one_primary_run_executes_multiple_attempts_without_child_run_identity_a
             &work_id,
             &branch_id,
             &session_id,
-            &id("intent"),
+            &common::id("intent"),
             "Execute two tasks in one primary session.",
         ))
         .await
@@ -62,7 +57,7 @@ async fn one_primary_run_executes_multiple_attempts_without_child_run_identity_a
             expected_graph_revision: GraphRevision::INITIAL,
             items: vec![task(&task_a), task(&task_b)],
             edges: Vec::new(),
-            source_ref: WorkChangeRef::parse(id("graph-change")).unwrap(),
+            source_ref: WorkChangeRef::parse(common::id("graph-change")).unwrap(),
             reason: None,
         })
         .await
@@ -75,8 +70,8 @@ async fn one_primary_run_executes_multiple_attempts_without_child_run_identity_a
         .expect("insert root executor run");
 
     let service = DatabaseWorkAttemptSettlementService::new(pool.clone());
-    let first_attempt_id = id("attempt-0");
-    let second_attempt_id = WorkItemAttemptId::parse(id("attempt-1")).unwrap();
+    let first_attempt_id = common::id("attempt-0");
+    let second_attempt_id = WorkItemAttemptId::parse(common::id("attempt-1")).unwrap();
     service
         .begin_attempt(NewWorkItemAttempt {
             owner_id: WorkOwnerId::parse(&owner_id).unwrap(),
@@ -169,7 +164,7 @@ async fn one_primary_run_executes_multiple_attempts_without_child_run_identity_a
             &run_id,
             7,
             final_settlement.clone(),
-            WorkItemAttemptId::parse(id("unused-successor")).unwrap(),
+            WorkItemAttemptId::parse(common::id("unused-successor")).unwrap(),
         )
         .await
         .expect("settle second primary attempt");
@@ -193,7 +188,7 @@ async fn one_primary_run_executes_multiple_attempts_without_child_run_identity_a
             &run_id,
             7,
             final_settlement.clone(),
-            WorkItemAttemptId::parse(id("unused-replay-successor")).unwrap(),
+            WorkItemAttemptId::parse(common::id("unused-replay-successor")).unwrap(),
         )
         .await
         .expect("exact lost-response replay");
@@ -206,7 +201,7 @@ async fn one_primary_run_executes_multiple_attempts_without_child_run_identity_a
             &run_id,
             99,
             final_settlement.clone(),
-            WorkItemAttemptId::parse(id("unused-epoch-successor")).unwrap(),
+            WorkItemAttemptId::parse(common::id("unused-epoch-successor")).unwrap(),
         )
         .await;
     assert!(
@@ -241,7 +236,7 @@ async fn one_primary_run_executes_multiple_attempts_without_child_run_identity_a
     .bind(&owner_id)
     .bind(&work_id)
     .bind(&branch_id)
-    .bind(id("duplicate-terminal-cut"))
+    .bind(common::id("duplicate-terminal-cut"))
     .execute(pool.get())
     .await;
     assert!(
@@ -280,7 +275,7 @@ async fn one_primary_run_executes_multiple_attempts_without_child_run_identity_a
             &run_id,
             7,
             final_settlement,
-            WorkItemAttemptId::parse(id("unused-replay-successor")).unwrap(),
+            WorkItemAttemptId::parse(common::id("unused-replay-successor")).unwrap(),
         )
         .await;
     assert!(matches!(
@@ -364,13 +359,13 @@ async fn one_primary_run_executes_multiple_attempts_without_child_run_identity_a
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn competing_terminal_cut_rolls_back_the_attempt_settlement() {
     let pool = common::setup_pool().await;
-    let owner_id = id("terminal-conflict-owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    let run_id = id("root-run");
-    let task_id = id("task");
-    let attempt_id = id("attempt");
+    let owner_id = common::id("terminal-conflict-owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
+    let run_id = common::id("root-run");
+    let task_id = common::id("task");
+    let attempt_id = common::id("attempt");
     let repository = DatabaseWorkRepository::new(pool.clone());
     repository
         .create_genesis(common::work_genesis(
@@ -378,7 +373,7 @@ async fn competing_terminal_cut_rolls_back_the_attempt_settlement() {
             &work_id,
             &branch_id,
             &session_id,
-            &id("intent"),
+            &common::id("intent"),
             "Prove terminal-cut conflicts roll back settlement.",
         ))
         .await
@@ -392,7 +387,7 @@ async fn competing_terminal_cut_rolls_back_the_attempt_settlement() {
             expected_graph_revision: GraphRevision::INITIAL,
             items: vec![task(&task_id)],
             edges: Vec::new(),
-            source_ref: WorkChangeRef::parse(id("graph-change")).unwrap(),
+            source_ref: WorkChangeRef::parse(common::id("graph-change")).unwrap(),
             reason: None,
         })
         .await
@@ -421,7 +416,7 @@ async fn competing_terminal_cut_rolls_back_the_attempt_settlement() {
         })
         .await
         .expect("begin primary attempt");
-    let competing_attempt_id = id("competing-attempt");
+    let competing_attempt_id = common::id("competing-attempt");
     sqlx::query(
         "INSERT INTO work_terminal_cuts
          (owner_id, work_id, branch_id, graph_revision, attempt_id, control_epoch)
@@ -447,7 +442,7 @@ async fn competing_terminal_cut_rolls_back_the_attempt_settlement() {
                 blocker_kind: None,
                 unavailable_capabilities: Vec::new(),
             },
-            WorkItemAttemptId::parse(id("unused-successor")).unwrap(),
+            WorkItemAttemptId::parse(common::id("unused-successor")).unwrap(),
         )
         .await;
     assert!(matches!(
@@ -485,13 +480,13 @@ async fn competing_terminal_cut_rolls_back_the_attempt_settlement() {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn blocked_primary_settlement_does_not_start_a_successor() {
     let pool = common::setup_pool().await;
-    let owner_id = id("blocked-primary-owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    let run_id = id("root-run");
-    let task_a = id("task-a");
-    let task_b = id("task-b");
+    let owner_id = common::id("blocked-primary-owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
+    let run_id = common::id("root-run");
+    let task_a = common::id("task-a");
+    let task_b = common::id("task-b");
     let repository = DatabaseWorkRepository::new(pool.clone());
     repository
         .create_genesis(common::work_genesis(
@@ -499,7 +494,7 @@ async fn blocked_primary_settlement_does_not_start_a_successor() {
             &work_id,
             &branch_id,
             &session_id,
-            &id("intent"),
+            &common::id("intent"),
             "Do not advance past a blocked task.",
         ))
         .await
@@ -513,7 +508,7 @@ async fn blocked_primary_settlement_does_not_start_a_successor() {
             expected_graph_revision: GraphRevision::INITIAL,
             items: vec![task(&task_a), task(&task_b)],
             edges: Vec::new(),
-            source_ref: WorkChangeRef::parse(id("graph-change")).unwrap(),
+            source_ref: WorkChangeRef::parse(common::id("graph-change")).unwrap(),
             reason: None,
         })
         .await
@@ -526,7 +521,7 @@ async fn blocked_primary_settlement_does_not_start_a_successor() {
         .expect("insert root executor run");
 
     let service = DatabaseWorkAttemptSettlementService::new(pool.clone());
-    let active_attempt_id = id("active-attempt");
+    let active_attempt_id = common::id("active-attempt");
     service
         .begin_attempt(NewWorkItemAttempt {
             owner_id: WorkOwnerId::parse(&owner_id).unwrap(),
@@ -556,7 +551,7 @@ async fn blocked_primary_settlement_does_not_start_a_successor() {
                 blocker_kind: Some(WorkAttemptBlockerKind::DependencyBlocked),
                 unavailable_capabilities: Vec::new(),
             },
-            WorkItemAttemptId::parse(id("must-not-start")).unwrap(),
+            WorkItemAttemptId::parse(common::id("must-not-start")).unwrap(),
         )
         .await
         .expect("record blocked settlement");
@@ -576,16 +571,16 @@ async fn blocked_primary_settlement_does_not_start_a_successor() {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn paused_primary_attempt_takeover_requires_inactive_old_run_and_same_session() {
     let pool = common::setup_pool().await;
-    let owner_id = id("takeover-owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    let old_run_id = id("old-run");
-    let new_run_id = id("new-run");
-    let other_session_run_id = id("other-session-run");
-    let other_session_id = id("other-session");
-    let task_id = id("task");
-    let attempt_id = id("attempt");
+    let owner_id = common::id("takeover-owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
+    let old_run_id = common::id("old-run");
+    let new_run_id = common::id("new-run");
+    let other_session_run_id = common::id("other-session-run");
+    let other_session_id = common::id("other-session");
+    let task_id = common::id("task");
+    let attempt_id = common::id("attempt");
     let repository = DatabaseWorkRepository::new(pool.clone());
     repository
         .create_genesis(common::work_genesis(
@@ -593,7 +588,7 @@ async fn paused_primary_attempt_takeover_requires_inactive_old_run_and_same_sess
             &work_id,
             &branch_id,
             &session_id,
-            &id("intent"),
+            &common::id("intent"),
             "Resume one paused primary task without changing its identity.",
         ))
         .await
@@ -607,7 +602,7 @@ async fn paused_primary_attempt_takeover_requires_inactive_old_run_and_same_sess
             expected_graph_revision: GraphRevision::INITIAL,
             items: vec![task(&task_id)],
             edges: Vec::new(),
-            source_ref: WorkChangeRef::parse(id("graph-change")).unwrap(),
+            source_ref: WorkChangeRef::parse(common::id("graph-change")).unwrap(),
             reason: None,
         })
         .await
@@ -789,7 +784,7 @@ fn item_run(
         ancestor_path: Some(run_id.into()),
         depth: 0,
         delegation_id: None,
-        agent_id: Some(id("agent")),
+        agent_id: Some(common::id("agent")),
         retry_of: None,
         retry_scope: None,
         status: "running".into(),
@@ -824,18 +819,18 @@ fn item_run(
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn settlement_is_exact_owner_scoped_immutable_and_idempotent() {
     let pool = common::setup_pool().await;
-    let owner_id = id("settlement-owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    let run_id = id("run");
+    let owner_id = common::id("settlement-owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
+    let run_id = common::id("run");
     DatabaseWorkRepository::new(pool.clone())
         .create_genesis(common::work_genesis(
             &owner_id,
             &work_id,
             &branch_id,
             &session_id,
-            &id("intent"),
+            &common::id("intent"),
             "Prove exact WorkItem attempt settlement.",
         ))
         .await
@@ -910,7 +905,7 @@ async fn settlement_is_exact_owner_scoped_immutable_and_idempotent() {
     assert!(matches!(
         service
             .record_for_run(
-                &id("other-owner"),
+                &common::id("other-owner"),
                 &run_id,
                 NewWorkAttemptSettlement {
                     outcome: WorkAttemptOutcome::Failed,
@@ -928,19 +923,19 @@ async fn settlement_is_exact_owner_scoped_immutable_and_idempotent() {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn terminal_fallback_settlement_is_atomic_and_never_overwrites_an_explicit_outcome() {
     let pool = common::setup_pool().await;
-    let owner_id = id("terminal-settlement-owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    let explicit_run_id = id("explicit-run");
-    let fallback_run_id = id("fallback-run");
+    let owner_id = common::id("terminal-settlement-owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
+    let explicit_run_id = common::id("explicit-run");
+    let fallback_run_id = common::id("fallback-run");
     DatabaseWorkRepository::new(pool.clone())
         .create_genesis(common::work_genesis(
             &owner_id,
             &work_id,
             &branch_id,
             &session_id,
-            &id("intent"),
+            &common::id("intent"),
             "Prove terminal WorkItem delivery reconciliation.",
         ))
         .await

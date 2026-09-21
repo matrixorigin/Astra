@@ -331,11 +331,38 @@ pub(crate) enum ServerDefaultModel {
     Unavailable(astra_core::ClassifiedError),
 }
 
-fn model_list_entry_is_active(entry: &ModelListItemResponse) -> bool {
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ModelCatalogError {
+    #[error("not logged in")]
+    NotAuthenticated,
+    #[error(transparent)]
+    Request(#[from] astra_thin_client::ThinClientError),
+    #[error("invalid model catalog JSON: {0}")]
+    InvalidJson(#[from] serde_json::Error),
+    #[error("invalid model catalog protocol: {0}")]
+    Protocol(String),
+}
+
+impl ModelCatalogError {
+    pub(crate) fn is_authentication_failure(&self) -> bool {
+        matches!(self, Self::NotAuthenticated)
+            || matches!(
+                self,
+                Self::Request(astra_thin_client::ThinClientError::Api { status, .. })
+                    if *status == reqwest::StatusCode::UNAUTHORIZED
+            )
+    }
+
+    pub(crate) fn is_transport_failure(&self) -> bool {
+        matches!(self, Self::Request(error) if error.is_transport())
+    }
+}
+
+pub(crate) fn model_list_entry_is_active(entry: &ModelListItemResponse) -> bool {
     entry.is_active
 }
 
-fn model_list_entry_name(entry: &ModelListItemResponse) -> Option<&str> {
+pub(crate) fn model_list_entry_name(entry: &ModelListItemResponse) -> Option<&str> {
     let name = entry.name.trim();
     (!name.is_empty()).then_some(name)
 }
@@ -363,6 +390,21 @@ pub(crate) async fn load_server_model_catalog(
     token: &str,
     purpose: astra_core::model_wire::purpose::ModelCatalogPurpose,
 ) -> Result<(Vec<ModelListItemResponse>, String), String> {
+    fetch_server_model_catalog(api, Some(token), purpose)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Fetch and validate the complete public model catalog once. Interactive
+/// pickers and server-governed model selection must share this pagination and
+/// protocol-validation path; otherwise a client can make different decisions
+/// about the same catalog depending on which UI surface requested it.
+pub(crate) async fn fetch_server_model_catalog(
+    api: &astra_thin_client::ThinClient,
+    token: Option<&str>,
+    purpose: astra_core::model_wire::purpose::ModelCatalogPurpose,
+) -> Result<(Vec<ModelListItemResponse>, String), ModelCatalogError> {
+    let tok = token.ok_or(ModelCatalogError::NotAuthenticated)?;
     let mut cursor: Option<ModelListCursor> = None;
     let mut items = Vec::new();
     let mut total = None;
@@ -371,7 +413,9 @@ pub(crate) async fn load_server_model_catalog(
     loop {
         if let Some(current) = &cursor {
             if !seen_cursors.insert(current.clone()) {
-                return Err("server model registry cycled its continuation cursor".to_string());
+                return Err(ModelCatalogError::Protocol(
+                    "server model registry cycled its continuation cursor".to_string(),
+                ));
             }
         }
         let cursor_tuple = cursor.as_ref().map(|value| {
@@ -383,48 +427,59 @@ pub(crate) async fn load_server_model_catalog(
         });
         let response = api
             .get_models_page_response_timeout(
-                token,
+                tok,
                 astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT,
                 cursor_tuple,
                 purpose,
             )
-            .await
-            .map_err(|error| format!("failed to load server model registry: {error}"))?;
+            .await?;
         if !response.status().is_success() {
-            return Err(format!(
-                "server model registry request failed with status {}",
-                response.status()
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ModelCatalogError::Request(
+                astra_thin_client::ThinClientError::Api { status, body },
             ));
         }
-        let page: ModelListPageResponse = response.json().await.map_err(|error| {
-            format!("server model registry response was not valid JSON: {error}")
+        let body = response.text().await.map_err(|error| {
+            ModelCatalogError::Request(astra_thin_client::ThinClientError::from(error))
         })?;
+        let page: ModelListPageResponse = serde_json::from_str(&body)?;
         if page.limit == 0 || page.limit > 200 {
-            return Err("server model registry returned an invalid page limit".to_string());
+            return Err(ModelCatalogError::Protocol(
+                "server model registry returned an invalid page limit".to_string(),
+            ));
         }
         if total.get_or_insert(page.total) != &page.total {
-            return Err("server model registry changed total during pagination".to_string());
+            return Err(ModelCatalogError::Protocol(
+                "server model registry changed total during pagination".to_string(),
+            ));
         }
         if revision.get_or_insert_with(|| page.catalog_revision.clone()) != &page.catalog_revision {
-            return Err("server model registry changed revision during pagination".to_string());
+            return Err(ModelCatalogError::Protocol(
+                "server model registry changed revision during pagination".to_string(),
+            ));
         }
         let page_had_items = !page.items.is_empty();
         items.extend(page.items);
         let Some(next) = page.next_cursor else {
             if items.len() != page.total as usize {
-                return Err(format!(
+                return Err(ModelCatalogError::Protocol(format!(
                     "server model registry ended with {} items but advertised {}",
                     items.len(),
                     page.total
-                ));
+                )));
             }
             return Ok((items, revision.unwrap_or_default()));
         };
         if !page_had_items {
-            return Err("server model registry returned a cursor without items".to_string());
+            return Err(ModelCatalogError::Protocol(
+                "server model registry returned a cursor without items".to_string(),
+            ));
         }
         if cursor.as_ref() == Some(&next) {
-            return Err("server model registry repeated its continuation cursor".to_string());
+            return Err(ModelCatalogError::Protocol(
+                "server model registry repeated its continuation cursor".to_string(),
+            ));
         }
         cursor = Some(next);
     }
@@ -2192,15 +2247,15 @@ mod tests {
     }
 
     use super::{
-        ACCESS_TOKEN_REFRESH_SKEW_SECS, BannerTextStyle, RestoredSessionState, ServerDefaultModel,
-        SilentRefreshError, access_token_needs_refresh, applied_user_intents_from_turn_metadata,
-        banner_session_display, banner_welcome_text, current_access_token, current_git_root,
-        default_model_selection_from_access, ensure_state_default_model, fresh_access_token,
-        git_root_from, initialize_session_state, load_server_model_access,
-        model_default_invalid_reason_message, model_selection_for_name_from_catalog,
-        model_selection_from_exact_response, pending_recovery_status_line,
-        resolve_server_default_model, resolve_server_model_selection, restore_history_from_journal,
-        restore_session_state_from_journal, restored_journal_state,
+        ACCESS_TOKEN_REFRESH_SKEW_SECS, BannerTextStyle, ModelCatalogError, RestoredSessionState,
+        ServerDefaultModel, SilentRefreshError, access_token_needs_refresh,
+        applied_user_intents_from_turn_metadata, banner_session_display, banner_welcome_text,
+        current_access_token, current_git_root, default_model_selection_from_access,
+        ensure_state_default_model, fetch_server_model_catalog, fresh_access_token, git_root_from,
+        initialize_session_state, load_server_model_access, model_default_invalid_reason_message,
+        model_selection_for_name_from_catalog, model_selection_from_exact_response,
+        pending_recovery_status_line, resolve_server_default_model, resolve_server_model_selection,
+        restore_history_from_journal, restore_session_state_from_journal, restored_journal_state,
         should_keep_credentials_on_refresh_error, style_banner_text,
     };
     use crate::cli::cli_config::cli_utils::{
@@ -2313,6 +2368,31 @@ mod tests {
             "total": total,
             "catalog_revision": "sha256:test-catalog"
         })
+    }
+
+    #[tokio::test]
+    async fn model_catalog_fetch_rejects_non_catalog_json_at_the_shared_boundary() {
+        for body in ["not-json", r#"{"models":[]}"#, "[]"] {
+            let mock = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/models"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&mock)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+
+            let error = fetch_server_model_catalog(
+                &api,
+                Some("token"),
+                astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+            )
+            .await
+            .expect_err("obsolete or malformed catalog shapes must fail at the shared boundary");
+            assert!(
+                matches!(error, ModelCatalogError::InvalidJson(_)),
+                "{error}"
+            );
+        }
     }
 
     #[test]

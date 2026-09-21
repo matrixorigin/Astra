@@ -7,11 +7,6 @@ use astra_services::work::{
     WorkRepositoryError, WorkSubjectRef,
 };
 use sqlx::Row;
-use uuid::Uuid;
-
-fn id(prefix: &str) -> String {
-    format!("{prefix}-{}", Uuid::new_v4())
-}
 
 fn hash(byte: char) -> WorkContentHash {
     WorkContentHash::parse(format!("sha256:{}", byte.to_string().repeat(64))).expect("hash")
@@ -22,8 +17,8 @@ fn genesis(owner_id: &str, work_id: &str, branch_id: &str) -> WorkGenesis {
         owner_id,
         work_id,
         branch_id,
-        &id("session"),
-        &id("intent"),
+        &common::id("session"),
+        &common::id("intent"),
         "Deliver and verify one exact materialized target.",
     )
 }
@@ -48,52 +43,15 @@ fn subject_change(
     }
 }
 
-async fn cleanup_owner(pool: &astra_core::SharedPool, owner_id: &str) {
-    for (table, owner_column) in [
-        ("work_runtime_event_outbox", "owner_id"),
-        ("work_runtime_event_outbox_slots", "owner_id"),
-        ("work_events", "owner_id"),
-        ("work_attention_receipts", "owner_id"),
-        ("work_event_sequences", "owner_id"),
-        ("work_current_gap_acceptances", "owner_id"),
-        ("work_acceptance_decisions", "owner_id"),
-        ("work_check_runs", "owner_id"),
-        ("work_proposals", "owner_id"),
-        ("work_proposal_sequences", "owner_id"),
-        ("work_branch_subjects", "owner_id"),
-        ("work_branches", "owner_id"),
-        ("work_item_edges", "owner_id"),
-        ("work_item_revisions", "owner_id"),
-        ("work_items", "owner_id"),
-        ("work_graph_revisions", "owner_id"),
-        ("work_graph_sequences", "owner_id"),
-        ("work_criterion_sets", "owner_id"),
-        ("work_criterion_revisions", "owner_id"),
-        ("work_criteria", "owner_id"),
-        ("work_goal_revisions", "owner_id"),
-        ("works", "owner_id"),
-        ("agent_sessions", "user_id"),
-    ] {
-        let statement = format!("DELETE FROM {table} WHERE {owner_column} = ?");
-        sqlx::query(&statement)
-            .bind(owner_id)
-            .execute(pool.get())
-            .await
-            .unwrap_or_else(|error| panic!("clean {table}: {error}"));
-    }
-}
-
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn concurrent_subject_cas_has_one_winner_and_exact_replays_are_noops() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let other_owner_id = id("other-owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    cleanup_owner(&pool, &owner_id).await;
-    cleanup_owner(&pool, &other_owner_id).await;
+    let owner_id = common::id("owner");
+    let other_owner_id = common::id("other-owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
@@ -121,8 +79,8 @@ async fn concurrent_subject_cas_has_one_winner_and_exact_replays_are_noops() {
         Err(WorkRepositoryError::NotFound)
     ));
 
-    let left_source = id("materialization-left");
-    let right_source = id("materialization-right");
+    let left_source = common::id("materialization-left");
+    let right_source = common::id("materialization-right");
     let left_change = subject_change(
         &owner_id,
         &work_id,
@@ -170,7 +128,8 @@ async fn concurrent_subject_cas_has_one_winner_and_exact_replays_are_noops() {
     let no_op = repository
         .set_branch_subject(WorkBranchSubjectChange {
             expected_branch_revision: winner.branch_revision,
-            source_ref: WorkChangeRef::parse(id("same-target-new-observation")).expect("source"),
+            source_ref: WorkChangeRef::parse(common::id("same-target-new-observation"))
+                .expect("source"),
             ..winning_change
         })
         .await
@@ -183,7 +142,7 @@ async fn concurrent_subject_cas_has_one_winner_and_exact_replays_are_noops() {
         branch_id: WorkBranchId::parse(&branch_id).expect("branch"),
         expected_branch_revision: winner.branch_revision,
         graph_revision: GraphRevision::INITIAL,
-        source_ref: WorkChangeRef::parse(id("execution-boundary")).expect("source"),
+        source_ref: WorkChangeRef::parse(common::id("execution-boundary")).expect("source"),
     };
     let invalidated_revision = repository
         .invalidate_branch_subject(invalidation.clone())
@@ -239,8 +198,8 @@ async fn concurrent_subject_cas_has_one_winner_and_exact_replays_are_noops() {
         ["work_created", "subject_changed", "subject_changed"]
     );
 
-    cleanup_owner(&pool, &owner_id).await;
-    cleanup_owner(&pool, &other_owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &other_owner_id).await;
 }
 
 #[tokio::test]
@@ -248,11 +207,10 @@ async fn concurrent_subject_cas_has_one_winner_and_exact_replays_are_noops() {
 async fn event_identity_failure_rolls_back_subject_and_branch_together() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let source_ref = id("materialization");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let source_ref = common::id("materialization");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
@@ -313,5 +271,5 @@ async fn event_identity_failure_rolls_back_subject_and_branch_together() {
             .expect("event count");
     assert_eq!(event_count, 2, "failed subject change leaves no event");
 
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }

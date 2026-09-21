@@ -1,5 +1,7 @@
 mod test_support;
 
+use test_support::require_db_it_env;
+
 use astra_runtime::server::artifact_retention_sweeper::run_artifact_retention_gc_once;
 use astra_services::{
     DatabaseRunStateStore, DatabaseSessionArtifactStore, DatabaseSessionService,
@@ -13,15 +15,6 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{MySql, QueryBuilder, Row};
 use uuid::Uuid;
-
-fn require_db_it_env() -> astra_core::MatrixOneSettings {
-    assert_eq!(
-        std::env::var("ASTRA_TEST_DB_IT").as_deref(),
-        Ok("1"),
-        "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
-    );
-    astra_core::MatrixOneSettings::from_env()
-}
 
 static SHARED_POOL: tokio::sync::OnceCell<astra_core::SharedPool> =
     tokio::sync::OnceCell::const_new();

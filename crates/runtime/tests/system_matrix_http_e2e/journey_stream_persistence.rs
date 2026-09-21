@@ -25,8 +25,8 @@ use tower::util::ServiceExt;
 use uuid::Uuid;
 
 use super::harness::{
-    E2E_PASSWORD, bootstrap, cleanup_session_data, delete_json, get_json, post_json,
-    seeded_model_selection, sse_first_data_json_with_type,
+    E2E_PASSWORD, bootstrap, cleanup_session_data, delete_json, get_json, parse_sse_events,
+    post_json, seeded_model_selection, sse_first_data_json_with_type,
     try_claim_interrupted_matrix_e2e_fixture,
 };
 
@@ -154,13 +154,6 @@ fn deferred_tool_invoke_round(call_id: &str, tool_name: &str, arguments: Value) 
             json!({"name": tool_name, "arguments": arguments}),
         )]
     })
-}
-
-fn parse_sse_events(raw: &str) -> Vec<Value> {
-    raw.lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter_map(|data| serde_json::from_str(data).ok())
-        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -12,11 +12,6 @@ use astra_services::work::{
     WorkRepository, WorkRepositoryError, WorkRevision, WorkSubjectRef,
 };
 use sqlx::Row;
-use uuid::Uuid;
-
-fn id(prefix: &str) -> String {
-    format!("{prefix}-{}", Uuid::new_v4())
-}
 
 fn hash(byte: char) -> WorkContentHash {
     WorkContentHash::parse(format!("sha256:{}", byte.to_string().repeat(64))).expect("hash")
@@ -31,8 +26,8 @@ fn genesis(owner_id: &str, work_id: &str, branch_id: &str) -> WorkGenesis {
         owner_id,
         work_id,
         branch_id,
-        &id("session"),
-        &id("intent"),
+        &common::id("session"),
+        &common::id("intent"),
         "Deliver with an explicit evidence-gap decision.",
     )
 }
@@ -73,7 +68,7 @@ async fn accept_criteria(
                     })
                 })
                 .collect(),
-            source_ref: WorkChangeRef::parse(id("criteria-source")).expect("source"),
+            source_ref: WorkChangeRef::parse(common::id("criteria-source")).expect("source"),
             reason: None,
         })
         .await
@@ -89,7 +84,7 @@ async fn accept_criteria(
             expected_criteria_set_revision: CriterionSetRevision::INITIAL,
             target_goal_revision: GoalRevision::INITIAL,
             target_criteria_set_revision: CriterionSetRevision::new(2).expect("set r2"),
-            source_ref: WorkChangeRef::parse(id("basis-source")).expect("source"),
+            source_ref: WorkChangeRef::parse(common::id("basis-source")).expect("source"),
         })
         .await
         .expect("adopt criteria");
@@ -122,7 +117,7 @@ fn decision(
                 check_run_refs: Vec::new(),
             })
             .collect(),
-        source_cursor: WorkChangeRef::parse(id("decision-cursor")).expect("cursor"),
+        source_cursor: WorkChangeRef::parse(common::id("decision-cursor")).expect("cursor"),
     }
 }
 
@@ -150,7 +145,7 @@ fn partial_check(
         subject_revision: hash('a'),
         artifact_digest: None,
         run_ref: WorkChangeRef::parse(attempt_id(branch_id)).expect("run"),
-        invocation_ref: WorkChangeRef::parse(id("invocation")).expect("invocation"),
+        invocation_ref: WorkChangeRef::parse(common::id("invocation")).expect("invocation"),
         verifier_kind: CheckVerifierKind::Test,
         verifier_fingerprint: hash('b'),
         environment_fingerprint: hash('c'),
@@ -162,7 +157,7 @@ fn partial_check(
             CheckEvidenceRef::parse("urn:astra:artifact:cloud:partial-check/result")
                 .expect("evidence"),
         ],
-        source_cursor: WorkChangeRef::parse(id("check-cursor")).expect("cursor"),
+        source_cursor: WorkChangeRef::parse(common::id("check-cursor")).expect("cursor"),
         produced_at: "2026-08-01T00:00:00Z".parse().expect("time"),
         expires_at: None,
     }
@@ -184,7 +179,7 @@ async fn establish_subject(
             graph_revision: GraphRevision::INITIAL,
             subject_ref: WorkSubjectRef::parse("workspace-1/repository-1/head-1").expect("subject"),
             subject_revision: hash('a'),
-            source_ref: WorkChangeRef::parse(id("subject-source")).expect("source"),
+            source_ref: WorkChangeRef::parse(common::id("subject-source")).expect("source"),
         })
         .await
         .expect("establish current subject");
@@ -198,7 +193,7 @@ async fn establish_subject(
     )
     .bind(&run_id)
     .bind(owner_id)
-    .bind(id("run-session"))
+    .bind(common::id("run-session"))
     .bind(&run_id)
     .bind(&run_id)
     .bind(work_id)
@@ -207,42 +202,6 @@ async fn establish_subject(
     .execute(pool.get())
     .await
     .expect("persist exact root WorkItem attempt");
-}
-
-async fn cleanup_owner(pool: &astra_core::SharedPool, owner_id: &str) {
-    for (table, owner_column) in [
-        ("agent_runs", "user_id"),
-        ("work_runtime_event_outbox", "owner_id"),
-        ("work_runtime_event_outbox_slots", "owner_id"),
-        ("work_events", "owner_id"),
-        ("work_attention_receipts", "owner_id"),
-        ("work_event_sequences", "owner_id"),
-        ("work_current_gap_acceptances", "owner_id"),
-        ("work_acceptance_decisions", "owner_id"),
-        ("work_check_runs", "owner_id"),
-        ("work_proposals", "owner_id"),
-        ("work_proposal_sequences", "owner_id"),
-        ("work_branch_subjects", "owner_id"),
-        ("work_branches", "owner_id"),
-        ("work_item_edges", "owner_id"),
-        ("work_item_revisions", "owner_id"),
-        ("work_items", "owner_id"),
-        ("work_graph_revisions", "owner_id"),
-        ("work_graph_sequences", "owner_id"),
-        ("work_criterion_sets", "owner_id"),
-        ("work_criterion_revisions", "owner_id"),
-        ("work_criteria", "owner_id"),
-        ("work_goal_revisions", "owner_id"),
-        ("works", "owner_id"),
-        ("agent_sessions", "user_id"),
-    ] {
-        let statement = format!("DELETE FROM {table} WHERE {owner_column} = ?");
-        sqlx::query(&statement)
-            .bind(owner_id)
-            .execute(pool.get())
-            .await
-            .unwrap_or_else(|error| panic!("clean {table}: {error}"));
-    }
 }
 
 async fn decision_count(pool: &astra_core::SharedPool, owner_id: &str, work_id: &str) -> i64 {
@@ -276,12 +235,11 @@ async fn current_gap_count(pool: &astra_core::SharedPool, owner_id: &str, work_i
 async fn acceptance_is_canonical_idempotent_and_revision_bound() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let criterion_ids = [id("criterion-a"), id("criterion-b")];
-    let decision_id = id("decision");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let criterion_ids = [common::id("criterion-a"), common::id("criterion-b")];
+    let decision_id = common::id("decision");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
@@ -291,7 +249,7 @@ async fn acceptance_is_canonical_idempotent_and_revision_bound() {
         &owner_id,
         &work_id,
         &branch_id,
-        &id("no-subject-decision"),
+        &common::id("no-subject-decision"),
         &criterion_ids,
     );
     no_subject.branch_revision = WorkBranchRevision::new(2).expect("branch r2");
@@ -349,7 +307,7 @@ async fn acceptance_is_canonical_idempotent_and_revision_bound() {
             expected_goal_revision: GoalRevision::INITIAL,
             goal: WorkGoal::parse("Changed Goal invalidates the old acceptance basis.")
                 .expect("goal"),
-            source_ref: WorkChangeRef::parse(id("goal-source")).expect("source"),
+            source_ref: WorkChangeRef::parse(common::id("goal-source")).expect("source"),
             reason: None,
         })
         .await
@@ -358,7 +316,7 @@ async fn acceptance_is_canonical_idempotent_and_revision_bound() {
         &owner_id,
         &work_id,
         &branch_id,
-        &id("stale-decision"),
+        &common::id("stale-decision"),
         &criterion_ids,
     );
     assert!(matches!(
@@ -403,7 +361,7 @@ async fn acceptance_is_canonical_idempotent_and_revision_bound() {
         );
     }
 
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -411,12 +369,11 @@ async fn acceptance_is_canonical_idempotent_and_revision_bound() {
 async fn partial_evidence_must_reference_a_same_criterion_check_run() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let criterion_ids = [id("criterion-a"), id("criterion-b")];
-    let check_run_id = id("check");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let criterion_ids = [common::id("criterion-a"), common::id("criterion-b")];
+    let check_run_id = common::id("check");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
@@ -438,7 +395,7 @@ async fn partial_evidence_must_reference_a_same_criterion_check_run() {
         &owner_id,
         &work_id,
         &branch_id,
-        &id("accepted-decision"),
+        &common::id("accepted-decision"),
         &criterion_ids[..1],
     );
     accepted.accepted_gaps[0].reason = AcceptanceGapReason::PartialCoverage;
@@ -453,7 +410,7 @@ async fn partial_evidence_must_reference_a_same_criterion_check_run() {
         &owner_id,
         &work_id,
         &branch_id,
-        &id("false-stale-decision"),
+        &common::id("false-stale-decision"),
         &criterion_ids[..1],
     );
     falsely_stale.accepted_gaps[0].reason = AcceptanceGapReason::StaleEvidence;
@@ -470,7 +427,7 @@ async fn partial_evidence_must_reference_a_same_criterion_check_run() {
         &owner_id,
         &work_id,
         &branch_id,
-        &id("mismatched-decision"),
+        &common::id("mismatched-decision"),
         &criterion_ids[1..],
     );
     mismatched.accepted_gaps[0].reason = AcceptanceGapReason::PartialCoverage;
@@ -492,7 +449,7 @@ async fn partial_evidence_must_reference_a_same_criterion_check_run() {
             graph_revision: GraphRevision::INITIAL,
             subject_ref: WorkSubjectRef::parse("workspace-1/repository-1/head-1").expect("subject"),
             subject_revision: hash('e'),
-            source_ref: WorkChangeRef::parse(id("new-subject-source")).expect("source"),
+            source_ref: WorkChangeRef::parse(common::id("new-subject-source")).expect("source"),
         })
         .await
         .expect("advance current subject");
@@ -500,7 +457,7 @@ async fn partial_evidence_must_reference_a_same_criterion_check_run() {
         &owner_id,
         &work_id,
         &branch_id,
-        &id("stale-evidence-decision"),
+        &common::id("stale-evidence-decision"),
         &criterion_ids[..1],
     );
     genuinely_stale.branch_revision = WorkBranchRevision::new(4).expect("branch r4");
@@ -578,7 +535,7 @@ async fn partial_evidence_must_reference_a_same_criterion_check_run() {
         "invalid acceptance attempts must leave no event"
     );
 
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -586,13 +543,12 @@ async fn partial_evidence_must_reference_a_same_criterion_check_run() {
 async fn concurrent_gap_decisions_converge_by_work_event_order() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let criterion_id = id("criterion");
-    let first_id = id("decision-a");
-    let second_id = id("decision-b");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let criterion_id = common::id("criterion");
+    let first_id = common::id("decision-a");
+    let second_id = common::id("decision-b");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
@@ -672,7 +628,7 @@ async fn concurrent_gap_decisions_converge_by_work_event_order() {
     );
     assert_eq!(current_gap_count(&pool, &owner_id, &work_id).await, 1);
 
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -680,13 +636,12 @@ async fn concurrent_gap_decisions_converge_by_work_event_order() {
 async fn event_retention_prunes_history_without_erasing_current_gap_acceptance() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let criterion_id = id("criterion");
-    let check_run_id = id("accepted-check");
-    let decision_id = id("decision");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let criterion_id = common::id("criterion");
+    let check_run_id = common::id("accepted-check");
+    let decision_id = common::id("decision");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
@@ -788,7 +743,7 @@ async fn event_retention_prunes_history_without_erasing_current_gap_acceptance()
                 &work_id,
                 &branch_id,
                 &criterion_id,
-                &id(suffix),
+                &common::id(suffix),
             ))
             .await
             .expect("append retained check");
@@ -848,5 +803,5 @@ async fn event_retention_prunes_history_without_erasing_current_gap_acceptance()
         "the exact verifier payload hash survives detail retention"
     );
 
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }

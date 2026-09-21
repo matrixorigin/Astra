@@ -7,19 +7,14 @@ use astra_services::work::{
     WorkGenesis, WorkId, WorkOwnerId, WorkRepository, WorkRepositoryError, WorkRevision,
 };
 use sqlx::Row;
-use uuid::Uuid;
-
-fn id(prefix: &str) -> String {
-    format!("{prefix}-{}", Uuid::new_v4())
-}
 
 fn genesis(owner_id: &str, work_id: &str) -> WorkGenesis {
     common::work_genesis(
         owner_id,
         work_id,
-        &id("branch"),
-        &id("session"),
-        &id("intent"),
+        &common::id("branch"),
+        &common::id("session"),
+        &common::id("intent"),
         "Implement and prove the acceptance contract.",
     )
 }
@@ -55,39 +50,8 @@ fn criteria_change(
         expected_work_revision: WorkRevision::INITIAL,
         expected_criteria_set_revision: CriterionSetRevision::INITIAL,
         members,
-        source_ref: WorkChangeRef::parse(id("event")).expect("source"),
+        source_ref: WorkChangeRef::parse(common::id("event")).expect("source"),
         reason: Some(WorkChangeReason::parse("User accepted Done when.").expect("reason")),
-    }
-}
-
-async fn cleanup_owner(pool: &astra_core::SharedPool, owner_id: &str) {
-    for (table, owner_column) in [
-        ("work_runtime_event_outbox", "owner_id"),
-        ("work_runtime_event_outbox_slots", "owner_id"),
-        ("work_events", "owner_id"),
-        ("work_attention_receipts", "owner_id"),
-        ("work_event_sequences", "owner_id"),
-        ("work_proposals", "owner_id"),
-        ("work_proposal_sequences", "owner_id"),
-        ("work_branches", "owner_id"),
-        ("work_item_edges", "owner_id"),
-        ("work_item_revisions", "owner_id"),
-        ("work_items", "owner_id"),
-        ("work_graph_revisions", "owner_id"),
-        ("work_graph_sequences", "owner_id"),
-        ("work_criterion_sets", "owner_id"),
-        ("work_criterion_revisions", "owner_id"),
-        ("work_criteria", "owner_id"),
-        ("work_goal_revisions", "owner_id"),
-        ("works", "owner_id"),
-        ("agent_sessions", "user_id"),
-    ] {
-        let statement = format!("DELETE FROM {table} WHERE {owner_column} = ?");
-        sqlx::query(&statement)
-            .bind(owner_id)
-            .execute(pool.get())
-            .await
-            .unwrap_or_else(|error| panic!("clean {table}: {error}"));
     }
 }
 
@@ -114,11 +78,10 @@ async fn count_work_rows(
 async fn accepted_criteria_are_immutable_canonical_and_leave_branch_basis_explicit() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let criterion_a = id("criterion-a");
-    let criterion_b = id("criterion-b");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let criterion_a = common::id("criterion-a");
+    let criterion_b = common::id("criterion-b");
     repository
         .create_genesis(genesis(&owner_id, &work_id))
         .await
@@ -271,7 +234,7 @@ async fn accepted_criteria_are_immutable_canonical_and_leave_branch_basis_explic
     let empty: serde_json::Value = serde_json::from_str(&empty_manifest).expect("empty manifest");
     assert_eq!(empty["members"], serde_json::json!([]));
 
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -279,15 +242,14 @@ async fn accepted_criteria_are_immutable_canonical_and_leave_branch_basis_explic
 async fn invalid_or_missing_criterion_members_roll_back_the_work_cas() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
     repository
         .create_genesis(genesis(&owner_id, &work_id))
         .await
         .expect("genesis");
 
-    let missing_id = CriterionId::parse(id("missing")).expect("missing id");
+    let missing_id = CriterionId::parse(common::id("missing")).expect("missing id");
     let missing_ref = CriterionRevisionRef {
         criterion_id: missing_id.clone(),
         revision: CriterionRevision::INITIAL,
@@ -304,7 +266,7 @@ async fn invalid_or_missing_criterion_members_roll_back_the_work_cas() {
             if missing.len() == 1 && missing[0].criterion_id == missing_id
     ));
 
-    let duplicate_id = id("duplicate");
+    let duplicate_id = common::id("duplicate");
     assert!(matches!(
         repository
             .accept_criteria(criteria_change(
@@ -341,7 +303,7 @@ async fn invalid_or_missing_criterion_members_roll_back_the_work_cas() {
         0
     );
 
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -349,9 +311,8 @@ async fn invalid_or_missing_criterion_members_roll_back_the_work_cas() {
 async fn concurrent_criterion_set_cas_has_one_complete_winner() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
     repository
         .create_genesis(genesis(&owner_id, &work_id))
         .await
@@ -363,7 +324,7 @@ async fn concurrent_criterion_set_cas_has_one_complete_winner() {
         &owner_id,
         &work_id,
         vec![new_criterion(
-            &id("criterion"),
+            &common::id("criterion"),
             CriterionKind::CommandCheck,
             "The command succeeds.",
         )],
@@ -372,7 +333,7 @@ async fn concurrent_criterion_set_cas_has_one_complete_winner() {
         &owner_id,
         &work_id,
         vec![new_criterion(
-            &id("criterion"),
+            &common::id("criterion"),
             CriterionKind::TestCheck,
             "The second targeted test passes.",
         )],
@@ -409,5 +370,5 @@ async fn concurrent_criterion_set_cas_has_one_complete_winner() {
         "losing criterion revisions must roll back"
     );
 
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }

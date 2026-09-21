@@ -1,3 +1,7 @@
+mod test_support;
+
+use test_support::require_db_it_env;
+
 use std::{sync::Arc, time::Instant};
 
 use astra_core::SharedPool;
@@ -9,15 +13,6 @@ use astra_services::{
 use serde_json::json;
 use sqlx::Row;
 use uuid::Uuid;
-
-fn require_db_it_env() -> astra_core::MatrixOneSettings {
-    let enabled = std::env::var("ASTRA_TEST_DB_IT").unwrap_or_default();
-    assert!(
-        enabled == "1",
-        "set ASTRA_TEST_DB_IT=1 for ignored perf benchmarks; got {enabled:?}"
-    );
-    astra_core::MatrixOneSettings::from_env()
-}
 
 async fn setup_pool() -> SharedPool {
     let settings = require_db_it_env();

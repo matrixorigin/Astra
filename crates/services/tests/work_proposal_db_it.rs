@@ -8,19 +8,14 @@ use astra_services::work::{
     WorkRepositoryError, WorkRevision,
 };
 use sqlx::Row;
-use uuid::Uuid;
-
-fn id(prefix: &str) -> String {
-    format!("{prefix}-{}", Uuid::new_v4())
-}
 
 fn genesis(owner_id: &str, work_id: &str, branch_id: &str) -> astra_services::work::WorkGenesis {
     common::work_genesis(
         owner_id,
         work_id,
         branch_id,
-        &id("session"),
-        &id("intent"),
+        &common::id("session"),
+        &common::id("intent"),
         "Expand a typed plan without changing authority.",
     )
 }
@@ -68,42 +63,7 @@ fn proposal(
         reason: astra_services::work::WorkChangeReason::parse("Refine the Work plan")
             .expect("reason"),
         source_kind: WorkProposalSourceKind::Model,
-        source_ref: WorkChangeRef::parse(id("model-invocation")).expect("source"),
-    }
-}
-
-async fn cleanup_owner(pool: &astra_core::SharedPool, owner_id: &str) {
-    for (table, owner_column) in [
-        ("work_runtime_event_outbox", "owner_id"),
-        ("work_runtime_event_outbox_slots", "owner_id"),
-        ("work_events", "owner_id"),
-        ("work_attention_receipts", "owner_id"),
-        ("work_event_sequences", "owner_id"),
-        ("work_current_gap_acceptances", "owner_id"),
-        ("work_acceptance_decisions", "owner_id"),
-        ("work_check_runs", "owner_id"),
-        ("work_proposals", "owner_id"),
-        ("work_proposal_sequences", "owner_id"),
-        ("work_branch_subjects", "owner_id"),
-        ("work_branches", "owner_id"),
-        ("work_item_edges", "owner_id"),
-        ("work_item_revisions", "owner_id"),
-        ("work_items", "owner_id"),
-        ("work_graph_revisions", "owner_id"),
-        ("work_graph_sequences", "owner_id"),
-        ("work_criterion_sets", "owner_id"),
-        ("work_criterion_revisions", "owner_id"),
-        ("work_criteria", "owner_id"),
-        ("work_goal_revisions", "owner_id"),
-        ("works", "owner_id"),
-        ("agent_sessions", "user_id"),
-    ] {
-        let statement = format!("DELETE FROM {table} WHERE {owner_column} = ?");
-        sqlx::query(&statement)
-            .bind(owner_id)
-            .execute(pool.get())
-            .await
-            .unwrap_or_else(|error| panic!("clean {table}: {error}"));
+        source_ref: WorkChangeRef::parse(common::id("model-invocation")).expect("source"),
     }
 }
 
@@ -112,15 +72,13 @@ async fn cleanup_owner(pool: &astra_core::SharedPool, owner_id: &str) {
 async fn proposal_is_canonical_idempotent_non_authoritative_and_revision_pinned() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let other_owner_id = id("other-owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let proposal_id = id("proposal");
-    let task_a = id("task-a");
-    let task_b = id("task-b");
-    cleanup_owner(&pool, &owner_id).await;
-    cleanup_owner(&pool, &other_owner_id).await;
+    let owner_id = common::id("owner");
+    let other_owner_id = common::id("other-owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let proposal_id = common::id("proposal");
+    let task_a = common::id("task-a");
+    let task_b = common::id("task-b");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
@@ -273,8 +231,8 @@ async fn proposal_is_canonical_idempotent_non_authoritative_and_revision_pinned(
         &owner_id,
         &work_id,
         &branch_id,
-        &id("wrong-owner-proposal"),
-        vec![item(&id("other-task"))],
+        &common::id("wrong-owner-proposal"),
+        vec![item(&common::id("other-task"))],
         Vec::new(),
     );
     wrong_owner.owner_id = WorkOwnerId::parse(&other_owner_id).expect("other owner");
@@ -287,9 +245,12 @@ async fn proposal_is_canonical_idempotent_non_authoritative_and_revision_pinned(
         &owner_id,
         &work_id,
         &branch_id,
-        &id("missing-endpoint"),
-        vec![item(&id("valid-task"))],
-        vec![dependency(&id("missing"), &id("also-missing"))],
+        &common::id("missing-endpoint"),
+        vec![item(&common::id("valid-task"))],
+        vec![dependency(
+            &common::id("missing"),
+            &common::id("also-missing"),
+        )],
     );
     assert!(matches!(
         repository.propose_plan(missing_endpoint).await,
@@ -301,7 +262,7 @@ async fn proposal_is_canonical_idempotent_non_authoritative_and_revision_pinned(
         &owner_id,
         &work_id,
         &branch_id,
-        &id("cyclic"),
+        &common::id("cyclic"),
         vec![item(&task_a), item(&task_b)],
         vec![dependency(&task_a, &task_b), dependency(&task_b, &task_a)],
     );
@@ -319,7 +280,7 @@ async fn proposal_is_canonical_idempotent_non_authoritative_and_revision_pinned(
             expected_work_revision: WorkRevision::INITIAL,
             expected_goal_revision: GoalRevision::INITIAL,
             goal: WorkGoal::parse("A new goal makes delayed proposals stale.").expect("goal"),
-            source_ref: WorkChangeRef::parse(id("goal-source")).expect("source"),
+            source_ref: WorkChangeRef::parse(common::id("goal-source")).expect("source"),
             reason: None,
         })
         .await
@@ -328,8 +289,8 @@ async fn proposal_is_canonical_idempotent_non_authoritative_and_revision_pinned(
         &owner_id,
         &work_id,
         &branch_id,
-        &id("incoherent-proposal"),
-        vec![item(&id("incoherent-task"))],
+        &common::id("incoherent-proposal"),
+        vec![item(&common::id("incoherent-task"))],
         Vec::new(),
     );
     incoherent.expected_work_revision = revised.work.parts().work_revision;
@@ -344,8 +305,8 @@ async fn proposal_is_canonical_idempotent_non_authoritative_and_revision_pinned(
         &owner_id,
         &work_id,
         &branch_id,
-        &id("stale-proposal"),
-        vec![item(&id("stale-task"))],
+        &common::id("stale-proposal"),
+        vec![item(&common::id("stale-task"))],
         Vec::new(),
     );
     assert!(matches!(
@@ -368,8 +329,8 @@ async fn proposal_is_canonical_idempotent_non_authoritative_and_revision_pinned(
         ["work_created", "plan_proposed", "goal_revised"]
     );
 
-    cleanup_owner(&pool, &owner_id).await;
-    cleanup_owner(&pool, &other_owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &other_owner_id).await;
 }
 
 #[tokio::test]
@@ -377,10 +338,9 @@ async fn proposal_is_canonical_idempotent_non_authoritative_and_revision_pinned(
 async fn pending_capacity_is_bounded_and_expiry_reclaims_one_slot() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
@@ -388,7 +348,7 @@ async fn pending_capacity_is_bounded_and_expiry_reclaims_one_slot() {
 
     let mut proposal_ids = Vec::new();
     for index in 0..8 {
-        let proposal_id = id(&format!("proposal-{index}"));
+        let proposal_id = common::id(&format!("proposal-{index}"));
         proposal_ids.push(proposal_id.clone());
         repository
             .propose_plan(proposal(
@@ -396,19 +356,19 @@ async fn pending_capacity_is_bounded_and_expiry_reclaims_one_slot() {
                 &work_id,
                 &branch_id,
                 &proposal_id,
-                vec![item(&id(&format!("task-{index}")))],
+                vec![item(&common::id(&format!("task-{index}")))],
                 Vec::new(),
             ))
             .await
             .expect("bounded pending proposal");
     }
-    let ninth_id = id("proposal-nine");
+    let ninth_id = common::id("proposal-nine");
     let ninth = proposal(
         &owner_id,
         &work_id,
         &branch_id,
         &ninth_id,
-        vec![item(&id("task-nine"))],
+        vec![item(&common::id("task-nine"))],
         Vec::new(),
     );
     assert!(matches!(
@@ -476,7 +436,7 @@ async fn pending_capacity_is_bounded_and_expiry_reclaims_one_slot() {
     .expect("proposal event count");
     assert_eq!(proposed_events, 9, "capacity rejection emits no event");
 
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -484,11 +444,10 @@ async fn pending_capacity_is_bounded_and_expiry_reclaims_one_slot() {
 async fn proposal_event_conflict_rolls_back_capacity_and_payload() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let proposal_id = id("proposal");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let proposal_id = common::id("proposal");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
@@ -514,7 +473,7 @@ async fn proposal_event_conflict_rolls_back_capacity_and_payload() {
                 &work_id,
                 &branch_id,
                 &proposal_id,
-                vec![item(&id("task"))],
+                vec![item(&common::id("task"))],
                 Vec::new(),
             ))
             .await,
@@ -552,5 +511,5 @@ async fn proposal_event_conflict_rolls_back_capacity_and_payload() {
     .expect("event head");
     assert_eq!(event_head, 1, "event allocation must roll back");
 
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }

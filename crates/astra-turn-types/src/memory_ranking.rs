@@ -115,7 +115,7 @@ impl RankableMemory {
         // runtime-side `MemoriaMemory::age_days` which owns chrono. This
         // shim uses a lightweight parse so tests can still exercise the
         // age-suffix formatting without pulling chrono into turn-types.
-        parse_rfc3339_days_ago(ts)
+        rfc3339_days_ago(ts)
     }
 
     /// Compact freshness suffix.
@@ -171,7 +171,7 @@ fn tier_params(trust_tier: Option<&str>) -> (i64, &'static str) {
 /// timestamp of the form `YYYY-MM-DDTHH:MM:SSZ` (or any prefix with
 /// a valid `YYYY-MM-DD`). Returns `None` on malformed input or when
 /// the date is in the future (clock skew).
-fn parse_rfc3339_days_ago(ts: &str) -> Option<i64> {
+pub fn rfc3339_days_ago(ts: &str) -> Option<i64> {
     // Parse YYYY-MM-DD.
     let date_part = ts.get(..10)?;
     let mut parts = date_part.split('-');

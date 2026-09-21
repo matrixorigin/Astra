@@ -72,6 +72,7 @@ pub mod diff_utils;
 pub mod edge_tools;
 pub mod entrypoint;
 pub(crate) mod explain_analyze_artifact;
+pub(crate) mod explain_analyze_format;
 pub(crate) mod explain_analyze_html;
 pub(crate) mod explain_analyze_report;
 pub mod git_branch_cache;
@@ -132,7 +133,7 @@ pub(crate) mod tests {
         ]))
     }
 
-    async fn spawn_mock_app(app: Router) -> String {
+    pub(crate) async fn spawn_mock_app(app: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base = format!("http://{addr}");
@@ -143,7 +144,7 @@ pub(crate) mod tests {
         base
     }
 
-    async fn spawn_mock(app: Router) -> String {
+    pub(crate) async fn spawn_mock(app: Router) -> String {
         spawn_mock_app(
             app.route("/models", get(mock_models_response))
                 .route("/model-access", get(mock_model_access_response)),

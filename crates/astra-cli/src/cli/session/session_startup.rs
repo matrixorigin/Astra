@@ -790,32 +790,21 @@ pub(crate) async fn complete_session_startup(
 
     let startup_token = session_runtime::fresh_access_token(api, profile).await;
 
-    if let Some(token) = startup_token.as_deref() {
-        if astra_core::model_override::normalize_model_override(state.model.as_deref()).is_some() {
-            let _ = session_runtime::ensure_state_default_model(api, token, state).await;
-        } else {
-            match session_runtime::resolve_server_default_model(api, token).await {
-                session_runtime::ServerDefaultModel::Selected(selection) => {
-                    state.context_budget =
-                        astra_runtime::prompts::ContextBudget::from_runtime_config_with_context_window(
-                            &state.runtime_config,
-                            Some(&selection.name),
-                            selection.context_window,
-                        );
-                    crate::cli::slash::slash_config::set_active_offering_id_for_request(Some(
-                        selection.offering_id,
-                    ));
-                    state.model = Some(selection.name);
-                }
-                session_runtime::ServerDefaultModel::NoModels => {
-                    state.model = Some("⚠ none".to_string());
-                }
-                session_runtime::ServerDefaultModel::Unavailable(error) => {
-                    eprintln!("warning: {error}");
-                }
+    // Keep startup on the same model-selection state machine used by turns and
+    // account commands. The local flag carries the one UI-specific outcome
+    // (an empty server catalog) without storing a display sentinel in state.
+    let no_server_model = if let Some(token) = startup_token.as_deref() {
+        match session_runtime::ensure_state_default_model(api, token, state).await {
+            Ok(Some(_)) => false,
+            Ok(None) => true,
+            Err(error) => {
+                eprintln!("warning: {error}");
+                false
             }
         }
-    }
+    } else {
+        false
+    };
     tracer.phase("model_check");
     prune_stale_pending_recovery(api, profile, state).await;
 
@@ -838,14 +827,13 @@ pub(crate) async fn complete_session_startup(
     }
     tracer.phase("edge_heartbeat");
 
-    if state.model.as_deref() == Some("⚠ none") {
+    if no_server_model {
         eprintln!(
             "  {}  {}",
             theme::icon_warn(),
             "No LLM model configured on server. Run: astra admin model add".yellow()
         );
         eprintln!();
-        state.model = None;
     }
 
     tracer.phase("completions_deferred");

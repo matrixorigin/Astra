@@ -1,11 +1,9 @@
 //! Slash command fallback routing for the interactive session.
 
 use astra_runtime::prompts;
-use astra_services::{
-    ModelListCursor, ModelListItemResponse, ModelListPageResponse, session_journal,
-};
+use astra_services::{ModelListItemResponse, session_journal};
 use crossterm::style::Stylize;
-use std::{collections::HashSet, io::IsTerminal, path::PathBuf};
+use std::{io::IsTerminal, path::PathBuf};
 
 use crate::cli::slash::{
     slash_account::handle_account_command,
@@ -35,14 +33,7 @@ use crate::cli::{
 
 pub(crate) type ModelCatalogEntry = ModelListItemResponse;
 
-fn model_list_entry_is_active(entry: &ModelCatalogEntry) -> bool {
-    entry.is_active
-}
-
-fn model_list_entry_name(entry: &ModelCatalogEntry) -> Option<&str> {
-    let name = entry.name.trim();
-    (!name.is_empty()).then_some(name)
-}
+pub(crate) use crate::cli::session::session_runtime::ModelCatalogError;
 
 fn model_list_entry_offering_id(entry: &ModelCatalogEntry) -> &str {
     entry.offering_id.as_str()
@@ -63,7 +54,8 @@ fn find_model_list_entry<'a>(
 ) -> Option<&'a ModelCatalogEntry> {
     models.iter().find(|m| {
         model_list_entry_offering_id(m) == name
-            || model_list_entry_name(m).is_some_and(|n| n.eq_ignore_ascii_case(name))
+            || session_runtime::model_list_entry_name(m)
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
     })
 }
 
@@ -131,8 +123,8 @@ pub(crate) async fn handle_slash_command(
                 let items: Vec<(String, String)> = models
                     .iter()
                     .filter_map(|m| {
-                        let name = model_list_entry_name(m)?;
-                        if !model_list_entry_is_active(m) {
+                        let name = session_runtime::model_list_entry_name(m)?;
+                        if !session_runtime::model_list_entry_is_active(m) {
                             return None;
                         }
                         let desc = m.description.clone().unwrap_or_default();
@@ -237,7 +229,7 @@ pub(crate) async fn handle_slash_command(
 
                         let matched_entry = find_model_list_entry(&models, arg);
                         if let Some(entry) = matched_entry {
-                            if !model_list_entry_is_active(entry) {
+                            if !session_runtime::model_list_entry_is_active(entry) {
                                 eprintln!(
                                     "{}",
                                     format!(
@@ -250,8 +242,8 @@ pub(crate) async fn handle_slash_command(
                                 return Ok(false);
                             }
                             selected_offering_id = Some(entry.offering_id.clone());
-                            selected_model_name =
-                                model_list_entry_name(entry).map(ToOwned::to_owned);
+                            selected_model_name = session_runtime::model_list_entry_name(entry)
+                                .map(ToOwned::to_owned);
                             context_window =
                                 session_runtime::model_list_entry_context_window(entry);
                         }
@@ -259,8 +251,8 @@ pub(crate) async fn handle_slash_command(
                         let available: Vec<String> = models
                             .iter()
                             .filter_map(|m| {
-                                let name = model_list_entry_name(m)?;
-                                if model_list_entry_is_active(m) {
+                                let name = session_runtime::model_list_entry_name(m)?;
+                                if session_runtime::model_list_entry_is_active(m) {
                                     Some(name.to_string())
                                 } else {
                                     None
@@ -616,127 +608,22 @@ pub(crate) async fn handle_slash_command(
     Ok(false)
 }
 
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum ModelCatalogError {
-    #[error("not logged in")]
-    NotAuthenticated,
-    #[error(transparent)]
-    Request(#[from] astra_thin_client::ThinClientError),
-    #[error("invalid model catalog JSON: {0}")]
-    InvalidJson(#[from] serde_json::Error),
-    #[error("invalid model catalog protocol: {0}")]
-    Protocol(String),
-}
-
-impl ModelCatalogError {
-    pub(crate) fn is_authentication_failure(&self) -> bool {
-        matches!(self, Self::NotAuthenticated)
-            || matches!(
-                self,
-                Self::Request(astra_thin_client::ThinClientError::Api { status, .. })
-                    if *status == reqwest::StatusCode::UNAUTHORIZED
-            )
-    }
-
-    pub(crate) fn is_transport_failure(&self) -> bool {
-        matches!(self, Self::Request(error) if error.is_transport())
-    }
-}
-
-fn parse_model_catalog_page(body: &str) -> Result<ModelListPageResponse, ModelCatalogError> {
-    Ok(serde_json::from_str(body)?)
-}
-
-fn parse_model_catalog(body: &str) -> Result<Vec<ModelCatalogEntry>, ModelCatalogError> {
-    Ok(parse_model_catalog_page(body)?.items)
-}
-
 /// Fetch the exact public model catalog. Only active Offerings reach the
 /// picker; administration surfaces use the server catalog directly.
 pub(crate) async fn fetch_model_catalog(
     api: &astra_thin_client::ThinClient,
     token: Option<&str>,
 ) -> Result<Vec<ModelCatalogEntry>, ModelCatalogError> {
-    let tok = token.ok_or(ModelCatalogError::NotAuthenticated)?;
-    let mut cursor: Option<ModelListCursor> = None;
-    let mut all = Vec::new();
-    let mut total = None;
-    let mut revision = None;
-    let mut seen_cursors = HashSet::new();
-    loop {
-        if let Some(current) = &cursor {
-            if !seen_cursors.insert(current.clone()) {
-                return Err(ModelCatalogError::Protocol(
-                    "model catalog cycled its continuation cursor".to_string(),
-                ));
-            }
-        }
-        let cursor_tuple = cursor.as_ref().map(|value| {
-            (
-                value.provider.as_str(),
-                value.model_name.as_str(),
-                value.model_id.as_str(),
-            )
-        });
-        let response = api
-            .get_models_page_response_timeout(
-                tok,
-                astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT,
-                cursor_tuple,
-                astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
-            )
-            .await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(ModelCatalogError::Request(
-                astra_thin_client::ThinClientError::Api { status, body },
-            ));
-        }
-        let body = response
-            .text()
-            .await
-            .map_err(|error| ModelCatalogError::Request(error.into()))?;
-        let page = parse_model_catalog_page(&body)?;
-        if page.limit == 0 || page.limit > 200 {
-            return Err(ModelCatalogError::Protocol(
-                "invalid model catalog page limit".to_string(),
-            ));
-        }
-        if total.get_or_insert(page.total) != &page.total {
-            return Err(ModelCatalogError::Protocol(
-                "model catalog total changed during pagination".to_string(),
-            ));
-        }
-        if revision.get_or_insert_with(|| page.catalog_revision.clone()) != &page.catalog_revision {
-            return Err(ModelCatalogError::Protocol(
-                "model catalog revision changed during pagination".to_string(),
-            ));
-        }
-        let page_had_items = !page.items.is_empty();
-        all.extend(page.items);
-        let Some(next) = page.next_cursor else {
-            if all.len() != page.total as usize {
-                return Err(ModelCatalogError::Protocol(format!(
-                    "model catalog returned {} items but advertised {}",
-                    all.len(),
-                    page.total
-                )));
-            }
-            return Ok(all.into_iter().filter(model_list_entry_is_active).collect());
-        };
-        if !page_had_items {
-            return Err(ModelCatalogError::Protocol(
-                "model catalog returned a cursor without items".to_string(),
-            ));
-        }
-        if cursor.as_ref() == Some(&next) {
-            return Err(ModelCatalogError::Protocol(
-                "model catalog repeated its continuation cursor".to_string(),
-            ));
-        }
-        cursor = Some(next);
-    }
+    let (models, _) = session_runtime::fetch_server_model_catalog(
+        api,
+        token,
+        astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+    )
+    .await?;
+    Ok(models
+        .into_iter()
+        .filter(|entry| session_runtime::model_list_entry_is_active(entry))
+        .collect())
 }
 
 /// Lookup a model entry by canonical Offering ID or display name.
@@ -761,12 +648,12 @@ pub(crate) fn entry_offering_id(entry: &ModelCatalogEntry) -> &str {
 
 /// Public accessor for a model entry's display name.
 pub(crate) fn entry_model_name(entry: &ModelCatalogEntry) -> Option<&str> {
-    model_list_entry_name(entry)
+    session_runtime::model_list_entry_name(entry)
 }
 
 /// Public accessor for a model entry's active state.
 pub(crate) fn entry_model_is_active(entry: &ModelCatalogEntry) -> bool {
-    model_list_entry_is_active(entry)
+    session_runtime::model_list_entry_is_active(entry)
 }
 
 /// Public accessor for a model entry's `provider` field.
@@ -778,31 +665,25 @@ pub(crate) fn entry_provider(entry: &ModelCatalogEntry) -> Option<&str> {
 mod model_list_json_tests {
     use super::{
         ModelCatalogError, entry_model_is_active, entry_model_name, entry_offering_id,
-        find_model_entry_by_name, model_list_entry_thinking_capability, parse_model_catalog,
+        find_model_entry_by_name, model_list_entry_thinking_capability,
     };
 
-    fn canonical_catalog_json() -> serde_json::Value {
-        serde_json::json!({
-            "items": [{
-            "offering_id": "offer-coding",
-            "access_id": "self-hosted",
-            "access_kind": "self_hosted",
-            "access_label": "Self-hosted",
-            "execution_placement": "server",
-            "name": "Coding Model",
-            "provider": "openai",
-            "description": "Primary coding model",
-            "is_active": true,
-            "context_window": 128000,
-            "max_completion_tokens": 8192,
-            "architecture": null,
-            "thinking_capability": "both"
-            }],
-            "next_cursor": null,
-            "limit": 50,
-            "total": 1,
-            "catalog_revision": "sha256:test-catalog"
-        })
+    fn catalog_entry() -> super::ModelCatalogEntry {
+        super::ModelCatalogEntry {
+            offering_id: "offer-coding".into(),
+            access_id: "self-hosted".into(),
+            access_kind: astra_services::ModelAccessKind::SelfHosted,
+            access_label: "Self-hosted".into(),
+            execution_placement: astra_services::ModelExecutionPlacement::Server,
+            name: "Coding Model".into(),
+            provider: "openai".into(),
+            description: Some("Primary coding model".into()),
+            is_active: true,
+            context_window: 128000,
+            max_completion_tokens: Some(8192),
+            architecture: None,
+            thinking_capability: Some(astra_services::models::ThinkingCapability::Both),
+        }
     }
 
     #[test]
@@ -827,27 +708,12 @@ mod model_list_json_tests {
 
     #[test]
     fn canonical_catalog_preserves_offering_and_model_facts() {
-        let models =
-            parse_model_catalog(&canonical_catalog_json().to_string()).expect("canonical catalog");
+        let models = vec![catalog_entry()];
         let entry = find_model_entry_by_name(&models, "offer-coding").expect("offering entry");
         assert_eq!(entry_offering_id(entry), "offer-coding");
         assert_eq!(entry_model_name(entry), Some("Coding Model"));
         assert_eq!(model_list_entry_thinking_capability(entry), Some("both"));
         assert!(entry_model_is_active(entry));
         assert!(find_model_entry_by_name(&models, "coding model").is_some());
-    }
-
-    #[test]
-    fn obsolete_catalog_shapes_are_rejected_at_the_boundary() {
-        let item = canonical_catalog_json()["items"][0].clone();
-        let envelope = serde_json::json!({"models": [item.clone()]});
-        parse_model_catalog(&envelope.to_string()).expect_err("envelopes are not the contract");
-
-        let mut obsolete = item;
-        let object = obsolete.as_object_mut().expect("catalog item object");
-        object.remove("offering_id");
-        object.insert("model_id".into(), serde_json::json!("provider-model-id"));
-        parse_model_catalog(&serde_json::json!([obsolete]).to_string())
-            .expect_err("provider model ids cannot select an Offering");
     }
 }

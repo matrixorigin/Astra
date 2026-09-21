@@ -28,6 +28,10 @@
 use ratatui::text::Line;
 use ratatui::text::Span;
 use std::borrow::Cow;
+
+use crate::cli::terminal_hyperlinks::{
+    is_absolute_path_like, is_relative_path_like, split_optional_line_suffix,
+};
 use std::ops::Range;
 use textwrap::Options;
 
@@ -277,42 +281,6 @@ fn is_file_path_like_token(raw_token: &str) -> bool {
         return false;
     }
     is_absolute_path_like(path) || is_relative_path_like(path)
-}
-
-fn split_optional_line_suffix(token: &str) -> (&str, Option<&str>) {
-    let Some((path, suffix)) = token.rsplit_once(':') else {
-        return (token, None);
-    };
-    if suffix.chars().all(|c| c.is_ascii_digit()) && path.contains('/') {
-        (path, Some(suffix))
-    } else {
-        (token, None)
-    }
-}
-
-fn is_absolute_path_like(path: &str) -> bool {
-    path.starts_with('/')
-        && path.len() > 1
-        && path
-            .chars()
-            .all(|c| !c.is_control() && !matches!(c, '\x1b' | '\x07'))
-}
-
-fn is_relative_path_like(path: &str) -> bool {
-    if !(path.starts_with("./") || path.starts_with("../") || path.contains('/')) {
-        return false;
-    }
-    if path.ends_with('/') || path.contains("://") {
-        return false;
-    }
-    let Some(last) = path.rsplit('/').next() else {
-        return false;
-    };
-    last.contains('.')
-        && !last.starts_with('.')
-        && path
-            .chars()
-            .all(|c| !c.is_control() && !matches!(c, '\x1b' | '\x07' | '*' | '?'))
 }
 
 fn is_substantive_non_url_token(raw_token: &str) -> bool {

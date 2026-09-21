@@ -61,6 +61,42 @@ pub fn require_system_e2e_env() {
     );
 }
 
+/// Collect a complete SSE response with one bounded deadline for the request
+/// and its body. Journeys that need richer timeout diagnostics keep their
+/// specialized collector locally.
+pub async fn collect_full_sse_stream(
+    app: &Router,
+    req: Request<Body>,
+    timeout_secs: u64,
+) -> (StatusCode, String) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let response = tokio::time::timeout_at(deadline, app.clone().oneshot(req))
+        .await
+        .unwrap_or_else(|_| panic!("SSE request did not start within {timeout_secs}s"))
+        .expect("oneshot");
+    let status = response.status();
+    let mut stream = response.into_body().into_data_stream();
+    let mut bytes = Vec::new();
+    loop {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(chunk)) => bytes.extend_from_slice(&chunk.expect("body chunk")),
+            Ok(None) => break,
+            Err(_) => panic!(
+                "SSE stream did not terminate within {timeout_secs}s; collected {} bytes",
+                bytes.len()
+            ),
+        }
+    }
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+pub fn parse_sse_events(raw: &str) -> Vec<Value> {
+    raw.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str(data).ok())
+        .collect()
+}
+
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     const BLOCK_SIZE: usize = 64;
     let mut normalized_key = [0u8; BLOCK_SIZE];
@@ -500,14 +536,10 @@ pub fn maybe_tool_result_payload_from_sse(
     output: &str,
     duration_ms: u64,
 ) -> Option<Value> {
-    let event = raw_sse
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
-        .find(|event| {
-            event.get("type").and_then(Value::as_str) == Some("tool_request")
-                && event.get("request_id").and_then(Value::as_str) == Some(request_id)
-        })?;
+    let event = parse_sse_events(raw_sse).into_iter().find(|event| {
+        event.get("type").and_then(Value::as_str) == Some("tool_request")
+            && event.get("request_id").and_then(Value::as_str) == Some(request_id)
+    })?;
     let field = |name: &str| {
         event
             .get(name)

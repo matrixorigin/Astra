@@ -7,19 +7,14 @@ use astra_services::work::{
     WorkItemRevisionRef, WorkItemText, WorkOwnerId, WorkRepository, WorkRepositoryError,
 };
 use sqlx::Row;
-use uuid::Uuid;
-
-fn id(prefix: &str) -> String {
-    format!("{prefix}-{}", Uuid::new_v4())
-}
 
 fn genesis(owner_id: &str, work_id: &str, branch_id: &str) -> WorkGenesis {
     common::work_genesis(
         owner_id,
         work_id,
         branch_id,
-        &id("session"),
-        &id("intent"),
+        &common::id("session"),
+        &common::id("intent"),
         "Deliver a proven dependency-aware change.",
     )
 }
@@ -49,7 +44,7 @@ fn graph_change(
         expected_graph_revision: GraphRevision::INITIAL,
         items,
         edges,
-        source_ref: WorkChangeRef::parse(id("event")).expect("source"),
+        source_ref: WorkChangeRef::parse(common::id("event")).expect("source"),
         reason: Some(WorkChangeReason::parse("Refined the task graph.").expect("reason")),
     }
 }
@@ -59,37 +54,6 @@ fn dependency(predecessor: &str, successor: &str) -> WorkItemEdge {
         predecessor_item_id: WorkItemId::parse(predecessor).expect("predecessor"),
         successor_item_id: WorkItemId::parse(successor).expect("successor"),
         kind: WorkItemEdgeKind::Dependency,
-    }
-}
-
-async fn cleanup_owner(pool: &astra_core::SharedPool, owner_id: &str) {
-    for (table, owner_column) in [
-        ("work_runtime_event_outbox", "owner_id"),
-        ("work_runtime_event_outbox_slots", "owner_id"),
-        ("work_events", "owner_id"),
-        ("work_attention_receipts", "owner_id"),
-        ("work_event_sequences", "owner_id"),
-        ("work_proposals", "owner_id"),
-        ("work_proposal_sequences", "owner_id"),
-        ("work_branches", "owner_id"),
-        ("work_item_edges", "owner_id"),
-        ("work_item_revisions", "owner_id"),
-        ("work_items", "owner_id"),
-        ("work_graph_revisions", "owner_id"),
-        ("work_graph_sequences", "owner_id"),
-        ("work_criterion_sets", "owner_id"),
-        ("work_criterion_revisions", "owner_id"),
-        ("work_criteria", "owner_id"),
-        ("work_goal_revisions", "owner_id"),
-        ("works", "owner_id"),
-        ("agent_sessions", "user_id"),
-    ] {
-        let statement = format!("DELETE FROM {table} WHERE {owner_column} = ?");
-        sqlx::query(&statement)
-            .bind(owner_id)
-            .execute(pool.get())
-            .await
-            .unwrap_or_else(|error| panic!("clean {table}: {error}"));
     }
 }
 
@@ -116,12 +80,11 @@ async fn scalar_count(
 async fn graph_replacement_is_canonical_immutable_and_branch_local() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let first = id("item-a");
-    let second = id("item-b");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let first = common::id("item-a");
+    let second = common::id("item-b");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
@@ -259,7 +222,7 @@ async fn graph_replacement_is_canonical_immutable_and_branch_local() {
         );
     }
 
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -267,10 +230,9 @@ async fn graph_replacement_is_canonical_immutable_and_branch_local() {
 async fn missing_item_reference_rolls_back_branch_and_revision_allocation() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
@@ -279,7 +241,7 @@ async fn missing_item_reference_rolls_back_branch_and_revision_allocation() {
     let initial_item_revision_count =
         scalar_count(&pool, "work_item_revisions", &owner_id, &work_id).await;
     let missing = WorkItemRevisionRef {
-        item_id: WorkItemId::parse(id("missing")).expect("missing item"),
+        item_id: WorkItemId::parse(common::id("missing")).expect("missing item"),
         revision: WorkItemRevision::INITIAL,
     };
 
@@ -347,7 +309,7 @@ async fn missing_item_reference_rolls_back_branch_and_revision_allocation() {
         "a rejected graph must not leave item revision residue"
     );
 
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -355,18 +317,17 @@ async fn missing_item_reference_rolls_back_branch_and_revision_allocation() {
 async fn concurrent_same_branch_graph_changes_have_one_cas_winner_without_residue() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
         .expect("genesis");
     let initial_item_revision_count =
         scalar_count(&pool, "work_item_revisions", &owner_id, &work_id).await;
-    let first_id = id("winner-a");
-    let second_id = id("winner-b");
+    let first_id = common::id("winner-a");
+    let second_id = common::id("winner-b");
     let first_repository = repository.clone();
     let second_repository = repository.clone();
     let first = first_repository.replace_graph(graph_change(
@@ -435,7 +396,7 @@ async fn concurrent_same_branch_graph_changes_have_one_cas_winner_without_residu
         "losing CAS must roll back its allocated revision"
     );
 
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -443,14 +404,12 @@ async fn concurrent_same_branch_graph_changes_have_one_cas_winner_without_residu
 async fn different_users_allocate_graph_revisions_independently() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_a = id("owner-a");
-    let owner_b = id("owner-b");
-    let work_a = id("work-a");
-    let work_b = id("work-b");
-    let branch_a = id("branch-a");
-    let branch_b = id("branch-b");
-    cleanup_owner(&pool, &owner_a).await;
-    cleanup_owner(&pool, &owner_b).await;
+    let owner_a = common::id("owner-a");
+    let owner_b = common::id("owner-b");
+    let work_a = common::id("work-a");
+    let work_b = common::id("work-b");
+    let branch_a = common::id("branch-a");
+    let branch_b = common::id("branch-b");
     let (genesis_a, genesis_b) = tokio::join!(
         repository.create_genesis(genesis(&owner_a, &work_a, &branch_a)),
         repository.create_genesis(genesis(&owner_b, &work_b, &branch_b)),
@@ -465,14 +424,14 @@ async fn different_users_allocate_graph_revisions_independently() {
             &owner_a,
             &work_a,
             &branch_a,
-            vec![new_item(&id("item-a"), WorkItemKind::Task)],
+            vec![new_item(&common::id("item-a"), WorkItemKind::Task)],
             Vec::new(),
         )),
         repository_b.replace_graph(graph_change(
             &owner_b,
             &work_b,
             &branch_b,
-            vec![new_item(&id("item-b"), WorkItemKind::Task)],
+            vec![new_item(&common::id("item-b"), WorkItemKind::Task)],
             Vec::new(),
         )),
     );
@@ -501,6 +460,6 @@ async fn different_users_allocate_graph_revisions_independently() {
         2
     );
 
-    cleanup_owner(&pool, &owner_a).await;
-    cleanup_owner(&pool, &owner_b).await;
+    common::cleanup_work_owner(&pool, &owner_a).await;
+    common::cleanup_work_owner(&pool, &owner_b).await;
 }

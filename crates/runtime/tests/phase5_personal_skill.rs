@@ -1,3 +1,5 @@
+mod test_support;
+
 use astra_services::{
     ActivateUserSkillVersion, CreateUserSkillSource, DatabasePersonalSkillStore,
     PersonalSkillError, RecordUserSkillEvaluation, SubmitUserSkillVersion, skill_md_content_hash,
@@ -7,12 +9,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 fn require_db_it_env() -> astra_core::MatrixOneSettings {
-    assert_eq!(
-        std::env::var("ASTRA_TEST_DB_IT").as_deref(),
-        Ok("1"),
-        "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
-    );
-    let mut settings = astra_core::MatrixOneSettings::from_env();
+    let mut settings = test_support::require_db_it_env();
     settings.db_pool_max_connections = settings.db_pool_max_connections.clamp(1, 4);
     settings.db_pool_min_connections = settings
         .db_pool_min_connections

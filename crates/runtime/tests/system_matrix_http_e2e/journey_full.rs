@@ -10,9 +10,10 @@ use tower::util::ServiceExt;
 
 use super::harness::{
     MATRIX_E2E_EDGE_WORKSPACE_ROOT, MatrixE2eCtx, cleanup_edge_registry, cleanup_session_data,
-    delete_json, delete_no_content, get_json, maybe_tool_result_payload_from_sse, post_empty,
-    post_json, post_json_with_headers, put_json, row_get_opt_i64, row_get_opt_str, row_get_str,
-    seed_pending_approval, seeded_model_selection, tool_result_payload, wait_for_agent_event_types,
+    delete_json, delete_no_content, get_json, maybe_tool_result_payload_from_sse, parse_sse_events,
+    post_empty, post_json, post_json_with_headers, put_json, row_get_opt_i64, row_get_opt_str,
+    row_get_str, seed_pending_approval, seeded_model_selection, tool_result_payload,
+    wait_for_agent_event_types,
 };
 
 async fn run_tool_backed_chat_turn(
@@ -136,11 +137,7 @@ async fn run_tool_backed_chat_turn(
         String::from_utf8_lossy(&acc)
     );
     let full = String::from_utf8_lossy(&acc).into_owned();
-    let events = full
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
-        .collect::<Vec<_>>();
+    let events = parse_sse_events(&full);
     let terminals = events
         .iter()
         .filter(|event| event["type"].as_str() == Some("turn_complete"))
@@ -1040,11 +1037,7 @@ pub async fn run_product_matrix_full_journey(
         acc.extend_from_slice(&chunk);
     }
     let full = String::from_utf8_lossy(&acc).into_owned();
-    let events = full
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
-        .collect::<Vec<_>>();
+    let events = parse_sse_events(&full);
     let terminals = events
         .iter()
         .filter(|event| event["type"].as_str() == Some("turn_complete"))

@@ -23,28 +23,6 @@ use astra_turn_types::{
 };
 use axum::http::StatusCode;
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
-
-fn id(prefix: &str) -> String {
-    format!("{prefix}-{}", Uuid::new_v4())
-}
-
-async fn cleanup_owner(pool: &astra_core::SharedPool, owner_id: &str) {
-    for (table, owner_column) in [
-        ("work_recovery_points", "owner_id"),
-        ("work_branch_deletion_operations", "owner_id"),
-        ("work_branches", "owner_id"),
-        ("works", "owner_id"),
-        ("agent_sessions", "user_id"),
-    ] {
-        let statement = format!("DELETE FROM {table} WHERE {owner_column} = ?");
-        sqlx::query(&statement)
-            .bind(owner_id)
-            .execute(pool.get())
-            .await
-            .unwrap_or_else(|error| panic!("clean {table}: {error}"));
-    }
-}
 
 async fn add_non_delivery_branch(
     pool: &astra_core::SharedPool,
@@ -98,7 +76,7 @@ fn manifest(
     };
     let mut manifest = RecoveryPointManifestV1 {
         schema_version: RECOVERY_POINT_MANIFEST_SCHEMA_VERSION,
-        recovery_point_id: id("recovery-point"),
+        recovery_point_id: common::id("recovery-point"),
         owner_id: owner_id.to_owned(),
         work_id: work_id.to_owned(),
         branch_id: branch_id.to_owned(),
@@ -122,9 +100,9 @@ fn manifest(
         execution: RecoveryPointExecutionBindingV1 {
             binding_generation: 1,
             binding_state: astra_turn_types::RecoveryPointBindingStateV1::Ready,
-            logical_workspace_id: id("workspace"),
+            logical_workspace_id: common::id("workspace"),
             executor_kind: RecoveryPointExecutorKindV1::Server,
-            executor_id: id("server"),
+            executor_id: common::id("server"),
             binding_hash: String::new(),
             physical_workspace_id: None,
         },
@@ -222,13 +200,11 @@ async fn commit_context_turn(
 async fn recovery_point_capture_is_preparing_and_owner_scoped() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let other_owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    cleanup_owner(&pool, &owner_id).await;
-    cleanup_owner(&pool, &other_owner_id).await;
+    let owner_id = common::id("owner");
+    let other_owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
 
     repository
         .create_genesis(common::work_genesis(
@@ -236,7 +212,7 @@ async fn recovery_point_capture_is_preparing_and_owner_scoped() {
             &work_id,
             &branch_id,
             &session_id,
-            &id("intent"),
+            &common::id("intent"),
             "Persist one owner-scoped recovery boundary.",
         ))
         .await
@@ -249,7 +225,7 @@ async fn recovery_point_capture_is_preparing_and_owner_scoped() {
         owner_id: owner.clone(),
         work_id: work.clone(),
         branch_id: branch,
-        request_id: WorkChangeRef::parse(id("request")).expect("request"),
+        request_id: WorkChangeRef::parse(common::id("request")).expect("request"),
         manifest: manifest(&owner_id, &work_id, &branch_id, &session_id),
     };
     let record = repository
@@ -311,15 +287,15 @@ async fn recovery_point_capture_is_preparing_and_owner_scoped() {
     assert_eq!(loaded.recovery_point_id, record.recovery_point_id);
 
     let other_owner = WorkOwnerId::parse(&other_owner_id).expect("other owner");
-    let other_work_id = id("work");
-    let other_session_id = id("session");
+    let other_work_id = common::id("work");
+    let other_session_id = common::id("session");
     repository
         .create_genesis(common::work_genesis(
             &other_owner_id,
             &other_work_id,
             &branch_id,
             &other_session_id,
-            &id("intent"),
+            &common::id("intent"),
             "A second owner may use the same opaque recovery-point identifier in another Work.",
         ))
         .await
@@ -338,7 +314,7 @@ async fn recovery_point_capture_is_preparing_and_owner_scoped() {
             owner_id: other_owner.clone(),
             work_id: WorkId::parse(&other_work_id).expect("other work"),
             branch_id: WorkBranchId::parse(&branch_id).expect("other branch"),
-            request_id: WorkChangeRef::parse(id("request")).expect("other request"),
+            request_id: WorkChangeRef::parse(common::id("request")).expect("other request"),
             manifest: other_manifest,
         })
         .await
@@ -356,7 +332,7 @@ async fn recovery_point_capture_is_preparing_and_owner_scoped() {
         .expect("second owner recovery point exists");
     assert_eq!(other_loaded.owner_id, other_owner);
     assert_eq!(other_loaded.branch_id.as_str(), branch_id);
-    let unauthorized_owner = WorkOwnerId::parse(id("owner")).expect("unauthorized owner");
+    let unauthorized_owner = WorkOwnerId::parse(common::id("owner")).expect("unauthorized owner");
     assert!(
         repository
             .recovery_points()
@@ -365,6 +341,9 @@ async fn recovery_point_capture_is_preparing_and_owner_scoped() {
             .expect("load unauthorized recovery point")
             .is_none()
     );
+
+    common::cleanup_work_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &other_owner_id).await;
 }
 
 #[tokio::test]
@@ -372,11 +351,10 @@ async fn recovery_point_capture_is_preparing_and_owner_scoped() {
 async fn canonical_recovery_point_capture_is_quiescent_idempotent_and_explicitly_logical() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("canonical-owner");
-    let work_id = id("canonical-work");
-    let branch_id = id("canonical-branch");
-    let session_id = id("canonical-session");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("canonical-owner");
+    let work_id = common::id("canonical-work");
+    let branch_id = common::id("canonical-branch");
+    let session_id = common::id("canonical-session");
 
     repository
         .create_genesis(common::work_genesis(
@@ -384,7 +362,7 @@ async fn canonical_recovery_point_capture_is_quiescent_idempotent_and_explicitly
             &work_id,
             &branch_id,
             &session_id,
-            &id("canonical-intent"),
+            &common::id("canonical-intent"),
             "Capture one stable logical progress boundary.",
         ))
         .await
@@ -429,7 +407,7 @@ async fn canonical_recovery_point_capture_is_quiescent_idempotent_and_explicitly
         Err(WorkRepositoryError::RecoveryPointNotCapturable { .. })
     ));
 
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -437,12 +415,11 @@ async fn canonical_recovery_point_capture_is_quiescent_idempotent_and_explicitly
 async fn canonical_recovery_capture_still_sees_unknown_effect_after_compaction() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("unknown-effect-owner");
-    let work_id = id("unknown-effect-work");
-    let branch_id = id("unknown-effect-branch");
-    let session_id = id("unknown-effect-session");
-    let run_id = id("unknown-effect-run");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("unknown-effect-owner");
+    let work_id = common::id("unknown-effect-work");
+    let branch_id = common::id("unknown-effect-branch");
+    let session_id = common::id("unknown-effect-session");
+    let run_id = common::id("unknown-effect-run");
 
     repository
         .create_genesis(common::work_genesis(
@@ -450,7 +427,7 @@ async fn canonical_recovery_capture_still_sees_unknown_effect_after_compaction()
             &work_id,
             &branch_id,
             &session_id,
-            &id("unknown-effect-intent"),
+            &common::id("unknown-effect-intent"),
             "Do not capture a boundary while an effect outcome is unknown.",
         ))
         .await
@@ -530,7 +507,7 @@ async fn canonical_recovery_capture_still_sees_unknown_effect_after_compaction()
         .execute(pool.get())
         .await
         .expect("clean terminal effect run");
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -538,11 +515,10 @@ async fn canonical_recovery_capture_still_sees_unknown_effect_after_compaction()
 async fn recovery_point_capture_rejects_a_criterion_set_with_a_missing_member() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
 
     repository
         .create_genesis(common::work_genesis(
@@ -550,7 +526,7 @@ async fn recovery_point_capture_rejects_a_criterion_set_with_a_missing_member() 
             &work_id,
             &branch_id,
             &session_id,
-            &id("intent"),
+            &common::id("intent"),
             "Reject a recovery boundary when its criterion member disappeared.",
         ))
         .await
@@ -563,7 +539,7 @@ async fn recovery_point_capture_rejects_a_criterion_set_with_a_missing_member() 
         owner_id: owner.clone(),
         work_id: work.clone(),
         branch_id: branch.clone(),
-        request_id: WorkChangeRef::parse(id("request")).expect("request"),
+        request_id: WorkChangeRef::parse(common::id("request")).expect("request"),
         manifest: manifest(&owner_id, &work_id, &branch_id, &session_id),
     };
     let record = repository
@@ -606,6 +582,8 @@ async fn recovery_point_capture_rejects_a_criterion_set_with_a_missing_member() 
         .expect("load rejected recovery point")
         .expect("recovery point remains durable");
     assert_eq!(loaded.status, WorkRecoveryPointStatus::Preparing);
+
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -613,11 +591,10 @@ async fn recovery_point_capture_rejects_a_criterion_set_with_a_missing_member() 
 async fn delivery_session_delete_explains_work_management_path() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("delivery");
-    let session_id = id("session");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("delivery");
+    let session_id = common::id("session");
 
     repository
         .create_genesis(common::work_genesis(
@@ -625,7 +602,7 @@ async fn delivery_session_delete_explains_work_management_path() {
             &work_id,
             &branch_id,
             &session_id,
-            &id("intent"),
+            &common::id("intent"),
             "Explain why a delivery Session cannot be deleted while progress is saved.",
         ))
         .await
@@ -639,7 +616,7 @@ async fn delivery_session_delete_explains_work_management_path() {
             owner_id: owner,
             work_id: work,
             branch_id: branch,
-            request_id: WorkChangeRef::parse(id("request")).expect("request"),
+            request_id: WorkChangeRef::parse(common::id("request")).expect("request"),
             manifest: manifest(&owner_id, &work_id, &branch_id, &session_id),
         })
         .await
@@ -657,7 +634,7 @@ async fn delivery_session_delete_explains_work_management_path() {
     assert!(body.0.detail.contains(&branch_id));
     assert!(body.0.detail.contains("choose another delivery branch"));
 
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -666,13 +643,12 @@ async fn branch_deletion_removes_branch_recovery_points() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
     let deletion = DatabaseWorkBranchDeletionService::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let delivery_branch_id = id("delivery");
-    let delivery_session_id = id("session");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let delivery_branch_id = common::id("delivery");
+    let delivery_session_id = common::id("session");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
 
     repository
         .create_genesis(common::work_genesis(
@@ -680,7 +656,7 @@ async fn branch_deletion_removes_branch_recovery_points() {
             &work_id,
             &delivery_branch_id,
             &delivery_session_id,
-            &id("intent"),
+            &common::id("intent"),
             "Delete branch-owned recovery state with the branch.",
         ))
         .await
@@ -717,7 +693,7 @@ async fn branch_deletion_removes_branch_recovery_points() {
             owner_id: owner.clone(),
             work_id: work.clone(),
             branch_id: branch.clone(),
-            request_id: WorkChangeRef::parse(id("request")).expect("request"),
+            request_id: WorkChangeRef::parse(common::id("request")).expect("request"),
             manifest: manifest(&owner_id, &work_id, &branch_id, &session_id),
         })
         .await
@@ -725,7 +701,7 @@ async fn branch_deletion_removes_branch_recovery_points() {
 
     let admission = deletion
         .admit(&WorkBranchDeletionRequest {
-            request_id: id("delete"),
+            request_id: common::id("delete"),
             owner_id: owner.clone(),
             work_id: work.clone(),
             branch_id: branch.clone(),
@@ -796,4 +772,6 @@ async fn branch_deletion_removes_branch_recovery_points() {
             .expect("list deleted branch recovery points")
             .is_empty()
     );
+
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }

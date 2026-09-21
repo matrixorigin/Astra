@@ -10,18 +10,11 @@ use std::time::Duration;
 use super::harness::{
     E2E_PASSWORD, MATRIX_E2E_EDGE_WORKSPACE_ROOT, bootstrap, collect_sse_body_text, delete_json,
     delete_no_content, durable_interaction_event_count, get_json, grant_astra_admin_role,
-    maybe_tool_result_payload_from_sse, post_empty, post_json, put_json, seed_pending_approval,
-    seeded_model_selection, tool_result_payload,
+    maybe_tool_result_payload_from_sse, parse_sse_events, post_empty, post_json, put_json,
+    seed_pending_approval, seeded_model_selection, tool_result_payload,
 };
 use axum::{body::Body, http::Request};
 use tower::util::ServiceExt;
-
-fn parse_sse_events(raw: &str) -> Vec<Value> {
-    raw.lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter_map(|data| serde_json::from_str(data).ok())
-        .collect()
-}
 
 pub async fn run_session_cancel_then_delete() {
     let b = bootstrap().await;

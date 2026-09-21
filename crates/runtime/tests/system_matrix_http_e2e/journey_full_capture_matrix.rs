@@ -1,40 +1,14 @@
 //! Session-scoped full LLM exchange capture with real MatrixOne-backed session metadata.
 
 use astra_services::session_journal::{JournalWriter, ProcessJournalDirGuard};
-use axum::http::StatusCode;
-use axum::{body::Body, http::Request};
-use futures_util::StreamExt;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use tempfile::tempdir;
-use tower::util::ServiceExt;
 
-use super::harness::{bootstrap, cleanup_session_data, put_json, seeded_model_selection};
-
-async fn collect_full_sse_stream(
-    app: &axum::Router,
-    req: Request<Body>,
-    timeout_secs: u64,
-) -> (StatusCode, String) {
-    let resp = app.clone().oneshot(req).await.expect("oneshot");
-    let status = resp.status();
-    let mut stream = resp.into_body().into_data_stream();
-    let mut acc = Vec::new();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    loop {
-        match tokio::time::timeout_at(deadline, stream.next()).await {
-            Ok(Some(chunk)) => {
-                let chunk = chunk.expect("body chunk");
-                acc.extend_from_slice(&chunk);
-            }
-            Ok(None) => break,
-            Err(_) => panic!(
-                "SSE stream did not terminate within {timeout_secs}s; collected {} bytes",
-                acc.len()
-            ),
-        }
-    }
-    (status, String::from_utf8_lossy(&acc).into_owned())
-}
+use super::harness::{
+    bootstrap, cleanup_session_data, collect_full_sse_stream, put_json, seeded_model_selection,
+};
 
 fn read_journal_events(user_id: &str, session_id: &str) -> Vec<Value> {
     let path = JournalWriter::for_user(user_id, session_id)

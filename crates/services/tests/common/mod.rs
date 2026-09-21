@@ -109,3 +109,76 @@ pub fn work_genesis(
     })
     .expect("Work genesis")
 }
+
+/// Returns an owner-scoped identifier for database integration fixtures.
+///
+/// Work tests deliberately use random owners so cleanup can be strict without
+/// touching another test's rows, even when several test binaries share a
+/// MatrixOne catalog.
+pub fn id(prefix: &str) -> String {
+    format!("{prefix}-{}", uuid::Uuid::new_v4())
+}
+
+/// Removes every canonical Work row and the directly-owned runtime/artifact
+/// row used by the Work integration fixtures.
+///
+/// The individual test files used to carry slightly different copies of this
+/// list. Keeping one superset here makes cleanup deterministic as the Work
+/// schema grows: a test can add a new assertion without having to remember to
+/// update a private cleanup copy. All entries are owner-scoped and the schema
+/// currently has no foreign-key constraints between these projections.
+pub async fn cleanup_work_owner(pool: &SharedPool, owner_id: &str) {
+    for (table, owner_column) in [
+        ("work_establishment_operations", "owner_id"),
+        ("work_branch_creation_operations", "owner_id"),
+        ("work_branch_control_operations", "owner_id"),
+        ("work_branch_deletion_operations", "owner_id"),
+        ("work_proposal_trigger_attempts", "owner_id"),
+        ("work_runtime_event_outbox_slots", "owner_id"),
+        ("work_runtime_event_outbox", "owner_id"),
+        ("work_terminal_cuts", "owner_id"),
+        ("work_item_attempts", "owner_id"),
+        ("work_current_gap_acceptances", "owner_id"),
+        ("work_acceptance_decisions", "owner_id"),
+        ("work_check_runs", "owner_id"),
+        ("work_recovery_points", "owner_id"),
+        ("work_patch_materialization_operations", "owner_id"),
+        ("work_patch_commit_operations", "owner_id"),
+        ("work_patch_artifacts", "owner_id"),
+        ("work_attention_receipts", "owner_id"),
+        ("work_event_sequences", "owner_id"),
+        ("work_events", "owner_id"),
+        ("work_proposals", "owner_id"),
+        ("work_proposal_sequences", "owner_id"),
+        ("work_branch_subjects", "owner_id"),
+        ("work_item_edges", "owner_id"),
+        ("work_item_revisions", "owner_id"),
+        ("work_items", "owner_id"),
+        ("work_graph_revisions", "owner_id"),
+        ("work_graph_sequences", "owner_id"),
+        ("work_criterion_sets", "owner_id"),
+        ("work_criterion_revisions", "owner_id"),
+        ("work_criteria", "owner_id"),
+        ("work_goal_revisions", "owner_id"),
+        ("work_branches", "owner_id"),
+        ("works", "owner_id"),
+        ("agent_run_events", "user_id"),
+        ("run_checkpoints", "user_id"),
+        ("run_display_projections", "user_id"),
+        ("agent_session_execution_slots", "user_id"),
+        ("agent_runs", "user_id"),
+        ("session_context_operation_receipts", "owner_user_id"),
+        ("session_context_authority_events", "owner_user_id"),
+        ("session_context_heads", "owner_user_id"),
+        ("session_artifact_references", "user_id"),
+        ("session_artifacts", "user_id"),
+        ("agent_sessions", "user_id"),
+    ] {
+        let statement = format!("DELETE FROM {table} WHERE {owner_column} = ?");
+        sqlx::query(&statement)
+            .bind(owner_id)
+            .execute(pool.get())
+            .await
+            .unwrap_or_else(|error| panic!("clean {table}: {error}"));
+    }
+}

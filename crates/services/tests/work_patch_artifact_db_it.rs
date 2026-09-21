@@ -22,11 +22,6 @@ use astra_services::work::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
-use uuid::Uuid;
-
-fn id(prefix: &str) -> String {
-    format!("{prefix}-{}", Uuid::new_v4())
-}
 
 fn hash(label: &str) -> WorkContentHash {
     WorkContentHash::parse(format!("sha256:{:x}", Sha256::digest(label.as_bytes())))
@@ -67,54 +62,19 @@ async fn insert_patch_payload(
     .expect("insert patch payload fixture");
 }
 
-async fn cleanup_owner(pool: &astra_core::SharedPool, owner_id: &str) {
-    for (table, owner_column) in [
-        ("agent_runs", "user_id"),
-        ("session_artifact_references", "user_id"),
-        ("session_artifacts", "user_id"),
-        ("work_patch_artifacts", "owner_id"),
-        ("work_patch_materialization_operations", "owner_id"),
-        ("work_patch_commit_operations", "owner_id"),
-        ("work_check_runs", "owner_id"),
-        ("work_events", "owner_id"),
-        ("work_event_sequences", "owner_id"),
-        ("work_branch_subjects", "owner_id"),
-        ("work_branches", "owner_id"),
-        ("work_item_edges", "owner_id"),
-        ("work_item_revisions", "owner_id"),
-        ("work_items", "owner_id"),
-        ("work_graph_revisions", "owner_id"),
-        ("work_graph_sequences", "owner_id"),
-        ("work_criterion_sets", "owner_id"),
-        ("work_criterion_revisions", "owner_id"),
-        ("work_criteria", "owner_id"),
-        ("work_goal_revisions", "owner_id"),
-        ("works", "owner_id"),
-        ("agent_sessions", "user_id"),
-    ] {
-        let statement = format!("DELETE FROM {table} WHERE {owner_column} = ?");
-        sqlx::query(&statement)
-            .bind(owner_id)
-            .execute(pool.get())
-            .await
-            .unwrap_or_else(|error| panic!("clean {table}: {error}"));
-    }
-}
-
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_output() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner = id("owner");
-    let work = id("work");
-    let branch = id("branch");
-    let session = id("session");
-    let criterion_id = id("criterion");
-    let subject_ref = WorkSubjectRef::parse(id("workspace")).expect("subject ref");
+    let owner = common::id("owner");
+    let work = common::id("work");
+    let branch = common::id("branch");
+    let session = common::id("session");
+    let criterion_id = common::id("criterion");
+    let subject_ref = WorkSubjectRef::parse(common::id("workspace")).expect("subject ref");
     let base_revision = hash("base");
     let result_revision = hash("result");
-    cleanup_owner(&pool, &owner).await;
 
     let created = repository
         .create_genesis(common::work_genesis(
@@ -122,7 +82,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
             &work,
             &branch,
             &session,
-            &id("intent"),
+            &common::id("intent"),
             "Export an exact patch for review.",
         ))
         .await
@@ -136,11 +96,11 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
             graph_revision: GraphRevision::INITIAL,
             subject_ref: subject_ref.clone(),
             subject_revision: result_revision.clone(),
-            source_ref: WorkChangeRef::parse(id("subject-event")).expect("subject source"),
+            source_ref: WorkChangeRef::parse(common::id("subject-event")).expect("subject source"),
         })
         .await
         .expect("record current subject");
-    let payload_id = id("payload");
+    let payload_id = common::id("payload");
     let patch = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n";
     insert_patch_payload(
         &pool,
@@ -154,7 +114,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
         owner_id: created.work.parts().owner_id.clone(),
         work_id: created.work.parts().work_id.clone(),
         branch_id: created.delivery_branch.parts().branch_id.clone(),
-        patch_artifact_id: WorkPatchArtifactId::parse(id("patch")).expect("patch id"),
+        patch_artifact_id: WorkPatchArtifactId::parse(common::id("patch")).expect("patch id"),
         payload_artifact_id: payload_id.clone(),
         expected_branch_revision: subject.branch_revision,
         expected_graph_revision: subject.graph_revision,
@@ -163,9 +123,9 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
         base_subject_revision: base_revision.clone(),
         result_subject_revision: result_revision.clone(),
         format: WorkPatchFormat::UnifiedDiffV1,
-        provider_invocation_ref: WorkProviderInvocationRef::parse(id("invocation"))
+        provider_invocation_ref: WorkProviderInvocationRef::parse(common::id("invocation"))
             .expect("invocation ref"),
-        source_ref: WorkChangeRef::parse(id("export-event")).expect("export source"),
+        source_ref: WorkChangeRef::parse(common::id("export-event")).expect("export source"),
     };
     sqlx::query(
         "INSERT INTO session_artifact_references
@@ -225,7 +185,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
     let commit_request = WorkPatchCommitRequest {
         owner_id: request.owner_id.clone(),
         work_id: request.work_id.clone(),
-        request_id: WorkChangeRef::parse(id("commit-request")).expect("commit request"),
+        request_id: WorkChangeRef::parse(common::id("commit-request")).expect("commit request"),
         target_branch_id: request.branch_id.clone(),
         patch_artifact_id: request.patch_artifact_id.clone(),
         expected_target_branch_revision: subject.branch_revision,
@@ -237,7 +197,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
             astra_services::work::SERVER_GIT_WORKTREE_COMMIT_PROVIDER_REF,
         )
         .expect("commit provider"),
-        policy_decision_ref: WorkChangeRef::parse(id("commit-policy-decision"))
+        policy_decision_ref: WorkChangeRef::parse(common::id("commit-policy-decision"))
             .expect("commit policy decision"),
     };
     let commit_operation = commit_service
@@ -275,7 +235,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
     assert!(public_commit.get("author_name").is_none());
     assert!(public_commit.get("author_email").is_none());
     let other_owner =
-        astra_services::work::WorkOwnerId::parse(id("other-owner")).expect("other owner");
+        astra_services::work::WorkOwnerId::parse(common::id("other-owner")).expect("other owner");
     assert!(matches!(
         commit_service
             .load(
@@ -295,9 +255,9 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
             WorkPatchCommitConflict::RequestIdentity
         ))
     ));
-    let commit_invocation =
-        WorkProviderInvocationRef::parse(id("commit-invocation")).expect("commit invocation");
-    let commit_executor = id("commit-executor");
+    let commit_invocation = WorkProviderInvocationRef::parse(common::id("commit-invocation"))
+        .expect("commit invocation");
+    let commit_executor = common::id("commit-executor");
     let claimed_commit = commit_service
         .claim_committing(
             &commit_request.owner_id,
@@ -319,7 +279,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
                 &commit_request.owner_id,
                 &commit_request.work_id,
                 &commit_operation.operation_id,
-                &id("other-executor"),
+                &common::id("other-executor"),
                 &commit_invocation,
             )
             .await,
@@ -360,7 +320,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
         item.owner_id == commit_request.owner_id
             && item.operation.operation_id == commit_operation.operation_id
     }));
-    let reconciliation_executor = id("commit-reconciler");
+    let reconciliation_executor = common::id("commit-reconciler");
     let reconciling_commit = commit_service
         .claim_reconciliation(
             &commit_request.owner_id,
@@ -386,7 +346,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
     };
     let mut stale_commit = commit_request.clone();
     stale_commit.request_id =
-        WorkChangeRef::parse(id("stale-commit-request")).expect("stale commit request");
+        WorkChangeRef::parse(common::id("stale-commit-request")).expect("stale commit request");
     stale_commit.expected_target_branch_revision = stale_commit
         .expected_target_branch_revision
         .checked_next()
@@ -410,8 +370,8 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
     .expect("count column");
     assert_eq!(commit_rows, 1, "conflicts must not create operations");
 
-    let target_branch = id("branch");
-    let target_session = id("session");
+    let target_branch = common::id("branch");
+    let target_session = common::id("session");
     sqlx::query(
         "INSERT INTO agent_sessions
          (session_id, user_id, title, status, event_count, metadata)
@@ -435,7 +395,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
     )
     .bind(&target_branch)
     .bind(&target_session)
-    .bind(id("fork-cursor"))
+    .bind(common::id("fork-cursor"))
     .bind(&owner)
     .bind(&work)
     .bind(&branch)
@@ -452,7 +412,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
             graph_revision: GraphRevision::INITIAL,
             subject_ref: subject_ref.clone(),
             subject_revision: base_revision.clone(),
-            source_ref: WorkChangeRef::parse(id("target-subject-event"))
+            source_ref: WorkChangeRef::parse(common::id("target-subject-event"))
                 .expect("target subject source"),
         })
         .await
@@ -461,7 +421,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
     let unverified_target_request = WorkPatchMaterializationRequest {
         owner_id: request.owner_id.clone(),
         work_id: request.work_id.clone(),
-        request_id: WorkChangeRef::parse(id("materialize-without-criteria"))
+        request_id: WorkChangeRef::parse(common::id("materialize-without-criteria"))
             .expect("unverified request"),
         patch_artifact_id: request.patch_artifact_id.clone(),
         target_branch_id: initial_target_subject.branch_id.clone(),
@@ -469,7 +429,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
         expected_target_graph_revision: initial_target_subject.graph_revision,
         provider_ref: WorkMaterializationProviderRef::parse("edge://device-1/workspace")
             .expect("provider"),
-        policy_decision_ref: WorkChangeRef::parse(id("policy-decision")).expect("policy"),
+        policy_decision_ref: WorkChangeRef::parse(common::id("policy-decision")).expect("policy"),
     };
     assert!(matches!(
         materialization.admit(&unverified_target_request).await,
@@ -492,7 +452,8 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
                         .expect("criterion command"),
                 },
             })],
-            source_ref: WorkChangeRef::parse(id("criteria-source")).expect("criteria source"),
+            source_ref: WorkChangeRef::parse(common::id("criteria-source"))
+                .expect("criteria source"),
             reason: None,
         })
         .await
@@ -508,7 +469,8 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
             expected_criteria_set_revision: CriterionSetRevision::INITIAL,
             target_goal_revision: astra_services::work::GoalRevision::INITIAL,
             target_criteria_set_revision: CriterionSetRevision::new(2).expect("criteria r2"),
-            source_ref: WorkChangeRef::parse(id("target-basis-source")).expect("basis source"),
+            source_ref: WorkChangeRef::parse(common::id("target-basis-source"))
+                .expect("basis source"),
         })
         .await
         .expect("adopt verification criterion on target");
@@ -521,7 +483,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
             graph_revision: GraphRevision::INITIAL,
             subject_ref: subject_ref.clone(),
             subject_revision: base_revision.clone(),
-            source_ref: WorkChangeRef::parse(id("aligned-target-subject"))
+            source_ref: WorkChangeRef::parse(common::id("aligned-target-subject"))
                 .expect("aligned subject source"),
         })
         .await
@@ -529,7 +491,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
     let materialization_request = WorkPatchMaterializationRequest {
         owner_id: request.owner_id.clone(),
         work_id: request.work_id.clone(),
-        request_id: WorkChangeRef::parse(id("materialize-request"))
+        request_id: WorkChangeRef::parse(common::id("materialize-request"))
             .expect("materialization request"),
         patch_artifact_id: request.patch_artifact_id.clone(),
         target_branch_id: target_subject.branch_id.clone(),
@@ -537,7 +499,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
         expected_target_graph_revision: target_subject.graph_revision,
         provider_ref: WorkMaterializationProviderRef::parse("edge://device-1/workspace")
             .expect("provider"),
-        policy_decision_ref: WorkChangeRef::parse(id("policy-decision")).expect("policy"),
+        policy_decision_ref: WorkChangeRef::parse(common::id("policy-decision")).expect("policy"),
     };
     let admitted = materialization
         .admit(&materialization_request)
@@ -626,7 +588,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
     );
     let mut overlapping_request = materialization_request.clone();
     overlapping_request.request_id =
-        WorkChangeRef::parse(id("materialize-overlap")).expect("overlap request");
+        WorkChangeRef::parse(common::id("materialize-overlap")).expect("overlap request");
     assert!(matches!(
         materialization.admit(&overlapping_request).await,
         Err(WorkPatchMaterializationError::Conflict(
@@ -664,7 +626,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
         admitted
     );
     let apply_invocation =
-        WorkProviderInvocationRef::parse(id("apply-invocation")).expect("apply invocation");
+        WorkProviderInvocationRef::parse(common::id("apply-invocation")).expect("apply invocation");
     let applying = materialization
         .claim_applying(
             &materialization_request.owner_id,
@@ -815,9 +777,9 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
             .await,
         Err(WorkPatchMaterializationError::VerificationRequired)
     ));
-    let verification_run_id = id("verification-run");
+    let verification_run_id = common::id("verification-run");
     let verification_attempt =
-        WorkItemAttemptId::parse(id("verification-attempt")).expect("verification attempt");
+        WorkItemAttemptId::parse(common::id("verification-attempt")).expect("verification attempt");
     sqlx::query(
         "INSERT INTO agent_runs
          (run_id, user_id, session_id, root_run_id, ancestor_path, depth, status,
@@ -841,7 +803,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
             owner_id: materialization_request.owner_id.clone(),
             work_id: materialization_request.work_id.clone(),
             branch_id: materialization_request.target_branch_id.clone(),
-            check_run_id: CheckRunId::parse(id("materialization-check")).expect("check id"),
+            check_run_id: CheckRunId::parse(common::id("materialization-check")).expect("check id"),
             graph_revision: materialization_request.expected_target_graph_revision,
             item: WorkItemRevisionRef {
                 item_id: WorkItemId::root(),
@@ -857,7 +819,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
             subject_revision: result_revision.clone(),
             artifact_digest: Some(applied.payload_hash.clone()),
             run_ref: WorkChangeRef::parse(&verification_run_id).expect("verification run ref"),
-            invocation_ref: WorkChangeRef::parse(id("verification-invocation"))
+            invocation_ref: WorkChangeRef::parse(common::id("verification-invocation"))
                 .expect("verification invocation"),
             verifier_kind: CheckVerifierKind::Test,
             verifier_fingerprint: hash("verification-command"),
@@ -870,7 +832,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
                 CheckEvidenceRef::parse("urn:astra:trace:cloud:materialization-check/invocation")
                     .expect("verification evidence"),
             ],
-            source_cursor: WorkChangeRef::parse(id("verification-cursor"))
+            source_cursor: WorkChangeRef::parse(common::id("verification-cursor"))
                 .expect("verification cursor"),
             produced_at: "2026-08-02T00:00:00Z".parse().expect("verification time"),
             expires_at: None,
@@ -905,7 +867,8 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
     );
     let mut conflicting_report = apply_report.clone();
     conflicting_report.provider_invocation_ref =
-        WorkProviderInvocationRef::parse(id("apply-invocation")).expect("different invocation");
+        WorkProviderInvocationRef::parse(common::id("apply-invocation"))
+            .expect("different invocation");
     assert!(matches!(
         materialization.record_applied(&conflicting_report).await,
         Err(WorkPatchMaterializationError::Conflict(
@@ -932,14 +895,14 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
             graph_revision: materialization_request.expected_target_graph_revision,
             subject_ref: target_subject.subject_ref.clone(),
             subject_revision: different_base,
-            source_ref: WorkChangeRef::parse(id("target-subject-event"))
+            source_ref: WorkChangeRef::parse(common::id("target-subject-event"))
                 .expect("target subject source"),
         })
         .await
         .expect("advance target to a different exact base");
     let mut wrong_base = materialization_request.clone();
-    wrong_base.request_id =
-        WorkChangeRef::parse(id("materialize-request")).expect("new materialization request");
+    wrong_base.request_id = WorkChangeRef::parse(common::id("materialize-request"))
+        .expect("new materialization request");
     wrong_base.expected_target_branch_revision = advanced_target.branch_revision;
     wrong_base.expected_target_graph_revision = advanced_target.graph_revision;
     assert!(matches!(
@@ -970,14 +933,14 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
             graph_revision: advanced_target.graph_revision,
             subject_ref: target_subject.subject_ref.clone(),
             subject_revision: base_revision.clone(),
-            source_ref: WorkChangeRef::parse(id("restore-target-base"))
+            source_ref: WorkChangeRef::parse(common::id("restore-target-base"))
                 .expect("restore base source"),
         })
         .await
         .expect("restore an exact patch base");
     let mut abort_request = materialization_request.clone();
     abort_request.request_id =
-        WorkChangeRef::parse(id("materialize-abort")).expect("abort request");
+        WorkChangeRef::parse(common::id("materialize-abort")).expect("abort request");
     abort_request.expected_target_branch_revision = restored_base.branch_revision;
     abort_request.expected_target_graph_revision = restored_base.graph_revision;
     let abort_operation = materialization
@@ -1010,15 +973,15 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
 
     let mut no_effect_request = materialization_request.clone();
     no_effect_request.request_id =
-        WorkChangeRef::parse(id("materialize-no-effect")).expect("no-effect request");
+        WorkChangeRef::parse(common::id("materialize-no-effect")).expect("no-effect request");
     no_effect_request.expected_target_branch_revision = restored_base.branch_revision;
     no_effect_request.expected_target_graph_revision = restored_base.graph_revision;
     let no_effect_operation = materialization
         .admit(&no_effect_request)
         .await
         .expect("admit no-effect proof operation");
-    let no_effect_invocation =
-        WorkProviderInvocationRef::parse(id("no-effect-invocation")).expect("no-effect invocation");
+    let no_effect_invocation = WorkProviderInvocationRef::parse(common::id("no-effect-invocation"))
+        .expect("no-effect invocation");
     materialization
         .claim_applying(
             &no_effect_request.owner_id,
@@ -1084,15 +1047,15 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
     );
     let mut mismatch_request = materialization_request.clone();
     mismatch_request.request_id =
-        WorkChangeRef::parse(id("materialize-mismatch")).expect("mismatch request");
+        WorkChangeRef::parse(common::id("materialize-mismatch")).expect("mismatch request");
     mismatch_request.expected_target_branch_revision = restored_base.branch_revision;
     mismatch_request.expected_target_graph_revision = restored_base.graph_revision;
     let mismatch_operation = materialization
         .admit(&mismatch_request)
         .await
         .expect("admit mismatch proof operation");
-    let mismatch_invocation =
-        WorkProviderInvocationRef::parse(id("mismatch-invocation")).expect("mismatch invocation");
+    let mismatch_invocation = WorkProviderInvocationRef::parse(common::id("mismatch-invocation"))
+        .expect("mismatch invocation");
     materialization
         .claim_applying(
             &mismatch_request.owner_id,
@@ -1143,13 +1106,14 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
             graph_revision: mismatched_subject.graph_revision,
             subject_ref: target_subject.subject_ref.clone(),
             subject_revision: base_revision.clone(),
-            source_ref: WorkChangeRef::parse(id("reset-target-base")).expect("reset base source"),
+            source_ref: WorkChangeRef::parse(common::id("reset-target-base"))
+                .expect("reset base source"),
         })
         .await
         .expect("reset target before drift proof");
     let mut drift_request = materialization_request.clone();
     drift_request.request_id =
-        WorkChangeRef::parse(id("materialize-target-drift")).expect("drift request");
+        WorkChangeRef::parse(common::id("materialize-target-drift")).expect("drift request");
     drift_request.expected_target_branch_revision = reset_for_target_change.branch_revision;
     drift_request.expected_target_graph_revision = reset_for_target_change.graph_revision;
     let drift_operation = materialization
@@ -1157,7 +1121,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
         .await
         .expect("admit target drift proof operation");
     let drift_invocation =
-        WorkProviderInvocationRef::parse(id("drift-invocation")).expect("drift invocation");
+        WorkProviderInvocationRef::parse(common::id("drift-invocation")).expect("drift invocation");
     materialization
         .claim_applying(
             &drift_request.owner_id,
@@ -1177,7 +1141,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
             graph_revision: drift_request.expected_target_graph_revision,
             subject_ref: target_subject.subject_ref.clone(),
             subject_revision: hash("concurrent-target-change"),
-            source_ref: WorkChangeRef::parse(id("concurrent-target-change"))
+            source_ref: WorkChangeRef::parse(common::id("concurrent-target-change"))
                 .expect("concurrent source"),
         })
         .await
@@ -1256,7 +1220,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
     assert!(matches!(
         materialization
             .list_for_source(WorkPatchMaterializationQuery {
-                owner_id: astra_services::work::WorkOwnerId::parse(id("other-owner"))
+                owner_id: astra_services::work::WorkOwnerId::parse(common::id("other-owner"))
                     .expect("other owner"),
                 work_id: materialization_request.work_id.clone(),
                 target_branch_id: materialization_request.target_branch_id.clone(),
@@ -1268,7 +1232,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
         Err(WorkPatchMaterializationError::NotFound)
     ));
 
-    let tampered_payload_id = id("payload");
+    let tampered_payload_id = common::id("payload");
     insert_patch_payload(
         &pool,
         &owner,
@@ -1278,9 +1242,9 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
     )
     .await;
     let mut tampered = request.clone();
-    tampered.patch_artifact_id = WorkPatchArtifactId::parse(id("patch")).expect("patch id");
+    tampered.patch_artifact_id = WorkPatchArtifactId::parse(common::id("patch")).expect("patch id");
     tampered.payload_artifact_id = tampered_payload_id;
-    tampered.source_ref = WorkChangeRef::parse(id("export-event")).expect("export source");
+    tampered.source_ref = WorkChangeRef::parse(common::id("export-event")).expect("export source");
     assert!(matches!(
         repository.record_patch_artifact(tampered).await,
         Err(WorkRepositoryError::PatchArtifactConflict {
@@ -1288,7 +1252,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
         })
     ));
 
-    let stale_payload_id = id("payload");
+    let stale_payload_id = common::id("payload");
     insert_patch_payload(
         &pool,
         &owner,
@@ -1306,7 +1270,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
             graph_revision: subject.graph_revision,
             subject_ref,
             subject_revision: hash("new-result"),
-            source_ref: WorkChangeRef::parse(id("subject-event")).expect("subject source"),
+            source_ref: WorkChangeRef::parse(common::id("subject-event")).expect("subject source"),
         })
         .await
         .expect("advance subject after export");
@@ -1315,9 +1279,9 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
         WorkBranchSubjectRevision::new(2).expect("revision two")
     );
     let mut stale = request;
-    stale.patch_artifact_id = WorkPatchArtifactId::parse(id("patch")).expect("patch id");
+    stale.patch_artifact_id = WorkPatchArtifactId::parse(common::id("patch")).expect("patch id");
     stale.payload_artifact_id = stale_payload_id;
-    stale.source_ref = WorkChangeRef::parse(id("export-event")).expect("export source");
+    stale.source_ref = WorkChangeRef::parse(common::id("export-event")).expect("export source");
     assert!(matches!(
         repository.record_patch_artifact(stale).await,
         Err(WorkRepositoryError::PatchArtifactConflict {
@@ -1373,7 +1337,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
         ))
     ));
 
-    let second_payload_id = id("payload");
+    let second_payload_id = common::id("payload");
     insert_patch_payload(
         &pool,
         &owner,
@@ -1382,7 +1346,7 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
         patch_content(patch, None),
     )
     .await;
-    let second_patch_id = WorkPatchArtifactId::parse(id("patch")).expect("second patch id");
+    let second_patch_id = WorkPatchArtifactId::parse(common::id("patch")).expect("second patch id");
     sqlx::query(
         "INSERT INTO session_artifact_references
          (user_id, session_id, artifact_id, reference_kind, reference_id)
@@ -1409,21 +1373,21 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
             base_subject_revision: hash("second clean base"),
             result_subject_revision: advanced.subject_revision.clone(),
             format: WorkPatchFormat::UnifiedDiffV1,
-            provider_invocation_ref: WorkProviderInvocationRef::parse(id("second-export"))
+            provider_invocation_ref: WorkProviderInvocationRef::parse(common::id("second-export"))
                 .expect("second export invocation"),
-            source_ref: WorkChangeRef::parse(id("second-export-event"))
+            source_ref: WorkChangeRef::parse(common::id("second-export-event"))
                 .expect("second export source"),
         })
         .await
         .expect("record second exact patch");
     let second_commit_request = WorkPatchCommitRequest {
-        request_id: WorkChangeRef::parse(id("second-commit-request"))
+        request_id: WorkChangeRef::parse(common::id("second-commit-request"))
             .expect("second commit request"),
         patch_artifact_id: second_patch_id,
         expected_target_branch_revision: advanced.branch_revision,
         expected_target_graph_revision: advanced.graph_revision,
         message: "Commit the second reviewed result".into(),
-        policy_decision_ref: WorkChangeRef::parse(id("second-commit-policy"))
+        policy_decision_ref: WorkChangeRef::parse(common::id("second-commit-policy"))
             .expect("second commit policy"),
         ..commit_request.clone()
     };
@@ -1431,9 +1395,10 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
         .admit(&second_commit_request)
         .await
         .expect("admit second exact commit");
-    let second_invocation = WorkProviderInvocationRef::parse(id("second-commit-invocation"))
-        .expect("second commit invocation");
-    let second_executor = id("second-commit-executor");
+    let second_invocation =
+        WorkProviderInvocationRef::parse(common::id("second-commit-invocation"))
+            .expect("second commit invocation");
+    let second_executor = common::id("second-commit-executor");
     commit_service
         .claim_committing(
             &second_commit_request.owner_id,
@@ -1481,5 +1446,5 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
             .expect("next successful commit branch revision")
     );
 
-    cleanup_owner(&pool, &owner).await;
+    common::cleanup_work_owner(&pool, &owner).await;
 }

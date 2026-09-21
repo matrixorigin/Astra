@@ -15,19 +15,12 @@ use uuid::Uuid;
 use super::harness::{
     E2E_PASSWORD, MATRIX_E2E_EDGE_WORKSPACE_ROOT, bootstrap, build_e2e_access_token, get_json,
     grant_astra_admin_role, load_durable_interaction_event, maybe_tool_result_payload_from_sse,
-    model_selection, post_empty, post_json, put_json, revoke_astra_admin_role,
+    model_selection, parse_sse_events, post_empty, post_json, put_json, revoke_astra_admin_role,
     seed_pending_approval, seeded_model_selection,
 };
 use super::journey_saas_platform_matrix::{
     cleanup_resource_limits, cleanup_seeded_run, limits_payload, seed_capacity_holding_run,
 };
-
-fn parse_sse_events(raw: &str) -> Vec<Value> {
-    raw.lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter_map(|data| serde_json::from_str(data).ok())
-        .collect()
-}
 
 async fn seed_resource_usage_tokens(pool: &sqlx::MySqlPool, user_id: &str, tokens: i64) {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();

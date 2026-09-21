@@ -24,7 +24,7 @@ use axum::{
 };
 use serde_json::{Value, json};
 use sqlx::Row;
-use test_support::parse_sse_events;
+use test_support::{parse_sse_events, require_db_it_env};
 use tokio::sync::RwLock;
 use tower::util::ServiceExt;
 use uuid::Uuid;
@@ -38,15 +38,6 @@ fn unsupported_phase1_http_method<T>(method: &str) -> Result<T, (StatusCode, Jso
             "phase1_run_durability test mock does not implement {method}"
         ))),
     ))
-}
-
-fn require_db_it_env() -> astra_core::MatrixOneSettings {
-    assert_eq!(
-        std::env::var("ASTRA_TEST_DB_IT").as_deref(),
-        Ok("1"),
-        "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
-    );
-    astra_core::MatrixOneSettings::from_env()
 }
 
 static SHARED_BOOTSTRAP: tokio::sync::OnceCell<astra_core::SharedPool> =

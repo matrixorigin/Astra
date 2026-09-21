@@ -17,6 +17,7 @@ use astra_services::{
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 pub type EdgeCallbackLedger = Arc<tokio::sync::Mutex<HashMap<String, Value>>>;
 
@@ -172,6 +173,15 @@ pub fn test_matrixone_settings() -> MatrixOneSettings {
     }
 }
 
+pub fn require_db_it_env() -> MatrixOneSettings {
+    assert_eq!(
+        std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+        Ok("1"),
+        "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
+    );
+    MatrixOneSettings::from_env()
+}
+
 pub fn test_run_lifecycle(
     encryptor: Arc<FernetTokenEncryptor>,
     ledger: EdgeCallbackLedger,
@@ -210,4 +220,30 @@ pub fn parse_sse_events(body: &str) -> Vec<Value> {
         .filter_map(|line| line.strip_prefix("data: "))
         .filter_map(|data| serde_json::from_str(data).ok())
         .collect()
+}
+
+pub fn assert_contract_json(actual: &Value, expected: &Value, label: &str) {
+    if let Some(expected_obj) = expected.as_object()
+        && expected_obj.contains_key("detail")
+        && !expected_obj.contains_key("request_id")
+    {
+        let actual_obj = actual
+            .as_object()
+            .unwrap_or_else(|| panic!("{label}: actual response should be a JSON object"));
+        let request_id = actual_obj
+            .get("request_id")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("{label}: error response should include request_id"));
+        assert!(
+            Uuid::parse_str(request_id).is_ok(),
+            "{label}: request_id should be a UUID"
+        );
+
+        let mut normalized_actual = actual_obj.clone();
+        normalized_actual.remove("request_id");
+        assert_eq!(Value::Object(normalized_actual), *expected, "{label}");
+        return;
+    }
+
+    assert_eq!(actual, expected, "{label}");
 }

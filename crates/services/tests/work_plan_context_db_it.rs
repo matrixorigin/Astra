@@ -8,11 +8,6 @@ use astra_services::work::{
 };
 use std::sync::Arc;
 use tokio::sync::Barrier;
-use uuid::Uuid;
-
-fn id(prefix: &str) -> String {
-    format!("{prefix}-{}", Uuid::new_v4())
-}
 
 fn genesis(
     owner_id: &str,
@@ -25,7 +20,7 @@ fn genesis(
         work_id,
         branch_id,
         session_id,
-        &id("intent"),
+        &common::id("intent"),
         "Maintain one coherent plan snapshot for the root loop.",
     )
 }
@@ -48,51 +43,15 @@ fn dependency(from: &str, to: &str) -> WorkItemEdge {
     }
 }
 
-async fn cleanup_owner(pool: &astra_core::SharedPool, owner_id: &str) {
-    for (table, owner_column) in [
-        ("work_runtime_event_outbox", "owner_id"),
-        ("work_runtime_event_outbox_slots", "owner_id"),
-        ("work_events", "owner_id"),
-        ("work_attention_receipts", "owner_id"),
-        ("work_event_sequences", "owner_id"),
-        ("work_current_gap_acceptances", "owner_id"),
-        ("work_acceptance_decisions", "owner_id"),
-        ("work_check_runs", "owner_id"),
-        ("work_proposals", "owner_id"),
-        ("work_proposal_sequences", "owner_id"),
-        ("work_branch_subjects", "owner_id"),
-        ("work_branches", "owner_id"),
-        ("work_item_edges", "owner_id"),
-        ("work_item_revisions", "owner_id"),
-        ("work_items", "owner_id"),
-        ("work_graph_revisions", "owner_id"),
-        ("work_graph_sequences", "owner_id"),
-        ("work_criterion_sets", "owner_id"),
-        ("work_criterion_revisions", "owner_id"),
-        ("work_criteria", "owner_id"),
-        ("work_goal_revisions", "owner_id"),
-        ("works", "owner_id"),
-        ("agent_sessions", "user_id"),
-    ] {
-        let statement = format!("DELETE FROM {table} WHERE {owner_column} = ?");
-        sqlx::query(&statement)
-            .bind(owner_id)
-            .execute(pool.get())
-            .await
-            .unwrap_or_else(|error| panic!("clean {table}: {error}"));
-    }
-}
-
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn public_branch_identity_resolves_one_active_owner_scoped_runtime_binding() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id, &session_id))
         .await
@@ -110,9 +69,21 @@ async fn public_branch_identity_resolves_one_active_owner_scoped_runtime_binding
     assert_eq!(binding.session_id.as_str(), session_id);
 
     for (other_owner, other_work, other_branch) in [
-        (id("other-owner"), work_id.clone(), branch_id.clone()),
-        (owner_id.clone(), id("other-work"), branch_id.clone()),
-        (owner_id.clone(), work_id.clone(), id("other-branch")),
+        (
+            common::id("other-owner"),
+            work_id.clone(),
+            branch_id.clone(),
+        ),
+        (
+            owner_id.clone(),
+            common::id("other-work"),
+            branch_id.clone(),
+        ),
+        (
+            owner_id.clone(),
+            work_id.clone(),
+            common::id("other-branch"),
+        ),
     ] {
         assert!(matches!(
             repository
@@ -165,7 +136,7 @@ async fn public_branch_identity_resolves_one_active_owner_scoped_runtime_binding
             .await,
         Err(WorkRepositoryError::NotFound)
     ));
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -173,12 +144,11 @@ async fn public_branch_identity_resolves_one_active_owner_scoped_runtime_binding
 async fn session_item_runtime_binding_accepts_only_the_active_item_in_the_bound_graph() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    let task_id = id("task");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
+    let task_id = common::id("task");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id, &session_id))
         .await
@@ -192,7 +162,7 @@ async fn session_item_runtime_binding_accepts_only_the_active_item_in_the_bound_
             expected_graph_revision: GraphRevision::INITIAL,
             items: vec![WorkGraphItemChange::New(item(&task_id))],
             edges: Vec::new(),
-            source_ref: WorkChangeRef::parse(id("graph-change")).expect("source"),
+            source_ref: WorkChangeRef::parse(common::id("graph-change")).expect("source"),
             reason: None,
         })
         .await
@@ -246,7 +216,7 @@ async fn session_item_runtime_binding_accepts_only_the_active_item_in_the_bound_
             .await,
         Err(WorkRepositoryError::NotFound)
     ));
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -254,13 +224,12 @@ async fn session_item_runtime_binding_accepts_only_the_active_item_in_the_bound_
 async fn session_plan_context_is_bounded_canonical_and_owner_scoped() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    let task_a = id("task-a");
-    let task_b = id("task-b");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
+    let task_a = common::id("task-a");
+    let task_b = common::id("task-b");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id, &session_id))
         .await
@@ -277,7 +246,7 @@ async fn session_plan_context_is_bounded_canonical_and_owner_scoped() {
                 WorkGraphItemChange::New(item(&task_a)),
             ],
             edges: vec![dependency(&task_a, &task_b)],
-            source_ref: WorkChangeRef::parse(id("graph-change")).expect("source"),
+            source_ref: WorkChangeRef::parse(common::id("graph-change")).expect("source"),
             reason: None,
         })
         .await
@@ -309,8 +278,8 @@ async fn session_plan_context_is_bounded_canonical_and_owner_scoped() {
     assert!(!encoded.contains(&owner_id));
     assert!(!encoded.contains(&session_id));
 
-    let fork_branch_id = id("fork-branch");
-    let fork_session_id = id("fork-session");
+    let fork_branch_id = common::id("fork-branch");
+    let fork_session_id = common::id("fork-session");
     sqlx::query(
         "INSERT INTO agent_sessions
          (session_id, user_id, agent_id, title, status, event_count, metadata,
@@ -334,7 +303,7 @@ async fn session_plan_context_is_bounded_canonical_and_owner_scoped() {
     .bind(&fork_branch_id)
     .bind(&fork_session_id)
     .bind(&branch_id)
-    .bind(id("fork-cursor"))
+    .bind(common::id("fork-cursor"))
     .execute(pool.get())
     .await
     .expect("fork branch");
@@ -361,8 +330,8 @@ async fn session_plan_context_is_bounded_canonical_and_owner_scoped() {
     assert_eq!(fork_context.basis().graph_revision.get(), 2);
     assert_eq!(fork_context.items(), context.items());
 
-    let foreign_owner = WorkOwnerId::parse(id("foreign-owner")).expect("foreign owner");
-    let missing_session = InternalSessionId::parse(id("missing-session")).expect("session");
+    let foreign_owner = WorkOwnerId::parse(common::id("foreign-owner")).expect("foreign owner");
+    let missing_session = InternalSessionId::parse(common::id("missing-session")).expect("session");
     assert!(matches!(
         repository
             .load_plan_context_for_session(
@@ -381,7 +350,7 @@ async fn session_plan_context_is_bounded_canonical_and_owner_scoped() {
             .await,
         Err(WorkRepositoryError::NotFound)
     ));
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -389,12 +358,11 @@ async fn session_plan_context_is_bounded_canonical_and_owner_scoped() {
 async fn plan_context_rejects_corrupt_hash_and_missing_item_revision() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    let task_id = id("task");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
+    let task_id = common::id("task");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id, &session_id))
         .await
@@ -408,7 +376,7 @@ async fn plan_context_rejects_corrupt_hash_and_missing_item_revision() {
             expected_graph_revision: GraphRevision::INITIAL,
             items: vec![WorkGraphItemChange::New(item(&task_id))],
             edges: Vec::new(),
-            source_ref: WorkChangeRef::parse(id("graph-change")).expect("source"),
+            source_ref: WorkChangeRef::parse(common::id("graph-change")).expect("source"),
             reason: None,
         })
         .await
@@ -444,7 +412,7 @@ async fn plan_context_rejects_corrupt_hash_and_missing_item_revision() {
     assert!(matches!(
         repository
             .load_session_plan_binding(
-                &WorkOwnerId::parse(id("foreign-owner")).expect("foreign owner"),
+                &WorkOwnerId::parse(common::id("foreign-owner")).expect("foreign owner"),
                 &InternalSessionId::parse(&session_id).expect("session")
             )
             .await,
@@ -491,7 +459,7 @@ async fn plan_context_rejects_corrupt_hash_and_missing_item_revision() {
             .await,
         Err(WorkRepositoryError::MissingWorkItemRevisions { missing }) if missing.len() == 1
     ));
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -499,12 +467,11 @@ async fn plan_context_rejects_corrupt_hash_and_missing_item_revision() {
 async fn plan_context_racing_graph_advance_is_never_torn() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    let task_id = id("task");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
+    let task_id = common::id("task");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id, &session_id))
         .await
@@ -538,7 +505,7 @@ async fn plan_context_racing_graph_advance_is_never_torn() {
             expected_graph_revision: GraphRevision::INITIAL,
             items: vec![WorkGraphItemChange::New(item(&task_id))],
             edges: Vec::new(),
-            source_ref: WorkChangeRef::parse(id("graph-change")).expect("source"),
+            source_ref: WorkChangeRef::parse(common::id("graph-change")).expect("source"),
             reason: None,
         })
         .await
@@ -567,7 +534,7 @@ async fn plan_context_racing_graph_advance_is_never_torn() {
         }
         assert!(context.dependencies().is_empty());
     }
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -575,11 +542,10 @@ async fn plan_context_racing_graph_advance_is_never_torn() {
 async fn maximum_active_frontier_uses_one_bounded_item_fetch() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id, &session_id))
         .await
@@ -596,7 +562,7 @@ async fn maximum_active_frontier_uses_one_bounded_item_fetch() {
             expected_graph_revision: GraphRevision::INITIAL,
             items,
             edges: Vec::new(),
-            source_ref: WorkChangeRef::parse(id("maximum-frontier")).expect("source"),
+            source_ref: WorkChangeRef::parse(common::id("maximum-frontier")).expect("source"),
             reason: None,
         })
         .await
@@ -613,7 +579,7 @@ async fn maximum_active_frontier_uses_one_bounded_item_fetch() {
     assert_eq!(context.items()[0].item_id.as_str(), "task-000");
     assert_eq!(context.items()[255].item_id.as_str(), "task-255");
     assert!(context.dependencies().is_empty());
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -621,14 +587,13 @@ async fn maximum_active_frontier_uses_one_bounded_item_fetch() {
 async fn public_task_graph_pages_are_owner_scoped_and_fail_closed_across_replan() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    let task_a = id("task-a");
-    let task_b = id("task-b");
-    let task_c = id("task-c");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
+    let task_a = common::id("task-a");
+    let task_b = common::id("task-b");
+    let task_c = common::id("task-c");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id, &session_id))
         .await
@@ -645,7 +610,7 @@ async fn public_task_graph_pages_are_owner_scoped_and_fail_closed_across_replan(
                 WorkGraphItemChange::New(item(&task_a)),
             ],
             edges: vec![dependency(&task_a, &task_b)],
-            source_ref: WorkChangeRef::parse(id("graph-change")).expect("source"),
+            source_ref: WorkChangeRef::parse(common::id("graph-change")).expect("source"),
             reason: None,
         })
         .await
@@ -712,7 +677,7 @@ async fn public_task_graph_pages_are_owner_scoped_and_fail_closed_across_replan(
                 WorkGraphItemChange::New(item(&task_c)),
             ],
             edges: vec![dependency(&task_a, &task_b), dependency(&task_b, &task_c)],
-            source_ref: WorkChangeRef::parse(id("replan")).expect("source"),
+            source_ref: WorkChangeRef::parse(common::id("replan")).expect("source"),
             reason: None,
         })
         .await
@@ -742,7 +707,7 @@ async fn public_task_graph_pages_are_owner_scoped_and_fail_closed_across_replan(
         repository
             .load_task_graph_page(
                 WorkTaskGraphQuery::new(
-                    WorkOwnerId::parse(id("other-owner")).expect("other owner"),
+                    WorkOwnerId::parse(common::id("other-owner")).expect("other owner"),
                     work,
                     branch,
                     None,
@@ -756,5 +721,5 @@ async fn public_task_graph_pages_are_owner_scoped_and_fail_closed_across_replan(
             .await,
         Err(WorkRepositoryError::NotFound)
     ));
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }

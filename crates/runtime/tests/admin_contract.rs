@@ -17,6 +17,9 @@ use serde::Deserialize;
 use tower::util::ServiceExt;
 use uuid::Uuid;
 
+mod test_support;
+use test_support::assert_contract_json;
+
 #[derive(Deserialize)]
 struct ResponseContract {
     status: u16,
@@ -380,36 +383,6 @@ async fn post_json(
         .unwrap();
     let json = serde_json::from_slice(&bytes).unwrap();
     (status, json)
-}
-
-fn assert_contract_json(actual: &serde_json::Value, expected: &serde_json::Value, label: &str) {
-    if let Some(expected_obj) = expected.as_object()
-        && expected_obj.contains_key("detail")
-        && !expected_obj.contains_key("request_id")
-    {
-        let actual_obj = actual
-            .as_object()
-            .unwrap_or_else(|| panic!("{label}: actual response should be a JSON object"));
-        let request_id = actual_obj
-            .get("request_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_else(|| panic!("{label}: error response should include request_id"));
-        assert!(
-            Uuid::parse_str(request_id).is_ok(),
-            "{label}: request_id should be a UUID"
-        );
-
-        let mut normalized_actual = actual_obj.clone();
-        normalized_actual.remove("request_id");
-        assert_eq!(
-            serde_json::Value::Object(normalized_actual),
-            *expected,
-            "{label}"
-        );
-        return;
-    }
-
-    assert_eq!(actual, expected, "{label}");
 }
 
 fn build_request(method: &str, path: &str, headers: &[(&str, &str)]) -> Request<body::Body> {
