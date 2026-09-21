@@ -48,8 +48,7 @@ use crate::turn::local_provider::LocalSessionProvider;
 use crate::turn::providers::{LiveRuntimeProvider, ObservationProvider, SessionStateProvider};
 use crate::turn::runtime_policy::RuntimePolicy;
 use astra_turn_core::agentic_post_tool_policy::{
-    AgenticPostToolIterationControl, AgenticPostToolPolicyRequest, apply_agentic_post_tool_policy,
-    map_post_tool_policy_outcome, policy_advisory_bundle_value,
+    AgenticPostToolPolicyRequest, apply_agentic_post_tool_policy,
 };
 use astra_turn_core::agentic_turn_flow::agentic_round_stall_preflight;
 use astra_turn_core::headless_tool_assembly::HeadlessPreResolvedToolResult;
@@ -2205,23 +2204,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         &mut state.turn_guard,
     );
 
-    // Exact-signature repetition is behavior evidence, not a termination
-    // boundary. Surface it once; actual token/round ceilings remain enforced
-    // by the budget layer.
-    if let Some(last_sig) = queue_repetition_threshold_advisory(state) {
-        if !prep.quiet {
-            host.emit_headless_line(
-                super::super::agentic::headless_round::HeadlessStderrStyle::Yellow,
-                format!(
-                    "↻ {} consecutive identical tool-call signatures observed ({}); \
-                     continuing with advisory evidence.",
-                    astra_turn_core::stall::CONSECUTIVE_IDENTICAL_SIGS_ADVISORY_THRESHOLD,
-                    last_sig,
-                ),
-            );
-        }
-    }
-
     let valid_tool_names = host.valid_tool_names().clone();
     let deferred_tool_names = host.deferred_tool_names();
     // Start before delegation interception as both delegation settlement and
@@ -3120,98 +3102,89 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         }
     }
 
-    match map_post_tool_policy_outcome(apply_agentic_post_tool_policy(
-        AgenticPostToolPolicyRequest {
-            run_execution_budget: state.run_execution_budget_snapshot(),
-            run_execution_control: state.run_execution_control_snapshot(),
-            turn_index: turn_index as u32,
-            messages: &mut state.messages,
-            turn_guard: &mut state.turn_guard,
-            verdict_events: &mut state.stall.verdict_events,
-            restricted_tools: &mut state.restricted_tools,
-            remaining_turns: &mut state.remaining_turns,
-            step_recorder: &mut state.step_recorder,
-            current_user_id: state.context_manifest_user_id.as_ref(),
-            current_session_id: state.current_session_id.as_ref(),
-            workspace_observation_quarantine: state.stall.workspace_observation_quarantine.as_ref(),
-            max_turns: state.max_turns,
-            recent_tools: &state.recent_tools,
-            last_heavy_checkpoint: &mut state.stall.last_heavy_checkpoint,
-            interaction_mode: host.turn_interaction_mode(),
-        },
-    )) {
-        AgenticPostToolIterationControl::ProceedEndTurn { advisories } => {
-            if let Some(payload) = policy_advisory_bundle_value(&advisories) {
-                state.push_volatile_payload(super::host::VolatileKind::PolicyAdvisory, payload);
-            }
-            if let Some(ref emitter) = state.messaging.progress_emitter {
-                let tool_calls_this_turn =
-                    state.total_tool_calls.saturating_sub(if turn_index > 0 {
-                        state.total_tool_calls
-                    } else {
-                        0
-                    });
-                let last_tool = edge_tool_round
-                    .last()
-                    .map(|r| r.tool.clone())
-                    .unwrap_or_else(|| "thinking".to_string());
-                emitter.turn_completed(turn_index as u32 + 1, tool_calls_this_turn, last_tool);
-                emitter.metrics_update(
-                    turn_index as u32 + 1,
-                    state.max_turns as u32,
-                    state.total_prompt,
-                    state.total_completion,
-                    state.total_tool_calls,
-                );
-            }
+    apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
+        run_execution_budget: state.run_execution_budget_snapshot(),
+        run_execution_control: state.run_execution_control_snapshot(),
+        turn_index: turn_index as u32,
+        messages: &mut state.messages,
+        turn_guard: &mut state.turn_guard,
+        verdict_events: &mut state.stall.verdict_events,
+        restricted_tools: &mut state.restricted_tools,
+        remaining_turns: &mut state.remaining_turns,
+        step_recorder: &mut state.step_recorder,
+        current_user_id: state.context_manifest_user_id.as_ref(),
+        current_session_id: state.current_session_id.as_ref(),
+        workspace_observation_quarantine: state.stall.workspace_observation_quarantine.as_ref(),
+        max_turns: state.max_turns,
+        recent_tools: &state.recent_tools,
+        last_heavy_checkpoint: &mut state.stall.last_heavy_checkpoint,
+        interaction_mode: host.turn_interaction_mode(),
+    });
+    if let Some(ref emitter) = state.messaging.progress_emitter {
+        let tool_calls_this_turn = state.total_tool_calls.saturating_sub(if turn_index > 0 {
+            state.total_tool_calls
+        } else {
+            0
+        });
+        let last_tool = edge_tool_round
+            .last()
+            .map(|r| r.tool.clone())
+            .unwrap_or_else(|| "thinking".to_string());
+        emitter.turn_completed(turn_index as u32 + 1, tool_calls_this_turn, last_tool);
+        emitter.metrics_update(
+            turn_index as u32 + 1,
+            state.max_turns as u32,
+            state.total_prompt,
+            state.total_completion,
+            state.total_tool_calls,
+        );
+    }
 
-            if let (Some(hub), Some(session)) = (
-                state.telemetry.observability_hub.as_ref(),
-                state.telemetry.observability_session.as_ref(),
-            ) {
-                let total_ms = prep.turn_start_time.elapsed().as_millis() as u64;
-                let ctx_asm_ms = (llm_wall_start - prep.turn_start_time).as_millis() as u64;
-                let tool_exec_ms: u64 = edge_tool_round.iter().map(|e| e.duration_ms).sum();
-                let timing = crate::observability::TurnTiming {
-                    turn: session_turn_number(state),
-                    context_assembly_ms: ctx_asm_ms,
-                    ttft_ms: turn_result.ttft_ms.unwrap_or(0),
-                    llm_total_ms: total_ms
-                        .saturating_sub(ctx_asm_ms)
-                        .saturating_sub(tool_exec_ms),
-                    tool_execution_ms: tool_exec_ms,
-                    total_ms,
-                };
-                tracing::debug!(
-                    target: "astra_timing",
-                    session_turn = timing.turn,
-                    total_ms = timing.total_ms,
-                    ctx_assembly_ms = timing.context_assembly_ms,
-                    ttft_ms = timing.ttft_ms,
-                    llm_ms = timing.llm_total_ms,
-                    tool_exec_ms = timing.tool_execution_ms,
-                    "turn completed"
-                );
-                let mut session_guard = astra_core::sync_poison::recover_rwlock_write(session);
-                crate::observability::on_turn_end(hub, &mut session_guard, timing);
-            }
+    if let (Some(hub), Some(session)) = (
+        state.telemetry.observability_hub.as_ref(),
+        state.telemetry.observability_session.as_ref(),
+    ) {
+        let total_ms = prep.turn_start_time.elapsed().as_millis() as u64;
+        let ctx_asm_ms = (llm_wall_start - prep.turn_start_time).as_millis() as u64;
+        let tool_exec_ms: u64 = edge_tool_round.iter().map(|e| e.duration_ms).sum();
+        let timing = crate::observability::TurnTiming {
+            turn: session_turn_number(state),
+            context_assembly_ms: ctx_asm_ms,
+            ttft_ms: turn_result.ttft_ms.unwrap_or(0),
+            llm_total_ms: total_ms
+                .saturating_sub(ctx_asm_ms)
+                .saturating_sub(tool_exec_ms),
+            tool_execution_ms: tool_exec_ms,
+            total_ms,
+        };
+        tracing::debug!(
+            target: "astra_timing",
+            session_turn = timing.turn,
+            total_ms = timing.total_ms,
+            ctx_assembly_ms = timing.context_assembly_ms,
+            ttft_ms = timing.ttft_ms,
+            llm_ms = timing.llm_total_ms,
+            tool_exec_ms = timing.tool_execution_ms,
+            "turn completed"
+        );
+        let mut session_guard = astra_core::sync_poison::recover_rwlock_write(session);
+        crate::observability::on_turn_end(hub, &mut session_guard, timing);
+    }
 
-            state.step_recorder.end_turn(false);
-            finalize_turn_trace(state).await;
-            refresh_runtime_promotion_signals_from_db(state).await;
-            if let Some(hub) = state.telemetry.observability_hub.as_ref() {
-                let high_failure = state.turn_guard.health.high_failure_tools(3, 0.5);
-                if !high_failure.is_empty() {
-                    hub.record_low_confidence_tools(high_failure);
-                }
-            }
-            let _turn_tokens = state.last_measured_prompt_tokens.unwrap_or(0);
-
-            // Context compaction is handled by the single unified pass in
-            // lifecycle.rs (compact_tool_results_adaptive) which
-            // runs before each LLM call. No per-round folding needed here.
+    state.step_recorder.end_turn(false);
+    finalize_turn_trace(state).await;
+    refresh_runtime_promotion_signals_from_db(state).await;
+    if let Some(hub) = state.telemetry.observability_hub.as_ref() {
+        let high_failure = state.turn_guard.health.high_failure_tools(3, 0.5);
+        if !high_failure.is_empty() {
+            hub.record_low_confidence_tools(high_failure);
         }
     }
+    let _turn_tokens = state.last_measured_prompt_tokens.unwrap_or(0);
+
+    // Context compaction is handled by the single unified pass in
+    // lifecycle.rs (compact_tool_results_adaptive) which
+    // runs before each LLM call. No per-round folding needed here.
 
     let policy_subject = host.runtime_policy_subject(state);
     let mut policy_state = std::mem::take(&mut state.stall.runtime_policy_evaluation);
@@ -3221,6 +3194,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         &state.stall.tool_call_records,
         state.llm_rounds_completed,
         crate::turn::runtime_policy::configured_evaluation_thresholds(),
+        state.turn_guard.recovery_evidence(),
     );
     state.stall.runtime_policy_evaluation = policy_state;
     let policy_update = match policy_update {
@@ -3236,39 +3210,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         state.stall.active_policy_feedback = policy_feedback;
     }
     Ok(TurnToolPhaseControl::ContinueLoop)
-}
-
-fn queue_repetition_threshold_advisory(state: &mut AgenticLoopState) -> Option<String> {
-    let threshold_reached = state.stall.events.iter().any(|(name, _)| {
-        name == astra_turn_core::agentic_stall_preflight::REPETITION_THRESHOLD_EVENT
-    });
-    if !threshold_reached || state.stall.repetition_advisory_emitted {
-        return None;
-    }
-
-    state.stall.repetition_advisory_emitted = true;
-    let last_signature = state
-        .stall
-        .turn_sigs
-        .last()
-        .and_then(|signatures| {
-            signatures
-                .iter()
-                .next()
-                .map(|signature| signature.display_hint())
-        })
-        .unwrap_or_else(|| "<unknown>".to_string());
-    state.push_volatile_payload(
-        super::host::VolatileKind::BehaviorAdvisory,
-        serde_json::json!({
-            "signal": "identical_tool_signature_repetition",
-            "consecutive_rounds": astra_turn_core::stall::CONSECUTIVE_IDENTICAL_SIGS_ADVISORY_THRESHOLD,
-            "latest_signature": last_signature,
-            "assessment": "Repeated identical calls may indicate a low-yield loop, but repetition can be justified when external state is expected to change.",
-            "recommendation": "Use the user goal and tool evidence to decide whether to wait, change approach, or continue."
-        }),
-    );
-    Some(last_signature)
 }
 
 fn observe_gate_cancelled(
@@ -4259,55 +4200,6 @@ mod tests {
             ..structured
         };
         assert_eq!(work_unit_observation(&text_only), None);
-    }
-
-    #[test]
-    fn identical_signature_threshold_emits_evidence_without_stopping_or_hiding_tools() {
-        let mut state = make_state();
-        state.stall.events.push((
-            astra_turn_core::agentic_stall_preflight::REPETITION_THRESHOLD_EVENT.to_string(),
-            4,
-        ));
-        state
-            .stall
-            .turn_sigs
-            .push(std::collections::BTreeSet::from([
-                astra_turn_core::stall::StallSignature::new(
-                    "bash",
-                    br#"{"command":"cargo clippy"}"#,
-                ),
-            ]));
-        let history_before = state.messages.clone();
-        let restricted_before = state.restricted_tools.clone();
-
-        let signature = queue_repetition_threshold_advisory(&mut state)
-            .expect("threshold event should emit once");
-
-        assert_eq!(
-            signature,
-            astra_turn_core::stall::StallSignature::new("bash", br#"{"command":"cargo clippy"}"#)
-                .display_hint()
-        );
-        assert!(!signature.contains("cargo clippy"));
-        assert!(state.interruption.is_none());
-        assert_eq!(state.messages, history_before);
-        assert_eq!(state.restricted_tools, restricted_before);
-        assert_eq!(state.volatile_pending.len(), 1);
-        let advisory = &state.volatile_pending[0];
-        assert_eq!(
-            advisory.kind,
-            super::super::host::VolatileKind::BehaviorAdvisory
-        );
-        assert_eq!(
-            advisory.kind.delivery_class(),
-            astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::DecisionFeedback
-        );
-        assert_eq!(
-            advisory.payload["signal"],
-            "identical_tool_signature_repetition"
-        );
-        assert!(queue_repetition_threshold_advisory(&mut state).is_none());
-        assert_eq!(state.volatile_pending.len(), 1);
     }
 
     #[test]

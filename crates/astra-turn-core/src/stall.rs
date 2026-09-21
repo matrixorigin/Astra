@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -62,12 +62,8 @@ pub const SERVER_STALL_WINDOW: usize = 3;
 /// alone does not prove that the next call is invalid or that the turn should
 /// stop; actual resource ceilings remain separate.
 ///
-/// Session 05e63cac t10 observed four identical `cargo clippy` calls
-/// (r0-r3) and later three identical `git status` calls (r43/47/48)
-/// followed by `echo ok` twice; the existing 3-nudge-limit ran out at
-/// round ~3 and the loop kept burning tool rounds until
-/// `token_budget_exceeded`. Emitting at >= 5 catches the pattern well past the
-/// nudge quota while leaving room for legitimate exponential-backoff retries.
+/// This threshold leaves room for legitimate retries while retaining an
+/// observable repetition signal; it is independent of correction counters.
 pub const CONSECUTIVE_IDENTICAL_SIGS_ADVISORY_THRESHOLD: usize = 5;
 
 /// Count how many of the most recent `turn_sigs` entries share the same
@@ -98,10 +94,8 @@ pub fn trailing_identical_sig_depth(turn_sigs: &[BTreeSet<crate::stall::StallSig
 /// Call sites append the actual budget number, e.g. `format!("{} (budget: {} turns)", MSG, n)`.
 pub const CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG: &str = "Turn budget exhausted. To increase, set ASTRA_MAX_TURNS (interactive) or ASTRA_PLAN_SUBTASK_MAX_TURNS (plan subtasks).";
 
-/// Maximum consecutive exploration-only rounds before triggering correction.
-/// Lowered from 8→5→3: with auto-expanding read_file (full-file on 2nd+ ranged
-/// read) and EdgeToolCache dedup, agents need fewer exploration rounds.
-/// 5 was still too permissive — allowed long sequences of redundant reads.
+/// Default window for signature-diversity observations, not a limit on
+/// exploration or an authority to inject corrections.
 pub const MAX_EXPLORATION_ROUNDS: usize = 3;
 
 pub fn canonical_tool_args(raw: &str) -> String {
@@ -210,10 +204,8 @@ pub fn round_tool_call_sig_and_names(
 /// True when the last `window` rounds have **identical** tool-call signatures
 /// (name + args). This is the CLI-loop equivalent of [`detect_server_stall`].
 ///
-/// sets, which misfired for legitimate patterns like three consecutive
-/// `read_file` calls with different paths. The signature-based version is
-/// the general fix: progress comes from *arguments changing*, not from
-/// avoiding any particular tool.
+/// Unlike tool-name sets, signatures distinguish calls with different
+/// arguments. Neither changing nor repeated arguments establish task progress.
 pub fn detect_cli_tool_sig_stall(
     turn_sigs: &[BTreeSet<crate::stall::StallSignature>],
     window: usize,
@@ -226,25 +218,20 @@ pub fn detect_cli_tool_sig_stall(
 /// Result of divergence analysis for the current turn sequence.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DivergenceStatus {
-    /// Agent is making progress.
+    /// Sufficient signature diversity, or insufficient evidence to classify.
     Healthy,
-    /// Agent is exploring without progress — may be using wrong tools.
+    /// Low signature diversity in the observed window.
     Exploring(usize),
-    /// Agent is actively diverging — inject correction prompt.
+    /// Identical signature sets across the observed window.
     Diverging(usize),
 }
 
-/// Progress assessment across recent rounds, based on tool-call signature
-/// **diversity** rather than a hand-picked "exploration" whitelist.
+/// Signature-diversity assessment across recent rounds, not an assessment of
+/// result novelty or task success. These observations carry no correction authority.
 ///
-/// - `NoProgress`  — last `window` rounds are literally the same call set
-///   (identical signatures). This is the only state that warrants injecting
-///   a correction; it's the real "stuck in a loop" condition.
-/// - `LowNovelty(rate)` — distinct-signature rate over the last `window`
-///   rounds is below `NOVELTY_FLOOR`. The agent is covering narrow ground
-///   but NOT literally repeating itself; worth surfacing as a hint, but
-///   not worth interrupting legitimate review / debug / analysis flows.
-/// - `Healthy` — enough novelty, or not enough history to judge.
+/// - `NoProgress` — identical call-signature sets throughout the window.
+/// - `LowNovelty(rate)` — distinct-signature rate below `NOVELTY_FLOOR`.
+/// - `Healthy` — enough signature diversity, or insufficient evidence.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProgressStatus {
     Healthy,
@@ -274,9 +261,8 @@ fn distinct_sig_count(rounds: &[BTreeSet<crate::stall::StallSignature>]) -> usiz
     seen.len()
 }
 
-/// General-purpose progress assessment. Task-type agnostic: it does NOT
-/// judge by which tools are used, only by whether the signature stream
-/// is repeating or stagnating.
+/// Task-agnostic signature assessment. This does not judge tool choice,
+/// result freshness, or whether repetition is required for recovery.
 pub fn assess_progress(
     tool_sigs: &[BTreeSet<crate::stall::StallSignature>],
     window: usize,
@@ -314,10 +300,9 @@ pub fn assess_progress(
 
 /// Detect divergence using the default exploration window.
 ///
-/// Delegates to [`assess_progress`]: only `NoProgress` flips to
-/// `Diverging` (the single state that warrants injecting a correction).
-/// `LowNovelty` maps to `Exploring` (surfaced as a hint, not a correction),
-/// and `Healthy` maps to `Healthy`.
+/// Delegates to [`assess_progress`]: `NoProgress` maps to `Diverging`,
+/// `LowNovelty` to `Exploring`, and `Healthy` to `Healthy`.
+/// All three are signature observations, not instructions to the model.
 pub fn detect_divergence(
     tool_sigs: &[BTreeSet<crate::stall::StallSignature>],
 ) -> Result<DivergenceStatus, StallDetectionError> {
@@ -337,118 +322,6 @@ pub fn detect_divergence_with_window(
         }
         ProgressStatus::NoProgress => Ok(DivergenceStatus::Diverging(exploration_round_window)),
     }
-}
-
-/// Advisory for repeated signatures. Result novelty and legitimate recheck
-/// obligations must be assessed separately before concluding no progress.
-pub const DIVERGENCE_CORRECTION: &str = "\
-Recent rounds repeated tool calls with the same arguments. Check whether results or \
-external state changed, or whether verification, recovery, or authorized waiting requires \
-another observation. If no new evidence is expected, consider a different approach within \
-the current task. Repeated arguments alone do not establish lack of progress.";
-
-// ─── Structured reflection nudge ────────────────────────────────────────────
-
-/// Bounded repetition evidence and advisory. Tool-call signatures cannot
-/// establish a root cause or whether a repeated observation is required.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StallReflection {
-    /// What happened: description of the stall pattern.
-    pub what_happened: String,
-    /// Why: diagnosed root cause.
-    pub why: String,
-    /// What to try: specific actionable suggestions.
-    pub what_to_try: String,
-    /// Confidence in the diagnosis (0.0-1.0).
-    pub confidence: f64,
-    /// Tools to avoid (under health avoidance or repeatedly failing).
-    pub avoid_tools: Vec<String>,
-}
-
-impl StallReflection {
-    /// Format as a nudge message for injection into the conversation.
-    pub fn to_nudge_message(&self) -> String {
-        let mut parts = vec![
-            "REFLECTION — Repeated-call evidence; progress is uncertain.\n".to_string(),
-            format!("What happened: {}\n", self.what_happened),
-            format!("Why: {}\n", self.why),
-            format!("What to try: {}", self.what_to_try),
-        ];
-        if !self.avoid_tools.is_empty() {
-            parts.push(format!(
-                "\nRetry-cautioned tools: [{}] — change inputs or strategy before using them again",
-                self.avoid_tools.join(", ")
-            ));
-        }
-        parts.join("")
-    }
-}
-
-/// Analyze stall history and build a structured reflection.
-///
-/// `tool_sigs`: per-turn opaque stall-equivalence signature sets.
-/// `error_tools`: tools that have active health avoidance due to repeated errors.
-/// `nudge_count`: shared guard advisory counter, not a count of repetition events.
-pub fn build_stall_reflection(
-    tool_sigs: &[BTreeSet<crate::stall::StallSignature>],
-    error_tools: &[&str],
-    nudge_count: usize,
-) -> StallReflection {
-    let window = tool_sigs.len().min(6);
-    let recent = &tool_sigs[tool_sigs.len().saturating_sub(window)..];
-
-    // Analyze: what tools are being repeated?
-    let mut tool_counts: HashMap<String, usize> = HashMap::new();
-    for sigs in recent {
-        for sig in sigs {
-            let name = sig.tool_name().to_owned();
-            if !name.is_empty() {
-                *tool_counts.entry(name).or_default() += 1;
-            }
-        }
-    }
-
-    // Find the most repeated tool
-    let top_tool = tool_counts
-        .iter()
-        .max_by_key(|(_, count)| *count)
-        .map(|(name, count)| (name.clone(), *count));
-    // Signatures establish repetition, not unchanged external state, missing
-    // progress, or whether earlier evidence remains in the model's context.
-    let what_happened = match top_tool {
-        Some((name, count)) => format!(
-            "Observed {count} signature occurrences for '{name}' across the last {window} rounds; guard advisory counter: {nudge_count}."
-        ),
-        None => {
-            format!("Observed {window} rounds without enough tool signatures to diagnose progress.")
-        }
-    };
-    StallReflection {
-        what_happened,
-        why: "Repeated calls may be necessary for verification, pagination, recovery, or waiting for changed state. Call signatures alone do not establish whether new evidence was obtained.".into(),
-        what_to_try: "Check what evidence or state change the next call is expected to provide. Continue required verification, recovery, and authorized waiting; if nothing new is expected, reuse available evidence or consider a different approach within the user's task.".into(),
-        confidence: 0.3,
-        // Only independent tool-health evidence can justify retry caution.
-        avoid_tools: error_tools.iter().map(|name| (*name).to_string()).collect::<BTreeSet<_>>().into_iter().collect(),
-    }
-}
-
-/// Detect if the LLM ignored a previous stall nudge by using tools
-/// that were explicitly listed in `avoid_tools`.
-/// Returns the list of violated (still-used) tools.
-pub fn detect_nudge_ignored(
-    avoid_tools: &[String],
-    current_tool_names: &std::collections::HashSet<String>,
-) -> Vec<String> {
-    if avoid_tools.is_empty() {
-        return Vec::new();
-    }
-    avoid_tools
-        .iter()
-        .filter(|t| current_tool_names.contains(t.as_str()))
-        .cloned()
-        .collect()
 }
 
 // ─── Adaptive stall thresholds ──────────────────────────────────────────────
@@ -735,8 +608,8 @@ mod tests {
 
     /// Regression: the real review-task pattern from session
     /// bc74b214-3e2e — three consecutive distinct `read_file` calls.
-    /// Must be classified as Healthy, NOT LowNovelty / NoProgress, so
-    /// no DIVERGENCE_CORRECTION is injected for legitimate exploration.
+    /// Distinct reads must remain Healthy in the signature assessment;
+    /// the detector does not establish task progress or authorize correction.
     #[test]
     fn assess_progress_healthy_on_distinct_reads() {
         let rounds = vec![
@@ -909,117 +782,6 @@ mod tests {
             &["grep", "grep"],
         ]);
         assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
-    }
-
-    // ── Structured reflection ──
-
-    #[test]
-    fn repeated_tool_names_do_not_establish_failure_or_require_mutation() {
-        for name in [
-            "bash",
-            "read_file",
-            "skill",
-            "discover_skills",
-            "github",
-            "custom_poll",
-        ] {
-            let sigs = make_sigs(&[&[name], &[name], &[name]]);
-            let first = build_stall_reflection(&sigs, &[], 0);
-            let repeated = build_stall_reflection(&sigs, &[], 5);
-            assert!(first.what_happened.contains(name));
-            assert!(first.avoid_tools.is_empty());
-            assert!(repeated.avoid_tools.is_empty());
-            assert_eq!(first.what_to_try, repeated.what_to_try);
-            for unsupported in [
-                "STOP",
-                "FINAL WARNING",
-                "str_replace",
-                "write_file",
-                "already in your context",
-            ] {
-                assert!(!repeated.to_nudge_message().contains(unsupported));
-            }
-            assert!(repeated.what_to_try.contains("verification"));
-            assert!(repeated.what_to_try.contains("authorized waiting"));
-            assert!(repeated.why.contains("Call signatures alone"));
-        }
-    }
-
-    #[test]
-    fn reflection_counts_signature_occurrences_without_inventing_rounds() {
-        let batch = [
-            StallSignature::new("bash", b"first"),
-            StallSignature::new("bash", b"second"),
-        ]
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-        let reflection = build_stall_reflection(&[batch.clone(), batch.clone(), batch], &[], 2);
-        assert!(reflection.what_happened.contains("6 signature occurrences"));
-        assert!(reflection.what_happened.contains("last 3 rounds"));
-        assert!(!reflection.what_happened.contains("prior repetition"));
-    }
-
-    #[test]
-    fn reflection_includes_error_tools() {
-        let sigs = make_sigs(&[&["read_file"], &["bash"], &["read_file"]]);
-        let reflection = build_stall_reflection(&sigs, &["bash", "git"], 0);
-        assert!(reflection.avoid_tools.contains(&"bash".to_string()));
-        assert!(reflection.avoid_tools.contains(&"git".to_string()));
-    }
-
-    #[test]
-    fn reflection_to_nudge_message_format() {
-        let sigs = make_sigs(&[&["bash"], &["bash"], &["bash"]]);
-        let reflection = build_stall_reflection(&sigs, &["git"], 0);
-        let msg = reflection.to_nudge_message();
-        assert!(msg.contains("REFLECTION"));
-        assert!(msg.contains("What happened:"));
-        assert!(msg.contains("Why:"));
-        assert!(msg.contains("What to try:"));
-        assert!(msg.contains("Retry-cautioned tools:"));
-    }
-
-    #[test]
-    fn reflection_generic_stall_pattern() {
-        // Different tool patterns repeating — generic stall
-        let sigs = make_sigs(&[
-            &["bash", "read_file"],
-            &["bash", "read_file"],
-            &["bash", "read_file"],
-        ]);
-        let reflection = build_stall_reflection(&sigs, &[], 0);
-        assert!(reflection.confidence > 0.0);
-        assert!(!reflection.what_happened.is_empty());
-    }
-
-    // ── Nudge-ignore detection ──
-
-    #[test]
-    fn nudge_ignored_detects_violation() {
-        let avoid = vec!["bash".to_string(), "git".to_string()];
-        let mut used = std::collections::HashSet::new();
-        used.insert("bash".to_string());
-        used.insert("memory".to_string());
-        let ignored = detect_nudge_ignored(&avoid, &used);
-        assert_eq!(ignored, vec!["bash".to_string()]);
-    }
-
-    #[test]
-    fn nudge_ignored_empty_when_obeyed() {
-        let avoid = vec!["bash".to_string()];
-        let mut used = std::collections::HashSet::new();
-        used.insert("memory".to_string());
-        let ignored = detect_nudge_ignored(&avoid, &used);
-        assert!(ignored.is_empty());
-    }
-
-    #[test]
-    fn nudge_ignored_empty_when_no_avoid() {
-        let avoid: Vec<String> = Vec::new();
-        let mut used = std::collections::HashSet::new();
-        used.insert("bash".to_string());
-        let ignored = detect_nudge_ignored(&avoid, &used);
-        assert!(ignored.is_empty());
     }
 
     // ── Tool call signature format tests ──
@@ -1443,127 +1205,6 @@ mod tests {
         assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  detect_nudge_ignored — additional cases
-    // ══════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn nudge_ignored_all_tools_violated() {
-        let avoid = vec!["bash".to_string(), "grep".to_string()];
-        let used: HashSet<String> = HashSet::from_iter(["bash".to_string(), "grep".to_string()]);
-        let mut ignored = detect_nudge_ignored(&avoid, &used);
-        ignored.sort();
-        assert_eq!(ignored, vec!["bash".to_string(), "grep".to_string()]);
-    }
-
-    #[test]
-    fn nudge_ignored_empty_current_tools() {
-        let avoid = vec!["bash".to_string()];
-        let used: HashSet<String> = HashSet::new();
-        assert!(detect_nudge_ignored(&avoid, &used).is_empty());
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    //  build_stall_reflection — additional cases
-    // ══════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn reflection_empty_sigs() {
-        let reflection = build_stall_reflection(&[], &[], 0);
-        assert!(!reflection.what_happened.is_empty());
-        assert!(reflection.confidence > 0.0);
-    }
-
-    #[test]
-    fn reflection_single_sig() {
-        let sigs = make_sigs(&[&["bash"]]);
-        let reflection = build_stall_reflection(&sigs, &[], 0);
-        assert!(!reflection.what_happened.is_empty());
-    }
-
-    #[test]
-    fn reflection_avoid_tools_dedup_with_error_tools() {
-        // top_tool is already in error_tools — should not duplicate
-        let sigs = make_sigs(&[&["bash"], &["bash"], &["bash"]]);
-        let r = build_stall_reflection(&sigs, &["bash"], 0);
-        let bash_count = r.avoid_tools.iter().filter(|t| *t == "bash").count();
-        assert_eq!(bash_count, 1, "bash should appear only once in avoid_tools");
-    }
-
-    #[test]
-    fn reflection_window_caps_at_six() {
-        // 10 rounds but only 6 should be analyzed
-        let sigs = make_sigs(&[
-            &["bash"],
-            &["bash"],
-            &["bash"],
-            &["bash"],
-            &["bash"],
-            &["bash"],
-            &["bash"],
-            &["bash"],
-            &["bash"],
-            &["bash"],
-        ]);
-        let r = build_stall_reflection(&sigs, &[], 0);
-        // "6 turns" in the what_happened string (window caps at 6)
-        assert!(
-            r.what_happened.contains("6"),
-            "window should cap at 6: {}",
-            r.what_happened
-        );
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    //  StallReflection::to_nudge_message — additional format tests
-    // ══════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn nudge_message_without_avoid_tools() {
-        let r = StallReflection {
-            what_happened: "test".to_string(),
-            why: "because".to_string(),
-            what_to_try: "something".to_string(),
-            confidence: 0.5,
-            avoid_tools: vec![],
-        };
-        let msg = r.to_nudge_message();
-        assert!(!msg.contains("Retry-cautioned tools"));
-    }
-
-    #[test]
-    fn nudge_message_with_multiple_avoid_tools() {
-        let r = StallReflection {
-            what_happened: "test".to_string(),
-            why: "because".to_string(),
-            what_to_try: "something".to_string(),
-            confidence: 0.5,
-            avoid_tools: vec![
-                "bash".to_string(),
-                "grep".to_string(),
-                "list_dir".to_string(),
-            ],
-        };
-        let msg = r.to_nudge_message();
-        assert!(msg.contains("bash, grep, list_dir"));
-    }
-
-    #[test]
-    fn nudge_message_contains_all_sections() {
-        let r = StallReflection {
-            what_happened: "WHAT".to_string(),
-            why: "WHY".to_string(),
-            what_to_try: "TRY".to_string(),
-            confidence: 0.9,
-            avoid_tools: vec!["tool_x".to_string()],
-        };
-        let msg = r.to_nudge_message();
-        assert!(msg.contains("WHAT"));
-        assert!(msg.contains("WHY"));
-        assert!(msg.contains("TRY"));
-        assert!(msg.contains("tool_x"));
-    }
-
     #[test]
     fn server_stall_text_turn_does_not_clear_history() {
         let bash_ls = vec![serde_json::json!({
@@ -1645,25 +1286,6 @@ mod tests {
             thresholds.stall_window <= 6,
             "stall window must not exceed 6, got {}",
             thresholds.stall_window
-        );
-    }
-
-    // ─── Optimization: read_file stall gives context-aware guidance ──────────
-
-    #[test]
-    fn read_file_stall_does_not_add_to_avoid_tools() {
-        let sigs = make_sigs(&[
-            &["read_file"],
-            &["read_file"],
-            &["read_file"],
-            &["read_file"],
-        ]);
-        let reflection = build_stall_reflection(&sigs, &[], 0);
-
-        assert!(
-            !reflection.avoid_tools.contains(&"read_file".to_string()),
-            "read_file must not be in avoid_tools — it's read-only and may be needed later. Got: {:?}",
-            reflection.avoid_tools
         );
     }
 }

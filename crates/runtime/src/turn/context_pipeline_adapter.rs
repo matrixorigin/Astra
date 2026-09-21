@@ -2266,8 +2266,8 @@ mod tests {
                 "kind": "policy_advisory",
                 "delivery_class": "advisory_evidence",
                 "payload": {
-                    "schema": "policy_advisory.v1",
-                    "advisories": [{"kind": "stall"}]
+                    "schema": "test_advisory",
+                    "evidence": "fixture"
                 },
                 "round_index": 2
             }]),
@@ -2280,14 +2280,14 @@ mod tests {
             sources
                 .extra_stable_sections
                 .iter()
-                .all(|section| !section.text.contains("policy_advisory.v1")),
+                .all(|section| !section.text.contains("test_advisory")),
             "typed runtime volatile must not enter the session-stable prompt prefix"
         );
         assert!(
             sources
                 .extra_dynamic_sections
                 .iter()
-                .any(|section| section.text.contains("policy_advisory.v1")),
+                .any(|section| section.text.contains("test_advisory")),
             "typed runtime volatile must be routed to RuntimeVolatile / CacheScope::None"
         );
     }

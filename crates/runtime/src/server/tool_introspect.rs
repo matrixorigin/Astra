@@ -43,7 +43,41 @@ pub(crate) fn render_introspect_snapshot(
     snapshot: &astra_turn_core::introspect::IntrospectSnapshot,
 ) -> String {
     let request = astra_turn_core::introspect::IntrospectRequest::from_args(args);
-    astra_turn_core::introspect::render_introspect_request(snapshot, &request)
+    let mut output = astra_turn_core::introspect::render_introspect_request(snapshot, &request);
+    let live_max_bytes_ignored = args.get("max_bytes").is_some_and(|value| !value.is_null())
+        && args.get("artifact").is_none();
+    if live_max_bytes_ignored && request.format.is_json() {
+        // Keep the machine boundary valid. The warning belongs in the typed
+        // coverage object; appending Markdown here would make the JSON
+        // report unparseable by the model projection and evaluation layer.
+        if let Ok(mut value) = serde_json::from_str::<Value>(&output) {
+            if let Some(data_coverage) = value
+                .get_mut("data_coverage")
+                .and_then(Value::as_object_mut)
+            {
+                data_coverage
+                    .entry("warnings")
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Some(warnings) = data_coverage
+                    .get_mut("warnings")
+                    .and_then(Value::as_array_mut)
+                {
+                    warnings.push(Value::String(
+                        "max_bytes applies only to introspect(artifact=...) windows; live observations are already bounded and this value was ignored"
+                            .to_string(),
+                    ));
+                }
+            }
+            output = serde_json::to_string(&value).unwrap_or(output);
+        } else {
+            tracing::warn!("introspect JSON renderer returned an invalid JSON boundary");
+        }
+    } else if live_max_bytes_ignored {
+        output.push_str(
+            "\n\n## Observation Parameter Boundary\n`max_bytes` applies only to `introspect(artifact=...)` windows; live observations are already bounded and this value was ignored.",
+        );
+    }
+    output
 }
 
 #[cfg(test)]
@@ -137,5 +171,48 @@ mod tests {
         assert!(out.contains("remaining=0"), "got: {out}");
         assert!(!out.contains('∞'), "got: {out}");
         assert!(out.contains("Snapshot age: 3 turn(s)"), "got: {out}");
+    }
+
+    #[test]
+    fn live_max_bytes_is_explicitly_ignored_instead_of_looking_like_expansion() {
+        let out = handle_introspect(
+            &serde_json::json!({"facet": "overview", "max_bytes": 16384}),
+            "session-1",
+            &RwLock::new(Some(
+                astra_turn_core::introspect::IntrospectSnapshot::default(),
+            )),
+            1,
+        );
+
+        assert!(out.contains("max_bytes` applies only to `introspect(artifact=...)`"));
+        assert!(out.contains("this value was ignored"));
+    }
+
+    #[test]
+    fn live_max_bytes_json_keeps_structured_boundary_valid() {
+        let out = handle_introspect(
+            &serde_json::json!({
+                "facet": "overview",
+                "format": "json",
+                "max_bytes": 16384
+            }),
+            "session-1",
+            &RwLock::new(Some(
+                astra_turn_core::introspect::IntrospectSnapshot::default(),
+            )),
+            1,
+        );
+
+        let value: Value = serde_json::from_str(&out).expect("live JSON must remain parseable");
+        assert!(!out.contains("## Observation Parameter Boundary"));
+        assert!(
+            value["data_coverage"]["warnings"]
+                .as_array()
+                .expect("typed coverage warnings")
+                .iter()
+                .any(|warning| warning
+                    .as_str()
+                    .is_some_and(|warning| warning.contains("max_bytes applies only")))
+        );
     }
 }

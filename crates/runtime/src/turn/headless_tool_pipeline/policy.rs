@@ -13,9 +13,9 @@ use astra_turn_core::headless_tool_assembly::{
 use astra_turn_core::headless_tool_body_preview::emit_headless_tool_body_preview;
 use astra_turn_core::headless_tool_journal::{
     journal_record_blocked_tool, journal_record_cancelled_tool,
-    journal_record_cross_turn_cache_hit, journal_record_duplicate_within_turn,
-    journal_record_suppressed_tool_retry, journal_record_tool_not_admitted,
-    journal_record_unknown_tool,
+    journal_record_cross_turn_cache_hit, journal_record_cross_turn_cache_hit_with_evidence,
+    journal_record_duplicate_within_turn, journal_record_suppressed_tool_retry,
+    journal_record_tool_not_admitted, journal_record_unknown_tool,
 };
 use astra_turn_core::headless_tool_stderr_lines::{
     headless_stderr_cache_hit_line, headless_stderr_unknown_tool_detail,
@@ -996,11 +996,13 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 .record_cache_hit_for_signature(&health_identity);
             self.ctx
                 .tool_call_records
-                .push(journal_record_cross_turn_cache_hit(
+                .push(journal_record_cross_turn_cache_hit_with_evidence(
                     execution.id.clone(),
                     execution.name.clone(),
                     cached.output.len() as u32,
                     args_preview,
+                    Some(&cached.output),
+                    serde_json::to_string(&execution.args).ok(),
                     Some(&cached.output),
                 ));
             return true;
@@ -1084,12 +1086,14 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 .record_cache_hit_for_signature(&health_identity);
             self.ctx
                 .tool_call_records
-                .push(journal_record_cross_turn_cache_hit(
+                .push(journal_record_cross_turn_cache_hit_with_evidence(
                     execution.id.clone(),
                     execution.name.clone(),
                     body.len() as u32,
                     args_preview,
                     Some(&body),
+                    serde_json::to_string(&execution.args).ok(),
+                    (reason_code != REASON_REPEATED_CACHE_HIT_SUPPRESSED).then_some(body.as_str()),
                 ));
             agent_warn!(
                 "dedup",

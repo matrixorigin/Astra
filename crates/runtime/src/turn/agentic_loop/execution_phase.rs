@@ -3895,22 +3895,6 @@ fn route_runtime_policy_evidence(
                 "policy recorded budget-expansion evidence without mutating budget"
             );
         }
-        RuntimePolicyEvidence::Advisory { message } => {
-            state.push_volatile_payload(
-                super::host::VolatileKind::BehaviorAdvisory,
-                serde_json::json!({
-                    "schema": "runtime_policy_advisory.v1",
-                    "signal": "policy_observation",
-                    "evidence": message,
-                    "authority": "advisory_evidence_only",
-                }),
-            );
-            tracing::info!(
-                target: "astra::policy",
-                signal = %message,
-                "policy observation recorded as advisory evidence"
-            );
-        }
         RuntimePolicyEvidence::ContextPressureObserved { urgency } => {
             let pressure = facts.performance.token_pressure;
             state.push_volatile_payload(
@@ -3922,7 +3906,6 @@ fn route_runtime_policy_evidence(
                         "token_pressure": pressure,
                         "urgency": urgency.to_string(),
                     },
-                    "recommendation": "Consider reusing prior results, avoiding duplicate reads, or selecting a narrow next action.",
                     "authority": "advisory_evidence_only",
                 }),
             );
@@ -4247,14 +4230,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             let token_pressure = status_provider.token_pressure();
             let alerts: Vec<String> = {
                 let mut a = Vec::new();
-                if state.stall.execution_escalation_advisory_emitted {
-                    a.push("execution_escalation".to_string());
-                }
                 if state.stall.work_evidence_advisory_emitted {
                     a.push("work_evidence_sufficiency".to_string());
-                }
-                if state.stall.nudge_count > 0 {
-                    a.push(format!("stall_nudges={}", state.stall.nudge_count));
                 }
                 let recent_tool_failures = state.turn_guard.health.recent_errors(10).len();
                 if recent_tool_failures > 0 {
@@ -4294,36 +4271,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
         if !guidance.is_empty() {
             state.push_volatile(super::host::VolatileKind::BudgetAdvisory, guidance);
-        }
-    }
-
-    // If a mutating task has accumulated only read-only observations, surface
-    // that fact before the next LLM call. It remains advisory because further
-    // investigation may still be justified by a concrete unknown.
-    if should_emit_execution_escalation_advisory(state) {
-        let read_only_calls = state
-            .stall
-            .tool_call_records
-            .iter()
-            .filter(|r| r.was_executed() && r.ok)
-            .count();
-        state.stall.execution_escalation_advisory_emitted = true;
-        let msg = execution_escalation_message(&state.message, read_only_calls);
-        state.push_volatile(super::host::VolatileKind::ExecutionEscalation, msg);
-        tracing::warn!(
-            target: "astra::loop_guard",
-            tier = "execution_escalation",
-            read_only_calls,
-            round = state.llm_rounds_completed,
-            "execution-pattern advisory observed"
-        );
-        if show_policy_feedback_status && !prep.quiet {
-            host.emit_headless_line(
-                HeadlessStderrStyle::Yellow,
-                format!(
-                    "↻ Mutating task accumulated {read_only_calls} read-only tool calls with zero edits; adding execution advisory…"
-                ),
-            );
         }
     }
 
@@ -6063,20 +6010,6 @@ fn prompt_cache_eligible_tokens_from_manifest(manifest: Option<&serde_json::Valu
         .and_then(|trace| trace.pointer("/wire/cache_estimate/eligible_tokens"))
         .and_then(serde_json::Value::as_u64)
 }
-
-/// Mid-loop escalation: kicks in while the model is still calling tools but
-/// has spent the first several rounds only on read-only inspection (`cat`,
-/// `grep`, `ls`, `git diff`, etc.) on a task whose profile says it should be
-/// mutating the workspace. Without this guard the loop runs out of budget
-/// before a single edit is applied.
-pub(crate) const EXECUTION_ESCALATION_MARKER: &str = "## ⤴ Execution Escalation";
-
-/// Minimum successful non-synthetic tool calls accumulated on a mutating task
-/// before we start forcing an execution escalation. Chosen to allow a normal
-/// "read a couple of files, then edit" workflow to proceed uninterrupted
-/// (typical fix workflows commit an edit within 3-5 tool calls), while still
-/// catching runaway read loops well before budget exhaustion.
-pub(crate) const EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD: usize = 8;
 
 pub(crate) fn has_concrete_workspace_mutation(state: &AgenticLoopState) -> bool {
     state
@@ -7887,62 +7820,10 @@ pub(crate) fn cache_waste_advisory_message(
         .join(", ");
     format!(
         "{CACHE_WASTE_MARKER}\n\
-         Observation: cached tool calls were repeated this turn [{tool_list}]. \
-         Those results are already in context — calling the same tool again wastes tokens and does not add evidence.\n\n\
-         Recommendation: reuse the cached result when it answers the current need. \
-         If evidence is still missing, a different target, query, argument set, or \
-         changed worktree may add new information. Repeated cached output should not \
-         be treated as new evidence.\n\n\
-         Original user query: {original_query}"
-    )
-}
-
-pub(crate) fn should_emit_execution_escalation_advisory(state: &AgenticLoopState) -> bool {
-    if state.stall.execution_escalation_advisory_emitted {
-        return false;
-    }
-    // One advisory per turn: if the parallel-batching signal was already
-    // emitted, skip this one to avoid stacking redundant evidence.
-    // NOTE: execution order in execute_turn_and_ingest_phase is
-    //   escalation → parallel-batching, so in practice escalation runs first.
-    //   This guard is defensive against future reordering.
-    if state.stall.parallel_batching_advisory_emitted {
-        return false;
-    }
-    if !state.task_profile.mutates_workspace {
-        return false;
-    }
-    if has_concrete_workspace_mutation(state) {
-        return false;
-    }
-
-    let successful_real_records: Vec<_> = state
-        .stall
-        .tool_call_records
-        .iter()
-        .filter(|record| record.was_executed())
-        .filter(|record| record.ok)
-        .collect();
-
-    if successful_real_records.len() < EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD {
-        return false;
-    }
-
-    // Every successful call was read-only (none mutating) and none committed
-    // a workspace change — the model is spinning on inspection.
-    successful_real_records
-        .iter()
-        .all(|record| !tool_record_is_workspace_mutation(record))
-}
-
-pub(crate) fn execution_escalation_message(original_query: &str, read_only_calls: usize) -> String {
-    format!(
-        "{EXECUTION_ESCALATION_MARKER}\n\
-         Observation: {read_only_calls} read-only tool calls have occurred on a task whose \
-         structured intent requires changing the workspace, and no concrete mutation is \
-         recorded yet. Consider whether the current evidence is sufficient for a targeted \
-         edit and relevant verification. More inspection remains reasonable when a specific \
-         unknown still blocks a safe change.\n\n\
+         Observation: cached tool results were returned this turn [{tool_list}]. \
+         Cache reuse does not establish current prompt coverage or lack of task progress.\n\n\
+         Recommendation: reuse earlier output when it is available and sufficient. \
+         Recover missing evidence when needed. A cached result does not prove a new execution.\n\n\
          Original user query: {original_query}"
     )
 }
@@ -16331,6 +16212,7 @@ mod tests {
                 &records,
                 2,
                 astra_turn_core::evaluation::EvaluationThresholds::default(),
+                None,
             )
             .unwrap();
             assert!(
@@ -16345,6 +16227,7 @@ mod tests {
                 &state.stall.tool_call_records[..1],
                 1,
                 astra_turn_core::evaluation::EvaluationThresholds::default(),
+                None,
             )
             .unwrap()
             .unwrap();
@@ -16354,6 +16237,7 @@ mod tests {
             &state.stall.tool_call_records,
             2,
             astra_turn_core::evaluation::EvaluationThresholds::default(),
+            None,
         )
         .unwrap()
         {
@@ -16557,6 +16441,7 @@ mod tests {
             &state.stall.tool_call_records,
             3,
             astra_turn_core::evaluation::EvaluationThresholds::default(),
+            None,
         )
         .unwrap();
         let unrelated_failure =
@@ -16808,6 +16693,7 @@ mod tests {
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
             "state": "evaluated",
             "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+            "recovery": null,
             "revision": 2,
             "evaluated_at_round": 4,
             "subject": {"kind": "run"},
@@ -16863,6 +16749,7 @@ mod tests {
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
             "state": "evaluated",
             "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+            "recovery": null,
             "revision": 2,
             "evaluated_at_round": 4,
             "subject": {"kind": "run"},
@@ -16936,11 +16823,13 @@ mod tests {
             &state.stall.tool_call_records,
             2,
             astra_turn_core::evaluation::EvaluationThresholds::default(),
+            None,
         )
         .unwrap();
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
             "state": "evaluated",
             "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+            "recovery": null,
             "revision": 2,
             "evaluated_at_round": 2,
             "subject": {"kind": "run"},
@@ -17031,11 +16920,13 @@ mod tests {
             &state.stall.tool_call_records,
             2,
             astra_turn_core::evaluation::EvaluationThresholds::default(),
+            None,
         )
         .unwrap();
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
             "state": "evaluated",
             "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+            "recovery": null,
             "revision": 2,
             "evaluated_at_round": 2,
             "subject": {"kind": "run"},
@@ -17098,11 +16989,13 @@ mod tests {
             &state.stall.tool_call_records,
             1,
             astra_turn_core::evaluation::EvaluationThresholds::default(),
+            None,
         )
         .unwrap();
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
             "state": "evaluated",
             "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+            "recovery": null,
             "revision": 1,
             "evaluated_at_round": 1,
             "subject": {"kind": "run"},
@@ -17141,6 +17034,7 @@ mod tests {
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
             "state": "evaluated",
             "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+            "recovery": null,
             "revision": 2,
             "evaluated_at_round": 4,
             "subject": {"kind": "run"},
@@ -17186,6 +17080,7 @@ mod tests {
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
             "state": "evaluated",
             "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+            "recovery": null,
             "revision": 2,
             "evaluated_at_round": 4,
             "subject": {"kind": "run"},
@@ -17272,7 +17167,8 @@ mod tests {
         state.budget_wrapup_injected = true;
         state.hooks.completion_settlement.text_only = true;
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
-            "state": "evaluated", "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION, "revision": 3,
+            "state": "evaluated", "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+            "recovery": null, "revision": 3,
             "evaluated_at_round": 6, "subject": {"kind": "run"},
             "entries": [{"signal": "unresolved_tool_outcomes", "stage": "converge",
                 "observed_at_round": 6, "evidence_count": 3, "recommendation": "diagnose_tool_outcomes"}]
@@ -17452,7 +17348,8 @@ mod tests {
         state.runtime_tool_executor = None;
         // Restore only the policy signal for the no-executor opening control.
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
-            "state": "evaluated", "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION, "revision": 3,
+            "state": "evaluated", "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+            "recovery": null, "revision": 3,
             "evaluated_at_round": 6, "subject": {"kind": "run"},
             "entries": [{"signal": "unresolved_tool_outcomes", "stage": "converge",
                 "observed_at_round": 6, "evidence_count": 3, "recommendation": "diagnose_tool_outcomes"}]
@@ -17487,6 +17384,7 @@ mod tests {
             }],
             1,
             astra_turn_core::evaluation::EvaluationThresholds::default(),
+            None,
         )
         .unwrap();
         state
@@ -17496,6 +17394,7 @@ mod tests {
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
             "state": "evaluated",
             "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+            "recovery": null,
             "revision": 3,
             "evaluated_at_round": 6,
             "subject": {"kind": "run"},
@@ -17540,6 +17439,7 @@ mod tests {
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
             "state": "evaluated",
             "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+            "recovery": null,
             "revision": 3,
             "evaluated_at_round": 8,
             "subject": {"kind": "run"},
@@ -17664,6 +17564,7 @@ mod tests {
             "policy_feedback": {
                 "state": "evaluated",
                 "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+            "recovery": null,
                 "revision": 2,
                 "evaluated_at_round": 2,
                 "subject": {
@@ -21279,168 +21180,6 @@ mod tests {
         );
     }
 
-    // ─── Mid-loop execution escalation tests ──────────────────────────────
-
-    fn make_mutating_state_with_reads(n: usize) -> AgenticLoopState {
-        let mut state = make_state();
-        state.message = "fix the bug in foo".into();
-        state.user_intent = state.message.clone();
-        mark_must_mutate(&mut state);
-        assert!(
-            state.task_profile.mutates_workspace,
-            "test precondition: profile must be mutating"
-        );
-        for i in 0..n {
-            state.stall.tool_call_records.push(ToolCallRecord {
-                name: "bash".into(),
-                ok: true,
-                args_full: Some(format!(r#"{{"command":"cat src/file{i}.rs"}}"#, i = i)),
-                ..Default::default()
-            });
-        }
-        state
-    }
-
-    #[test]
-    fn escalation_fires_after_threshold_of_read_only_calls_on_mutating_task() {
-        let state = make_mutating_state_with_reads(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD);
-        assert!(should_emit_execution_escalation_advisory(&state));
-    }
-
-    #[test]
-    fn escalation_does_not_fire_just_below_threshold() {
-        let state = make_mutating_state_with_reads(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD - 1);
-        assert!(!should_emit_execution_escalation_advisory(&state));
-    }
-
-    #[test]
-    fn escalation_does_not_fire_on_non_mutating_task() {
-        let mut state =
-            make_mutating_state_with_reads(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD + 2);
-        // Flip profile to read-only exploration — escalation must not engage.
-        state.task_profile = astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default();
-        state.turn_intent = None;
-        assert!(!state.task_profile.mutates_workspace);
-        assert!(!should_emit_execution_escalation_advisory(&state));
-    }
-
-    #[test]
-    fn escalation_does_not_fire_when_any_mutation_present() {
-        let mut state = make_mutating_state_with_reads(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD);
-        // One actual edit in the middle of many reads must suppress the guard.
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "edit_file".into(),
-            ok: true,
-            ..Default::default()
-        });
-        assert!(!should_emit_execution_escalation_advisory(&state));
-    }
-
-    #[test]
-    fn escalation_does_not_fire_when_bash_mutation_mixed_in() {
-        let mut state = make_mutating_state_with_reads(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD);
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(r#"{"command":"sed -i 's/a/b/' foo.rs"}"#.into()),
-            ..Default::default()
-        });
-        assert!(!should_emit_execution_escalation_advisory(&state));
-    }
-
-    #[test]
-    fn escalation_is_one_shot_per_turn() {
-        let mut state = make_mutating_state_with_reads(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD);
-        state.stall.execution_escalation_advisory_emitted = true;
-        assert!(
-            !should_emit_execution_escalation_advisory(&state),
-            "flag must prevent a second injection"
-        );
-    }
-
-    #[test]
-    fn escalation_suppressed_when_parallel_batching_already_fired() {
-        let mut state = make_mutating_state_with_reads(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD);
-        // Precondition: without the flag, escalation would fire.
-        assert!(should_emit_execution_escalation_advisory(&state));
-        // Once parallel-batching force has fired, escalation must yield to
-        // honor the one-advisory-per-turn invariant.
-        state.stall.parallel_batching_advisory_emitted = true;
-        assert!(
-            !should_emit_execution_escalation_advisory(&state),
-            "escalation must not fire when parallel-batching force already active"
-        );
-    }
-
-    #[test]
-    fn escalation_ignores_failed_tool_calls_for_threshold() {
-        let mut state = make_state();
-        state.message = "fix the bug".into();
-        state.user_intent = state.message.clone();
-        mark_must_mutate(&mut state);
-        // 20 failed reads — don't count toward threshold (they weren't real
-        // progress; retrying reads is already flagged elsewhere).
-        for _ in 0..20 {
-            state.stall.tool_call_records.push(ToolCallRecord {
-                name: "bash".into(),
-                ok: false,
-                args_full: Some(r#"{"command":"cat missing.rs"}"#.into()),
-                ..Default::default()
-            });
-        }
-        assert!(!should_emit_execution_escalation_advisory(&state));
-    }
-
-    #[test]
-    fn escalation_ignores_synthetic_placeholders() {
-        let mut state = make_state();
-        state.message = "fix the bug".into();
-        state.user_intent = state.message.clone();
-        mark_must_mutate(&mut state);
-        for _ in 0..(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD + 2) {
-            state.stall.tool_call_records.push(ToolCallRecord {
-                name: "bash".into(),
-                ok: true,
-                args_preview: Some("<synthetic placeholder>".into()),
-                ..Default::default()
-            });
-        }
-        // If all records are synthetic placeholders they should be filtered
-        // out and the threshold should not be met.
-        let all_synthetic = state
-            .stall
-            .tool_call_records
-            .iter()
-            .all(|r| r.is_synthetic_placeholder());
-        if all_synthetic {
-            assert!(!should_emit_execution_escalation_advisory(&state));
-        }
-    }
-
-    #[test]
-    fn parallel_batching_suppressed_when_escalation_already_fired() {
-        let mut state = make_state();
-        state.message = "explore the codebase".into();
-        state.user_intent = state.message.clone();
-        for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD {
-            push_single_tool_round(&mut state);
-        }
-        // Precondition: without escalation flag, parallel-batching would fire.
-        assert!(should_emit_parallel_batching_advisory(
-            &state,
-            PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
-        ));
-        // Once escalation has fired, parallel-batching must yield.
-        state.stall.execution_escalation_advisory_emitted = true;
-        assert!(
-            !should_emit_parallel_batching_advisory(
-                &state,
-                PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
-            ),
-            "parallel-batching must not fire when escalation already active"
-        );
-    }
-
     #[test]
     fn parallel_batching_suppressed_when_cascade_guard_already_fired() {
         let flags: Vec<Box<dyn Fn(&mut AgenticLoopState)>> =
@@ -23076,6 +22815,7 @@ mod tests {
                         serde_json::from_value(serde_json::json!({
                             "state": "evaluated",
                             "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+            "recovery": null,
                             "revision": 2,
                             "evaluated_at_round": 4,
                             "subject": {"kind": "run"},
@@ -24081,72 +23821,46 @@ mod tests {
         assert!(rendered.contains("Use the release checklist."));
     }
 
-    fn execution_escalation_state() -> AgenticLoopState {
-        let mut state = make_state();
-        state.message = "fix the broken auth middleware".into();
-        state.user_intent = state.message.clone();
-        mark_must_mutate(&mut state);
-        for i in 0..EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD {
-            state.stall.tool_call_records.push(ToolCallRecord {
-                name: "read_file".to_string(),
-                ok: true,
-                ms: 10,
-                args_preview: Some(format!("path: src/{i}.rs")),
-                file_path: Some(format!("src/{i}.rs")),
-                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
-                ..Default::default()
-            });
-        }
-        state
-    }
-
     #[tokio::test]
-    async fn auto_delivers_policy_feedback_to_model_without_status_chatter() {
-        let mut auto_state = execution_escalation_state();
-        let history_before = auto_state.messages.clone();
-        let mut auto_host = MockHost::new(vec![text_result("done", 10, 5, Some(1))])
-            .with_interaction_mode(TurnInteractionMode::Auto);
-
-        execute_turn_and_ingest_phase(&mut auto_host, &mut auto_state, 0, prep(false))
-            .await
-            .expect("auto turn");
-
-        let delivered = auto_host
-            .executed_volatile
-            .first()
-            .expect("volatile model boundary");
-        assert!(
-            delivered
+    async fn interaction_modes_deliver_same_policy_without_rewriting_history() {
+        use astra_turn_core::context_feedback::{RuntimePolicySubject, RuntimeRecoveryEvidence};
+        let mut delivered_payloads = Vec::new();
+        for mode in [TurnInteractionMode::Auto, TurnInteractionMode::Prompt] {
+            let mut state = make_state();
+            state.stall.active_policy_feedback =
+                crate::turn::runtime_policy::evaluate_tool_boundary_with_thresholds(
+                    &mut state.stall.runtime_policy_evaluation,
+                    RuntimePolicySubject::Run,
+                    &[],
+                    0,
+                    astra_turn_core::evaluation::EvaluationThresholds::default(),
+                    Some(RuntimeRecoveryEvidence {
+                        error_pressure: 1,
+                        timeout_pressure: 0,
+                        cautioned_tools: vec![],
+                        timeout_dominant_tools: vec![],
+                        omitted_tools: 0,
+                    }),
+                )
+                .unwrap()
+                .unwrap();
+            let history_before = state.messages.clone();
+            let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))])
+                .with_interaction_mode(mode);
+            execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(false))
+                .await
+                .unwrap();
+            let delivered = host.executed_volatile.first().unwrap();
+            let policy = delivered
                 .iter()
-                .any(|injection| injection.kind == VolatileKind::ExecutionEscalation),
-            "Auto must preserve policy feedback at the model boundary"
-        );
-        assert_eq!(
-            auto_host.executed_messages.first(),
-            Some(&history_before),
-            "runtime feedback must not impersonate conversational history"
-        );
-        assert!(
-            auto_host
-                .emitted_lines
-                .iter()
-                .all(|line| !line.contains("Mutating task accumulated")),
-            "Auto should not turn model feedback into repeated UI status lines"
-        );
-
-        let mut prompt_state = execution_escalation_state();
-        let mut prompt_host = MockHost::new(vec![text_result("done", 10, 5, Some(1))])
-            .with_interaction_mode(TurnInteractionMode::Prompt);
-        execute_turn_and_ingest_phase(&mut prompt_host, &mut prompt_state, 0, prep(false))
-            .await
-            .expect("prompt turn");
-        assert!(
-            prompt_host
-                .emitted_lines
-                .iter()
-                .any(|line| line.contains("Mutating task accumulated")),
-            "Prompt mode may mirror the same policy evidence as status text"
-        );
+                .filter(|injection| injection.kind == VolatileKind::PolicyAdvisory)
+                .collect::<Vec<_>>();
+            assert_eq!(policy.len(), 1);
+            assert_eq!(policy[0].payload["recovery"]["error_pressure"], 1);
+            assert_eq!(host.executed_messages.first(), Some(&history_before));
+            delivered_payloads.push(policy[0].payload.clone());
+        }
+        assert_eq!(delivered_payloads[0], delivered_payloads[1]);
     }
 
     #[tokio::test]

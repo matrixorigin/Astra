@@ -1697,6 +1697,8 @@ pub struct ToolEvaluationFact {
     assessment_observation_candidate: bool,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     operation_identity: Option<EvaluationIdentity>,
+    /// False when the outcome key used only a preview or other partial evidence.
+    operation_identity_complete: bool,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     effective_result_class: Option<String>,
     non_failure_outcome: bool,
@@ -1713,6 +1715,81 @@ pub struct ToolEvaluationFact {
     read_target: Option<ReadRange>,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     validation_prefix: Option<EvaluationIdentity>,
+    /// Identity of a successful read-only request and the exact result
+    /// delivered at the model boundary. This is equality-only evidence: it
+    /// proves that the same observable result was delivered again, never that
+    /// the underlying world stayed unchanged.
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    observation_request_identity: Option<EvaluationIdentity>,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    observation_result_identity: Option<EvaluationIdentity>,
+    /// Facets actually delivered by a live introspection snapshot. This is
+    /// separate from the source-owned revision: a facet can be a redundant
+    /// read even when the underlying snapshot has not changed.
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    observation_coverage: Option<Vec<String>>,
+    /// Normalized scope of a live introspection request. Cross-facet reuse is
+    /// allowed only when the earlier read was at least as detailed and used
+    /// the same source/horizon/context boundary.
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    observation_scope: Option<ObservationScope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObservationScope {
+    topic: String,
+    facet: String,
+    depth: String,
+    horizon: String,
+    source_policy: String,
+    include_context: bool,
+    format: String,
+}
+
+impl ObservationScope {
+    fn from_request(request: &crate::introspect::IntrospectRequest) -> Self {
+        Self {
+            topic: request.topic.as_str().to_string(),
+            facet: request.facet.as_str().to_string(),
+            depth: request.depth.as_str().to_string(),
+            horizon: request.horizon.as_str().to_string(),
+            source_policy: request.source_policy.as_str().to_string(),
+            include_context: request.include_context,
+            format: if request.format.is_json() {
+                "json".to_string()
+            } else {
+                "text".to_string()
+            },
+        }
+    }
+
+    fn can_cover(
+        &self,
+        requested: &Self,
+        delivered_facets: &[String],
+        required_facets: &[String],
+    ) -> bool {
+        self.topic == requested.topic
+            && self.horizon == requested.horizon
+            && self.source_policy == requested.source_policy
+            && self.include_context == requested.include_context
+            && self.format == requested.format
+            && depth_rank(&self.depth) >= depth_rank(&requested.depth)
+            && required_facets
+                .iter()
+                .all(|facet| delivered_facets.iter().any(|delivered| delivered == facet))
+    }
+}
+
+fn depth_rank(depth: &str) -> u8 {
+    match depth {
+        "hint" => 0,
+        "summary" => 1,
+        "diagnostic" => 2,
+        "forensic" => 3,
+        _ => 0,
+    }
 }
 
 /// Opaque failures are local to the current evidence window and never match a
@@ -1762,6 +1839,9 @@ impl ToolEvaluationFact {
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.operation_identity_complete && self.operation_identity.is_none() {
+            return Err("complete operation evidence without identity");
+        }
         let class = self.effective_result_class.as_deref().unwrap_or("");
         let resolves = result_class_resolves_outcome_failure(class);
         if (result_class_is_outcome_failure(class) && self.non_failure_outcome)
@@ -1775,6 +1855,10 @@ impl ToolEvaluationFact {
 
     pub fn from_record(record: &ToolCallRecord) -> Self {
         let args = record.authoritative_args_full().unwrap_or("");
+        let (observation_request_identity, observation_result_identity) =
+            observation_evidence_identities(record);
+        let observation_coverage = observation_coverage(record);
+        let observation_scope = observation_scope(record);
         Self {
             tool_name: record.name.clone(),
             execution_completion: record.execution_completion.clone(),
@@ -1784,6 +1868,7 @@ impl ToolEvaluationFact {
             ),
             operation_identity: operation_identity_key(record)
                 .map(|key| EvaluationIdentity::new(b"operation", &key)),
+            operation_identity_complete: !args.trim().is_empty(),
             effective_result_class: effective_tool_result_class(record),
             non_failure_outcome: record_is_non_failure_outcome(record),
             is_rejected_attempt: record_is_rejected_attempt(record),
@@ -1801,6 +1886,10 @@ impl ToolEvaluationFact {
             read_target: extract_read_target(&record.name, args),
             validation_prefix: normalize_validation_prefix(&record.name, args)
                 .map(|prefix| EvaluationIdentity::new(b"validation", &prefix)),
+            observation_request_identity,
+            observation_result_identity,
+            observation_coverage,
+            observation_scope,
         }
     }
 
@@ -1841,6 +1930,295 @@ impl ToolEvaluationFact {
     pub fn operation_identity(&self) -> Option<EvaluationIdentity> {
         self.operation_identity
     }
+
+    /// Repetition requires full authoritative arguments, not a shared preview.
+    pub fn complete_operation_identity(&self) -> Option<EvaluationIdentity> {
+        self.operation_identity
+            .filter(|_| self.operation_identity_complete)
+    }
+
+    /// Equality-only identity for a read-only result that was actually
+    /// delivered. `None` deliberately means that the runtime cannot prove
+    /// what the model received.
+    pub fn observation_evidence_identity(
+        &self,
+    ) -> Option<(EvaluationIdentity, EvaluationIdentity)> {
+        self.observation_request_identity
+            .zip(self.observation_result_identity)
+    }
+
+    pub fn observation_coverage(&self) -> Option<&[String]> {
+        self.observation_coverage.as_deref()
+    }
+}
+
+/// Build the conservative identity used by the online convergence feedback.
+/// The request must have complete arguments and the result must have an exact
+/// bounded model projection. A durable artifact hash identifies bytes stored
+/// for later recovery, not evidence delivered in this call; a preview is never
+/// enough to claim that no new evidence was delivered.
+///
+/// Live introspection is the one structured exception: its report carries a
+/// source-owned evidence revision that excludes the diagnostic call's own
+/// counters and latency. Comparing that revision avoids treating observation
+/// overhead as new task evidence while still breaking the run when the
+/// observed runtime facts actually change. If an older/foreign result lacks
+/// the marker, the function fails closed.
+fn observation_evidence_identities(
+    record: &ToolCallRecord,
+) -> (Option<EvaluationIdentity>, Option<EvaluationIdentity>) {
+    if !record.ok
+        || !matches!(
+            record.effective_disposition(),
+            astra_services::session_journal::ToolCallDisposition::Executed
+                | astra_services::session_journal::ToolCallDisposition::Reused
+        )
+    {
+        return (None, None);
+    }
+    let Some(args) = record.authoritative_args_full().map(str::trim) else {
+        return (None, None);
+    };
+    if args.is_empty() {
+        return (None, None);
+    }
+    let args_value = serde_json::from_str::<serde_json::Value>(args).ok();
+    let classification = crate::tool::categories::classify(&record.name, args_value.as_ref());
+    if !matches!(
+        classification.category,
+        crate::tool::categories::ToolCategory::ReadOnly
+            | crate::tool::categories::ToolCategory::Consultative
+    ) {
+        return (None, None);
+    }
+    let Some(request_key) = observation_request_key(record, args_value.as_ref()) else {
+        return (None, None);
+    };
+    let result_key = if record.name == "introspect"
+        && args_value
+            .as_ref()
+            .is_some_and(|args| args.get("artifact").is_none())
+    {
+        let result = delivered_model_result(record).filter(|value| !value.is_empty());
+        let Some(result) = result else {
+            return (None, None);
+        };
+        let Some(revision) = crate::introspect::extract_evidence_revision(result) else {
+            return (None, None);
+        };
+        format!("introspect_evidence_revision:{revision}")
+    } else {
+        let Some(result) = delivered_model_result(record).filter(|value| !value.is_empty()) else {
+            return (None, None);
+        };
+        result.to_string()
+    };
+    if result_key.is_empty() {
+        return (None, None);
+    }
+    (
+        Some(EvaluationIdentity::new(
+            b"observation_request",
+            &request_key,
+        )),
+        Some(EvaluationIdentity::new(b"observation_result", &result_key)),
+    )
+}
+
+fn observation_coverage(record: &ToolCallRecord) -> Option<Vec<String>> {
+    if record.name != "introspect"
+        || !record.ok
+        || !matches!(
+            record.effective_disposition(),
+            astra_services::session_journal::ToolCallDisposition::Executed
+                | astra_services::session_journal::ToolCallDisposition::Reused
+        )
+    {
+        return None;
+    }
+    let args = record.authoritative_args_full()?.trim();
+    if args.is_empty() {
+        return None;
+    }
+    let args = serde_json::from_str::<serde_json::Value>(args).ok()?;
+    if args.get("artifact").is_some() {
+        return None;
+    }
+    let result = delivered_model_result(record).filter(|value| !value.is_empty())?;
+    let facets = crate::introspect::extract_covered_facets(result)?;
+    let mut normalized = std::collections::BTreeSet::new();
+    for facet in facets {
+        if !matches!(
+            facet.as_str(),
+            "overview"
+                | "session"
+                | "recent"
+                | "errors"
+                | "trace"
+                | "volatile"
+                | "stall"
+                | "noise"
+                | "cache"
+                | "session_memory"
+        ) {
+            return None;
+        }
+        normalized.insert(facet);
+    }
+    Some(normalized.into_iter().collect())
+}
+
+/// Return the exact sanitized result projection available to the live
+/// evaluator. An artifact replacement is durable storage presentation only;
+/// without the runtime lane it is intentionally unmeasurable.
+fn delivered_model_result(record: &ToolCallRecord) -> Option<&str> {
+    record.runtime_model_result_full.as_deref().or_else(|| {
+        record
+            .result_artifact
+            .is_none()
+            .then_some(record.result_full.as_deref())
+            .flatten()
+    })
+}
+
+fn observation_scope(record: &ToolCallRecord) -> Option<ObservationScope> {
+    if record.name != "introspect" {
+        return None;
+    }
+    let args = record.authoritative_args_full()?.trim();
+    if args.is_empty() {
+        return None;
+    }
+    let args = serde_json::from_str::<serde_json::Value>(args).ok()?;
+    if args.get("artifact").is_some() {
+        return None;
+    }
+    Some(ObservationScope::from_request(
+        &crate::introspect::IntrospectRequest::from_args(&args),
+    ))
+}
+
+/// Normalize the live introspection request using the parameters that actually
+/// affect its projection. `max_bytes` is an artifact-window parameter and is
+/// ignored by a live request; keeping it out of this identity prevents a
+/// non-semantic retry from looking like a new diagnostic query. Artifact
+/// recovery keeps the ordinary exact operation identity because offset and
+/// window size do affect the delivered evidence.
+fn observation_request_key(
+    record: &ToolCallRecord,
+    args: Option<&serde_json::Value>,
+) -> Option<String> {
+    if record.name != "introspect" {
+        return operation_identity_key(record);
+    }
+    let Some(args) = args else {
+        return operation_identity_key(record);
+    };
+    if args.get("artifact").is_some() {
+        return operation_identity_key(record);
+    }
+    let request = crate::introspect::IntrospectRequest::from_args(args);
+    Some(
+        serde_json::json!({
+            "topic": request.topic.as_str(),
+            "facet": request.facet.as_str(),
+            "depth": request.depth.as_str(),
+            "horizon": request.horizon.as_str(),
+            "source_policy": request.source_policy.as_str(),
+            "include_context": request.include_context,
+            "format": if request.format.is_json() { "json" } else { "text" },
+        })
+        .to_string(),
+    )
+}
+
+/// Count the trailing run of successful read-only observations that delivered
+/// the same request/result pair or, for live introspection, the same
+/// source-owned snapshot without adding facet coverage. The scan stops at the
+/// first different or unmeasurable observation, so an unrelated read,
+/// mutation, failed call, or missing result never gets silently folded into a
+/// "no new evidence" claim.
+pub fn trailing_repeated_observation_evidence(facts: &[ToolEvaluationFact]) -> usize {
+    trailing_exact_observation_evidence(facts).max(trailing_covered_observation_evidence(facts))
+}
+
+fn trailing_exact_observation_evidence(facts: &[ToolEvaluationFact]) -> usize {
+    let mut iter = facts.iter().rev();
+    let Some(first) = iter
+        .next()
+        .and_then(ToolEvaluationFact::observation_evidence_identity)
+    else {
+        return 0;
+    };
+    let first_coverage = facts
+        .last()
+        .and_then(|fact| fact.observation_coverage())
+        .map(|coverage| coverage.to_vec());
+    // A live introspection result must carry an explicit coverage marker. An
+    // empty marker means bounded delivery and is still eligible for exact
+    // repeat detection; a missing marker is an unmeasurable foreign/legacy
+    // result and must fail closed.
+    if facts
+        .last()
+        .is_some_and(|fact| fact.tool_name == "introspect" && first_coverage.is_none())
+    {
+        return 0;
+    }
+    let mut count = 1;
+    for fact in iter {
+        let same_coverage = if first_coverage.is_some() {
+            fact.observation_coverage()
+                .map(|coverage| coverage.to_vec())
+                == first_coverage
+        } else {
+            true
+        };
+        if fact.observation_evidence_identity() == Some(first) && same_coverage {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count
+}
+
+fn trailing_covered_observation_evidence(facts: &[ToolEvaluationFact]) -> usize {
+    let Some(latest) = facts.last() else {
+        return 0;
+    };
+    let Some((_, latest_result)) = latest.observation_evidence_identity() else {
+        return 0;
+    };
+    let Some(latest_scope) = latest.observation_scope.as_ref() else {
+        return 0;
+    };
+    let Some(latest_facets) = latest.observation_coverage() else {
+        return 0;
+    };
+    // Empty coverage is a valid bounded-delivery marker, but it cannot prove
+    // that one facet contains another. Exact equality detection above still
+    // reports repeated delivery without upgrading it to cross-facet reuse.
+    if latest_facets.is_empty() {
+        return 0;
+    }
+
+    let mut count = 0;
+    for fact in facts.iter().rev() {
+        let Some((_, result)) = fact.observation_evidence_identity() else {
+            break;
+        };
+        let Some(scope) = fact.observation_scope.as_ref() else {
+            break;
+        };
+        let Some(facets) = fact.observation_coverage() else {
+            break;
+        };
+        if result != latest_result || !scope.can_cover(latest_scope, facets, latest_facets) {
+            break;
+        }
+        count += 1;
+    }
+    if count >= 2 { count } else { 0 }
 }
 
 pub fn active_rejected_fact_keys(
@@ -3835,6 +4213,295 @@ mod tests {
             count_unresolved_tool_outcome_failures(&[first, different]),
             1,
             "a different operation must not clear the active failure"
+        );
+    }
+
+    #[test]
+    fn repeated_observation_evidence_requires_same_read_and_delivered_result() {
+        let read = || {
+            let mut record = journal_ok_call("read_file");
+            record.disposition =
+                Some(astra_services::session_journal::ToolCallDisposition::Executed);
+            record.args_full = Some(serde_json::json!({"path": "a.txt"}).to_string());
+            record.result_full = Some("snapshot".into());
+            record
+        };
+
+        let first = read();
+        let second = read();
+        let third = read();
+        assert_eq!(
+            trailing_repeated_observation_evidence(&[
+                ToolEvaluationFact::from_record(&first),
+                ToolEvaluationFact::from_record(&second),
+                ToolEvaluationFact::from_record(&third),
+            ],),
+            3
+        );
+
+        let mut changed_result = read();
+        changed_result.result_full = Some("new snapshot".into());
+        assert_eq!(
+            trailing_repeated_observation_evidence(&[
+                ToolEvaluationFact::from_record(&first),
+                ToolEvaluationFact::from_record(&changed_result),
+            ]),
+            1,
+            "a changed delivered result is new evidence"
+        );
+
+        let descriptor = || astra_services::session_journal::ToolResultArtifactDescriptor {
+            document_kind: Default::default(),
+            version: astra_services::session_journal::TOOL_RESULT_ARTIFACT_DESCRIPTOR_VERSION,
+            call_id: "call-1".into(),
+            run_id: "run-1".into(),
+            byte_len: 8,
+            content_sha256: "same-artifact".into(),
+        };
+        let mut stored_first = read();
+        stored_first.result_artifact = Some(descriptor());
+        let mut stored_changed = read();
+        stored_changed.result_artifact = Some(descriptor());
+        stored_changed.result_full = Some("recovered window".into());
+        assert_eq!(
+            trailing_repeated_observation_evidence(&[
+                ToolEvaluationFact::from_record(&stored_first),
+                ToolEvaluationFact::from_record(&stored_changed),
+            ]),
+            0,
+            "artifact-only records do not prove any model-visible projection"
+        );
+
+        let mut live_artifact_first = read();
+        live_artifact_first.result_full =
+            Some("<persisted-output>artifact handle</persisted-output>".into());
+        live_artifact_first.result_artifact = Some(descriptor());
+        live_artifact_first.runtime_model_result_full = Some("snapshot".into());
+        let mut live_artifact_second = live_artifact_first.clone();
+        live_artifact_second.round = Some(2);
+        assert_eq!(
+            trailing_repeated_observation_evidence(&[
+                ToolEvaluationFact::from_record(&live_artifact_first),
+                ToolEvaluationFact::from_record(&live_artifact_second),
+            ]),
+            2,
+            "the live model projection remains usable even when the durable result is an artifact"
+        );
+
+        let mut overview = journal_ok_call("introspect");
+        overview.args_full =
+            Some(serde_json::json!({"facet": "overview", "format": "json"}).to_string());
+        overview.result_full = Some(
+            serde_json::json!({
+                "evidence_revision": "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "covered_facets": ["overview"],
+                "summary": "bounded composite overview"
+            })
+            .to_string(),
+        );
+        let mut overview_with_artifact_window = overview.clone();
+        overview_with_artifact_window.args_full = Some(
+            serde_json::json!({
+                "facet": "overview",
+                "format": "json",
+                "max_bytes": 16384
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            trailing_repeated_observation_evidence(&[
+                ToolEvaluationFact::from_record(&overview),
+                ToolEvaluationFact::from_record(&overview_with_artifact_window),
+            ]),
+            2,
+            "live introspection ignores artifact-only max_bytes for request identity"
+        );
+
+        let mut trace = overview.clone();
+        trace.args_full = Some(serde_json::json!({"facet": "trace", "format": "json"}).to_string());
+        trace.result_full = Some(
+            serde_json::json!({
+                "evidence_revision": "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "covered_facets": ["trace"],
+                "summary": "the same snapshot, a different facet"
+            })
+            .to_string(),
+        );
+        assert!(
+            ToolEvaluationFact::from_record(&overview)
+                .observation_coverage()
+                .is_some()
+        );
+        assert!(
+            ToolEvaluationFact::from_record(&trace)
+                .observation_coverage()
+                .is_some()
+        );
+        assert_eq!(
+            ToolEvaluationFact::from_record(&overview)
+                .observation_evidence_identity()
+                .map(|(_, result)| result),
+            ToolEvaluationFact::from_record(&trace)
+                .observation_evidence_identity()
+                .map(|(_, result)| result),
+            "facet-specific reads should share the source snapshot revision"
+        );
+        assert_eq!(
+            trailing_repeated_observation_evidence(&[
+                ToolEvaluationFact::from_record(&overview),
+                ToolEvaluationFact::from_record(&trace),
+            ]),
+            1,
+            "a bounded JSON overview does not claim to have delivered trace detail"
+        );
+
+        let mut errors = trace.clone();
+        errors.args_full =
+            Some(serde_json::json!({"facet": "errors", "format": "json"}).to_string());
+        errors.result_full = Some(
+            serde_json::json!({
+                "evidence_revision": "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "covered_facets": ["errors"],
+                "summary": "another facet already covered by overview"
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            trailing_repeated_observation_evidence(&[
+                ToolEvaluationFact::from_record(&overview),
+                ToolEvaluationFact::from_record(&trace),
+                ToolEvaluationFact::from_record(&errors),
+            ]),
+            1,
+            "different facets must not be merged without explicit containment"
+        );
+
+        let mut expanded_overview = overview.clone();
+        expanded_overview.result_full = Some(
+            serde_json::json!({
+                "evidence_revision": "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "covered_facets": ["overview", "trace"],
+                "summary": "the same snapshot with additional delivered detail"
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            trailing_repeated_observation_evidence(&[
+                ToolEvaluationFact::from_record(&overview),
+                ToolEvaluationFact::from_record(&expanded_overview),
+            ]),
+            1,
+            "same revision with expanded delivered coverage is new evidence"
+        );
+
+        let mut missing_coverage = overview.clone();
+        missing_coverage.result_full = Some(
+            serde_json::json!({
+                "evidence_revision": "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "summary": "coverage marker omitted"
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            trailing_repeated_observation_evidence(&[
+                ToolEvaluationFact::from_record(&overview),
+                ToolEvaluationFact::from_record(&missing_coverage),
+            ]),
+            0,
+            "an introspection result without delivered coverage must fail closed"
+        );
+
+        let mut bounded_overview = overview.clone();
+        bounded_overview.result_full = Some(
+            serde_json::json!({
+                "evidence_revision": "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "covered_facets": [],
+                "summary": "the report was bounded before facet coverage could be claimed"
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            trailing_repeated_observation_evidence(&[
+                ToolEvaluationFact::from_record(&bounded_overview),
+                ToolEvaluationFact::from_record(&bounded_overview),
+            ]),
+            2,
+            "an explicit empty coverage marker still proves identical delivery"
+        );
+        let mut reused_bounded_overview = bounded_overview.clone();
+        reused_bounded_overview.disposition =
+            Some(astra_services::session_journal::ToolCallDisposition::Reused);
+        reused_bounded_overview.result_class =
+            Some(astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS.into());
+        assert_eq!(
+            trailing_repeated_observation_evidence(&[
+                ToolEvaluationFact::from_record(&bounded_overview),
+                ToolEvaluationFact::from_record(&reused_bounded_overview),
+            ]),
+            2,
+            "a cache-reused result with full delivery identity participates in repetition evidence"
+        );
+
+        assert_eq!(
+            trailing_repeated_observation_evidence(&[
+                ToolEvaluationFact::from_record(&trace),
+                ToolEvaluationFact::from_record(&overview),
+            ]),
+            1,
+            "a broader facet that adds coverage must reset the redundant suffix"
+        );
+
+        let mut changed_overview = overview.clone();
+        changed_overview.result_full = Some(
+            serde_json::json!({
+                "evidence_revision": "v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "covered_facets": ["overview"],
+                "summary": "the target evidence changed"
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            trailing_repeated_observation_evidence(&[
+                ToolEvaluationFact::from_record(&overview),
+                ToolEvaluationFact::from_record(&changed_overview),
+            ]),
+            1,
+            "a source-owned evidence revision change is new evidence"
+        );
+
+        let mut unmarked_overview = overview.clone();
+        unmarked_overview.result_full = Some("same overview without a marker".into());
+        assert_eq!(
+            trailing_repeated_observation_evidence(&[
+                ToolEvaluationFact::from_record(&overview),
+                ToolEvaluationFact::from_record(&unmarked_overview),
+            ]),
+            0,
+            "unmarked introspection output must fail closed"
+        );
+
+        let mut mutation = read();
+        mutation.name = "write_file".into();
+        mutation.args_full =
+            Some(serde_json::json!({"path": "a.txt", "content": "changed"}).to_string());
+        assert_eq!(
+            trailing_repeated_observation_evidence(&[
+                ToolEvaluationFact::from_record(&first),
+                ToolEvaluationFact::from_record(&mutation),
+            ]),
+            0,
+            "a mutation must break an observation-only run"
+        );
+
+        let mut unknown_result = read();
+        unknown_result.result_full = None;
+        assert_eq!(
+            trailing_repeated_observation_evidence(&[
+                ToolEvaluationFact::from_record(&first),
+                ToolEvaluationFact::from_record(&unknown_result),
+            ]),
+            0,
+            "a missing result must not be treated as unchanged evidence"
         );
     }
 

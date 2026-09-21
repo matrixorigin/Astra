@@ -272,11 +272,18 @@ fn validate_necessary_evidence(
     use WorkAdmissionTruth::{No, Uncertain, Yes};
     let truth = |id: &str| evidence[id].truth;
     let mut necessary = vec!["required".to_string(), "parallel_subruns".to_string()];
-    let mut groups = vec![("mutation", MUTATIONS)];
+    // Work lifecycle and task-resource mutation are independent dimensions.
+    // Once Work is confidently not required, an unresolved mutation intent
+    // must remain Unknown rather than blocking the lifecycle decision. A
+    // later completion/receipt consumer still owns that uncertainty. Required
+    // Work, however, needs a complete mutation contract before a graph plan
+    // can be generated, so keep the existing strict validation in that branch.
+    let mut groups = Vec::new();
     if truth("required") == Yes {
+        groups.push(("mutation", MUTATIONS));
         necessary.push("defer".into());
     }
-    if truth("mutation.must_mutate") == Yes {
+    if truth("required") == Yes && truth("mutation.must_mutate") == Yes {
         groups.push(("scope", SCOPES));
         if truth("scope.external") == Yes || truth("scope.mixed") == Yes {
             groups.push(("domain", DOMAINS));
@@ -369,29 +376,23 @@ pub fn parse_work_admission_classification(
     };
     let required = answer("required").expect("validated required");
     let parallel = answer("parallel_subruns").expect("validated topology");
-    let workspace_mutation = serde_json::from_value(json!(
-        select("mutation", MUTATIONS).expect("validated mutation")
-    ))
-    .expect("closed mutation");
+    let workspace_mutation = select("mutation", MUTATIONS)
+        .map(|value| serde_json::from_value(json!(value)).expect("closed mutation"))
+        .unwrap_or(WorkspaceMutationIntent::Unknown);
     // Only material control fields need a determined semantic answer.
     let defer = required && answer("defer").expect("validated activation");
     let mutation_completion_scope = if workspace_mutation == WorkspaceMutationIntent::MustMutate {
-        serde_json::from_value(json!(select("scope", SCOPES).expect("validated scope")))
-            .expect("closed scope")
+        select("scope", SCOPES)
+            .map(|value| serde_json::from_value(json!(value)).expect("closed scope"))
+            .unwrap_or(MutationCompletionScope::Unknown)
     } else {
         MutationCompletionScope::Unknown
     };
-    let external_owner_required = workspace_mutation == WorkspaceMutationIntent::MustMutate
-        && matches!(
-            mutation_completion_scope,
-            MutationCompletionScope::External | MutationCompletionScope::Mixed
-        );
-    let domain = if external_owner_required {
-        Some(select("domain", DOMAINS).expect("validated external owner"))
-    } else {
-        // Ambiguous descriptive domains convey no owner; they cannot prevent admission.
-        select("domain", DOMAINS)
-    };
+    // Required Work validates this branch above. A non-Work mutation can
+    // still be classified without a determined owner, so do not assume that
+    // an external scope implies a domain was supplied. Ambiguous descriptive
+    // domains convey no owner and cannot prevent admission.
+    let domain = select("domain", DOMAINS);
     let domain = match domain.as_deref() {
         Some("none") | None => None,
         Some(value) => Some(serde_json::from_value(json!(value)).expect("closed domain")),
@@ -601,7 +602,7 @@ mod tests {
             assert!(criteria.as_ref().unwrap().no.contains(instructions));
         }
         let error = parse_work_admission_classification(&request,
-            r#"{"true":["mutation.must_mutate","domain.memory"],"uncertain":["scope.workspace","scope.external","scope.mixed","scope.unknown"]}"#,
+            r#"{"true":["required","mutation.must_mutate","domain.memory"],"uncertain":["scope.workspace","scope.external","scope.mixed","scope.unknown"]}"#,
         ).unwrap_err();
         let clarification = work_admission_clarification_request(&request, &error).unwrap();
         assert_eq!(clarification.questions, request.questions);
@@ -855,8 +856,37 @@ mod tests {
     #[test]
     fn uncertainty_retains_all_evidence_and_critical_locks() {
         let request = work_admission_classification_request(&Default::default());
-        for (required, may_mutate) in [(0.19, 0.37), (0.21, 0.37), (0.23, 0.28)] {
-            let mut answers = response(&request, &["mutation.read_only", "parallel_subruns"]);
+        let mut not_required = response(&request, &["mutation.read_only", "parallel_subruns"]);
+        not_required
+            .answers
+            .insert("required".into(), JudgmentAnswer::Noul { noul: 0.19 });
+        not_required.answers.insert(
+            "mutation.may_mutate".into(),
+            JudgmentAnswer::Noul { noul: 0.37 },
+        );
+        let classification = parse(&request, &not_required).unwrap();
+        assert_eq!(
+            classification.work_lifecycle,
+            WorkLifecycleIntent::NotRequired
+        );
+        assert_eq!(
+            classification.workspace_mutation,
+            WorkspaceMutationIntent::Unknown
+        );
+        assert_eq!(
+            classification.mutation_completion_scope,
+            MutationCompletionScope::Unknown
+        );
+
+        for (required, may_mutate, mutation_is_necessary) in
+            [(0.21, 0.37, false), (0.23, 0.28, false), (0.8, 0.37, true)]
+        {
+            let topology = if mutation_is_necessary {
+                vec!["mutation.read_only"]
+            } else {
+                vec!["mutation.read_only", "parallel_subruns"]
+            };
+            let mut answers = response(&request, &topology);
             answers
                 .answers
                 .insert("required".into(), JudgmentAnswer::Noul { noul: required });
@@ -873,20 +903,29 @@ mod tests {
                 diagnostics.provenance,
                 JudgmentResponseProvenance::ProviderProbability
             );
-            assert!(
+            assert_eq!(
                 diagnostics
                     .uncertain_fields
-                    .contains(&"mutation.may_mutate".into())
+                    .contains(&"mutation.may_mutate".into()),
+                mutation_is_necessary
             );
             assert_eq!(
                 diagnostics.uncertain_fields.contains(&"required".into()),
-                required > 0.2
+                !mutation_is_necessary
             );
-            assert!(diagnostics.locked_fields["parallel_subruns"]);
-            assert!(!diagnostics.locked_fields["mutation.must_mutate"]);
+            assert_eq!(
+                diagnostics.locked_fields.get("parallel_subruns").copied(),
+                Some(!mutation_is_necessary)
+            );
+            assert_eq!(
+                diagnostics
+                    .locked_fields
+                    .contains_key("mutation.must_mutate"),
+                mutation_is_necessary
+            );
             assert_eq!(
                 diagnostics.locked_fields.contains_key("required"),
-                required <= 0.2
+                mutation_is_necessary
             );
             assert!(!diagnostics.locked_fields.contains_key("capability.web"));
             assert!(work_admission_clarification_request(&request, &error).is_some());
@@ -965,12 +1004,7 @@ mod tests {
         let TurnIntentJudgeError::Uncertain { diagnostics } = error else {
             panic!("{error}")
         };
-        for (field, value) in [
-            ("parallel_subruns", 0.0),
-            ("parallel_subruns", 0.5),
-            ("mutation.must_mutate", 1.0),
-            ("mutation.must_mutate", 0.5),
-        ] {
+        for (field, value) in [("parallel_subruns", 0.0), ("parallel_subruns", 0.5)] {
             let mut answers = response(&clarified, &["mutation.read_only", "parallel_subruns"]);
             answers
                 .answers
@@ -1031,13 +1065,18 @@ mod tests {
         // Even when another necessary field abstains, a known contradiction
         // takes precedence and cannot be laundered through clarification.
         for raw in [
-            r#"{"true":["mutation.read_only","mutation.must_mutate","scope.workspace"],"uncertain":["required"]}"#,
+            r#"{"true":["required","mutation.read_only","mutation.must_mutate","scope.workspace"],"uncertain":[]}"#,
             r#"{"true":[],"uncertain":["required"]}"#,
-            r#"{"true":["mutation.must_mutate","scope.external","domain.none"],"uncertain":["required"]}"#,
+            r#"{"true":["required","mutation.must_mutate","scope.external","domain.none"],"uncertain":[]}"#,
         ] {
             let error = parse_work_admission_classification(&request, raw).unwrap_err();
-            assert!(matches!(error, TurnIntentJudgeError::Conflicting { .. }));
-            assert!(work_admission_clarification_request(&request, &error).is_none());
+            if raw.contains(r#""uncertain":["required"]"#) {
+                assert!(matches!(error, TurnIntentJudgeError::Uncertain { .. }));
+                assert!(work_admission_clarification_request(&request, &error).is_some());
+            } else {
+                assert!(matches!(error, TurnIntentJudgeError::Conflicting { .. }));
+                assert!(work_admission_clarification_request(&request, &error).is_none());
+            }
         }
     }
 
@@ -1082,20 +1121,24 @@ mod tests {
             panic!("{error}")
         };
         assert!(!diagnostics.locked_fields.contains_key("defer"));
-        let error = parse_work_admission_classification(
+        let classification = parse_work_admission_classification(
             &request,
             r#"{"true":["scope.external","domain.github"],"uncertain":["mutation.must_mutate"]}"#,
         )
-        .unwrap_err();
-        let TurnIntentJudgeError::Uncertain { diagnostics } = error else {
-            panic!("{error}")
-        };
-        assert!(
-            !diagnostics
-                .locked_fields
-                .keys()
-                .any(|id| id.starts_with("scope.") || id.starts_with("domain."))
+        .unwrap();
+        assert_eq!(
+            classification.work_lifecycle,
+            WorkLifecycleIntent::NotRequired
         );
+        assert_eq!(
+            classification.workspace_mutation,
+            WorkspaceMutationIntent::Unknown
+        );
+        assert_eq!(
+            classification.mutation_completion_scope,
+            MutationCompletionScope::Unknown
+        );
+        assert_eq!(classification.domain, Some(TurnIntentDomain::GitHub));
     }
     #[test]
     fn non_durable_classification_needs_no_graph() {
@@ -1113,6 +1156,64 @@ mod tests {
             WorkAdmissionDecision::NotRequired { .. }
         ));
     }
+
+    #[test]
+    fn not_required_keeps_lifecycle_decided_when_mutation_is_uncertain() {
+        let request = work_admission_classification_request(&TurnIntentJudgeContext::default());
+        let classification = parse_work_admission_classification(
+            &request,
+            r#"{"true":[],"uncertain":["mutation.read_only"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            classification.work_lifecycle,
+            WorkLifecycleIntent::NotRequired
+        );
+        assert_eq!(
+            classification.workspace_mutation,
+            WorkspaceMutationIntent::Unknown
+        );
+        assert_eq!(
+            classification.mutation_completion_scope,
+            MutationCompletionScope::Unknown
+        );
+        assert!(matches!(
+            classification.into_not_required().unwrap(),
+            WorkAdmissionDecision::NotRequired {
+                workspace_mutation: WorkspaceMutationIntent::Unknown,
+                mutation_completion_scope: MutationCompletionScope::Unknown,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn required_work_still_requires_mutation_contract() {
+        let request = work_admission_classification_request(&TurnIntentJudgeContext::default());
+        let error = parse_work_admission_classification(
+            &request,
+            r#"{"true":["required"],"uncertain":["mutation.read_only"]}"#,
+        )
+        .unwrap_err();
+        let TurnIntentJudgeError::Uncertain { diagnostics } = error else {
+            panic!("expected required Work to remain fail-closed")
+        };
+        assert!(
+            diagnostics
+                .uncertain_fields
+                .contains(&"mutation.read_only".to_string())
+        );
+        assert!(
+            work_admission_clarification_request(
+                &request,
+                &TurnIntentJudgeError::Uncertain {
+                    diagnostics: diagnostics.clone(),
+                }
+            )
+            .is_some()
+        );
+    }
+
     #[test]
     fn required_deferred_classification_cannot_downgrade() {
         let request = work_admission_classification_request(&TurnIntentJudgeContext::default());
@@ -1168,6 +1269,7 @@ mod tests {
                 &response(
                     &request,
                     &[
+                        "required",
                         "mutation.read_only",
                         "mutation.must_mutate",
                         "scope.unknown",
@@ -1182,7 +1284,12 @@ mod tests {
                 &request,
                 &response(
                     &request,
-                    &["mutation.must_mutate", "scope.external", "domain.none"]
+                    &[
+                        "required",
+                        "mutation.must_mutate",
+                        "scope.external",
+                        "domain.none"
+                    ]
                 )
             )
             .is_err()
@@ -1233,12 +1340,40 @@ mod tests {
     }
 
     #[test]
+    fn non_work_external_mutation_without_domain_is_safe() {
+        let request = work_admission_classification_request(&TurnIntentJudgeContext::default());
+        let classification = parse_work_admission_classification(
+            &request,
+            r#"{"true":["mutation.must_mutate","scope.external"],"uncertain":[]}"#,
+        )
+        .expect("optional domain abstention must not panic");
+        assert_eq!(
+            classification.work_lifecycle,
+            WorkLifecycleIntent::NotRequired
+        );
+        assert_eq!(
+            classification.workspace_mutation,
+            WorkspaceMutationIntent::MustMutate
+        );
+        assert_eq!(
+            classification.mutation_completion_scope,
+            MutationCompletionScope::External
+        );
+        assert_eq!(classification.domain, None);
+    }
+
+    #[test]
     fn material_fields_still_require_confident_exclusive_answers() {
         let request = work_admission_classification_request(&TurnIntentJudgeContext::default());
         let required = response(&request, &["required", "mutation.read_only", "domain.none"]);
         let external = response(
             &request,
-            &["mutation.must_mutate", "scope.external", "domain.github"],
+            &[
+                "required",
+                "mutation.must_mutate",
+                "scope.external",
+                "domain.github",
+            ],
         );
         for (mut answers, id) in [
             (required, "defer"),
@@ -1318,16 +1453,18 @@ mod tests {
     #[test]
     fn sparse_chat_rejects_empty_incomplete_duplicate_and_unknown_decisions() {
         let request = work_admission_classification_request(&TurnIntentJudgeContext::default());
+        let empty =
+            parse_work_admission_classification(&request, r#"{"true":[],"uncertain":[]}"#).unwrap();
+        assert_eq!(empty.work_lifecycle, WorkLifecycleIntent::NotRequired);
+        assert_eq!(empty.workspace_mutation, WorkspaceMutationIntent::Unknown);
         for invalid in [
-            r#"{"true":[],"uncertain":[]}"#,
             r#"{"true":["mutation.read_only","mutation.read_only"],"uncertain":[]}"#,
             r#"{"true":["mutation.read_only"],"uncertain":["mutation.read_only"]}"#,
             r#"{"true":["mutation.read_only"],"uncertain":["invented"]}"#,
             r#"{"true":["mutation.read_only"],"uncertain":["defer","defer"]}"#,
             r#"{"true":[true],"uncertain":[]}"#,
-            r#"{"true":["mutation.must_mutate"],"uncertain":[]}"#,
-            r#"{"true":["mutation.must_mutate","scope.external"],"uncertain":[]}"#,
-            r#"{"true":["mutation.read_only","mutation.must_mutate"],"uncertain":[]}"#,
+            r#"{"true":["required","mutation.must_mutate","scope.external"],"uncertain":[]}"#,
+            r#"{"true":["required","mutation.read_only","mutation.must_mutate"],"uncertain":[]}"#,
             r#"{"true":["mutation.read_only"]}"#,
             r#"["mutation.read_only"]"#,
         ] {
@@ -1340,18 +1477,28 @@ mod tests {
     #[test]
     fn sparse_chat_preserves_material_uncertainty() {
         let request = work_admission_classification_request(&TurnIntentJudgeContext::default());
-        for uncertain in ["required", "parallel_subruns", "mutation.read_only"] {
-            let yes = if uncertain == "mutation.read_only" {
-                vec![]
-            } else {
-                vec!["mutation.read_only"]
-            };
-            let payload = json!({"true":yes, "uncertain":[uncertain]});
+        for uncertain in ["required", "parallel_subruns"] {
+            let payload = json!({"true":["mutation.read_only"], "uncertain":[uncertain]});
             assert!(parse_work_admission_classification(&request, &payload.to_string()).is_err());
         }
+        let mutation_uncertain = json!({"true":[], "uncertain":["mutation.read_only"]});
+        let classification =
+            parse_work_admission_classification(&request, &mutation_uncertain.to_string()).unwrap();
+        assert_eq!(
+            classification.work_lifecycle,
+            WorkLifecycleIntent::NotRequired
+        );
+        assert_eq!(
+            classification.workspace_mutation,
+            WorkspaceMutationIntent::Unknown
+        );
+        assert_eq!(
+            classification.mutation_completion_scope,
+            MutationCompletionScope::Unknown
+        );
         let required = json!({"true":["required","mutation.read_only"], "uncertain":["defer"]});
         assert!(parse_work_admission_classification(&request, &required.to_string()).is_err());
-        let external = json!({"true":["mutation.must_mutate","scope.external"], "uncertain":["domain.github"]});
+        let external = json!({"true":["required","mutation.must_mutate","scope.external"], "uncertain":["domain.github"]});
         assert!(parse_work_admission_classification(&request, &external.to_string()).is_err());
         let optional = json!({"true":["mutation.read_only"], "uncertain":["defer","scope.workspace","domain.github","capability.web"]});
         let classification =

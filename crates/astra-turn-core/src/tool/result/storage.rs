@@ -1267,8 +1267,11 @@ pub fn resolve_session_tool_result_artifact_request(
         Some(descriptor) => descriptor,
         None => {
             return Some(Err(
-                "artifact must be a valid artifact://session/tool-result/<opaque_token> handle"
-                    .to_string(),
+                "artifact must be a valid artifact://session/tool-result/<opaque_token> handle; "
+                    .to_string()
+                    + "urn:astra:observation:* and urn:astra:evidence:* values are evidence citations, "
+                    + "not artifact handles—omit artifact for live introspect or use the returned "
+                    + "artifact://session/tool-result/<opaque_token> handle",
             ));
         }
     };
@@ -1597,6 +1600,22 @@ mod tests {
             read_verified_persisted_result(dir.path(), &typed.descriptor, 1024).unwrap(),
             content
         );
+    }
+
+    #[test]
+    fn observation_reference_is_not_accepted_as_artifact_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = resolve_session_tool_result_artifact_request(
+            dir.path(),
+            &serde_json::json!({
+                "artifact": "urn:astra:observation:durable:introspect:invocation_lifecycle"
+            }),
+        )
+        .expect("present artifact must be validated")
+        .expect_err("observation references are not artifact handles");
+        assert!(error.contains("artifact://session/tool-result/<opaque_token>"));
+        assert!(error.contains("evidence citations"));
+        assert!(error.contains("omit artifact"));
     }
 
     #[test]

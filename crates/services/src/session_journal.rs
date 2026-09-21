@@ -1242,6 +1242,14 @@ pub struct ToolCallRecord {
     /// cannot persist model-supplied credentials.
     #[serde(skip)]
     pub runtime_args_full: Option<String>,
+    /// Exact sanitized result projection delivered at the live model
+    /// boundary. This is separate from `result_full`: the durable field may
+    /// be an owner-scoped artifact replacement, which is a storage pointer
+    /// rather than observation evidence. The live lane is skipped on
+    /// serialization and is only used while the current runtime evaluates
+    /// feedback.
+    #[serde(skip)]
+    pub runtime_model_result_full: Option<String>,
     /// Full tool result text (untruncated, after per-tool output limit).
     /// Enables debugging tool failures without re-execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -297,9 +297,8 @@ pub use astra_turn_core::{
     response_guard::{is_prompt_leaked, is_repetition_loop},
     routing::build_skipped_routing_metadata,
     stall::{
-        DIVERGENCE_CORRECTION, DivergenceStatus, SERVER_STALL_WINDOW, canonical_tool_args,
-        detect_divergence, detect_server_stall, record_server_tool_signatures,
-        server_tool_call_signature,
+        DivergenceStatus, SERVER_STALL_WINDOW, canonical_tool_args, detect_divergence,
+        detect_server_stall, record_server_tool_signatures, server_tool_call_signature,
     },
     state::{new_session_entry, resolve_turn_identifiers},
     stream_events::{

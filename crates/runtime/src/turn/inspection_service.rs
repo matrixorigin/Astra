@@ -334,10 +334,6 @@ pub fn local_reflect_from_snapshot(
                     cb.state, cb.consecutive_failures,
                 ));
             }
-            lines.push(format!(
-                "stall_nudge_count={}",
-                snapshot.stall_state.nudge_count,
-            ));
         }
 
         ObservationFacet::Recent | ObservationFacet::Trace => {
@@ -581,15 +577,10 @@ mod tests {
                 success_count: 0,
                 consecutive_failures: 5,
             }),
-            stall_state: astra_turn_core::introspect::StallSnapshotSummary {
-                nudge_count: 3,
-                ..Default::default()
-            },
             ..Default::default()
         };
         let summary = local_reflect_from_snapshot(&snapshot, ObservationFacet::Stall);
         assert!(summary.contains("circuit_breaker: tripped"));
         assert!(summary.contains("consecutive_failures=5"));
-        assert!(summary.contains("stall_nudge_count=3"));
     }
 }

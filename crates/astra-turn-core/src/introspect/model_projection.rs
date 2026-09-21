@@ -12,6 +12,8 @@ impl IntrospectReport {
             "schema": "astra-introspect-model-projection-v1",
             "tool": "introspect",
             "snapshot_boundary": "before_current_introspect_execution",
+            "evidence_revision": self.evidence_revision,
+            "covered_facets": self.covered_facets,
             "recovery": "Inspect further only for needed evidence. Another introspect call creates a new snapshot, not the remainder of this one.",
             "observations": [],
             "evidence": [],
@@ -197,6 +199,11 @@ impl IntrospectReport {
                 projected = candidate;
             }
         }
+        // Source coverage is not automatically model-visible: the final
+        // projection may omit every observation for a facet. Recompute the
+        // marker from retained semantic units so downstream reuse logic never
+        // treats budgeted-away detail as delivered evidence.
+        projected["covered_facets"] = json!(projected_covered_facets(self, &projected));
         projected.to_string()
     }
 
@@ -260,6 +267,57 @@ impl IntrospectReport {
 
 fn fits(value: &Value, max_chars: usize) -> bool {
     value.to_string().chars().count() <= max_chars
+}
+
+fn projected_covered_facets(report: &IntrospectReport, projected: &Value) -> Vec<String> {
+    let Some(observations) = projected.get("observations").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let Some(evidence) = projected.get("evidence").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    report
+        .covered_facets
+        .iter()
+        .filter(|facet| {
+            let source_for_facet = report
+                .observations
+                .iter()
+                .filter(|observation| observation.facet == **facet)
+                .collect::<Vec<_>>();
+            let retained_for_facet = observations
+                .iter()
+                .filter(|observation| {
+                    observation.get("facet").and_then(Value::as_str) == Some(facet.as_str())
+                })
+                .collect::<Vec<_>>();
+            if source_for_facet.is_empty() || source_for_facet.len() != retained_for_facet.len() {
+                return false;
+            }
+            source_for_facet.iter().all(|source| {
+                let Some(retained) = retained_for_facet.iter().find(|candidate| {
+                    candidate.get("ref_id").and_then(Value::as_str) == Some(source.ref_id.as_str())
+                }) else {
+                    return false;
+                };
+                source.evidence_refs.iter().all(|reference| {
+                    retained
+                        .get("evidence_refs")
+                        .and_then(Value::as_array)
+                        .is_some_and(|references| {
+                            references
+                                .iter()
+                                .any(|candidate| candidate.as_str() == Some(reference.as_str()))
+                        })
+                        && evidence.iter().any(|candidate| {
+                            candidate.get("ref_id").and_then(Value::as_str)
+                                == Some(reference.as_str())
+                        })
+                })
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -419,6 +477,66 @@ mod tests {
             report.observations.len() - result["observations"].as_array().unwrap().len()
         );
         assert_eq!(serde_json::to_value(&report).unwrap(), before);
+    }
+
+    #[test]
+    fn projection_does_not_claim_coverage_when_all_observations_are_omitted() {
+        let mut report = build_introspect_report(
+            &IntrospectSnapshot::default(),
+            &IntrospectRequest::default(),
+        );
+        report.covered_facets = vec!["overview".into()];
+        report.observations.clear();
+
+        let projected: Value =
+            serde_json::from_str(&report.model_projection(INTROSPECT_MODEL_RESULT_CHARS)).unwrap();
+        assert_eq!(projected["covered_facets"], json!([]));
+    }
+
+    #[test]
+    fn projection_does_not_claim_coverage_for_partial_facet_retention() {
+        let mut report = build_introspect_report(
+            &IntrospectSnapshot::default(),
+            &IntrospectRequest::default(),
+        );
+        let facet = report.observations[0].facet.clone();
+        let mut omitted = report.observations[0].clone();
+        omitted.ref_id = "urn:observation:omitted".into();
+        omitted.summary = "complete detail".into();
+        report.observations.push(omitted);
+        report.covered_facets = vec![facet.clone()];
+
+        let complete: Value =
+            serde_json::from_str(&report.model_projection(INTROSPECT_MODEL_RESULT_CHARS)).unwrap();
+        assert_eq!(
+            complete["observations"].as_array().unwrap().len(),
+            report.observations.len()
+        );
+        assert_eq!(complete["covered_facets"], json!([facet.clone()]));
+
+        report.observations[1].summary = "oversized detail ".repeat(2_000);
+        let partial: Value =
+            serde_json::from_str(&report.model_projection(INTROSPECT_MODEL_RESULT_CHARS)).unwrap();
+        assert_eq!(partial["covered_facets"], json!([]));
+        assert_eq!(partial["observations"].as_array().unwrap().len(), 1);
+
+        let mut missing_support = build_introspect_report(
+            &IntrospectSnapshot::default(),
+            &IntrospectRequest::default(),
+        );
+        let facet = missing_support.observations[0].facet.clone();
+        let mut extra_evidence = missing_support.evidence[0].clone();
+        extra_evidence.ref_id = "urn:evidence:required-but-omitted".into();
+        missing_support.evidence.push(extra_evidence);
+        missing_support.observations[0]
+            .evidence_refs
+            .push("urn:evidence:required-but-omitted".into());
+        missing_support.covered_facets = vec![facet];
+
+        let missing: Value =
+            serde_json::from_str(&missing_support.model_projection(INTROSPECT_MODEL_RESULT_CHARS))
+                .unwrap();
+        assert_eq!(missing["covered_facets"], json!([]));
     }
 
     #[test]

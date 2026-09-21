@@ -982,6 +982,23 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             model_tool_result_for_followup(result_presentation, model_result_str, &journal_result)
         };
 
+        // Online feedback must evaluate the exact sanitized projection that
+        // crossed the model boundary. `result_full` may intentionally point
+        // at an out-of-line artifact, so do not make the evaluator recover a
+        // model-visible identity from storage presentation. Generic artifact
+        // replacements are not evidence: the model received only a pointer
+        // and can request a native recovery window if needed.
+        if let Some(record) = self.ctx.tool_call_records.last_mut() {
+            record.runtime_model_result_full = if !is_err
+                && (journal_result.artifact.is_none()
+                    || result_presentation != astra_tools::ModelResultPresentation::Generic)
+            {
+                (!model_result_str.is_empty()).then_some(model_result_str.clone())
+            } else {
+                None
+            };
+        }
+
         let (mut tool_msg, tr) = openai_tool_roundtrip_values_with_result_fields(
             &execution.id,
             &execution.name,

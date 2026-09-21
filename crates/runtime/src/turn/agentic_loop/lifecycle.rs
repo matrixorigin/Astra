@@ -3034,7 +3034,6 @@ fn apply_structured_user_reanchor(
     }
 
     state.turn_guard.begin_fresh_user_turn();
-    state.stall.begin_fresh_user_turn();
     // Hard capability/permission restrictions are owned by their boundary and
     // must survive a semantic re-anchor. Behavioral state can reset here, but
     // user intent must not broaden the executable capability surface.
@@ -3932,43 +3931,6 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     maybe_pre_route_skill(host, state).await;
 
     if turn_index > 0 {
-        // ── Stall correction: inject a nudge if stall was detected ────
-        // Stall events are recorded during the tool phase of the *previous*
-        // turn.  If any new events appeared, build a reflection and inject it
-        // so the LLM can self-correct before the next tool round.
-        //
-        // Limit: at most 3 nudges per loop to avoid nudge-spam which itself
-        // wastes context.
-        const MAX_NUDGES: u32 = 3;
-        if !state.stall.events.is_empty() && state.stall.nudge_count < MAX_NUDGES {
-            let recent_events: Vec<_> = state
-                .stall
-                .events
-                .iter()
-                .filter(|(_, t)| *t as usize >= turn_index.saturating_sub(1))
-                .collect();
-            if !recent_events.is_empty() {
-                let error_tools: Vec<&str> = state.turn_guard.health.health_avoidance_tools();
-                let reflection = astra_turn_core::stall::build_stall_reflection(
-                    &state.stall.turn_sigs,
-                    &error_tools,
-                    state.stall.nudge_count as usize,
-                );
-                let nudge = reflection.to_nudge_message();
-                state.push_volatile(super::host::VolatileKind::StallNudge, nudge);
-                state.stall.nudge_count += 1;
-                if !quiet {
-                    host.emit_headless_line(
-                        HeadlessStderrStyle::Yellow,
-                        format!(
-                            "  ⚠ Stall correction injected (nudge #{}) — {}",
-                            state.stall.nudge_count, reflection.what_happened,
-                        ),
-                    );
-                }
-            }
-        }
-
         // Context pressure estimation + adaptive compaction.
         // When pipeline_session is active, use its pressure model (predictive
         // with reserves) and cascade-aware limits. Otherwise fall back to
@@ -5387,6 +5349,7 @@ mod tests {
         ];
         state.stall.turn_sigs = vec![turn_sig("read_file:first"), turn_sig("read_file:second")];
         state.stall.active_policy_feedback = RuntimePolicyFeedbackSet::Evaluated {
+            recovery: None,
             schema_version: RuntimePolicyFeedbackSet::SCHEMA_VERSION,
             revision: 2,
             evaluated_at_round: 12,
