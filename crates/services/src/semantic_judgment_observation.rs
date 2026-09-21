@@ -571,6 +571,19 @@ pub struct SemanticJudgmentStageCounts {
     pub clarification: usize,
 }
 
+/// A typed, bounded projection of a captured decided result.  This is derived
+/// from the already authenticated observations; it is not a second decision
+/// record and it does not assert that the runtime adopted the classification.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticJudgmentDecisionSummary {
+    pub run_id: String,
+    pub turn: u32,
+    pub round: u32,
+    pub evaluation_span_id: String,
+    pub stage: astra_turn_types::RequestJudgmentStageV1,
+    pub classification: astra_turn_types::RequestJudgmentClassificationV1,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticJudgmentScope {
@@ -732,6 +745,71 @@ impl SemanticJudgmentView {
         self
     }
 
+    /// Return only the decided classifications that are present in the
+    /// bounded observation window.  Missing or omitted observations are not
+    /// reconstructed from the aggregate counts.
+    pub fn decision_summaries(&self) -> Vec<SemanticJudgmentDecisionSummary> {
+        self.observations
+            .iter()
+            .filter_map(|observation| {
+                let astra_turn_types::RequestJudgmentResultV1::Decided { classification } =
+                    &observation.observation.fact.result
+                else {
+                    return None;
+                };
+                Some(SemanticJudgmentDecisionSummary {
+                    run_id: observation.observation.correlation.run_id.clone(),
+                    turn: observation.observation.correlation.turn,
+                    round: observation.observation.correlation.round,
+                    evaluation_span_id: observation
+                        .observation
+                        .correlation
+                        .evaluation_span_id
+                        .clone(),
+                    stage: observation.observation.fact.stage,
+                    classification: classification.clone(),
+                })
+            })
+            .collect()
+    }
+
+    fn captured_evaluation_count(&self) -> usize {
+        self.observations
+            .iter()
+            .map(|observation| {
+                (
+                    observation.observation.correlation.run_id.as_str(),
+                    observation.observation.correlation.turn,
+                    observation
+                        .observation
+                        .correlation
+                        .evaluation_span_id
+                        .as_str(),
+                )
+            })
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    fn captured_result_labels(&self, limit: usize, detailed: bool) -> Vec<String> {
+        self.observations
+            .iter()
+            .take(limit)
+            .map(|observation| {
+                let result = &observation.observation.fact.result;
+                format!(
+                    "{}: {}",
+                    stage_label(observation.observation.fact.stage),
+                    if detailed {
+                        result.detail_label()
+                    } else {
+                        result.presentation_label()
+                    }
+                )
+            })
+            .collect()
+    }
+
     pub fn render(&self) -> String {
         let source = match self.scope {
             SemanticJudgmentScope::SessionTraceAtRead => "session trace",
@@ -780,6 +858,15 @@ impl SemanticJudgmentView {
                 self.omitted_details
             ));
         }
+        let captured = self.captured_result_labels(3, true);
+        if !captured.is_empty() {
+            rendered.push_str(". Captured result(s): ");
+            rendered.push_str(&captured.join("; "));
+            let omitted = self.observations.len().saturating_sub(captured.len());
+            if omitted > 0 {
+                rendered.push_str(&format!("; {omitted} more detail(s) hidden"));
+            }
+        }
         rendered.push_str(
             ". Classification informs preparation; it does not prove the agent followed it. Model and token usage are reported separately.",
         );
@@ -809,6 +896,10 @@ impl SemanticJudgmentView {
             );
         };
         let mut parts = Vec::new();
+        let captured = self.captured_result_labels(2, false);
+        if !captured.is_empty() {
+            parts.push(format!("captured: {}", captured.join("; ")));
+        }
         if c.decisions > 0 {
             parts.push(format!("{} decided", c.decisions));
         }
@@ -845,6 +936,16 @@ impl SemanticJudgmentView {
         if self.capture_omitted_observations > 0 || self.omitted_details > 0 {
             line.push_str(" · some detail hidden");
         }
+        if self.observations.len() > captured.len() {
+            line.push_str(&format!(
+                " · {} other captured result(s) hidden",
+                self.observations.len() - captured.len()
+            ));
+        }
+        let evaluation_count = self.captured_evaluation_count();
+        if evaluation_count > 1 {
+            line.push_str(&format!(" · {evaluation_count} evaluations captured"));
+        }
         line
     }
 
@@ -857,6 +958,13 @@ impl SemanticJudgmentView {
                 self.render()
             }
         }
+    }
+}
+
+fn stage_label(stage: astra_turn_types::RequestJudgmentStageV1) -> &'static str {
+    match stage {
+        astra_turn_types::RequestJudgmentStageV1::Initial => "initial",
+        astra_turn_types::RequestJudgmentStageV1::Clarification => "clarification",
     }
 }
 
@@ -1573,6 +1681,21 @@ mod tests {
         assert_eq!(counts.clarification, 1);
         assert_eq!(view.omitted_details, 1);
         assert_eq!(view.observations.len(), 2);
+        assert_eq!(view.decision_summaries().len(), 1);
+        let compact = view.render_compact();
+        assert!(
+            compact.contains(
+                "captured: initial: uncertain fields=required; clarification: Work not required · read-only · scope=unknown"
+            ),
+            "{compact}"
+        );
+        assert!(compact.contains("scope=unknown"), "{compact}");
+        assert!(compact.contains("1 decided"), "{compact}");
+        assert!(
+            !compact.contains("other captured result(s) hidden"),
+            "{compact}"
+        );
+        assert!(compact.contains("adoption unknown"), "{compact}");
         assert!(view.capture_incomplete);
         assert!(
             view.render()
@@ -1582,6 +1705,9 @@ mod tests {
             view.render()
                 .contains("1 detail(s) hidden but included in counts")
         );
+        let detailed = view.render();
+        assert!(detailed.contains("work=not_required"), "{detailed}");
+        assert!(detailed.contains("activation=not_deferred"), "{detailed}");
         assert!(!view.render().contains("observation(s) not counted"));
         assert!(!view.render().contains("0.5"));
         assert!(serde_json::to_string(&view).unwrap().contains("0.5"));
@@ -1590,6 +1716,52 @@ mod tests {
             view
         );
         assert!(!serde_json::to_string(&view).unwrap().contains("tokens"));
+    }
+
+    #[test]
+    fn semantic_judgment_compact_preserves_captured_result_and_evaluation_boundaries() {
+        let mut older = observation();
+        older.fact.result = decided();
+        older.correlation.evaluation_span_id = "evaluation-old".into();
+
+        let mut newer = observation();
+        newer.correlation.run_id = "run-new".into();
+        newer.correlation.turn = 4;
+        newer.correlation.evaluation_span_id = "evaluation-new".into();
+        newer.fact.stage = RequestJudgmentStageV1::Clarification;
+        newer.fact.result = RequestJudgmentResultV1::Unavailable {
+            reason: SemanticJudgmentUnavailableReasonV1::Deadline,
+            delivery: SemanticJudgmentDeliveryV1::Unresolved,
+        };
+
+        let view = SemanticJudgmentView::from_capture(project(
+            vec![
+                row(metadata("newer", &newer)),
+                row(metadata("older", &older)),
+            ],
+            4,
+            4,
+        ));
+        let compact = view.render_compact();
+        assert!(
+            compact
+                .contains("captured: clarification: unavailable (deadline, delivery unresolved)"),
+            "{compact}"
+        );
+        assert!(compact.contains("1 decided"), "{compact}");
+        assert!(compact.contains("1 unavailable"), "{compact}");
+        assert!(compact.contains("2 evaluations captured"), "{compact}");
+        assert!(compact.contains("Work not required"), "{compact}");
+        assert!(
+            !compact.contains("other captured result(s) hidden"),
+            "{compact}"
+        );
+        assert_eq!(view.decision_summaries().len(), 1);
+        assert_eq!(
+            view.decision_summaries()[0].evaluation_span_id,
+            "evaluation-old"
+        );
+        assert_eq!(view.decision_summaries()[0].run_id, "run-1");
     }
 
     #[test]

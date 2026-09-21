@@ -479,6 +479,12 @@ fn valid_id(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        RequestJudgmentCapabilityV1, RequestJudgmentClassificationV1, RequestJudgmentDomainV1,
+        RequestJudgmentMutationV1, RequestJudgmentResultV1, RequestJudgmentScopeV1,
+        RequestJudgmentStageV1, SEMANTIC_JUDGMENT_PRESENTATION_MAX_BYTES, SemanticJudgmentFactV1,
+    };
+
     #[test]
     fn auxiliary_capture_overflow_is_partial_evidence_not_unavailability() {
         use super::ExplainAnalyzeAuxiliaryUsageV1;
@@ -522,6 +528,31 @@ mod tests {
             context: None,
             coverage_gaps: Vec::new(),
         }
+    }
+
+    #[test]
+    fn semantic_judgment_presentation_is_valid_for_explain_event() {
+        let fact = SemanticJudgmentFactV1 {
+            stage: RequestJudgmentStageV1::Clarification,
+            result: RequestJudgmentResultV1::Decided {
+                classification: RequestJudgmentClassificationV1 {
+                    work_required: true,
+                    activation_deferred: true,
+                    domain: Some(RequestJudgmentDomainV1::Database),
+                    mutation: RequestJudgmentMutationV1::MustMutate,
+                    scope: RequestJudgmentScopeV1::Mixed,
+                    parallel_subruns: true,
+                    capabilities: vec![
+                        RequestJudgmentCapabilityV1::Web,
+                        RequestJudgmentCapabilityV1::AgentSpawner,
+                    ],
+                },
+            },
+        };
+        let mut event = started();
+        event.label = fact.presentation_label();
+        assert!(event.label.len() <= SEMANTIC_JUDGMENT_PRESENTATION_MAX_BYTES);
+        assert!(event.is_valid(), "{}", event.label);
     }
 
     #[test]
