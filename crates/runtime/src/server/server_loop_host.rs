@@ -9452,6 +9452,40 @@ impl ServerAgenticLoopHost {
             if let Some(buffer) = state.turn_event_buffer.as_mut() {
                 buffer.record_trace_span_v2(trace);
             }
+            let Some(context) = self.explain_analyze_context.clone().filter(|context| {
+                context.run_id == observation.correlation.run_id
+                    && context.turn_id == format!("turn-{}", observation.correlation.turn)
+            }) else {
+                continue;
+            };
+            let now = Instant::now();
+            let node = ExplainAnalyzeNode::new(
+                &context,
+                format!("{}/judgment/{span_id}", context.root_node_id),
+                Some(context.root_node_id.clone()),
+                astra_turn_types::ExplainAnalyzeNodeKindV1::Preparation,
+                observation.fact.presentation_label(),
+                now,
+                Some(observation.correlation.round),
+                None,
+            );
+            for (transition, duration, outcome) in [
+                (
+                    astra_turn_types::ExplainAnalyzeTransitionV1::Started,
+                    None,
+                    None,
+                ),
+                (
+                    astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
+                    Some(0),
+                    Some(observation.fact.preparation_outcome()),
+                ),
+            ] {
+                if let Some(event) = context.event(&node, transition, now, duration, outcome, None)
+                {
+                    self.emit_progress_event(event);
+                }
+            }
         }
     }
 

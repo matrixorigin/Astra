@@ -576,7 +576,9 @@ fn stable_semantic_judgments(
         "coverage": judgments.coverage,
         "capture_incomplete": judgments.capture_incomplete,
         "capture_truncated": judgments.capture_truncated,
+        "adoption": "unknown",
         "counts": counts,
+        "decisions": judgments.decision_summaries(),
         "capture_gaps": judgments.capture_gaps,
     })
 }

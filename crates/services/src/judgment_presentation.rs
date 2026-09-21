@@ -21,7 +21,6 @@ pub fn purpose_label(operation: &str, purpose: &str) -> &'static str {
         "completion_proxy:turn_intent" => "Request classification",
         "skill_auto_route" => "Skill selection",
         "work_plan" => "Work planning",
-        "work_direction" => "Work planning",
         "memory_relevance" | "memory_feedback" | "memory_retrieval_rerank" => "Memory judgment",
         "completion_proxy:memory_retrieval_rerank" => "Memory judgment",
         "tool_result_rerank" | "completion_proxy:tool_result_rerank" => "Tool result selection",

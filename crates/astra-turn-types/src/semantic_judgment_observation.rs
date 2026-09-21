@@ -8,6 +8,7 @@ pub const SEMANTIC_JUDGMENT_SCHEMA_VERSION: u16 = 1;
 pub const SEMANTIC_JUDGMENT_TRACE_ATTR: &str = "semantic_judgment.v1";
 pub const SEMANTIC_JUDGMENT_MAX_BYTES: usize = 8_192;
 pub const SEMANTIC_JUDGMENT_ID_MAX_BYTES: usize = 512;
+pub const SEMANTIC_JUDGMENT_PRESENTATION_MAX_BYTES: usize = 160;
 pub const REQUEST_JUDGMENT_MAX_FIELDS: usize = 19;
 /// Payload-free validation error; never retains serde/provider error text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -264,55 +265,21 @@ impl SemanticJudgmentFactV1 {
     /// Provider/model and usage belong to the correlated physical-attempt
     /// ledger; this label describes only the semantic outcome.
     pub fn preparation_label(&self) -> String {
-        match &self.result {
-            RequestJudgmentResultV1::Decided { classification } => {
-                let outcome = if !classification.work_required {
-                    "no agent work needed"
-                } else if classification.activation_deferred {
-                    "work deferred"
-                } else {
-                    match classification.mutation {
-                        RequestJudgmentMutationV1::ReadOnly => "read-only work",
-                        RequestJudgmentMutationV1::MayMutate => "work may make changes",
-                        RequestJudgmentMutationV1::MustMutate => "changes required",
-                        RequestJudgmentMutationV1::Unknown => "mutation intent unknown",
-                    }
-                };
-                format!("Classify request · {outcome}")
-            }
-            RequestJudgmentResultV1::Abstained { .. } => "Classify request · uncertain".into(),
-            RequestJudgmentResultV1::Conflicting { .. } => {
-                "Classify request · conflicting result".into()
-            }
-            RequestJudgmentResultV1::Invalid {
-                reason: SemanticJudgmentInvalidV1::MalformedJson,
-            } => "Classify request · invalid response".into(),
-            RequestJudgmentResultV1::Invalid {
-                reason: SemanticJudgmentInvalidV1::UnsupportedCombination,
-            } => "Classify request · unsupported result".into(),
-            RequestJudgmentResultV1::Invalid { .. } => "Classify request · invalid response".into(),
-            RequestJudgmentResultV1::NotDispatched {
-                reason: SemanticJudgmentPreDispatchReasonV1::NoOffering,
-            } => "Classify request · skipped; no eligible model".into(),
-            RequestJudgmentResultV1::NotDispatched { .. } => "Classify request · skipped".into(),
-            RequestJudgmentResultV1::Unavailable {
-                reason: SemanticJudgmentUnavailableReasonV1::Deadline,
-                ..
-            } => "Classify request · timed out".into(),
-            RequestJudgmentResultV1::Unavailable {
-                reason: SemanticJudgmentUnavailableReasonV1::Cancelled,
-                ..
-            } => "Classify request · cancelled".into(),
-            RequestJudgmentResultV1::Unavailable {
-                reason: SemanticJudgmentUnavailableReasonV1::ProviderPtlError,
-                ..
-            } => "Classify request · provider rejected result".into(),
-            RequestJudgmentResultV1::Unavailable {
-                reason: SemanticJudgmentUnavailableReasonV1::UnexpectedFinish,
-                ..
-            } => "Classify request · incomplete result".into(),
-            RequestJudgmentResultV1::Unavailable { .. } => "Classify request · unavailable".into(),
-        }
+        self.presentation_label()
+    }
+
+    /// Shared single-fact label for Explain and the bounded observation views.
+    /// The stage is explicit so an initial result is not mistaken for a later
+    /// clarification, and the wording remains descriptive rather than causal.
+    pub fn presentation_label(&self) -> String {
+        let stage = match self.stage {
+            RequestJudgmentStageV1::Initial => "initial",
+            RequestJudgmentStageV1::Clarification => "clarification",
+        };
+        bounded_presentation_label(format!(
+            "Classify request · {stage} · {}",
+            self.result.presentation_label()
+        ))
     }
     pub const fn preparation_outcome(&self) -> crate::ExplainAnalyzeOutcomeV1 {
         use crate::ExplainAnalyzeOutcomeV1 as O;
@@ -342,6 +309,21 @@ impl SemanticJudgmentFactV1 {
             _ => O::Unavailable,
         }
     }
+}
+
+fn bounded_presentation_label(label: String) -> String {
+    if label.len() <= SEMANTIC_JUDGMENT_PRESENTATION_MAX_BYTES {
+        return label;
+    }
+    let suffix = "...";
+    let mut end = SEMANTIC_JUDGMENT_PRESENTATION_MAX_BYTES - suffix.len();
+    while !label.is_char_boundary(end) {
+        end -= 1;
+    }
+    if let Some(separator) = label[..end].rfind(" · ") {
+        end = separator;
+    }
+    format!("{}{}", &label[..end], suffix)
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
@@ -426,6 +408,48 @@ fn unique_fields(fields: &[RequestJudgmentFieldV1]) -> bool {
             .all(|(i, f)| !fields[..i].contains(f))
 }
 impl RequestJudgmentResultV1 {
+    /// A bounded, user-facing description of the typed result.
+    ///
+    /// This is a classification fact only.  In particular, words such as
+    /// "required", "deferred", and "capability" do not mean that the
+    /// corresponding work was started, paused, authorized, or executed.
+    pub fn presentation_label(&self) -> String {
+        self.presentation_label_with(false)
+    }
+
+    /// Complete fixed-field rendering for diagnostic surfaces.  The typed
+    /// classification remains the source of truth; this is only a view.
+    pub fn detail_label(&self) -> String {
+        self.presentation_label_with(true)
+    }
+
+    fn presentation_label_with(&self, detailed: bool) -> String {
+        match self {
+            Self::Decided { classification } => {
+                if detailed {
+                    classification.detail_label()
+                } else {
+                    classification.presentation_label()
+                }
+            }
+            Self::Abstained {
+                uncertain_fields, ..
+            } => format!("uncertain fields={}", presentation_fields(uncertain_fields)),
+            Self::Conflicting { fields } => {
+                format!("conflicting fields={}", presentation_fields(fields))
+            }
+            Self::Invalid { reason } => format!("invalid ({})", invalid_label(*reason)),
+            Self::NotDispatched { reason } => {
+                format!("not dispatched ({})", pre_dispatch_label(*reason))
+            }
+            Self::Unavailable { reason, delivery } => format!(
+                "unavailable ({}, {})",
+                unavailable_label(*reason),
+                delivery_label(*delivery)
+            ),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), SemanticJudgmentValidationError> {
         let valid = match self {
             Self::Decided { classification: c } => {
@@ -469,6 +493,205 @@ impl RequestJudgmentResultV1 {
         }
     }
 }
+
+impl RequestJudgmentClassificationV1 {
+    /// Render the useful part of a structured classification without implying
+    /// adoption.  This is intentionally compact for default summaries.
+    pub fn presentation_label(&self) -> String {
+        let work = if self.work_required {
+            "Work required"
+        } else {
+            "Work not required"
+        };
+        let mut parts = vec![
+            work.to_string(),
+            mutation_display(self.mutation).to_string(),
+        ];
+        if self.activation_deferred {
+            parts.push("activation deferred".into());
+        }
+        if let Some(domain) = self.domain {
+            parts.push(format!("domain={}", domain_label(domain)));
+        }
+        parts.push(format!("scope={}", scope_label(self.scope)));
+        if self.parallel_subruns {
+            parts.push("parallel subruns".into());
+        }
+        if !self.capabilities.is_empty() {
+            parts.push(format!(
+                "capability={}",
+                self.capabilities
+                    .iter()
+                    .map(|capability| capability_label(*capability))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        parts.join(" · ")
+    }
+
+    pub fn detail_label(&self) -> String {
+        let work = if self.work_required {
+            "required"
+        } else {
+            "not_required"
+        };
+        let activation = if self.activation_deferred {
+            "deferred"
+        } else {
+            "not_deferred"
+        };
+        let domain = self.domain.map_or("none", domain_label);
+        let capabilities = if self.capabilities.is_empty() {
+            "none".to_string()
+        } else {
+            self.capabilities
+                .iter()
+                .map(|capability| capability_label(*capability))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            "work={work} · activation={activation} · domain={domain} · mutation={} · scope={} · topology={} · capabilities={capabilities}",
+            mutation_label(self.mutation),
+            scope_label(self.scope),
+            if self.parallel_subruns {
+                "parallel"
+            } else {
+                "single"
+            },
+        )
+    }
+}
+
+fn presentation_fields(fields: &[RequestJudgmentFieldV1]) -> String {
+    const MAX_RENDERED_FIELDS: usize = 3;
+    let mut rendered = fields
+        .iter()
+        .take(MAX_RENDERED_FIELDS)
+        .map(|field| field_label(*field))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if fields.len() > MAX_RENDERED_FIELDS {
+        rendered.push(format!("+{} more", fields.len() - MAX_RENDERED_FIELDS));
+    }
+    if rendered.is_empty() {
+        "none".into()
+    } else {
+        rendered.join(",")
+    }
+}
+
+fn field_label(field: RequestJudgmentFieldV1) -> &'static str {
+    match field {
+        RequestJudgmentFieldV1::Required => "required",
+        RequestJudgmentFieldV1::Defer => "defer",
+        RequestJudgmentFieldV1::MutationReadOnly => "mutation.read_only",
+        RequestJudgmentFieldV1::MutationMayMutate => "mutation.may_mutate",
+        RequestJudgmentFieldV1::MutationMustMutate => "mutation.must_mutate",
+        RequestJudgmentFieldV1::ScopeWorkspace => "scope.workspace",
+        RequestJudgmentFieldV1::ScopeExternal => "scope.external",
+        RequestJudgmentFieldV1::ScopeMixed => "scope.mixed",
+        RequestJudgmentFieldV1::ScopeUnknown => "scope.unknown",
+        RequestJudgmentFieldV1::DomainNone => "domain.none",
+        RequestJudgmentFieldV1::DomainGithub => "domain.github",
+        RequestJudgmentFieldV1::DomainGit => "domain.git",
+        RequestJudgmentFieldV1::DomainCode => "domain.code",
+        RequestJudgmentFieldV1::DomainMemory => "domain.memory",
+        RequestJudgmentFieldV1::DomainWeb => "domain.web",
+        RequestJudgmentFieldV1::DomainSystem => "domain.system",
+        RequestJudgmentFieldV1::DomainDatabase => "domain.database",
+        RequestJudgmentFieldV1::ParallelSubruns => "parallel_subruns",
+        RequestJudgmentFieldV1::CapabilityWeb => "capability.web",
+    }
+}
+
+fn domain_label(domain: RequestJudgmentDomainV1) -> &'static str {
+    match domain {
+        RequestJudgmentDomainV1::Github => "github",
+        RequestJudgmentDomainV1::Git => "git",
+        RequestJudgmentDomainV1::Code => "code",
+        RequestJudgmentDomainV1::Memory => "memory",
+        RequestJudgmentDomainV1::Web => "web",
+        RequestJudgmentDomainV1::System => "system",
+        RequestJudgmentDomainV1::Database => "database",
+    }
+}
+
+fn mutation_label(mutation: RequestJudgmentMutationV1) -> &'static str {
+    match mutation {
+        RequestJudgmentMutationV1::ReadOnly => "read_only",
+        RequestJudgmentMutationV1::MayMutate => "may_mutate",
+        RequestJudgmentMutationV1::MustMutate => "must_mutate",
+        RequestJudgmentMutationV1::Unknown => "unknown",
+    }
+}
+
+fn mutation_display(mutation: RequestJudgmentMutationV1) -> &'static str {
+    match mutation {
+        RequestJudgmentMutationV1::ReadOnly => "read-only",
+        RequestJudgmentMutationV1::MayMutate => "may mutate",
+        RequestJudgmentMutationV1::MustMutate => "must mutate",
+        RequestJudgmentMutationV1::Unknown => "mutation unknown",
+    }
+}
+
+fn scope_label(scope: RequestJudgmentScopeV1) -> &'static str {
+    match scope {
+        RequestJudgmentScopeV1::Workspace => "workspace",
+        RequestJudgmentScopeV1::External => "external",
+        RequestJudgmentScopeV1::Mixed => "mixed",
+        RequestJudgmentScopeV1::Unknown => "unknown",
+    }
+}
+
+fn capability_label(capability: RequestJudgmentCapabilityV1) -> &'static str {
+    match capability {
+        RequestJudgmentCapabilityV1::Web => "web",
+        RequestJudgmentCapabilityV1::AgentSpawner => "agent_spawner",
+    }
+}
+
+fn invalid_label(reason: SemanticJudgmentInvalidV1) -> &'static str {
+    match reason {
+        SemanticJudgmentInvalidV1::MalformedJson => "malformed response",
+        SemanticJudgmentInvalidV1::InvalidContract => "invalid contract",
+        SemanticJudgmentInvalidV1::UnsupportedCombination => "unsupported combination",
+    }
+}
+
+fn pre_dispatch_label(reason: SemanticJudgmentPreDispatchReasonV1) -> &'static str {
+    match reason {
+        SemanticJudgmentPreDispatchReasonV1::NoOffering => "no eligible model",
+        SemanticJudgmentPreDispatchReasonV1::CapacityPressure => "capacity pressure",
+        SemanticJudgmentPreDispatchReasonV1::InvalidRequest => "invalid request",
+        SemanticJudgmentPreDispatchReasonV1::OutputBudget => "output budget",
+        SemanticJudgmentPreDispatchReasonV1::RouteUnavailable => "route unavailable",
+        SemanticJudgmentPreDispatchReasonV1::DurableMaterialUnavailable => {
+            "durable material unavailable"
+        }
+        SemanticJudgmentPreDispatchReasonV1::PreparationDeadline => "preparation deadline",
+        SemanticJudgmentPreDispatchReasonV1::Cancelled => "cancelled",
+    }
+}
+
+fn unavailable_label(reason: SemanticJudgmentUnavailableReasonV1) -> &'static str {
+    match reason {
+        SemanticJudgmentUnavailableReasonV1::ExecutionError => "execution error",
+        SemanticJudgmentUnavailableReasonV1::Deadline => "deadline",
+        SemanticJudgmentUnavailableReasonV1::Cancelled => "cancelled",
+        SemanticJudgmentUnavailableReasonV1::ProviderPtlError => "provider rejected",
+        SemanticJudgmentUnavailableReasonV1::UnexpectedFinish => "unexpected finish",
+    }
+}
+
+fn delivery_label(delivery: SemanticJudgmentDeliveryV1) -> &'static str {
+    match delivery {
+        SemanticJudgmentDeliveryV1::Unresolved => "delivery unresolved",
+        SemanticJudgmentDeliveryV1::ResponseReceived => "response received",
+    }
+}
+
 impl SemanticJudgmentObservationV1 {
     pub fn validate(&self) -> Result<(), SemanticJudgmentValidationError> {
         let c = &self.correlation;
@@ -640,7 +863,7 @@ mod tests {
         ));
         assert_eq!(
             initial.fact.preparation_label(),
-            "Classify request · uncertain"
+            "Classify request · initial · uncertain fields=required"
         );
         assert!(!initial.fact.preparation_label().contains("baseline"));
 
@@ -658,7 +881,7 @@ mod tests {
         };
         assert_eq!(
             initial.fact.preparation_label(),
-            "Classify request · changes required"
+            "Classify request · clarification · Work required · must mutate · domain=code · scope=workspace"
         );
     }
     #[test]
@@ -739,6 +962,26 @@ mod tests {
     fn request_judgment_presentation_does_not_claim_execution_or_usage() {
         use crate::ExplainAnalyzeOutcomeV1 as Outcome;
         assert_eq!(observation().fact.preparation_outcome(), Outcome::Completed);
+        let decided = RequestJudgmentResultV1::Decided {
+            classification: RequestJudgmentClassificationV1 {
+                work_required: true,
+                activation_deferred: true,
+                domain: Some(RequestJudgmentDomainV1::Code),
+                mutation: RequestJudgmentMutationV1::MayMutate,
+                scope: RequestJudgmentScopeV1::Workspace,
+                parallel_subruns: true,
+                capabilities: vec![RequestJudgmentCapabilityV1::Web],
+            },
+        };
+        let label = decided.presentation_label();
+        assert!(label.contains("Work required"));
+        assert!(label.contains("activation deferred"));
+        assert!(label.contains("domain=code"));
+        assert!(label.contains("may mutate"));
+        assert!(label.contains("scope=workspace"));
+        assert!(label.contains("parallel subruns"));
+        assert!(label.contains("capability=web"));
+        assert!(!label.contains("executed") && !label.contains("authorized"));
         let mut fact = observation().fact;
         fact.result = RequestJudgmentResultV1::Conflicting {
             fields: vec![RequestJudgmentFieldV1::Required],
