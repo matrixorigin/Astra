@@ -11543,10 +11543,7 @@ impl AgenticRunLifecycleService {
                 )
                 .await
                 {
-                    Ok(Some(notice)) => {
-                        Self::append_runtime_required_prompt_text(edge_profile, notice)
-                    }
-                    Ok(None) => {}
+                    Ok(notice) => Self::append_runtime_required_prompt_text(edge_profile, notice),
                     Err(error) => Self::append_runtime_required_prompt_text(
                         edge_profile,
                         crate::server::explain_analyze_artifact::unavailable_context_notice(

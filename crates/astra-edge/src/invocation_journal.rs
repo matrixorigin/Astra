@@ -488,11 +488,11 @@ impl EdgeInvocationJournal {
     pub(crate) async fn complete(
         &mut self,
         request_id: &str,
-        delivery_generation: u64,
+        execution_generation: u64,
         result: DurableEdgeResult,
-    ) -> Result<DurableEdgeResult, JournalError> {
+    ) -> Result<PendingResult, JournalError> {
         let mut record = self
-            .execution_record(request_id, delivery_generation)?
+            .execution_record(request_id, execution_generation)?
             .clone();
         if record.state != DurableState::Running {
             return Err(JournalError::Corrupt {
@@ -504,10 +504,7 @@ impl EdgeInvocationJournal {
         record.result = Some(result);
         self.commit_record(request_id.to_string(), Some(record))
             .await?;
-        Ok(self.state.records[request_id]
-            .result
-            .clone()
-            .expect("completed result"))
+        self.pending_result(request_id, &self.state.records[request_id])
     }
 
     pub(crate) async fn acknowledge(
@@ -554,18 +551,24 @@ impl EdgeInvocationJournal {
                     DurableState::CompletedAwaitingAck | DurableState::OutcomeUnknownAwaitingAck
                 )
             })
-            .map(|(request_id, record)| {
-                Ok(PendingResult {
-                    request_id: request_id.clone(),
-                    identity: record.identity.clone(),
-                    delivery_generation: record.delivery_generation,
-                    result: record.result.clone().ok_or_else(|| JournalError::Corrupt {
-                        path: self.path.clone(),
-                        detail: format!("terminal record {request_id} has no result"),
-                    })?,
-                })
-            })
+            .map(|(request_id, record)| self.pending_result(request_id, record))
             .collect()
+    }
+
+    fn pending_result(
+        &self,
+        request_id: &str,
+        record: &DurableInvocationRecord,
+    ) -> Result<PendingResult, JournalError> {
+        Ok(PendingResult {
+            request_id: request_id.to_string(),
+            identity: record.identity.clone(),
+            delivery_generation: record.delivery_generation,
+            result: record.result.clone().ok_or_else(|| JournalError::Corrupt {
+                path: self.path.clone(),
+                detail: format!("terminal record {request_id} has no result"),
+            })?,
+        })
     }
 
     fn execution_record(
@@ -980,7 +983,8 @@ mod tests {
                     },
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .result;
             assert!(result.is_error);
             assert_eq!(
                 result.tool_result_fields.as_ref().unwrap()["outcome_certainty"],
@@ -1037,7 +1041,11 @@ mod tests {
             PrepareOutcome::Execute
         ));
         assert_eq!(
-            journal.complete(&id, 1, result.clone()).await.unwrap(),
+            journal
+                .complete(&id, 1, result.clone())
+                .await
+                .unwrap()
+                .result,
             result
         );
         drop(journal);
@@ -1154,7 +1162,7 @@ mod tests {
                 .unwrap(),
             PrepareOutcome::Execute
         ));
-        journal
+        let pending = journal
             .complete(
                 &request_id,
                 7,
@@ -1167,6 +1175,9 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(pending.request_id, request_id);
+        assert_eq!(pending.delivery_generation, 7);
+        assert_eq!(pending.result.output, "body");
         drop(journal);
 
         let mut restored = EdgeInvocationJournal::open(path).await.unwrap();
@@ -1200,7 +1211,7 @@ mod tests {
             PrepareOutcome::Active
         ));
 
-        journal
+        let completed = journal
             .complete(
                 &request_id,
                 4,
@@ -1213,6 +1224,9 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(completed.request_id, request_id);
+        assert_eq!(completed.delivery_generation, 5);
+        assert_eq!(completed.result.output, "done");
         let pending = journal.pending_results().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].delivery_generation, 5);

@@ -738,8 +738,8 @@ pub(crate) async fn context_notice_for_run(
     session_id: &str,
     expected_run_id: &str,
     expected_owner_generation: u64,
-) -> Result<Option<String>, String> {
-    Ok(Some(
+) -> Result<String, String> {
+    Ok(
         match discover_context_notice_for_run(
             pool,
             user_id,
@@ -754,7 +754,7 @@ pub(crate) async fn context_notice_for_run(
             )),
             ContextNoticeDiscovery::Notice(notice) => notice,
         },
-    ))
+    )
 }
 
 /// Read and validate the exact authoritative Explain snapshot once.

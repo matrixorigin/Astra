@@ -1339,14 +1339,11 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                     );
                     continue;
                 }
-                let request_id = persist_completion(&mut journal, completed).await?;
-                let record = journal.pending_results()?.into_iter().find(|pending| {
-                    pending.request_id == request_id
-                }).ok_or_else(|| format!("durable edge result {request_id} disappeared before delivery"))?;
-                let result_msg = record.result.client_message(
-                    record.request_id,
-                    record.identity,
-                    record.delivery_generation,
+                let pending = persist_completion(&mut journal, completed).await?;
+                let result_msg = pending.result.client_message(
+                    pending.request_id,
+                    pending.identity,
+                    pending.delivery_generation,
                 );
                 write.send(Message::Text(serde_json::to_string(&result_msg)?.into())).await?;
             }
@@ -1393,8 +1390,8 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
 async fn persist_completion(
     journal: &mut EdgeInvocationJournal,
     completed: CompletedEdgeInvocation,
-) -> Result<String, JournalError> {
-    let result = journal
+) -> Result<invocation_journal::PendingResult, JournalError> {
+    let pending = journal
         .complete(
             &completed.request_id,
             completed.generation,
@@ -1405,11 +1402,11 @@ async fn persist_completion(
         request_id = %completed.request_id,
         generation = completed.generation,
         duration_ms = completed.duration_ms,
-        is_error = result.is_error,
-        output_len = result.output.len(),
+        is_error = pending.result.is_error,
+        output_len = pending.result.output.len(),
         "Tool execution complete"
     );
-    Ok(completed.request_id)
+    Ok(pending)
 }
 
 async fn settle_invocations(

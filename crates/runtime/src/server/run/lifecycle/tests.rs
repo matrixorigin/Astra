@@ -23944,7 +23944,6 @@ async fn db_explain_publication_is_discoverable_and_readable() {
         generation,
     )
     .await
-    .unwrap()
     .unwrap();
     assert!(context.contains(&artifact));
     let store = astra_services::DatabaseSessionArtifactStore::new(pool.settings().clone())
@@ -24097,8 +24096,7 @@ async fn db_explain_discovery_reads_an_existing_snapshot_once() {
         generation,
     )
     .await
-    .expect("validate Explain snapshot")
-    .expect("readable Explain notice");
+    .expect("validate Explain snapshot");
     assert!(expected_notice.contains(&handle));
     assert!(expected_notice.contains("status=complete"));
     let mut edge_profile = serde_json::Map::new();
@@ -24306,7 +24304,6 @@ async fn db_pause_resume_promotes_buffered_completed_terminal_explain_publicatio
         durable.run_generation,
     )
     .await
-    .unwrap()
     .unwrap();
     assert!(notice.contains(&handle));
     let store = astra_services::DatabaseSessionArtifactStore::new(pool.settings().clone())
