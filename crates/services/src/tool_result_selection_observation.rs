@@ -17,6 +17,8 @@ use crate::{ServiceError, ServiceResult};
 pub const TOOL_RESULT_SELECTION_TRACE_NAME: &str = "tool_result_selection";
 const MAX_TRACE_BYTES: usize = 32_768;
 const MAX_CANDIDATES: usize = 512;
+const MAX_EXPLANATIONS: usize = 32;
+const MAX_EXPLANATION_ATTEMPT_IDS: usize = 4;
 
 pub fn tool_result_selection_trace(
     observation_span_id: &str,
@@ -66,6 +68,13 @@ pub struct ToolResultJudgmentView {
     pub applications: ToolResultApplicationCounts,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ToolResultJudgmentModel>,
+    /// Bounded, per-evaluation facts joined to provider-wire receipts only by
+    /// the immutable decision digest. This is a read projection, not
+    /// execution authority.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub explanations: Vec<ToolResultJudgmentExplanation>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub explanations_truncated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +103,276 @@ pub struct ToolResultJudgmentModel {
     pub provider: String,
     pub model: String,
     pub observed_invocations: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultJudgmentTrigger {
+    NotRecorded,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultJudgmentEffect {
+    Unknown,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResultJudgmentApplication {
+    pub coverage: ToolResultJudgmentCoverage,
+    pub matched_receipts: usize,
+    pub included: usize,
+    pub partially_included: usize,
+    pub omitted: usize,
+    pub unknown: usize,
+    pub conflicting: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempt_ids: Vec<String>,
+}
+
+impl ToolResultJudgmentApplication {
+    fn mark_conflicting(&mut self) {
+        self.conflicting = self.conflicting.saturating_add(1);
+        if matches!(
+            self.coverage,
+            ToolResultJudgmentCoverage::Available | ToolResultJudgmentCoverage::NotObserved
+        ) {
+            self.coverage = ToolResultJudgmentCoverage::CaptureIncomplete;
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResultJudgmentExplanation {
+    pub correlation: astra_turn_types::ToolResultSelectionCorrelationV1,
+    pub coverage: astra_turn_types::ToolResultSelectionCoverageV1,
+    pub outcome: astra_turn_types::ToolResultSelectionOutcomeV1,
+    pub trigger: ToolResultJudgmentTrigger,
+    pub application: ToolResultJudgmentApplication,
+    pub effect: ToolResultJudgmentEffect,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub provenance_conflict: bool,
+}
+
+impl ToolResultJudgmentApplication {
+    fn render_compact(&self) -> String {
+        if self.coverage == ToolResultJudgmentCoverage::SourceUnavailable {
+            return "application unavailable".into();
+        }
+        if self.conflicting > 0 && self.matched_receipts == 0 {
+            return "application conflicting".into();
+        }
+        if self.matched_receipts == 0 {
+            return "application not captured".into();
+        }
+        let mut parts = Vec::new();
+        if self.included > 0 {
+            parts.push(format!("{} included", self.included));
+        }
+        if self.partially_included > 0 {
+            parts.push(format!("{} partial", self.partially_included));
+        }
+        if self.omitted > 0 {
+            parts.push(format!("{} omitted", self.omitted));
+        }
+        if self.unknown > 0 {
+            parts.push(format!("{} unknown", self.unknown));
+        }
+        if self.conflicting > 0 {
+            parts.push(format!("{} conflicting", self.conflicting));
+        }
+        if parts.is_empty() {
+            "application not captured".into()
+        } else {
+            format!("application {}", parts.join(", "))
+        }
+    }
+}
+
+impl ToolResultJudgmentExplanation {
+    fn outcome_label(&self) -> String {
+        if self.provenance_conflict {
+            return "model provenance conflicting; result model is not reliable".into();
+        }
+        use astra_turn_types::{
+            ToolResultProjectionDispositionV1 as Disposition,
+            ToolResultSelectionOutcomeV1 as Outcome,
+        };
+        match &self.outcome {
+            Outcome::Started => "started; terminal result unknown".into(),
+            Outcome::Decided {
+                disposition: Disposition::Selected,
+                selected_chunks,
+                execution,
+                ..
+            } => format!(
+                "selected {selected_chunks} chunk(s) via {} ({})",
+                execution.model_name,
+                crate::judgment_presentation::provider_label(&execution.provider),
+            ),
+            Outcome::Decided {
+                disposition: Disposition::Baseline,
+                fallback,
+                execution,
+                ..
+            } => format!(
+                "kept baseline via {} ({}) · {}",
+                execution.model_name,
+                crate::judgment_presentation::provider_label(&execution.provider),
+                tool_result_selection_fallback_label(*fallback),
+            ),
+            Outcome::Baseline { fallback, .. } => {
+                format!(
+                    "kept baseline · {}",
+                    tool_result_selection_fallback_label(Some(*fallback))
+                )
+            }
+            Outcome::NotDispatched { reason } => {
+                format!(
+                    "not dispatched · {}",
+                    tool_result_selection_not_dispatched_reason_label(*reason)
+                )
+            }
+            Outcome::Unavailable { reason, execution } => execution.as_ref().map_or_else(
+                || {
+                    format!(
+                        "unavailable · {}",
+                        tool_result_selection_unavailable_reason_label(*reason)
+                    )
+                },
+                |execution| {
+                    format!(
+                        "unavailable via {} ({}) · {}",
+                        execution.model_name,
+                        crate::judgment_presentation::provider_label(&execution.provider),
+                        tool_result_selection_unavailable_reason_label(*reason),
+                    )
+                },
+            ),
+        }
+    }
+
+    fn render_detail(&self) -> String {
+        format!(
+            "turn {} round {} · source {} bytes, scanned {} bytes, {} candidate chunks · source {} · goal {} · trigger not recorded · {} · {} · downstream effect unknown",
+            self.correlation.turn,
+            self.correlation.round,
+            self.coverage.source_bytes,
+            self.coverage.scanned_bytes,
+            self.coverage.candidate_chunks,
+            if self.coverage.source_complete {
+                "complete"
+            } else {
+                "incomplete"
+            },
+            if self.coverage.goal_complete {
+                "complete"
+            } else {
+                "incomplete"
+            },
+            self.outcome_label(),
+            self.application.render_compact(),
+        )
+    }
+
+    fn render_compact(&self) -> String {
+        let result = if self.provenance_conflict {
+            "decision model provenance conflicting"
+        } else {
+            match self.outcome {
+                astra_turn_types::ToolResultSelectionOutcomeV1::Started => "decision started",
+                astra_turn_types::ToolResultSelectionOutcomeV1::Decided {
+                    disposition: astra_turn_types::ToolResultProjectionDispositionV1::Selected,
+                    ..
+                } => "decision selected",
+                astra_turn_types::ToolResultSelectionOutcomeV1::Decided { .. } => {
+                    "decision baseline"
+                }
+                astra_turn_types::ToolResultSelectionOutcomeV1::Baseline { .. } => {
+                    "decision baseline fallback"
+                }
+                astra_turn_types::ToolResultSelectionOutcomeV1::NotDispatched { .. } => {
+                    "decision not dispatched"
+                }
+                astra_turn_types::ToolResultSelectionOutcomeV1::Unavailable { .. } => {
+                    "decision unavailable"
+                }
+            }
+        };
+        format!("{result} · {}", self.application.render_compact())
+    }
+}
+
+fn tool_result_selection_fallback_label(
+    fallback: Option<astra_turn_types::ToolResultProjectionFallbackV1>,
+) -> &'static str {
+    match fallback {
+        Some(astra_turn_types::ToolResultProjectionFallbackV1::JudgmentUnavailable) => {
+            "judgment unavailable"
+        }
+        Some(astra_turn_types::ToolResultProjectionFallbackV1::JudgmentInvalid) => {
+            "judgment invalid"
+        }
+        Some(astra_turn_types::ToolResultProjectionFallbackV1::NoClearMatch) => "no clear match",
+        Some(astra_turn_types::ToolResultProjectionFallbackV1::IncompleteCoverage) => {
+            "incomplete evidence"
+        }
+        Some(astra_turn_types::ToolResultProjectionFallbackV1::ProjectionNotSmaller) => {
+            "selection was not smaller"
+        }
+        Some(astra_turn_types::ToolResultProjectionFallbackV1::RecoveryUnavailable) => {
+            "recovery unavailable"
+        }
+        Some(astra_turn_types::ToolResultProjectionFallbackV1::PresentationNotEligible) => {
+            "presentation not eligible"
+        }
+        None => "no fallback recorded",
+    }
+}
+
+pub fn tool_result_selection_not_dispatched_reason_label(
+    reason: astra_turn_types::ToolResultSelectionNotDispatchedReasonV1,
+) -> &'static str {
+    match reason {
+        astra_turn_types::ToolResultSelectionNotDispatchedReasonV1::NoOffering => "no offering",
+        astra_turn_types::ToolResultSelectionNotDispatchedReasonV1::InvalidRequest => {
+            "invalid request"
+        }
+        astra_turn_types::ToolResultSelectionNotDispatchedReasonV1::OutputBudget => "output budget",
+        astra_turn_types::ToolResultSelectionNotDispatchedReasonV1::RouteUnavailable => {
+            "route unavailable"
+        }
+        astra_turn_types::ToolResultSelectionNotDispatchedReasonV1::DurableMaterialUnavailable => {
+            "durable material unavailable"
+        }
+    }
+}
+
+pub fn tool_result_selection_unavailable_reason_label(
+    reason: astra_turn_types::ToolResultSelectionUnavailableReasonV1,
+) -> &'static str {
+    match reason {
+        astra_turn_types::ToolResultSelectionUnavailableReasonV1::Cancelled => "cancelled",
+        astra_turn_types::ToolResultSelectionUnavailableReasonV1::ExecutionError => {
+            "execution error"
+        }
+        astra_turn_types::ToolResultSelectionUnavailableReasonV1::ProviderPtlError => {
+            "provider protocol error"
+        }
+        astra_turn_types::ToolResultSelectionUnavailableReasonV1::UnexpectedFinish => {
+            "unexpected finish"
+        }
+        astra_turn_types::ToolResultSelectionUnavailableReasonV1::InvalidResponse => {
+            "invalid response"
+        }
+        astra_turn_types::ToolResultSelectionUnavailableReasonV1::MissingExecutionProvenance => {
+            "execution provenance missing"
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl ToolResultJudgmentView {
@@ -168,6 +447,19 @@ impl ToolResultJudgmentView {
         }
         if let Some(note) = coverage_note(CoverageSubject::Application, self.application_coverage) {
             line.push_str(&format!(". {note}"));
+        }
+        if !self.explanations.is_empty() {
+            let details = self
+                .explanations
+                .iter()
+                .take(8)
+                .map(ToolResultJudgmentExplanation::render_detail)
+                .collect::<Vec<_>>()
+                .join("; ");
+            line.push_str(&format!(". Decision details: {details}"));
+            if self.explanations_truncated || self.explanations.len() > 8 {
+                line.push_str("; additional decision details omitted");
+            }
         }
         line.push('.');
         line
@@ -248,7 +540,10 @@ impl ToolResultJudgmentView {
                 }
             }
         };
-        let mut line = format!("Tool-result selection · {evaluation} · {application}");
+        let mut line = format!("Tool-result selection · {evaluation}");
+        if self.explanations.is_empty() {
+            line.push_str(&format!(" · {application}"));
+        }
         if let Some(model) = self.models.first() {
             let identity = format!(
                 "{} ({})",
@@ -270,6 +565,22 @@ impl ToolResultJudgmentView {
         }
         if let Some(note) = coverage_note(CoverageSubject::Application, self.application_coverage) {
             line.push_str(&format!(" · {note}"));
+        }
+        if let Some(explanation) = self.explanations.first() {
+            line.push_str(" · ");
+            line.push_str(&explanation.render_compact());
+            if self.explanations.len() > 1 {
+                line.push_str(&format!(
+                    " · +{} other decision(s)",
+                    self.explanations.len() - 1
+                ));
+            }
+        }
+        if !self.explanations.is_empty() {
+            line.push_str(" · downstream effect unknown");
+        }
+        if self.explanations_truncated {
+            line.push_str(" · decision details truncated");
         }
         line
     }
@@ -378,6 +689,8 @@ pub fn project_tool_result_judgments(
     };
     let mut started = BTreeMap::new();
     let mut terminal = BTreeMap::new();
+    let mut started_order = Vec::new();
+    let mut terminal_order = Vec::new();
     let mut conflicts = BTreeSet::new();
     for (index, row) in rows.into_iter().enumerate() {
         if index >= limit {
@@ -418,6 +731,7 @@ pub fn project_tool_result_judgments(
                 }
                 Some(_) => {}
                 None => {
+                    started_order.push(key.clone());
                     started.insert(key, observation);
                 }
             }
@@ -433,6 +747,7 @@ pub fn project_tool_result_judgments(
             }
             Some(_) => {}
             None => {
+                terminal_order.push(key.clone());
                 terminal.insert(key, observation);
             }
         }
@@ -527,8 +842,10 @@ pub fn project_tool_result_judgments(
         )
         .collect();
 
-    let mut receipts = BTreeMap::new();
+    let mut receipts =
+        BTreeMap::<(String, String), astra_turn_types::ToolResultProjectionBindingV1>::new();
     let mut receipt_conflicts = BTreeSet::new();
+    let mut receipt_conflicting_decisions = BTreeSet::new();
     for application in input.applications {
         let binding = &application.binding;
         let key = (
@@ -536,10 +853,17 @@ pub fn project_tool_result_judgments(
             binding.decision.freeze_key_sha256.clone(),
         );
         if binding.validate().is_err() || receipt_conflicts.contains(&key) {
+            if let Some(previous) = receipts.remove(&key) {
+                receipt_conflicting_decisions.insert(previous.decision.decision_sha256);
+            }
+            if !binding.decision.decision_sha256.is_empty() {
+                receipt_conflicting_decisions.insert(binding.decision.decision_sha256.clone());
+            }
             receipt_conflicts.insert(key.clone());
-            receipts.remove(&key);
         } else if let Some(previous) = receipts.get(&key) {
             if previous != binding {
+                receipt_conflicting_decisions.insert(previous.decision.decision_sha256.clone());
+                receipt_conflicting_decisions.insert(binding.decision.decision_sha256.clone());
                 receipts.remove(&key);
                 receipt_conflicts.insert(key);
             }
@@ -581,7 +905,186 @@ pub fn project_tool_result_judgments(
     if !input.application_source_available {
         view.application_coverage = ToolResultJudgmentCoverage::SourceUnavailable;
     }
+    for key in &terminal_order {
+        if conflicts.contains(key) {
+            continue;
+        }
+        let Some(observation) = terminal.get(key) else {
+            continue;
+        };
+        push_explanation(
+            &mut view.explanations,
+            &mut view.explanations_truncated,
+            observation,
+            &receipts,
+            &receipt_conflicting_decisions,
+            &invocation_conflicts,
+            view.application_coverage,
+        );
+        if view.explanations_truncated {
+            break;
+        }
+    }
+    if !view.explanations_truncated {
+        for key in &started_order {
+            if terminal.contains_key(key) || conflicts.contains(key) {
+                continue;
+            }
+            let Some(observation) = started.get(key) else {
+                continue;
+            };
+            push_explanation(
+                &mut view.explanations,
+                &mut view.explanations_truncated,
+                observation,
+                &receipts,
+                &receipt_conflicting_decisions,
+                &invocation_conflicts,
+                view.application_coverage,
+            );
+            if view.explanations_truncated {
+                break;
+            }
+        }
+    }
     view
+}
+
+fn push_explanation(
+    explanations: &mut Vec<ToolResultJudgmentExplanation>,
+    explanations_truncated: &mut bool,
+    observation: &astra_turn_types::ToolResultSelectionObservationV1,
+    receipts: &BTreeMap<(String, String), astra_turn_types::ToolResultProjectionBindingV1>,
+    conflicting_decisions: &BTreeSet<String>,
+    invocation_conflicts: &BTreeSet<String>,
+    application_coverage: ToolResultJudgmentCoverage,
+) {
+    if explanations.len() >= MAX_EXPLANATIONS {
+        *explanations_truncated = true;
+        return;
+    }
+    explanations.push(ToolResultJudgmentExplanation {
+        correlation: observation.correlation.clone(),
+        coverage: observation.coverage.clone(),
+        outcome: observation.outcome.clone(),
+        trigger: ToolResultJudgmentTrigger::NotRecorded,
+        application: application_for_explanation(
+            &observation.outcome,
+            receipts,
+            conflicting_decisions,
+            application_coverage,
+        ),
+        effect: ToolResultJudgmentEffect::Unknown,
+        provenance_conflict: outcome_invocation_id(&observation.outcome)
+            .is_some_and(|invocation_id| invocation_conflicts.contains(invocation_id)),
+    });
+}
+
+fn application_for_explanation(
+    outcome: &astra_turn_types::ToolResultSelectionOutcomeV1,
+    receipts: &BTreeMap<(String, String), astra_turn_types::ToolResultProjectionBindingV1>,
+    conflicting_decisions: &BTreeSet<String>,
+    coverage: ToolResultJudgmentCoverage,
+) -> ToolResultJudgmentApplication {
+    use astra_turn_types::ToolResultProjectionWireStateV1 as WireState;
+
+    let mut application = ToolResultJudgmentApplication {
+        coverage,
+        ..Default::default()
+    };
+    let Some(decision_sha256) = outcome_decision_sha256(outcome) else {
+        return application;
+    };
+    if conflicting_decisions.contains(decision_sha256) {
+        application.mark_conflicting();
+    }
+    for ((attempt_id, _), binding) in receipts {
+        if binding.decision.decision_sha256 != decision_sha256 {
+            continue;
+        }
+        if !outcome_matches_binding(outcome, binding) {
+            application.mark_conflicting();
+            continue;
+        }
+        application.matched_receipts += 1;
+        if application.attempt_ids.len() < MAX_EXPLANATION_ATTEMPT_IDS {
+            application.attempt_ids.push(attempt_id.clone());
+        }
+        match binding.receipt.state {
+            WireState::Included => application.included += 1,
+            WireState::PartiallyIncluded => application.partially_included += 1,
+            WireState::Omitted => application.omitted += 1,
+            WireState::Unknown => application.unknown += 1,
+        }
+    }
+    application
+}
+
+fn outcome_decision_sha256(
+    outcome: &astra_turn_types::ToolResultSelectionOutcomeV1,
+) -> Option<&str> {
+    use astra_turn_types::ToolResultSelectionOutcomeV1 as Outcome;
+    match outcome {
+        Outcome::Decided {
+            decision_sha256, ..
+        }
+        | Outcome::Baseline {
+            decision_sha256, ..
+        } => Some(decision_sha256.as_str()),
+        Outcome::Started | Outcome::NotDispatched { .. } | Outcome::Unavailable { .. } => None,
+    }
+}
+
+fn outcome_invocation_id(outcome: &astra_turn_types::ToolResultSelectionOutcomeV1) -> Option<&str> {
+    use astra_turn_types::ToolResultSelectionOutcomeV1 as Outcome;
+    match outcome {
+        Outcome::Decided { execution, .. }
+        | Outcome::Unavailable {
+            execution: Some(execution),
+            ..
+        } => Some(execution.invocation_id.as_str()),
+        Outcome::Started
+        | Outcome::Baseline { .. }
+        | Outcome::NotDispatched { .. }
+        | Outcome::Unavailable {
+            execution: None, ..
+        } => None,
+    }
+}
+
+fn outcome_matches_binding(
+    outcome: &astra_turn_types::ToolResultSelectionOutcomeV1,
+    binding: &astra_turn_types::ToolResultProjectionBindingV1,
+) -> bool {
+    use astra_turn_types::ToolResultSelectionOutcomeV1 as Outcome;
+    match outcome {
+        Outcome::Decided {
+            decision_sha256,
+            disposition,
+            fallback,
+            selected_chunks,
+            execution,
+            ..
+        } => {
+            usize::try_from(*selected_chunks).ok() == Some(binding.decision.selected_ranges.len())
+                && binding.decision.decision_sha256 == *decision_sha256
+                && binding.decision.disposition == *disposition
+                && binding.decision.fallback == *fallback
+                && binding.decision.judgment_invocation_id.as_deref()
+                    == Some(execution.invocation_id.as_str())
+        }
+        Outcome::Baseline {
+            decision_sha256,
+            fallback,
+        } => {
+            binding.decision.decision_sha256 == *decision_sha256
+                && binding.decision.disposition
+                    == astra_turn_types::ToolResultProjectionDispositionV1::Baseline
+                && binding.decision.fallback == Some(*fallback)
+                && binding.decision.judgment_invocation_id.is_none()
+        }
+        Outcome::Started | Outcome::NotDispatched { .. } | Outcome::Unavailable { .. } => false,
+    }
 }
 
 const LOAD_SQL: &str = "SELECT user_id, session_id, CASE WHEN OCTET_LENGTH(CAST(metadata AS CHAR)) <= ? THEN CAST(metadata AS CHAR) ELSE NULL END AS metadata_json, CASE WHEN OCTET_LENGTH(CAST(metadata AS CHAR)) > ? THEN 1 ELSE 0 END AS metadata_oversized FROM agent_events WHERE user_id = ? AND session_id = ? AND event_type = 'trace_span' ORDER BY created_at DESC, event_id DESC LIMIT ?";
@@ -847,6 +1350,40 @@ mod tests {
         assert!(compact.contains("2 terminal results"), "{compact}");
         assert!(compact.contains("2 selected"), "{compact}");
         assert!(!compact.contains("2 evaluated"), "{compact}");
+
+        let mut conflicting_model = decided.clone();
+        conflicting_model.correlation.evaluation_id = "evaluation-3".into();
+        if let astra_turn_types::ToolResultSelectionOutcomeV1::Decided { execution, .. } =
+            &mut conflicting_model.outcome
+        {
+            execution.model_name = "other-model".into();
+            execution.provider = "other-provider".into();
+        }
+        let conflicting_view = project_tool_result_judgments(
+            [
+                row("user-1", "session-1", "span-a", &decided),
+                row(
+                    "user-1",
+                    "session-1",
+                    "span-conflicting-model",
+                    &conflicting_model,
+                ),
+            ],
+            projection_input(&[]),
+        );
+        assert!(conflicting_view.models.is_empty());
+        assert_eq!(conflicting_view.conflicting, 1);
+        assert!(
+            conflicting_view
+                .explanations
+                .iter()
+                .all(|explanation| explanation.provenance_conflict)
+        );
+        assert!(
+            conflicting_view
+                .render()
+                .contains("model provenance conflicting")
+        );
     }
 
     #[test]
@@ -916,6 +1453,23 @@ mod tests {
             body,
         )
         .unwrap();
+        let selected_observation = observation(
+            "evaluation-1",
+            astra_turn_types::ToolResultSelectionOutcomeV1::Decided {
+                decision_sha256: decision.decision_sha256.clone(),
+                disposition: ToolResultProjectionDispositionV1::Selected,
+                selected_chunks: 1,
+                relevant_chunks: 1,
+                uncertain_chunks: 0,
+                irrelevant_chunks: 1,
+                fallback: None,
+                execution: astra_turn_types::ToolResultSelectionExecutionV1 {
+                    invocation_id: "invocation-1".into(),
+                    model_name: "jev-1.13.0".into(),
+                    provider: "jet".into(),
+                },
+            },
+        );
         let receipt = ToolResultProjectionReceiptV1 {
             decision_sha256: decision.decision_sha256.clone(),
             provider_wire_sha256: "4".repeat(64),
@@ -942,6 +1496,133 @@ mod tests {
             ToolResultJudgmentCoverage::Available
         );
         assert!(view.render().contains("0 evaluation(s)"));
+
+        let matched = project_tool_result_judgments(
+            [row(
+                "user-1",
+                "session-1",
+                "selection-terminal",
+                &selected_observation,
+            )],
+            projection_input(&applications),
+        );
+        assert_eq!(matched.explanations.len(), 1);
+        assert_eq!(matched.explanations[0].application.matched_receipts, 1);
+        assert_eq!(matched.explanations[0].application.included, 1);
+        assert_eq!(
+            matched.explanations[0].trigger,
+            ToolResultJudgmentTrigger::NotRecorded
+        );
+        assert_eq!(
+            matched.explanations[0].effect,
+            ToolResultJudgmentEffect::Unknown
+        );
+        assert!(matched.render().contains("downstream effect unknown"));
+
+        let mut invocation_mismatch = selected_observation.clone();
+        if let astra_turn_types::ToolResultSelectionOutcomeV1::Decided { execution, .. } =
+            &mut invocation_mismatch.outcome
+        {
+            execution.invocation_id = "other-invocation".into();
+        }
+        let conflicting = project_tool_result_judgments(
+            [row(
+                "user-1",
+                "session-1",
+                "selection-mismatch",
+                &invocation_mismatch,
+            )],
+            projection_input(&applications),
+        );
+        assert_eq!(conflicting.explanations[0].application.matched_receipts, 0);
+        assert_eq!(conflicting.explanations[0].application.conflicting, 1);
+        assert_eq!(
+            conflicting.explanations[0].application.coverage,
+            ToolResultJudgmentCoverage::CaptureIncomplete
+        );
+        assert!(conflicting.render().contains("application conflicting"));
+
+        let valid_binding = applications[0].binding.clone();
+        let mut invalid_binding = valid_binding.clone();
+        invalid_binding.decision.decision_sha256 = "6".repeat(64);
+        invalid_binding.receipt.actual_ranges.clear();
+        let fact = |binding| crate::inference_execution::ToolResultProjectionApplicationFact {
+            attempt_id: "attempt-1".into(),
+            binding,
+        };
+        for ordered in [
+            vec![fact(valid_binding.clone()), fact(invalid_binding.clone())],
+            vec![fact(invalid_binding), fact(valid_binding)],
+        ] {
+            let invalidates_previous = project_tool_result_judgments(
+                [row(
+                    "user-1",
+                    "session-1",
+                    "selection-terminal",
+                    &selected_observation,
+                )],
+                projection_input(&ordered),
+            );
+            let application = &invalidates_previous.explanations[0].application;
+            assert_eq!(application.matched_receipts, 0);
+            assert_eq!(application.conflicting, 1);
+            assert_eq!(
+                application.coverage,
+                ToolResultJudgmentCoverage::CaptureIncomplete
+            );
+        }
+
+        let mut selected_count_mismatch = selected_observation.clone();
+        if let astra_turn_types::ToolResultSelectionOutcomeV1::Decided {
+            selected_chunks,
+            relevant_chunks,
+            irrelevant_chunks,
+            ..
+        } = &mut selected_count_mismatch.outcome
+        {
+            *selected_chunks = 2;
+            *relevant_chunks = 2;
+            *irrelevant_chunks = 0;
+        }
+        let count_mismatch = project_tool_result_judgments(
+            [row(
+                "user-1",
+                "session-1",
+                "selection-count-mismatch",
+                &selected_count_mismatch,
+            )],
+            projection_input(&applications),
+        );
+        assert_eq!(
+            count_mismatch.explanations[0].application.matched_receipts,
+            0
+        );
+        assert_eq!(count_mismatch.explanations[0].application.conflicting, 1);
+
+        let mut incomplete = observation(
+            "evaluation-incomplete",
+            astra_turn_types::ToolResultSelectionOutcomeV1::Baseline {
+                decision_sha256: "5".repeat(64),
+                fallback: astra_turn_types::ToolResultProjectionFallbackV1::IncompleteCoverage,
+            },
+        );
+        incomplete.coverage.scanned_bytes = 50;
+        incomplete.coverage.source_complete = false;
+        incomplete.coverage.goal_complete = false;
+        let detail = project_tool_result_judgments(
+            [row("user-1", "session-1", "incomplete", &incomplete)],
+            projection_input(&[]),
+        )
+        .render();
+        assert!(
+            detail.contains("source 100 bytes, scanned 50 bytes"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("source incomplete · goal incomplete"),
+            "{detail}"
+        );
+        assert!(!detail.contains("input 100 bytes"), "{detail}");
     }
 
     #[test]

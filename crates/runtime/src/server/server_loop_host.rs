@@ -3442,8 +3442,12 @@ fn explain_analyze_tool_name(event: &Value) -> &str {
 }
 
 fn bounded_explain_analyze_label(prefix: &str, name: &str) -> String {
+    bounded_explain_analyze_text(&format!("{prefix} {name}"))
+}
+
+fn bounded_explain_analyze_text(value: &str) -> String {
     const MAX_LABEL_BYTES: usize = 160;
-    let mut label = format!("{prefix} {name}");
+    let mut label = value.to_string();
     if label.len() > MAX_LABEL_BYTES {
         let mut boundary = MAX_LABEL_BYTES - '…'.len_utf8();
         while !label.is_char_boundary(boundary) {
@@ -5881,7 +5885,7 @@ fn explain_tool_result_selection(
         ExplainAnalyzeOutcomeV1, ToolResultProjectionDispositionV1, ToolResultProjectionFallbackV1,
         ToolResultSelectionOutcomeV1,
     };
-    match outcome {
+    let (label, explain_outcome) = match outcome {
         ToolResultSelectionOutcomeV1::Started => (
             "Tool-result judgment started".into(),
             ExplainAnalyzeOutcomeV1::Waiting,
@@ -5893,8 +5897,9 @@ fn explain_tool_result_selection(
             ..
         } => (
             format!(
-                "Tool-result judgment · {} · selected {selected_chunks}/{} chunks",
-                execution.model_name, coverage.candidate_chunks
+                "Tool-result judgment · selected {selected_chunks}/{} chunks · model {} · wire application reported separately",
+                coverage.candidate_chunks,
+                explain_tool_result_judgment_model(execution)
             ),
             ExplainAnalyzeOutcomeV1::Succeeded,
         ),
@@ -5904,8 +5909,8 @@ fn explain_tool_result_selection(
             ..
         } => (
             format!(
-                "Tool-result judgment · {} · kept existing tool context (no clear match)",
-                execution.model_name
+                "Tool-result judgment · kept existing tool context (no clear match) · model {} · wire application reported separately",
+                explain_tool_result_judgment_model(execution)
             ),
             ExplainAnalyzeOutcomeV1::Fallback,
         ),
@@ -5915,15 +5920,15 @@ fn explain_tool_result_selection(
             ..
         } => (
             format!(
-                "Tool-result judgment · {} · kept existing tool context (selection was not smaller)",
-                execution.model_name
+                "Tool-result judgment · kept existing tool context (selection was not smaller) · model {} · wire application reported separately",
+                explain_tool_result_judgment_model(execution)
             ),
             ExplainAnalyzeOutcomeV1::Fallback,
         ),
         ToolResultSelectionOutcomeV1::Decided { execution, .. } => (
             format!(
-                "Tool-result judgment · {} · kept existing tool context",
-                execution.model_name
+                "Tool-result judgment · kept existing tool context · model {} · wire application reported separately",
+                explain_tool_result_judgment_model(execution)
             ),
             ExplainAnalyzeOutcomeV1::Fallback,
         ),
@@ -5931,23 +5936,49 @@ fn explain_tool_result_selection(
             "Tool-result selection · kept existing tool context (incomplete evidence)".into(),
             ExplainAnalyzeOutcomeV1::Fallback,
         ),
-        ToolResultSelectionOutcomeV1::NotDispatched { .. } => (
-            "Tool-result selection · kept existing tool context (judgment unavailable)".into(),
+        ToolResultSelectionOutcomeV1::NotDispatched { reason } => (
+            format!(
+                "Tool-result selection · kept existing tool context (not dispatched: {})",
+                astra_services::tool_result_selection_observation::tool_result_selection_not_dispatched_reason_label(
+                    *reason,
+                )
+            ),
             ExplainAnalyzeOutcomeV1::Unavailable,
         ),
-        ToolResultSelectionOutcomeV1::Unavailable { execution, .. } => (
+        ToolResultSelectionOutcomeV1::Unavailable { execution, reason } => (
             execution.as_ref().map_or_else(
-                || "Tool-result judgment · unavailable; kept existing tool context".into(),
+                || {
+                    format!(
+                        "Tool-result judgment · unavailable ({}) · kept existing tool context",
+                        astra_services::tool_result_selection_observation::tool_result_selection_unavailable_reason_label(
+                            *reason,
+                        )
+                    )
+                },
                 |execution| {
                     format!(
-                        "Tool-result judgment · {} · unavailable; kept existing tool context",
-                        execution.model_name
+                        "Tool-result judgment · unavailable ({}) · model {} · kept existing tool context",
+                        astra_services::tool_result_selection_observation::tool_result_selection_unavailable_reason_label(
+                            *reason,
+                        ),
+                        explain_tool_result_judgment_model(execution)
                     )
                 },
             ),
             ExplainAnalyzeOutcomeV1::Unavailable,
         ),
-    }
+    };
+    (bounded_explain_analyze_text(&label), explain_outcome)
+}
+
+fn explain_tool_result_judgment_model(
+    execution: &astra_turn_types::ToolResultSelectionExecutionV1,
+) -> String {
+    format!(
+        "{} ({})",
+        execution.model_name,
+        astra_services::judgment_presentation::provider_label(&execution.provider)
+    )
 }
 
 fn tool_result_projection_reduces_current_context(baseline: &str, selected: &str) -> bool {
@@ -23531,6 +23562,42 @@ mod tests {
                 }
             )
         ));
+    }
+
+    #[test]
+    fn tool_result_judgment_explain_label_is_bounded_for_catalog_identities() {
+        let (label, outcome) = explain_tool_result_selection(
+            &astra_turn_types::ToolResultSelectionCoverageV1 {
+                source_bytes: 100,
+                scanned_bytes: 100,
+                candidate_chunks: 2,
+                source_complete: true,
+                goal_complete: true,
+            },
+            &astra_turn_types::ToolResultSelectionOutcomeV1::Decided {
+                decision_sha256: "a".repeat(64),
+                disposition: astra_turn_types::ToolResultProjectionDispositionV1::Selected,
+                selected_chunks: 1,
+                relevant_chunks: 1,
+                uncertain_chunks: 0,
+                irrelevant_chunks: 1,
+                fallback: None,
+                execution: astra_turn_types::ToolResultSelectionExecutionV1 {
+                    invocation_id: "invocation".into(),
+                    model_name: "m".repeat(255),
+                    provider: "p".repeat(128),
+                },
+            },
+        );
+        assert!(
+            label.len() <= 160,
+            "label exceeded Explain contract: {label}"
+        );
+        assert!(label.contains("selected"));
+        assert_eq!(
+            outcome,
+            astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded
+        );
     }
 
     #[tokio::test]
