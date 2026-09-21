@@ -7823,6 +7823,17 @@ impl RunStateStore for FaultInjectedRunStateStore {
         self.inner.load_run(user_id, run_id).await
     }
 
+    async fn load_run_interaction_projection(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        kind: astra_services::runs::DurableRunInteractionKind,
+    ) -> Result<Option<astra_services::runs::DurableRunInteractionProjection>, String> {
+        self.inner
+            .load_run_interaction_projection(user_id, run_id, kind)
+            .await
+    }
+
     async fn load_run_status_snapshot(
         &self,
         user_id: &str,
@@ -8171,6 +8182,16 @@ impl RunStateStore for FaultInjectedRunStateStore {
         run_id: &str,
     ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
         self.inner.load_run_projection(user_id, run_id).await
+    }
+
+    async fn find_latest_explain_analyze_root(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Option<(String, u64)>, String> {
+        self.inner
+            .find_latest_explain_analyze_root(user_id, session_id)
+            .await
     }
 
     async fn rebuild_run_projection(

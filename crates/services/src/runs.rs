@@ -4777,90 +4777,23 @@ pub trait RunStateStore: Send + Sync {
     /// Load the current interaction wait frontier and its indexed facts. This
     /// read is deliberately narrower than a general run projection so a Web
     /// observer can poll a long-running Work without scanning transcript
-    /// history. Stores that cannot provide the indexed form may fall back to
-    /// their process-local run representation.
+    /// history.
     async fn load_run_interaction_projection(
         &self,
         user_id: &str,
         run_id: &str,
         kind: DurableRunInteractionKind,
-    ) -> Result<Option<DurableRunInteractionProjection>, String> {
-        let Some(run) = self.load_run(user_id, run_id).await? else {
-            return Ok(None);
-        };
-        let request_id = run.events.iter().rev().find_map(|event| {
-            (extract_event_type(event) == "interaction_wait_started"
-                && event
-                    .pointer("/data/waiting_for")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(kind.waiting_for()))
-            .then(|| extract_interaction_request_id(event))
-            .flatten()
-        });
-        let recent_events = request_id
-            .as_deref()
-            .map(|request_id| {
-                run.events
-                    .iter()
-                    .filter(|event| {
-                        extract_interaction_request_id(event).as_deref() == Some(request_id)
-                            && (extract_event_type(event) == kind.required_event_type()
-                                || (kind == DurableRunInteractionKind::AskUser
-                                    && extract_event_type(event) == "user_prompt_required")
-                                || extract_event_type(event) == kind.resolved_event_type())
-                    })
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(Some(DurableRunInteractionProjection {
-            run_id: run.run_id,
-            session_id: run.session_id,
-            status: run.status,
-            waiting_for: run.waiting_for,
-            recent_events,
-        }))
-    }
+    ) -> Result<Option<DurableRunInteractionProjection>, String>;
 
     /// Find the newest root run that explicitly requested Explain Analyze.
     /// Shared stores must answer this from their durable indexed
     /// authority; callers must never infer it from a bounded UI run tree.
     ///
-    /// The default is intentionally fail-closed when the session projection
-    /// is truncated. It remains useful for deterministic in-memory stores,
-    /// while a production store can override it with a direct indexed query.
     async fn find_latest_explain_analyze_root(
         &self,
         user_id: &str,
         session_id: &str,
-    ) -> Result<Option<(String, u64)>, String> {
-        const FALLBACK_LIMIT: u32 = 100;
-        let page = self
-            .list_session_runs(user_id, session_id, FALLBACK_LIMIT)
-            .await?;
-        if page.truncated {
-            return Err(
-                "authoritative Explain Analyze discovery is unavailable because the session run projection is truncated"
-                    .to_string(),
-            );
-        }
-        let mut candidates = page
-            .runs
-            .into_iter()
-            .filter(|run| run.depth == 0 && run_requested_explain_analyze(run))
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| {
-            right
-                .updated_at
-                .cmp(&left.updated_at)
-                .then_with(|| right.created_at.cmp(&left.created_at))
-                .then_with(|| right.run_id.cmp(&left.run_id))
-        });
-        Ok(candidates
-            .into_iter()
-            .next()
-            .map(|run| (run.run_id, run.run_generation)))
-    }
+    ) -> Result<Option<(String, u64)>, String>;
 
     /// Read only the newest typed terminal cancellation origin.
     ///

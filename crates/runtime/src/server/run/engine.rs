@@ -6185,6 +6185,9 @@ mod tests {
         inner: InMemoryRunStateStore,
         fail_remaining: AtomicUsize,
         cancellation_lookup_failures: AtomicUsize,
+        load_run_control_failures: AtomicUsize,
+        load_user_intent_control_delta_failures: AtomicUsize,
+        recovery_claim_failures: AtomicUsize,
         attempts: AtomicUsize,
         waiting_queries: AtomicUsize,
         recovery_claims: AtomicUsize,
@@ -6208,6 +6211,9 @@ mod tests {
                 inner: InMemoryRunStateStore::new(),
                 fail_remaining: AtomicUsize::new(failures),
                 cancellation_lookup_failures: AtomicUsize::new(0),
+                load_run_control_failures: AtomicUsize::new(0),
+                load_user_intent_control_delta_failures: AtomicUsize::new(0),
+                recovery_claim_failures: AtomicUsize::new(0),
                 attempts: AtomicUsize::new(0),
                 waiting_queries: AtomicUsize::new(0),
                 recovery_claims: AtomicUsize::new(0),
@@ -6228,6 +6234,24 @@ mod tests {
 
         fn with_cancellation_lookup_failures(self, failures: usize) -> Self {
             self.cancellation_lookup_failures
+                .store(failures, Ordering::SeqCst);
+            self
+        }
+
+        fn with_load_run_control_failures(self, failures: usize) -> Self {
+            self.load_run_control_failures
+                .store(failures, Ordering::SeqCst);
+            self
+        }
+
+        fn with_load_user_intent_control_delta_failures(self, failures: usize) -> Self {
+            self.load_user_intent_control_delta_failures
+                .store(failures, Ordering::SeqCst);
+            self
+        }
+
+        fn with_recovery_claim_failures(self, failures: usize) -> Self {
+            self.recovery_claim_failures
                 .store(failures, Ordering::SeqCst);
             self
         }
@@ -6298,12 +6322,16 @@ mod tests {
         }
 
         fn should_fail_this_attempt(&self) -> bool {
-            self.fail_remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok()
+            consume_failure(&self.fail_remaining)
         }
+    }
+
+    fn consume_failure(remaining: &AtomicUsize) -> bool {
+        remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
     }
 
     #[async_trait::async_trait]
@@ -6335,6 +6363,28 @@ mod tests {
             run_id: &str,
         ) -> Result<Option<DurableRunRecord>, String> {
             self.inner.load_run(user_id, run_id).await
+        }
+
+        async fn load_run_control(
+            &self,
+            user_id: &str,
+            run_id: &str,
+        ) -> Result<Option<astra_services::runs::DurableRunControlRecord>, String> {
+            if consume_failure(&self.load_run_control_failures) {
+                return Err("load failed".into());
+            }
+            self.inner.load_run_control(user_id, run_id).await
+        }
+
+        async fn load_run_interaction_projection(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            kind: astra_services::runs::DurableRunInteractionKind,
+        ) -> Result<Option<astra_services::runs::DurableRunInteractionProjection>, String> {
+            self.inner
+                .load_run_interaction_projection(user_id, run_id, kind)
+                .await
         }
 
         async fn apply_run_user_intents(
@@ -6422,6 +6472,9 @@ mod tests {
             after_event_idx: i64,
             limit: usize,
         ) -> Result<Option<DurableRunUserIntentControlDelta>, String> {
+            if consume_failure(&self.load_user_intent_control_delta_failures) {
+                return Err("load failed".into());
+            }
             self.inner
                 .load_user_intent_control_delta(user_id, run_id, after_event_idx, limit)
                 .await
@@ -6672,6 +6725,9 @@ mod tests {
             limit: u32,
         ) -> Result<Vec<astra_services::runs::RecoveryClaim>, String> {
             self.recovery_claims.fetch_add(1, Ordering::SeqCst);
+            if consume_failure(&self.recovery_claim_failures) {
+                return Err("store unavailable".into());
+            }
             self.inner.claim_recoverable_active_runs(limit).await
         }
 
@@ -6680,8 +6736,21 @@ mod tests {
             limit: u32,
         ) -> Result<Vec<astra_services::runs::RecoveryClaim>, String> {
             self.recovery_claims.fetch_add(1, Ordering::SeqCst);
+            if consume_failure(&self.recovery_claim_failures) {
+                return Err("store unavailable".into());
+            }
             self.inner
                 .claim_expired_recoverable_active_runs(limit)
+                .await
+        }
+
+        async fn find_latest_explain_analyze_root(
+            &self,
+            user_id: &str,
+            session_id: &str,
+        ) -> Result<Option<(String, u64)>, String> {
+            self.inner
+                .find_latest_explain_analyze_root(user_id, session_id)
                 .await
         }
 
@@ -6793,225 +6862,6 @@ mod tests {
             self.inner
                 .update_retry_count(user_id, expected_session_id, run_id, retry_count)
                 .await
-        }
-    }
-
-    struct FailingLoadRunStore;
-
-    #[async_trait::async_trait]
-    impl RunStateStore for FailingLoadRunStore {
-        async fn reconcile_execution_handoff(
-            &self,
-            claim: &astra_services::runs::RecoveryClaim,
-        ) -> Result<Option<astra_services::runs::RecoveryReconciliation>, String> {
-            let _ = claim;
-            Err("store unavailable".into())
-        }
-
-        async fn claim_expired_recoverable_active_runs(
-            &self,
-            _limit: u32,
-        ) -> Result<Vec<astra_services::runs::RecoveryClaim>, String> {
-            Err("store unavailable".into())
-        }
-
-        async fn claim_recoverable_active_runs(
-            &self,
-            _limit: u32,
-        ) -> Result<Vec<astra_services::runs::RecoveryClaim>, String> {
-            Err("store unavailable".into())
-        }
-
-        async fn insert_run(&self, _record: DurableRunRecord) -> Result<(), String> {
-            Err("store unavailable".into())
-        }
-
-        async fn claim_run_start(
-            &self,
-            _record: DurableRunRecord,
-            _requested_session_id: Option<&str>,
-        ) -> Result<DurableRunStartClaim, String> {
-            Err("store unavailable".into())
-        }
-
-        async fn load_run(
-            &self,
-            _user_id: &str,
-            _run_id: &str,
-        ) -> Result<Option<DurableRunRecord>, String> {
-            Err("load failed".into())
-        }
-
-        async fn load_run_event_delta(
-            &self,
-            _user_id: &str,
-            _run_id: &str,
-            _after_event_idx: i64,
-        ) -> Result<Option<DurableRunEventDelta>, String> {
-            Err("load failed".into())
-        }
-
-        async fn load_user_intent_control_delta(
-            &self,
-            _user_id: &str,
-            _run_id: &str,
-            _after_event_idx: i64,
-            _limit: usize,
-        ) -> Result<Option<DurableRunUserIntentControlDelta>, String> {
-            Err("load failed".into())
-        }
-
-        async fn update_run_status(
-            &self,
-            _user_id: &str,
-            _expected_session_id: &str,
-            _run_id: &str,
-            _status: &str,
-            _waiting_for: Option<&str>,
-            _error_message: Option<&str>,
-        ) -> Result<bool, String> {
-            Err("store unavailable".into())
-        }
-
-        async fn update_run_status_if_current(
-            &self,
-            _request: RunStatusCasRequest<'_>,
-        ) -> Result<bool, String> {
-            Err("store unavailable".into())
-        }
-
-        async fn update_run_status_with_event_if_current(
-            &self,
-            _user_id: &str,
-            _expected_session_id: &str,
-            _run_id: &str,
-            _expected_statuses: &[&str],
-            _status: &str,
-            _waiting_for: Option<&str>,
-            _error_message: Option<&str>,
-            _event: serde_json::Value,
-        ) -> Result<bool, String> {
-            Err("store unavailable".into())
-        }
-
-        async fn update_run_status_with_events_if_current(
-            &self,
-            _user_id: &str,
-            _expected_session_id: &str,
-            _run_id: &str,
-            _expected_statuses: &[&str],
-            _expected_owner_generation: Option<u64>,
-            _status: &str,
-            _waiting_for: Option<&str>,
-            _error_message: Option<&str>,
-            _events: &[serde_json::Value],
-        ) -> Result<bool, String> {
-            Err("store unavailable".into())
-        }
-
-        async fn update_run_usage(
-            &self,
-            _user_id: &str,
-            _expected_session_id: &str,
-            _run_id: &str,
-            _prompt_tokens: u64,
-            _completion_tokens: u64,
-            _tool_calls: u32,
-        ) -> Result<bool, String> {
-            Err("store unavailable".into())
-        }
-
-        async fn update_run_usage_if_current_owner(
-            &self,
-            _request: RunUsageOwnerUpdateRequest<'_>,
-        ) -> Result<bool, String> {
-            Err("store unavailable".into())
-        }
-
-        async fn save_checkpoint(
-            &self,
-            _request: astra_services::runs::RunCheckpointWriteRequest<'_>,
-        ) -> Result<Option<astra_services::runs::RunCheckpointReceipt>, String> {
-            Err("store unavailable".into())
-        }
-
-        async fn load_latest_checkpoint(
-            &self,
-            _user_id: &str,
-            _run_id: &str,
-            _checkpoint_kind: Option<&str>,
-        ) -> Result<Option<DurableRunCheckpointRecord>, String> {
-            Err("store unavailable".into())
-        }
-
-        async fn load_run_projection(
-            &self,
-            _user_id: &str,
-            _run_id: &str,
-        ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
-            Err("store unavailable".into())
-        }
-
-        async fn rebuild_run_projection(
-            &self,
-            _user_id: &str,
-            _expected_session_id: &str,
-            _run_id: &str,
-        ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
-            Err("store unavailable".into())
-        }
-
-        async fn append_events_batch(
-            &self,
-            _user_id: &str,
-            _expected_session_id: &str,
-            _run_id: &str,
-            _events: &[serde_json::Value],
-        ) -> Result<(), String> {
-            Err("store unavailable".into())
-        }
-
-        async fn list_user_runs_cursor(
-            &self,
-            _user_id: &str,
-            _limit: u32,
-            _cursor: Option<RunListCursor>,
-        ) -> Result<DurableRunListPage, String> {
-            Err("store unavailable".into())
-        }
-
-        async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
-            Err("store unavailable".into())
-        }
-
-        async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
-            Err("store unavailable".into())
-        }
-
-        async fn find_blocking_session_run(
-            &self,
-            _user_id: &str,
-            _session_id: &str,
-        ) -> Result<Option<DurableRunRecord>, String> {
-            Err("store unavailable".into())
-        }
-
-        async fn find_sub_runs(
-            &self,
-            _user_id: &str,
-            _delegation_id: &str,
-        ) -> Result<Vec<DurableRunRecord>, String> {
-            Err("store unavailable".into())
-        }
-
-        async fn update_retry_count(
-            &self,
-            _user_id: &str,
-            _expected_session_id: &str,
-            _run_id: &str,
-            _retry_count: u32,
-        ) -> Result<bool, String> {
-            Err("store unavailable".into())
         }
     }
 
@@ -8862,8 +8712,11 @@ mod tests {
     #[tokio::test]
     async fn run_control_poll_metrics_record_status_and_input_store_errors() {
         let registry = Arc::new(MetricsRegistry::new());
-        let engine =
-            RunEngine::new(Arc::new(FailingLoadRunStore)).with_metrics_registry(registry.clone());
+        let store =
+            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
+                .with_load_run_control_failures(1)
+                .with_load_user_intent_control_delta_failures(1);
+        let engine = RunEngine::new(Arc::new(store)).with_metrics_registry(registry.clone());
 
         let status = engine.check_control_status("user-1", "run-input").await;
         assert_eq!(status.unwrap_err(), "load failed");
@@ -9020,8 +8873,10 @@ mod tests {
     #[tokio::test]
     async fn recovery_metrics_record_scan_error() {
         let registry = Arc::new(MetricsRegistry::new());
-        let engine =
-            RunEngine::new(Arc::new(FailingLoadRunStore)).with_metrics_registry(registry.clone());
+        let store =
+            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
+                .with_recovery_claim_failures(1);
+        let engine = RunEngine::new(Arc::new(store)).with_metrics_registry(registry.clone());
 
         let error = engine.recover_active_runs().await.unwrap_err();
         assert_eq!(error, "store unavailable");
@@ -9422,7 +9277,10 @@ mod tests {
 
     #[tokio::test]
     async fn poll_user_intents_reports_store_load_errors() {
-        let engine = RunEngine::new(Arc::new(FailingLoadRunStore));
+        let store =
+            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
+                .with_load_user_intent_control_delta_failures(1);
+        let engine = RunEngine::new(Arc::new(store));
 
         let poll = engine.poll_user_intents("user-1", "run-input", 7).await;
 
