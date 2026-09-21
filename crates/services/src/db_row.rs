@@ -1,12 +1,14 @@
+use crate::TransactionConnection;
 use sqlx::Row;
 
 /// Read the database authority clock without depending on whether a backend
 /// reports `NOW(6)` as DATETIME or TIMESTAMP. MatrixOne and MySQL expose
 /// different wire types for that expression, while the explicit signed epoch
 /// value has one stable SQLx representation.
-pub(crate) async fn database_now_unix_ms(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-) -> Result<i64, sqlx::Error> {
+pub(crate) async fn database_now_unix_ms<T>(tx: &mut T) -> Result<i64, sqlx::Error>
+where
+    T: TransactionConnection,
+{
     sqlx::query("SELECT CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED) AS database_now_unix_ms")
         .fetch_one(&mut **tx)
         .await?

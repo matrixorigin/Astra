@@ -4,12 +4,13 @@ use crate::session_handoff::{
     SessionHandoffError, load_controller_basis_in_transaction,
     mutate_idle_controller_in_transaction,
 };
+use crate::{CancellationSafeTransaction, TransactionConnection};
 use astra_core::SharedPool;
 use astra_turn_types::{DEFAULT_CONVERSATION_BRANCH_ID, SessionHandoffStateV1, SessionKeyV1};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sqlx::{MySql, Row, Transaction};
+use sqlx::Row;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -175,6 +176,15 @@ impl DatabaseWorkBranchControlService {
         Self { pool }
     }
 
+    async fn begin(
+        &self,
+        operation: &'static str,
+    ) -> Result<CancellationSafeTransaction, WorkBranchControlError> {
+        CancellationSafeTransaction::begin(self.pool.get())
+            .await
+            .map_err(|source| database_error(operation, source))
+    }
+
     /// Claim the single background executor for a pending forced takeover.
     ///
     /// The lease makes HTTP retries cheap and prevents one client retry storm
@@ -282,12 +292,7 @@ impl DatabaseWorkBranchControlService {
         let request_hash = request_hash(request);
         let idempotency_hash = identity_hash(&request.request_id);
         let candidate_operation_id = Uuid::new_v4().to_string();
-        let mut tx = self
-            .pool
-            .get()
-            .begin()
-            .await
-            .map_err(|source| database_error("begin", source))?;
+        let mut tx = self.begin("begin").await?;
         let admitted = sqlx::query(
             "SELECT operation_id, request_hash, operation_state
              FROM work_branch_control_operations
@@ -308,6 +313,9 @@ impl DatabaseWorkBranchControlService {
                 .map_err(|source| database_error("decode request hash", source))?
                 != request_hash
             {
+                tx.rollback()
+                    .await
+                    .map_err(|source| database_error("rollback idempotency mismatch", source))?;
                 return Err(WorkBranchControlError::IdempotencyMismatch);
             }
             (
@@ -499,12 +507,7 @@ impl DatabaseWorkBranchControlService {
         let request_hash = request_hash(request);
         let idempotency_hash = identity_hash(&request.request_id);
         let candidate_operation_id = Uuid::new_v4().to_string();
-        let mut tx = self
-            .pool
-            .get()
-            .begin()
-            .await
-            .map_err(|source| database_error("begin force admission", source))?;
+        let mut tx = self.begin("begin force admission").await?;
         let admitted = sqlx::query(
             "SELECT operation_id, request_hash, session_id, forced_authorization_id, handoff_id
              FROM work_branch_control_operations
@@ -526,6 +529,9 @@ impl DatabaseWorkBranchControlService {
                     .map_err(|source| database_error("decode force request hash", source))?
                     != request_hash
                 {
+                    tx.rollback().await.map_err(|source| {
+                        database_error("rollback force idempotency mismatch", source)
+                    })?;
                     return Err(WorkBranchControlError::IdempotencyMismatch);
                 }
                 (
@@ -669,12 +675,7 @@ impl DatabaseWorkBranchControlService {
         operation_id: &str,
         authorization_id: &str,
     ) -> Result<String, WorkBranchControlError> {
-        let mut tx = self
-            .pool
-            .get()
-            .begin()
-            .await
-            .map_err(|source| database_error("begin force authorization", source))?;
+        let mut tx = self.begin("begin force authorization").await?;
         sqlx::query(
             "UPDATE work_branch_control_operations
              SET forced_authorization_id = ?
@@ -722,12 +723,7 @@ impl DatabaseWorkBranchControlService {
         operation_id: &str,
         basis: &SessionControllerBasisV1,
     ) -> Result<WorkBranchControlOperation, WorkBranchControlError> {
-        let mut tx = self
-            .pool
-            .get()
-            .begin()
-            .await
-            .map_err(|source| database_error("begin force completion", source))?;
+        let mut tx = self.begin("begin force completion").await?;
         lock_active_work(&mut tx, &request.owner_id, &request.work_id).await?;
         let branch = lock_branch(&mut tx, request).await?;
         let result = sqlx::query(
@@ -873,12 +869,7 @@ impl DatabaseWorkBranchControlService {
         branch_id: &WorkBranchId,
         operation_id: &str,
     ) -> Result<WorkBranchControlOperation, WorkBranchControlError> {
-        let mut tx = self
-            .pool
-            .get()
-            .begin()
-            .await
-            .map_err(|source| database_error("begin force abort", source))?;
+        let mut tx = self.begin("begin force abort").await?;
         let row = sqlx::query(
             "SELECT expected_branch_revision FROM work_branch_control_operations
              WHERE owner_id = ? AND work_id = ? AND branch_id = ?
@@ -927,12 +918,7 @@ impl DatabaseWorkBranchControlService {
         operation_id: &str,
         observed_basis: &SessionControllerBasisV1,
     ) -> Result<WorkBranchControlOperation, WorkBranchControlError> {
-        let mut tx = self
-            .pool
-            .get()
-            .begin()
-            .await
-            .map_err(|source| database_error("begin force conflict", source))?;
+        let mut tx = self.begin("begin force conflict").await?;
         lock_active_work(&mut tx, &request.owner_id, &request.work_id).await?;
         let branch = lock_branch(&mut tx, request).await?;
         let outcome = if branch.branch_revision != request.expected_branch_revision.get() {
@@ -1006,11 +992,14 @@ struct LockedBranch {
     branch_revision: i64,
 }
 
-async fn lock_active_work(
-    tx: &mut Transaction<'_, MySql>,
+async fn lock_active_work<T>(
+    tx: &mut T,
     owner_id: &WorkOwnerId,
     work_id: &WorkId,
-) -> Result<(), WorkBranchControlError> {
+) -> Result<(), WorkBranchControlError>
+where
+    T: TransactionConnection,
+{
     let active: Option<i64> = sqlx::query_scalar(
         "SELECT work_revision FROM works
          WHERE owner_id = ? AND work_id = ? AND archived_at IS NULL
@@ -1024,10 +1013,13 @@ async fn lock_active_work(
     active.map(|_| ()).ok_or(WorkBranchControlError::NotFound)
 }
 
-async fn lock_branch(
-    tx: &mut Transaction<'_, MySql>,
+async fn lock_branch<T>(
+    tx: &mut T,
     request: &WorkBranchControlRequest,
-) -> Result<LockedBranch, WorkBranchControlError> {
+) -> Result<LockedBranch, WorkBranchControlError>
+where
+    T: TransactionConnection,
+{
     let row = sqlx::query(
         "SELECT session_id, branch_revision FROM work_branches
          WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND archived_at IS NULL
@@ -1051,13 +1043,16 @@ async fn lock_branch(
     })
 }
 
-async fn load_operation_locked(
-    tx: &mut Transaction<'_, MySql>,
+async fn load_operation_locked<T>(
+    tx: &mut T,
     owner_id: &WorkOwnerId,
     work_id: &WorkId,
     branch_id: &WorkBranchId,
     operation_id: &str,
-) -> Result<WorkBranchControlOperation, WorkBranchControlError> {
+) -> Result<WorkBranchControlOperation, WorkBranchControlError>
+where
+    T: TransactionConnection,
+{
     let row = sqlx::query(
         "SELECT * FROM work_branch_control_operations
          WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND operation_id = ?

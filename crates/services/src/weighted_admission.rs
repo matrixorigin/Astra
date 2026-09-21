@@ -6,7 +6,6 @@
 
 use std::{
     collections::HashMap,
-    ops::{Deref, DerefMut},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -14,14 +13,12 @@ use std::{
     time::Duration,
 };
 
+use crate::CancellationSafeTransaction;
 use astra_core::{SharedPool, is_duplicate_key_error};
 use astra_turn_types::SessionKeyV1;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{
-    MySql, MySqlConnection, Row, TransactionManager, mysql::MySqlTransactionManager,
-    pool::PoolConnection,
-};
+use sqlx::Row;
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
@@ -128,127 +125,11 @@ macro_rules! admission_io {
     ($tx:expr, $future:expr) => {{
         $tx.mark_io_in_flight();
         let result = $future.await;
-        $tx.mark_io_complete();
+        if result.is_ok() {
+            $tx.mark_io_complete();
+        }
         result
     }};
-}
-
-/// A transaction backed by a checked-out pool connection.
-///
-/// SQLx's `Transaction` drop handler only queues `ROLLBACK`; if a cancelled
-/// MySQL future is still waiting for a row lock, returning that connection to
-/// the pool can keep the pool slot occupied until the old response arrives.
-/// This guard lets timeout paths mark the physical connection for close while
-/// preserving normal rollback-and-reuse for ordinary capacity errors.
-struct AdmissionTransaction {
-    connection: Option<PoolConnection<MySql>>,
-    transaction_open: bool,
-    discard_on_drop: bool,
-}
-
-impl AdmissionTransaction {
-    async fn begin(
-        pool: &SharedPool,
-        deadline: std::time::Instant,
-        operation: &'static str,
-        timeout: Duration,
-    ) -> Result<Self, DistributedAdmissionError> {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        let connection = tokio::time::timeout(remaining, pool.get().acquire())
-            .await
-            .map_err(|_| admission_timeout_error(timeout))?
-            .map_err(|source| distributed_database_error(operation, source))?;
-        let mut transaction = Self {
-            connection: Some(connection),
-            transaction_open: false,
-            discard_on_drop: true,
-        };
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        match tokio::time::timeout(
-            remaining,
-            MySqlTransactionManager::begin(&mut *transaction.connection_mut(), None),
-        )
-        .await
-        {
-            Ok(Ok(())) => {
-                transaction.transaction_open = true;
-                transaction.discard_on_drop = false;
-                Ok(transaction)
-            }
-            Ok(Err(source)) => Err(distributed_database_error(operation, source)),
-            Err(_) => Err(admission_timeout_error(timeout)),
-        }
-    }
-
-    fn connection_mut(&mut self) -> &mut MySqlConnection {
-        self.connection
-            .as_deref_mut()
-            .expect("admission transaction connection already released")
-    }
-
-    fn discard_on_drop(&mut self) {
-        self.discard_on_drop = true;
-        if let Some(connection) = self.connection.as_mut() {
-            connection.close_on_drop();
-        }
-    }
-
-    fn mark_io_in_flight(&mut self) {
-        self.discard_on_drop = true;
-    }
-
-    fn mark_io_complete(&mut self) {
-        self.discard_on_drop = false;
-    }
-
-    async fn commit(mut self) -> Result<(), sqlx::Error> {
-        if self.transaction_open {
-            self.mark_io_in_flight();
-            let result = MySqlTransactionManager::commit(self.connection_mut()).await;
-            match result {
-                Ok(()) => {
-                    self.transaction_open = false;
-                    self.mark_io_complete();
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        self.discard_on_drop = false;
-        self.connection.take();
-        Ok(())
-    }
-}
-
-impl Deref for AdmissionTransaction {
-    type Target = MySqlConnection;
-
-    fn deref(&self) -> &Self::Target {
-        self.connection
-            .as_deref()
-            .expect("admission transaction connection already released")
-    }
-}
-
-impl DerefMut for AdmissionTransaction {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.connection_mut()
-    }
-}
-
-impl Drop for AdmissionTransaction {
-    fn drop(&mut self) {
-        let Some(connection) = self.connection.as_mut() else {
-            return;
-        };
-        if self.discard_on_drop {
-            connection.close_on_drop();
-        } else if self.transaction_open {
-            // This mirrors SQLx's normal Transaction drop behavior. It is only
-            // used after a query future has completed, so the protocol is
-            // synchronized and the connection can safely return to the pool.
-            MySqlTransactionManager::start_rollback(connection);
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -597,25 +478,33 @@ impl DatabaseWeightedAdmissionController {
         &self,
         deadline: std::time::Instant,
         operation: &'static str,
-    ) -> Result<AdmissionTransaction, DistributedAdmissionError> {
-        AdmissionTransaction::begin(&self.pool, deadline, operation, self.admission_wait_timeout)
-            .await
+    ) -> Result<CancellationSafeTransaction, DistributedAdmissionError> {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        tokio::time::timeout(
+            remaining,
+            CancellationSafeTransaction::begin(self.pool.get()),
+        )
+        .await
+        .map_err(|_| admission_timeout_error(self.admission_wait_timeout))?
+        .map_err(|source| distributed_database_error(operation, source))
     }
 
     async fn lock_admission_gate(
         &self,
-        tx: &mut AdmissionTransaction,
+        tx: &mut CancellationSafeTransaction,
         deadline: std::time::Instant,
     ) -> Result<LockedDistributedAdmissionGate, DistributedAdmissionError> {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         tx.mark_io_in_flight();
         match tokio::time::timeout(remaining, lock_distributed_admission_gate(tx)).await {
             Ok(result) => {
-                tx.mark_io_complete();
+                if result.is_ok() {
+                    tx.mark_io_complete();
+                }
                 result
             }
             Err(_) => {
-                tx.discard_on_drop();
+                tx.mark_io_in_flight();
                 Err(self.admission_timeout())
             }
         }
@@ -785,7 +674,7 @@ struct LockedDistributedAdmissionGate {
 }
 
 async fn lock_distributed_admission_gate(
-    tx: &mut AdmissionTransaction,
+    tx: &mut CancellationSafeTransaction,
 ) -> Result<LockedDistributedAdmissionGate, DistributedAdmissionError> {
     let row = sqlx::query(
         "SELECT capacity_hash, usage_initialized,
@@ -845,7 +734,7 @@ async fn lock_distributed_admission_gate(
 /// reservations have drained. A NULL hash is the uninitialized state of the
 /// current capacity protocol.
 async fn ensure_distributed_admission_capacity(
-    tx: &mut AdmissionTransaction,
+    tx: &mut CancellationSafeTransaction,
     limits: WeightedAdmissionLimits,
     active: Option<&str>,
 ) -> Result<(), DistributedAdmissionError> {
@@ -953,7 +842,7 @@ fn capacity_gate_transition(
 }
 
 async fn load_distributed_reservation(
-    tx: &mut AdmissionTransaction,
+    tx: &mut CancellationSafeTransaction,
     key: &SessionKeyV1,
     idempotency_hash: &str,
 ) -> Result<Option<DistributedAdmissionReservation>, DistributedAdmissionError> {
@@ -1004,7 +893,7 @@ async fn load_distributed_reservation(
 /// them in the same code path (for example expiry cleanup or session delete).
 /// The next admission rebuilds the totals while holding the durable gate.
 async fn mark_materialized_usage_dirty(
-    tx: &mut AdmissionTransaction,
+    tx: &mut CancellationSafeTransaction,
 ) -> Result<(), DistributedAdmissionError> {
     admission_io!(
         tx,
@@ -1024,7 +913,7 @@ async fn mark_materialized_usage_dirty(
 /// repair path, used once after schema upgrade or after an out-of-band delete;
 /// normal reserve/release paths update the totals incrementally.
 async fn ensure_materialized_admission_usage(
-    tx: &mut AdmissionTransaction,
+    tx: &mut CancellationSafeTransaction,
     gate: &mut LockedDistributedAdmissionGate,
 ) -> Result<(), DistributedAdmissionError> {
     if gate.usage_initialized {
@@ -1122,7 +1011,7 @@ async fn ensure_materialized_admission_usage(
 }
 
 async fn load_materialized_owner_usage(
-    tx: &mut AdmissionTransaction,
+    tx: &mut CancellationSafeTransaction,
     key: &SessionKeyV1,
 ) -> Result<AdmissionWork, DistributedAdmissionError> {
     let row = admission_io!(
@@ -1149,7 +1038,7 @@ async fn load_materialized_owner_usage(
 }
 
 async fn add_materialized_admission_usage(
-    tx: &mut AdmissionTransaction,
+    tx: &mut CancellationSafeTransaction,
     key: &SessionKeyV1,
     work: AdmissionWork,
 ) -> Result<(), DistributedAdmissionError> {
@@ -1209,7 +1098,7 @@ async fn add_materialized_admission_usage(
 }
 
 async fn subtract_materialized_admission_usage(
-    tx: &mut AdmissionTransaction,
+    tx: &mut CancellationSafeTransaction,
     key: &SessionKeyV1,
     work: AdmissionWork,
 ) -> Result<(), DistributedAdmissionError> {
@@ -1312,7 +1201,7 @@ async fn subtract_materialized_admission_usage(
 }
 
 async fn insert_distributed_reservation(
-    tx: &mut AdmissionTransaction,
+    tx: &mut CancellationSafeTransaction,
     reservation: &DistributedAdmissionReservation,
     expires_at: chrono::NaiveDateTime,
 ) -> Result<(), DistributedAdmissionError> {

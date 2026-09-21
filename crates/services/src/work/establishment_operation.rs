@@ -8,10 +8,11 @@
 //! while each invocation remains one-shot in the invocation ledger.
 
 use super::{InternalSessionId, WorkBranchId, WorkId, WorkOwnerId};
+use crate::{CancellationSafeTransaction, TransactionConnection};
 use astra_core::SharedPool;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use sqlx::{MySql, Row, Transaction};
+use sqlx::Row;
 use thiserror::Error;
 
 pub const WORK_ESTABLISHMENT_OPERATION_SCHEMA_VERSION: u16 = 2;
@@ -627,10 +628,8 @@ impl DatabaseWorkEstablishmentService {
     async fn begin(
         &self,
         operation: &'static str,
-    ) -> Result<Transaction<'_, MySql>, WorkEstablishmentError> {
-        self.pool
-            .get()
-            .begin()
+    ) -> Result<CancellationSafeTransaction, WorkEstablishmentError> {
+        CancellationSafeTransaction::begin(self.pool.get())
             .await
             .map_err(|source| database_error(operation, source))
     }
@@ -639,13 +638,16 @@ impl DatabaseWorkEstablishmentService {
 /// Apply the Work-carrier half of a durable user-intent transition inside the
 /// caller's transaction. This is crate-visible so the canonical run-intent
 /// store can commit `user_intent_applied` and supersession atomically.
-pub(crate) async fn cancel_pending_for_new_turn_tx(
-    tx: &mut Transaction<'_, MySql>,
+pub(crate) async fn cancel_pending_for_new_turn_tx<T>(
+    tx: &mut T,
     owner_id: &WorkOwnerId,
     session_id: &InternalSessionId,
     current_turn_chain_id: &str,
     reason: &str,
-) -> Result<bool, WorkEstablishmentError> {
+) -> Result<bool, WorkEstablishmentError>
+where
+    T: TransactionConnection,
+{
     validate_turn_chain_id(current_turn_chain_id)?;
     lock_session_admission_fence(tx, owner_id, session_id).await?;
     let pending = load_pending_for_session_locked(tx, owner_id, session_id).await?;
@@ -718,11 +720,14 @@ fn canonical_payload_turn_chain_id(payload_json: &str) -> Result<String, WorkEst
         })
 }
 
-async fn load_pending_for_session_locked(
-    tx: &mut Transaction<'_, MySql>,
+async fn load_pending_for_session_locked<T>(
+    tx: &mut T,
     owner_id: &WorkOwnerId,
     session_id: &InternalSessionId,
-) -> Result<Vec<WorkEstablishmentOperation>, WorkEstablishmentError> {
+) -> Result<Vec<WorkEstablishmentOperation>, WorkEstablishmentError>
+where
+    T: TransactionConnection,
+{
     let rows = sqlx::query(
         "SELECT operation_id, request_hash, payload_json, work_id, branch_id,
                 session_id, run_id, activation, operation_state, operation_phase, last_error,
@@ -740,11 +745,14 @@ async fn load_pending_for_session_locked(
     rows.iter().map(decode_operation).collect()
 }
 
-async fn lock_session_admission_fence(
-    tx: &mut Transaction<'_, MySql>,
+async fn lock_session_admission_fence<T>(
+    tx: &mut T,
     owner_id: &WorkOwnerId,
     session_id: &InternalSessionId,
-) -> Result<(), WorkEstablishmentError> {
+) -> Result<(), WorkEstablishmentError>
+where
+    T: TransactionConnection,
+{
     let exists = sqlx::query(
         "SELECT session_id
          FROM agent_sessions
@@ -778,11 +786,14 @@ async fn lock_session_admission_fence(
     Ok(())
 }
 
-async fn load_operation_locked(
-    tx: &mut Transaction<'_, MySql>,
+async fn load_operation_locked<T>(
+    tx: &mut T,
     owner_id: &WorkOwnerId,
     operation_id: &str,
-) -> Result<WorkEstablishmentOperation, WorkEstablishmentError> {
+) -> Result<WorkEstablishmentOperation, WorkEstablishmentError>
+where
+    T: TransactionConnection,
+{
     let row = sqlx::query(
         "SELECT operation_id, request_hash, payload_json, work_id, branch_id, session_id,
                 run_id, activation, operation_state, operation_phase, last_error, created_at,

@@ -1,3 +1,4 @@
+use crate::TransactionConnection;
 use crate::auth::DatabaseUserRecord;
 use crate::auth::session::SessionRecord;
 use astra_core::{
@@ -1077,12 +1078,15 @@ where
 /// tombstoned identities fail closed. Callers that support offline/lazy roots
 /// may create a missing parent, but only through the tombstone-gated canonical
 /// upsert. The lock is held until the caller commits or rolls back.
-pub async fn admit_session_event_write(
-    tx: &mut sqlx::Transaction<'_, MySql>,
+pub async fn admit_session_event_write<T>(
+    tx: &mut T,
     session_id: &str,
     user_id: &str,
     allow_lazy_create: bool,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), sqlx::Error>
+where
+    T: TransactionConnection,
+{
     // The durable lifecycle fence is the first and shared lock for every
     // session-child write. A completed or pending delete is an authoritative
     // admission rejection, while storage and consistency failures retain
@@ -1160,11 +1164,14 @@ pub async fn admit_session_event_write(
 /// the active, non-tombstoned session, then the session execution slot, and
 /// only then may the caller lock run rows. Sessions without an active run
 /// still use this fence, so run creation cannot race an idle handoff check.
-pub async fn admit_session_execution_write(
-    tx: &mut sqlx::Transaction<'_, MySql>,
+pub async fn admit_session_execution_write<T>(
+    tx: &mut T,
     session_id: &str,
     user_id: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), sqlx::Error>
+where
+    T: TransactionConnection,
+{
     admit_session_event_write(tx, session_id, user_id, false).await?;
 
     // Lock the derived slot before any run row. A missing slot is a valid
@@ -1183,13 +1190,16 @@ pub async fn admit_session_execution_write(
 
 /// Admit the session and execution slot before locking an exact run.
 /// `allow_missing_run` is reserved for run creation.
-pub async fn admit_session_scoped_run_write(
-    tx: &mut sqlx::Transaction<'_, MySql>,
+pub async fn admit_session_scoped_run_write<T>(
+    tx: &mut T,
     session_id: &str,
     user_id: &str,
     run_id: &str,
     allow_missing_run: bool,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, sqlx::Error>
+where
+    T: TransactionConnection,
+{
     admit_session_execution_write(tx, session_id, user_id).await?;
     let run_exists: Option<i32> = query_scalar(
         "SELECT 1 FROM agent_runs
@@ -1308,11 +1318,14 @@ pub enum AgentSessionWriteFenceState {
 /// Maintenance uses this form to serialize with session-bound writers while
 /// retaining the distinction between a delete still owned by reconciliation
 /// and a completed durable tombstone.
-pub async fn lock_existing_agent_session_write_fence(
-    tx: &mut Transaction<'_, MySql>,
+pub async fn lock_existing_agent_session_write_fence<T>(
+    tx: &mut T,
     session_id: &str,
     user_id: &str,
-) -> Result<AgentSessionWriteFenceState, sqlx::Error> {
+) -> Result<AgentSessionWriteFenceState, sqlx::Error>
+where
+    T: TransactionConnection,
+{
     let row = query(
         "SELECT delete_requested_at, database_deleted_at \
          FROM agent_session_lifecycle_fences \
@@ -1394,11 +1407,14 @@ pub(crate) async fn lock_or_claim_orphaned_agent_session_write_fence(
 /// request locks the same row before removing data, so an already-queued
 /// writer either commits before the delete or observes the tombstone and rolls
 /// its whole transaction back.
-pub async fn lock_agent_session_write_fence(
-    tx: &mut Transaction<'_, MySql>,
+pub async fn lock_agent_session_write_fence<T>(
+    tx: &mut T,
     session_id: &str,
     user_id: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), sqlx::Error>
+where
+    T: TransactionConnection,
+{
     // Session creation/backfill establishes the fence before normal child
     // writes. Fast-path the common case so every manifest/event write does not
     // pay an INSERT IGNORE round trip. Keep the insert as a repair path for
@@ -1432,13 +1448,16 @@ pub async fn lock_agent_session_write_fence(
     }
 }
 
-pub async fn add_agent_session_event_count_or_create(
-    tx: &mut Transaction<'_, MySql>,
+pub async fn add_agent_session_event_count_or_create<T>(
+    tx: &mut T,
     session_id: &str,
     user_id: &str,
     delta: i64,
     last_event_id: Option<&str>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), sqlx::Error>
+where
+    T: TransactionConnection,
+{
     if delta < 0 {
         return Err(sqlx::Error::Protocol(
             "add_agent_session_event_count_or_create requires a non-negative delta".into(),

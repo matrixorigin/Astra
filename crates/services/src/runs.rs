@@ -26,6 +26,7 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::TransactionConnection;
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
 use crate::db_row::RowExt as RunStateDbRow;
 use crate::models::AdmittedModelExecution;
@@ -2007,12 +2008,15 @@ pub(crate) async fn lock_claimed_execution_handoff_tx(
     }))
 }
 
-async fn load_run_metadata_for_exact_session_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+async fn load_run_metadata_for_exact_session_tx<T>(
+    tx: &mut T,
     user_id: &str,
     expected_session_id: &str,
     run_id: &str,
-) -> DbStoreResult<Option<DurableRunRecord>> {
+) -> DbStoreResult<Option<DurableRunRecord>>
+where
+    T: TransactionConnection,
+{
     match crate::storage::admit_session_scoped_run_write(
         tx,
         expected_session_id,
@@ -2122,14 +2126,17 @@ pub(crate) enum ExecutionHandoffReferenceError {
     Unavailable(String),
 }
 
-pub(crate) async fn lock_and_validate_execution_handoff_reference_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+pub(crate) async fn lock_and_validate_execution_handoff_reference_tx<T>(
+    tx: &mut T,
     user_id: &str,
     session_id: &str,
     run_id: &str,
     checkpoint_id: &str,
     producer_generation: u64,
-) -> Result<(), ExecutionHandoffReferenceError> {
+) -> Result<(), ExecutionHandoffReferenceError>
+where
+    T: TransactionConnection,
+{
     let run = load_run_metadata_for_exact_session_tx(tx, user_id, session_id, run_id)
         .await
         .map_err(|error| ExecutionHandoffReferenceError::Unavailable(error.to_string()))?
@@ -3693,10 +3700,13 @@ fn validated_durable_lineage_segments_for_identity(
     Ok(segments)
 }
 
-async fn lock_durable_lineage_cancellation_markers_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+async fn lock_durable_lineage_cancellation_markers_tx<T>(
+    tx: &mut T,
     run: &DurableRunRecord,
-) -> Result<DurableLineageCancellationMarkers, String> {
+) -> Result<DurableLineageCancellationMarkers, String>
+where
+    T: TransactionConnection,
+{
     let segments = validated_durable_lineage_segments(run)?;
     lock_durable_lineage_cancellation_markers_for_segments_tx(
         tx,
@@ -3708,13 +3718,16 @@ async fn lock_durable_lineage_cancellation_markers_tx(
     .await
 }
 
-async fn lock_durable_lineage_cancellation_markers_for_segments_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+async fn lock_durable_lineage_cancellation_markers_for_segments_tx<T>(
+    tx: &mut T,
     user_id: &str,
     session_id: &str,
     target_run_id: &str,
     segments: &[String],
-) -> Result<DurableLineageCancellationMarkers, String> {
+) -> Result<DurableLineageCancellationMarkers, String>
+where
+    T: TransactionConnection,
+{
     let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
         "SELECT run_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
                 CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested

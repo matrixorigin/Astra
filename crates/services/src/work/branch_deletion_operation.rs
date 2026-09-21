@@ -1,6 +1,7 @@
 use super::{
     InternalSessionId, WorkBranchId, WorkBranchRevision, WorkId, WorkOwnerId, WorkRevision,
 };
+use crate::CancellationSafeTransaction;
 use astra_core::SharedPool;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -130,6 +131,15 @@ impl DatabaseWorkBranchDeletionService {
         Self { pool }
     }
 
+    async fn begin(
+        &self,
+        operation: &'static str,
+    ) -> Result<CancellationSafeTransaction, WorkBranchDeletionError> {
+        CancellationSafeTransaction::begin(self.pool.get())
+            .await
+            .map_err(|source| database_error(operation, source))
+    }
+
     /// Atomically establishes the sole durable owner of branch deletion.
     ///
     /// Admission does not delete anything. It advances the Work/branch CAS
@@ -142,12 +152,7 @@ impl DatabaseWorkBranchDeletionService {
         validate_request(request)?;
         let idempotency_hash = digest(request.request_id.as_bytes());
         let request_hash = request_digest(request);
-        let mut tx = self
-            .pool
-            .get()
-            .begin()
-            .await
-            .map_err(|source| database_error("begin branch deletion admission", source))?;
+        let mut tx = self.begin("begin branch deletion admission").await?;
         let work = sqlx::query(
             "SELECT work_revision, delivery_branch_id FROM works
              WHERE owner_id = ? AND work_id = ? FOR UPDATE",
@@ -176,6 +181,9 @@ impl DatabaseWorkBranchDeletionService {
                 .map_err(|source| database_error("decode branch deletion request hash", source))?
                 != request_hash
             {
+                tx.rollback().await.map_err(|source| {
+                    database_error("rollback branch deletion idempotency mismatch", source)
+                })?;
                 return Err(WorkBranchDeletionError::IdempotencyMismatch);
             }
             let admission = decode_admission(&row)?;
@@ -201,6 +209,9 @@ impl DatabaseWorkBranchDeletionService {
             .map_err(|source| database_error("decode branch deletion owner", source))?
             .is_some()
         {
+            tx.rollback()
+                .await
+                .map_err(|source| database_error("rollback branch deletion in progress", source))?;
             return Err(WorkBranchDeletionError::DeletionInProgress);
         }
         let observed_work_revision: i64 = work
@@ -538,12 +549,7 @@ impl DatabaseWorkBranchDeletionService {
         operation_id: &str,
         executor_token: &str,
     ) -> Result<WorkBranchDeletionOperation, WorkBranchDeletionError> {
-        let mut tx = self
-            .pool
-            .get()
-            .begin()
-            .await
-            .map_err(|source| database_error("begin branch deletion fence", source))?;
+        let mut tx = self.begin("begin branch deletion fence").await?;
         let row = sqlx::query(
             "SELECT * FROM work_branch_deletion_operations
              WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND operation_id = ?
@@ -749,10 +755,9 @@ impl DatabaseWorkBranchDeletionService {
                 );
             }
         }
-        let mut tx =
-            self.pool.get().begin().await.map_err(|source| {
-                database_error("begin branch deletion session completion", source)
-            })?;
+        let mut tx = self
+            .begin("begin branch deletion session completion")
+            .await?;
         let still_exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(
                  SELECT 1 FROM agent_sessions WHERE user_id = ? AND session_id = ?
@@ -823,12 +828,7 @@ impl DatabaseWorkBranchDeletionService {
         executor_token: &str,
         session_id: &str,
     ) -> Result<(), WorkBranchDeletionError> {
-        let mut tx = self
-            .pool
-            .get()
-            .begin()
-            .await
-            .map_err(|source| database_error("begin branch recovery-point release", source))?;
+        let mut tx = self.begin("begin branch recovery-point release").await?;
         // Keep deletion-operation ownership as the first lock, matching every
         // other recovery phase. The branch row is locked only after the
         // operation proves this executor still owns the phase lease.
@@ -934,9 +934,9 @@ impl DatabaseWorkBranchDeletionService {
         operation_id: &str,
         executor_token: &str,
     ) -> Result<WorkBranchDeletionOperation, WorkBranchDeletionError> {
-        let mut tx = self.pool.get().begin().await.map_err(|source| {
-            database_error("begin branch deletion lineage reconciliation", source)
-        })?;
+        let mut tx = self
+            .begin("begin branch deletion lineage reconciliation")
+            .await?;
         let row = sqlx::query(
             "SELECT * FROM work_branch_deletion_operations
              WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND operation_id = ?
@@ -1089,10 +1089,7 @@ impl DatabaseWorkBranchDeletionService {
         operation_id: &str,
         executor_token: &str,
     ) -> Result<WorkBranchDeletionOperation, WorkBranchDeletionError> {
-        let mut tx =
-            self.pool.get().begin().await.map_err(|source| {
-                database_error("begin Work branch deletion completion", source)
-            })?;
+        let mut tx = self.begin("begin Work branch deletion completion").await?;
         let row = sqlx::query(
             "SELECT * FROM work_branch_deletion_operations
              WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND operation_id = ?

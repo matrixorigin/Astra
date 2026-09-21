@@ -1,11 +1,12 @@
 use super::{
     ForkCursorRef, InternalSessionId, WorkBranchId, WorkBranchRevision, WorkId, WorkOwnerId,
 };
+use crate::{CancellationSafeTransaction, TransactionConnection};
 use astra_core::SharedPool;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sqlx::{MySql, Row, Transaction};
+use sqlx::Row;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -736,20 +737,21 @@ impl DatabaseWorkBranchCreationService {
     async fn begin(
         &self,
         operation: &'static str,
-    ) -> Result<Transaction<'_, MySql>, WorkBranchCreationError> {
-        self.pool
-            .get()
-            .begin()
+    ) -> Result<CancellationSafeTransaction, WorkBranchCreationError> {
+        CancellationSafeTransaction::begin(self.pool.get())
             .await
             .map_err(|source| database_error(operation, source))
     }
 }
 
-async fn load_operation_locked<'a>(
-    tx: &mut Transaction<'a, MySql>,
+async fn load_operation_locked<T>(
+    tx: &mut T,
     request: &WorkBranchCreationRequest,
     operation_id: &str,
-) -> Result<sqlx::mysql::MySqlRow, WorkBranchCreationError> {
+) -> Result<sqlx::mysql::MySqlRow, WorkBranchCreationError>
+where
+    T: TransactionConnection,
+{
     let row = sqlx::query(
         "SELECT * FROM work_branch_creation_operations
          WHERE owner_id = ? AND work_id = ? AND origin_branch_id = ? AND operation_id = ?
@@ -773,13 +775,16 @@ async fn load_operation_locked<'a>(
     Ok(row)
 }
 
-async fn load_operation_locked_by_identity<'a>(
-    tx: &mut Transaction<'a, MySql>,
+async fn load_operation_locked_by_identity<T>(
+    tx: &mut T,
     owner_id: &WorkOwnerId,
     work_id: &WorkId,
     origin_branch_id: &WorkBranchId,
     operation_id: &str,
-) -> Result<sqlx::mysql::MySqlRow, WorkBranchCreationError> {
+) -> Result<sqlx::mysql::MySqlRow, WorkBranchCreationError>
+where
+    T: TransactionConnection,
+{
     sqlx::query(
         "SELECT * FROM work_branch_creation_operations
          WHERE owner_id = ? AND work_id = ? AND origin_branch_id = ? AND operation_id = ?
