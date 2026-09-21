@@ -140,15 +140,16 @@ Draining must continue even after a persistence failure to unblock senders.
 Following a journal I/O or integrity error, no further append is attempted on
 that connection; reopening validates the WAL and recovers records without a
 durable completion as unknown. A connection reconnect does not imply a process
-restart. The old body-only limit is retained solely as a legacy read integrity
-check; the full wire budget owns all new terminal writes.
+restart. The full wire budget owns both new terminal writes and recovery
+validation; there is no separate legacy body-only result limit.
 
 The shared `MAX_EDGE_MESSAGE_BYTES` budget measures the complete serialized
 message, including identity, generation, metadata and escaping. The journal
 persists an explicit unknown-evidence result if a completed result cannot fit.
-On open it applies the same durable transition to legacy pending results that
-fit the former body-only limit. Results remain pending until an exact ACK;
-this transition never requests re-execution of the original tool.
+On open it applies the same durable transition to any structurally valid
+pending result whose complete wire envelope is too large. Results remain
+pending until an exact ACK; this transition never requests re-execution of the
+original tool.
 
 Release candidates explicitly initialize the Rustls provider before TLS clients
 are constructed. The joint CLI/Edge build runs an offline direct/CONNECT

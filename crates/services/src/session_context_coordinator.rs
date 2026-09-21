@@ -480,13 +480,7 @@ pub trait SessionContextCoordinator: Send + Sync {
     async fn load_admission_snapshot(
         &self,
         key: &SessionKeyV1,
-    ) -> Result<SessionAdmissionSnapshotV1, SessionContextCoordinatorError> {
-        Ok(SessionAdmissionSnapshotV1 {
-            head: self.load_head(key).await?,
-            active_writer: self.load_active_writer(key).await?,
-            authority_epochs: self.load_authority_epochs(key).await?.unwrap_or_default(),
-        })
-    }
+    ) -> Result<SessionAdmissionSnapshotV1, SessionContextCoordinatorError>;
 
     async fn materialize(
         &self,
@@ -554,12 +548,6 @@ pub trait SessionContextCoordinator: Send + Sync {
         idempotency_key: &str,
     ) -> Result<AcquireWriterOutcome, SessionContextCoordinatorError>;
 
-    async fn renew_writer(
-        &self,
-        lease: &ConversationWriterLeaseV1,
-        ttl: Duration,
-    ) -> Result<ConversationWriterLeaseV1, SessionContextCoordinatorError>;
-
     async fn release_writer(
         &self,
         lease: &ConversationWriterLeaseV1,
@@ -584,10 +572,8 @@ pub trait SessionContextCoordinator: Send + Sync {
         expected_execution_binding_generation: Option<u64>,
     ) -> Result<ReserveTurnOutcome, SessionContextCoordinatorError>;
 
-    /// Acquire the branch writer and reserve its next turn as one logical
-    /// admission. Stores that can transact both facts together should
-    /// override this method; other stores preserve the same behavior through
-    /// the two primitive operations.
+    /// Acquire the branch writer and reserve its next turn as one atomic
+    /// admission.
     #[allow(clippy::too_many_arguments)]
     async fn acquire_writer_and_reserve_turn(
         &self,
@@ -598,60 +584,7 @@ pub trait SessionContextCoordinator: Send + Sync {
         writer_idempotency_key: &str,
         reservation_idempotency_key: &str,
         expected_execution_binding_generation: Option<u64>,
-    ) -> Result<AcquireWriterAndReserveTurnOutcome, SessionContextCoordinatorError> {
-        let lease = match self
-            .acquire_writer(key, expected_cursor, actor, ttl, writer_idempotency_key)
-            .await?
-        {
-            AcquireWriterOutcome::Acquired(lease)
-            | AcquireWriterOutcome::AlreadyAcquired(lease) => lease,
-            AcquireWriterOutcome::Conflict {
-                current_head,
-                active_lease_expires_at_unix_ms,
-            } => {
-                return Ok(AcquireWriterAndReserveTurnOutcome::WriterConflict {
-                    current_head,
-                    active_lease_expires_at_unix_ms,
-                });
-            }
-        };
-        match self
-            .reserve_turn(
-                &lease,
-                expected_cursor,
-                ttl,
-                reservation_idempotency_key,
-                expected_execution_binding_generation,
-            )
-            .await
-        {
-            Ok(ReserveTurnOutcome::Reserved(reservation))
-            | Ok(ReserveTurnOutcome::AlreadyReserved(reservation)) => {
-                Ok(AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation })
-            }
-            Ok(ReserveTurnOutcome::Conflict { current_head }) => {
-                Ok(AcquireWriterAndReserveTurnOutcome::ReservationConflict {
-                    lease,
-                    current_head,
-                })
-            }
-            Err(error) => {
-                if let Err(release_error) = self.release_writer(&lease).await {
-                    tracing::warn!(
-                        %release_error,
-                        "failed to release canonical writer after turn reservation failure"
-                    );
-                }
-                Err(error)
-            }
-        }
-    }
-
-    async fn renew_turn_reservation(
-        &self,
-        reservation: &TurnReservationV1,
-        ttl: Duration,
-    ) -> Result<TurnReservationV1, SessionContextCoordinatorError>;
+    ) -> Result<AcquireWriterAndReserveTurnOutcome, SessionContextCoordinatorError>;
 
     /// Atomically renew the complete authority required to commit one turn.
     async fn renew_turn_authority(
@@ -2893,64 +2826,6 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         Ok(AcquireWriterOutcome::Acquired(lease))
     }
 
-    async fn renew_writer(
-        &self,
-        lease: &ConversationWriterLeaseV1,
-        ttl: Duration,
-    ) -> Result<ConversationWriterLeaseV1, SessionContextCoordinatorError> {
-        validate_ttl(ttl, MAX_LEASE_TTL)?;
-        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
-            .await
-            .map_err(|source| database_error("acquire_renew_writer", source))?;
-        let mut tx = connection
-            .begin()
-            .await
-            .map_err(|source| database_error("begin_renew_writer", source))?;
-        let (mut state, now) = lock_database_state_at_now(&mut tx, &lease.key).await?;
-        if let Err(error) = validate_active_lease(&state, lease, now) {
-            record_database_authority_event(
-                &mut tx,
-                &state,
-                AuthorityAuditFact {
-                    operation: "renew_writer",
-                    outcome: authority_error_outcome(&error),
-                    actor: Some(&lease.actor),
-                    lease_id: Some(&lease.lease_id),
-                    reservation_id: None,
-                    expected_cursor: lease.expected_cursor.as_ref(),
-                },
-            )
-            .await?;
-            tx.commit()
-                .await
-                .map_err(|source| database_error("commit_renew_writer_audit", source))?;
-            connection.release();
-            return Err(error);
-        }
-        let renewed = state.active_writer.as_mut().expect("validated lease");
-        renewed.expires_at_unix_ms = checked_expiry(now, ttl)?;
-        let renewed = renewed.clone();
-        update_database_state(&mut tx, &state).await?;
-        record_database_authority_event(
-            &mut tx,
-            &state,
-            AuthorityAuditFact {
-                operation: "renew_writer",
-                outcome: "renewed",
-                actor: Some(&lease.actor),
-                lease_id: Some(&lease.lease_id),
-                reservation_id: None,
-                expected_cursor: lease.expected_cursor.as_ref(),
-            },
-        )
-        .await?;
-        tx.commit()
-            .await
-            .map_err(|source| database_error("commit_renew_writer", source))?;
-        connection.release();
-        Ok(renewed)
-    }
-
     async fn renew_turn_authority(
         &self,
         lease: &ConversationWriterLeaseV1,
@@ -4008,72 +3883,6 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .map_err(|source| database_error("commit_turn", source))?;
         connection.release();
         Ok(CoordinatorMutationV1::Applied { cursor })
-    }
-
-    async fn renew_turn_reservation(
-        &self,
-        reservation: &TurnReservationV1,
-        ttl: Duration,
-    ) -> Result<TurnReservationV1, SessionContextCoordinatorError> {
-        validate_ttl(ttl, MAX_RESERVATION_TTL)?;
-        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
-            .await
-            .map_err(|source| database_error("acquire_renew_turn_reservation", source))?;
-        let mut tx = connection
-            .begin()
-            .await
-            .map_err(|source| database_error("begin_renew_turn_reservation", source))?;
-        let (mut state, now) = lock_database_state_at_now(&mut tx, &reservation.key).await?;
-        if let Err(error) = validate_active_reservation(&state, reservation, now) {
-            record_database_authority_event(
-                &mut tx,
-                &state,
-                AuthorityAuditFact {
-                    operation: "renew_turn",
-                    outcome: authority_error_outcome(&error),
-                    actor: None,
-                    lease_id: Some(&reservation.lease_id),
-                    reservation_id: Some(&reservation.reservation_id),
-                    expected_cursor: reservation.expected_cursor.as_ref(),
-                },
-            )
-            .await?;
-            tx.commit()
-                .await
-                .map_err(|source| database_error("commit_renew_turn_audit", source))?;
-            connection.release();
-            return Err(error);
-        }
-        let lease_expiry = state
-            .active_writer
-            .as_ref()
-            .expect("validated reservation lease")
-            .expires_at_unix_ms;
-        let renewed = state
-            .active_reservation
-            .as_mut()
-            .expect("validated reservation");
-        renewed.expires_at_unix_ms = checked_expiry(now, ttl)?.min(lease_expiry);
-        let renewed = renewed.clone();
-        update_database_state(&mut tx, &state).await?;
-        record_database_authority_event(
-            &mut tx,
-            &state,
-            AuthorityAuditFact {
-                operation: "renew_turn",
-                outcome: "renewed",
-                actor: None,
-                lease_id: Some(&reservation.lease_id),
-                reservation_id: Some(&reservation.reservation_id),
-                expected_cursor: reservation.expected_cursor.as_ref(),
-            },
-        )
-        .await?;
-        tx.commit()
-            .await
-            .map_err(|source| database_error("commit_renew_turn_reservation", source))?;
-        connection.release();
-        Ok(renewed)
     }
 
     async fn advance_authority_epochs(

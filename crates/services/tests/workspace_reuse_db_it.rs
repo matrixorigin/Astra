@@ -451,8 +451,11 @@ async fn checkout_reuse_fences_root_and_child_resume_without_changing_run_state(
 async fn idle_reuse_does_not_release_another_users_claim() {
     let (pool, coordinator, keys) = fixture().await;
     let (other_pool, other_coordinator, other_keys) = fixture().await;
-    let other_lease = match reserve(&other_coordinator, &other_keys[0]).await.unwrap() {
-        AcquireWriterAndReserveTurnOutcome::Ready { lease, .. } => lease,
+    let (other_lease, other_reservation) = match reserve(&other_coordinator, &other_keys[0])
+        .await
+        .unwrap()
+    {
+        AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation } => (lease, reservation),
         result => panic!("{result:?}"),
     };
     coordinator
@@ -468,7 +471,7 @@ async fn idle_reuse_does_not_release_another_users_claim() {
     .unwrap();
     assert_eq!(claim_owner, other_keys[0].session_id);
     other_coordinator
-        .renew_writer(&other_lease, Duration::from_secs(60))
+        .renew_turn_authority(&other_lease, &other_reservation, Duration::from_secs(60))
         .await
         .unwrap();
     cleanup(&pool, &keys[0].owner_user_id).await;

@@ -1176,16 +1176,13 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                         continue;
                                     }
                                     Err(error @ JournalError::IdentityConflict { .. }) => {
-                                        let result = DurableEdgeResult::from_tool_result(
-                                            astra_tools::ToolResult::error(format!(
-                                                "Edge invocation identity conflict before dispatch: {error}"
-                                            )),
-                                            0,
-                                        );
-                                        let message = result.client_message(
+                                        let message = rejected_tool_message(
                                             request_id,
                                             *identity,
                                             delivery_generation,
+                                            format!(
+                                                "Edge invocation identity conflict before dispatch: {error}"
+                                            ),
                                         );
                                         write.send(Message::Text(serde_json::to_string(&message)?.into())).await?;
                                         continue;
