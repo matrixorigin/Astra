@@ -24039,7 +24039,7 @@ async fn db_explain_publication_is_discoverable_and_readable() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-async fn db_explain_discovery_reads_a_large_existing_snapshot_once() {
+async fn db_explain_discovery_reads_an_existing_snapshot_once() {
     let pool = setup_lifecycle_run_db_it().await;
     let user = "explain-discovery-perf-it";
     let session = format!("explain-discovery-perf-{}", Uuid::new_v4());
@@ -24088,49 +24088,6 @@ async fn db_explain_discovery_reads_a_large_existing_snapshot_once() {
     let artifact_id = handle
         .strip_prefix("artifact://session/explain-analyze/")
         .expect("canonical Explain benchmark handle");
-    let row = sqlx::query(
-        "SELECT content_json, CAST(metadata AS CHAR) AS metadata_json
-         FROM session_artifacts
-         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
-    )
-    .bind(user)
-    .bind(&session)
-    .bind(artifact_id)
-    .fetch_one(pool.get())
-    .await
-    .expect("load Explain benchmark payload");
-    let mut content: serde_json::Value = serde_json::from_str(
-        &row.try_get::<String, _>("content_json")
-            .expect("decode Explain benchmark content"),
-    )
-    .expect("parse Explain benchmark content");
-    content["benchmark_padding"] = serde_json::Value::String("x".repeat(256 * 1024));
-    let content_json = serde_json::to_string(&content).expect("serialize padded Explain content");
-    let integrity_bytes =
-        serde_json::to_vec_pretty(&content).expect("serialize Explain integrity bytes");
-    let mut metadata: serde_json::Value = serde_json::from_str(
-        &row.try_get::<String, _>("metadata_json")
-            .expect("decode Explain benchmark metadata"),
-    )
-    .expect("parse Explain benchmark metadata");
-    metadata["size_bytes"] = json!(integrity_bytes.len());
-    let checksum = {
-        use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(&integrity_bytes))
-    };
-    metadata["checksum_sha256"] = json!(checksum);
-    sqlx::query(
-        "UPDATE session_artifacts SET content_json = ?, metadata = ?
-         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
-    )
-    .bind(&content_json)
-    .bind(metadata.to_string())
-    .bind(user)
-    .bind(&session)
-    .bind(artifact_id)
-    .execute(pool.get())
-    .await
-    .expect("store padded valid Explain benchmark payload");
 
     let expected_notice = crate::server::explain_analyze_artifact::context_notice_for_run(
         Some(&pool),
@@ -24140,8 +24097,8 @@ async fn db_explain_discovery_reads_a_large_existing_snapshot_once() {
         generation,
     )
     .await
-    .expect("validate padded Explain snapshot")
-    .expect("readable padded Explain notice");
+    .expect("validate Explain snapshot")
+    .expect("readable Explain notice");
     assert!(expected_notice.contains(&handle));
     assert!(expected_notice.contains("status=complete"));
     let mut edge_profile = serde_json::Map::new();

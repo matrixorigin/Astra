@@ -14,7 +14,7 @@ use astra_services::{
     resource_governor::{LimitCheck, ResourceLimitKind},
     storage::{CORE_SCHEMA_CONTRACT_VERSION, ensure_core_schema},
 };
-use sqlx::{MySql, Pool, Row, mysql::MySqlPoolOptions, query};
+use sqlx::{MySql, Pool, Row, mysql::MySqlPoolOptions, query, query_scalar};
 use uuid::Uuid;
 
 const PREVIOUS_CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-15-v77";
@@ -506,6 +506,150 @@ async fn assert_v77_session_schema_upgrades_before_session_creation(
     Ok(())
 }
 
+async fn assert_checkpoint_history_migration(db: &IsolatedDatabase) -> Result<(), String> {
+    ensure_core_schema(&db.settings, "mysql")
+        .await
+        .map_err(|error| format!("bootstrap checkpoint migration fixture: {error}"))?;
+
+    let legacy_run = format!("legacy-checkpoint-{}", Uuid::new_v4().simple());
+    let malformed_run = format!("malformed-checkpoint-{}", Uuid::new_v4().simple());
+    let divergent_run = format!("divergent-checkpoint-{}", Uuid::new_v4().simple());
+    for (run_id, checkpoint_json) in [
+        (
+            &legacy_run,
+            r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"legacy"}"#,
+        ),
+        (&malformed_run, "{"),
+    ] {
+        query(
+            "INSERT INTO agent_runs
+             (run_id, user_id, session_id, root_run_id, ancestor_path, status,
+              checkpoint_version, checkpoint_json, created_at, updated_at)
+             VALUES (?, 'migration-user', 'migration-session', ?, ?, 'running',
+                     'checkpoint_v1', ?, '2026-09-01 00:00:00.000001',
+                     '2026-09-01 00:00:00.000001')",
+        )
+        .bind(run_id)
+        .bind(run_id)
+        .bind(run_id)
+        .bind(checkpoint_json)
+        .execute(&db.pool)
+        .await
+        .map_err(|error| format!("insert checkpoint migration fixture {run_id}: {error}"))?;
+    }
+    query(
+        "INSERT INTO agent_runs
+         (run_id, user_id, session_id, root_run_id, ancestor_path, status,
+          checkpoint_version, checkpoint_json, created_at, updated_at)
+         VALUES (?, 'migration-user', 'migration-session', ?, ?, 'running',
+                 'checkpoint_v1', ?, '2026-09-01 00:00:00.000002',
+                 '2026-09-01 00:00:00.000002')",
+    )
+    .bind(&divergent_run)
+    .bind(&divergent_run)
+    .bind(&divergent_run)
+    .bind(r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"embedded"}"#)
+    .execute(&db.pool)
+    .await
+    .map_err(|error| format!("insert divergent embedded checkpoint: {error}"))?;
+    query(
+        "INSERT INTO run_checkpoints
+         (checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
+          checkpoint_version, idempotency_key, checkpoint_json, created_at)
+         VALUES (?, ?, 'migration-user', 'migration-session', 1, 'resume',
+                 'checkpoint_v1', ?, ?, '2026-08-01 00:00:00.000001')",
+    )
+    .bind(format!("ckpt-divergent-{}", Uuid::new_v4().simple()))
+    .bind(&divergent_run)
+    .bind(format!("checkpoint:{divergent_run}:resume:canonical"))
+    .bind(r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"canonical"}"#)
+    .execute(&db.pool)
+    .await
+    .map_err(|error| format!("insert divergent canonical checkpoint: {error}"))?;
+
+    query(
+        "UPDATE astra_schema_contracts SET contract_version = '2026-09-20-v83'
+         WHERE component = 'astra-core'",
+    )
+    .execute(&db.pool)
+    .await
+    .map_err(|error| format!("mark schema before checkpoint migration: {error}"))?;
+    ensure_core_schema(&db.settings, "mysql")
+        .await
+        .map_err(|error| format!("migrate legacy checkpoint rows: {error}"))?;
+
+    let migrated: i64 = query_scalar(
+        "SELECT COUNT(*) FROM run_checkpoints
+         WHERE user_id = 'migration-user' AND run_id = ?
+           AND checkpoint_kind = 'resume' AND checkpoint_version = 'checkpoint_v1'",
+    )
+    .bind(&legacy_run)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|error| format!("count migrated checkpoint row: {error}"))?;
+    if migrated != 1 {
+        return Err(format!("migrated checkpoint rows = {migrated}, want 1"));
+    }
+    let malformed: i64 = query_scalar(
+        "SELECT COUNT(*) FROM run_checkpoints
+         WHERE user_id = 'migration-user' AND run_id = ?",
+    )
+    .bind(&malformed_run)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|error| format!("count malformed checkpoint migration row: {error}"))?;
+    if malformed != 0 {
+        return Err(format!("malformed checkpoint rows = {malformed}, want 0"));
+    }
+    let divergent_count: i64 = query_scalar(
+        "SELECT COUNT(*) FROM run_checkpoints
+         WHERE user_id = 'migration-user' AND run_id = ?",
+    )
+    .bind(&divergent_run)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|error| format!("count divergent checkpoint rows: {error}"))?;
+    if divergent_count != 1 {
+        return Err(format!(
+            "divergent canonical checkpoint rows = {divergent_count}, want 1"
+        ));
+    }
+    let divergent_payload: String = query_scalar(
+        "SELECT checkpoint_json FROM run_checkpoints
+         WHERE user_id = 'migration-user' AND run_id = ? LIMIT 1",
+    )
+    .bind(&divergent_run)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|error| format!("load divergent canonical checkpoint: {error}"))?;
+    if !divergent_payload.contains("canonical") {
+        return Err("legacy snapshot replaced established canonical checkpoint".into());
+    }
+
+    query(
+        "UPDATE astra_schema_contracts SET contract_version = '2026-09-20-v83'
+         WHERE component = 'astra-core'",
+    )
+    .execute(&db.pool)
+    .await
+    .map_err(|error| format!("mark schema for idempotency retry: {error}"))?;
+    ensure_core_schema(&db.settings, "mysql")
+        .await
+        .map_err(|error| format!("repeat legacy checkpoint migration: {error}"))?;
+    let repeated: i64 = query_scalar(
+        "SELECT COUNT(*) FROM run_checkpoints
+         WHERE user_id = 'migration-user' AND run_id = ?",
+    )
+    .bind(&legacy_run)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|error| format!("count repeated checkpoint migration rows: {error}"))?;
+    if repeated != 1 {
+        return Err(format!("repeated checkpoint rows = {repeated}, want 1"));
+    }
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
 async fn edge_pending_dispatch_schema_upgrade_preserves_terminal_rows_and_rejects_active_rows() {
@@ -528,4 +672,13 @@ async fn v77_session_schema_upgrade_supports_ordinary_and_provider_creation() {
     let result = assert_v77_session_schema_upgrades_before_session_creation(&db).await;
     db.cleanup().await;
     result.expect("v77 session schema upgrade");
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn checkpoint_history_schema_upgrade_is_idempotent_and_skips_bad_rows() {
+    let db = IsolatedDatabase::new().await;
+    let result = assert_checkpoint_history_migration(&db).await;
+    db.cleanup().await;
+    result.expect("checkpoint history schema upgrade");
 }

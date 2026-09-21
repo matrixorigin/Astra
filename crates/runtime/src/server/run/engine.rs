@@ -3458,7 +3458,19 @@ impl RunEngine {
             run.checkpoint_version.as_deref(),
             Some("execution_handoff_v1")
         );
-        self.recover_session_continuation(run).await
+        let has_graceful_resume_checkpoint = self
+            .load_latest_checkpoint(user_id, run_id, Some("resume"))
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|checkpoint| {
+                astra_services::runs::is_graceful_resume_checkpoint(
+                    &checkpoint.checkpoint_version,
+                    &checkpoint.checkpoint_json,
+                )
+            });
+        self.recover_session_continuation(run, has_graceful_resume_checkpoint)
+            .await
     }
 
     async fn recover_active_run(
@@ -3606,15 +3618,17 @@ impl RunEngine {
                 }
             };
         }
-        self.recover_session_continuation(claim.run).await
+        self.recover_session_continuation(claim.run, claim.has_graceful_resume_checkpoint)
+            .await
     }
 
     async fn recover_session_continuation(
         &self,
         mut run: DurableRunRecord,
+        has_graceful_resume_checkpoint: bool,
     ) -> Option<DurableRunRecord> {
         let expected_status = run.status.clone();
-        let checkpoint_available = has_graceful_resume_checkpoint(self, &run).await;
+        let checkpoint_available = has_graceful_resume_checkpoint;
         let continue_via_session =
             matches!(run.status.as_str(), STATUS_WAITING | STATUS_PAUSED) || checkpoint_available;
         if continue_via_session {
@@ -4593,39 +4607,6 @@ impl UserIntentProvider for RunEngine {
             )),
         }
     }
-}
-
-async fn has_graceful_resume_checkpoint(engine: &RunEngine, run: &DurableRunRecord) -> bool {
-    // `save_checkpoint` updates the agent_runs snapshot in the same transaction,
-    // so the recovery scan already carries the common-case checkpoint. Avoid
-    // one extra query per active run; fall back to the typed history table only
-    // for legacy/incomplete rows.
-    if checkpoint_is_graceful_resume(
-        run.checkpoint_version.as_deref().unwrap_or_default(),
-        run.checkpoint_json.as_deref().unwrap_or_default(),
-    ) {
-        return true;
-    }
-    if let Ok(Some(checkpoint)) = engine
-        .load_latest_checkpoint(&run.user_id, &run.run_id, Some("resume"))
-        .await
-    {
-        return checkpoint_is_graceful_resume(
-            &checkpoint.checkpoint_version,
-            &checkpoint.checkpoint_json,
-        );
-    }
-    false
-}
-
-fn checkpoint_is_graceful_resume(checkpoint_version: &str, checkpoint_json: &str) -> bool {
-    if checkpoint_version != "checkpoint_v1" || checkpoint_json.is_empty() {
-        return false;
-    }
-    serde_json::from_str::<serde_json::Value>(checkpoint_json)
-        .ok()
-        .and_then(|value| value.get("graceful").and_then(serde_json::Value::as_bool))
-        .unwrap_or(false)
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -10470,62 +10451,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_active_runs_falls_back_to_embedded_legacy_checkpoint() {
+    async fn recover_active_runs_uses_canonical_history_when_embedded_head_is_missing() {
         let store = Arc::new(InMemoryRunStateStore::new());
         let engine = RunEngine::new(store.clone());
-        let now = chrono::Utc::now().to_rfc3339();
-        store
-            .insert_run(DurableRunRecord {
-                run_id: "run-legacy".to_string(),
-                user_id: "user-1".to_string(),
-                session_id: "sess-legacy".to_string(),
-                parent_run_id: None,
-                root_run_id: Some("run-legacy".to_string()),
-                ancestor_path: Some("run-legacy".to_string()),
-                depth: 0,
-                delegation_id: None,
-                agent_id: None,
-                retry_of: None,
-                retry_scope: Some("node".to_string()),
-                status: STATUS_RUNNING.to_string(),
-                waiting_for: None,
-                owner_pod_id: None,
-                owner_lease_expires_at: None,
-                run_generation: 0,
-                last_event_idx: 0,
-                checkpoint_version: Some("checkpoint_v1".to_string()),
-                checkpoint_json: Some(
-                    r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"legacy-batch"}"#
-                        .to_string(),
-                ),
-                error_code: None,
-                error_message: None,
-                retry_count: 0,
-                total_prompt_tokens: 0,
-                total_completion_tokens: 0,
-                total_tool_calls: 0,
-                agent_binding_id: None,
-                agent_binding_name: None,
-                agent_binding_schema_version: None,
-                model_offering_id: None,
-                resolved_model_name: None,
-                runtime_profile: None,
-                start_request_fingerprint: None,
-                work_binding: None,
-                events: vec![serde_json::json!({"event_type":"run_started","data":{}})],
-                created_at: now.clone(),
-                updated_at: now,
-            })
+        engine
+            .start_run("run-history-only", "user-1", "sess-history-only")
             .await
             .unwrap();
+        engine
+            .persist_checkpoint(
+                "user-1",
+                "sess-history-only",
+                "run-history-only",
+                r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"history-only"}"#,
+            )
+            .await
+            .unwrap();
+
+        let mut run = store
+            .load_run("user-1", "run-history-only")
+            .await
+            .unwrap()
+            .unwrap();
+        run.checkpoint_version = None;
+        run.checkpoint_json = None;
+        store.insert_run(run).await.unwrap();
 
         let recovered = engine.recover_active_runs().await.unwrap();
         let resumed = recovered
             .into_iter()
-            .find(|run| run.run_id == "run-legacy")
-            .expect("legacy checkpointed run should still resume");
+            .find(|run| run.run_id == "run-history-only")
+            .expect("canonical history checkpoint should be recoverable");
         assert_eq!(resumed.status, STATUS_PAUSED);
-        assert!(resumed.waiting_for.is_none());
+        assert_eq!(
+            resumed.events.last().unwrap()["data"]["checkpoint_available"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_active_runs_does_not_resume_an_embedded_only_snapshot() {
+        let store = Arc::new(InMemoryRunStateStore::new());
+        let engine = RunEngine::new(store.clone());
+        engine
+            .start_run("run-embedded-only", "user-1", "sess-embedded-only")
+            .await
+            .unwrap();
+
+        let mut run = store
+            .load_run("user-1", "run-embedded-only")
+            .await
+            .unwrap()
+            .unwrap();
+        run.checkpoint_version = Some("checkpoint_v1".to_string());
+        run.checkpoint_json = Some(
+            r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"legacy-only"}"#
+                .to_string(),
+        );
+        store.insert_run(run).await.unwrap();
+
+        let recovered = engine.recover_active_runs().await.unwrap();
+        let failed = recovered
+            .into_iter()
+            .find(|run| run.run_id == "run-embedded-only")
+            .expect("embedded-only run should still be classified");
+        assert_eq!(failed.status, STATUS_FAILED);
     }
 
     #[tokio::test]

@@ -3953,16 +3953,18 @@ fn decode_device_lease_event_payload(row: &impl RowExt) -> Result<DeviceLeaseEnd
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Instant};
 
-    use astra_core::{ErrorResponse, error_response};
+    use astra_core::{ErrorResponse, SharedPool, error_response};
     use astra_services::auth::SessionActivityRecord;
+    use astra_services::observation_capture::DurableCaptureOutcome;
     use astra_services::{
         AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
         AuthTokenRecord, AuthUserRecord, SessionCreateRequestData, SessionListFilter,
         SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
         StoredSessionArtifact,
     };
+    use astra_services::{ContextManifestWrite, DatabaseContextManifestStore};
     use async_trait::async_trait;
     use axum::{
         Json,
@@ -4391,6 +4393,149 @@ mod tests {
             HeaderValue::from_static("Bearer session-test-token"),
         );
         headers
+    }
+
+    async fn perf_setup_pool() -> SharedPool {
+        assert_eq!(
+            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+            Ok("1"),
+            "set ASTRA_TEST_DB_IT=1 for ignored session handler benchmarks"
+        );
+        let settings = astra_core::MatrixOneSettings::from_env();
+        let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+            .unwrap_or_else(|_| "mysql".to_string());
+        astra_services::ensure_core_schema(&settings, &catalog)
+            .await
+            .expect("ensure_core_schema must pass before session handler benchmarks");
+        SharedPool::new(&settings)
+            .await
+            .expect("SharedPool::new must connect to MatrixOne")
+    }
+
+    fn perf_id(prefix: &str) -> String {
+        format!("{prefix}-{}", Uuid::new_v4().simple())
+    }
+
+    async fn insert_perf_session(pool: &SharedPool, user_id: &str, session_id: &str) {
+        sqlx::query(
+            "INSERT INTO agent_sessions
+             (session_id, user_id, agent_id, title, status, metadata, created_at, updated_at)
+             VALUES (?, ?, 'perf-agent', 'perf session', 'active', '{}', NOW(6), NOW(6))",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .execute(pool.get())
+        .await
+        .expect("perf insert_session must succeed");
+    }
+
+    fn perf_millis(started: Instant) -> u128 {
+        started.elapsed().as_millis()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ASTRA_TEST_DB_IT=1; perf_benchmark"]
+    async fn perf_benchmark_7_latest_manifest_reads_use_production_reader() {
+        const MANIFESTS: usize = 512;
+
+        let pool = perf_setup_pool().await;
+        let user_id = perf_id("perf-read-user");
+        let session_id = perf_id("perf-read-session");
+        let preferred_run_id = perf_id("perf-read-preferred-run");
+        let latest_run_id = perf_id("perf-read-latest-run");
+        let manifest_prefix = perf_id("perf-manifest");
+        insert_perf_session(&pool, &user_id, &session_id).await;
+
+        let store = DatabaseContextManifestStore::new(pool.clone());
+        for index in 0..MANIFESTS {
+            let outcome = store
+                .save_manifest(
+                    ContextManifestWrite {
+                        manifest_id: format!("{manifest_prefix}-{index:04}"),
+                        user_id: user_id.clone(),
+                        session_id: session_id.clone(),
+                        run_id: Some(if index + 1 == MANIFESTS {
+                            latest_run_id.clone()
+                        } else {
+                            preferred_run_id.clone()
+                        }),
+                        turn_id: format!("turn-{index}"),
+                        model_provider: "mock".to_string(),
+                        model_name: "perf-read-llm".to_string(),
+                        context_window_tokens: 8_000,
+                        max_output_tokens: 700,
+                        total_estimated_tokens: 1_200,
+                        policy_version: "context_manifest_v1".to_string(),
+                        tokenizer_id: Some("estimated_v1".to_string()),
+                        budget_template_id: Some("budget_v1_8k".to_string()),
+                        turn_intent: Some("normal".to_string()),
+                        reason: "normal_turn".to_string(),
+                        manifest_json: json!({}),
+                    },
+                    vec![],
+                )
+                .await
+                .expect("PERF-7 manifest seed must succeed");
+            assert_eq!(
+                outcome,
+                DurableCaptureOutcome::Inserted,
+                "PERF-7 seed must be a fresh capture"
+            );
+        }
+
+        let started = Instant::now();
+        let preferred =
+            load_latest_context_manifest(&pool, &user_id, &session_id, Some(&preferred_run_id))
+                .await
+                .expect("PERF-7 preferred latest-manifest query must succeed")
+                .expect("PERF-7 preferred latest-manifest query must find a row");
+        let preferred_ms = perf_millis(started);
+        assert_eq!(
+            preferred.manifest_id,
+            format!("{manifest_prefix}-{:04}", MANIFESTS - 2)
+        );
+
+        let started = Instant::now();
+        let fallback = load_latest_context_manifest(&pool, &user_id, &session_id, None)
+            .await
+            .expect("PERF-7 fallback latest-manifest query must succeed")
+            .expect("PERF-7 fallback latest-manifest query must find a row");
+        let fallback_ms = perf_millis(started);
+        assert_eq!(
+            fallback.manifest_id,
+            format!("{manifest_prefix}-{:04}", MANIFESTS - 1)
+        );
+
+        let missing_preferred = load_latest_context_manifest(
+            &pool,
+            &user_id,
+            &session_id,
+            Some("perf-read-missing-run"),
+        )
+        .await
+        .expect("PERF-7 missing preferred run fallback must succeed")
+        .expect("PERF-7 missing preferred run must fall back to session latest");
+        assert_eq!(
+            missing_preferred.manifest_id,
+            format!("{manifest_prefix}-{:04}", MANIFESTS - 1)
+        );
+
+        let wrong_owner = load_latest_context_manifest(
+            &pool,
+            "perf-read-not-owner",
+            &session_id,
+            Some(&preferred_run_id),
+        )
+        .await
+        .expect("PERF-7 wrong-owner read must succeed");
+        assert!(wrong_owner.is_none(), "PERF-7 must not read another owner");
+        println!(
+            "PERF_RESULT benchmark=manifest_latest_read history_rows={MANIFESTS} preferred_ms={preferred_ms} fallback_ms={fallback_ms}"
+        );
+        assert!(
+            preferred_ms < 50 && fallback_ms < 50,
+            "PERF-7 latest reads must stay under 50ms: preferred={preferred_ms}ms fallback={fallback_ms}ms"
+        );
     }
 
     #[tokio::test]

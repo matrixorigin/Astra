@@ -483,108 +483,38 @@ async fn one_connection_preserves_distinct_nullable_parameter_shapes() {
     insert_session(&pool, &user_id, &session_id).await;
     let store = DatabaseContextManifestStore::new(pool.clone());
 
-    let first_id = id("nullable-all-none");
-    let mut first_items = vec![
-        item(&session_id, 0),
-        item(&session_id, 1),
-        item(&session_id, 2),
-    ];
-    first_items[1].source_hash = Some("first-hash-only".to_string());
-    first_items[2].raw_ref = Some("conversation_log://nullable/first-ref-only".to_string());
-    store
-        .save_manifest(
-            manifest(&first_id, &user_id, &session_id, None),
-            first_items,
-        )
-        .await
-        .expect("save first mixed nullable shape");
+    let make_items = |values: [(Option<&str>, Option<&str>); 3]| {
+        values
+            .into_iter()
+            .enumerate()
+            .map(|(order, (source_hash, raw_ref))| {
+                let mut item = item(&session_id, order as i32);
+                item.source_hash = source_hash.map(str::to_string);
+                item.raw_ref = raw_ref.map(str::to_string);
+                item
+            })
+            .collect::<Vec<_>>()
+    };
 
     let second_id = id("nullable-raw-ref-change");
     let mut second = manifest(&second_id, &user_id, &session_id, Some("run-present"));
     second.tokenizer_id = Some("tokenizer-present".to_string());
     second.budget_template_id = Some("budget-present".to_string());
     second.turn_intent = Some("intent-present".to_string());
-    let mut second_items = vec![
-        item(&session_id, 0),
-        item(&session_id, 1),
-        item(&session_id, 2),
-    ];
-    second_items[1].source_hash = Some("first-hash-only".to_string());
-    second_items[1].raw_ref = Some("conversation_log://nullable/second-ref-only".to_string());
-    store
-        .save_manifest(second, second_items)
-        .await
-        .expect("save raw-ref-only shape change on the same connection");
-
     let third_id = id("nullable-source-hash-change");
     let mut third = manifest(&third_id, &user_id, &session_id, Some("run-third"));
     third.tokenizer_id = Some("tokenizer-third".to_string());
     third.budget_template_id = Some("budget-third".to_string());
     third.turn_intent = Some("intent-third".to_string());
-    let mut third_items = vec![
-        item(&session_id, 0),
-        item(&session_id, 1),
-        item(&session_id, 2),
-    ];
-    third_items[1].raw_ref = Some("conversation_log://nullable/second-ref-only".to_string());
-    third_items[2].source_hash = Some("third-hash-only".to_string());
-    store
-        .save_manifest(third, third_items)
-        .await
-        .expect("save source-hash-only shape change on the same connection");
-
-    let first = sqlx::query(
-        "SELECT run_id, tokenizer_id, budget_template_id, turn_intent
-         FROM context_manifests WHERE manifest_id = ?",
-    )
-    .bind(&first_id)
-    .fetch_one(pool.get())
-    .await
-    .expect("load all-NULL manifest");
-    assert_eq!(first.try_get::<Option<String>, _>("run_id").unwrap(), None);
-    assert_eq!(
-        first.try_get::<Option<String>, _>("tokenizer_id").unwrap(),
-        None
-    );
-    assert_eq!(
-        first
-            .try_get::<Option<String>, _>("budget_template_id")
-            .unwrap(),
-        None
-    );
-    assert_eq!(
-        first.try_get::<Option<String>, _>("turn_intent").unwrap(),
-        None
-    );
-
-    let second = sqlx::query(
-        "SELECT run_id, tokenizer_id, budget_template_id, turn_intent
-         FROM context_manifests WHERE manifest_id = ?",
-    )
-    .bind(&second_id)
-    .fetch_one(pool.get())
-    .await
-    .expect("load all-non-NULL manifest");
-    assert_eq!(
-        second.try_get::<String, _>("run_id").unwrap(),
-        "run-present"
-    );
-    assert_eq!(
-        second.try_get::<String, _>("tokenizer_id").unwrap(),
-        "tokenizer-present"
-    );
-    assert_eq!(
-        second.try_get::<String, _>("budget_template_id").unwrap(),
-        "budget-present"
-    );
-    assert_eq!(
-        second.try_get::<String, _>("turn_intent").unwrap(),
-        "intent-present"
-    );
-
-    for (manifest_id, expected) in [
+    let cases = vec![
         (
-            &first_id,
+            manifest(&id("nullable-all-none"), &user_id, &session_id, None),
+            make_items([
+                (None, None),
+                (Some("first-hash-only"), None),
+                (None, Some("conversation_log://nullable/first-ref-only")),
+            ]),
+            vec![None, None, None, None],
             vec![
                 (None, None),
                 (Some("first-hash-only"), None),
@@ -592,7 +522,21 @@ async fn one_connection_preserves_distinct_nullable_parameter_shapes() {
             ],
         ),
         (
-            &second_id,
+            second,
+            make_items([
+                (None, None),
+                (
+                    Some("first-hash-only"),
+                    Some("conversation_log://nullable/second-ref-only"),
+                ),
+                (None, None),
+            ]),
+            vec![
+                Some("run-present"),
+                Some("tokenizer-present"),
+                Some("budget-present"),
+                Some("intent-present"),
+            ],
             vec![
                 (None, None),
                 (
@@ -603,19 +547,61 @@ async fn one_connection_preserves_distinct_nullable_parameter_shapes() {
             ],
         ),
         (
-            &third_id,
+            third,
+            make_items([
+                (None, None),
+                (None, Some("conversation_log://nullable/second-ref-only")),
+                (Some("third-hash-only"), None),
+            ]),
+            vec![
+                Some("run-third"),
+                Some("tokenizer-third"),
+                Some("budget-third"),
+                Some("intent-third"),
+            ],
             vec![
                 (None, None),
                 (None, Some("conversation_log://nullable/second-ref-only")),
                 (Some("third-hash-only"), None),
             ],
         ),
-    ] {
+    ];
+
+    for (manifest, items, expected_header, expected_items) in cases {
+        let manifest_id = manifest.manifest_id.clone();
+        store
+            .save_manifest(manifest, items)
+            .await
+            .expect("save nullable shape on the same connection");
+
+        let header = sqlx::query(
+            "SELECT run_id, tokenizer_id, budget_template_id, turn_intent
+             FROM context_manifests WHERE manifest_id = ?",
+        )
+        .bind(&manifest_id)
+        .fetch_one(pool.get())
+        .await
+        .expect("load nullable manifest header");
+        let actual_header = [
+            "run_id",
+            "tokenizer_id",
+            "budget_template_id",
+            "turn_intent",
+        ]
+        .into_iter()
+        .map(|column| header.try_get::<Option<String>, _>(column).unwrap())
+        .collect::<Vec<_>>();
+        let expected_header = expected_header
+            .into_iter()
+            .map(|value| value.map(str::to_string))
+            .collect::<Vec<_>>();
+        assert_eq!(actual_header, expected_header);
+
         let rows = sqlx::query(
             "SELECT source_hash, raw_ref FROM context_manifest_items
              WHERE manifest_id = ? ORDER BY item_order",
         )
-        .bind(manifest_id)
+        .bind(&manifest_id)
         .fetch_all(pool.get())
         .await
         .expect("load mixed nullable item shapes");
@@ -628,7 +614,7 @@ async fn one_connection_preserves_distinct_nullable_parameter_shapes() {
                 )
             })
             .collect::<Vec<_>>();
-        let expected = expected
+        let expected = expected_items
             .into_iter()
             .map(|(hash, raw_ref)| (hash.map(str::to_string), raw_ref.map(str::to_string)))
             .collect::<Vec<_>>();
