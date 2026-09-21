@@ -437,7 +437,7 @@ impl ToolRegistry {
         } else if flags.contains(ToolFlags::ORCHESTRATION)
             || matches!(
                 name,
-                "get_agent_info" | "reflect" | "skill" | "discover_skills"
+                "get_agent_info" | "introspect" | "reflect" | "skill" | "discover_skills"
             )
         {
             ToolDisplayCategory::Utility
@@ -2196,6 +2196,7 @@ mod tests {
             "rollback_session_state",
             "reflect",
             "get_agent_info",
+            "introspect",
             "skill",
             "discover_skills",
         ] {
