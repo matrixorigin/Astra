@@ -1707,7 +1707,17 @@ mod tests {
         assert_eq!(model_result, inline);
         let projected: serde_json::Value = serde_json::from_str(&model_result).unwrap();
         assert_eq!(projected["schema"], "astra-introspect-model-projection-v1");
-        assert_eq!(projected["summary"], report.summary);
+        let summary_shortened = report.summary.chars().count() > 360;
+        let expected_summary = if summary_shortened {
+            format!("{}…", report.summary.chars().take(360).collect::<String>())
+        } else {
+            report.summary.clone()
+        };
+        assert_eq!(projected["summary"], expected_summary);
+        assert_eq!(
+            projected["projection_budget"]["summary_shortened"],
+            summary_shortened
+        );
         assert!(
             !model_result.contains("introspect(artifact="),
             "introspect should use typed facet requests rather than recursively paging its own snapshot"

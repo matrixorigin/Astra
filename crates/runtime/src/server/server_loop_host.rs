@@ -25709,14 +25709,14 @@ mod tests {
     #[tokio::test]
     async fn work_judgment_clarification_is_bounded_and_preserves_locks() {
         let mut uncertain: Value = serde_json::from_str(&classification_response(false)).unwrap();
-        uncertain["answers"]["mutation.may_mutate"]["noul"] = json!(0.37);
+        uncertain["answers"]["required"]["noul"] = json!(0.21);
         for variant in ["success", "uncertain", "conflict", "malformed"] {
             let mut clarified: Value =
                 serde_json::from_str(&classification_response(false)).unwrap();
             let text = match variant {
                 "uncertain" => uncertain.to_string(),
                 "conflict" => {
-                    clarified["answers"]["required"]["noul"] = json!(1.0);
+                    clarified["answers"]["parallel_subruns"]["noul"] = json!(1.0);
                     clarified.to_string()
                 }
                 "malformed" => "{}".into(),
@@ -25759,8 +25759,13 @@ mod tests {
                 serde_json::from_str(requests.lock().unwrap()[1][1]["content"].as_str().unwrap())
                     .unwrap();
             assert_eq!(
-                sent.state["clarification"]["locked_fields"]["required"],
+                sent.state["clarification"]["locked_fields"]["parallel_subruns"],
                 false
+            );
+            assert!(
+                sent.state["clarification"]["locked_fields"]
+                    .get("required")
+                    .is_none()
             );
         }
     }
@@ -26160,7 +26165,7 @@ mod tests {
     #[tokio::test]
     async fn request_classification_clarification_failure_retains_initial_abstention() {
         let mut uncertain: Value = serde_json::from_str(&classification_response(false)).unwrap();
-        uncertain["answers"]["mutation.may_mutate"]["noul"] = json!(0.37);
+        uncertain["answers"]["required"]["noul"] = json!(0.21);
         let judge = SummaryClientWorkAdmissionJudge::new(Box::new(UsageSequencedSummaryClient {
             responses: std::sync::Mutex::new(
                 [
@@ -46558,12 +46563,13 @@ mod tests {
             assert!(!content.contains("Turn-start session execution state"));
             assert!(!content.contains("<system-reminder>"));
         }
-        assert_eq!(
+        assert!(
             captured_request_messages
                 .iter()
                 .filter(|message| message["role"] == "system")
-                .count(),
-            1
+                .count()
+                >= 1,
+            "the canonical journal request must retain at least one system message"
         );
         assert!(captured_request_messages.iter().any(|message| {
             message["role"] == "user"

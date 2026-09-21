@@ -1103,7 +1103,13 @@ mod tests {
         assert!(!summary.render().contains("capture truncated"));
         assert_eq!(summary.groups[0].known_input_tokens, 123);
         assert!(summary.groups[0].input_incomplete);
-        assert!(summary.render().contains("local_captured_run_turn"));
+        assert!(matches!(
+            summary.scope,
+            astra_services::reflect::JudgmentUsageScope::LocalCapturedRunTurn {
+                ref run_id,
+                ref turn_id,
+            } if run_id == "run-1" && turn_id == "turn-2"
+        ));
         let dir = astra_services::local_session_artifact_store()
             .session_dir(session)
             .unwrap();

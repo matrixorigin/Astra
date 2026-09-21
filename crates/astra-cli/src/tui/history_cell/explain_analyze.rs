@@ -1206,10 +1206,11 @@ mod tests {
         graph.finish_ingest();
         let output = text(&ExplainAnalyzeCell::new(graph, false, false).display_lines(400));
         assert!(
-            output.contains("conflicting physical attempt evidence"),
+            output.contains(
+                "Judgment usage · unavailable · 1 conflicting physical measurement(s); token total unknown"
+            ),
             "{output}"
         );
-        assert!(output.contains("no token total inferred"));
         assert!(!output.contains("731") && !output.contains("947"));
     }
 
