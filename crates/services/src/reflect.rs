@@ -1810,21 +1810,20 @@ impl ReflectService for DatabaseReflectService {
                 groups: Vec::new(),
                 omitted_groups: 0,
             });
-        if include_semantic_execution {
-            if let Some(view) = semantic_judgments.as_mut() {
-                if view.counts.is_some() {
-                    match physical_capture.as_ref() {
-                        Ok(capture) => {
-                            crate::semantic_judgment_observation::apply_semantic_execution_capture(
-                                view, capture, session_id,
-                            );
-                        }
-                        Err(coverage) => {
-                            crate::semantic_judgment_observation::mark_execution_lookup_unavailable(
-                                view, *coverage,
-                            );
-                        }
-                    }
+        if include_semantic_execution
+            && let Some(view) = semantic_judgments.as_mut()
+            && view.counts.is_some()
+        {
+            match physical_capture.as_ref() {
+                Ok(capture) => {
+                    crate::semantic_judgment_observation::apply_semantic_execution_capture(
+                        view, capture, session_id,
+                    );
+                }
+                Err(coverage) => {
+                    crate::semantic_judgment_observation::mark_execution_lookup_unavailable(
+                        view, *coverage,
+                    );
                 }
             }
         }
