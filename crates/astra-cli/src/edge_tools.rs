@@ -9683,8 +9683,14 @@ mod tests {
             let output = executor.handle_introspect(&serde_json::json!({
                 "facet":"session", "source_policy":"local_only", "depth":depth
             }));
-            assert!(output.contains("local_captured_run_turn"), "{output}");
-            assert!(output.contains("run-1"), "{output}");
+            assert!(
+                output.contains("Judgment usage · run-scoped capture"),
+                "{output}"
+            );
+            assert!(
+                output.contains("Jev (jev) · Request classification"),
+                "{output}"
+            );
             assert!(output.contains("123"), "{output}");
             assert!(
                 !output.contains("source=inference_provider_attempts"),
@@ -9694,7 +9700,10 @@ mod tests {
         let excluded = executor.handle_introspect(&serde_json::json!({
             "facet":"session", "source_policy":"cloud_only", "depth":"summary"
         }));
-        assert!(!excluded.contains("jev-test"), "{excluded}");
+        assert!(
+            !excluded.contains("Jev (jev) · Request classification"),
+            "{excluded}"
+        );
     }
 
     #[test]

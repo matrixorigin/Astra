@@ -93,6 +93,20 @@ fn projection_binding(
     wire_hash: &str,
     target_byte: char,
 ) -> ToolResultProjectionBindingV1 {
+    projection_binding_with_fallback(
+        run_id,
+        wire_hash,
+        target_byte,
+        ToolResultProjectionFallbackV1::JudgmentUnavailable,
+    )
+}
+
+fn projection_binding_with_fallback(
+    run_id: &str,
+    wire_hash: &str,
+    target_byte: char,
+    fallback: ToolResultProjectionFallbackV1,
+) -> ToolResultProjectionBindingV1 {
     let body = b"full canonical tool result";
     let decision = ToolResultProjectionDecisionV1::new(
         run_id,
@@ -104,7 +118,7 @@ fn projection_binding(
         ToolResultProjectionDispositionV1::Baseline,
         Vec::new(),
         None,
-        Some(ToolResultProjectionFallbackV1::JudgmentUnavailable),
+        Some(fallback),
         body,
     )
     .expect("projection decision");
@@ -3614,14 +3628,24 @@ async fn projection_decision_is_session_scoped_immutable_and_attempt_receipted()
         .await
         .expect("admit projection conflict");
     let conflict_base = provider_attempt(&conflict_plan, 0);
+    let conflict_binding = projection_binding_with_fallback(
+        &run_id,
+        provider_attempt(&conflict_plan, 0)
+            .wire()
+            .provider_wire_hash(),
+        'b',
+        ToolResultProjectionFallbackV1::JudgmentInvalid,
+    );
+    assert_eq!(
+        conflict_binding.decision.freeze_key_sha256, binding.decision.freeze_key_sha256,
+        "conflict must address the same frozen subject"
+    );
+    assert_ne!(
+        conflict_binding.decision.decision_sha256, binding.decision.decision_sha256,
+        "conflict must carry a different immutable decision"
+    );
     let conflict = conflict_base
-        .with_tool_result_projections(vec![projection_binding(
-            &run_id,
-            provider_attempt(&conflict_plan, 0)
-                .wire()
-                .provider_wire_hash(),
-            'd',
-        )])
+        .with_tool_result_projections(vec![conflict_binding])
         .expect("bind structurally valid conflicting decision");
     assert_eq!(
         begin_inference_provider_attempt(&shared_pool, &conflict)
