@@ -785,6 +785,79 @@ impl SemanticJudgmentView {
         );
         rendered
     }
+
+    /// Short projection for the default introspect/reflect view. A semantic
+    /// result is not a physical attempt and does not prove that the runtime
+    /// adopted it, so the compact form keeps that boundary explicit.
+    pub fn render_compact(&self) -> String {
+        let Some(c) = &self.counts else {
+            let source = match self.coverage {
+                SemanticJudgmentCoverage::SourceExcluded => "excluded by source policy",
+                SemanticJudgmentCoverage::SourceUnavailable => "source unavailable",
+                SemanticJudgmentCoverage::NoPool => "no provider pool",
+                SemanticJudgmentCoverage::Timeout => "timed out",
+                SemanticJudgmentCoverage::QueryFailed => "query failed",
+                SemanticJudgmentCoverage::NotObserved => "not observed",
+                SemanticJudgmentCoverage::CaptureIncomplete => "capture incomplete",
+            };
+            return format!(
+                "Request classification · {source} in {} · adoption unknown",
+                match self.scope {
+                    SemanticJudgmentScope::SessionTraceAtRead => "session trace",
+                    SemanticJudgmentScope::LocalJournalAtRead => "local journal",
+                }
+            );
+        };
+        let mut parts = Vec::new();
+        if c.decisions > 0 {
+            parts.push(format!("{} decided", c.decisions));
+        }
+        if c.abstained > 0 {
+            parts.push(format!("{} uncertain", c.abstained));
+        }
+        if c.conflicting > 0 {
+            parts.push(format!("{} conflicting", c.conflicting));
+        }
+        if c.invalid > 0 {
+            parts.push(format!("{} invalid", c.invalid));
+        }
+        if c.not_dispatched > 0 {
+            parts.push(format!("{} skipped", c.not_dispatched));
+        }
+        if c.evaluation_unavailable > 0 {
+            parts.push(format!("{} unavailable", c.evaluation_unavailable));
+        }
+        if parts.is_empty() {
+            parts.push("no result captured".into());
+        }
+        let mut line = format!(
+            "Request classification · {} · adoption unknown",
+            parts.join(" · ")
+        );
+        if c.evaluated == 0 && c.not_dispatched == 0 && c.evaluation_unavailable == 0 {
+            line.push_str(" · not evidence of zero calls");
+        }
+        if self.capture_truncated {
+            line.push_str(" · capture truncated");
+        } else if self.capture_incomplete {
+            line.push_str(" · capture incomplete");
+        }
+        if self.capture_omitted_observations > 0 || self.omitted_details > 0 {
+            line.push_str(" · some detail hidden");
+        }
+        line
+    }
+
+    pub fn render_for_depth(&self, depth: astra_core::ObservationDepth) -> String {
+        match depth {
+            astra_core::ObservationDepth::Hint | astra_core::ObservationDepth::Summary => {
+                self.render_compact()
+            }
+            astra_core::ObservationDepth::Diagnostic | astra_core::ObservationDepth::Forensic => {
+                self.render()
+            }
+        }
+    }
 }
 
 pub fn semantic_judgment_facet_enabled(facet: astra_core::ObservationFacet) -> bool {

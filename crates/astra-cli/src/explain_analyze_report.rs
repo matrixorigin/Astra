@@ -101,7 +101,7 @@ pub(crate) fn render(
     }
 
     lines.extend(
-        auxiliary_usage_lines(&graph)
+        auxiliary_usage_lines_with_detail(&graph, verbose)
             .into_iter()
             .map(|line| format!("  {line}")),
     );
@@ -547,9 +547,12 @@ mod tests {
         assert!(output.contains("Jev"), "{output}");
         assert!(output.contains("in 42"), "{output}");
         assert!(output.contains("out unknown"), "{output}");
-        assert!(output.contains("partial"), "{output}");
-        assert!(output.contains("offering jev-1"), "{output}");
-        assert!(output.contains("operation relevance"), "{output}");
+        assert!(output.contains("usage partial"), "{output}");
+        assert!(!output.contains("offering jev-1"), "{output}");
+        assert!(!output.contains("operation relevance"), "{output}");
+        let detailed = auxiliary_usage_lines_with_detail(&graph, true).join("\n");
+        assert!(detailed.contains("offering jev-1"), "{detailed}");
+        assert!(detailed.contains("operation relevance"), "{detailed}");
     }
 
     #[test]
@@ -605,7 +608,7 @@ mod tests {
         assert!(output.contains("Request classification"), "{output}");
         assert!(output.contains("in at least 40"), "{output}");
         assert!(output.contains("out at least 5"), "{output}");
-        assert!(output.contains("1/2 requests reported"), "{output}");
+        assert!(output.contains("usage 1/2 measured"), "{output}");
     }
 
     #[test]
@@ -667,7 +670,7 @@ mod tests {
             "out at least 384",
             "cache read at least 0",
             "cache write at least 128",
-            "128/128 captured requests reported",
+            "usage measured",
             "capture truncated",
         ] {
             assert!(output.contains(expected), "missing {expected}: {output}");
@@ -683,21 +686,28 @@ mod tests {
             truncated: false,
             attempts: vec![],
         };
-        let output = auxiliary_usage_lines(&graph_for(vec![complete, unavailable])).join("\n");
+        let output = auxiliary_usage_lines(&graph_for(vec![complete.clone(), unavailable.clone()]))
+            .join("\n");
         assert!(output.contains("in at least 2"), "{output}");
         assert!(output.contains("out at least 3"));
-        assert!(output.contains("1/1 captured requests reported"));
-        assert!(output.contains("capture unavailable"));
+        assert!(output.contains("usage measured"));
+        assert!(output.contains("some call usage unavailable"));
         assert!(!output.contains("capture truncated"));
+        let detailed =
+            auxiliary_usage_lines_with_detail(&graph_for(vec![complete, unavailable]), true)
+                .join("\n");
+        assert!(detailed.contains("capture unavailable"), "{detailed}");
         let empty = ExplainAnalyzeAuxiliaryUsageV1 {
             available: true,
             truncated: true,
             attempts: vec![],
         };
-        let output = auxiliary_usage_lines(&graph_for(vec![empty])).join("\n");
-        assert!(output.contains("full usage unknown"));
+        let output = auxiliary_usage_lines(&graph_for(vec![empty.clone()])).join("\n");
+        assert!(output.contains("token counts are lower bounds"));
         assert!(!output.contains("in 0"));
         assert!(!output.contains("0/0"));
+        let detailed = auxiliary_usage_lines_with_detail(&graph_for(vec![empty]), true).join("\n");
+        assert!(detailed.contains("full usage unknown"), "{detailed}");
     }
 
     #[test]
@@ -745,11 +755,26 @@ mod tests {
                 events.push(event);
             }
         }
-        // TUI consumes the same section; its full renderer has a local test.
+        // The default surfaces use the compact user-facing projection.
         for output in [
             auxiliary_usage_lines(&graph).join("\n"),
             render(&events, false, false),
             crate::explain_analyze_html::render(&events, false, false),
+        ] {
+            assert!(
+                output.contains(
+                    "Judgment usage · unavailable · 1 conflicting physical measurement(s); token total unknown"
+                ),
+                "{output}"
+            );
+            assert!(!output.contains("731") && !output.contains("947"));
+            assert!(!output.contains("capture truncated"));
+        }
+        // Detailed Explain/TUI/HTML views retain the forensic vocabulary.
+        for output in [
+            auxiliary_usage_lines_with_detail(&graph, true).join("\n"),
+            render(&events, true, false),
+            crate::explain_analyze_html::render(&events, true, false),
         ] {
             assert!(
                 output.contains("conflicting physical attempt evidence (1 identities)"),
@@ -768,6 +793,19 @@ mod tests {
             for output in [
                 render(&records, false, false),
                 crate::explain_analyze_html::render(&records, false, false),
+            ] {
+                assert!(
+                    output.contains(
+                        "Judgment usage · unavailable · conflicting turn/usage facts; token total unknown"
+                    ),
+                    "{output}"
+                );
+                assert!(!output.contains("731") && !output.contains("947"));
+                assert!(!output.contains("capture truncated"));
+            }
+            for output in [
+                render(&records, true, false),
+                crate::explain_analyze_html::render(&records, true, false),
             ] {
                 assert!(output.contains("conflicting turn/usage facts"), "{output}");
                 assert!(output.contains("no token total inferred"));
@@ -825,13 +863,13 @@ mod tests {
         let output = render(&[start, end], false, false);
         let lines = output
             .lines()
-            .filter(|line| line.contains("Auxiliary tokens"))
+            .filter(|line| line.contains("Judgment ·"))
             .collect::<Vec<_>>();
         assert_eq!(lines.len(), 3, "{output}");
         for (_, label, tokens) in operations {
             let line = lines.iter().find(|line| line.contains(label)).unwrap();
             assert!(line.contains(&format!("in {tokens} ·")), "{line}");
-            assert!(line.contains("1/1 requests reported"), "{line}");
+            assert!(line.contains("usage measured"), "{line}");
             assert!(line.contains("cache read unknown"), "{line}");
         }
         assert_eq!(
@@ -943,7 +981,7 @@ mod tests {
         let output = render(&events, false, false);
         let lines = output
             .lines()
-            .filter(|line| line.contains("Auxiliary tokens"))
+            .filter(|line| line.contains("Judgment ·"))
             .collect::<Vec<_>>();
         assert_eq!(lines.len(), 3, "{output}");
         for (identity, label, counts) in [
@@ -968,7 +1006,7 @@ mod tests {
                 .find(|line| line.contains(identity) && line.contains(label))
                 .unwrap();
             assert!(line.contains(counts), "{line}");
-            assert!(line.contains("1/1 requests reported"), "{line}");
+            assert!(line.contains("usage measured"), "{line}");
             assert!(!line.contains("partial"), "{line}");
         }
     }
@@ -1211,16 +1249,35 @@ mod tests {
 }
 
 /// Same separately attributed auxiliary usage section for text, TUI and HTML.
+#[cfg(test)]
 pub(crate) fn auxiliary_usage_lines(graph: &ExplainAnalyzeGraphV1) -> Vec<String> {
+    auxiliary_usage_lines_with_detail(graph, false)
+}
+
+pub(crate) fn auxiliary_usage_lines_with_detail(
+    graph: &ExplainAnalyzeGraphV1,
+    detailed: bool,
+) -> Vec<String> {
     use std::collections::BTreeMap;
     if graph.auxiliary_capture_conflicted() {
-        return vec!["Auxiliary tokens · capture unavailable · conflicting turn/usage facts; no token total inferred; not a truncation claim".into()];
+        return vec![if detailed {
+            "Auxiliary tokens · capture unavailable · conflicting turn/usage facts; no token total inferred; not a truncation claim".into()
+        } else {
+            "Judgment usage · unavailable · conflicting turn/usage facts; token total unknown"
+                .into()
+        }];
     }
     let conflicts = graph.auxiliary_usage_conflict_count();
     if conflicts > 0 {
-        return vec![format!(
-            "Auxiliary tokens · capture unavailable · conflicting physical attempt evidence ({conflicts} identities); no token total inferred; not a truncation claim"
-        )];
+        return vec![if detailed {
+            format!(
+                "Auxiliary tokens · capture unavailable · conflicting physical attempt evidence ({conflicts} identities); no token total inferred; not a truncation claim"
+            )
+        } else {
+            format!(
+                "Judgment usage · unavailable · {conflicts} conflicting physical measurement(s); token total unknown"
+            )
+        }];
     }
     type GroupKey<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str);
     type Attempts<'a> = Vec<&'a astra_turn_types::ExplainAnalyzeAuxiliaryAttemptV1>;
@@ -1240,96 +1297,151 @@ pub(crate) fn auxiliary_usage_lines(graph: &ExplainAnalyzeGraphV1) -> Vec<String
             .push(attempt);
     }
     let mut lines = Vec::new();
-    for ((provider, offering, model, purpose, operation), attempts) in groups {
-        let provider = if provider == "typesafe" {
-            "Jev"
-        } else {
-            provider
-        };
-        let purpose = auxiliary_usage_label(operation, purpose);
-        let reported = attempts
-            .iter()
-            .filter_map(|a| a.usage.as_ref())
-            .collect::<Vec<_>>();
-        let values = if reported.is_empty() {
-            "usage unavailable".into()
-        } else {
-            let lanes = [
-                (
-                    "in",
-                    reported
-                        .iter()
-                        .map(|u| u.fresh_input_tokens)
-                        .collect::<Vec<_>>(),
-                ),
-                (
-                    "cache read",
-                    reported.iter().map(|u| u.cache_read_tokens).collect(),
-                ),
-                (
-                    "cache write",
-                    reported.iter().map(|u| u.cache_creation_tokens).collect(),
-                ),
-                ("out", reported.iter().map(|u| u.output_tokens).collect()),
-            ];
-            lanes
-                .into_iter()
-                .map(|(name, counts)| {
-                    let total = counts.len();
-                    let known = counts.into_iter().flatten().collect::<Vec<_>>();
-                    if known.is_empty() {
-                        format!("{name} unknown")
-                    } else {
-                        let qualifier = if !incomplete_capture
-                            && known.len() == total
-                            && reported.len() == attempts.len()
-                        {
-                            ""
+    let render_group =
+        |provider: &str,
+         model: &str,
+         purpose: &str,
+         operation: &str,
+         offering: Option<&str>,
+         attempts: Vec<&astra_turn_types::ExplainAnalyzeAuxiliaryAttemptV1>| {
+            let reported = attempts
+                .iter()
+                .filter_map(|a| a.usage.as_ref())
+                .collect::<Vec<_>>();
+            let values = if reported.is_empty() {
+                "usage unavailable".into()
+            } else {
+                let lanes = [
+                    (
+                        "in",
+                        reported
+                            .iter()
+                            .map(|u| u.fresh_input_tokens)
+                            .collect::<Vec<_>>(),
+                    ),
+                    (
+                        "cache read",
+                        reported.iter().map(|u| u.cache_read_tokens).collect(),
+                    ),
+                    (
+                        "cache write",
+                        reported.iter().map(|u| u.cache_creation_tokens).collect(),
+                    ),
+                    ("out", reported.iter().map(|u| u.output_tokens).collect()),
+                ];
+                lanes
+                    .into_iter()
+                    .map(|(name, counts)| {
+                        let total = counts.len();
+                        let known = counts.into_iter().flatten().collect::<Vec<_>>();
+                        if known.is_empty() {
+                            format!("{name} unknown")
                         } else {
-                            "at least "
-                        };
-                        format!(
-                            "{name} {qualifier}{}",
-                            known.into_iter().map(u128::from).sum::<u128>()
-                        )
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" · ")
+                            let qualifier = if !incomplete_capture
+                                && known.len() == total
+                                && reported.len() == attempts.len()
+                            {
+                                ""
+                            } else {
+                                "at least "
+                            };
+                            format!(
+                                "{name} {qualifier}{}",
+                                known.into_iter().map(u128::from).sum::<u128>()
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            };
+            let partial = if attempts.iter().any(|a| {
+                a.usage_status
+                    != astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact
+            }) {
+                " · usage partial"
+            } else {
+                ""
+            };
+            let calls = if attempts.len() == 1 {
+                "1 call".to_string()
+            } else {
+                format!("{} calls", attempts.len())
+            };
+            let measured = if reported.len() == attempts.len() {
+                "usage measured".to_string()
+            } else {
+                format!("usage {}/{} measured", reported.len(), attempts.len())
+            };
+            if detailed {
+                let scope = if incomplete_capture {
+                    " · captured scope incomplete"
+                } else {
+                    ""
+                };
+                format!(
+                    "Auxiliary tokens · {} ({model}) · {} · {calls} · {values} · {measured}{partial}{scope} · operation {operation} · offering {}",
+                    astra_services::judgment_presentation::provider_label(provider),
+                    astra_services::judgment_presentation::purpose_label(operation, purpose),
+                    offering.unwrap_or("offering unavailable"),
+                )
+            } else {
+                let coverage = if truncated {
+                    " · capture truncated; counts are lower bounds"
+                } else if graph.auxiliary_usage_unavailable() {
+                    " · capture incomplete"
+                } else {
+                    ""
+                };
+                format!(
+                    "Judgment · {} · {} ({model}) · {calls} · {values} · {measured}{partial}{coverage}",
+                    astra_services::judgment_presentation::purpose_label(operation, purpose),
+                    astra_services::judgment_presentation::provider_label(provider),
+                )
+            }
         };
-        let partial = if attempts.iter().any(|a| {
-            a.usage_status != astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact
-        }) {
-            " · partial"
-        } else {
-            ""
-        };
-        let scope = if incomplete_capture { " captured" } else { "" };
-        lines.push(format!("Auxiliary tokens · {provider} ({model}) · {purpose} · operation {operation} · offering {offering} · {values} · {}/{}{scope} requests reported{partial}",reported.len(),attempts.len()));
+    if detailed {
+        for ((provider, offering, model, purpose, operation), attempts) in groups {
+            lines.push(render_group(
+                provider,
+                model,
+                purpose,
+                operation,
+                Some(offering),
+                attempts,
+            ));
+        }
+    } else {
+        let mut display_groups: BTreeMap<(&str, &str, &str, &str), Attempts<'_>> = BTreeMap::new();
+        for ((provider, _offering, model, purpose, operation), attempts) in groups {
+            display_groups
+                .entry((provider, model, purpose, operation))
+                .or_default()
+                .extend(attempts);
+        }
+        for ((provider, model, purpose, operation), attempts) in display_groups {
+            lines.push(render_group(
+                provider, model, purpose, operation, None, attempts,
+            ));
+        }
     }
     if truncated {
-        lines.push("Auxiliary tokens · capture truncated · counts cover captured requests only; all token sums are lower bounds; full usage unknown".into());
+        lines.push(if detailed {
+            "Auxiliary tokens · capture truncated · counts cover captured requests only; all token sums are lower bounds; full usage unknown".into()
+        } else {
+            "Judgment usage · capture truncated · token counts are lower bounds".into()
+        });
     }
     if graph.auxiliary_usage_unavailable() {
-        lines.push("Auxiliary tokens · capture unavailable".into());
+        lines.push(if detailed {
+            "Auxiliary tokens · capture unavailable".into()
+        } else {
+            "Judgment usage · some call usage unavailable".into()
+        });
     }
     lines
 }
 
+#[cfg(test)]
 fn auxiliary_usage_label(operation: &str, purpose: &str) -> &'static str {
-    match operation {
-        "request_judgment" => "Request classification",
-        "skill_auto_route" => "Skill selection",
-        "work_plan" => "Work planning",
-        _ => match purpose {
-            "memory_retrieval_rerank" => "Memory judgment",
-            "tool_result_rerank" => "Tool result selection",
-            "memory_extraction" => "Memory extraction",
-            "introspection" => "Request analysis",
-            "verification_judge" => "Verification",
-            "reflection" => "Reflection",
-            "required_compaction" => "Context summary",
-            _ => "Auxiliary inference",
-        },
-    }
+    astra_services::judgment_presentation::purpose_label(operation, purpose)
 }

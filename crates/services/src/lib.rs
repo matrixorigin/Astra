@@ -29,6 +29,7 @@ pub mod inference_execution;
 pub mod interaction_contract;
 pub mod introspection;
 pub mod jobs;
+pub mod judgment_presentation;
 pub mod llm_trusted_domains;
 pub mod marketplace;
 pub mod marketplace_stats;

@@ -47,7 +47,8 @@ pub(crate) fn render(
 
     writer.push(&overview_card(&graph, delivery_degraded));
 
-    let auxiliary_lines = crate::explain_analyze_report::auxiliary_usage_lines(&graph);
+    let auxiliary_lines =
+        crate::explain_analyze_report::auxiliary_usage_lines_with_detail(&graph, verbose);
     if !auxiliary_lines.is_empty() {
         writer.push("<section class=\"panel\"><h2>Auxiliary model usage</h2>");
         for line in auxiliary_lines {
