@@ -7640,7 +7640,7 @@ mod tests {
         };
         validate_criterion(&criterion).expect("bounded absence check");
         let result = evaluate_deterministic_with_session(
-            &[criterion.clone()],
+            std::slice::from_ref(&criterion),
             &outcome_with_tools(&[]),
             Some(&session),
         );

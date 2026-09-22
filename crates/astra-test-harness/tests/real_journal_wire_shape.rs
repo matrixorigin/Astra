@@ -172,6 +172,7 @@ fn legacy_fixture_session_event_count_llm_round_matches() {
         &[Criterion::SessionEventCount {
             event_type: "llm_round".into(),
             min: 1,
+            max: None,
             optional: false,
         }],
         &outcome,
@@ -187,6 +188,7 @@ fn legacy_fixture_session_event_count_llm_round_matches() {
         &[Criterion::SessionEventCount {
             event_type: "llm_round".into(),
             min: 5,
+            max: None,
             optional: false,
         }],
         &outcome,
@@ -271,6 +273,7 @@ fn session_event_count_step_completed_passes_on_step_events_layout() {
         &[Criterion::SessionEventCount {
             event_type: "StepCompleted".into(),
             min: 1,
+            max: None,
             optional: false,
         }],
         &outcome,
@@ -301,6 +304,7 @@ fn session_event_count_llm_round_still_fails_on_step_events_only() {
         &[Criterion::SessionEventCount {
             event_type: "llm_round".into(),
             min: 1,
+            max: None,
             optional: false,
         }],
         &outcome,
