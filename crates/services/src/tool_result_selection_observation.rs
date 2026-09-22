@@ -130,6 +130,16 @@ impl ToolResultJudgmentApplication {
     }
 }
 
+fn tool_result_judgment_execution_label(
+    execution: &astra_turn_types::ToolResultSelectionExecutionV1,
+) -> String {
+    crate::judgment_presentation::provider_model_label(
+        Some(execution.provider.as_str()),
+        Some(execution.model_name.as_str()),
+    )
+    .unwrap_or_else(|| "execution identity unavailable".into())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResultJudgmentExplanation {
     pub correlation: astra_turn_types::ToolResultSelectionCorrelationV1,
@@ -192,9 +202,8 @@ impl ToolResultJudgmentExplanation {
                 execution,
                 ..
             } => format!(
-                "selected {selected_chunks} chunk(s) via {} ({})",
-                execution.model_name,
-                crate::judgment_presentation::provider_label(&execution.provider),
+                "selected {selected_chunks} chunk(s) · execution via {}",
+                tool_result_judgment_execution_label(execution),
             ),
             Outcome::Decided {
                 disposition: Disposition::Baseline,
@@ -202,9 +211,8 @@ impl ToolResultJudgmentExplanation {
                 execution,
                 ..
             } => format!(
-                "kept baseline via {} ({}) · {}",
-                execution.model_name,
-                crate::judgment_presentation::provider_label(&execution.provider),
+                "kept baseline · execution via {} · {}",
+                tool_result_judgment_execution_label(execution),
                 tool_result_selection_fallback_label(*fallback),
             ),
             Outcome::Baseline { fallback, .. } => {
@@ -228,9 +236,8 @@ impl ToolResultJudgmentExplanation {
                 },
                 |execution| {
                     format!(
-                        "unavailable via {} ({}) · {}",
-                        execution.model_name,
-                        crate::judgment_presentation::provider_label(&execution.provider),
+                        "unavailable · execution via {} · {}",
+                        tool_result_judgment_execution_label(execution),
                         tool_result_selection_unavailable_reason_label(*reason),
                     )
                 },
@@ -239,8 +246,13 @@ impl ToolResultJudgmentExplanation {
     }
 
     fn render_detail(&self) -> String {
-        format!(
-            "turn {} round {} · source {} bytes, scanned {} bytes, {} candidate chunks · source {} · goal {} · trigger not recorded · {} · {} · downstream effect unknown",
+        let trigger = match &self.outcome {
+            astra_turn_types::ToolResultSelectionOutcomeV1::NotDispatched { .. }
+            | astra_turn_types::ToolResultSelectionOutcomeV1::Baseline { .. } => None,
+            _ => Some("why it ran is not recorded"),
+        };
+        let mut detail = format!(
+            "turn {} round {} · source {} bytes, scanned {} bytes, {} candidate chunks · source {} · goal {}",
             self.correlation.turn,
             self.correlation.round,
             self.coverage.source_bytes,
@@ -256,9 +268,17 @@ impl ToolResultJudgmentExplanation {
             } else {
                 "incomplete"
             },
+        );
+        if let Some(trigger) = trigger {
+            detail.push_str(" · ");
+            detail.push_str(trigger);
+        }
+        detail.push_str(&format!(
+            " · {} · {} · later task effect not recorded",
             self.outcome_label(),
             self.application.render_compact(),
-        )
+        ));
+        detail
     }
 
     fn render_compact(&self) -> String {
@@ -411,10 +431,13 @@ impl ToolResultJudgmentView {
                 .models
                 .iter()
                 .map(|m| {
+                    let identity = crate::judgment_presentation::provider_model_label(
+                        Some(m.provider.as_str()),
+                        Some(m.model.as_str()),
+                    )
+                    .unwrap_or_else(|| "execution identity unavailable".into());
                     format!(
-                        "{} via {} ({} observed invocation(s))",
-                        m.model,
-                        crate::judgment_presentation::provider_label(&m.provider),
+                        "execution via {identity} ({} observed invocation(s))",
                         m.observed_invocations
                     )
                 })
@@ -531,12 +554,12 @@ impl ToolResultJudgmentView {
             line.push_str(&format!(" · {application}"));
         }
         if let Some(model) = self.models.first() {
-            let identity = format!(
-                "{} ({})",
-                crate::judgment_presentation::provider_label(&model.provider),
-                model.model
-            );
-            line.push_str(&format!(" · model {identity}"));
+            let identity = crate::judgment_presentation::provider_model_label(
+                Some(model.provider.as_str()),
+                Some(model.model.as_str()),
+            )
+            .unwrap_or_else(|| "execution identity unavailable".into());
+            line.push_str(&format!(" · execution via {identity}"));
             if self.models.len() > 1 {
                 line.push_str(&format!(" +{} other model(s)", self.models.len() - 1));
             }
@@ -563,7 +586,7 @@ impl ToolResultJudgmentView {
             }
         }
         if !self.explanations.is_empty() {
-            line.push_str(" · downstream effect unknown");
+            line.push_str(" · later task effect not recorded");
         }
         if self.explanations_truncated {
             line.push_str(" · decision details truncated");
@@ -1305,7 +1328,7 @@ mod tests {
                 execution: astra_turn_types::ToolResultSelectionExecutionV1 {
                     invocation_id: "invocation-1".into(),
                     model_name: "jev-1.13.0".into(),
-                    provider: "jet".into(),
+                    provider: "typesafe".into(),
                 },
             },
         );
@@ -1329,7 +1352,7 @@ mod tests {
         assert_eq!(view.terminal_missing, 0);
         assert_eq!(view.models[0].model, "jev-1.13.0");
         assert_eq!(view.models[0].observed_invocations, 1);
-        assert!(view.render().contains("jev-1.13.0 via jet"));
+        assert!(view.render().contains("execution via Jev · jev-1.13.0"));
         let compact = view.render_compact();
         assert!(compact.contains("2 terminal results"), "{compact}");
         assert!(compact.contains("2 selected"), "{compact}");
@@ -1409,6 +1432,30 @@ mod tests {
             "{compact}"
         );
         assert!(compact.contains("1 conflicting"), "{compact}");
+
+        let skipped_view = project_tool_result_judgments(
+            [row("user-1", "session-1", "span-skipped", &skipped)],
+            projection_input(&[]),
+        );
+        let skipped_detail = skipped_view.render();
+        assert!(skipped_detail.contains("not dispatched · no offering"));
+        assert!(!skipped_detail.contains("why it ran is not recorded"));
+
+        let mut baseline = observation(
+            "evaluation-baseline",
+            astra_turn_types::ToolResultSelectionOutcomeV1::Baseline {
+                decision_sha256: "a".repeat(64),
+                fallback: astra_turn_types::ToolResultProjectionFallbackV1::IncompleteCoverage,
+            },
+        );
+        baseline.coverage.goal_complete = false;
+        let baseline_detail = project_tool_result_judgments(
+            [row("user-1", "session-1", "span-baseline", &baseline)],
+            projection_input(&[]),
+        )
+        .render();
+        assert!(baseline_detail.contains("kept baseline · incomplete evidence"));
+        assert!(!baseline_detail.contains("why it ran is not recorded"));
     }
 
     #[test]
@@ -1450,7 +1497,7 @@ mod tests {
                 execution: astra_turn_types::ToolResultSelectionExecutionV1 {
                     invocation_id: "invocation-1".into(),
                     model_name: "jev-1.13.0".into(),
-                    provider: "jet".into(),
+                    provider: "typesafe".into(),
                 },
             },
         );
@@ -1493,7 +1540,7 @@ mod tests {
         assert_eq!(matched.explanations.len(), 1);
         assert_eq!(matched.explanations[0].application.matched_receipts, 1);
         assert_eq!(matched.explanations[0].application.included, 1);
-        assert!(matched.render().contains("downstream effect unknown"));
+        assert!(matched.render().contains("later task effect not recorded"));
 
         let mut invocation_mismatch = selected_observation.clone();
         if let astra_turn_types::ToolResultSelectionOutcomeV1::Decided { execution, .. } =
