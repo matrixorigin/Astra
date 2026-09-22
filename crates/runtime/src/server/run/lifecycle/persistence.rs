@@ -566,8 +566,7 @@ impl PostLoopPersistContext {
             ));
         }
         let (turn_started_at, _) = turn_trace_time_bounds(state);
-        let outcome = persist_server_loop_trace_events_in_tx(
-            &mut tx,
+        let events = build_server_loop_trace_events(
             &self.user_id,
             &self.session_id,
             &self.run_id,
@@ -578,17 +577,17 @@ impl PostLoopPersistContext {
             state,
             self.model_name.as_deref(),
             turn_started_at,
-        )
-        .await?;
-        tx.commit().await.map_err(|error| error.to_string())?;
-        connection.release();
+        );
+        let outcome = DatabaseTraceEventWriter::write_many_in_tx(&mut tx, events)
+            .await
+            .map_err(|error| error.to_string())?;
         if let Some((delta, last_event_id)) = outcome
             .session_event_deltas
             .get(&(self.user_id.clone(), self.session_id.clone()))
             && *delta > 0
         {
             crate::data_layer::storage::bump_agent_session_event_count(
-                pool.get(),
+                &mut *tx,
                 &self.session_id,
                 &self.user_id,
                 *delta,
@@ -597,6 +596,8 @@ impl PostLoopPersistContext {
             .await
             .map_err(|error| format!("bump terminal trace session event count: {error}"))?;
         }
+        tx.commit().await.map_err(|error| error.to_string())?;
+        connection.release();
         Ok(())
     }
 
@@ -1185,19 +1186,14 @@ async fn persist_server_loop_canonical_append_inner(
         }
     }
 
-    // Core events (user_query + llm_response) + transcript items.
-    //
-    // `persist_server_loop_core_events_in_tx` now returns `Result`; on Err the
-    // transaction is poisoned (partial writes may be staged) and we MUST
-    // rollback instead of continuing to write detail events into the same tx.
+    // Core and detail facts share one insertion batch and session admission.
     let (execution_started_at, terminal_offset_ms) = turn_trace_time_bounds(state);
     let root_started_at = state
         .canonical_turn_started_at
         .get()
         .copied()
         .unwrap_or(execution_started_at);
-    let mut capture_outcome = match persist_server_loop_core_events_in_tx(
-        &mut tx,
+    let mut events = build_server_loop_core_events(
         append.user_id,
         append.session_id,
         append.run_id,
@@ -1212,16 +1208,27 @@ async fn persist_server_loop_canonical_append_inner(
         root_started_at,
         execution_started_at,
         terminal_offset_ms,
-    )
-    .await
-    {
+    );
+    events.extend(build_server_loop_trace_events(
+        append.user_id,
+        append.session_id,
+        append.run_id,
+        append.parent_run_id,
+        append.agent_id,
+        append.parent_agent_id,
+        append.trace_context.clone(),
+        state,
+        append.model_name,
+        execution_started_at,
+    ));
+    let capture_outcome = match DatabaseTraceEventWriter::write_many_in_tx(&mut tx, events).await {
         Ok(outcome) => outcome,
         Err(error) => {
-            let msg = format!("core events tx failed: {}", error);
+            let msg = format!("canonical events tx failed: {}", error);
             tracing::warn!(
                 session_id = %append.session_id,
                 error = %error,
-                "post-loop: core events tx failed, rolling back MO transaction"
+                "post-loop: canonical events tx failed, rolling back MO transaction"
             );
             // rollback consumes the transaction; cannot use tx after this
             if let Err(rollback_err) = tx.rollback().await {
@@ -1234,41 +1241,6 @@ async fn persist_server_loop_canonical_append_inner(
             return Err(msg);
         }
     };
-
-    // Trace detail events (LLM rounds, tool calls).
-    match persist_server_loop_trace_events_in_tx(
-        &mut tx,
-        append.user_id,
-        append.session_id,
-        append.run_id,
-        append.parent_run_id,
-        append.agent_id,
-        append.parent_agent_id,
-        append.trace_context.clone(),
-        state,
-        append.model_name,
-        execution_started_at,
-    )
-    .await
-    {
-        Ok(outcome) => capture_outcome.merge(outcome),
-        Err(error) => {
-            let msg = format!("detail events tx failed: {}", error);
-            tracing::warn!(
-                session_id = %append.session_id,
-                error = %error,
-                "post-loop: detail events tx failed, rolling back MO transaction"
-            );
-            if let Err(rb_err) = tx.rollback().await {
-                tracing::error!(
-                    session_id = %append.session_id,
-                    error = %rb_err,
-                    "post-loop: rollback failed after detail events tx failure"
-                );
-            }
-            return Err(msg);
-        }
-    }
 
     // Atomic settlement and its authoritative replay verifier require the same
     // complete evidence, including tool/round/user-intent events. Non-terminal
@@ -1317,6 +1289,24 @@ async fn persist_server_loop_canonical_append_inner(
             );
         }
         return Err(msg);
+    }
+
+    // Admission already holds this session's lock. Commit the insertion delta
+    // with its events so a crash or lost acknowledgement cannot lose the count.
+    if let Some((delta, last_event_id)) = capture_outcome
+        .session_event_deltas
+        .get(&(append.user_id.to_string(), append.session_id.to_string()))
+        && *delta > 0
+    {
+        crate::data_layer::storage::bump_agent_session_event_count(
+            &mut *tx,
+            append.session_id,
+            append.user_id,
+            *delta,
+            last_event_id.as_deref(),
+        )
+        .await
+        .map_err(|error| format!("bump canonical session event count: {error}"))?;
     }
 
     let terminal_commit = if let Some(settlement) = settlement {
@@ -1412,24 +1402,6 @@ async fn persist_server_loop_canonical_append_inner(
                 return Err(msg);
             }
         }
-    }
-    // Event rows and run state are now durable. Update the derived session
-    // counter outside the long canonical transaction so sibling fanout runs
-    // never wait on `agent_sessions` while holding their own event/run locks.
-    if let Some((delta, last_event_id)) = capture_outcome
-        .session_event_deltas
-        .get(&(append.user_id.to_string(), append.session_id.to_string()))
-        && *delta > 0
-    {
-        crate::data_layer::storage::bump_agent_session_event_count(
-            pool.get(),
-            append.session_id,
-            append.user_id,
-            *delta,
-            last_event_id.as_deref(),
-        )
-        .await
-        .map_err(|error| format!("bump canonical session event count: {error}"))?;
     }
     if let Some((store, _)) = terminal_commit.as_ref()
         && let Err(error) = store
@@ -2039,59 +2011,6 @@ fn server_loop_user_query_event(
     event.content = Some(user_message.to_string());
     event.created_at = created_at;
     Some(event)
-}
-
-/// Transactional variant: uses the provided transaction for all writes instead
-/// of creating its own. The caller owns commit/rollback.
-async fn persist_server_loop_core_events_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    user_id: &str,
-    session_id: &str,
-    run_id: &str,
-    parent_run_id: Option<&str>,
-    parent_event_id: Option<&str>,
-    agent_id: Option<&str>,
-    parent_agent_id: Option<&str>,
-    trace_context: Option<TraceContext>,
-    user_message: &str,
-    state: &AgenticLoopState,
-    model_name: Option<&str>,
-    root_started_at: chrono::DateTime<chrono::Utc>,
-    execution_started_at: chrono::DateTime<chrono::Utc>,
-    terminal_offset_ms: u64,
-) -> Result<TraceEventPersistOutcome, String> {
-    let events = build_server_loop_core_events(
-        user_id,
-        session_id,
-        run_id,
-        parent_run_id,
-        parent_event_id,
-        agent_id,
-        parent_agent_id,
-        trace_context,
-        user_message,
-        state,
-        model_name,
-        root_started_at,
-        execution_started_at,
-        terminal_offset_ms,
-    );
-    if events.is_empty() {
-        return Ok(TraceEventPersistOutcome::default());
-    }
-
-    match DatabaseTraceEventWriter::write_many_in_tx(tx, events).await {
-        Ok(deltas) => Ok(deltas),
-        Err(e) => {
-            astra_core::agent_error!(
-                "server-loop",
-                "failed to persist core events (in tx) for session {session_id}: {e}"
-            );
-            // Transaction is poisoned; caller must rollback. Do not keep writing
-            // transcript items into a dirty transaction.
-            Err(e.to_string())
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3318,10 +3237,7 @@ pub(crate) fn build_tool_trace_events(
     events
 }
 
-/// Transactional variant: uses the provided transaction for all writes.
-/// The caller owns commit/rollback.
-async fn persist_server_loop_trace_events_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+fn build_server_loop_trace_events(
     user_id: &str,
     session_id: &str,
     run_id: &str,
@@ -3332,7 +3248,7 @@ async fn persist_server_loop_trace_events_in_tx(
     state: &AgenticLoopState,
     model_name: Option<&str>,
     turn_started_at: chrono::DateTime<chrono::Utc>,
-) -> Result<TraceEventPersistOutcome, String> {
+) -> Vec<TraceEvent> {
     let trace = trace_context
         .unwrap_or_else(|| server_trace_context(user_id, session_id, run_id, state.session_turn));
     // Detail events are persisted as one terminal batch, so `Utc::now()` here
@@ -3358,20 +3274,7 @@ async fn persist_server_loop_trace_events_in_tx(
         parent_agent_id,
         &state.stall.tool_call_records,
     ));
-    if events.is_empty() {
-        return Ok(TraceEventPersistOutcome::default());
-    }
-
-    match DatabaseTraceEventWriter::write_many_in_tx(tx, events).await {
-        Ok(deltas) => Ok(deltas),
-        Err(e) => {
-            astra_core::agent_error!(
-                "server-loop",
-                "failed to persist trace detail events (in tx) for session {session_id}: {e}"
-            );
-            Err(e.to_string())
-        }
-    }
+    events
 }
 
 /// Variant that uses an existing transaction instead of creating its own.
@@ -3869,6 +3772,30 @@ mod tests {
     // Cache schema bootstrap, not sockets owned by a previous test's Tokio runtime.
     static SHARED_BOOTSTRAP: tokio::sync::OnceCell<MatrixOneSettings> =
         tokio::sync::OnceCell::const_new();
+
+    async fn assert_session_event_count(
+        db: &sqlx::MySqlPool,
+        user_id: &str,
+        session_id: &str,
+    ) -> i64 {
+        let (recorded, actual): (i64, i64) = sqlx::query_as(
+            "SELECT sessions.event_count,
+                    (SELECT COUNT(*) FROM agent_events events
+                     WHERE events.user_id = sessions.user_id
+                       AND events.session_id = sessions.session_id)
+             FROM agent_sessions sessions WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_one(db)
+        .await
+        .expect("read session counter and committed events");
+        assert_eq!(
+            recorded, actual,
+            "session counter must match committed events"
+        );
+        recorded
+    }
 
     fn resolved_terminal_fixture() -> astra_services::runs::AtomicRunTerminalSettlementCommit {
         astra_services::runs::AtomicRunTerminalSettlementCommit {
@@ -6104,6 +6031,10 @@ mod tests {
         .fetch_one(&db)
         .await
         .expect("load durable run after rollback");
+        assert_eq!(
+            assert_session_event_count(&db, &user_id, &session_id).await,
+            0
+        );
         assert_eq!(canonical_event_count, 0);
         assert_eq!(transcript_count, 0);
         assert_eq!(run_event_count, baseline_run_event_count);
@@ -6393,6 +6324,8 @@ mod tests {
             persist_server_loop_canonical_terminal_settlement(&pool, append(), &state, settlement)
                 .await
                 .expect("commit canonical terminal settlement");
+        let committed_count = assert_session_event_count(&db, &user_id, &session_id).await;
+        assert!(committed_count > 0);
         assert_eq!(commit.terminal_events, terminal_events);
         assert!(commit.terminal_assistant_source_event_id.is_some());
         if let Some(execution_started_at) = execution_started_at {
@@ -6453,12 +6386,20 @@ mod tests {
         .expect("delayed lost-ack resolution retains the original capture")
         .expect("commit must remain authoritative");
         assert_eq!(resolved.committed_events, terminal_events);
+        assert_eq!(
+            assert_session_event_count(&db, &user_id, &session_id).await,
+            committed_count
+        );
 
         tokio::time::sleep(Duration::from_millis(25)).await;
         let replay =
             persist_server_loop_canonical_terminal_settlement(&pool, append(), &state, settlement)
                 .await
                 .expect("delayed terminal replay is idempotent");
+        assert_eq!(
+            assert_session_event_count(&db, &user_id, &session_id).await,
+            committed_count
+        );
         assert_eq!(replay.terminal_events, commit.terminal_events);
         assert_eq!(
             replay.terminal_assistant_source_event_id,

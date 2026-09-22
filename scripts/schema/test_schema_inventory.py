@@ -927,7 +927,7 @@ fn char_literal() { let slash = '/'; }
             encoding="utf-8"
         )
         self.assertNotIn("CREATE TABLE IF NOT EXISTS session_sync_log", storage)
-        self.assertIn("DROP TABLE IF EXISTS session_sync_log", storage)
+        self.assertNotIn("DROP TABLE IF EXISTS session_sync_log", storage)
 
         state_sync = (
             schema_inventory.REPO_ROOT / "crates/services/src/state_sync.rs"
@@ -950,7 +950,7 @@ fn char_literal() { let slash = '/'; }
             "CREATE TABLE IF NOT EXISTS session_deletion_tombstones",
             storage,
         )
-        self.assertIn("DROP TABLE IF EXISTS session_deletion_tombstones", storage)
+        self.assertNotIn("DROP TABLE IF EXISTS session_deletion_tombstones", storage)
         self.assertIn("agent_session_lifecycle_fences", storage)
 
     def test_retired_session_projection_tables_are_absent_from_production_schema(self) -> None:
@@ -1061,8 +1061,8 @@ fn char_literal() { let slash = '/'; }
                 "list_checkpoints",
             ],
             "crates/services/src/storage.rs": [
-                "retire_auth_memoria_identities",
-                "DROP TABLE IF EXISTS auth_memoria_identities",
+                "validate_core_schema_table_claim",
+                "verify_core_schema_shape",
                 "preview_template_registry",
                 "raw_ref_scheme_registry",
                 "INSERT IGNORE INTO raw_ref_scheme_registry",

@@ -27,6 +27,15 @@ MatrixOne is the platform state store and analytic substrate. It should support:
 - analytic/evaluation workloads;
 - optional MatrixOne-native value such as time travel or hybrid search when appropriate.
 
+## Schema bootstrap
+
+Bootstrap supports a fresh database or the current schema contract. Canonical
+CREATE declarations define the complete table shape; startup validates it
+without ALTER-based upgrades, historical backfills, or retired-table cleanup.
+An older completion marker is rejected and requires a new database. Interrupted
+fresh bootstrap can retry under the existing database lease, with readiness
+published only after schema validation succeeds.
+
 ## Retention
 
 Retention is a product contract:
@@ -42,6 +51,12 @@ Retention is a product contract:
 
 - Event ids should be stable and collision-resistant.
 - Ingestion should be idempotent.
+- Session event counters commit in the same transaction as their inserted event
+  rows, including terminal settlement and trace repair. Replay contributes no
+  insertion delta; a lost commit acknowledgement must not trigger a separate
+  counter update.
+- Terminal capture batches core conversation events and LLM/tool trace events
+  through the same writer, sharing session admission and insertion readback.
 - Poison records should be isolated.
 - Invalid records should not block later independent facts.
 - Slot/lease semantics must avoid permanent deadlock through expiry or repair.

@@ -195,13 +195,14 @@ CARGO_INCREMENTAL=0 cargo test --locked -p astra-services \
 This covers create, credential rotation, explicit probe and failed-write
 preservation. Official OpenAI/Anthropic probe and rotation tests seed only their
 fixture rows with loopback endpoints; production official endpoints remain fixed.
-The same fixture also removes the new thinking observation columns in its
-designated disposable database, reruns schema bootstrap twice, and verifies
-that the old model row survives and credential rotation invalidates observations.
-Never designate a database containing non-test data for this fixture.
-Destructive schema rehearsals require an effective database name beginning with
-`astra_test_probe_` and a nonempty suffix, checked before bootstrap or writes.
-This prefix is a guardrail, not permission to reuse a database containing data.
+The fixture uses the current schema and verifies that credential rotation
+invalidates observations. Use only the explicitly designated test database;
+never designate a database containing non-test data.
+`schema_assertions::core_schema_catalog_matches_live_idempotent_bootstrap`
+creates its own disposable database to cover fresh bootstrap, expired lease
+recovery, interrupted-bootstrap retry, repeated validation, old-marker rejection,
+and failure without readiness publication when a required key is missing.
+Bootstrap does not migrate old schemas; recreate an unsupported database.
 `memoria_reauthentication_http` separately covers same-key reconnect, pending
 proof invalidation and an in-flight verification crossing disconnect/reconnect.
 

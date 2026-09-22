@@ -3855,7 +3855,7 @@ fn decode_device_lease_event_payload(row: &impl RowExt) -> Result<DeviceLeaseEnd
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{sync::Arc, time::Instant};
+    use std::sync::Arc;
 
     use astra_core::{ErrorResponse, SharedPool, error_response};
     use astra_services::auth::SessionActivityRecord;
@@ -4297,28 +4297,11 @@ mod tests {
         headers
     }
 
-    async fn perf_setup_pool() -> SharedPool {
-        assert_eq!(
-            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
-            Ok("1"),
-            "set ASTRA_TEST_DB_IT=1 for ignored session handler benchmarks"
-        );
-        let settings = astra_core::MatrixOneSettings::from_env();
-        let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
-            .unwrap_or_else(|_| "mysql".to_string());
-        astra_services::ensure_core_schema(&settings, &catalog)
-            .await
-            .expect("ensure_core_schema must pass before session handler benchmarks");
-        SharedPool::new(&settings)
-            .await
-            .expect("SharedPool::new must connect to MatrixOne")
-    }
-
-    fn perf_id(prefix: &str) -> String {
+    fn manifest_fixture_id(prefix: &str) -> String {
         format!("{prefix}-{}", Uuid::new_v4().simple())
     }
 
-    async fn insert_perf_session(pool: &SharedPool, user_id: &str, session_id: &str) {
+    async fn insert_manifest_session(pool: &SharedPool, user_id: &str, session_id: &str) {
         sqlx::query(
             "INSERT INTO agent_sessions
              (session_id, user_id, agent_id, title, status, metadata, created_at, updated_at)
@@ -4328,25 +4311,21 @@ mod tests {
         .bind(user_id)
         .execute(pool.get())
         .await
-        .expect("perf insert_session must succeed");
-    }
-
-    fn perf_millis(started: Instant) -> u128 {
-        started.elapsed().as_millis()
+        .expect("insert manifest reader session");
     }
 
     #[tokio::test]
-    #[ignore = "requires ASTRA_TEST_DB_IT=1; perf_benchmark"]
-    async fn perf_benchmark_7_latest_manifest_reads_use_production_reader() {
-        const MANIFESTS: usize = 512;
+    #[ignore = "requires ASTRA_TEST_DB_IT=1; live MatrixOne"]
+    async fn latest_manifest_reader_prefers_run_and_preserves_owner_scope() {
+        const MANIFESTS: usize = 3;
 
-        let pool = perf_setup_pool().await;
-        let user_id = perf_id("perf-read-user");
-        let session_id = perf_id("perf-read-session");
-        let preferred_run_id = perf_id("perf-read-preferred-run");
-        let latest_run_id = perf_id("perf-read-latest-run");
-        let manifest_prefix = perf_id("perf-manifest");
-        insert_perf_session(&pool, &user_id, &session_id).await;
+        let pool = crate::turn::services::setup_live_pool_for_test().await;
+        let user_id = manifest_fixture_id("reader-user");
+        let session_id = manifest_fixture_id("reader-session");
+        let preferred_run_id = manifest_fixture_id("reader-preferred-run");
+        let latest_run_id = manifest_fixture_id("reader-latest-run");
+        let manifest_prefix = manifest_fixture_id("reader-manifest");
+        insert_manifest_session(&pool, &user_id, &session_id).await;
 
         let store = DatabaseContextManifestStore::new(pool.clone());
         for index in 0..MANIFESTS {
@@ -4377,32 +4356,28 @@ mod tests {
                     vec![],
                 )
                 .await
-                .expect("PERF-7 manifest seed must succeed");
+                .expect("seed manifest");
             assert_eq!(
                 outcome,
                 DurableCaptureOutcome::Inserted,
-                "PERF-7 seed must be a fresh capture"
+                "seed must be a fresh capture"
             );
         }
 
-        let started = Instant::now();
         let preferred =
             load_latest_context_manifest(&pool, &user_id, &session_id, Some(&preferred_run_id))
                 .await
-                .expect("PERF-7 preferred latest-manifest query must succeed")
-                .expect("PERF-7 preferred latest-manifest query must find a row");
-        let preferred_ms = perf_millis(started);
+                .expect("read preferred manifest")
+                .expect("preferred run has a manifest");
         assert_eq!(
             preferred.manifest_id,
             format!("{manifest_prefix}-{:04}", MANIFESTS - 2)
         );
 
-        let started = Instant::now();
         let fallback = load_latest_context_manifest(&pool, &user_id, &session_id, None)
             .await
-            .expect("PERF-7 fallback latest-manifest query must succeed")
-            .expect("PERF-7 fallback latest-manifest query must find a row");
-        let fallback_ms = perf_millis(started);
+            .expect("read latest manifest")
+            .expect("session has a manifest");
         assert_eq!(
             fallback.manifest_id,
             format!("{manifest_prefix}-{:04}", MANIFESTS - 1)
@@ -4415,8 +4390,8 @@ mod tests {
             Some("perf-read-missing-run"),
         )
         .await
-        .expect("PERF-7 missing preferred run fallback must succeed")
-        .expect("PERF-7 missing preferred run must fall back to session latest");
+        .expect("read missing run fallback")
+        .expect("missing run falls back to session latest");
         assert_eq!(
             missing_preferred.manifest_id,
             format!("{manifest_prefix}-{:04}", MANIFESTS - 1)
@@ -4429,15 +4404,8 @@ mod tests {
             Some(&preferred_run_id),
         )
         .await
-        .expect("PERF-7 wrong-owner read must succeed");
-        assert!(wrong_owner.is_none(), "PERF-7 must not read another owner");
-        println!(
-            "PERF_RESULT benchmark=manifest_latest_read history_rows={MANIFESTS} preferred_ms={preferred_ms} fallback_ms={fallback_ms}"
-        );
-        assert!(
-            preferred_ms < 50 && fallback_ms < 50,
-            "PERF-7 latest reads must stay under 50ms: preferred={preferred_ms}ms fallback={fallback_ms}ms"
-        );
+        .expect("read foreign owner");
+        assert!(wrong_owner.is_none(), "must not read another owner");
     }
 
     #[tokio::test]

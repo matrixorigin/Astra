@@ -8,15 +8,30 @@ use astra_services::storage::{ensure_core_schema, load_core_schema_table_contrac
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
-    let (pool, settings) = common::setup_pool_and_settings().await;
+    let mut settings = common::require_db_it_env();
     let bootstrap_catalog =
         std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+    let mut admin_settings = settings.clone();
+    admin_settings.database = bootstrap_catalog.clone();
+    let admin = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_settings.database_url_with_password())
+        .await
+        .expect("connect bootstrap catalog");
+    settings.database = format!("astra_schema_it_{}", uuid::Uuid::new_v4().simple());
+    settings.db_pool_max_connections = 4;
+    settings.db_pool_min_connections = 1;
+    sqlx::query(&format!("CREATE DATABASE `{}`", settings.database))
+        .execute(&admin)
+        .await
+        .expect("create isolated schema database");
     ensure_core_schema(&settings, &bootstrap_catalog)
         .await
-        .expect("second core schema bootstrap");
+        .expect("fresh core schema bootstrap");
+    let pool = astra_core::SharedPool::new(&settings).await.unwrap();
     ensure_core_schema(&settings, &bootstrap_catalog)
         .await
-        .expect("third core schema bootstrap");
+        .expect("repeated core schema bootstrap");
 
     let schema = current_schema(&pool).await;
     let existing =
@@ -71,7 +86,7 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
     );
     assert!(
         !existing.contains("session_deletion_tombstones"),
-        "the redundant deletion tombstone table must be retired during bootstrap"
+        "fresh bootstrap must not create the redundant deletion tombstone table"
     );
     assert!(
         !contracts
@@ -81,7 +96,7 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
     );
     assert!(
         !existing.contains("auth_memoria_identities"),
-        "the migration-only Memoria identity table must be retired during bootstrap"
+        "fresh bootstrap must not create the obsolete Memoria identity table"
     );
     let proposal_columns = column_names(&pool, &schema, "work_proposals").await;
     for expected in [
@@ -215,6 +230,133 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
     .try_get::<i64, _>("count")
     .unwrap();
     assert_eq!(contracts, 1, "repeated bootstrap must remain idempotent");
+
+    // An interrupted fresh bootstrap can leave canonical tables and claims,
+    // no readiness marker, and an expired lease. It must be safe to retry.
+    for sql in [
+        "DELETE FROM astra_schema_contracts WHERE component = 'astra-core'",
+        "DELETE FROM astra_schema_table_contracts WHERE table_name = 'session_weighted_admission_owner_usage'",
+        "DROP TABLE session_weighted_admission_owner_usage",
+        "INSERT INTO astra_schema_bootstrap_leases (component, holder_id, lease_expires_at) VALUES ('astra-core', 'crashed-owner', DATE_SUB(NOW(6), INTERVAL 1 SECOND))",
+    ] {
+        sqlx::query(sql).execute(pool.get()).await.unwrap();
+    }
+    ensure_core_schema(&settings, &bootstrap_catalog)
+        .await
+        .expect("retry interrupted fresh bootstrap through expired lease");
+    let current: String = sqlx::query_scalar(
+        "SELECT contract_version FROM astra_schema_contracts WHERE component = 'astra-core'",
+    )
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        current,
+        astra_services::storage::CORE_SCHEMA_CONTRACT_VERSION
+    );
+
+    sqlx::query("UPDATE astra_schema_contracts SET contract_version = 'unsupported-old-schema' WHERE component = 'astra-core'")
+        .execute(pool.get()).await.unwrap();
+    let error = ensure_core_schema(&settings, &bootstrap_catalog)
+        .await
+        .expect_err("old completion marker must never enter bootstrap")
+        .to_string();
+    assert!(error.contains("recreate the database"), "{error}");
+    let unchanged: String = sqlx::query_scalar(
+        "SELECT contract_version FROM astra_schema_contracts WHERE component = 'astra-core'",
+    )
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(unchanged, "unsupported-old-schema");
+
+    sqlx::query(
+        "UPDATE astra_schema_contracts SET contract_version = ? WHERE component = 'astra-core'",
+    )
+    .bind(&current)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE auth_user_roles DROP INDEX idx_auth_user_roles_role_id")
+        .execute(pool.get())
+        .await
+        .unwrap();
+    for completed in [true, false] {
+        if !completed {
+            sqlx::query("DELETE FROM astra_schema_contracts WHERE component = 'astra-core'")
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+        let error = ensure_core_schema(&settings, &bootstrap_catalog)
+            .await
+            .expect_err("missing key must fail validation without repair")
+            .to_string();
+        assert!(error.contains("idx_auth_user_roles_role_id"), "{error}");
+        assert!(
+            index_columns(
+                &pool,
+                &schema,
+                "auth_user_roles",
+                "idx_auth_user_roles_role_id"
+            )
+            .await
+            .is_empty()
+        );
+    }
+    // Restore only this disposable fixture's index to isolate column drift.
+    sqlx::query("CREATE INDEX idx_auth_user_roles_role_id ON auth_user_roles (role_id)")
+        .execute(pool.get())
+        .await
+        .unwrap();
+    ensure_core_schema(&settings, &bootstrap_catalog)
+        .await
+        .expect("restored fixture is valid");
+    sqlx::query("ALTER TABLE user_llm_models DROP COLUMN thinking_probe_json")
+        .execute(pool.get())
+        .await
+        .unwrap();
+    for completed in [true, false] {
+        if !completed {
+            sqlx::query("DELETE FROM astra_schema_contracts WHERE component = 'astra-core'")
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+        let error = ensure_core_schema(&settings, &bootstrap_catalog)
+            .await
+            .expect_err("missing runtime field must fail without repair")
+            .to_string();
+        assert!(
+            error.contains("user_llm_models.thinking_probe_json"),
+            "{error}"
+        );
+        assert!(
+            !column_names(&pool, &schema, "user_llm_models")
+                .await
+                .iter()
+                .any(|column| column == "thinking_probe_json")
+        );
+    }
+    let markers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM astra_schema_contracts WHERE component = 'astra-core'",
+    )
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(markers, 0, "failed validation must not publish readiness");
+    // MatrixOne does not complete SQLx's graceful MySQL shutdown handshake.
+    // These task-owned pools have no concurrent borrowers; drop their sockets.
+    while pool.get().size() > 0 {
+        drop(pool.get().acquire().await.unwrap().detach());
+    }
+    sqlx::query(&format!("DROP DATABASE `{}`", settings.database))
+        .execute(&admin)
+        .await
+        .expect("drop isolated schema database");
+    while admin.size() > 0 {
+        drop(admin.acquire().await.unwrap().detach());
+    }
 }
 
 #[tokio::test]

@@ -613,10 +613,8 @@ impl DatabaseTraceEventWriter {
             // must dominate before any caller projects derived content.
             persist_outcome.merge(session_outcome);
         }
-        // Session summary updates are deliberately deferred until the owning
-        // transaction commits. They use the actual INSERT IGNORE delta, not a
-        // COUNT(*) scan that would lock/scan the shared event table under
-        // concurrent fanout.
+        // The transaction owner applies insertion deltas before committing.
+        // Replayed events never increment the count or require a COUNT(*) scan.
         Ok(persist_outcome)
     }
 }

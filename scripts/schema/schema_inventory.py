@@ -1919,7 +1919,7 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
             "sync status no longer depends on session_sync_log"
         ),
         migration_backfill=(
-            "no backfill; schema setup drops the legacy table and live MatrixOne tests assert it is absent"
+            "no backfill; fresh schema excludes the retired table and live MatrixOne tests assert it is absent"
         ),
         rollback=(
             "rollback would require explicitly reintroducing the DDL and persistence path; "
@@ -2039,8 +2039,7 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
             "anti-resurrection and recovery authority"
         ),
         migration_backfill=(
-            "legacy rows are copied into agent_session_lifecycle_fences before the redundant table "
-            "is dropped during the v85 schema bootstrap"
+            "none; bootstrap supports the current fresh schema without legacy data migration"
         ),
         rollback=(
             "rollback would require explicitly restoring the legacy table and its readers; "
@@ -2048,7 +2047,6 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         ),
         test_evidence=[
             "crates/services/tests/schema_assertions.rs::core_schema_catalog_matches_live_idempotent_bootstrap",
-            "crates/services/tests/edge_dispatch_schema_migration_db_it.rs::deletion_tombstone_schema_upgrade_migrates_rows_and_drops_redundant_table",
         ],
         rationale=(
             "the tombstone duplicated the lifecycle fence's irreversible delete fact and added "
@@ -2059,29 +2057,27 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         candidate="auth_memoria_identities",
         decision="removed",
         current_read_paths=[
-            "none in steady-state auth; v86 bootstrap reads the legacy source only during migration",
+            "none; identity lookup uses auth_external_identities",
         ],
         current_write_paths=[
-            "v86 bootstrap backfills auth_external_identities with the reserved memoria:legacy provider id and drops the source table",
+            "none; current issuer-scoped identities are written to auth_external_identities",
         ],
         user_api_impact=(
-            "legacy Memoria accounts remain reconnectable only with an explicit legacy issuer; "
+            "reserved legacy mappings in the canonical table require an explicit legacy issuer; "
             "current issuer-scoped identity and disconnect behavior remain in auth_external_identities"
         ),
         migration_backfill=(
-            "copy memoria_user_id/astra_user_id into auth_external_identities, fail closed on a "
-            "conflicting canonical mapping, then drop the migration-only source table"
+            "none; bootstrap supports the current fresh schema without legacy data migration"
         ),
         rollback=(
-            "rollback requires restoring the source rows from the reserved memoria:legacy mappings; "
-            "the canonical rows retain the complete legacy identity pair"
+            "rollback requires explicitly restoring the retired importer and its source data; "
+            "fresh bootstrap does not preserve or convert legacy source rows"
         ),
         test_evidence=[
-            "crates/services/tests/edge_dispatch_schema_migration_db_it.rs::legacy_memoria_identity_schema_upgrade_migrates_rows_and_drops_source_table",
             "crates/services/tests/memoria_auth_db_it.rs::memoria_issuer_atomicity_concurrent_binding_and_disconnect",
         ],
         rationale=(
-            "the table is a read-only migration source with no independent authority; keeping it "
+            "the obsolete source table has no current schema or runtime owner; restoring it "
             "forces runtime auth and model eligibility to maintain a second identity lookup"
         ),
     ),
