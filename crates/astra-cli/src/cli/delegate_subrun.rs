@@ -316,7 +316,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         let effective_model = Some(model_selection.name.clone());
         let child_thinking = effective_model
             .as_deref()
-            .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).1)
+            .map(|model| astra_turn_core::thinking_config::resolve_model_thinking_request(model).1)
             .unwrap_or_default();
         // The model alias does not establish a cache protocol. The admitted
         // server execution owns provider-specific request shaping.

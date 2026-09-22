@@ -490,6 +490,21 @@ pub fn resolve_model_thinking(model_selector: &str) -> (&str, ThinkingConfig) {
     (model_selector, ThinkingConfig::Off)
 }
 
+/// Parse an optional thinking suffix as a request override.
+///
+/// A plain model selector carries no request to disable reasoning, so it uses
+/// the admitted Offering's default. Explicit typed `ThinkingConfig::Off`
+/// remains available at request boundaries that support it; the legacy model
+/// suffix syntax has never encoded that distinction.
+pub fn resolve_model_thinking_request(model_selector: &str) -> (&str, ThinkingConfig) {
+    let (base_model, config) = resolve_model_thinking(model_selector);
+    if base_model == model_selector && matches!(config, ThinkingConfig::Off) {
+        (base_model, ThinkingConfig::ModelDefault)
+    } else {
+        (base_model, config)
+    }
+}
+
 // ─── Two-level /model selection ─────────────────────────────────────────────
 
 /// A selectable thinking option shown in the /model second-level prompt.
@@ -964,6 +979,22 @@ mod tests {
         let (name, cfg) = resolve_model_thinking("us.anthropic.claude-opus-4-6-v1");
         assert_eq!(name, "us.anthropic.claude-opus-4-6-v1");
         assert_eq!(cfg, ThinkingConfig::Off);
+    }
+
+    #[test]
+    fn request_parser_treats_an_unsuffixed_model_as_provider_default() {
+        let (name, cfg) = resolve_model_thinking_request("us.anthropic.claude-opus-4-6-v1");
+        assert_eq!(name, "us.anthropic.claude-opus-4-6-v1");
+        assert_eq!(cfg, ThinkingConfig::ModelDefault);
+
+        let (name, cfg) = resolve_model_thinking_request("some-model(thinking:high)");
+        assert_eq!(name, "some-model");
+        assert_eq!(
+            cfg,
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High
+            }
+        );
     }
 
     #[test]

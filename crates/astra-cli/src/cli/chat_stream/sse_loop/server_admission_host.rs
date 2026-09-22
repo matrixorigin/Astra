@@ -2181,7 +2181,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         let provider = astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(&model_id);
         let raw_provider = provider.raw_provider_name().to_owned();
         let capture_thinking =
-            astra_turn_core::thinking_config::resolve_model_thinking(model_selector).1;
+            astra_turn_core::thinking_config::resolve_model_thinking_request(model_selector).1;
         // Canonical prefix bytes: JSON-serialize the messages as-is.
         // This is the format `fork_reconstruct::reconstruct_messages`
         // expects on the consuming end. System prompts and tool
