@@ -26765,6 +26765,7 @@ mod tests {
                         result: observed,
                     },
                     diagnostic: None,
+                    execution: None,
                     interrupted: false,
                 });
             host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
