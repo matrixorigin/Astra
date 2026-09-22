@@ -458,6 +458,10 @@ pub struct RunStartContext {
     pub agent_binding_schema_version: Option<String>,
     pub model_selection: Option<ModelSelection>,
     pub resolved_model_selection: Option<ResolvedModelSelection>,
+    /// Trusted process-local proof that the complete model identity was
+    /// produced from admitted execution material for this run. This is not a
+    /// durable provenance label and is never reconstructed from request data.
+    pub model_identity_admitted: bool,
     pub runtime_profile: Option<RuntimeProfileRequest>,
     pub provider_request_fingerprint: Option<String>,
     pub provider_run_owner: Option<astra_services::runs::ProviderRunOwner>,
@@ -496,6 +500,7 @@ impl Default for RunStartContext {
             agent_binding_schema_version: None,
             model_selection: None,
             resolved_model_selection: None,
+            model_identity_admitted: false,
             runtime_profile: None,
             provider_request_fingerprint: None,
             provider_run_owner: None,
@@ -556,15 +561,11 @@ fn inherit_parent_run_identity(
                     });
                     Ok(())
                 }
-                (Some(selection), Some(resolved))
-                    if selection.offering_id == offering_id
-                        && resolved.offering_id == offering_id
-                        && resolved.model_name == model_name =>
-                {
-                    Ok(())
+                (Some(_), Some(_)) if context.model_identity_admitted => {
+                    durable_model_identity(context).map(|_| ())
                 }
                 _ => Err(
-                    "child run model identity must inherit the admitted parent Offering"
+                    "child run model identity must be inherited or contain one matching admitted Offering and resolved model"
                         .to_string(),
                 ),
             }
@@ -7127,6 +7128,163 @@ mod tests {
                 "provider_scope_id": "workspace-a"
             })
         );
+    }
+
+    #[tokio::test]
+    async fn delegated_run_accepts_a_distinct_admitted_child_model_identity() {
+        let engine = test_engine();
+        engine
+            .start_run_with_context(
+                "run-model-parent-explicit-child",
+                "user-1",
+                "sess-1",
+                RunStartContext {
+                    model_selection: Some(ModelSelection {
+                        offering_id: "offer-parent".to_string(),
+                    }),
+                    resolved_model_selection: Some(ResolvedModelSelection {
+                        offering_id: "offer-parent".to_string(),
+                        model_name: "parent-model".to_string(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        engine
+            .start_run_ext_with_context(
+                "run-model-explicit-child",
+                "user-1",
+                "sess-1",
+                Some("run-model-parent-explicit-child"),
+                Some("delegation-explicit-child"),
+                Some("reviewer"),
+                None,
+                RunStartContext {
+                    model_identity_admitted: true,
+                    model_selection: Some(ModelSelection {
+                        offering_id: "offer-child".to_string(),
+                    }),
+                    resolved_model_selection: Some(ResolvedModelSelection {
+                        offering_id: "offer-child".to_string(),
+                        model_name: "child-model".to_string(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a Server-admitted child Offering may differ from its parent");
+
+        let child = engine
+            .load_run("user-1", "run-model-explicit-child")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.model_offering_id.as_deref(), Some("offer-child"));
+        assert_eq!(child.resolved_model_name.as_deref(), Some("child-model"));
+    }
+
+    #[tokio::test]
+    async fn delegated_run_rejects_a_mismatched_explicit_child_model_identity() {
+        let engine = test_engine();
+        engine
+            .start_run_with_context(
+                "run-model-parent-invalid-child",
+                "user-1",
+                "sess-1",
+                RunStartContext {
+                    model_selection: Some(ModelSelection {
+                        offering_id: "offer-parent".to_string(),
+                    }),
+                    resolved_model_selection: Some(ResolvedModelSelection {
+                        offering_id: "offer-parent".to_string(),
+                        model_name: "parent-model".to_string(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let error = engine
+            .start_run_ext_with_context(
+                "run-model-invalid-child",
+                "user-1",
+                "sess-1",
+                Some("run-model-parent-invalid-child"),
+                Some("delegation-invalid-child"),
+                Some("reviewer"),
+                None,
+                RunStartContext {
+                    model_identity_admitted: true,
+                    model_selection: Some(ModelSelection {
+                        offering_id: "offer-child-a".to_string(),
+                    }),
+                    resolved_model_selection: Some(ResolvedModelSelection {
+                        offering_id: "offer-child-b".to_string(),
+                        model_name: "child-model".to_string(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("mismatched child identity must fail before persistence");
+        assert!(error.contains("matching admitted Offering"), "{error}");
+        assert!(
+            engine
+                .load_run("user-1", "run-model-invalid-child")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_run_rejects_an_unadmitted_explicit_child_model_identity() {
+        let engine = test_engine();
+        engine
+            .start_run_with_context(
+                "run-model-parent-unadmitted-child",
+                "user-1",
+                "sess-1",
+                RunStartContext {
+                    model_selection: Some(ModelSelection {
+                        offering_id: "offer-parent".to_string(),
+                    }),
+                    resolved_model_selection: Some(ResolvedModelSelection {
+                        offering_id: "offer-parent".to_string(),
+                        model_name: "parent-model".to_string(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let error = engine
+            .start_run_ext_with_context(
+                "run-model-unadmitted-child",
+                "user-1",
+                "sess-1",
+                Some("run-model-parent-unadmitted-child"),
+                Some("delegation-unadmitted-child"),
+                Some("reviewer"),
+                None,
+                RunStartContext {
+                    model_selection: Some(ModelSelection {
+                        offering_id: "offer-child".to_string(),
+                    }),
+                    resolved_model_selection: Some(ResolvedModelSelection {
+                        offering_id: "offer-child".to_string(),
+                        model_name: "child-model".to_string(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("an explicit child identity requires trusted admission provenance");
+        assert!(error.contains("inherited or contain"), "{error}");
     }
 
     #[tokio::test]

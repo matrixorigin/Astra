@@ -242,6 +242,7 @@ pub(crate) fn run_start_context_from_request(
             .map(|binding| binding.binding_schema_version.clone()),
         model_selection: request.model_selection.clone(),
         resolved_model_selection: request.resolved_model_selection.clone(),
+        model_identity_admitted: false,
         runtime_profile: effective_runtime_profile(request),
         provider_request_fingerprint: None,
         provider_run_owner: request.provider_run_owner.clone(),

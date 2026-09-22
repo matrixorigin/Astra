@@ -7786,6 +7786,10 @@ impl AgenticRunLifecycleService {
             execution_bindings,
             agent_binding_context.map(|context| context.bindings.as_slice()),
         );
+        // The request-derived context starts untrusted. Preserve this proof
+        // only after the selection, resolved identity, and short-lived
+        // execution material have matched at the Server admission boundary.
+        context.model_identity_admitted = true;
         context.work_binding = work_binding.map(ValidatedWorkRuntimeBinding::durable_binding);
         use astra_services::runs::{
             DurableAdmissionSource, ModelAdmissionSource, RuntimeCapabilitySource,
@@ -22311,6 +22315,7 @@ impl ServerSubRunExecutor {
                     interaction_mode: config.interaction_mode,
                     agent_binding_name: Some(config.agent_profile.name.clone()),
                     provider_run_owner: inherited_provider_run_owner(&config.context)?,
+                    model_identity_admitted: execution.is_some(),
                     model_selection: execution.map(|execution| ModelSelection {
                         offering_id: execution.offering_id.clone(),
                     }),
