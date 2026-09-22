@@ -2070,7 +2070,7 @@ mod tests {
                     ..Default::default()
                 },
                 models: vec![ToolResultJudgmentModel {
-                    provider: "jet".into(),
+                    provider: "typesafe".into(),
                     model: "jev-1.13.0".into(),
                     observed_invocations: 1,
                 }],
@@ -2086,12 +2086,16 @@ mod tests {
             .iter()
             .find(|item| item.kind == "tool_result_judgment")
             .expect("tool-result judgment observation");
-        assert!(observation.summary.contains("model jet (jev-1.13.0)"));
+        assert!(
+            observation
+                .summary
+                .contains("execution via Jev · jev-1.13.0")
+        );
         assert!(observation.summary.contains("1 included"));
         let text_request = IntrospectRequest::from_args(&serde_json::json!({}));
         let text = render_introspect_request(&snapshot, &text_request);
         assert!(text.contains("Tool-result selection ·"));
-        assert!(text.contains("model jet (jev-1.13.0)"));
+        assert!(text.contains("execution via Jev · jev-1.13.0"));
 
         let receipt_only = IntrospectSnapshot {
             tool_result_judgments: Some(ToolResultJudgmentView {
