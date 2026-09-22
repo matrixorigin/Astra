@@ -529,18 +529,6 @@ impl CliSpawnAgentExecutor {
         self
     }
 
-    /// Resolve the access token for the next spawn. Provider takes
-    /// precedence so refreshes propagate; falls back to the captured
-    /// `self.token` when the provider is absent or returns `None`.
-    fn resolve_token(&self) -> String {
-        if let Some(provider) = &self.token_provider {
-            if let Some(t) = provider() {
-                return t;
-            }
-        }
-        self.token.clone()
-    }
-
     fn resolve_effective_model(&self, config_model: Option<&str>) -> Option<String> {
         config_model
             .map(ToOwned::to_owned)
@@ -1745,16 +1733,23 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn cli_fanout_resolves_inherited_offering_once_before_spawning() {
-        let server = MockServer::start().await;
-        let offering = ModelListItemResponse {
-            offering_id: "offer-parent".into(),
+    fn test_executor(base_url: &str) -> CliSpawnAgentExecutor {
+        CliSpawnAgentExecutor::new(
+            astra_thin_client::ThinClient::new(base_url, None).expect("test api"),
+            "token".into(),
+            PathBuf::from("/tmp"),
+            None,
+        )
+    }
+
+    fn test_offering(offering_id: &str, name: &str) -> ModelListItemResponse {
+        ModelListItemResponse {
+            offering_id: offering_id.into(),
             access_id: "self-hosted".into(),
             access_kind: ModelAccessKind::SelfHosted,
             access_label: "Self-hosted".into(),
             execution_placement: ModelExecutionPlacement::Server,
-            name: "parent-model".into(),
+            name: name.into(),
             provider: "openai".into(),
             description: None,
             is_active: true,
@@ -1762,7 +1757,13 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_fanout_resolves_inherited_offering_once_before_spawning() {
+        let server = MockServer::start().await;
+        let offering = test_offering("offer-parent", "parent-model");
         Mock::given(method("GET"))
             .and(path("/models"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1775,13 +1776,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let executor = Arc::new(CliSpawnAgentExecutor::new(
-            api,
-            "token".into(),
-            PathBuf::from("/tmp"),
-            None,
-        ));
+        let executor = Arc::new(test_executor(&server.uri()));
         let context = cli_fanout_test_context();
         let inputs = (0..2)
             .map(|slot| SpawnAgentInput {
@@ -1858,14 +1853,7 @@ mod tests {
             .expect(1)
             .mount(&unavailable_server)
             .await;
-        let unavailable_api =
-            astra_thin_client::ThinClient::new(&unavailable_server.uri(), None).unwrap();
-        let unavailable_executor = Arc::new(CliSpawnAgentExecutor::new(
-            unavailable_api,
-            "token".into(),
-            PathBuf::from("/tmp"),
-            None,
-        ));
+        let unavailable_executor = Arc::new(test_executor(&unavailable_server.uri()));
         unsupported[1].reasoning = None;
         assert!(
             Arc::clone(&unavailable_executor)
@@ -1889,13 +1877,7 @@ mod tests {
             .expect(1)
             .mount(&revoked_server)
             .await;
-        let revoked_api = astra_thin_client::ThinClient::new(&revoked_server.uri(), None).unwrap();
-        let revoked_executor = Arc::new(CliSpawnAgentExecutor::new(
-            revoked_api,
-            "token".into(),
-            PathBuf::from("/tmp"),
-            None,
-        ));
+        let revoked_executor = Arc::new(test_executor(&revoked_server.uri()));
         let revoked_error = match Arc::clone(&revoked_executor)
             .prepare_batch(&unsupported, &context, Some(&parent))
             .await
@@ -1921,12 +1903,7 @@ mod tests {
             .expect(2)
             .mount(&server)
             .await;
-        let executor = Arc::new(CliSpawnAgentExecutor::new(
-            astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
-            "token".into(),
-            PathBuf::from("/tmp"),
-            None,
-        ));
+        let executor = Arc::new(test_executor(&server.uri()));
         let context = cli_fanout_test_context();
         let inputs = [
             SpawnAgentInput {
@@ -2014,12 +1991,7 @@ mod tests {
             .expect(1)
             .mount(&mismatch_server)
             .await;
-        let mismatch_executor = Arc::new(CliSpawnAgentExecutor::new(
-            astra_thin_client::ThinClient::new(&mismatch_server.uri(), None).unwrap(),
-            "token".into(),
-            PathBuf::from("/tmp"),
-            None,
-        ));
+        let mismatch_executor = Arc::new(test_executor(&mismatch_server.uri()));
         assert!(
             Arc::clone(&mismatch_executor)
                 .prepare_batch(&inputs, &context, Some(&parent))
@@ -2035,12 +2007,7 @@ mod tests {
                 .expect(1)
                 .mount(&failure_server)
                 .await;
-            let failure_executor = Arc::new(CliSpawnAgentExecutor::new(
-                astra_thin_client::ThinClient::new(&failure_server.uri(), None).unwrap(),
-                "token".into(),
-                PathBuf::from("/tmp"),
-                None,
-            ));
+            let failure_executor = Arc::new(test_executor(&failure_server.uri()));
             assert!(
                 Arc::clone(&failure_executor)
                     .prepare_batch(&inputs, &context, Some(&parent))
@@ -2069,12 +2036,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let executor = Arc::new(CliSpawnAgentExecutor::new(
-            astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
-            "token".into(),
-            PathBuf::from("/tmp"),
-            None,
-        ));
+        let executor = Arc::new(test_executor(&server.uri()));
         let input = SpawnAgentInput {
             description: "reasoning override".into(),
             prompt: "reply".into(),
@@ -2117,21 +2079,7 @@ mod tests {
     #[tokio::test]
     async fn cli_fanout_without_typed_parent_selection_ignores_stale_display_name() {
         let server = MockServer::start().await;
-        let offering = ModelListItemResponse {
-            offering_id: "default-offer".into(),
-            access_id: "self-hosted".into(),
-            access_kind: ModelAccessKind::SelfHosted,
-            access_label: "Self-hosted".into(),
-            execution_placement: ModelExecutionPlacement::Server,
-            name: "default-model".into(),
-            provider: "openai".into(),
-            description: None,
-            is_active: true,
-            context_window: 128_000,
-            max_completion_tokens: None,
-            architecture: None,
-            thinking_capability: None,
-        };
+        let offering = test_offering("default-offer", "default-model");
         Mock::given(method("GET"))
             .and(path("/models"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -2142,31 +2090,11 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let executor = Arc::new(
-            CliSpawnAgentExecutor::new(
-                astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
-                "token".into(),
-                PathBuf::from("/tmp"),
-                None,
-            )
-            .with_default_model(Some("default-model".into())),
-        );
+        let executor =
+            Arc::new(test_executor(&server.uri()).with_default_model(Some("default-model".into())));
         let context = SpawnContext {
-            parent_run_id: "parent-run".into(),
-            parent_agent_id: "parent-agent".into(),
             resolved_model_name: Some("stale-display-name".into()),
-            recursion_depth: 0,
-            parent_is_fork_child: false,
-            working_dir: PathBuf::from("/tmp"),
-            inherited_permissions: InheritedPermissions::auto_approve(),
-            inherited_skills: Vec::new(),
-            live_event_sink: None,
-            client_tool_delivery_tx: None,
-            trace_context: None,
-            spawn_tool_call_id: None,
-            execution_metadata: None,
-            workspace_mutation: Default::default(),
-            delegation_chain: Vec::new(),
+            ..cli_fanout_test_context()
         };
         let inputs = vec![SpawnAgentInput {
             description: "review".into(),
@@ -2447,11 +2375,11 @@ mod tests {
     /// stale token stays in the spawn executor and every spawn 401s.
     ///
     /// This test pins the fix: when a token provider is installed,
-    /// `resolve_token()` MUST return the provider's value, not the
+    /// `resolve_token_async()` MUST return the provider's value, not the
     /// frozen one. Mutating the provider's source between calls
     /// proves freshness.
-    #[test]
-    fn token_provider_overrides_stale_captured_token() {
+    #[tokio::test]
+    async fn token_provider_overrides_stale_captured_token() {
         let api = astra_thin_client::ThinClient::new("http://test", None).expect("test api");
         let executor_no_provider = CliSpawnAgentExecutor::new(
             api.clone(),
@@ -2460,7 +2388,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            executor_no_provider.resolve_token(),
+            executor_no_provider.resolve_token_async().await.unwrap(),
             "stale-token",
             "without a provider, fall back to the captured token"
         );
@@ -2479,14 +2407,14 @@ mod tests {
         .with_token_provider(provider);
 
         assert_eq!(
-            executor.resolve_token(),
+            executor.resolve_token_async().await.unwrap(),
             "v1",
             "provider must take precedence over the captured fallback"
         );
         // Simulate a token refresh in the parent flow.
         *live_token.lock_recover() = "v2-refreshed".to_string();
         assert_eq!(
-            executor.resolve_token(),
+            executor.resolve_token_async().await.unwrap(),
             "v2-refreshed",
             "subsequent spawns must read the refreshed token, not a frozen copy"
         );
@@ -2496,8 +2424,8 @@ mod tests {
     /// out mid-session), fall back to the captured token rather than
     /// crashing or sending an empty string. The captured token will
     /// itself fail with 401 — but at least with a recognisable error.
-    #[test]
-    fn token_provider_none_falls_back_to_captured() {
+    #[tokio::test]
+    async fn token_provider_none_falls_back_to_captured() {
         let api = astra_thin_client::ThinClient::new("http://test", None).expect("test api");
         let provider: TokenProvider = std::sync::Arc::new(|| None);
         let executor = CliSpawnAgentExecutor::new(
@@ -2509,7 +2437,7 @@ mod tests {
         .with_token_provider(provider);
 
         assert_eq!(
-            executor.resolve_token(),
+            executor.resolve_token_async().await.unwrap(),
             "fallback-token",
             "provider returning None must fall back to the captured token"
         );
@@ -2535,7 +2463,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new("http://test", None).expect("test api");
         let provider: TokenProvider = std::sync::Arc::new(|| panic!("token store poisoned"));
         let live_sink = Arc::new(RecordingLiveSink::default());
-        let (inherited_permissions, permission_context) = test_permission_context();
         let executor =
             CliSpawnAgentExecutor::new(api, "stale-token".to_string(), PathBuf::from("/tmp"), None)
                 .with_token_provider(provider);
@@ -2550,31 +2477,15 @@ mod tests {
                 agent_type: "task".into(),
                 description: "Review token failure".into(),
                 task: "review".into(),
-                system_prompt_addendum: String::new(),
-                model_selection: None,
-                fanout_slot: None,
-                thinking: astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
                 model: Some("test-model".into()),
-                initial_turns: 1,
                 hard_turn_limit: Some(1),
-                allowed_tools: Vec::new(),
-                read_only: true,
-                workspace_mutation: Default::default(),
-                working_dir: PathBuf::from("/tmp"),
-                mailbox: None,
-                progress_emitter: None,
-                context_cache: None,
-                inherited_permissions,
                 parent_address: None,
-                permission_context,
-                inherited_skills: Vec::new(),
                 live_event_sink: Some(live_sink.clone()),
-                client_tool_delivery_tx: None,
-                inherited_prefix: None,
-                execution_metadata: None,
-                is_fork_child: false,
-                delegation_chain: Vec::new(),
-                work_item: None,
+                ..prepared_cli_test_config(
+                    None,
+                    None,
+                    astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
+                )
             })
             .await
             .expect_err("token provider panic should fail execute");
@@ -2606,7 +2517,6 @@ mod tests {
         .expect("mock LLM");
         let api = astra_thin_client::ThinClient::new(&mock.base_url, None).expect("test api");
         let live_sink = Arc::new(RecordingLiveSink::default());
-        let (inherited_permissions, permission_context) = test_permission_context();
         let executor =
             CliSpawnAgentExecutor::new(api, "test-token".into(), std::env::temp_dir(), None);
 
@@ -2620,31 +2530,16 @@ mod tests {
                 agent_type: "task".into(),
                 description: "Live output child".into(),
                 task: "Return one concise finding.".into(),
-                system_prompt_addendum: String::new(),
-                model_selection: None,
-                fanout_slot: None,
-                thinking: astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
                 model: Some("mock-model".into()),
-                initial_turns: 1,
                 hard_turn_limit: Some(1),
-                allowed_tools: Vec::new(),
-                read_only: true,
-                workspace_mutation: Default::default(),
                 working_dir: std::env::temp_dir(),
-                mailbox: None,
-                progress_emitter: None,
-                context_cache: None,
-                inherited_permissions,
                 parent_address: None,
-                permission_context,
-                inherited_skills: Vec::new(),
                 live_event_sink: Some(live_sink.clone()),
-                client_tool_delivery_tx: None,
-                inherited_prefix: None,
-                execution_metadata: None,
-                is_fork_child: false,
-                delegation_chain: Vec::new(),
-                work_item: None,
+                ..prepared_cli_test_config(
+                    None,
+                    None,
+                    astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
+                )
             })
             .await
             .expect("spawned run");
