@@ -14,6 +14,26 @@ pub fn provider_label(provider: &str) -> &str {
     }
 }
 
+/// Render a provider/model pair for a user-facing judgment summary.
+///
+/// The provider remains the authority for the wire route while the model is
+/// kept beside it.  In particular, `typesafe` is the implementation provider
+/// name for Jev, so exposing only the wire name makes a real Jev call look
+/// like an opaque internal service.  Empty values are omitted rather than
+/// guessed from an operation or a nearby attempt.
+pub fn provider_model_label(provider: Option<&str>, model: Option<&str>) -> Option<String> {
+    let provider = provider
+        .filter(|value| !value.is_empty())
+        .map(provider_label);
+    let model = model.filter(|value| !value.is_empty());
+    match (provider, model) {
+        (Some(provider), Some(model)) => Some(format!("{provider} · {model}")),
+        (Some(provider), None) => Some(provider.to_owned()),
+        (None, Some(model)) => Some((*model).to_owned()),
+        (None, None) => None,
+    }
+}
+
 /// Stable user-facing labels for the supported judgment operations.
 pub fn purpose_label(operation: &str, purpose: &str) -> &'static str {
     match operation {
@@ -64,5 +84,14 @@ mod tests {
             "Memory judgment"
         );
         assert_eq!(purpose_label("unknown", "other"), "Auxiliary inference");
+        assert_eq!(
+            provider_model_label(Some("typesafe"), Some("jev-1.13.0")),
+            Some("Jev · jev-1.13.0".into())
+        );
+        assert_eq!(
+            provider_model_label(Some("deepseek"), Some("deepseek-flash")),
+            Some("deepseek · deepseek-flash".into())
+        );
+        assert_eq!(provider_model_label(Some(""), None), None);
     }
 }

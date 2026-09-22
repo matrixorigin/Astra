@@ -976,18 +976,24 @@ impl SemanticJudgmentView {
     fn execution_coverage_note(&self) -> Option<&'static str> {
         match self.execution_coverage {
             SemanticJudgmentExecutionCoverage::LookupIncomplete => {
-                Some("execution lookup incomplete")
+                Some("execution record is partial")
             }
             SemanticJudgmentExecutionCoverage::SourceExcluded => {
-                Some("execution lookup excluded by source policy")
+                Some("execution record is excluded by the selected source")
             }
-            SemanticJudgmentExecutionCoverage::NoPool => Some("execution ledger unavailable"),
-            SemanticJudgmentExecutionCoverage::Timeout => Some("execution lookup timed out"),
-            SemanticJudgmentExecutionCoverage::QueryFailed => Some("execution lookup failed"),
+            SemanticJudgmentExecutionCoverage::NoPool => Some("execution record unavailable"),
+            SemanticJudgmentExecutionCoverage::Timeout => {
+                Some("loading execution details timed out")
+            }
+            SemanticJudgmentExecutionCoverage::QueryFailed => {
+                Some("execution record failed to load")
+            }
             SemanticJudgmentExecutionCoverage::SourceUnavailable => {
-                Some("execution identity unavailable from this source")
+                Some("execution identity is unavailable from this source")
             }
-            SemanticJudgmentExecutionCoverage::Deferred => Some("execution details deferred"),
+            SemanticJudgmentExecutionCoverage::Deferred => {
+                Some("model details not loaded at this depth")
+            }
             SemanticJudgmentExecutionCoverage::NotObserved
             | SemanticJudgmentExecutionCoverage::LookupComplete => None,
         }
@@ -1084,7 +1090,7 @@ impl SemanticJudgmentView {
                 SemanticJudgmentCoverage::CaptureIncomplete => "capture incomplete",
             };
             return format!(
-                "Request classification · {source} in {} · adoption unknown",
+                "Request classification · {source} in {}; no result is available here",
                 match self.scope {
                     SemanticJudgmentScope::SessionTraceAtRead => "session trace",
                     SemanticJudgmentScope::LocalJournalAtRead => "local journal",
@@ -1096,58 +1102,65 @@ impl SemanticJudgmentView {
         if !captured.is_empty() {
             parts.push(format!("captured: {}", captured.join("; ")));
         }
-        if c.decisions > 0 {
-            parts.push(format!("{} decided", c.decisions));
+        let evaluation_count = self.captured_evaluation_count();
+        if evaluation_count > 0 {
+            let label = if evaluation_count == 1 {
+                "evaluation"
+            } else {
+                "evaluations"
+            };
+            parts.push(format!("{evaluation_count} {label}"));
         }
-        if c.abstained > 0 {
-            parts.push(format!("{} uncertain", c.abstained));
-        }
-        if c.conflicting > 0 {
-            parts.push(format!("{} conflicting", c.conflicting));
-        }
-        if c.invalid > 0 {
-            parts.push(format!("{} invalid", c.invalid));
-        }
-        if c.not_dispatched > 0 {
-            parts.push(format!("{} skipped", c.not_dispatched));
-        }
-        if c.evaluation_unavailable > 0 {
-            parts.push(format!("{} unavailable", c.evaluation_unavailable));
+        if captured.is_empty() || self.observations.len() > captured.len() {
+            if c.abstained > 0 {
+                parts.push(format!("{} uncertain", c.abstained));
+            }
+            if c.conflicting > 0 {
+                parts.push(format!("{} conflicting", c.conflicting));
+            }
+            if c.invalid > 0 {
+                parts.push(format!("{} invalid", c.invalid));
+            }
+            if c.not_dispatched > 0 {
+                parts.push(format!("{} skipped", c.not_dispatched));
+            }
+            if c.evaluation_unavailable > 0 {
+                parts.push(format!("{} unavailable", c.evaluation_unavailable));
+            }
         }
         if parts.is_empty() {
             parts.push("no result captured".into());
         }
-        let mut line = format!(
-            "Request classification · {} · adoption unknown",
-            parts.join(" · ")
-        );
-        if c.evaluated == 0 && c.not_dispatched == 0 && c.evaluation_unavailable == 0 {
-            line.push_str(" · not evidence of zero calls");
+        let mut line = format!("Request classification · {}", parts.join(" · "));
+        // This view contains classification and (when available) physical
+        // execution evidence. It intentionally does not contain an
+        // application receipt, so state that boundary without implying that
+        // a missing record means the classification was ignored.
+        if c.evaluated == 0 && c.evaluation_unavailable == 0 && c.not_dispatched > 0 {
+            let skipped = if c.not_dispatched == 1 {
+                "captured classification was skipped".to_owned()
+            } else {
+                format!("{} captured classifications were skipped", c.not_dispatched)
+            };
+            line.push_str(" · ");
+            line.push_str(&skipped);
+        } else {
+            line.push_str(" · whether it guided the run is not recorded");
         }
         if self.capture_truncated {
-            line.push_str(" · capture truncated");
+            line.push_str(" · history truncated");
         } else if self.capture_incomplete {
-            line.push_str(" · capture incomplete");
+            line.push_str(" · history may be incomplete");
         }
         if self.capture_omitted_observations > 0 || self.omitted_details > 0 {
-            line.push_str(" · some detail hidden");
+            line.push_str(" · more detail omitted");
         }
         if self.execution_omitted > 0 {
-            line.push_str(" · execution detail hidden");
+            line.push_str(" · more execution detail omitted");
         }
         if let Some(note) = self.execution_coverage_note() {
             line.push_str(" · ");
             line.push_str(note);
-        }
-        if self.observations.len() > captured.len() {
-            line.push_str(&format!(
-                " · {} other captured result(s) hidden",
-                self.observations.len() - captured.len()
-            ));
-        }
-        let evaluation_count = self.captured_evaluation_count();
-        if evaluation_count > 1 {
-            line.push_str(&format!(" · {evaluation_count} evaluations captured"));
         }
         line
     }
@@ -1188,14 +1201,12 @@ impl SemanticJudgmentExecutionExplanation {
     fn render_label(&self) -> String {
         match self.association {
             SemanticJudgmentExecutionAssociation::Matched => {
-                let mut label = match (&self.model_name, &self.provider) {
-                    (Some(model), Some(provider)) => {
-                        format!("execution model={model} · provider={provider}")
-                    }
-                    (Some(model), None) => format!("execution model={model}"),
-                    (None, Some(provider)) => format!("execution provider={provider}"),
-                    (None, None) => "execution matched".to_owned(),
-                };
+                let mut label = crate::judgment_presentation::provider_model_label(
+                    self.provider.as_deref(),
+                    self.model_name.as_deref(),
+                )
+                .map(|identity| format!("execution via {identity}"))
+                .unwrap_or_else(|| "execution matched".to_owned());
                 if self.attempts.len() > 1 {
                     label.push_str(&format!(" · {} attempts", self.attempts.len()));
                 }
@@ -1628,7 +1639,14 @@ mod tests {
             not_captured.association,
             SemanticJudgmentExecutionAssociation::NotCaptured
         );
-        assert!(view.render().contains("model=deepseek-flash"));
+        assert!(
+            view.render()
+                .contains("execution via deepseek · deepseek-flash")
+        );
+        assert!(
+            view.render_compact()
+                .contains("via deepseek · deepseek-flash")
+        );
         assert!(
             view.captured_result_labels(4, true)
                 .join("; ")
@@ -1662,7 +1680,7 @@ mod tests {
         assert!(view.execution_explanations[0].attempts_truncated);
         assert!(
             view.render_compact()
-                .contains("execution lookup incomplete")
+                .contains("execution record is partial")
         );
     }
 
@@ -1824,7 +1842,10 @@ mod tests {
             SemanticJudgmentExecutionCoverage::Deferred
         );
         assert!(view.execution_explanations.is_empty());
-        assert!(view.render_compact().contains("execution details deferred"));
+        assert!(
+            view.render_compact()
+                .contains("model details not loaded at this depth")
+        );
     }
 
     fn decided() -> RequestJudgmentResultV1 {
@@ -2164,9 +2185,19 @@ mod tests {
             32,
         );
         assert_eq!(copies.duplicate_observations, 1);
-        let counts = SemanticJudgmentView::from_capture(copies).counts.unwrap();
+        let view = SemanticJudgmentView::from_capture(copies);
+        let counts = view.counts.as_ref().unwrap();
         assert_eq!(counts.not_dispatched, 1);
         assert_eq!(counts.evaluated, 0);
+        let compact = view.render_compact();
+        assert!(
+            compact.contains("captured classification was skipped"),
+            "{compact}"
+        );
+        assert!(
+            !compact.contains("whether it guided the run is not recorded"),
+            "{compact}"
+        );
     }
 
     #[test]
@@ -2476,12 +2507,15 @@ mod tests {
             "{compact}"
         );
         assert!(compact.contains("scope=unknown"), "{compact}");
-        assert!(compact.contains("1 decided"), "{compact}");
+        assert!(compact.contains("1 evaluation"), "{compact}");
         assert!(
             !compact.contains("other captured result(s) hidden"),
             "{compact}"
         );
-        assert!(compact.contains("adoption unknown"), "{compact}");
+        assert!(
+            compact.contains("whether it guided the run is not recorded"),
+            "{compact}"
+        );
         assert!(view.capture_incomplete);
         assert!(
             view.render()
@@ -2534,9 +2568,7 @@ mod tests {
                 .contains("captured: clarification: unavailable (deadline, delivery unresolved)"),
             "{compact}"
         );
-        assert!(compact.contains("1 decided"), "{compact}");
-        assert!(compact.contains("1 unavailable"), "{compact}");
-        assert!(compact.contains("2 evaluations captured"), "{compact}");
+        assert!(compact.contains("2 evaluations"), "{compact}");
         assert!(compact.contains("Work not required"), "{compact}");
         assert!(
             !compact.contains("other captured result(s) hidden"),
@@ -2620,7 +2652,10 @@ mod tests {
             view.execution_coverage,
             SemanticJudgmentExecutionCoverage::Timeout
         );
-        assert!(view.render().contains("execution lookup timed out"));
+        assert!(
+            view.render()
+                .contains("loading execution details timed out")
+        );
     }
 
     #[test]

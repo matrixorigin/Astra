@@ -2052,7 +2052,8 @@ impl ReflectService for DatabaseReflectService {
             );
             view.data_coverage.overall = "partial".into();
             view.data_coverage.warnings.push(
-                "Semantic trace capture is incomplete; model adoption remains unknown.".into(),
+                "Semantic judgment history is partial; whether it guided the run is not recorded."
+                    .into(),
             );
         }
         if let Some(judgments) = &tool_result_judgments {
