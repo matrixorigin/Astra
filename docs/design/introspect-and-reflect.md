@@ -48,6 +48,18 @@ visible with incomplete token coverage; it is never a zero-token call. Explain
 uses the same ledger at turn scope. Classification confidence and reflection's
 inferred confidence are distinct; neither proves that a direction was applied
 or that Work was delivered.
+
+Reflect also summarizes its existing bounded request-context window by run,
+agent, Offering, provider, configured/upstream model, and purpose. Physical
+retries count separately; repeated terminal request facts count once. At most
+eight identity groups are rendered, with an explicit omitted-group count.
+The aggregate covers captured terminal requests, not complete session billing.
+Exact, partial, unavailable, and unknown usage remain separate. Missing usage
+renders unknown; a reported zero remains zero. Cache percentage is shown only
+when every captured terminal request has an exact usage payload, the producer
+reports cache coverage for every positive-input request, and the input
+denominator is positive. Incomplete usage retains known token counts without
+claiming a cache percentage. Display identities are bounded and escaped.
 The session view covers the supported judgment operations (request admission,
 skill routing, memory relevance/feedback, tool-result selection, verification,
 and completion-proxy turn intent), not every auxiliary model call. Routine hint/summary projections

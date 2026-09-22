@@ -515,6 +515,7 @@ struct ModelRequestSummary {
     output_tokens: u64,
     cache_invalidations: u64,
     usage_observations: u64,
+    cache_usage_observations: u64,
     usage_coverage: ModelRequestUsageCoverage,
     groups: Vec<ModelRequestGroup>,
     omitted_groups: usize,
@@ -647,6 +648,14 @@ impl ModelRequestSummary {
                 .observe(record.event.usage_status.as_deref());
             if let Some(usage) = record.event.usage.as_ref() {
                 summary.usage_observations = summary.usage_observations.saturating_add(1);
+                // The producer owns cache coverage (System One, for example,
+                // reports input/output but no cache buckets). Do not infer it
+                // from normalized zero buckets or an exact input/output status.
+                if record.event.cache.cache_read_share.is_some()
+                    || usage.input.total_input_tokens() == 0
+                {
+                    summary.cache_usage_observations += 1;
+                }
                 group.usage_observations = group.usage_observations.saturating_add(1);
                 add_prompt_cache_usage(&mut summary.input, &usage.input);
                 summary.output_tokens = summary.output_tokens.saturating_add(usage.output_tokens);
@@ -664,7 +673,12 @@ impl ModelRequestSummary {
 
     fn render(&self) -> String {
         let total_input_tokens = self.input.total_input_tokens();
-        let cache_share = if self.usage_observations == 0 || total_input_tokens == 0 {
+        let cache_share = if self.terminal_requests == 0
+            || self.usage_observations != self.terminal_requests
+            || self.cache_usage_observations != self.terminal_requests
+            || self.usage_coverage.exact != self.terminal_requests
+            || total_input_tokens == 0
+        {
             "unknown".to_string()
         } else {
             format!(
@@ -2719,6 +2733,7 @@ mod tests {
             wire_composition: ModelRequestWireComposition::default(),
             tool_result_projections: Vec::new(),
             cache: ModelRequestCache {
+                cache_read_share: Some(950.0 / 1050.0),
                 invalidation_reasons: vec!["tool_schemas_changed".into()],
                 ..Default::default()
             },
@@ -2757,6 +2772,24 @@ mod tests {
             summary.render()
         );
         assert!(summary.render().contains("usage coverage exact=1"));
+
+        let mut no_cache_evidence = record.clone();
+        no_cache_evidence.event.identity.request_id = "request-systemone".into();
+        no_cache_evidence.event.identity.provider_protocol = "typesafe_systemone".into();
+        no_cache_evidence.event.cache.cache_read_share = None;
+        no_cache_evidence.event.usage.as_mut().unwrap().input =
+            astra_turn_types::NormalizedPromptCacheUsage::new(100, 0, 0);
+        for records in [
+            vec![no_cache_evidence.clone()],
+            vec![record.clone(), no_cache_evidence],
+        ] {
+            let no_cache_evidence = ModelRequestSummary::from_records(&records).unwrap();
+            assert!(
+                no_cache_evidence
+                    .render()
+                    .contains("known cache read unknown")
+            );
+        }
 
         let mut child = record.clone();
         child.event_id = "event-2".into();
@@ -2815,6 +2848,7 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("partial=1, unavailable=1"), "{rendered}");
+        assert!(rendered.contains("known cache read unknown"), "{rendered}");
         assert_eq!(
             render_model_request_identity(Some("model\nforged")),
             "\"model\\nforged\""
@@ -2833,6 +2867,11 @@ mod tests {
             output_tokens: 176,
             cache_invalidations: 0,
             usage_observations: 3,
+            cache_usage_observations: 3,
+            usage_coverage: ModelRequestUsageCoverage {
+                exact: 3,
+                ..Default::default()
+            },
             ..ModelRequestSummary::default()
         };
 
@@ -2842,6 +2881,39 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("34594"), "{rendered}");
+
+        for coverage in [
+            ModelRequestUsageCoverage {
+                exact: 2,
+                partial: 1,
+                ..Default::default()
+            },
+            ModelRequestUsageCoverage {
+                exact: 2,
+                unavailable: 1,
+                ..Default::default()
+            },
+            ModelRequestUsageCoverage {
+                exact: 2,
+                unknown: 1,
+                ..Default::default()
+            },
+        ] {
+            let incomplete = ModelRequestSummary {
+                usage_coverage: coverage,
+                ..summary.clone()
+            };
+            assert!(incomplete.render().contains("known cache read unknown"));
+        }
+        let missing_payload = ModelRequestSummary {
+            usage_observations: 2,
+            ..summary
+        };
+        assert!(
+            missing_payload
+                .render()
+                .contains("known cache read unknown")
+        );
     }
 
     #[test]
