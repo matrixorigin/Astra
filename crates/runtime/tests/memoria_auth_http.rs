@@ -116,7 +116,6 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
         self_hosted_master_access: false,
         issuer: None,
         web_url: Some("http://localhost".into()),
-        legacy_issuer: None,
     };
     let auth = Arc::new(
         DatabaseAuthService::new(

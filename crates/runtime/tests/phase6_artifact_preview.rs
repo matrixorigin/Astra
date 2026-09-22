@@ -8,8 +8,7 @@ use astra_services::{
     DatabaseStateProjectionStore, SessionArtifactContentChunkV1,
     SessionArtifactContentDescriptorV1, SessionArtifactContentStore, SessionArtifactJsonRecord,
     SessionArtifactStoreError, SessionService, StateItemUpsert, budget_for_turn_intent,
-    build_presigned_artifact_download, content_hash_with_normalize_version,
-    expired_artifact_placeholder, runs::ToolOutputBatchItem,
+    build_presigned_artifact_download, expired_artifact_placeholder, runs::ToolOutputBatchItem,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -881,7 +880,7 @@ async fn l2_50b_gc_honors_durable_reference_edges_without_payload_inference() {
 
 shared_db_test! {
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_51_unknown_tool_uses_400b_fallback_and_writes_warning_event() {
+async fn l2_51_unknown_tool_uses_400b_fallback_without_warning_event() {
     let pool = setup_pool().await;
     let (user_id, session_id, run_id) = ids();
     insert_session(&pool, &user_id, &session_id).await;
@@ -930,51 +929,7 @@ async fn l2_51_unknown_tool_uses_400b_fallback_and_writes_warning_event() {
         "fallback"
     );
     assert!(row.try_get::<u64, _>("preview_len").unwrap() <= 400);
-    assert_eq!(row.try_get::<i64, _>("warning_count").unwrap(), 1);
-}
-
-}
-
-shared_db_test! {
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_52_preview_template_normalize_versions_are_seeded_and_deterministic() {
-    let pool = setup_pool().await;
-    let rows = sqlx::query(
-        "SELECT tool_name, normalize_version FROM preview_template_registry
-         WHERE tool_name IN ('pg_dump', 'fetch_url', 'parse_pdf', 'SKILL.md',
-             'list_dir', 'task_board', 'agent_fanout', 'session', 'web_fetch', 'mo_query')
-           AND status = 'active'",
-    )
-    .fetch_all(pool.get())
-    .await
-    .unwrap();
-    let seeded = rows
-        .into_iter()
-        .map(|row| {
-            (
-                row.try_get::<String, _>("tool_name").unwrap(),
-                row.try_get::<String, _>("normalize_version").unwrap(),
-            )
-        })
-        .collect::<std::collections::HashMap<_, _>>();
-    for expected in [
-        "pg_dump",
-        "fetch_url",
-        "parse_pdf",
-        "SKILL.md",
-        "list_dir",
-        "task_board",
-        "agent_fanout",
-        "session",
-        "web_fetch",
-        "mo_query",
-    ] {
-        let normalize_version = seeded.get(expected).expect("baseline template missing");
-        let a = content_hash_with_normalize_version("sha256:content", Some(normalize_version));
-        let b = content_hash_with_normalize_version("sha256:content", Some(normalize_version));
-        assert_eq!(a, b);
-        assert!(a.starts_with("sha256:"));
-    }
+    assert_eq!(row.try_get::<i64, _>("warning_count").unwrap(), 0);
 }
 
 }

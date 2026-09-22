@@ -4,8 +4,8 @@ use test_support::require_db_it_env;
 
 use astra_runtime::prompts::CompactionTier;
 use astra_services::{
-    BASELINE_PREVIEW_TEMPLATES, BUDGET_V1_8K_PROMPT_CAP, BUDGET_V1_8K_TOTAL_CAP, BudgetV1_8k,
-    ContextManifestItemWrite, ContextManifestWrite, DatabaseContextManifestStore, RetrievalStage,
+    BUDGET_V1_8K_PROMPT_CAP, BUDGET_V1_8K_TOTAL_CAP, BudgetV1_8k, ContextManifestItemWrite,
+    ContextManifestWrite, DatabaseContextManifestStore, RetrievalStage,
     content_hash_with_normalize_version, cross_session_retrieval_requires_user_filter,
     delegation_budget, delegation_budget_allocation, next_action_confidence_action,
     suggested_next_action_expires_at,
@@ -269,54 +269,6 @@ async fn l2_29_suggested_next_action_expiry_by_kind() {
     assert!(suggested_next_action_expires_at("approval", now).contains("2026-05-08"));
     assert!(suggested_next_action_expires_at("todo", now).contains("2026-05-14"));
     assert!(suggested_next_action_expires_at("hint", now).contains("2026-05-07T01"));
-}
-
-#[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_30_preview_template_baselines_cover_large_tool_outputs() {
-    let names = BASELINE_PREVIEW_TEMPLATES
-        .iter()
-        .map(|(name, _, _)| *name)
-        .collect::<Vec<_>>();
-    for expected in [
-        "cargo",
-        "rustc",
-        "clippy",
-        "fetch_url",
-        "parse_pdf",
-        "pg_dump",
-        "slow_query_analyzer",
-        "SKILL.md",
-    ] {
-        assert!(names.contains(&expected), "missing {expected}");
-    }
-    assert!(names.len() >= 18);
-}
-
-#[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_31_unknown_tool_gets_fallback_preview_budget() {
-    let pool = setup_pool().await;
-    let store = DatabaseContextManifestStore::new(pool.clone());
-    let suffix = Uuid::new_v4();
-    let session_id = format!("session-{suffix}");
-    let user_id = format!("user-{suffix}");
-    let tool_name = format!("unknown_tool_{suffix}");
-    let fallback_bytes = store
-        .preview_template_budget_or_fallback(&user_id, &session_id, Some("run-preview"), &tool_name)
-        .await
-        .unwrap();
-    assert_eq!(fallback_bytes, 400);
-    let row = sqlx::query(
-        "SELECT COUNT(*) AS c FROM agent_events
-         WHERE session_id = ? AND user_id = ? AND event_type = 'preview_template_missing'",
-    )
-    .bind(&session_id)
-    .bind(&user_id)
-    .fetch_one(pool.get())
-    .await
-    .unwrap();
-    assert_eq!(row.try_get::<i64, _>("c").unwrap(), 1);
 }
 
 async fn ensure_phase3_test_tables(pool: &astra_core::SharedPool) {

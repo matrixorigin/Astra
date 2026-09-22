@@ -1201,26 +1201,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / evaluation",
         product_owner="user feedback, quality loops, evaluation training inputs",
     ),
-    "preview_template_registry": TableMetadata(
-        semantic_owner="astra_services::tool_output_preview",
-        state_class="durable preview template registry fact",
-        primary_query="preview template lookup by tool_name/version and active template list by tool_name/status/updated_at",
-        retention_policy="retain active and compatible template versions while tool output previews can be rendered or re-normalized; deactivate old versions instead of deleting while artifacts may reference them",
-        rebuildability="rebuildable only from checked-in template definitions if they exactly match deployed first_class_columns_json, field weights, and schema_json",
-        merge_guidance="keep separate from raw_ref_scheme_registry; preview templates control rendering/normalization while raw ref schemes control resolver and access semantics",
-        migration_owner="astra_services::storage / tool_output_preview",
-        product_owner="tool output preview rendering, search normalization, artifact UX",
-    ),
-    "raw_ref_scheme_registry": TableMetadata(
-        semantic_owner="astra_services::raw_ref_resolver",
-        state_class="durable raw reference scheme registry fact",
-        primary_query="raw reference scheme lookup by scheme and active resolver metadata",
-        retention_policy="retain active resolver definitions while raw refs in manifests, previews, citations, or artifacts can be dereferenced; disable schemes before deleting resolver metadata",
-        rebuildability="rebuildable only from resolver bootstrap definitions if access_check, backing_store, and canonical examples remain identical",
-        merge_guidance="keep separate from preview_template_registry; scheme rows define dereference and access-check authority, not preview rendering templates",
-        migration_owner="astra_services::storage / raw_ref_resolver",
-        product_owner="raw reference resolution, artifact/context access checks, manifest dereferencing",
-    ),
     "llm_provider_admission_pacing": TableMetadata(
         semantic_owner="astra_runtime::llm_provider_admission",
         state_class="coordination virtual-time pacing fact",
@@ -2063,7 +2043,7 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
             "none; current issuer-scoped identities are written to auth_external_identities",
         ],
         user_api_impact=(
-            "reserved legacy mappings in the canonical table require an explicit legacy issuer; "
+            "login accepts only current issuer-scoped identities, without legacy relinking; "
             "current issuer-scoped identity and disconnect behavior remain in auth_external_identities"
         ),
         migration_backfill=(
@@ -2107,38 +2087,6 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         ],
         rationale=(
             "small table size is not evidence of redundancy; it is the durable root for rollback/list identity"
-        ),
-    ),
-    ConsolidationReview(
-        candidate="preview_template_registry + raw_ref_scheme_registry",
-        decision="keep_separate",
-        current_read_paths=[
-            "crates/services/src/runs.rs::preview_template_registry",
-            "crates/services/src/context_manifest.rs::raw_ref_scheme_registry",
-        ],
-        current_write_paths=[
-            "crates/services/src/storage.rs::seed raw_ref_scheme_registry",
-            "crates/services/src/storage.rs::seed preview_template_registry",
-        ],
-        user_api_impact=(
-            "preview templates affect artifact/tool-output rendering; raw-ref schemes affect dereference "
-            "authority and access checks"
-        ),
-        migration_backfill=(
-            "no merge; a unified table would need a typed registry model and separate indexes for resolver "
-            "authority versus rendering templates"
-        ),
-        rollback=(
-            "keep current bootstrap seeds as rollback source; merged rows would need lossless split back "
-            "into scheme metadata and template metadata"
-        ),
-        test_evidence=[
-            "crates/services/tests/schema_assertions.rs::preview_template_registry",
-            "crates/services/tests/schema_assertions.rs::raw_ref_scheme_registry",
-            "crates/runtime/tests/phase6_artifact_preview.rs",
-        ],
-        rationale=(
-            "same bootstrap area does not imply same lifecycle; resolver/access semantics differ from rendering"
         ),
     ),
     ConsolidationReview(

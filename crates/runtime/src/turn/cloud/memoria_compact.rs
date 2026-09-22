@@ -1457,47 +1457,19 @@ pub async fn compact_with_memoria(
     compact_config: Option<&CompactConfig>,
     summary_client: Option<&dyn SummaryLlmClient>,
 ) -> CompactResult {
-    let client = match client {
-        Some(client) if client.admits_operation(false).await.unwrap_or(false) => Some(client),
+    // Applicability is local state. Do not resolve credentials when this
+    // compaction cannot retrieve memory; actual reads still recheck consent.
+    let memory_source = match (client, session_id) {
+        (Some(client), Some(sid))
+            if params.current_tokens >= config.min_tokens_for_retrieval
+                && params.tier != CompactionTier::Normal
+                && client.admits_operation(false).await.unwrap_or(false) =>
+        {
+            Some((client, sid))
+        }
         _ => None,
     };
-    // Check if we should attempt Memoria retrieval
-    let should_retrieve = params.current_tokens >= config.min_tokens_for_retrieval
-        && params.tier != CompactionTier::Normal
-        && client.is_some()
-        && session_id.is_some();
-
-    if !should_retrieve {
-        // Fall back to pure truncation
-        astra_core::history_work::record_serialized_value(
-            astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
-            messages,
-        );
-        let mut msgs = messages.to_vec();
-        return CompactionEngine::compact_tiered(
-            &mut msgs,
-            params.budget_chars,
-            params.keep_chars,
-            params.tier,
-            params.keep_recent_turns,
-        );
-    }
-
-    let Some(client) = client else {
-        astra_core::history_work::record_serialized_value(
-            astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
-            messages,
-        );
-        let mut msgs = messages.to_vec();
-        return CompactionEngine::compact_tiered(
-            &mut msgs,
-            params.budget_chars,
-            params.keep_chars,
-            params.tier,
-            params.keep_recent_turns,
-        );
-    };
-    let Some(sid) = session_id else {
+    let Some((client, sid)) = memory_source else {
         astra_core::history_work::record_serialized_value(
             astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
             messages,
@@ -1822,18 +1794,25 @@ mod tests {
 
     struct MockMemoriaPort {
         memories: Mutex<Vec<MemoriaMemory>>,
+        admissions: std::sync::atomic::AtomicUsize,
     }
 
     impl MockMemoriaPort {
         fn new(memories: Vec<MemoriaMemory>) -> Self {
             Self {
                 memories: Mutex::new(memories),
+                admissions: std::sync::atomic::AtomicUsize::new(0),
             }
         }
     }
 
     #[async_trait::async_trait]
     impl MemoriaPort for MockMemoriaPort {
+        async fn admits_operation(&self, _write: bool) -> Result<bool, String> {
+            self.admissions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(true)
+        }
         async fn retrieve_ext(
             &self,
             _query: &str,
@@ -2126,14 +2105,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_below_threshold_skips_retrieval() {
+    async fn inapplicable_compaction_skips_credential_admission() {
         let msgs = vec![user("hello"), assistant("hi")];
         let config = MemoriaCompactConfig {
             min_tokens_for_retrieval: 10_000,
             ..Default::default()
         };
         let mock = MockMemoriaPort::new(vec![]);
-        let params = MemoriaCompactParams {
+        let mut params = MemoriaCompactParams {
             budget_chars: 10000,
             keep_chars: 2000,
             tier: CompactionTier::TrimSchemas,
@@ -2142,18 +2121,22 @@ mod tests {
             session_facts: None,
         };
 
-        let result = compact_with_memoria(
-            &msgs,
-            Some("sess1"),
-            &config,
-            &params,
-            Some(&mock),
-            None,
-            None,
-        )
-        .await;
-
-        assert_eq!(result.messages.len(), 2);
+        for (tokens, tier, session) in [
+            (1000, CompactionTier::TrimSchemas, Some("sess1")),
+            (20_000, CompactionTier::Normal, Some("sess1")),
+            (20_000, CompactionTier::TrimSchemas, None),
+        ] {
+            params.current_tokens = tokens;
+            params.tier = tier;
+            let result =
+                compact_with_memoria(&msgs, session, &config, &params, Some(&mock), None, None)
+                    .await;
+            assert_eq!(result.messages.len(), 2);
+            assert_eq!(
+                mock.admissions.load(std::sync::atomic::Ordering::Relaxed),
+                0
+            );
+        }
     }
 
     #[tokio::test]
@@ -2201,6 +2184,10 @@ mod tests {
         assert_eq!(
             result.messages, msgs,
             "history must remain real messages only"
+        );
+        assert_eq!(
+            mock.admissions.load(std::sync::atomic::Ordering::Relaxed),
+            1
         );
         let ctx_content = result
             .session_memory_context

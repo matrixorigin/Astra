@@ -96,7 +96,6 @@ async fn uc_builtin_memory_preserves_identity_lifecycle_and_transport() {
         self_hosted_master_access: false,
         issuer: None,
         web_url: None,
-        legacy_issuer: None,
     };
     let auth = Arc::new(
         DatabaseAuthService::new(
@@ -138,6 +137,36 @@ async fn uc_builtin_memory_preserves_identity_lifecycle_and_transport() {
     };
     let alice_port = make_port(&alice.user_id);
     let bob_port = make_port(&bob.user_id);
+    // Scoped-only resolution must not consult UC; an unavailable upstream
+    // cannot change its absent-scoped-credential result.
+    *fixture.status.lock().unwrap() = "unavailable".into();
+    assert!(
+        auth.memoria_credentials()
+            .unwrap()
+            .resolve(&alice.user_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    *fixture.status.lock().unwrap() = "active".into();
+    let uc_provider_id = format!("uc:{}", settings.issuer);
+    {
+        let extra_subject = format!("ambiguous-{nonce}");
+        sqlx::query("INSERT INTO auth_external_identities (provider_id,external_subject,astra_user_id) VALUES (?, ?, ?)")
+            .bind(&uc_provider_id).bind(&extra_subject).bind(&alice.user_id)
+            .execute(pool.get()).await.unwrap();
+        assert!(alice_port.admits_operation(false).await.is_err());
+        sqlx::query("DELETE FROM auth_external_identities WHERE provider_id = ? AND external_subject = ? AND astra_user_id = ?")
+            .bind(&uc_provider_id).bind(&extra_subject).bind(&alice.user_id)
+            .execute(pool.get()).await.unwrap();
+    }
+    let subject: String = sqlx::query_scalar("SELECT external_subject FROM auth_external_identities WHERE provider_id = ? AND astra_user_id = ?")
+        .bind(&uc_provider_id).bind(&alice.user_id).fetch_one(pool.get()).await.unwrap();
+    sqlx::query("UPDATE auth_external_identities SET external_subject = '' WHERE provider_id = ? AND astra_user_id = ?")
+        .bind(&uc_provider_id).bind(&alice.user_id).execute(pool.get()).await.unwrap();
+    assert!(alice_port.admits_operation(false).await.is_err());
+    sqlx::query("UPDATE auth_external_identities SET external_subject = ? WHERE provider_id = ? AND astra_user_id = ?")
+        .bind(subject).bind(&uc_provider_id).bind(&alice.user_id).execute(pool.get()).await.unwrap();
     let a = alice_port
         .resolve_tool_transport(true)
         .await

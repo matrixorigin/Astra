@@ -2719,33 +2719,6 @@ async fn phase3_context_manifest_schema_contract() {
         render_modes.is_ok(),
         "context_manifest_items.render_mode must accept code_block_preserved"
     );
-
-    let raw_ref_schemes = sqlx::query("SELECT scheme FROM raw_ref_scheme_registry")
-        .fetch_all(pool.get())
-        .await
-        .expect("load raw_ref schemes")
-        .into_iter()
-        .map(|row| row.try_get::<String, _>("scheme").unwrap())
-        .collect::<Vec<_>>();
-    for expected in ["artifact", "s3", "conversation_log"] {
-        assert!(
-            raw_ref_schemes.iter().any(|scheme| scheme == expected),
-            "raw_ref_scheme_registry missing {expected}"
-        );
-    }
-
-    let preview_count = sqlx::query(
-        "SELECT COUNT(*) AS count FROM preview_template_registry WHERE status = 'active'",
-    )
-    .fetch_one(pool.get())
-    .await
-    .expect("preview template count")
-    .try_get::<i64, _>("count")
-    .unwrap();
-    assert!(
-        preview_count >= 18,
-        "preview_template_registry should seed at least 18 baseline templates"
-    );
 }
 
 #[tokio::test]
@@ -3471,60 +3444,4 @@ async fn phase6_artifact_retention_preview_schema_contract() {
             "session_tool_outputs must not keep legacy ownerless index {removed_index}"
         );
     }
-
-    let preview_templates = column_names(&pool, &schema, "preview_template_registry").await;
-    for expected in [
-        "tool_name",
-        "version",
-        "max_preview_bytes",
-        "normalize_version",
-        "schema_json",
-    ] {
-        assert!(
-            preview_templates.iter().any(|column| column == expected),
-            "preview_template_registry missing {expected}"
-        );
-    }
-    let template_count = sqlx::query(
-        "SELECT COUNT(*) AS count FROM preview_template_registry WHERE status = 'active'",
-    )
-    .fetch_one(pool.get())
-    .await
-    .expect("count preview templates")
-    .try_get::<i64, _>("count")
-    .unwrap_or(0);
-    assert!(
-        template_count >= 18,
-        "expected at least 18 active preview templates, got {template_count}"
-    );
-    let required_templates = sqlx::query(
-        "SELECT tool_name FROM preview_template_registry
-         WHERE tool_name IN ('pg_dump', 'fetch_url', 'parse_pdf', 'SKILL.md', 'cargo', 'rustc',
-          'clippy', 'pg_schema_structurize', 'slow_query_analyzer', 'curl',
-          'git', 'docker_logs', 'kubectl', 'python_stdout', 'npm_build', 'csv_head',
-          'json_preview', 'markdown_preview', 'list_dir', 'glob', 'grep', 'symbols',
-          'task_board', 'agent', 'agent_fanout', 'session', 'web_fetch', 'tool_search',
-          'memory', 'mo_query')
-         AND status = 'active'",
-    )
-    .fetch_all(pool.get())
-    .await
-    .expect("load required preview templates");
-    assert!(
-        required_templates.len() >= 30,
-        "required Phase 6 template set is incomplete"
-    );
-
-    let scheme_rows = sqlx::query(
-        "SELECT scheme FROM raw_ref_scheme_registry
-         WHERE scheme IN ('artifact', 's3', 'conversation_log', 'tool_output', 'chunk', 'state_item')
-           AND is_active = 1",
-    )
-    .fetch_all(pool.get())
-    .await
-    .expect("load raw_ref schemes");
-    assert!(
-        scheme_rows.len() >= 6,
-        "raw_ref_scheme_registry missing Phase 6 schemes"
-    );
 }

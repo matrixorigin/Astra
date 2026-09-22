@@ -133,8 +133,8 @@ use crate::server::tool_database_snapshots::{self, DatabaseSnapshotRollbackJourn
 use crate::server::tool_execution_result::{result_metadata_str, tool_result_from_output};
 use crate::server::tool_local_execution::{
     LocalToolExecutionLifecycle, LocalToolPreflight, LocalToolPreflightContext,
-    record_preview_template_missing, run_local_tool_policy_preflight,
-    spawn_resource_tool_call_recording, unknown_local_tool_result, validate_local_tool_arguments,
+    run_local_tool_policy_preflight, spawn_resource_tool_call_recording, unknown_local_tool_result,
+    validate_local_tool_arguments,
 };
 use crate::server::tool_plan_gate::{
     PlanModeSnapshot, is_plan_mode_blocked_tool, plan_mode_authoring_active,
@@ -4385,16 +4385,7 @@ impl RuntimeToolExecutor {
                 }
             }
             // ── Unknown tool fallback ──────────────────────────────────
-            _ => {
-                record_preview_template_missing(
-                    &self.user_id,
-                    &self.session_id,
-                    self.context_manifest_pool.as_ref(),
-                    name,
-                )
-                .await;
-                unknown_local_tool_result(name)
-            }
+            _ => unknown_local_tool_result(name),
         };
 
         let coordination_integrity_valid = workspace_authority.coordination_integrity_valid();

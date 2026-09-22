@@ -594,7 +594,8 @@ class FreshDatabaseContractTests(unittest.TestCase):
     def test_schema_inventory_is_closed_and_all_non_boot_tables_are_empty(self):
         repo = MODULE_PATH.parents[2]
         canonical = contract._canonical_schema_inventory(repo)
-        registries = contract._canonical_baseline_registry_rows(repo)
+        self.assertNotIn("preview_template_registry", canonical)
+        self.assertNotIn("raw_ref_scheme_registry", canonical)
         self.assertIn("plans", canonical)
         self.assertIn("workspace_records", canonical)
         self.assertIn("session_checkpoints", canonical)
@@ -605,12 +606,6 @@ class FreshDatabaseContractTests(unittest.TestCase):
         # default user role plus the one bootstrap admin role.
         counts["auth_roles"] = 2
         counts["auth_user_roles"] = 2
-        counts["raw_ref_scheme_registry"] = len(
-            registries["raw_ref_scheme_registry"]
-        )
-        counts["preview_template_registry"] = len(
-            registries["preview_template_registry"]
-        )
         contract._validate_closed_schema_counts(canonical, canonical, counts)
         changed_bootstrap_auth = {**counts, "auth_users": 2}
         with self.assertRaisesRegex(contract.ContractError, "auth_users"):
@@ -663,7 +658,6 @@ class FreshDatabaseContractTests(unittest.TestCase):
             },
         )
         actual = canonical - conditional
-        registries = contract._canonical_baseline_registry_rows(repo)
         counts = {table: 0 for table in actual}
         counts.update(
             {
@@ -671,12 +665,6 @@ class FreshDatabaseContractTests(unittest.TestCase):
                 "astra_schema_table_contracts": 1,
                 "infra_llm_models": 1,
                 "maintenance_sweep_cursors": 1,
-                "preview_template_registry": len(
-                    registries["preview_template_registry"]
-                ),
-                "raw_ref_scheme_registry": len(
-                    registries["raw_ref_scheme_registry"]
-                ),
                 "session_weighted_admission_gates": 1,
                 "sweeper_leases": 1,
             }
@@ -722,47 +710,6 @@ class FreshDatabaseContractTests(unittest.TestCase):
                 {**counts, "llm_provider_admission_windows": 0},
                 optional_absent=conditional,
             )
-
-    def test_production_baseline_registries_are_exact_counted_and_hashed(self):
-        repo = MODULE_PATH.parents[2]
-        expected = contract._canonical_baseline_registry_rows(repo)
-
-        def rows(sql, _database=None):
-            if "FROM raw_ref_scheme_registry" in sql:
-                return [list(row) for row in expected["raw_ref_scheme_registry"]]
-            if "FROM preview_template_registry" in sql:
-                return [list(row) for row in expected["preview_template_registry"]]
-            raise AssertionError(sql)
-
-        with mock.patch.object(contract, "_mysql_rows", side_effect=rows):
-            sealed = contract._validate_baseline_registry_rows("fresh", repo)
-        self.assertEqual(
-            sealed["raw_ref_scheme_registry_count"],
-            len(expected["raw_ref_scheme_registry"]),
-        )
-        self.assertEqual(
-            sealed["preview_template_registry_count"],
-            len(expected["preview_template_registry"]),
-        )
-        self.assertRegex(sealed["raw_ref_scheme_registry_sha256"], r"^[0-9a-f]{64}$")
-        self.assertRegex(sealed["preview_template_registry_sha256"], r"^[0-9a-f]{64}$")
-
-        mutated = {
-            table: [list(row) for row in rows] for table, rows in expected.items()
-        }
-        mutated["preview_template_registry"][0][3] = "9999"
-
-        def changed_rows(sql, _database=None):
-            table = (
-                "raw_ref_scheme_registry"
-                if "FROM raw_ref_scheme_registry" in sql
-                else "preview_template_registry"
-            )
-            return mutated[table]
-
-        with mock.patch.object(contract, "_mysql_rows", side_effect=changed_rows):
-            with self.assertRaisesRegex(contract.ContractError, "exact source-owned"):
-                contract._validate_baseline_registry_rows("fresh", repo)
 
     def test_runtime_system_baseline_is_source_owned_and_exact(self):
         repo = MODULE_PATH.parents[2]

@@ -111,67 +111,6 @@ pub const CONTEXT_MANIFEST_REASONS: &[(&str, &str, Option<&str>)] = &[
     ("other", "fallback", None),
 ];
 
-pub const BASELINE_PREVIEW_TEMPLATES: &[(&str, u32, &str)] = &[
-    ("bash", 1200, "shell_v1"),
-    ("run_script", 1200, "python_stdout_v1"),
-    ("read_file", 1000, "text_v1"),
-    ("write_file", 1000, "text_v1"),
-    ("str_replace", 1000, "diff_v1"),
-    ("list_dir", 1200, "text_v1"),
-    ("glob", 1200, "text_v1"),
-    ("grep", 1200, "text_v1"),
-    ("symbols", 1200, "rust_v1"),
-    ("web_search", 1000, "search_v1"),
-    ("web_fetch", 1200, "html_v1"),
-    ("tool_search", 1000, "text_v1"),
-    ("session", 1200, "text_v1"),
-    ("task_board", 1200, "text_v1"),
-    ("agent", 1200, "text_v1"),
-    ("agent_fanout", 1600, "text_v1"),
-    ("memory", 1200, "text_v1"),
-    ("mo_query", 1200, "sql_v1"),
-    ("pg_dump", 1000, "sql_v1"),
-    ("fetch_url", 1000, "html_v1"),
-    ("parse_pdf", 1000, "pdf_v1"),
-    ("SKILL.md", 1200, "skill_md_v1"),
-    ("cargo", 1200, "rust_v1"),
-    ("rustc", 1200, "rust_v1"),
-    ("clippy", 1200, "rust_v1"),
-    ("pg_schema_structurize", 1200, "sql_v1"),
-    ("slow_query_analyzer", 1200, "sql_v1"),
-    ("curl", 1000, "text_v1"),
-    ("git", 1200, "diff_v1"),
-    ("docker_logs", 1200, "text_v1"),
-    ("kubectl", 1200, "text_v1"),
-    ("python_stdout", 1200, "text_v1"),
-    ("npm_build", 1200, "js_v1"),
-    ("csv_head", 1200, "csv_v1"),
-    ("json_preview", 1200, "json_v1"),
-    ("markdown_preview", 1200, "markdown_v1"),
-];
-
-pub fn preview_template_fts_field_weights(normalize_version: &str) -> &'static str {
-    match normalize_version {
-        "sql_v1" => r#"{"statement":2.0,"object_name":1.5,"error":2.0,"preview_text":1.0}"#,
-        "rust_v1" => r#"{"diagnostic":2.0,"crate":1.4,"file":1.3,"preview_text":1.0}"#,
-        "skill_md_v1" => r#"{"name":2.0,"description":1.6,"trigger":1.4,"preview_text":1.0}"#,
-        "json_v1" => r#"{"path":1.8,"key":1.5,"value":1.0,"preview_text":1.0}"#,
-        "csv_v1" => r#"{"header":1.8,"sample":1.2,"preview_text":1.0}"#,
-        "diff_v1" => r#"{"path":1.7,"symbol":1.4,"hunk":1.2,"preview_text":1.0}"#,
-        "html_v1" => r#"{"title":1.8,"heading":1.5,"url":1.2,"preview_text":1.0}"#,
-        "pdf_v1" => r#"{"title":1.8,"section":1.5,"preview_text":1.0}"#,
-        "js_v1" => r#"{"package":1.6,"script":1.4,"error":2.0,"preview_text":1.0}"#,
-        "markdown_v1" => r#"{"heading":1.7,"link":1.2,"preview_text":1.0}"#,
-        "artifact_file_v1" => {
-            r#"{"title":2.0,"filename":1.8,"content_type":1.3,"preview_text":1.0}"#
-        }
-        "shell_v1" => r#"{"command":1.6,"stderr":2.0,"stdout":1.0,"preview_text":1.0}"#,
-        "python_stdout_v1" => r#"{"script":1.5,"stdout":1.0,"stderr":2.0,"preview_text":1.0}"#,
-        "search_v1" => r#"{"query":2.0,"title":1.5,"snippet":1.2,"preview_text":1.0}"#,
-        _ => r#"{"preview_text":1.0,"tool_name":1.2,"error":1.8}"#,
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BudgetV1_8k {
     pub anchor: u32,
@@ -494,8 +433,6 @@ pub enum ContextManifestError {
     CrossSessionAuthMissing,
     #[error("session is not active: owner={user_id}, session={session_id}")]
     SessionNotActive { user_id: String, session_id: String },
-    #[error("unsupported raw_ref scheme: {scheme}")]
-    UnsupportedRawRefScheme { scheme: String },
 }
 
 fn context_manifest_session_admission_error(
@@ -537,19 +474,6 @@ fn context_manifest_decode_error(
     }
 }
 
-fn context_manifest_invalid_value_error(
-    operation: &'static str,
-    entity: &str,
-    column: &str,
-    message: impl Into<String>,
-) -> ContextManifestError {
-    let source = sqlx::Error::Decode(Box::new(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        message.into(),
-    )));
-    context_manifest_decode_error(operation, entity, column, source)
-}
-
 fn context_manifest_row_string(
     row: &impl ContextManifestDbRow,
     operation: &'static str,
@@ -568,50 +492,6 @@ fn context_manifest_row_optional_string(
 ) -> Result<Option<String>, ContextManifestError> {
     row.optional_string_column(column)
         .map_err(|source| context_manifest_decode_error(operation, entity, column, source))
-}
-
-fn context_manifest_row_u32_at_least(
-    row: &impl ContextManifestDbRow,
-    operation: &'static str,
-    entity: &str,
-    column: &str,
-    min: i64,
-) -> Result<u32, ContextManifestError> {
-    let value = row
-        .i64_column(column)
-        .map_err(|source| context_manifest_decode_error(operation, entity, column, source))?;
-    if value < min {
-        return Err(context_manifest_invalid_value_error(
-            operation,
-            entity,
-            column,
-            format!("invalid {entity}.{column}: {value}; expected >= {min}"),
-        ));
-    }
-    u32::try_from(value).map_err(|_| {
-        context_manifest_invalid_value_error(
-            operation,
-            entity,
-            column,
-            format!(
-                "invalid {entity}.{column}: {value}; expected <= {}",
-                u32::MAX
-            ),
-        )
-    })
-}
-
-fn decode_preview_template_budget_row(
-    row: &impl ContextManifestDbRow,
-    tool_name: &str,
-) -> Result<u32, ContextManifestError> {
-    context_manifest_row_u32_at_least(
-        row,
-        "preview_template_lookup_decode",
-        tool_name,
-        "max_preview_bytes",
-        1,
-    )
 }
 
 fn decode_session_artifact_manifest_row(
@@ -1017,33 +897,6 @@ impl DatabaseContextManifestStore {
         Ok(DurableCaptureOutcome::Inserted)
     }
 
-    pub async fn validate_raw_ref(&self, raw_ref: &str) -> Result<(), ContextManifestError> {
-        let Some((scheme, _rest)) = raw_ref.split_once("://") else {
-            return Err(ContextManifestError::UnsupportedRawRefScheme {
-                scheme: String::new(),
-            });
-        };
-        let exists = sqlx::query(
-            "SELECT scheme FROM raw_ref_scheme_registry WHERE scheme = ? AND is_active = 1",
-        )
-        .bind(scheme)
-        .fetch_optional(self.pool.get())
-        .await
-        .map_err(|source| ContextManifestError::Database {
-            operation: "raw_ref_scheme_lookup",
-            entity: raw_ref.to_string(),
-            source,
-        })?
-        .is_some();
-        if exists {
-            Ok(())
-        } else {
-            Err(ContextManifestError::UnsupportedRawRefScheme {
-                scheme: scheme.to_string(),
-            })
-        }
-    }
-
     pub async fn record_retrieval_degrade_event(
         &self,
         user_id: &str,
@@ -1074,49 +927,6 @@ impl DatabaseContextManifestStore {
         .await
         .map(|_| ())?;
         Ok(next_stage)
-    }
-
-    pub async fn preview_template_budget_or_fallback(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        run_id: Option<&str>,
-        tool_name: &str,
-    ) -> Result<u32, ContextManifestError> {
-        let row = sqlx::query(
-            "SELECT max_preview_bytes FROM preview_template_registry
-             WHERE tool_name = ? AND status = 'active'
-             ORDER BY updated_at DESC
-             LIMIT 1",
-        )
-        .bind(tool_name)
-        .fetch_optional(self.pool.get())
-        .await
-        .map_err(|source| ContextManifestError::Database {
-            operation: "preview_template_lookup",
-            entity: tool_name.to_string(),
-            source,
-        })?;
-        if let Some(row) = row {
-            return decode_preview_template_budget_row(&row, tool_name);
-        }
-
-        self.insert_session_event_and_bump_count(SessionEventInsert {
-            user_id,
-            session_id,
-            event_type: "preview_template_missing",
-            content: tool_name,
-            metadata: serde_json::json!({
-                "run_id": run_id,
-                "tool_name": tool_name,
-                "fallback_max_preview_bytes": 400,
-            }),
-            operation: "preview_template_missing_event",
-            entity: tool_name,
-        })
-        .await
-        .map(|_| ())?;
-        Ok(400)
     }
 
     pub async fn render_artifact_manifest_item(
@@ -1299,7 +1109,6 @@ mod tests {
     #[derive(Clone)]
     struct FakeContextManifestRow {
         failed_column: Option<&'static str>,
-        i64_overrides: Vec<(&'static str, i64)>,
         metadata: Option<&'static str>,
     }
 
@@ -1307,7 +1116,6 @@ mod tests {
         fn complete() -> Self {
             Self {
                 failed_column: None,
-                i64_overrides: Vec::new(),
                 metadata: Some(r#"{"summary":"metadata summary"}"#),
             }
         }
@@ -1315,13 +1123,6 @@ mod tests {
         fn fail_on(column: &'static str) -> Self {
             Self {
                 failed_column: Some(column),
-                ..Self::complete()
-            }
-        }
-
-        fn with_i64(column: &'static str, value: i64) -> Self {
-            Self {
-                i64_overrides: vec![(column, value)],
                 ..Self::complete()
             }
         }
@@ -1357,21 +1158,6 @@ mod tests {
             self.fail_if_needed(column)?;
             Ok(match column {
                 "metadata" => self.metadata.map(ToString::to_string),
-                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
-            })
-        }
-
-        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
-            self.fail_if_needed(column)?;
-            if let Some((_, value)) = self
-                .i64_overrides
-                .iter()
-                .find(|(candidate, _)| *candidate == column)
-            {
-                return Ok(*value);
-            }
-            Ok(match column {
-                "max_preview_bytes" => 1024,
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
             })
         }
@@ -1411,37 +1197,6 @@ mod tests {
             expired_artifact_placeholder("artifact-1", Some("important preserved summary"));
         assert!(rendered.contains("historical, raw no longer available"));
         assert!(rendered.contains("important preserved summary"));
-    }
-
-    #[test]
-    fn preview_template_budget_decode_preserves_values_and_fails_loudly() {
-        assert_eq!(
-            decode_preview_template_budget_row(&FakeContextManifestRow::complete(), "bash")
-                .unwrap(),
-            1024
-        );
-
-        assert_context_manifest_db_error_mentions(
-            decode_preview_template_budget_row(
-                &FakeContextManifestRow::fail_on("max_preview_bytes"),
-                "bash",
-            ),
-            "max_preview_bytes",
-        );
-        assert_context_manifest_db_error_mentions(
-            decode_preview_template_budget_row(
-                &FakeContextManifestRow::with_i64("max_preview_bytes", 0),
-                "bash",
-            ),
-            "max_preview_bytes",
-        );
-        assert_context_manifest_db_error_mentions(
-            decode_preview_template_budget_row(
-                &FakeContextManifestRow::with_i64("max_preview_bytes", i64::from(u32::MAX) + 1),
-                "bash",
-            ),
-            "max_preview_bytes",
-        );
     }
 
     #[test]

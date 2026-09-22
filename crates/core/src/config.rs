@@ -1145,7 +1145,6 @@ impl AppSettings {
                     .is_some_and(|value| value == "1"),
                 issuer: lookup("MEMORIA_ISSUER"),
                 web_url: lookup("MEMORIA_WEB_URL"),
-                legacy_issuer: lookup("MEMORIA_LEGACY_ISSUER"),
             },
             uc_native: UcNativeSettings::from_lookup(&lookup)?,
             runtime_root_secret: required_value(
@@ -1571,7 +1570,6 @@ pub struct MemoriaSettings {
     pub self_hosted_master_access: bool,
     pub issuer: Option<String>,
     pub web_url: Option<String>,
-    pub legacy_issuer: Option<String>,
 }
 
 impl MemoriaSettings {
@@ -1585,7 +1583,6 @@ impl MemoriaSettings {
                 .is_ok_and(|value| value == "1"),
             issuer: env::var("MEMORIA_ISSUER").ok(),
             web_url: env::var("MEMORIA_WEB_URL").ok(),
-            legacy_issuer: env::var("MEMORIA_LEGACY_ISSUER").ok(),
         }
     }
 
@@ -1778,7 +1775,6 @@ mod tests {
             self_hosted_master_access: false,
             issuer: None,
             web_url: None,
-            legacy_issuer: None,
         };
         assert!(!settings.allows_self_hosted_master_fallback());
 

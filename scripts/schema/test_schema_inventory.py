@@ -790,8 +790,6 @@ fn char_literal() { let slash = '/'; }
             "harness_skill_rules",
             "harness_snapshots",
             "llm_provider_admission_pacing",
-            "preview_template_registry",
-            "raw_ref_scheme_registry",
         }
         for table in ctx_eval_harness_preview_tables:
             with self.subTest(table=table):
@@ -864,14 +862,6 @@ fn char_literal() { let slash = '/'; }
         self.assertIn(
             "feedback is evaluation input",
             self.tables["eval_user_feedback"]["merge_guidance"],
-        )
-        self.assertIn(
-            "not preview rendering templates",
-            self.tables["raw_ref_scheme_registry"]["merge_guidance"],
-        )
-        self.assertIn(
-            "raw ref schemes control resolver",
-            self.tables["preview_template_registry"]["merge_guidance"],
         )
         self.assertIn(
             "virtual-time concurrency smoothing",
@@ -985,7 +975,6 @@ fn char_literal() { let slash = '/'; }
             "session_history_chunks",
             "session_artifacts_grants",
             "data_versioning_checkpoints",
-            "preview_template_registry + raw_ref_scheme_registry",
             "harness_skill_drafts + harness_skill_rules",
             "team_execution_history + team_snapshots",
         }
@@ -1011,10 +1000,6 @@ fn char_literal() { let slash = '/'; }
 
         self.assertIn("tracing-only", self.p1_5_reviews["session_sync_log"]["user_api_impact"])
         self.assertIn(
-            "legacy issuer",
-            self.p1_5_reviews["auth_memoria_identities"]["user_api_impact"],
-        )
-        self.assertIn(
             "hydration",
             self.p1_5_reviews["session_state_revisions"]["rationale"],
         )
@@ -1029,12 +1014,6 @@ fn char_literal() { let slash = '/'; }
         self.assertIn(
             "rollback/list",
             self.p1_5_reviews["data_versioning_checkpoints"]["user_api_impact"],
-        )
-        self.assertIn(
-            "access checks",
-            self.p1_5_reviews[
-                "preview_template_registry + raw_ref_scheme_registry"
-            ]["user_api_impact"],
         )
         self.assertIn(
             "distinct cardinality",
@@ -1063,14 +1042,6 @@ fn char_literal() { let slash = '/'; }
             "crates/services/src/storage.rs": [
                 "validate_core_schema_table_claim",
                 "verify_core_schema_shape",
-                "preview_template_registry",
-                "raw_ref_scheme_registry",
-                "INSERT IGNORE INTO raw_ref_scheme_registry",
-                "INSERT IGNORE INTO preview_template_registry",
-            ],
-            "crates/services/src/auth/memoria.rs": [
-                "LEGACY_MEMORIA_PROVIDER_ID",
-                "auth_external_identities",
             ],
             "crates/services/src/harness.rs": [
                 "harness_skill_drafts",

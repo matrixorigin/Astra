@@ -9012,17 +9012,6 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
         .await
         .expect("record retrieval degrade event");
     assert_eq!(next_stage, Some(RetrievalStage::Fts));
-    let missing_tool_name = format!("missing-tool-{}", Uuid::new_v4());
-    let fallback_budget = context_manifest_store
-        .preview_template_budget_or_fallback(
-            &user_id,
-            &context_session,
-            Some("run-context-it"),
-            &missing_tool_name,
-        )
-        .await
-        .expect("record preview template missing event");
-    assert_eq!(fallback_budget, 400);
     let context_count =
         sqlx::query("SELECT event_count FROM agent_sessions WHERE session_id = ? AND user_id = ?")
             .bind(&context_session)
@@ -9033,7 +9022,7 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
             .try_get::<i64, _>("event_count")
             .expect("decode context manifest event_count");
     assert_eq!(
-        context_count, 3,
+        context_count, 2,
         "context manifest diagnostics should add one event_count delta per persisted event"
     );
     let context_event_ids =
@@ -9046,7 +9035,7 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
             .into_iter()
             .map(|row| row.try_get::<String, _>("event_id").expect("event_id"))
             .collect::<Vec<_>>();
-    assert_eq!(context_event_ids.len(), 3);
+    assert_eq!(context_event_ids.len(), 2);
 
     let state_projection_store = DatabaseStateProjectionStore::new(shared.clone());
     let active_skill_name = format!("active-skill-{}", Uuid::new_v4());
