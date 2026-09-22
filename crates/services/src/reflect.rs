@@ -514,6 +514,34 @@ struct ModelRequestSummary {
     input: astra_turn_types::NormalizedPromptCacheUsage,
     output_tokens: u64,
     cache_invalidations: u64,
+    usage_observations: u64,
+    usage_coverage: ModelRequestUsageCoverage,
+    groups: Vec<ModelRequestGroup>,
+    omitted_groups: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ModelRequestUsageCoverage {
+    exact: u64,
+    partial: u64,
+    unavailable: u64,
+    unknown: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ModelRequestGroup {
+    run_id: Option<String>,
+    agent_id: Option<String>,
+    offering_id: String,
+    provider: String,
+    model: String,
+    upstream_model: Option<String>,
+    purpose: String,
+    terminal_requests: u64,
+    input: astra_turn_types::NormalizedPromptCacheUsage,
+    output_tokens: u64,
+    usage_observations: u64,
+    usage_coverage: ModelRequestUsageCoverage,
 }
 
 /// Bounded latency facts from durable `llm_round` events. This is deliberately
@@ -572,37 +600,71 @@ fn llm_round_latency_summary_from_row(
 
 impl ModelRequestSummary {
     fn from_records(records: &[ModelRequestContextRecord]) -> Option<Self> {
+        const MAX_GROUPS: usize = 8;
         let mut summary = Self::default();
+        let mut seen_requests = BTreeSet::new();
+        let mut groups = BTreeMap::new();
         for record in records {
             if record.stage != ModelRequestEventStage::Terminal {
                 continue;
             }
+            let identity = &record.event.identity;
+            if !seen_requests.insert((identity.request_id.as_str(), identity.physical_attempt)) {
+                continue;
+            }
             summary.terminal_requests = summary.terminal_requests.saturating_add(1);
+            summary
+                .usage_coverage
+                .observe(record.event.usage_status.as_deref());
+            let key = (
+                identity.run_id.clone(),
+                identity.agent_id.clone(),
+                identity.offering_id.clone(),
+                identity.provider.clone(),
+                identity.model.clone(),
+                record
+                    .event
+                    .route
+                    .as_ref()
+                    .map(|route| route.upstream_model.clone()),
+                identity.inference_purpose.clone(),
+            );
+            let group = groups
+                .entry(key.clone())
+                .or_insert_with(|| ModelRequestGroup {
+                    run_id: key.0,
+                    agent_id: key.1,
+                    offering_id: key.2,
+                    provider: key.3,
+                    model: key.4,
+                    upstream_model: key.5,
+                    purpose: key.6,
+                    ..ModelRequestGroup::default()
+                });
+            group.terminal_requests = group.terminal_requests.saturating_add(1);
+            group
+                .usage_coverage
+                .observe(record.event.usage_status.as_deref());
             if let Some(usage) = record.event.usage.as_ref() {
-                summary.input.fresh_input_tokens = summary
-                    .input
-                    .fresh_input_tokens
-                    .saturating_add(usage.input.fresh_input_tokens);
+                summary.usage_observations = summary.usage_observations.saturating_add(1);
+                group.usage_observations = group.usage_observations.saturating_add(1);
+                add_prompt_cache_usage(&mut summary.input, &usage.input);
                 summary.output_tokens = summary.output_tokens.saturating_add(usage.output_tokens);
-                summary.input.cache_read_tokens = summary
-                    .input
-                    .cache_read_tokens
-                    .saturating_add(usage.input.cache_read_tokens);
-                summary.input.cache_creation_tokens = summary
-                    .input
-                    .cache_creation_tokens
-                    .saturating_add(usage.input.cache_creation_tokens);
+                add_prompt_cache_usage(&mut group.input, &usage.input);
+                group.output_tokens = group.output_tokens.saturating_add(usage.output_tokens);
             }
             if !record.event.cache.invalidation_reasons.is_empty() {
                 summary.cache_invalidations = summary.cache_invalidations.saturating_add(1);
             }
         }
+        summary.omitted_groups = groups.len().saturating_sub(MAX_GROUPS);
+        summary.groups = groups.into_values().take(MAX_GROUPS).collect();
         (summary.terminal_requests > 0).then_some(summary)
     }
 
     fn render(&self) -> String {
         let total_input_tokens = self.input.total_input_tokens();
-        let cache_share = if total_input_tokens == 0 {
+        let cache_share = if self.usage_observations == 0 || total_input_tokens == 0 {
             "unknown".to_string()
         } else {
             format!(
@@ -610,17 +672,93 @@ impl ModelRequestSummary {
                 self.input.cache_read_tokens as f64 / total_input_tokens as f64 * 100.0
             )
         };
-        format!(
-            "Model requests: {} terminal; cache read {cache_share} ({}/{} total input; {} fresh, {} cache write), {} model-context invalidation record(s), {} output tokens. Pipeline cache-break alerts, when present, are reported separately as session issues.",
+        let mut rendered = format!(
+            "Model requests (bounded captured window; not complete session billing): {} terminal; known cache read {cache_share} ({}/{} known input; {} fresh, {} cache write), {} model-context invalidation record(s), {} known output tokens; usage coverage exact={}, partial={}, unavailable={}, unknown={}.",
             self.terminal_requests,
-            self.input.cache_read_tokens,
-            total_input_tokens,
-            self.input.fresh_input_tokens,
-            self.input.cache_creation_tokens,
+            render_known_usage(self.usage_observations, self.input.cache_read_tokens),
+            render_known_usage(self.usage_observations, total_input_tokens),
+            render_known_usage(self.usage_observations, self.input.fresh_input_tokens),
+            render_known_usage(self.usage_observations, self.input.cache_creation_tokens),
             self.cache_invalidations,
-            self.output_tokens,
-        )
+            render_known_usage(self.usage_observations, self.output_tokens),
+            self.usage_coverage.exact,
+            self.usage_coverage.partial,
+            self.usage_coverage.unavailable,
+            self.usage_coverage.unknown,
+        );
+        for group in &self.groups {
+            rendered.push_str(&format!(
+                "\n- run={} agent={} offering={} provider={} model={} upstream_model={} purpose={} requests={} known_input={} known_output={} usage(exact={}, partial={}, unavailable={}, unknown={})",
+                render_model_request_identity(group.run_id.as_deref()),
+                render_model_request_identity(group.agent_id.as_deref()),
+                render_model_request_identity(Some(&group.offering_id)),
+                render_model_request_identity(Some(&group.provider)),
+                render_model_request_identity(Some(&group.model)),
+                render_model_request_identity(group.upstream_model.as_deref()),
+                render_model_request_identity(Some(&group.purpose)),
+                group.terminal_requests,
+                render_known_usage(group.usage_observations, group.input.total_input_tokens()),
+                render_known_usage(group.usage_observations, group.output_tokens),
+                group.usage_coverage.exact,
+                group.usage_coverage.partial,
+                group.usage_coverage.unavailable,
+                group.usage_coverage.unknown,
+            ));
+        }
+        if self.omitted_groups > 0 {
+            rendered.push_str(&format!(
+                "\n- {0} additional model identity group(s) omitted",
+                self.omitted_groups
+            ));
+        }
+        rendered.push_str(" Pipeline cache-break alerts, when present, are reported separately as session issues.");
+        rendered
     }
+}
+
+impl ModelRequestUsageCoverage {
+    fn observe(&mut self, status: Option<&str>) {
+        match status {
+            Some("provider_exact") => self.exact = self.exact.saturating_add(1),
+            Some("provider_partial") => self.partial = self.partial.saturating_add(1),
+            Some("unavailable") => self.unavailable = self.unavailable.saturating_add(1),
+            _ => self.unknown = self.unknown.saturating_add(1),
+        }
+    }
+}
+
+fn add_prompt_cache_usage(
+    total: &mut astra_turn_types::NormalizedPromptCacheUsage,
+    usage: &astra_turn_types::NormalizedPromptCacheUsage,
+) {
+    total.fresh_input_tokens = total
+        .fresh_input_tokens
+        .saturating_add(usage.fresh_input_tokens);
+    total.cache_read_tokens = total
+        .cache_read_tokens
+        .saturating_add(usage.cache_read_tokens);
+    total.cache_creation_tokens = total
+        .cache_creation_tokens
+        .saturating_add(usage.cache_creation_tokens);
+}
+
+fn render_known_usage(observations: u64, value: u64) -> String {
+    if observations == 0 {
+        "unknown".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn render_model_request_identity(value: Option<&str>) -> String {
+    let Some(value) = value else {
+        return "unknown".to_string();
+    };
+    let mut bounded = value.chars().take(128).collect::<String>();
+    if value.chars().nth(128).is_some() {
+        bounded.push('…');
+    }
+    serde_json::to_string(&bounded).expect("string serialization cannot fail")
 }
 
 impl AgentDeliveryRollup {
@@ -2599,21 +2737,92 @@ mod tests {
                 .naive_utc(),
         };
 
-        let summary =
-            ModelRequestSummary::from_records(&[record]).expect("terminal request summary");
+        let summary = ModelRequestSummary::from_records(std::slice::from_ref(&record))
+            .expect("terminal request summary");
         assert_eq!(summary.terminal_requests, 1);
         assert_eq!(
             summary.input,
             astra_turn_types::NormalizedPromptCacheUsage::new(50, 950, 50)
         );
         assert_eq!(summary.cache_invalidations, 1);
+        assert_eq!(summary.usage_coverage.exact, 1);
+        assert_eq!(summary.groups.len(), 1);
+        assert_eq!(summary.groups[0].run_id.as_deref(), Some("run-1"));
+        assert_eq!(summary.groups[0].offering_id, "offering-1");
         assert!(
-            summary
-                .render()
-                .contains("cache read 90.5% (950/1050 total input; 50 fresh, 50 cache write)"),
+            summary.render().contains(
+                "known cache read 90.5% (950/1050 known input; 50 fresh, 50 cache write)"
+            ),
             "{}",
             summary.render()
         );
+        assert!(summary.render().contains("usage coverage exact=1"));
+
+        let mut child = record.clone();
+        child.event_id = "event-2".into();
+        child.event.identity.request_id = "request-2".into();
+        child.event.identity.run_id = Some("child-run".into());
+        child.event.identity.agent_id = Some("child-agent".into());
+        child.event.identity.parent_run_id = Some("run-1".into());
+        child.event.identity.offering_id = "offering-2".into();
+        child.event.identity.inference_purpose = "sub_agent".into();
+        child.event.usage_status = Some("provider_partial".into());
+        let mut retry = child.clone();
+        retry.event_id = "event-3".into();
+        retry.event.identity.request_id = "request-3".into();
+        retry.event.identity.physical_attempt = 1;
+        retry.event.usage = None;
+        retry.event.usage_status = Some("unavailable".into());
+        let duplicate_retry = retry.clone();
+        let unavailable = ModelRequestSummary::from_records(std::slice::from_ref(&retry))
+            .expect("unavailable request summary");
+        assert!(unavailable.render().contains("known_input=unknown"));
+        assert!(unavailable.render().contains("known_output=unknown"));
+
+        let mut exact_zero = record.clone();
+        exact_zero.event.identity.request_id = "request-zero".into();
+        exact_zero.event.usage = Some(ModelRequestUsage {
+            input: astra_turn_types::NormalizedPromptCacheUsage::default(),
+            output_tokens: 0,
+        });
+        let exact_zero = ModelRequestSummary::from_records(std::slice::from_ref(&exact_zero))
+            .expect("measured-zero request summary");
+        assert!(exact_zero.render().contains("known_input=0"));
+        assert!(exact_zero.render().contains("known_output=0"));
+
+        let mixed = ModelRequestSummary::from_records(&[record, child, retry, duplicate_retry])
+            .expect("mixed parent and child request summary");
+        assert_eq!(
+            mixed.terminal_requests, 3,
+            "duplicate terminal facts collapse"
+        );
+        assert_eq!(mixed.groups.len(), 2);
+        assert_eq!(mixed.usage_coverage.exact, 1);
+        assert_eq!(mixed.usage_coverage.partial, 1);
+        assert_eq!(mixed.usage_coverage.unavailable, 1);
+        let child_group = mixed
+            .groups
+            .iter()
+            .find(|group| group.run_id.as_deref() == Some("child-run"))
+            .expect("child identity group");
+        assert_eq!(child_group.offering_id, "offering-2");
+        assert_eq!(child_group.terminal_requests, 2);
+        assert_eq!(child_group.usage_coverage.partial, 1);
+        assert_eq!(child_group.usage_coverage.unavailable, 1);
+        let rendered = mixed.render();
+        assert!(
+            rendered.contains("run=\"child-run\" agent=\"child-agent\""),
+            "{rendered}"
+        );
+        assert!(rendered.contains("partial=1, unavailable=1"), "{rendered}");
+        assert_eq!(
+            render_model_request_identity(Some("model\nforged")),
+            "\"model\\nforged\""
+        );
+        let long_identity = "x".repeat(200);
+        let rendered_identity = render_model_request_identity(Some(&long_identity));
+        assert!(rendered_identity.contains('…'));
+        assert!(rendered_identity.chars().count() <= 131);
     }
 
     #[test]
@@ -2623,11 +2832,13 @@ mod tests {
             input: astra_turn_types::NormalizedPromptCacheUsage::new(222, 76_800, 0),
             output_tokens: 176,
             cache_invalidations: 0,
+            usage_observations: 3,
+            ..ModelRequestSummary::default()
         };
 
         let rendered = summary.render();
         assert!(
-            rendered.contains("cache read 99.7% (76800/77022 total input; 222 fresh"),
+            rendered.contains("known cache read 99.7% (76800/77022 known input; 222 fresh"),
             "{rendered}"
         );
         assert!(!rendered.contains("34594"), "{rendered}");
