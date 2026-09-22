@@ -2270,6 +2270,10 @@ impl DelegationEngine {
                 retry_of,
                 crate::server::run::engine::RunStartContext {
                     interaction_mode,
+                    generation_controls: Some(crate::server::run::engine::RunGenerationControls {
+                        thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
+                        first_output_max_tokens: None,
+                    }),
                     ..Default::default()
                 },
             )
@@ -9233,6 +9237,13 @@ mod tests {
                 .unwrap()
                 .expect("durable fork child");
             assert_eq!(durable.events[0]["data"]["interaction_mode"], "auto");
+            assert_eq!(
+                crate::server::run::engine::durable_run_generation_controls(&durable).unwrap(),
+                crate::server::run::engine::RunGenerationControls {
+                    thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
+                    first_output_max_tokens: None,
+                }
+            );
         }
     }
 

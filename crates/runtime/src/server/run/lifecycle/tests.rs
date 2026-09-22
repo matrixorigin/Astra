@@ -12861,6 +12861,13 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
     assert_eq!(child.model_offering_id.as_deref(), Some("model-test-model"));
     assert_eq!(child.resolved_model_name.as_deref(), Some("test-model"));
     assert_eq!(
+        crate::server::run::engine::durable_run_generation_controls(&child).unwrap(),
+        crate::server::run::engine::RunGenerationControls {
+            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
+            first_output_max_tokens: None,
+        }
+    );
+    assert_eq!(
         child.events[0]["data"]["interaction_mode"], "auto",
         "child durable start must record the effective interaction policy"
     );
@@ -12872,6 +12879,38 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
         .expect_err("durable retry cannot reinterpret its interaction policy");
     assert!(policy_error.contains("changed its interaction policy"));
     config.interaction_mode = RequestedTurnInteractionMode::Auto;
+
+    config.thinking = astra_turn_core::thinking_config::ThinkingConfig::ModelDefault;
+    let thinking_error = executor
+        .ensure_durable_subrun_started(&config, config.admitted_model_execution.as_ref())
+        .await
+        .expect_err("durable retry cannot change reasoning controls");
+    assert!(thinking_error.contains("changed its generation controls"));
+    config.thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+
+    config.max_output_tokens = Some(4096);
+    let cap_error = executor
+        .ensure_durable_subrun_started(&config, config.admitted_model_execution.as_ref())
+        .await
+        .expect_err("durable retry cannot add a first-round output limit");
+    assert!(cap_error.contains("changed its generation controls"));
+    config.max_output_tokens = None;
+    executor
+        .ensure_durable_subrun_started(&config, config.admitted_model_execution.as_ref())
+        .await
+        .expect("unchanged controls retain the existing durable child");
+    assert_eq!(
+        run_engine
+            .load_run("user-1", "child-run")
+            .await
+            .unwrap()
+            .unwrap()
+            .events
+            .iter()
+            .filter(|event| event["event_type"] == "run_started")
+            .count(),
+        1
+    );
 
     config.admitted_model_execution = Some(AdmittedModelExecution::from_endpoint(
         "model-other".to_string(),

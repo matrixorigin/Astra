@@ -63,6 +63,7 @@ use astra_services::{
     },
 };
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
+use astra_turn_core::thinking_config::ThinkingConfig;
 use astra_turn_types::ModelSelection;
 
 use astra_core::{
@@ -458,6 +459,8 @@ pub struct RunStartContext {
     pub agent_binding_schema_version: Option<String>,
     pub model_selection: Option<ModelSelection>,
     pub resolved_model_selection: Option<ResolvedModelSelection>,
+    /// Immutable effective controls for an executable child run.
+    pub(crate) generation_controls: Option<RunGenerationControls>,
     /// Trusted process-local proof that the complete model identity was
     /// produced from admitted execution material for this run. This is not a
     /// durable provenance label and is never reconstructed from request data.
@@ -500,6 +503,7 @@ impl Default for RunStartContext {
             agent_binding_schema_version: None,
             model_selection: None,
             resolved_model_selection: None,
+            generation_controls: None,
             model_identity_admitted: false,
             runtime_profile: None,
             provider_request_fingerprint: None,
@@ -510,6 +514,51 @@ impl Default for RunStartContext {
             validated_work_item_assignment: false,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RunGenerationControls {
+    pub thinking: ThinkingConfig,
+    pub first_output_max_tokens: Option<u32>,
+}
+
+pub(crate) fn durable_run_generation_controls(
+    run: &DurableRunRecord,
+) -> Result<RunGenerationControls, String> {
+    let mut started = run
+        .events
+        .iter()
+        .filter(|event| event["event_type"] == "run_started");
+    let event = started
+        .next()
+        .ok_or_else(|| "durable run has no start event".to_string())?;
+    if started.next().is_some() {
+        return Err("durable run has conflicting start events".to_string());
+    }
+    let value = event
+        .pointer("/data/generation_controls")
+        .ok_or_else(|| "durable run is missing generation controls".to_string())?;
+    if !value
+        .as_object()
+        .is_some_and(|controls| controls.contains_key("first_output_max_tokens"))
+    {
+        return Err("durable run is missing its first-output limit field".to_string());
+    }
+    let controls: RunGenerationControls = serde_json::from_value(value.clone())
+        .map_err(|error| format!("durable run has invalid generation controls: {error}"))?;
+    if controls.first_output_max_tokens == Some(0) {
+        return Err("durable run has a zero first-output limit".to_string());
+    }
+    if let ThinkingConfig::Enabled { budget_tokens } = &controls.thinking {
+        if *budget_tokens < 1024 {
+            return Err("durable run has an invalid reasoning budget".to_string());
+        }
+        if let Some(limit) = controls.first_output_max_tokens {
+            controls.thinking.validate_output_budget(u64::from(limit))?;
+        }
+    }
+    Ok(controls)
 }
 
 fn durable_model_identity(
@@ -841,7 +890,10 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
     }
     if let Some(metadata) = context.execution_metadata.as_ref() {
         for (key, value) in metadata {
-            if key != "execution_restrictions" && key != "admission_source" {
+            if key != "execution_restrictions"
+                && key != "admission_source"
+                && key != "generation_controls"
+            {
                 data.entry(key.clone()).or_insert_with(|| value.clone());
             }
         }
@@ -856,6 +908,12 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
         data.insert(
             "admission_source".into(),
             serde_json::to_value(source).expect("typed admission source serializes"),
+        );
+    }
+    if let Some(controls) = context.generation_controls.as_ref() {
+        data.insert(
+            "generation_controls".into(),
+            serde_json::to_value(controls).expect("typed generation controls serialize"),
         );
     }
     if let Some(fingerprint) = context.provider_request_fingerprint.as_ref() {
@@ -6956,6 +7014,76 @@ mod tests {
         assert_eq!(run.events[0]["data"]["interactive_client"], true);
         assert_eq!(run.events[0]["data"]["turn_intent_policy"], "fixed_default");
         assert_eq!(run.events[0]["data"]["skill_auto_route_policy"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn generation_controls_round_trip_and_reject_missing_or_corrupt_snapshots() {
+        let engine = test_engine();
+        let controls = RunGenerationControls {
+            thinking: ThinkingConfig::Enabled {
+                budget_tokens: 2048,
+            },
+            first_output_max_tokens: Some(4096),
+        };
+        engine
+            .start_run_with_context(
+                "controlled",
+                "user-1",
+                "sess-1",
+                RunStartContext {
+                    generation_controls: Some(controls.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut run = engine
+            .load_run("user-1", "controlled")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable_run_generation_controls(&run).unwrap(), controls);
+
+        let valid_start = run.events[0].clone();
+        run.events.push(valid_start.clone());
+        assert!(durable_run_generation_controls(&run).is_err());
+        run.events.pop();
+
+        run.events[0]["data"]["generation_controls"] = serde_json::json!({
+            "thinking": {"mode": "off"}
+        });
+        assert!(durable_run_generation_controls(&run).is_err());
+        run.events[0] = valid_start;
+
+        run.events[0]["data"]["generation_controls"]["first_output_max_tokens"] =
+            serde_json::json!(0);
+        assert!(durable_run_generation_controls(&run).is_err());
+        run.events[0]["data"]["generation_controls"] = serde_json::json!({
+            "thinking": {"mode": "enabled", "budget_tokens": 4096},
+            "first_output_max_tokens": 4096
+        });
+        assert!(durable_run_generation_controls(&run).is_err());
+
+        run.events[0]["data"]["generation_controls"]["thinking"] =
+            serde_json::json!({"mode": "unknown"});
+        assert!(durable_run_generation_controls(&run).is_err());
+        run.events[0]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("generation_controls");
+        assert!(durable_run_generation_controls(&run).is_err());
+    }
+
+    #[test]
+    fn execution_metadata_cannot_forge_generation_controls() {
+        let event = run_started_event_data(&RunStartContext {
+            execution_metadata: Some(serde_json::Map::from_iter([(
+                "generation_controls".to_string(),
+                serde_json::json!({"thinking": {"mode": "off"}, "first_output_max_tokens": 1}),
+            )])),
+            ..Default::default()
+        });
+        assert!(event.get("generation_controls").is_none());
     }
 
     #[test]

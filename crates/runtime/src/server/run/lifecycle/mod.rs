@@ -22230,6 +22230,15 @@ impl ServerSubRunExecutor {
                 .ok_or_else(|| "durable sub-run parent has no ancestor root".to_string())?
         };
         if let Some(existing) = existing {
+            let requested_controls = crate::server::run::engine::RunGenerationControls {
+                thinking: config.thinking.clone(),
+                first_output_max_tokens: config.max_output_tokens,
+            };
+            if crate::server::run::engine::durable_run_generation_controls(&existing)?
+                != requested_controls
+            {
+                return Err("durable sub-run retry changed its generation controls".into());
+            }
             if existing.session_id != config.session_id
                 || existing.parent_run_id.as_deref() != Some(config.parent_run_id.as_str())
             {
@@ -22364,6 +22373,10 @@ impl ServerSubRunExecutor {
                 None,
                 crate::server::run::engine::RunStartContext {
                     interaction_mode: config.interaction_mode,
+                    generation_controls: Some(crate::server::run::engine::RunGenerationControls {
+                        thinking: config.thinking.clone(),
+                        first_output_max_tokens: config.max_output_tokens,
+                    }),
                     agent_binding_name: Some(config.agent_profile.name.clone()),
                     provider_run_owner: inherited_provider_run_owner(&config.context)?,
                     model_identity_admitted: execution.is_some(),
@@ -22392,12 +22405,22 @@ impl ServerSubRunExecutor {
         &self,
         config: &SubRunConfig,
         selected_execution: Option<&astra_services::AdmittedModelExecution>,
-    ) -> Result<Option<astra_services::AdmittedModelExecution>, String> {
+    ) -> Result<
+        (
+            Option<astra_services::AdmittedModelExecution>,
+            crate::server::run::engine::RunGenerationControls,
+        ),
+        String,
+    > {
         let inherited_execution = selected_execution
             .or(config.admitted_model_execution.as_ref())
             .or(self.admitted_model_execution.as_ref());
+        let requested_controls = crate::server::run::engine::RunGenerationControls {
+            thinking: config.thinking.clone(),
+            first_output_max_tokens: config.max_output_tokens,
+        };
         let Some(run_engine) = self.durable_run_engine() else {
-            return Ok(inherited_execution.cloned());
+            return Ok((inherited_execution.cloned(), requested_controls));
         };
         let run = run_engine
             .load_run(&config.user_id, &config.run_id)
@@ -22405,6 +22428,10 @@ impl ServerSubRunExecutor {
             .ok_or_else(|| {
                 "durable sub-run disappeared before model materialization".to_string()
             })?;
+        let durable_controls = crate::server::run::engine::durable_run_generation_controls(&run)?;
+        if durable_controls != requested_controls {
+            return Err("durable sub-run generation controls changed before execution".into());
+        }
         let offering_id = run.model_offering_id.as_deref().ok_or_else(|| {
             "durable sub-run is missing its admitted Offering identity".to_string()
         })?;
@@ -22419,7 +22446,7 @@ impl ServerSubRunExecutor {
                         .to_string(),
                 );
             }
-            return Ok(Some(execution.clone()));
+            return Ok((Some(execution.clone()), durable_controls));
         }
         let execution = self.admit_offering(&config.user_id, offering_id).await?;
         if execution.model_name != expected_model_name {
@@ -22428,7 +22455,7 @@ impl ServerSubRunExecutor {
                     .to_string(),
             );
         }
-        Ok(Some(execution))
+        Ok((Some(execution), durable_controls))
     }
 
     async fn select_subrun_execution(
@@ -23270,7 +23297,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 .and_then(|run| run.work_binding),
             None => None,
             };
-        let admitted_model_execution = self
+        let (admitted_model_execution, generation_controls) = self
             .materialize_durable_subrun_execution(&config, selected_execution.as_ref())
             .await?;
         let child_model_name = admitted_model_execution
@@ -23394,8 +23421,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             config.session_id.clone(),
         )
         .with_model(child_model_name.clone())
-        .with_initial_output_limit(config.max_output_tokens)
-        .with_preserved_thinking(config.thinking != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault)
+        .with_initial_output_limit(generation_controls.first_output_max_tokens)
+        .with_preserved_thinking(generation_controls.thinking != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault)
         .with_model_service(self.model_service.clone())
         .with_admitted_model_execution(admitted_model_execution)
         .with_inference_owner_pod_id(
@@ -23689,7 +23716,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
-            thinking: config.thinking.clone(),
+            thinking: generation_controls.thinking.clone(),
             permission_context: Some(permission_context),
             permission_handler: None,
             tactical_adapter: None,
