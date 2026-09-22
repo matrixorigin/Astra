@@ -1859,9 +1859,8 @@ pub async fn revalidate_admitted_model_executions(
                 }
             })?;
             let model = resolved_active_llm_from_offering_row(row, offering_id, encryptor)
-                .map_err(|error| {
+                .inspect_err(|_| {
                     active_llm_model_resolution_cache_remove(&cache_key);
-                    error
                 })?;
             let execution = AdmittedModelExecution::from_offering(ResolvedModelOffering {
                 offering_id: offering_id.clone(),
