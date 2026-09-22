@@ -61,3 +61,63 @@ fn requested_revision_rejects_execution_paths_without_identity_verification() {
         );
     }
 }
+
+#[test]
+fn case_routing_overrides_are_rejected_before_preflight_or_model_execution() {
+    let directory = tempfile::tempdir().unwrap();
+    let suite = directory.path().join("cases");
+    std::fs::create_dir(&suite).unwrap();
+    // Deliberately not executable: revision-bound case validation must fail
+    // before even attempting the artifact/health/model probes of this CLI.
+    let cli = directory.path().join("astra");
+    std::fs::write(&cli, "must never be executed").unwrap();
+    for configuration in [
+        "cli_env: {ASTRA_API_URL: 'http://case-target.invalid'}",
+        "cli_env: {ASTRA_PROFILE: other}",
+        "cli_env: {https_proxy: 'http://case-proxy.invalid'}",
+        "extra_cli_args: ['--api-url=http://case-target.invalid']",
+        "extra_cli_args: ['--profile', other]",
+    ] {
+        std::fs::write(
+            suite.join("routing.yaml"),
+            format!(
+                "name: routing\nprompt: hello\n{configuration}\nsteps:\n  - prompt: continue\n"
+            ),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_astra-test"))
+            .arg("--suite")
+            .arg(&suite)
+            .arg("--astra-bin")
+            .arg(&cli)
+            .args([
+                "--profile",
+                "local",
+                "--models",
+                "test-model",
+                "--no-judger",
+            ])
+            .current_dir(directory.path())
+            .env("ASTRA_API_URL", "http://preflight-target.invalid")
+            .env(
+                "ASTRA_EXPECTED_BUILD_GIT_SHA",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("can change the verified execution target"),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("case-target.invalid"),
+            "must not disclose values: {stderr}"
+        );
+        assert!(
+            !stderr.contains("binary exists but is not executable"),
+            "{stderr}"
+        );
+    }
+}

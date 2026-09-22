@@ -64,6 +64,27 @@ Revision verification requires the built-in CLI executor and is unavailable in
 dashboard mode. Embedded identity is a build declaration: use the trusted build
 workflow to refresh source metadata, particularly after uncommitted edits;
 this check does not fingerprint runtime configuration or all dependencies.
+Preflight resolves the legacy execution profile before checking health and
+passes that same explicit profile to health, model probes and case execution;
+it does not validate a native MOI endpoint and then execute on a legacy one.
+An automatic switch to the isolated `harness-auto` profile rechecks readiness
+and revision before registration and again before retrying the model probe.
+Artifact-only `--build-info-json` remains independent of profiles/configuration.
+In revision-bound mode, selected cases cannot override endpoint/profile,
+credential/settings roots, home directories, access tokens or proxy variables
+through `cli_env`, or routing flags through `extra_cli_args`. These are rejected
+before any live probe; configure shared routing in the harness environment or
+`--profile` instead. Non-routing overrides such as `ASTRA_TRACE` remain allowed.
+Strict mode loads the startup directory's dotenv once (unless the caller already
+selected `ASTRA_CONFIG_SOURCE=explicit-env`), then exports `explicit-env` to the
+whole execution chain. Probe/case working-directory dotenv files cannot supply
+another endpoint, and cases cannot override `ASTRA_CONFIG_SOURCE`. This mode
+also skips local ServerConfig files, including `ASTRA_SERVER_CONFIG`: settings
+needed by local dependency probes must be available in the exported environment.
+It does not change the remote Server's configuration.
+Cases and their setup commands are trusted test inputs: this verification is
+not isolation against scripts or concurrent processes changing CLI settings,
+credentials, binaries or the deployment after preflight.
 
 Invalid machine-event evidence fails the run even when terminal JSON reports
 success. The report retains available terminal text and token diagnostics, but
