@@ -664,6 +664,7 @@ name = "astra-test-harness"
 version = "0.2.7"
 dependencies = [
  "anyhow",
+ "astra-core",
  "astra-credentials",
  "astra-harness",
  "astra-pipeline",

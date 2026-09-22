@@ -14,6 +14,7 @@ path = "src/main.rs"
 path = "src/lib.rs"
 
 [dependencies]
+astra-core.workspace = true
 astra-credentials.workspace = true
 astra-harness.workspace = true
 astra-pipeline.workspace = true

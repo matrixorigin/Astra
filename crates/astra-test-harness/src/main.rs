@@ -318,9 +318,32 @@ fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
     )
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    if astra_core::build_info::write_json_if_requested()
+        .map_err(|error| anyhow::anyhow!("build identity: {error}"))?
+    {
+        return Ok(());
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let args = Args::parse();
+    dotenvy::dotenv().ok();
+    if args.skip_preflight && std::env::var_os("ASTRA_EXPECTED_BUILD_GIT_SHA").is_some() {
+        anyhow::bail!("--skip-preflight cannot bypass ASTRA_EXPECTED_BUILD_GIT_SHA verification");
+    }
+    if std::env::var_os("ASTRA_EXPECTED_BUILD_GIT_SHA").is_some()
+        && (args.live_dashboard.is_some() || args.executor_cmd.is_some())
+    {
+        anyhow::bail!(
+            "revision verification requires the built-in CLI executor without --live-dashboard"
+        );
+    }
     if !args.no_judger && args.judger_cmd.is_none() {
         astra_test_harness::judger::validate_builtin_judger_timeout(args.judger_timeout)
             .map_err(anyhow::Error::msg)?;
@@ -481,7 +504,7 @@ async fn main() -> Result<()> {
                 }
             }
             Err(e) => {
-                anyhow::bail!("pre-flight check failed: {e}\n  (use --skip-preflight to bypass)");
+                anyhow::bail!("pre-flight check failed: {e}");
             }
         }
     }
