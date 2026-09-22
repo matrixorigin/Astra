@@ -3489,6 +3489,15 @@ fn bounded_explain_component(value: &str, max_bytes: usize) -> String {
     format!("{}{}", &value[..boundary], suffix)
 }
 
+fn bounded_explain_judgment_identity(provider: &str, model: &str) -> Option<String> {
+    let provider = bounded_explain_component(provider, 12);
+    let model = bounded_explain_component(model, 28);
+    astra_services::judgment_presentation::provider_model_label(
+        Some(provider.as_str()),
+        Some(model.as_str()),
+    )
+}
+
 #[derive(Clone)]
 struct ExplainAnalyzeContext {
     run_id: String,
@@ -5935,9 +5944,9 @@ fn explain_tool_result_selection(
             ..
         } => (
             format!(
-                "Tool-result judgment · selected {selected_chunks}/{} chunks · model {} · wire application reported separately",
+                "Tool-result judgment · inclusion shown on model request · selected {selected_chunks}/{} chunks · execution via {}",
                 coverage.candidate_chunks,
-                explain_tool_result_judgment_model(execution)
+                explain_tool_result_judgment_execution(execution)
             ),
             ExplainAnalyzeOutcomeV1::Succeeded,
         ),
@@ -5947,8 +5956,8 @@ fn explain_tool_result_selection(
             ..
         } => (
             format!(
-                "Tool-result judgment · kept existing tool context (no clear match) · model {} · wire application reported separately",
-                explain_tool_result_judgment_model(execution)
+                "Tool-result judgment · inclusion shown on model request · kept existing tool context · no clear match · execution via {}",
+                explain_tool_result_judgment_execution(execution)
             ),
             ExplainAnalyzeOutcomeV1::Fallback,
         ),
@@ -5958,15 +5967,15 @@ fn explain_tool_result_selection(
             ..
         } => (
             format!(
-                "Tool-result judgment · kept existing tool context (selection was not smaller) · model {} · wire application reported separately",
-                explain_tool_result_judgment_model(execution)
+                "Tool-result judgment · inclusion shown on model request · kept existing tool context · selection not smaller · execution via {}",
+                explain_tool_result_judgment_execution(execution)
             ),
             ExplainAnalyzeOutcomeV1::Fallback,
         ),
         ToolResultSelectionOutcomeV1::Decided { execution, .. } => (
             format!(
-                "Tool-result judgment · kept existing tool context · model {} · wire application reported separately",
-                explain_tool_result_judgment_model(execution)
+                "Tool-result judgment · inclusion shown on model request · kept existing tool context · execution via {}",
+                explain_tool_result_judgment_execution(execution)
             ),
             ExplainAnalyzeOutcomeV1::Fallback,
         ),
@@ -5995,11 +6004,11 @@ fn explain_tool_result_selection(
                 },
                 |execution| {
                     format!(
-                        "Tool-result judgment · unavailable ({}) · model {} · kept existing tool context",
+                        "Tool-result judgment · unavailable ({}) · execution via {} · kept existing tool context",
                         astra_services::tool_result_selection_observation::tool_result_selection_unavailable_reason_label(
                             *reason,
                         ),
-                        explain_tool_result_judgment_model(execution)
+                        explain_tool_result_judgment_execution(execution)
                     )
                 },
             ),
@@ -6009,14 +6018,11 @@ fn explain_tool_result_selection(
     (bounded_explain_analyze_text(&label), explain_outcome)
 }
 
-fn explain_tool_result_judgment_model(
+fn explain_tool_result_judgment_execution(
     execution: &astra_turn_types::ToolResultSelectionExecutionV1,
 ) -> String {
-    format!(
-        "{} ({})",
-        execution.model_name,
-        astra_services::judgment_presentation::provider_label(&execution.provider)
-    )
+    bounded_explain_judgment_identity(&execution.provider, &execution.model_name)
+        .unwrap_or_else(|| "execution identity unavailable".into())
 }
 
 fn tool_result_projection_reduces_current_context(baseline: &str, selected: &str) -> bool {
@@ -8748,19 +8754,28 @@ impl ServerAgenticLoopHost {
         fact: &astra_turn_types::SemanticJudgmentFactV1,
         execution: Option<&astra_turn_core::cloud_summary::SummaryExecutionProvenance>,
     ) -> String {
-        let Some(execution) = execution else {
-            return fact.presentation_label();
-        };
         let stage = match fact.stage {
             astra_turn_types::RequestJudgmentStageV1::Initial => "initial",
             astra_turn_types::RequestJudgmentStageV1::Clarification => "clarification",
         };
-        let model = bounded_explain_component(&execution.model_name, 48);
-        let provider = bounded_explain_component(&execution.provider, 32);
-        let result = bounded_explain_component(&fact.result.presentation_label(), 48);
-        bounded_explain_analyze_text(&format!(
-            "Classify request · {stage} · model={model} · provider={provider} · {result}"
-        ))
+        let presented_result = bounded_explain_component(&fact.result.presentation_label(), 48);
+        let result = match &fact.result {
+            astra_turn_types::RequestJudgmentResultV1::NotDispatched { .. } => {
+                format!("classification was not run · {}", presented_result)
+            }
+            _ => format!("guidance use not recorded · {}", presented_result),
+        };
+        let mut parts = vec!["Classify request".to_owned(), stage.to_owned(), result];
+        if !matches!(
+            &fact.result,
+            astra_turn_types::RequestJudgmentResultV1::NotDispatched { .. }
+        ) && let Some(execution) = execution
+            && let Some(identity) =
+                bounded_explain_judgment_identity(&execution.provider, &execution.model_name)
+        {
+            parts.push(format!("execution via {identity}"));
+        }
+        bounded_explain_analyze_text(&parts.join(" · "))
     }
 
     async fn reconcile_work_admission_skill_revision(
@@ -23510,7 +23525,12 @@ mod tests {
             },
             outcome.as_ref().unwrap(),
         );
-        assert!(label.contains("jev-1.13.0") && label.contains("selected 1/2 chunks"));
+        assert!(
+            label.contains("execution via Jev · jev-1.13.0")
+                && label.contains("selected 1/2 chunks")
+        );
+        assert!(!label.contains("wire application reported separately"));
+        assert!(label.contains("inclusion shown on model request"));
         assert_eq!(
             explain_outcome,
             astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded
@@ -23692,6 +23712,7 @@ mod tests {
             "label exceeded Explain contract: {label}"
         );
         assert!(label.contains("selected"));
+        assert!(label.contains("inclusion shown on model request"));
         assert_eq!(
             outcome,
             astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded
@@ -26063,9 +26084,77 @@ mod tests {
             &host.pending_classification_observations[0].fact,
             Some(initial_execution),
         );
-        assert!(label.contains("model=deepseek-flash"), "{label}");
-        assert!(label.contains("provider=deepseek"), "{label}");
+        assert!(label.contains("guidance use not recorded"), "{label}");
+        assert!(
+            label.contains("execution via deepseek · deepseek-flash"),
+            "{label}"
+        );
+        assert!(!label.contains("model="), "{label}");
+        assert!(!label.contains("provider="), "{label}");
         assert!(label.len() <= 160, "{} bytes", label.len());
+
+        let jev_label = ServerAgenticLoopHost::classification_explain_label(
+            &host.pending_classification_observations[0].fact,
+            Some(
+                &astra_turn_core::cloud_summary::SummaryExecutionProvenance {
+                    provider: "typesafe".into(),
+                    model_name: "jev-1.13.0".into(),
+                    invocation_id: "invocation-jev".into(),
+                },
+            ),
+        );
+        assert!(
+            jev_label.contains("execution via Jev · jev-1.13.0"),
+            "{jev_label}"
+        );
+
+        let no_execution = ServerAgenticLoopHost::classification_explain_label(
+            &host.pending_classification_observations[0].fact,
+            None,
+        );
+        assert!(
+            no_execution.contains("guidance use not recorded"),
+            "{no_execution}"
+        );
+        assert!(!no_execution.contains("execution via"), "{no_execution}");
+
+        let long_identity = ServerAgenticLoopHost::classification_explain_label(
+            &host.pending_classification_observations[0].fact,
+            Some(
+                &astra_turn_core::cloud_summary::SummaryExecutionProvenance {
+                    provider: "provider".repeat(32),
+                    model_name: "model".repeat(64),
+                    invocation_id: "invocation-long".into(),
+                },
+            ),
+        );
+        assert!(long_identity.len() <= 160, "{long_identity}");
+        assert!(
+            long_identity.contains("uncertain fields=required"),
+            "{long_identity}"
+        );
+        assert!(long_identity.contains("execution via"), "{long_identity}");
+        assert!(
+            long_identity.contains("guidance use not recorded"),
+            "{long_identity}"
+        );
+
+        let not_dispatched = astra_turn_types::SemanticJudgmentFactV1 {
+            stage: astra_turn_types::RequestJudgmentStageV1::Initial,
+            result: astra_turn_types::RequestJudgmentResultV1::NotDispatched {
+                reason: astra_turn_types::SemanticJudgmentPreDispatchReasonV1::NoOffering,
+            },
+        };
+        let skipped_label =
+            ServerAgenticLoopHost::classification_explain_label(&not_dispatched, None);
+        assert!(
+            skipped_label.contains("classification was not run"),
+            "{skipped_label}"
+        );
+        assert!(
+            !skipped_label.contains("guidance use not recorded"),
+            "{skipped_label}"
+        );
 
         // A scope mismatch must discard the trace and its live-only
         // provenance together; neither can survive into a later turn.
