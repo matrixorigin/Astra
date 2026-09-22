@@ -457,6 +457,115 @@ export type ExplainAnalyzeAuxiliaryUsageV1 = {
   }[];
 };
 
+export type ExplainAnalyzeAuxiliaryCallV1 = {
+  call_id: string;
+  operation_id: string;
+  stage: string;
+  start_elapsed_ms: number;
+  duration_ms: number;
+  outcome: ExplainAnalyzeOutcomeV1;
+};
+
+export type ExplainAnalyzeRequestJudgmentFieldV1 =
+  | "required"
+  | "defer"
+  | "mutation.read_only"
+  | "mutation.may_mutate"
+  | "mutation.must_mutate"
+  | "scope.workspace"
+  | "scope.external"
+  | "scope.mixed"
+  | "scope.unknown"
+  | "domain.none"
+  | "domain.github"
+  | "domain.git"
+  | "domain.code"
+  | "domain.memory"
+  | "domain.web"
+  | "domain.system"
+  | "domain.database"
+  | "parallel_subruns"
+  | "capability.web";
+
+export type ExplainAnalyzeRequestJudgmentResultV1 =
+  | {
+      result: "decided";
+      classification: {
+        work_required: boolean;
+        activation_deferred: boolean;
+        domain: "github" | "git" | "code" | "memory" | "web" | "system" | "database" | null;
+        mutation: "read_only" | "may_mutate" | "must_mutate";
+        scope: "workspace" | "external" | "mixed" | "unknown";
+        parallel_subruns: boolean;
+        capabilities: Array<"web" | "agent_spawner">;
+      };
+    }
+  | {
+      result: "abstained";
+      uncertain_fields: ExplainAnalyzeRequestJudgmentFieldV1[];
+      assessment: {
+        provenance: "provider_probability" | "discrete_decision";
+        fields: Array<{
+          field: ExplainAnalyzeRequestJudgmentFieldV1;
+          score: number;
+        }>;
+      };
+    }
+  | {
+      result: "conflicting";
+      fields: ExplainAnalyzeRequestJudgmentFieldV1[];
+    }
+  | {
+      result: "invalid";
+      reason: "malformed_json" | "invalid_contract" | "unsupported_combination";
+    }
+  | {
+      result: "not_dispatched";
+      reason:
+        | "no_offering"
+        | "capacity_pressure"
+        | "invalid_request"
+        | "output_budget"
+        | "route_unavailable"
+        | "durable_material_unavailable"
+        | "preparation_deadline"
+        | "cancelled";
+    }
+  | {
+      result: "unavailable";
+      reason:
+        | "execution_error"
+        | "deadline"
+        | "cancelled"
+        | "provider_ptl_error"
+        | "unexpected_finish";
+      delivery: "unresolved" | "response_received";
+    };
+
+export type ExplainAnalyzeAdmissionSettlementV1 = {
+  status: "accepted" | "rejected" | "unavailable" | "not_dispatched";
+  reason:
+    | { kind: "accepted" }
+    | { kind: "classifier_uncertain" }
+    | { kind: "classifier_conflicting" }
+    | { kind: "invalid_classifier_response" }
+    | { kind: "provider_rejected" }
+    | { kind: "planning_rejected" }
+    | { kind: "reconciliation_rejected" }
+    | { kind: "unavailable"; reason: "execution_error" | "deadline" | "cancelled" | "provider_ptl_error" | "unexpected_finish" }
+    | { kind: "not_dispatched"; reason: "no_offering" | "capacity_pressure" | "invalid_request" | "output_budget" | "route_unavailable" | "durable_material_unavailable" | "preparation_deadline" | "cancelled" };
+  classification?: ExplainAnalyzeRequestJudgmentResultV1;
+  decision?: ExplainAnalyzeRequestJudgmentResultV1;
+};
+
+/** Local auxiliary timing and typed admission facts on a terminal turn. */
+export type ExplainAnalyzeAuxiliaryDetailsV1 = {
+  /** Omitted by Rust when no auxiliary call interval was captured. */
+  calls?: ExplainAnalyzeAuxiliaryCallV1[];
+  truncated?: boolean;
+  admission?: ExplainAnalyzeAdmissionSettlementV1;
+};
+
 export type ExplainAnalyzeEventV1 = {
   type: "explain_analyze";
   schema_version: 1;
@@ -479,6 +588,7 @@ export type ExplainAnalyzeEventV1 = {
   outcome?: ExplainAnalyzeOutcomeV1;
   usage?: ExplainAnalyzeUsageV1;
   auxiliary_usage?: ExplainAnalyzeAuxiliaryUsageV1;
+  auxiliary_details?: ExplainAnalyzeAuxiliaryDetailsV1;
   context?: ExplainAnalyzeContextMetricsV1;
   coverage_gaps?: ExplainAnalyzeCoverageGapV1[];
 };

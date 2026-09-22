@@ -240,6 +240,76 @@ describe('streamChatMessage cancellation semantics', () => {
     });
   });
 
+  it('accepts the runtime terminal Explain payload with auxiliary details', async () => {
+    const onExplainAnalyzeEvent = vi.fn();
+    const event = {
+      type: 'explain_analyze',
+      schema_version: 1,
+      event_id: 'clock-1:terminal',
+      run_id: 'run-123',
+      turn_id: 'turn-1',
+      node_id: 'turn-1',
+      producer_id: 'worker-1',
+      clock_domain_id: 'clock-1',
+      kind: 'turn',
+      label: 'User turn',
+      transition: 'finished',
+      elapsed_ms: 100,
+      start_elapsed_ms: 0,
+      duration_ms: 100,
+      outcome: 'completed',
+      auxiliary_details: {
+        calls: [{
+          call_id: 'request_judgment:initial:0',
+          operation_id: 'request_judgment',
+          stage: 'initial',
+          start_elapsed_ms: 12,
+          duration_ms: 8,
+          outcome: 'succeeded',
+        }],
+        admission: {
+          status: 'accepted',
+          reason: { kind: 'accepted' },
+          classification: {
+            result: 'decided',
+            classification: {
+              work_required: true,
+              activation_deferred: false,
+              domain: null,
+              mutation: 'read_only',
+              scope: 'unknown',
+              parallel_subruns: false,
+              capabilities: [],
+            },
+          },
+          decision: {
+            result: 'decided',
+            classification: {
+              work_required: true,
+              activation_deferred: true,
+              domain: null,
+              mutation: 'read_only',
+              scope: 'unknown',
+              parallel_subruns: false,
+              capabilities: [],
+            },
+          },
+        },
+      },
+    };
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      body: sseBody([
+        `data: ${JSON.stringify(event)}\n\n`,
+        'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
+      ]),
+    });
+
+    await streamChatMessage('chat-123', defaultPayload, { onExplainAnalyzeEvent });
+
+    expect(onExplainAnalyzeEvent).toHaveBeenCalledWith(event);
+  });
+
   it('treats a cancelled run as a clean stop instead of a failed stream', async () => {
     const onCancelled = vi.fn();
     const onDone = vi.fn();

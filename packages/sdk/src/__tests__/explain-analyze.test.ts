@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   explainAnalyzeFactFingerprint,
+  explainAnalyzeAuxiliaryDetailsLines,
   explainAnalyzeAuxiliaryUsageLines,
   explainAnalyzeMaxConcurrency,
   explainAnalyzeTurnOutcome,
@@ -763,6 +764,117 @@ describe("auxiliary provider usage", () => {
     expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([partial]))[0]).toContain("usage unavailable");
     const unavailable = finished("turn", "turn", 0, 100, {auxiliary_usage: {available: false, attempts: []}});
     expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([unavailable]))).toEqual(["Auxiliary tokens · capture unavailable"]);
+  });
+});
+
+describe("auxiliary execution details", () => {
+  it("accepts the runtime terminal payload and carries it through SDK projections", () => {
+    const classifier = {
+      result: "decided" as const,
+      classification: {
+        work_required: true,
+        activation_deferred: false,
+        domain: null,
+        mutation: "read_only" as const,
+        scope: "unknown" as const,
+        parallel_subruns: false,
+        capabilities: [] as const,
+      },
+    };
+    const reconciled = {
+      ...classifier,
+      classification: { ...classifier.classification, activation_deferred: true },
+    };
+    const event = finished("turn", "turn", 0, 100, {
+      auxiliary_details: {
+        calls: [{
+          call_id: "request/初期:0",
+          operation_id: "request_judgment",
+          stage: "initial",
+          start_elapsed_ms: 12,
+          duration_ms: 8,
+          outcome: "succeeded",
+        }],
+        admission: {
+          status: "accepted",
+          reason: { kind: "accepted" },
+          classification: classifier,
+          decision: reconciled,
+        },
+      },
+    });
+
+    expect(isExplainAnalyzeEventV1(event)).toBe(true);
+    const graph = reduceExplainAnalyzeEvents([event]);
+    expect(graph.integrity).toBe("consistent");
+    expect(graph.nodes[0].auxiliaryDetails?.admission?.decision).toEqual(reconciled);
+    expect(explainAnalyzeAuxiliaryDetailsLines(graph)).toEqual([
+      "Auxiliary scope · turn",
+      "Auxiliary timing · request_judgment · call request/初期:0 · operation request_judgment · stage initial · 8 ms · client outcome succeeded · starts +12 ms · logical client interval; overlapping intervals are not added",
+      expect.stringContaining("Admission settlement · status accepted"),
+    ]);
+    expect(renderExplainAnalyzeHtml([event])).toContain("Auxiliary execution details");
+    expect(isExplainAnalyzeEventV1({
+      ...event,
+      event_id: "turn:no-call-interval",
+      auxiliary_details: { admission: event.auxiliary_details!.admission },
+    })).toBe(true);
+  });
+
+  it("rejects a terminal detail with unknown nested fields", () => {
+    const event = finished("turn", "turn", 0, 100, {
+      auxiliary_details: {
+        calls: [],
+        admission: {
+          status: "accepted",
+          reason: { kind: "accepted", extra: true } as never,
+          decision: {
+            result: "decided",
+            classification: {
+              work_required: true,
+              activation_deferred: false,
+              domain: null,
+              mutation: "read_only",
+              scope: "unknown",
+              parallel_subruns: false,
+              capabilities: [],
+            },
+          },
+        },
+      },
+    });
+    expect(isExplainAnalyzeEventV1(event)).toBe(false);
+
+    const accepted = {
+      ...event.auxiliary_details!.admission!,
+      reason: { kind: "accepted" as const },
+    };
+    const invalidProvenance = {
+      result: "abstained",
+      uncertain_fields: ["required"],
+      assessment: {
+        provenance: ["discrete_decision"],
+        fields: [{ field: "required", score: 0.5 }],
+      },
+    } as never;
+    expect(isExplainAnalyzeEventV1({
+      ...event,
+      event_id: "turn:invalid-provenance-type",
+      auxiliary_details: { admission: { ...accepted, classification: invalidProvenance } },
+    })).toBe(false);
+
+    const invalidDiscreteScore = {
+      ...invalidProvenance,
+      assessment: {
+        provenance: "discrete_decision",
+        fields: [{ field: "required", score: 0.2 }],
+      },
+    } as never;
+    expect(isExplainAnalyzeEventV1({
+      ...event,
+      event_id: "turn:invalid-discrete-score",
+      auxiliary_details: { admission: { ...accepted, classification: invalidDiscreteScore } },
+    })).toBe(false);
   });
 });
 

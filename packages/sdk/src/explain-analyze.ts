@@ -6,6 +6,10 @@ import type {
   ExplainAnalyzeCoverageGapV1,
   ExplainAnalyzeUsageV1,
   ExplainAnalyzeContextMetricsV1,
+  ExplainAnalyzeAuxiliaryDetailsV1,
+  ExplainAnalyzeAdmissionSettlementV1,
+  ExplainAnalyzeRequestJudgmentResultV1,
+  ExplainAnalyzeRequestJudgmentFieldV1,
   MemorySelectionReport,
 } from "./types";
 
@@ -27,6 +31,7 @@ export type ExplainAnalyzeNodeV1 = {
   usage?: ExplainAnalyzeUsageV1;
   context?: ExplainAnalyzeContextMetricsV1;
   auxiliaryUsage?: ExplainAnalyzeEventV1["auxiliary_usage"];
+  auxiliaryDetails?: ExplainAnalyzeEventV1["auxiliary_details"];
   coverageGaps: ExplainAnalyzeCoverageGapV1[];
   startObserved: boolean;
   terminalObserved: boolean;
@@ -112,7 +117,7 @@ const allowedEventKeys = new Set([
   "outcome",
   "usage",
   "context",
-  "coverage_gaps", "auxiliary_usage",
+  "coverage_gaps", "auxiliary_usage", "auxiliary_details",
 ]);
 const coverageGaps = new Set<ExplainAnalyzeCoverageGapV1>([
   "user_input_wait_intervals",
@@ -153,6 +158,8 @@ export function isExplainAnalyzeEventV1(
   }
   if (value.auxiliary_usage !== undefined &&
       (value.kind !== "turn" || value.transition !== "finished" || !isAuxiliaryUsage(value.auxiliary_usage))) return false;
+  if (value.auxiliary_details !== undefined &&
+      (value.kind !== "turn" || value.transition !== "finished" || !isExplainAnalyzeAuxiliaryDetails(value.auxiliary_details, value.elapsed_ms))) return false;
   if (value.coverage_gaps !== undefined &&
     (value.kind !== "turn" || value.transition !== "finished" ||
       !isCoverageGapList(value.coverage_gaps))) {
@@ -171,6 +178,7 @@ export function isExplainAnalyzeEventV1(
       value.duration_ms === undefined &&
       value.outcome === undefined &&
       value.usage === undefined && value.context === undefined && value.coverage_gaps === undefined
+        && value.auxiliary_details === undefined
     );
   }
   if (
@@ -208,6 +216,177 @@ function isAuxiliaryUsage(value: unknown): boolean {
   });
 }
 
+const admissionStatuses = new Set([
+  "accepted", "rejected", "unavailable", "not_dispatched",
+]);
+const admissionReasonKinds = new Set([
+  "accepted", "classifier_uncertain", "classifier_conflicting",
+  "invalid_classifier_response", "provider_rejected", "planning_rejected",
+  "reconciliation_rejected", "unavailable", "not_dispatched",
+]);
+const judgmentFields = new Set<ExplainAnalyzeRequestJudgmentFieldV1>([
+  "required", "defer", "mutation.read_only", "mutation.may_mutate",
+  "mutation.must_mutate", "scope.workspace", "scope.external", "scope.mixed",
+  "scope.unknown", "domain.none", "domain.github", "domain.git", "domain.code",
+  "domain.memory", "domain.web", "domain.system", "domain.database",
+  "parallel_subruns", "capability.web",
+]);
+const judgmentDomains = new Set([
+  "github", "git", "code", "memory", "web", "system", "database",
+]);
+const judgmentMutations = new Set(["read_only", "may_mutate", "must_mutate"]);
+const judgmentScopes = new Set(["workspace", "external", "mixed", "unknown"]);
+const judgmentCapabilities = new Set(["web", "agent_spawner"]);
+const invalidJudgmentReasons = new Set([
+  "malformed_json", "invalid_contract", "unsupported_combination",
+]);
+const preDispatchReasons = new Set([
+  "no_offering", "capacity_pressure", "invalid_request", "output_budget",
+  "route_unavailable", "durable_material_unavailable", "preparation_deadline",
+  "cancelled",
+]);
+const unavailableReasons = new Set([
+  "execution_error", "deadline", "cancelled", "provider_ptl_error",
+  "unexpected_finish",
+]);
+const judgmentDeliveries = new Set(["unresolved", "response_received"]);
+
+function isExplainAnalyzeAuxiliaryDetails(
+  value: unknown,
+  terminalElapsedMs: number,
+): value is ExplainAnalyzeAuxiliaryDetailsV1 {
+  const calls = isRecord(value) && value.calls === undefined ? [] : isRecord(value) ? value.calls : undefined;
+  if (!isRecord(value) || Object.keys(value).some((key) => !["calls", "truncated", "admission"].includes(key)) ||
+      (value.truncated !== undefined && typeof value.truncated !== "boolean") ||
+      !Array.isArray(calls) || calls.length > 16 ||
+      !calls.every((call) => isExplainAnalyzeAuxiliaryCall(call, terminalElapsedMs))) return false;
+  const callIds = new Set<string>();
+  if (calls.some((call) => {
+    const id = isRecord(call) ? call.call_id : undefined;
+    if (typeof id !== "string" || callIds.has(id)) return true;
+    callIds.add(id);
+    return false;
+  })) return false;
+  return value.admission === undefined || isExplainAnalyzeAdmissionSettlement(value.admission);
+}
+
+function isExplainAnalyzeAuxiliaryCall(value: unknown, terminalElapsedMs: number): boolean {
+  if (!isRecord(value) || Object.keys(value).some((key) =>
+    !["call_id", "operation_id", "stage", "start_elapsed_ms", "duration_ms", "outcome"].includes(key))) return false;
+  return isExplainId(value.call_id) && isExplainId(value.operation_id) && isExplainId(value.stage) &&
+    isNonNegativeInteger(value.start_elapsed_ms) && isNonNegativeInteger(value.duration_ms) &&
+    value.start_elapsed_ms <= terminalElapsedMs &&
+    value.duration_ms <= terminalElapsedMs - value.start_elapsed_ms + 1 &&
+    typeof value.outcome === "string" && outcomes.has(value.outcome);
+}
+
+function isExplainId(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0 &&
+    new TextEncoder().encode(value).length <= 512;
+}
+
+function isExplainAnalyzeAdmissionSettlement(value: unknown): value is ExplainAnalyzeAdmissionSettlementV1 {
+  if (!isRecord(value) || Object.keys(value).some((key) =>
+    !["status", "reason", "classification", "decision"].includes(key)) ||
+      typeof value.status !== "string" || !admissionStatuses.has(value.status) ||
+      !isExplainAnalyzeAdmissionReason(value.reason)) return false;
+  if (value.classification !== undefined && !isExplainAnalyzeRequestJudgmentResult(value.classification)) return false;
+  if (value.decision !== undefined && !isExplainAnalyzeRequestJudgmentResult(value.decision)) return false;
+  const reason = value.reason as Record<string, unknown>;
+  switch (value.status) {
+    case "accepted":
+      return reason.kind === "accepted" &&
+        value.decision !== undefined && value.decision.result === "decided";
+    case "rejected":
+      return reason.kind !== "accepted" && reason.kind !== "unavailable" &&
+        reason.kind !== "not_dispatched" && value.decision === undefined;
+    case "unavailable":
+      return reason.kind === "unavailable" && value.decision === undefined;
+    case "not_dispatched":
+      return reason.kind === "not_dispatched" && value.decision === undefined;
+    default:
+      return false;
+  }
+}
+
+function isExplainAnalyzeAdmissionReason(value: unknown): boolean {
+  if (!isRecord(value) || Object.keys(value).some((key) => !["kind", "reason"].includes(key)) ||
+      typeof value.kind !== "string" || !admissionReasonKinds.has(value.kind)) return false;
+  if (value.kind === "unavailable") {
+    return typeof value.reason === "string" && unavailableReasons.has(value.reason);
+  }
+  if (value.kind === "not_dispatched") {
+    return typeof value.reason === "string" && preDispatchReasons.has(value.reason);
+  }
+  return value.reason === undefined;
+}
+
+function isExplainAnalyzeRequestJudgmentResult(
+  value: unknown,
+): value is ExplainAnalyzeRequestJudgmentResultV1 {
+  if (!isRecord(value) || typeof value.result !== "string") return false;
+  switch (value.result) {
+    case "decided": {
+      if (Object.keys(value).some((key) => !["result", "classification"].includes(key)) ||
+          !isRecord(value.classification) ||
+          Object.keys(value.classification).some((key) => ![
+            "work_required", "activation_deferred", "domain", "mutation", "scope",
+            "parallel_subruns", "capabilities",
+          ].includes(key))) return false;
+      const classification = value.classification;
+      return typeof classification.work_required === "boolean" &&
+        typeof classification.activation_deferred === "boolean" &&
+        (classification.domain === null || (typeof classification.domain === "string" && judgmentDomains.has(classification.domain))) &&
+        typeof classification.mutation === "string" && judgmentMutations.has(classification.mutation) &&
+        typeof classification.scope === "string" && judgmentScopes.has(classification.scope) &&
+        typeof classification.parallel_subruns === "boolean" &&
+        Array.isArray(classification.capabilities) && classification.capabilities.length <= 2 &&
+        classification.capabilities.every((capability) => typeof capability === "string" && judgmentCapabilities.has(capability)) &&
+        new Set(classification.capabilities).size === classification.capabilities.length &&
+        (!classification.activation_deferred || classification.work_required) &&
+        (classification.mutation === "must_mutate" || classification.scope === "unknown");
+    }
+    case "abstained": {
+      if (Object.keys(value).some((key) => !["result", "uncertain_fields", "assessment"].includes(key)) ||
+          !isJudgmentFieldList(value.uncertain_fields) || !isRecord(value.assessment) ||
+          Object.keys(value.assessment).some((key) => !["provenance", "fields"].includes(key)) ||
+          typeof value.assessment.provenance !== "string" ||
+          !["provider_probability", "discrete_decision"].includes(value.assessment.provenance) ||
+          !Array.isArray(value.assessment.fields) || value.assessment.fields.length === 0 ||
+          value.assessment.fields.length > 19) return false;
+      const fields = value.assessment.fields;
+      const seen = new Set<string>();
+      if (fields.some((field) => !isRecord(field) || Object.keys(field).some((key) => !["field", "score"].includes(key)) ||
+          typeof field.field !== "string" || !judgmentFields.has(field.field as ExplainAnalyzeRequestJudgmentFieldV1) ||
+          seen.has(field.field) || (seen.add(field.field), typeof field.score !== "number" || !Number.isFinite(field.score) || field.score < 0 || field.score > 1))) return false;
+      if (value.assessment.provenance === "discrete_decision" && fields.some((field) => ![0, 0.5, 1].includes(field.score))) return false;
+      return value.uncertain_fields.every((field) => fields.some((assessment) => assessment.field === field));
+    }
+    case "conflicting":
+      return Object.keys(value).every((key) => ["result", "fields"].includes(key)) && isJudgmentFieldList(value.fields);
+    case "invalid":
+      return Object.keys(value).every((key) => ["result", "reason"].includes(key)) &&
+        typeof value.reason === "string" && invalidJudgmentReasons.has(value.reason);
+    case "not_dispatched":
+      return Object.keys(value).every((key) => ["result", "reason"].includes(key)) &&
+        typeof value.reason === "string" && preDispatchReasons.has(value.reason);
+    case "unavailable":
+      return Object.keys(value).every((key) => ["result", "reason", "delivery"].includes(key)) &&
+        typeof value.reason === "string" && unavailableReasons.has(value.reason) &&
+        typeof value.delivery === "string" && judgmentDeliveries.has(value.delivery) &&
+        ((value.reason === "provider_ptl_error" || value.reason === "unexpected_finish") ===
+          (value.delivery === "response_received"));
+    default:
+      return false;
+  }
+}
+
+function isJudgmentFieldList(value: unknown): value is ExplainAnalyzeRequestJudgmentFieldV1[] {
+  return Array.isArray(value) && value.length > 0 && value.length <= 19 &&
+    value.every((field) => typeof field === "string" && judgmentFields.has(field as ExplainAnalyzeRequestJudgmentFieldV1)) &&
+    new Set(value).size === value.length;
+}
+
 /** Auxiliary physical attempts are separate from timed main-model node usage. */
 export function explainAnalyzeAuxiliaryUsageLines(graph: ExplainAnalyzeGraphV1): string[] {
   type Attempt = NonNullable<ExplainAnalyzeEventV1["auxiliary_usage"]>["attempts"][number];
@@ -222,7 +401,7 @@ export function explainAnalyzeAuxiliaryUsageLines(graph: ExplainAnalyzeGraphV1):
     for (let i = 0; i < left.length; i++) if (left[i] !== right[i]) return left[i] > right[i];
     return false;
   };
-  let conflicted = graph.auxiliaryCaptureConflicted === true || graph.nodes.some(n => n.conflicted && (n.kind === "turn" || !!n.auxiliaryUsage));
+  let conflicted = graph.auxiliaryCaptureConflicted === true || graph.nodes.some(n => n.conflicted && (n.kind === "turn" || !!n.auxiliaryUsage || !!n.auxiliaryDetails));
   let unavailable = false;
   let truncated = false;
   for (const node of graph.nodes) {
@@ -267,6 +446,33 @@ export function explainAnalyzeAuxiliaryUsageLines(graph: ExplainAnalyzeGraphV1):
   });
   if (unavailable) lines.push("Auxiliary tokens · capture unavailable");
   if (truncated) lines.push("Auxiliary tokens · capture truncated; request counts cover captured attempts only; token sums are lower bounds");
+  return lines;
+}
+
+/** Render logical auxiliary timing and typed admission facts separately from
+ * physical provider usage. Intervals may overlap and are never added together. */
+export function explainAnalyzeAuxiliaryDetailsLines(graph: ExplainAnalyzeGraphV1): string[] {
+  const terminalTurns = graph.nodes
+    .filter((node) => node.kind === "turn" && node.terminalObserved && !node.conflicted && node.auxiliaryDetails)
+    .sort((left, right) => left.nodeId.localeCompare(right.nodeId));
+  const lines: string[] = [];
+  for (const node of terminalTurns) {
+    const details = node.auxiliaryDetails!;
+    lines.push(`Auxiliary scope · ${node.nodeId}`);
+    for (const call of [...(details.calls ?? [])].sort((left, right) =>
+      left.start_elapsed_ms - right.start_elapsed_ms || left.call_id.localeCompare(right.call_id))) {
+      lines.push(`Auxiliary timing · ${call.operation_id} · call ${call.call_id} · operation ${call.operation_id} · stage ${call.stage} · ${formatMs(call.duration_ms)} · client outcome ${call.outcome} · starts +${formatMs(call.start_elapsed_ms)} · logical client interval; overlapping intervals are not added`);
+    }
+    if (details.truncated === true) {
+      lines.push("Auxiliary timing · capture truncated · only the bounded set of logical calls is shown");
+    }
+    if (details.admission) {
+      const admission = details.admission;
+      const status = admission.status.replace("_", " ");
+      const jsonOrUnavailable = (value: unknown) => value === undefined ? "unavailable" : JSON.stringify(value);
+      lines.push(`Admission settlement · status ${status} · reason ${jsonOrUnavailable(admission.reason)} · classifier result ${jsonOrUnavailable(admission.classification)} · reconciled decision ${jsonOrUnavailable(admission.decision)}`);
+    }
+  }
   return lines;
 }
 
@@ -444,7 +650,7 @@ export function reduceExplainAnalyzeEvents(
     if (seen !== undefined) {
       duplicateEventCount += 1;
       if (seen !== fingerprint) {
-        auxiliaryCaptureConflicted ||= value.kind === "turn" || !!value.auxiliary_usage;
+        auxiliaryCaptureConflicted ||= value.kind === "turn" || !!value.auxiliary_usage || !!value.auxiliary_details;
         conflictedNodeIds.add(value.node_id);
         // A reused event identity can also point at a different node.
         const original = JSON.parse(seen) as { node_id: string };
@@ -480,6 +686,7 @@ export function reduceExplainAnalyzeEvents(
               ...(value.usage ? { usage: value.usage } : {}),
               ...(value.context ? { context: value.context } : {}),
               ...(value.auxiliary_usage ? { auxiliaryUsage: value.auxiliary_usage } : {}),
+              ...(value.auxiliary_details ? { auxiliaryDetails: value.auxiliary_details } : {}),
             }
           : {}),
         startObserved: value.transition === "started",
@@ -523,6 +730,7 @@ export function reduceExplainAnalyzeEvents(
         stableJson(node.usage ?? null) !== stableJson(value.usage ?? null) ||
         stableJson(node.context ?? null) !== stableJson(value.context ?? null) ||
         stableJson(node.auxiliaryUsage ?? null) !== stableJson(value.auxiliary_usage ?? null) ||
+        stableJson(node.auxiliaryDetails ?? null) !== stableJson(value.auxiliary_details ?? null) ||
         stableJson(node.coverageGaps) !== stableJson(value.coverage_gaps ?? [])
       ) {
         node.conflicted = true;
@@ -539,12 +747,13 @@ export function reduceExplainAnalyzeEvents(
       node.usage = value.usage;
       node.context = value.context;
       node.auxiliaryUsage = value.auxiliary_usage;
+      node.auxiliaryDetails = value.auxiliary_details;
       node.coverageGaps = value.coverage_gaps ?? [];
       node.terminalObserved = true;
     }
     if (node.conflicted) {
       conflictedNodeIds.add(node.nodeId);
-      auxiliaryCaptureConflicted ||= value.kind === "turn" || !!value.auxiliary_usage;
+      auxiliaryCaptureConflicted ||= value.kind === "turn" || !!value.auxiliary_usage || !!value.auxiliary_details;
     }
   }
 
@@ -739,6 +948,7 @@ export function renderExplainAnalyzeHtml(
   const nodeGraph = renderHtmlNodeGraph(graph);
   const graphDetails = renderHtmlGraphDetails(graph);
   const plainTree = renderExplainAnalyzeText(events, { degraded: options.degraded });
+  const auxiliaryDetails = explainAnalyzeAuxiliaryDetailsLines(graph);
   const providerAttempts = graph.nodes.filter(
     (node) => node.kind === "provider_attempt",
   );
@@ -789,7 +999,7 @@ export function renderExplainAnalyzeHtml(
     : "";
   const statusClass = isDegraded || statusLabel === "Mixed outcomes" ? "state-running" : status === "failed" || status === "interrupted" ? "state-failed" : status === "waiting" ? "state-running" : "state-complete";
   return `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>${title} · Explain Analyze</title><style>${EXPLAIN_ANALYZE_HTML_STYLE}</style></head><body><main class="shell"><div class="topline"><div class="brand"><span class="brand-mark" aria-hidden="true">A</span><span>ASTRA <b>/</b> Explain Analyze</span></div><div class="top-actions"><a href="#plain-text-tree">Copy</a><a href="#secondary-graph">Graph</a></div></div><header class="report-head"><div><p class="eyebrow">Explain Analyze</p><h1>${title}</h1><p class="subtitle">What ran, when it ran, and which measurements are available.</p></div><div class="report-result"><strong>${turnDuration === undefined ? "Not recorded" : escapeHtml(formatMs(turnDuration))}</strong><span class="state ${statusClass}">${escapeHtml(statusLabel)}</span></div></header><p class="report-facts">${escapeHtml(timingSummary)}</p><p class="report-facts">${escapeHtml(measuredOverlap)}</p>${coverageSummary ? `<p class="report-facts report-facts-warning">${escapeHtml(coverageSummary)}</p>` : ""}<p class="token-summary">${escapeHtml(tokenSummary)}</p>${explainAnalyzeAuxiliaryUsageLines(graph).length ? `<section class="panel"><h2>Auxiliary model usage</h2>${explainAnalyzeAuxiliaryUsageLines(graph).map(line => `<p>${escapeHtml(line)}</p>`).join("")}</section>` : ""}${waitSummary ? `<p class="wait-summary">${escapeHtml(waitSummary)}</p>` : ""}${warning}<section class="tree-panel" id="tree-view" aria-labelledby="tree-heading"><div class="tree-heading"><div><h2 id="tree-heading">Execution tree</h2><p>Recorded containment is shown with branches. Open a group to inspect its children.</p></div><span class="tree-search-hint">Find a stage with Ctrl/Cmd+F</span></div><div class="tree-actions"><a href="#plain-text-tree">Copy plain-text tree</a><span>Use Tab and Enter on groups to expand or collapse.</span></div><div class="text-tree">${tree || "<p class=\"empty\">No execution facts were captured.</p>"}</div></section><section class="copy-panel" id="plain-text-tree"><h2>Copy plain-text tree</h2><textarea readonly aria-label="Copyable plain-text execution tree" rows="${Math.max(4, Math.min(24, graph.nodes.length + clockDomains.length + 2))}">${escapeHtml(plainTree)}</textarea><p>Select the text and copy it; this report is a script-free snapshot.</p></section><section class="secondary-views" aria-label="Secondary Explain Analyze views"><details class="secondary-view" id="secondary-graph"><summary><span>Graph view</span><small>Explicit parent and dependency edges</small></summary><div class="graph-node-view">${nodeGraph}${graphDetails}</div></details><details class="secondary-view" id="secondary-timeline"><summary><span>Timeline view</span><small>Measured spans by clock domain</small></summary><div class="graph-scroll">${timeline || "<div class=\"empty\">No execution facts were captured.</div>"}</div></details></section><footer class="footer"><span>Amber intervals are measured waits. Tool I/O wait is shown only when separately recorded.</span><strong>Saved report · script-free snapshot</strong></footer></main></body></html>`;
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>${title} · Explain Analyze</title><style>${EXPLAIN_ANALYZE_HTML_STYLE}</style></head><body><main class="shell"><div class="topline"><div class="brand"><span class="brand-mark" aria-hidden="true">A</span><span>ASTRA <b>/</b> Explain Analyze</span></div><div class="top-actions"><a href="#plain-text-tree">Copy</a><a href="#secondary-graph">Graph</a></div></div><header class="report-head"><div><p class="eyebrow">Explain Analyze</p><h1>${title}</h1><p class="subtitle">What ran, when it ran, and which measurements are available.</p></div><div class="report-result"><strong>${turnDuration === undefined ? "Not recorded" : escapeHtml(formatMs(turnDuration))}</strong><span class="state ${statusClass}">${escapeHtml(statusLabel)}</span></div></header><p class="report-facts">${escapeHtml(timingSummary)}</p><p class="report-facts">${escapeHtml(measuredOverlap)}</p>${coverageSummary ? `<p class="report-facts report-facts-warning">${escapeHtml(coverageSummary)}</p>` : ""}<p class="token-summary">${escapeHtml(tokenSummary)}</p>${explainAnalyzeAuxiliaryUsageLines(graph).length ? `<section class="panel"><h2>Auxiliary model usage</h2>${explainAnalyzeAuxiliaryUsageLines(graph).map(line => `<p>${escapeHtml(line)}</p>`).join("")}</section>` : ""}${auxiliaryDetails.length ? `<section class="panel"><h2>Auxiliary execution details</h2>${auxiliaryDetails.map(line => `<p>${escapeHtml(line)}</p>`).join("")}</section>` : ""}${waitSummary ? `<p class="wait-summary">${escapeHtml(waitSummary)}</p>` : ""}${warning}<section class="tree-panel" id="tree-view" aria-labelledby="tree-heading"><div class="tree-heading"><div><h2 id="tree-heading">Execution tree</h2><p>Recorded containment is shown with branches. Open a group to inspect its children.</p></div><span class="tree-search-hint">Find a stage with Ctrl/Cmd+F</span></div><div class="tree-actions"><a href="#plain-text-tree">Copy plain-text tree</a><span>Use Tab and Enter on groups to expand or collapse.</span></div><div class="text-tree">${tree || "<p class=\"empty\">No execution facts were captured.</p>"}</div></section><section class="copy-panel" id="plain-text-tree"><h2>Copy plain-text tree</h2><textarea readonly aria-label="Copyable plain-text execution tree" rows="${Math.max(4, Math.min(24, graph.nodes.length + clockDomains.length + 2))}">${escapeHtml(plainTree)}</textarea><p>Select the text and copy it; this report is a script-free snapshot.</p></section><section class="secondary-views" aria-label="Secondary Explain Analyze views"><details class="secondary-view" id="secondary-graph"><summary><span>Graph view</span><small>Explicit parent and dependency edges</small></summary><div class="graph-node-view">${nodeGraph}${graphDetails}</div></details><details class="secondary-view" id="secondary-timeline"><summary><span>Timeline view</span><small>Measured spans by clock domain</small></summary><div class="graph-scroll">${timeline || "<div class=\"empty\">No execution facts were captured.</div>"}</div></details></section><footer class="footer"><span>Amber intervals are measured waits. Tool I/O wait is shown only when separately recorded.</span><strong>Saved report · script-free snapshot</strong></footer></main></body></html>`;
 }
 
 function renderHtmlTokenSummary(

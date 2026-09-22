@@ -16,6 +16,7 @@ import {
   reduceExplainAnalyzeEvents,
   renderExplainAnalyzeHtml,
   explainAnalyzeAuxiliaryUsageLines,
+  explainAnalyzeAuxiliaryDetailsLines,
   renderExplainAnalyzeText,
 } from "@astra/sdk";
 import type {
@@ -59,6 +60,7 @@ export function ExplainAnalyzePanel({
     () => new Set(),
   );
   const graph = useMemo(() => reduceExplainAnalyzeEvents(events), [events]);
+  const auxiliaryDetailsLines = useMemo(() => explainAnalyzeAuxiliaryDetailsLines(graph), [graph]);
   const clockGroups = useMemo(() => groupByClockDomain(graph.nodes), [graph.nodes]);
   const searchMatches = useMemo(() => {
     const query = search.trim().toLocaleLowerCase();
@@ -312,6 +314,11 @@ export function ExplainAnalyzePanel({
       {explainAnalyzeAuxiliaryUsageLines(graph).length > 0 ? (
         <div aria-label="Auxiliary model token usage" className="space-y-1 border-b border-border px-5 py-2 text-xs text-text-muted">
           {explainAnalyzeAuxiliaryUsageLines(graph).map((line, index) => <p key={index}>{line}</p>)}
+        </div>
+      ) : null}
+      {auxiliaryDetailsLines.length > 0 ? (
+        <div aria-label="Auxiliary execution details" className="space-y-1 border-b border-border px-5 py-2 text-xs text-text-muted">
+          {auxiliaryDetailsLines.map((line, index) => <p key={index}>{line}</p>)}
         </div>
       ) : null}
 

@@ -7879,6 +7879,10 @@ impl ServerAgenticLoopHost {
         &mut self,
         decision: astra_services::WorkAdmissionDecision,
     ) -> bool {
+        let explain_decision =
+            astra_services::semantic_judgment_observation::accepted_request_judgment_result(
+                &decision,
+            );
         let required = matches!(
             &decision,
             astra_services::WorkAdmissionDecision::Required { .. }
@@ -7893,6 +7897,22 @@ impl ServerAgenticLoopHost {
         // (for example same-turn agent fan-out) that must shape the tool
         // surface without establishing a durable Work graph.
         self.pending_work_admission = Some(decision);
+        // Explain retains the original classifier result, but the admitted
+        // decision is a projection of this canonical owner. Reconciliation
+        // paths must therefore refresh it here instead of maintaining a
+        // second mutable copy of runtime admission state.
+        if self
+            .work_admission_explain_admission
+            .as_ref()
+            .is_some_and(|admission| {
+                admission.status
+                    == astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::Accepted
+            })
+        {
+            if let Some(admission) = self.work_admission_explain_admission.as_mut() {
+                admission.decision = Some(explain_decision);
+            }
+        }
         required
     }
 
@@ -9797,7 +9817,7 @@ impl ServerAgenticLoopHost {
                 "reconciled typed Work activation before durable dispatch"
             );
         }
-        self.pending_work_admission = Some(decision.with_activation(reconciled));
+        self.apply_work_admission_decision(decision.with_activation(reconciled));
     }
 
     fn reconcile_work_boundary_after_provider(
@@ -23708,6 +23728,21 @@ mod tests {
     }
 
     struct PendingClassificationClient;
+
+    fn accepted_explain_admission(
+        decision: &astra_services::WorkAdmissionDecision,
+    ) -> astra_turn_types::ExplainAnalyzeAdmissionSettlementV1 {
+        let result =
+            astra_services::semantic_judgment_observation::accepted_request_judgment_result(
+                decision,
+            );
+        astra_turn_types::ExplainAnalyzeAdmissionSettlementV1 {
+            status: astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::Accepted,
+            reason: astra_turn_types::ExplainAnalyzeAdmissionSettlementReasonV1::Accepted,
+            classification: Some(result.clone()),
+            decision: Some(result),
+        }
+    }
 
     #[async_trait::async_trait]
     impl SummaryLlmClient for PendingClassificationClient {
@@ -37935,8 +37970,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn primary_typed_defer_wins_before_server_work_dispatch() {
+    #[tokio::test]
+    async fn primary_typed_defer_wins_before_server_work_dispatch() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -37947,7 +37982,7 @@ mod tests {
             true, false,
         ))
         .build();
-        host.pending_work_admission = Some(astra_services::WorkAdmissionDecision::Required {
+        let initial_decision = astra_services::WorkAdmissionDecision::Required {
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
             mutation_completion_scope:
@@ -37969,7 +38004,8 @@ mod tests {
             activation: astra_services::WorkAdmissionActivation::Start,
             execution_topology: astra_services::WorkExecutionTopology::Primary,
             required_capabilities: Vec::new(),
-        });
+        };
+        host.pending_work_admission = Some(initial_decision.clone());
 
         let provider_calls = vec![
             json!({
@@ -37986,6 +38022,10 @@ mod tests {
             }),
         ];
         let mut state = create_test_state();
+        state.current_run_id = Some("run-work-activation".to_string());
+        state.current_session_id = Some("s-work-activation".to_string());
+        host.on_turn_started(&state);
+        host.work_admission_explain_admission = Some(accepted_explain_admission(&initial_decision));
         state.session_turn = 4;
         host.reconcile_work_activation_from_primary(&mut state, &provider_calls);
         let call = host
@@ -38001,6 +38041,22 @@ mod tests {
             arguments["activation"].as_str(),
             Some("defer"),
             "an explicit typed defer must not be replaced by the judge default start"
+        );
+        host.on_turn_terminal(&mut state, &Ok(AgenticLoopOutcome::Completed))
+            .await;
+        let terminal = host
+            .take_emitted_events()
+            .into_iter()
+            .find(|event| event["kind"] == "turn" && event["transition"] == "finished")
+            .expect("terminal turn fact");
+        assert_eq!(
+            terminal["auxiliary_details"]["admission"]["classification"]["classification"]["activation_deferred"],
+            false
+        );
+        assert_eq!(
+            terminal["auxiliary_details"]["admission"]["decision"]["classification"]["activation_deferred"],
+            true,
+            "terminal Explain must report the reconciled defer decision"
         );
     }
 
@@ -38526,8 +38582,8 @@ mod tests {
         assert!(host.pending_work_establishment.is_none());
     }
 
-    #[test]
-    fn explicit_fanout_replaces_speculative_required_work_projection() {
+    #[tokio::test]
+    async fn explicit_fanout_replaces_speculative_required_work_projection() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -38538,7 +38594,7 @@ mod tests {
             true, false,
         ))
         .build();
-        host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::Required {
+        let initial_decision = astra_services::WorkAdmissionDecision::Required {
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -38559,8 +38615,13 @@ mod tests {
             activation: astra_services::WorkAdmissionActivation::Start,
             execution_topology: astra_services::WorkExecutionTopology::Primary,
             required_capabilities: Vec::new(),
-        });
+        };
+        host.apply_work_admission_decision(initial_decision.clone());
         let mut state = create_test_state();
+        state.current_run_id = Some("run-fanout-precedence".to_string());
+        state.current_session_id = Some("s-fanout-precedence".to_string());
+        host.on_turn_started(&state);
+        host.work_admission_explain_admission = Some(accepted_explain_admission(&initial_decision));
         state.turn_intent = Some(
             astra_config::user_profile::TurnIntent::default()
                 .with_work_lifecycle(astra_config::user_profile::WorkLifecycleIntent::Required),
@@ -38594,6 +38655,26 @@ mod tests {
         assert!(
             host.take_admitted_work_establishment_call(&state).is_none(),
             "an explicit fanout carrier must not synthesize a durable Work graph"
+        );
+        host.on_turn_terminal(&mut state, &Ok(AgenticLoopOutcome::Completed))
+            .await;
+        let terminal = host
+            .take_emitted_events()
+            .into_iter()
+            .find(|event| event["kind"] == "turn" && event["transition"] == "finished")
+            .expect("terminal turn fact");
+        assert_eq!(
+            terminal["auxiliary_details"]["admission"]["classification"]["classification"]["work_required"],
+            true
+        );
+        assert_eq!(
+            terminal["auxiliary_details"]["admission"]["decision"]["classification"]["work_required"],
+            false,
+            "terminal Explain must report the reconciled fanout decision"
+        );
+        assert_eq!(
+            terminal["auxiliary_details"]["admission"]["decision"]["classification"]["parallel_subruns"],
+            true
         );
     }
 
