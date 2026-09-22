@@ -511,6 +511,7 @@ pub struct AgentDeliveryRollup {
 #[derive(Debug, Clone, Default, PartialEq)]
 struct ModelRequestSummary {
     terminal_requests: u64,
+    conflicting_requests: u64,
     input: astra_turn_types::NormalizedPromptCacheUsage,
     output_tokens: u64,
     cache_invalidations: u64,
@@ -603,17 +604,40 @@ impl ModelRequestSummary {
     fn from_records(records: &[ModelRequestContextRecord]) -> Option<Self> {
         const MAX_GROUPS: usize = 8;
         let mut summary = Self::default();
-        let mut seen_requests = BTreeSet::new();
-        let mut groups = BTreeMap::new();
+        let mut requests: BTreeMap<&str, Option<&ModelRequestContextRecord>> = BTreeMap::new();
         for record in records {
             if record.stage != ModelRequestEventStage::Terminal {
                 continue;
             }
-            let identity = &record.event.identity;
-            if !seen_requests.insert((identity.request_id.as_str(), identity.physical_attempt)) {
-                continue;
-            }
+            // request_id is already the canonical physical-attempt ID. Keep
+            // conflicts sticky so input order cannot select an identity or
+            // usage payload, even if a later row repeats the first version.
+            requests
+                .entry(record.event.identity.request_id.as_str())
+                .and_modify(|existing| {
+                    if existing.is_some_and(|first| {
+                        first.event.identity != record.event.identity
+                            || first.event.route != record.event.route
+                            || first.event.usage != record.event.usage
+                            || first.event.usage_status != record.event.usage_status
+                            || first.event.cache != record.event.cache
+                            || first.event.terminal_status != record.event.terminal_status
+                            || first.terminal_status != record.terminal_status
+                    }) {
+                        *existing = None;
+                    }
+                })
+                .or_insert(Some(record));
+        }
+        let mut groups = BTreeMap::new();
+        for record in requests.into_values() {
             summary.terminal_requests = summary.terminal_requests.saturating_add(1);
+            let Some(record) = record else {
+                summary.conflicting_requests += 1;
+                summary.usage_coverage.observe(None);
+                continue;
+            };
+            let identity = &record.event.identity;
             summary
                 .usage_coverage
                 .observe(record.event.usage_status.as_deref());
@@ -687,7 +711,7 @@ impl ModelRequestSummary {
             )
         };
         let mut rendered = format!(
-            "Model requests (bounded captured window; not complete session billing): {} terminal; known cache read {cache_share} ({}/{} known input; {} fresh, {} cache write), {} model-context invalidation record(s), {} known output tokens; usage coverage exact={}, partial={}, unavailable={}, unknown={}.",
+            "Model requests (bounded captured window; not complete session billing): {} terminal; known cache read {cache_share} ({}/{} known input; {} fresh, {} cache write), {} model-context invalidation record(s), observed output tokens: {}; usage coverage exact={}, partial={}, unavailable={}, unknown={}.",
             self.terminal_requests,
             render_known_usage(self.usage_observations, self.input.cache_read_tokens),
             render_known_usage(self.usage_observations, total_input_tokens),
@@ -700,6 +724,12 @@ impl ModelRequestSummary {
             self.usage_coverage.unavailable,
             self.usage_coverage.unknown,
         );
+        if self.conflicting_requests > 0 {
+            rendered.push_str(&format!(
+                " {} conflicting physical request(s) counted as unknown; their usage and identity groups are excluded.",
+                self.conflicting_requests,
+            ));
+        }
         for group in &self.groups {
             rendered.push_str(&format!(
                 "\n- run={} agent={} offering={} provider={} model={} upstream_model={} purpose={} requests={} known_input={} known_output={} usage(exact={}, partial={}, unavailable={}, unknown={})",
@@ -2685,8 +2715,7 @@ mod tests {
         assert!(!summary.contains("validated"), "{summary}");
     }
 
-    #[test]
-    fn model_request_summary_uses_terminal_typed_cache_facts() {
+    fn model_request_test_record() -> ModelRequestContextRecord {
         let identity = ModelRequestIdentity {
             request_id: "request-1".into(),
             provider_response_id: Some("response-1".into()),
@@ -2742,7 +2771,7 @@ mod tests {
             usage_status: Some("provider_exact".into()),
             error_kind: None,
         };
-        let record = ModelRequestContextRecord {
+        ModelRequestContextRecord {
             event_id: "event-1".into(),
             stage: ModelRequestEventStage::Terminal,
             terminal_status: Some("succeeded".into()),
@@ -2750,8 +2779,12 @@ mod tests {
             created_at: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
                 .unwrap()
                 .naive_utc(),
-        };
+        }
+    }
 
+    #[test]
+    fn model_request_summary_uses_terminal_typed_cache_facts() {
+        let record = model_request_test_record();
         let summary = ModelRequestSummary::from_records(std::slice::from_ref(&record))
             .expect("terminal request summary");
         assert_eq!(summary.terminal_requests, 1);
@@ -2857,6 +2890,109 @@ mod tests {
         let rendered_identity = render_model_request_identity(Some(&long_identity));
         assert!(rendered_identity.contains('…'));
         assert!(rendered_identity.chars().count() <= 131);
+    }
+
+    #[test]
+    fn model_request_duplicates_quarantine_conflicts_independently_of_order() {
+        let original = model_request_test_record();
+        let mut changed_index = original.clone();
+        changed_index.event.identity.physical_attempt += 1;
+        let mut changed_identity = original.clone();
+        changed_identity.event.identity.offering_id = "conflicting-offering".into();
+        changed_identity.event.identity.run_id = Some("conflicting-run".into());
+        let mut changed_usage = original.clone();
+        changed_usage.event.usage.as_mut().unwrap().output_tokens += 1;
+        let mut changed_coverage = original.clone();
+        changed_coverage.event.usage_status = Some("provider_partial".into());
+        let mut changed_cache = original.clone();
+        changed_cache.event.cache.cache_read_share = None;
+
+        let mut retry = original.clone();
+        retry.event.identity.request_id = "distinct-retry".into();
+        retry.event.identity.physical_attempt += 1;
+        let retry_summary =
+            ModelRequestSummary::from_records(std::slice::from_ref(&retry)).unwrap();
+
+        for conflicting in [
+            changed_index,
+            changed_identity,
+            changed_usage,
+            changed_coverage,
+            changed_cache,
+        ] {
+            let mut expected = retry_summary.clone();
+            expected.terminal_requests += 1;
+            expected.conflicting_requests = 1;
+            expected.usage_coverage.unknown = 1;
+            for records in [
+                vec![
+                    original.clone(),
+                    conflicting.clone(),
+                    original.clone(),
+                    retry.clone(),
+                ],
+                vec![
+                    conflicting.clone(),
+                    original.clone(),
+                    retry.clone(),
+                    original.clone(),
+                ],
+                vec![
+                    retry.clone(),
+                    original.clone(),
+                    original.clone(),
+                    conflicting.clone(),
+                ],
+            ] {
+                let summary = ModelRequestSummary::from_records(&records).unwrap();
+                assert_eq!(summary, expected);
+                assert_eq!(summary.render(), expected.render());
+                assert!(summary.render().contains("known cache read unknown"));
+                assert!(
+                    summary
+                        .render()
+                        .contains("1 conflicting physical request(s)")
+                );
+            }
+            let all_conflicted =
+                ModelRequestSummary::from_records(&[original.clone(), conflicting]).unwrap();
+            assert_eq!(all_conflicted.terminal_requests, 1);
+            assert_eq!(all_conflicted.usage_coverage.unknown, 1);
+            assert!(all_conflicted.groups.is_empty());
+            assert_eq!(all_conflicted.usage_observations, 0);
+            assert!(
+                all_conflicted
+                    .render()
+                    .contains("observed output tokens: unknown")
+            );
+        }
+    }
+
+    #[test]
+    fn model_request_duplicates_count_once_but_distinct_retry_ids_count_separately() {
+        let original = model_request_test_record();
+        let mut duplicate = original.clone();
+        // Capture metadata is not physical identity or usage evidence.
+        duplicate.event_id = "replayed-event".into();
+        duplicate.created_at += chrono::Duration::seconds(1);
+        let mut retry = original.clone();
+        retry.event.identity.request_id = "retry-request".into();
+        retry.event.identity.physical_attempt += 1;
+        let expected =
+            ModelRequestSummary::from_records(&[original.clone(), retry.clone()]).unwrap();
+        assert_eq!(expected.terminal_requests, 2);
+        assert_eq!(expected.conflicting_requests, 0);
+        assert_eq!(expected.output_tokens, 20);
+        assert_eq!(expected.groups[0].terminal_requests, 2);
+        for records in [
+            vec![original.clone(), duplicate.clone(), retry.clone()],
+            vec![retry, duplicate, original],
+        ] {
+            assert_eq!(
+                ModelRequestSummary::from_records(&records).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]

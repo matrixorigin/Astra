@@ -53,6 +53,11 @@ Reflect also summarizes its existing bounded request-context window by run,
 agent, Offering, provider, configured/upstream model, and purpose. Physical
 retries count separately; repeated terminal request facts count once. At most
 eight identity groups are rendered, with an explicit omitted-group count.
+Deduplication uses the canonical physical request ID, not a second composite
+identity derived from the attempt index. Conflicting terminal facts for that
+ID count as one unknown request; their usage and model attribution are excluded
+and the conflict count is visible. Input order cannot decide which conflicting
+identity or usage wins.
 The aggregate covers captured terminal requests, not complete session billing.
 Exact, partial, unavailable, and unknown usage remain separate. Missing usage
 renders unknown; a reported zero remains zero. Cache percentage is shown only
