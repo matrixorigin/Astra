@@ -1858,28 +1858,11 @@ pub async fn revalidate_admitted_model_executions(
                     offering_id: offering_id.clone(),
                 }
             })?;
-            let is_active: i16 = row.try_get("is_active").map_err(|error| {
-                active_llm_model_resolution_cache_remove(&cache_key);
-                ModelOfferingResolutionError::Backend(format!(
-                    "invalid infra_llm_models.is_active: {error}"
-                ))
-            })?;
-            if is_active == 0 {
-                active_llm_model_resolution_cache_remove(&cache_key);
-                let model_name: String = row.try_get("model_name").map_err(|error| {
-                    ModelOfferingResolutionError::Backend(format!(
-                        "invalid infra_llm_models.model_name: {error}"
-                    ))
+            let model = resolved_active_llm_from_offering_row(row, offering_id, encryptor)
+                .map_err(|error| {
+                    active_llm_model_resolution_cache_remove(&cache_key);
+                    error
                 })?;
-                return Err(ModelOfferingResolutionError::Inactive {
-                    offering_id: offering_id.clone(),
-                    model_name,
-                });
-            }
-            let model = build_resolved_active_llm_from_row(row, encryptor).map_err(|error| {
-                active_llm_model_resolution_cache_remove(&cache_key);
-                ModelOfferingResolutionError::Backend(error)
-            })?;
             let execution = AdmittedModelExecution::from_offering(ResolvedModelOffering {
                 offering_id: offering_id.clone(),
                 model: model.clone(),
@@ -2046,6 +2029,14 @@ async fn resolve_active_llm_offering_uncached(
         offering_id: offering_id.to_string(),
     })?;
 
+    resolved_active_llm_from_offering_row(&row, offering_id, encryptor)
+}
+
+fn resolved_active_llm_from_offering_row(
+    row: &sqlx::mysql::MySqlRow,
+    offering_id: &str,
+    encryptor: &FernetTokenEncryptor,
+) -> Result<ResolvedActiveLlmModel, ModelOfferingResolutionError> {
     let is_active: i16 = row.try_get("is_active").map_err(|error| {
         ModelOfferingResolutionError::Backend(format!(
             "invalid infra_llm_models.is_active: {error}"
@@ -2063,7 +2054,7 @@ async fn resolve_active_llm_offering_uncached(
         });
     }
 
-    build_resolved_active_llm_from_row(&row, encryptor)
+    build_resolved_active_llm_from_row(row, encryptor)
         .map_err(ModelOfferingResolutionError::Backend)
 }
 
