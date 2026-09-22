@@ -69,6 +69,13 @@ core tools or capabilities explicitly enabled by the parent; unknown names are
 rejected before dispatch. Dynamic capabilities must be present in that explicit
 parent set. A legacy unrestricted parent context retains its existing behavior.
 
+For a Server fanout with explicit child models, the runtime validates every
+slot before launching any child, admits the distinct non-inherited Offerings as
+one bounded user-scoped batch, and binds each admitted execution to its slot.
+An inherited parent Offering reuses the parent's admission without another
+catalog read. Any invalid or revoked slot fails preparation for the entire
+fanout; admission does not authorize a partial launch.
+
 ## Result integration
 
 Parent should receive:

@@ -277,7 +277,7 @@ pub use models::{
     prompt_cache_capability_from_models_yaml, resolve_active_llm_model,
     resolve_active_llm_offering, resolve_memory_offerings, resolve_reasoning_offering,
     revalidate_active_llm_offering, revalidate_admitted_model_execution,
-    validate_model_offering_id,
+    revalidate_admitted_model_executions, validate_model_offering_id,
 };
 pub use multi_agent::{
     DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, EdgeAgentRecord,

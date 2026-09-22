@@ -21516,7 +21516,59 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         let parent = self
             .runtime_context_for_parent_run(&context.parent_run_id)
             .await?;
-        let mut admitted: HashMap<String, astra_services::AdmittedModelExecution> = HashMap::new();
+        let inherited = parent.admitted_model_execution.as_ref();
+        let mut requested = Vec::new();
+        for input in inputs {
+            input.fanout_slot_identity()?;
+            match input.model_selection.as_ref() {
+                Some(selection) => {
+                    astra_services::validate_model_offering_id(&selection.offering_id)
+                        .map_err(|error| format!("invalid child model selection: {error}"))?;
+                    if inherited.is_none_or(|parent| parent.offering_id != selection.offering_id)
+                        && !requested.contains(&selection.offering_id)
+                    {
+                        requested.push(selection.offering_id.clone());
+                    }
+                }
+                None if inherited.is_none() => {
+                    return Err(
+                        "server dynamic child cannot inherit a missing parent model admission"
+                            .to_string(),
+                    );
+                }
+                None => {}
+            }
+        }
+        let executions = if requested.is_empty() {
+            Vec::new()
+        } else if let Some(model_service) = self.model_service.as_ref() {
+            model_service
+                .admit_model_offerings(parent.user_id.clone(), requested.clone())
+                .await
+                .map_err(|(_, body)| body.0.detail)?
+        } else {
+            astra_services::revalidate_admitted_model_executions(
+                &self.matrixone,
+                self.encryptor.as_ref(),
+                &parent.user_id,
+                &requested,
+                self.shared_pool.as_ref().map(SharedPool::get),
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        };
+        if executions.len() != requested.len()
+            || executions
+                .iter()
+                .zip(&requested)
+                .any(|(execution, requested)| execution.offering_id != *requested)
+        {
+            return Err(
+                "batch model admission returned an incomplete or mismatched Offering set"
+                    .to_string(),
+            );
+        }
+        let admitted: HashMap<_, _> = requested.into_iter().zip(executions).collect();
         let mut prepared: Vec<Box<dyn PreparedSpawn>> = Vec::with_capacity(inputs.len());
         for input in inputs {
             let slot = input.fanout_slot_identity()?;
@@ -21525,29 +21577,28 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
                 .as_ref()
                 .map(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::config)
                 .unwrap_or(astra_turn_core::thinking_config::ThinkingConfig::ModelDefault);
-            let offering_id = input
-                .model_selection
-                .as_ref()
-                .map(|selection| selection.offering_id.as_str())
-                .or_else(|| {
-                    parent
-                        .admitted_model_execution
-                        .as_ref()
-                        .map(|execution| execution.offering_id.as_str())
-                })
-                .ok_or_else(|| {
+            let execution = match input.model_selection.as_ref() {
+                Some(selection)
+                    if inherited
+                        .is_none_or(|parent| parent.offering_id != selection.offering_id) =>
+                {
+                    admitted
+                        .get(&selection.offering_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            "batch model admission lost a selected Offering".to_string()
+                        })?
+                }
+                _ => inherited.cloned().ok_or_else(|| {
                     "server dynamic child cannot inherit a missing parent model admission"
                         .to_string()
-                })?;
-            let execution = if let Some(execution) = admitted.get(offering_id) {
-                execution.clone()
-            } else {
-                let execution = self
-                    .select_spawn_model_execution(&parent, input.model_selection.as_ref())
-                    .await?;
-                admitted.insert(offering_id.to_string(), execution.clone());
-                execution
+                })?,
             };
+            astra_services::models::validate_model_execution_purpose(
+                &execution,
+                astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
+            )
+            .map_err(|(_, body)| body.0.detail)?;
             crate::server::model_execution_admission::validate_reasoning_control(
                 &execution, &thinking,
             )?;

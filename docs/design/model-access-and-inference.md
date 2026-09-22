@@ -241,6 +241,10 @@ their own provider account.
   OpenAI transport; adding user ownership does not create another agent loop.
 - Inference admission revalidates `(user_id, offering_id, is_active)` and
   decrypts the current credential immediately before provider execution.
+  Server child fanout admits a bounded set of distinct Offerings with batched
+  owner-scoped and deployment reads, preserving per-Offering freshness without
+  one database round trip per child. The all-or-nothing batch is validated
+  before any child is launched; inherited parent admission adds no read.
 - Create, credential rotation and explicit probe validate connectivity with a
   small output budget using the same provider-specific wire-field rule as
   inference: OpenAI (including o-series) and the generic OpenAI-compatible

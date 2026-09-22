@@ -34,6 +34,107 @@ async fn seed_model(pool: &sqlx::Pool<sqlx::MySql>, model_name: &str) -> String 
 }
 
 #[tokio::test]
+#[ignore = "requires a dedicated live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn batch_admission_is_ordered_owner_scoped_and_fresh() {
+    let (shared_pool, settings) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get().clone();
+    let encryptor = FernetTokenEncryptor::new("batch-admission-db-it-key").unwrap();
+    let owner = format!("batch_owner_{}", Uuid::new_v4().simple());
+    let other = format!("batch_other_{}", Uuid::new_v4().simple());
+    let infra_a = seed_model(&pool, &format!("batch_a_{}", Uuid::new_v4().simple())).await;
+    let infra_b = seed_model(&pool, &format!("batch_b_{}", Uuid::new_v4().simple())).await;
+    for (id, secret) in [(&infra_a, "infra-a-secret"), (&infra_b, "infra-b-secret")] {
+        sqlx::query("UPDATE infra_llm_models SET api_key_encrypted = ? WHERE model_id = ?")
+            .bind(encryptor.encrypt(secret).unwrap())
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let personal = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO user_llm_models \
+         (model_id, user_id, model_alias, model_name, provider, api_key_encrypted, base_url, \
+          context_window, is_default, is_active) \
+         VALUES (?, ?, 'batch-personal', 'deepseek-chat', 'deepseek', ?, \
+          'https://api.deepseek.com', 128000, 0, 1)",
+    )
+    .bind(&personal)
+    .bind(&owner)
+    .bind(encryptor.encrypt("personal-secret").unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let service = DatabaseModelService::new(settings, Arc::new(encryptor)).with_pool(shared_pool);
+    let requested = vec![
+        infra_a.clone(),
+        personal.clone(),
+        infra_b.clone(),
+        personal.clone(),
+    ];
+    let admitted = service
+        .admit_model_offerings(owner.clone(), requested.clone())
+        .await
+        .expect("one batch admits each distinct authorized Offering");
+    assert_eq!(
+        admitted
+            .iter()
+            .map(|item| item.offering_id.as_str())
+            .collect::<Vec<_>>(),
+        requested.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    assert_eq!(admitted[0].api_key, "infra-a-secret");
+    assert_eq!(admitted[1].api_key, "personal-secret");
+    assert_eq!(admitted[2].api_key, "infra-b-secret");
+    assert_eq!(
+        admitted[1], admitted[3],
+        "duplicate Offering reuses one result"
+    );
+    assert!(!format!("{admitted:?}").contains("personal-secret"));
+
+    let other_error = service
+        .admit_model_offerings(other, vec![personal.clone()])
+        .await
+        .expect_err("a different owner cannot admit the personal Offering");
+    let scalar_error = service
+        .admit_model_offering("not-the-owner".into(), personal.clone())
+        .await
+        .expect_err("scalar owner isolation is the reference contract");
+    assert_eq!(other_error.0, scalar_error.0);
+    assert_eq!(other_error.1.error_code, scalar_error.1.error_code);
+
+    sqlx::query("UPDATE user_llm_models SET is_active = 0 WHERE user_id = ? AND model_id = ?")
+        .bind(&owner)
+        .bind(&personal)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let error = service
+        .admit_model_offerings(owner.clone(), requested)
+        .await
+        .expect_err("inactive final personal Offering rejects all batch results");
+    assert_eq!(error.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        error.1.error_code.as_deref(),
+        Some("model_offering_unavailable")
+    );
+    sqlx::query("DELETE FROM user_llm_models WHERE user_id = ? AND model_id = ?")
+        .bind(&owner)
+        .bind(&personal)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for id in [infra_a, infra_b] {
+        sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
 async fn database_model_corrupt_capability_and_json_shape_fail_loud() {

@@ -2399,12 +2399,14 @@ impl UserIntentProvider for StaticRunControlProvider {
 
 struct ActiveTestModelService {
     base_url: String,
+    batch_requests: StdMutex<Vec<Vec<String>>>,
 }
 
 impl ActiveTestModelService {
     fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
+            batch_requests: StdMutex::new(Vec::new()),
         }
     }
 }
@@ -2472,6 +2474,40 @@ fn test_model_record_at(name: String, base_url: &str) -> astra_services::ModelRe
 
 #[async_trait]
 impl astra_services::ModelService for ActiveTestModelService {
+    async fn admit_model_offerings(
+        &self,
+        _user_id: String,
+        offering_ids: Vec<String>,
+    ) -> Result<Vec<astra_services::AdmittedModelExecution>, (StatusCode, Json<ErrorResponse>)>
+    {
+        self.batch_requests
+            .lock()
+            .unwrap()
+            .push(offering_ids.clone());
+        offering_ids
+            .into_iter()
+            .map(|offering_id| {
+                if offering_id == "invalid" {
+                    return Err(error_response_coded(
+                        StatusCode::NOT_FOUND,
+                        "Offering is not available",
+                        "model_offering_not_found",
+                    ));
+                }
+                let mut offering = test_resolved_model_offering_at(&self.base_url);
+                offering.offering_id = offering_id.clone();
+                offering.model.model_name = offering_id;
+                astra_services::AdmittedModelExecution::from_offering(offering).map_err(|error| {
+                    error_response_coded(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        error,
+                        "model_catalog_unavailable",
+                    )
+                })
+            })
+            .collect()
+    }
+
     async fn create_model(
         &self,
         _user_id: String,
@@ -6408,6 +6444,58 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
         .await
         .expect("inherited Offering is prepared without a catalog lookup");
     assert_eq!(prepared.len(), 2);
+
+    let model_service = Arc::new(ActiveTestModelService::default());
+    let batch_executor = Arc::new(
+        ServerSpawnAgentExecutor::new(
+            test_settings(),
+            test_encryptor(),
+            Arc::new(TokioMutex::new(HashMap::new())),
+        )
+        .with_model_service(Some(model_service.clone())),
+    );
+    batch_executor
+        .set_runtime_context(test_spawn_runtime_context("root-run", "user-a"))
+        .await;
+    Arc::clone(&batch_executor)
+        .prepare_batch(&inputs, &context, None)
+        .await
+        .expect("inherited slots do not query the model service");
+    assert!(model_service.batch_requests.lock().unwrap().is_empty());
+    let mut heterogeneous = inputs.clone();
+    let mut repeated = inputs[0].clone();
+    repeated.fanout_slot_index = Some(2);
+    heterogeneous.push(repeated);
+    for input in &mut heterogeneous {
+        input.fanout_target_count = Some(3);
+    }
+    heterogeneous[0].model_selection = Some(ModelSelection {
+        offering_id: "model-b".into(),
+    });
+    heterogeneous[1].model_selection = Some(ModelSelection {
+        offering_id: "model-c".into(),
+    });
+    heterogeneous[2].model_selection = Some(ModelSelection {
+        offering_id: "model-b".into(),
+    });
+    let prepared = Arc::clone(&batch_executor)
+        .prepare_batch(&heterogeneous, &context, None)
+        .await
+        .expect("distinct Offerings are admitted together");
+    assert_eq!(prepared.len(), 3);
+    assert_eq!(
+        model_service.batch_requests.lock().unwrap().as_slice(),
+        &[vec!["model-b".to_string(), "model-c".to_string()]]
+    );
+    heterogeneous[2].model_selection = Some(ModelSelection {
+        offering_id: "invalid".into(),
+    });
+    assert!(
+        Arc::clone(&batch_executor)
+            .prepare_batch(&heterogeneous, &context, None)
+            .await
+            .is_err()
+    );
 
     let mut mismatched = test_spawn_run_config(vec![], true);
     mismatched.parent_address = Some(astra_messaging::types::AgentAddress::new(

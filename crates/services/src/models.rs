@@ -3,7 +3,7 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeStruct};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use sqlx::{Row, query, query_scalar};
+use sqlx::{QueryBuilder, Row, query, query_scalar};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
@@ -881,6 +881,7 @@ impl std::fmt::Debug for AdmittedModelExecution {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelOfferingResolutionError {
     InvalidOfferingId,
+    BatchTooLarge,
     NotFound {
         offering_id: String,
     },
@@ -904,6 +905,9 @@ fn model_offering_resolution_error_response(
         ModelOfferingResolutionError::InvalidOfferingId => {
             (StatusCode::BAD_REQUEST, "model_selection_invalid")
         }
+        ModelOfferingResolutionError::BatchTooLarge => {
+            (StatusCode::BAD_REQUEST, "model_admission_batch_too_large")
+        }
         ModelOfferingResolutionError::NotFound { .. } => {
             (StatusCode::NOT_FOUND, "model_offering_not_found")
         }
@@ -923,6 +927,7 @@ impl std::fmt::Display for ModelOfferingResolutionError {
             Self::InvalidOfferingId => {
                 f.write_str("offering_id must be an exact non-empty identifier of at most 64 bytes")
             }
+            Self::BatchTooLarge => f.write_str("Too many model Offerings in one admission"),
             Self::NotFound { offering_id } => {
                 write!(f, "Offering '{offering_id}' is not available")
             }
@@ -1123,6 +1128,18 @@ fn active_llm_model_resolution_cache_remove(key: &ActiveLlmModelCacheKey) {
         .expect("active LLM model resolution cache lock poisoned")
         .entries
         .remove(key);
+}
+
+fn deployment_batch_query_error(
+    matrixone: &MatrixOneSettings,
+    offering_ids: &[&str],
+    error: sqlx::Error,
+) -> ModelOfferingResolutionError {
+    for offering_id in offering_ids {
+        let key = ActiveLlmModelCacheKey::for_offering_id(matrixone, offering_id);
+        active_llm_model_resolution_cache_remove(&key);
+    }
+    ModelOfferingResolutionError::Backend(format!("DB query: {error}"))
 }
 
 fn active_llm_model_resolution_lock(key: &ActiveLlmModelCacheKey) -> Arc<tokio::sync::Mutex<()>> {
@@ -1599,6 +1616,20 @@ pub fn validate_model_offering_id(offering_id: &str) -> Result<&str, ModelOfferi
     Ok(offering_id)
 }
 
+const MAX_MODEL_ADMISSION_BATCH: usize = 64;
+
+fn validate_model_admission_batch(
+    offering_ids: &[String],
+) -> Result<(), ModelOfferingResolutionError> {
+    if offering_ids.len() > MAX_MODEL_ADMISSION_BATCH {
+        return Err(ModelOfferingResolutionError::BatchTooLarge);
+    }
+    for offering_id in offering_ids {
+        validate_model_offering_id(offering_id)?;
+    }
+    Ok(())
+}
+
 /// Resolve a client-visible effective Offering by durable ID.
 ///
 /// This path is deliberately stricter than [`resolve_active_llm_model`]: it
@@ -1708,121 +1739,254 @@ pub async fn revalidate_admitted_model_execution(
     offering_id: &str,
     pool: Option<&sqlx::Pool<sqlx::MySql>>,
 ) -> Result<AdmittedModelExecution, ModelOfferingResolutionError> {
-    let offering_id = validate_model_offering_id(offering_id)?;
-    let pool = require_pool(pool, matrixone)
+    let executions = revalidate_admitted_model_executions(
+        matrixone,
+        encryptor,
+        user_id,
+        &[offering_id.to_owned()],
+        pool,
+    )
+    .await?;
+    Ok(executions.into_iter().next().expect("singleton admission"))
+}
+
+/// Resolve a fixed request-local set with one owner lookup and, if needed,
+/// one deployment lookup. No result escapes when any member is invalid.
+/// Every call reads current rows; this is not an authorization cache.
+pub async fn revalidate_admitted_model_executions(
+    matrixone: &MatrixOneSettings,
+    encryptor: &FernetTokenEncryptor,
+    user_id: &str,
+    offering_ids: &[String],
+    provided_pool: Option<&sqlx::MySqlPool>,
+) -> Result<Vec<AdmittedModelExecution>, ModelOfferingResolutionError> {
+    validate_model_admission_batch(offering_ids)?;
+    if offering_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pool = require_pool(provided_pool, matrixone)
         .await
         .map_err(ModelOfferingResolutionError::Backend)?;
-    let row = query(
-        "SELECT model_alias, model_name, provider, api_key_encrypted, base_url, \
-         context_window, is_active, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json FROM user_llm_models \
-         WHERE user_id = ? AND model_id = ? LIMIT 1",
-    )
-    .bind(user_id)
-    .bind(offering_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|error| ModelOfferingResolutionError::Backend(format!("DB query: {error}")))?;
+    let mut seen = BTreeSet::new();
+    let unique: Vec<&str> = offering_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|offering_id| seen.insert(*offering_id))
+        .collect();
 
-    if let Some(row) = row {
-        let alias: String = row.try_get("model_alias").map_err(|error| {
-            ModelOfferingResolutionError::Backend(format!(
-                "invalid user_llm_models.model_alias: {error}"
-            ))
-        })?;
-        let is_active: i16 = row.try_get("is_active").map_err(|error| {
-            ModelOfferingResolutionError::Backend(format!(
-                "invalid user_llm_models.is_active: {error}"
-            ))
-        })?;
-        if is_active == 0 {
-            return Err(ModelOfferingResolutionError::Inactive {
-                offering_id: offering_id.to_string(),
-                model_name: alias,
-            });
-        }
-        let encrypted: String = row.try_get("api_key_encrypted").map_err(|error| {
-            ModelOfferingResolutionError::Backend(format!(
-                "invalid user_llm_models.api_key_encrypted: {error}"
-            ))
-        })?;
-        let api_key = encryptor
-            .decrypt(&encrypted)
-            .map_err(ModelOfferingResolutionError::Backend)?;
-        let context_window: i32 = row.try_get("context_window").map_err(|error| {
-            ModelOfferingResolutionError::Backend(format!(
-                "invalid user_llm_models.context_window: {error}"
-            ))
-        })?;
-        let context_window = u32::try_from(context_window).map_err(|_| {
-            ModelOfferingResolutionError::Backend(
-                "invalid user_llm_models.context_window: must be positive".to_string(),
-            )
-        })?;
-        let provider: String = row
-            .try_get("provider")
-            .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
-        let base_url: String = row
-            .try_get("base_url")
-            .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
-        if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
-            crate::byok_endpoint::require_endpoint_policy(&pool, &base_url)
-                .await
-                .map_err(ModelOfferingResolutionError::Backend)?;
-        }
-        let upstream: String = row
-            .try_get("model_name")
-            .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
-        let protocol = canonical_thinking_protocol(&provider, &base_url, &upstream);
-        let snapshot: Option<String> = row
-            .try_get("thinking_probe_json")
-            .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
-        let identity = probe_identity(&provider, &base_url, &upstream, &encrypted, "");
-        let thinking_capability = cached_capability(snapshot.as_deref(), &identity, protocol);
-        return Ok(AdmittedModelExecution {
-            offering_id: offering_id.to_string(),
-            access_kind: ModelAccessKind::CloudByok,
-            execution_placement: ModelExecutionPlacement::Server,
-            model_name: alias,
-            wire_model_name: Some(row.try_get("model_name").map_err(|error| {
-                ModelOfferingResolutionError::Backend(format!(
-                    "invalid user_llm_models.model_name: {error}"
-                ))
-            })?),
-            api_key,
-            base_url: row.try_get("base_url").map_err(|error| {
-                ModelOfferingResolutionError::Backend(format!(
-                    "invalid user_llm_models.base_url: {error}"
-                ))
-            })?,
-            provider: row.try_get("provider").map_err(|error| {
-                ModelOfferingResolutionError::Backend(format!(
-                    "invalid user_llm_models.provider: {error}"
-                ))
-            })?,
-            cache_capability: None,
-            thinking_capability,
-            fixed_temperature: None,
-            thinking_protocol: Some(protocol),
-            request_body_overrides: None,
-            context_window: Some(context_window),
-            max_completion_tokens: None,
-            header_overrides: HashMap::new(),
-            completions_url_override: None,
-            request_timeout_ms: None,
-        });
-    }
-
-    if !deployment_models_allowed(&pool, user_id)
-        .await
-        .map_err(ModelOfferingResolutionError::Backend)?
+    let mut personal_query = QueryBuilder::<sqlx::MySql>::new(
+        "SELECT model_id, model_alias, model_name, provider, api_key_encrypted, base_url, \
+         context_window, is_active, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json \
+         FROM user_llm_models WHERE user_id = ",
+    );
+    personal_query.push_bind(user_id).push(" AND model_id IN (");
     {
-        return Err(ModelOfferingResolutionError::NotFound {
+        let mut separated = personal_query.separated(", ");
+        for offering_id in &unique {
+            separated.push_bind(*offering_id);
+        }
+    }
+    personal_query.push(')');
+    let mut personal = HashMap::new();
+    for row in personal_query
+        .build()
+        .fetch_all(&pool)
+        .await
+        .map_err(|error| ModelOfferingResolutionError::Backend(format!("DB query: {error}")))?
+    {
+        let id: String = row.try_get("model_id").map_err(|error| {
+            ModelOfferingResolutionError::Backend(format!(
+                "invalid user_llm_models.model_id: {error}"
+            ))
+        })?;
+        personal.insert(id, row);
+    }
+
+    let unresolved: Vec<&str> = unique
+        .iter()
+        .copied()
+        .filter(|id| !personal.contains_key(*id))
+        .collect();
+    let deployment_allowed = if unresolved.is_empty() {
+        false
+    } else {
+        deployment_models_allowed(&pool, user_id)
+            .await
+            .map_err(ModelOfferingResolutionError::Backend)?
+    };
+    let mut deployment = HashMap::new();
+    if deployment_allowed {
+        let mut deployment_query = QueryBuilder::<sqlx::MySql>::new(format!(
+            "SELECT model_id, {RESOLVE_COLS}, is_active FROM infra_llm_models WHERE model_id IN ("
+        ));
+        {
+            let mut separated = deployment_query.separated(", ");
+            for offering_id in &unresolved {
+                separated.push_bind(*offering_id);
+            }
+        }
+        deployment_query.push(')');
+        let deployment_rows = deployment_query
+            .build()
+            .fetch_all(&pool)
+            .await
+            .map_err(|error| deployment_batch_query_error(matrixone, &unresolved, error))?;
+        for row in deployment_rows {
+            let id: String = row.try_get("model_id").map_err(|error| {
+                ModelOfferingResolutionError::Backend(format!(
+                    "invalid infra_llm_models.model_id: {error}"
+                ))
+            })?;
+            deployment.insert(id, row);
+        }
+    }
+
+    let mut resolved: HashMap<&str, AdmittedModelExecution> = HashMap::new();
+    let mut ordered = Vec::with_capacity(offering_ids.len());
+    for offering_id in offering_ids {
+        if let Some(execution) = resolved.get(offering_id.as_str()) {
+            ordered.push(execution.clone());
+            continue;
+        }
+        let execution = if let Some(row) = personal.get(offering_id) {
+            admitted_user_model_from_row(row, offering_id, encryptor, &pool).await?
+        } else {
+            let cache_key = ActiveLlmModelCacheKey::for_offering_id(matrixone, offering_id);
+            let row = deployment.get(offering_id).ok_or_else(|| {
+                active_llm_model_resolution_cache_remove(&cache_key);
+                ModelOfferingResolutionError::NotFound {
+                    offering_id: offering_id.clone(),
+                }
+            })?;
+            let is_active: i16 = row.try_get("is_active").map_err(|error| {
+                active_llm_model_resolution_cache_remove(&cache_key);
+                ModelOfferingResolutionError::Backend(format!(
+                    "invalid infra_llm_models.is_active: {error}"
+                ))
+            })?;
+            if is_active == 0 {
+                active_llm_model_resolution_cache_remove(&cache_key);
+                let model_name: String = row.try_get("model_name").map_err(|error| {
+                    ModelOfferingResolutionError::Backend(format!(
+                        "invalid infra_llm_models.model_name: {error}"
+                    ))
+                })?;
+                return Err(ModelOfferingResolutionError::Inactive {
+                    offering_id: offering_id.clone(),
+                    model_name,
+                });
+            }
+            let model = build_resolved_active_llm_from_row(row, encryptor).map_err(|error| {
+                active_llm_model_resolution_cache_remove(&cache_key);
+                ModelOfferingResolutionError::Backend(error)
+            })?;
+            let execution = AdmittedModelExecution::from_offering(ResolvedModelOffering {
+                offering_id: offering_id.clone(),
+                model: model.clone(),
+            })
+            .map_err(|error| {
+                active_llm_model_resolution_cache_remove(&cache_key);
+                ModelOfferingResolutionError::Backend(error)
+            })?;
+            active_llm_model_resolution_cache_store(cache_key, model);
+            execution
+        };
+        resolved.insert(offering_id.as_str(), execution.clone());
+        ordered.push(execution);
+    }
+    Ok(ordered)
+}
+
+async fn admitted_user_model_from_row(
+    row: &sqlx::mysql::MySqlRow,
+    offering_id: &str,
+    encryptor: &FernetTokenEncryptor,
+    pool: &sqlx::MySqlPool,
+) -> Result<AdmittedModelExecution, ModelOfferingResolutionError> {
+    let alias: String = row.try_get("model_alias").map_err(|error| {
+        ModelOfferingResolutionError::Backend(format!(
+            "invalid user_llm_models.model_alias: {error}"
+        ))
+    })?;
+    let is_active: i16 = row.try_get("is_active").map_err(|error| {
+        ModelOfferingResolutionError::Backend(format!("invalid user_llm_models.is_active: {error}"))
+    })?;
+    if is_active == 0 {
+        return Err(ModelOfferingResolutionError::Inactive {
             offering_id: offering_id.to_string(),
+            model_name: alias,
         });
     }
-    let offering =
-        revalidate_active_llm_offering(matrixone, encryptor, offering_id, Some(&pool)).await?;
-    AdmittedModelExecution::from_offering(offering).map_err(ModelOfferingResolutionError::Backend)
+    let encrypted: String = row.try_get("api_key_encrypted").map_err(|error| {
+        ModelOfferingResolutionError::Backend(format!(
+            "invalid user_llm_models.api_key_encrypted: {error}"
+        ))
+    })?;
+    let api_key = encryptor
+        .decrypt(&encrypted)
+        .map_err(ModelOfferingResolutionError::Backend)?;
+    let context_window: i32 = row.try_get("context_window").map_err(|error| {
+        ModelOfferingResolutionError::Backend(format!(
+            "invalid user_llm_models.context_window: {error}"
+        ))
+    })?;
+    let context_window = u32::try_from(context_window).map_err(|_| {
+        ModelOfferingResolutionError::Backend(
+            "invalid user_llm_models.context_window: must be positive".to_string(),
+        )
+    })?;
+    let provider: String = row
+        .try_get("provider")
+        .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
+    let base_url: String = row
+        .try_get("base_url")
+        .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
+    if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
+        crate::byok_endpoint::require_endpoint_policy(pool, &base_url)
+            .await
+            .map_err(ModelOfferingResolutionError::Backend)?;
+    }
+    let upstream: String = row
+        .try_get("model_name")
+        .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
+    let protocol = canonical_thinking_protocol(&provider, &base_url, &upstream);
+    let snapshot: Option<String> = row
+        .try_get("thinking_probe_json")
+        .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
+    let identity = probe_identity(&provider, &base_url, &upstream, &encrypted, "");
+    let thinking_capability = cached_capability(snapshot.as_deref(), &identity, protocol);
+    Ok(AdmittedModelExecution {
+        offering_id: offering_id.to_string(),
+        access_kind: ModelAccessKind::CloudByok,
+        execution_placement: ModelExecutionPlacement::Server,
+        model_name: alias,
+        wire_model_name: Some(row.try_get("model_name").map_err(|error| {
+            ModelOfferingResolutionError::Backend(format!(
+                "invalid user_llm_models.model_name: {error}"
+            ))
+        })?),
+        api_key,
+        base_url: row.try_get("base_url").map_err(|error| {
+            ModelOfferingResolutionError::Backend(format!(
+                "invalid user_llm_models.base_url: {error}"
+            ))
+        })?,
+        provider: row.try_get("provider").map_err(|error| {
+            ModelOfferingResolutionError::Backend(format!(
+                "invalid user_llm_models.provider: {error}"
+            ))
+        })?,
+        cache_capability: None,
+        thinking_capability,
+        fixed_temperature: None,
+        thinking_protocol: Some(protocol),
+        request_body_overrides: None,
+        context_window: Some(context_window),
+        max_completion_tokens: None,
+        header_overrides: HashMap::new(),
+        completions_url_override: None,
+        request_timeout_ms: None,
+    })
 }
 
 /// Shared eligibility gate for catalog and execution, including resumed runs.
@@ -2583,6 +2747,32 @@ pub trait ModelService: Send + Sync {
     ) -> Result<AdmittedModelExecution, (StatusCode, Json<ErrorResponse>)> {
         let offering = self.revalidate_model_offering(offering_id).await?;
         AdmittedModelExecution::from_offering(offering).map_err(internal_error)
+    }
+
+    /// Admit a bounded set of exact Offerings for one authenticated user.
+    /// Implementations with storage should batch their reads; the default
+    /// keeps custom ModelService implementations compatible with this owner.
+    async fn admit_model_offerings(
+        &self,
+        user_id: String,
+        offering_ids: Vec<String>,
+    ) -> Result<Vec<AdmittedModelExecution>, (StatusCode, Json<ErrorResponse>)> {
+        validate_model_admission_batch(&offering_ids)
+            .map_err(model_offering_resolution_error_response)?;
+        let mut admitted: HashMap<String, AdmittedModelExecution> = HashMap::new();
+        let mut ordered = Vec::with_capacity(offering_ids.len());
+        for offering_id in offering_ids {
+            if let Some(execution) = admitted.get(&offering_id) {
+                ordered.push(execution.clone());
+                continue;
+            }
+            let execution = self
+                .admit_model_offering(user_id.clone(), offering_id.clone())
+                .await?;
+            admitted.insert(offering_id, execution.clone());
+            ordered.push(execution);
+        }
+        Ok(ordered)
     }
 
     async fn create_model(
@@ -3566,6 +3756,34 @@ impl ModelService for DatabaseModelService {
             self.encryptor.as_ref(),
             &user_id,
             &offering_id,
+            self.pool.as_ref().map(SharedPool::get),
+        )
+        .await
+        .map_err(model_offering_resolution_error_response)
+    }
+
+    async fn admit_model_offerings(
+        &self,
+        user_id: String,
+        offering_ids: Vec<String>,
+    ) -> Result<Vec<AdmittedModelExecution>, (StatusCode, Json<ErrorResponse>)> {
+        validate_model_admission_batch(&offering_ids)
+            .map_err(model_offering_resolution_error_response)?;
+        if offering_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(subject) = self.uc_subject(&user_id).await? {
+            let catalog = self.genesis_catalog(&subject).await?;
+            return offering_ids
+                .iter()
+                .map(|offering_id| self.admit_genesis_from_catalog(&catalog, offering_id))
+                .collect();
+        }
+        revalidate_admitted_model_executions(
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            &user_id,
+            &offering_ids,
             self.pool.as_ref().map(SharedPool::get),
         )
         .await
@@ -6159,6 +6377,31 @@ mod tests {
             Some(&model),
             "expired entries remain available for stale-if-DB-error fallback"
         );
+    }
+
+    #[test]
+    fn deployment_batch_query_failure_evicts_only_attempted_offerings() {
+        let settings = MatrixOneSettings::mock();
+        let attempted = ActiveLlmModelCacheKey::for_offering_id(&settings, "attempted-model");
+        let unrelated = ActiveLlmModelCacheKey::for_offering_id(&settings, "unrelated-model");
+        active_llm_model_resolution_cache_store(
+            attempted.clone(),
+            sample_resolved_active_model("attempted-model"),
+        );
+        active_llm_model_resolution_cache_store(
+            unrelated.clone(),
+            sample_resolved_active_model("unrelated-model"),
+        );
+
+        let error = deployment_batch_query_error(
+            &settings,
+            &["attempted-model"],
+            sqlx::Error::PoolTimedOut,
+        );
+        assert!(matches!(error, ModelOfferingResolutionError::Backend(_)));
+        assert!(active_llm_model_resolution_cache_stale_lookup(&attempted).is_none());
+        assert!(active_llm_model_resolution_cache_stale_lookup(&unrelated).is_some());
+        active_llm_model_resolution_cache_remove(&unrelated);
     }
 
     #[test]
