@@ -2651,7 +2651,10 @@ async fn post_loop_memory_never_purges_an_unconfirmed_final_snapshot() {
             _: Option<&str>,
             _: usize,
             _: bool,
-        ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String> {
+        ) -> Result<
+            Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>,
+            astra_memoria::MemoriaOperationError,
+        > {
             Ok(Vec::new())
         }
 
@@ -2764,7 +2767,10 @@ async fn post_loop_memory_disabled_capability_settles_without_health_failure() {
             _: Option<&str>,
             _: usize,
             _: bool,
-        ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String> {
+        ) -> Result<
+            Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>,
+            astra_memoria::MemoriaOperationError,
+        > {
             Ok(Vec::new())
         }
 

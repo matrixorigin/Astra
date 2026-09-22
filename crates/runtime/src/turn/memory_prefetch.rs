@@ -58,17 +58,6 @@ pub async fn prefetch_memories_with_client(
     }
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + INTERACTIVE_MEMORY_READ_DEADLINE;
-    match tokio::time::timeout_at(deadline, client.admits_operation(false)).await {
-        Ok(Ok(true)) => {}
-        Ok(Ok(false)) => return MemoryPrefetchResult::default(),
-        Ok(Err(_)) | Err(_) => {
-            return MemoryPrefetchResult {
-                outcome: astra_turn_types::MemoryRetrievalOutcome::Unavailable,
-                fetch_ms: started.elapsed().as_millis() as i64,
-                ..Default::default()
-            };
-        }
-    }
     let trimmed_msg = user_msg.trim();
     let result = retrieve_rankable(client, trimmed_msg, user_id, session_id, top_k, deadline).await;
     let outcome = result.outcome;
@@ -120,6 +109,7 @@ async fn retrieve_rankable(
             memories: memories.into_iter().map(rankable_from_memoria).collect(),
             outcome: astra_turn_types::MemoryRetrievalOutcome::Complete,
         },
+        Ok(Err(astra_memoria::MemoriaOperationError::Disabled(_))) => RankableRetrieval::default(),
         Ok(Err(error)) => {
             tracing::warn!(
                 target: "astra_runtime::memory_prefetch",
@@ -184,17 +174,8 @@ pub async fn prefetch_session_start_memories_with_client(
 ) -> SessionStartPrefetchResult {
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + INTERACTIVE_MEMORY_READ_DEADLINE;
-    match tokio::time::timeout_at(deadline, client.admits_operation(false)).await {
-        Ok(Ok(true)) => {}
-        Ok(Ok(false)) => return SessionStartPrefetchResult::default(),
-        Ok(Err(_)) | Err(_) => {
-            return SessionStartPrefetchResult {
-                outcome: astra_turn_types::MemoryRetrievalOutcome::Unavailable,
-                fetch_ms: started.elapsed().as_millis() as i64,
-                ..Default::default()
-            };
-        }
-    }
+    // Independent operations resolve authority twice, including when disabled.
+    // Both authority and HTTP work share this absolute deadline; no grant is reused.
 
     // Two structured queries in parallel:
     //   1. `profile` — broad query to surface user-identity memories.
@@ -394,12 +375,14 @@ mod tests {
     #[derive(Default)]
     struct ScriptedClient {
         calls: Mutex<Vec<(String, String, String, usize)>>,
-        responses: Mutex<VecDeque<Result<Vec<MemoriaMemory>, String>>>,
+        responses:
+            Mutex<VecDeque<Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError>>>,
     }
 
     #[derive(Default)]
     struct NeverRespondingClient {
         calls: Mutex<usize>,
+        authority_calls: Mutex<usize>,
         admission_delay: Duration,
         deny: bool,
         profile_result: Option<MemoriaMemory>,
@@ -408,10 +391,7 @@ mod tests {
     #[async_trait::async_trait]
     impl MemoriaPort for NeverRespondingClient {
         async fn admits_operation(&self, _write: bool) -> Result<bool, String> {
-            if !self.admission_delay.is_zero() {
-                tokio::time::sleep(self.admission_delay).await;
-            }
-            Ok(!self.deny)
+            panic!("read admission belongs to the operation")
         }
         async fn retrieve_for_prompt(
             &self,
@@ -419,7 +399,14 @@ mod tests {
             _user_id: &str,
             _session_id: &str,
             _top_k: usize,
-        ) -> Result<Vec<MemoriaMemory>, String> {
+        ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
+            *self.authority_calls.lock().unwrap() += 1;
+            tokio::time::sleep(self.admission_delay).await;
+            if self.deny {
+                return Err(astra_memoria::MemoriaOperationError::Disabled(
+                    "disabled".into(),
+                ));
+            }
             *self.calls.lock().expect("calls") += 1;
             if query == "user profile preferences role"
                 && let Some(memory) = &self.profile_result
@@ -435,7 +422,7 @@ mod tests {
             _session_id: Option<&str>,
             _top_k: usize,
             _filter_session: bool,
-        ) -> Result<Vec<MemoriaMemory>, String> {
+        ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
             panic!("prompt recall must use retrieve_for_prompt")
         }
 
@@ -456,13 +443,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MemoriaPort for ScriptedClient {
+        async fn admits_operation(&self, _: bool) -> Result<bool, String> {
+            panic!("read admission belongs to the operation")
+        }
         async fn retrieve_for_prompt(
             &self,
             query: &str,
             user_id: &str,
             session_id: &str,
             top_k: usize,
-        ) -> Result<Vec<MemoriaMemory>, String> {
+        ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
             self.calls.lock().expect("calls").push((
                 query.to_string(),
                 user_id.to_string(),
@@ -482,7 +472,7 @@ mod tests {
             _session_id: Option<&str>,
             _top_k: usize,
             _filter_session: bool,
-        ) -> Result<Vec<MemoriaMemory>, String> {
+        ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
             panic!("prompt recall must use retrieve_for_prompt")
         }
 
@@ -675,18 +665,37 @@ mod tests {
 
     #[tokio::test]
     async fn recall_failure_is_soft_evidence_absence() {
-        let client = ScriptedClient {
-            responses: Mutex::new(VecDeque::from([Err("backend unavailable".into())])),
-            ..Default::default()
-        };
-        let result =
-            prefetch_memories_with_client(&client, "review memory #42", "user", "session", 5).await;
-        assert!(result.entries.is_empty());
-        assert_eq!(result.items, 0);
-        assert_eq!(
-            result.outcome,
-            astra_turn_types::MemoryRetrievalOutcome::Unavailable
-        );
+        use astra_memoria::MemoriaOperationError;
+        use astra_turn_types::MemoryRetrievalOutcome;
+        for (response, outcome) in [
+            (Ok(Vec::new()), MemoryRetrievalOutcome::Complete),
+            (
+                Err(MemoriaOperationError::Disabled("disabled".into())),
+                MemoryRetrievalOutcome::NotAttempted,
+            ),
+            (
+                Err(MemoriaOperationError::AuthorityUnavailable(
+                    "lookup failed".into(),
+                )),
+                MemoryRetrievalOutcome::Unavailable,
+            ),
+            (
+                Err(MemoriaOperationError::Failed("backend unavailable".into())),
+                MemoryRetrievalOutcome::Unavailable,
+            ),
+        ] {
+            let client = ScriptedClient {
+                responses: Mutex::new(VecDeque::from([response])),
+                ..Default::default()
+            };
+            let result =
+                prefetch_memories_with_client(&client, "review memory #42", "user", "session", 5)
+                    .await;
+            assert!(result.entries.is_empty());
+            assert_eq!(result.items, 0);
+            assert_eq!(result.outcome, outcome);
+            assert_eq!(client.calls.lock().unwrap().len(), 1);
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -760,6 +769,10 @@ mod tests {
                     1
                 };
                 assert_eq!(*client.calls.lock().unwrap(), expected);
+                assert_eq!(
+                    *client.authority_calls.lock().unwrap(),
+                    if session_start { 2 } else { 1 }
+                );
             }
         }
     }
@@ -783,6 +796,7 @@ mod tests {
             astra_turn_types::MemoryRetrievalOutcome::NotAttempted
         );
         assert_eq!(*client.calls.lock().unwrap(), 0);
+        assert_eq!(*client.authority_calls.lock().unwrap(), 3);
     }
 
     #[tokio::test(start_paused = true)]

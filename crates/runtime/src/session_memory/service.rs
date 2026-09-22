@@ -1637,7 +1637,7 @@ mod tests {
             session_id: Option<&str>,
             _top_k: usize,
             _filter_session: bool,
-        ) -> Result<Vec<MemoriaMemory>, String> {
+        ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
             Ok(self
                 .stored
                 .lock()
@@ -1717,7 +1717,7 @@ mod tests {
             _session_id: Option<&str>,
             _top_k: usize,
             _filter_session: bool,
-        ) -> Result<Vec<MemoriaMemory>, String> {
+        ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
             Ok(Vec::new())
         }
 
@@ -2482,7 +2482,7 @@ mod tests {
                 _: Option<&str>,
                 _: usize,
                 _: bool,
-            ) -> Result<Vec<MemoriaMemory>, String> {
+            ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
                 if self
                     .retrieve_calls
                     .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
@@ -2565,7 +2565,7 @@ mod tests {
                 _: Option<&str>,
                 _: usize,
                 _: bool,
-            ) -> Result<Vec<MemoriaMemory>, String> {
+            ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
                 panic!("intentional test panic in retrieve_ext")
             }
 
@@ -2629,7 +2629,7 @@ mod tests {
                 _: Option<&str>,
                 _: usize,
                 _: bool,
-            ) -> Result<Vec<MemoriaMemory>, String> {
+            ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
                 self.retrieval_started.notify_one();
                 std::future::pending().await
             }
@@ -2718,9 +2718,9 @@ mod tests {
             _sid: Option<&str>,
             _k: usize,
             _f: bool,
-        ) -> Result<Vec<MemoriaMemory>, String> {
+        ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
             if self.retrieve_fail {
-                Err("retrieve flaked".to_string())
+                Err("retrieve flaked".into())
             } else {
                 Ok(Vec::new())
             }
@@ -2762,6 +2762,7 @@ mod tests {
                 Ok(0)
             }
             async fn admits_operation(&self, write: bool) -> Result<bool, String> {
+                assert!(write, "read admission belongs to the operation");
                 Ok(self.read && !write)
             }
             async fn retrieve_ext(
@@ -2770,7 +2771,13 @@ mod tests {
                 _: Option<&str>,
                 _: usize,
                 _: bool,
-            ) -> Result<Vec<astra_memoria::MemoriaMemory>, String> {
+            ) -> Result<Vec<astra_memoria::MemoriaMemory>, astra_memoria::MemoriaOperationError>
+            {
+                if !self.read {
+                    return Err(astra_memoria::MemoriaOperationError::Disabled(
+                        "disabled".into(),
+                    ));
+                }
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok(vec![])
             }
@@ -3385,8 +3392,10 @@ mod tests {
                 _: Option<&str>,
                 _: usize,
                 _: bool,
-            ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String>
-            {
+            ) -> Result<
+                Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>,
+                astra_memoria::MemoriaOperationError,
+            > {
                 Ok(Vec::new())
             }
             async fn store(

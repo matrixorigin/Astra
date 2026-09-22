@@ -2605,7 +2605,8 @@ mod tests {
             _session_id: Option<&str>,
             _top_k: usize,
             _filter_session: bool,
-        ) -> Result<Vec<astra_memoria::MemoriaMemory>, String> {
+        ) -> Result<Vec<astra_memoria::MemoriaMemory>, astra_memoria::MemoriaOperationError>
+        {
             unreachable!("the prompt-facing gateway resolves raw tool transport")
         }
 

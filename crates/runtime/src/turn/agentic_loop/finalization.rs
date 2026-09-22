@@ -2368,7 +2368,10 @@ mod tests {
             _sid: Option<&str>,
             _k: usize,
             _f: bool,
-        ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String> {
+        ) -> Result<
+            Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>,
+            astra_memoria::MemoriaOperationError,
+        > {
             Ok(Vec::new())
         }
         async fn store(
