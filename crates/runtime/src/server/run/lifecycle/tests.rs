@@ -6404,7 +6404,7 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
         })
         .collect();
     let prepared = Arc::clone(&executor)
-        .prepare_batch(&inputs, &context)
+        .prepare_batch(&inputs, &context, None)
         .await
         .expect("inherited Offering is prepared without a catalog lookup");
     assert_eq!(prepared.len(), 2);
@@ -6429,7 +6429,7 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
         Some(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::Off);
     assert!(
         Arc::clone(&executor)
-            .prepare_batch(&unsupported, &context)
+            .prepare_batch(&unsupported, &context, None)
             .await
             .is_err(),
         "one unsupported reasoning control must reject the whole batch"
@@ -6442,7 +6442,7 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
     });
     assert!(
         Arc::clone(&executor)
-            .prepare_batch(&invalid_offering, &context)
+            .prepare_batch(&invalid_offering, &context, None)
             .await
             .is_err(),
         "an invalid final-slot Offering must reject the whole batch"

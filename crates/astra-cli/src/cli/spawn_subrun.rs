@@ -10,9 +10,9 @@ use std::sync::Arc;
 use astra_pipeline::{step_protocol::InMemoryIdempotencyCache, step_recorder::StepRecorder};
 use astra_runtime::{
     orchestration::{
-        CancellationOrigin, InheritedPermissions, PermissionSummary, SpawnAgentExecutor,
-        SpawnRunConfig, SpawnRunResult, project_subrun_status_to_spawn,
-        spawn_completion_status_from_finish_reason,
+        CancellationOrigin, InheritedPermissions, PermissionSummary, PreparedSpawn,
+        SpawnAgentExecutor, SpawnAgentInput, SpawnContext, SpawnRunConfig, SpawnRunResult,
+        project_subrun_status_to_spawn, spawn_completion_status_from_finish_reason,
     },
     semantic_dedup::SemanticDedup,
     turn::agentic_loop::finalization::run_agentic_loop_with_host,
@@ -25,7 +25,7 @@ use astra_runtime::{
 };
 use astra_turn_core::{
     agent_live_event::SharedAgentLiveEventSink, interruption::InterruptionKind,
-    tool::schema::tool_names_from_schemas,
+    orchestration_fanout_group::AgentFanoutSlotIdentity, tool::schema::tool_names_from_schemas,
 };
 use serde_json::{Value, json};
 
@@ -662,7 +662,93 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         self.bind_session_transcript(session_id.to_string());
     }
 
+    async fn prepare_batch(
+        self: Arc<Self>,
+        inputs: &[SpawnAgentInput],
+        context: &SpawnContext,
+        parent_selection: Option<&astra_turn_types::ModelSelection>,
+    ) -> Result<Vec<Box<dyn PreparedSpawn>>, String> {
+        if inputs
+            .iter()
+            .any(|input| input.model_selection.is_some() || input.reasoning.is_some())
+        {
+            return Err("this execution boundary cannot pre-admit per-slot model or reasoning selections for an atomic fanout".to_string());
+        }
+        let token = self.resolve_token_async().await?;
+        let model = if let Some(parent_selection) = parent_selection {
+            crate::cli::session::session_runtime::resolve_server_offering_selection(
+                &self.api,
+                &token,
+                &parent_selection.offering_id,
+            )
+            .await?
+        } else {
+            // A display name without a typed Offering is not an admitted
+            // model choice. Match single-spawn fallback to the CLI default.
+            let inherited_model = self.resolve_effective_model(None);
+            crate::cli::skill_subrun::resolve_subrun_model_selection(
+                &self.api,
+                &token,
+                inherited_model.as_deref(),
+            )
+            .await?
+        };
+        inputs
+            .iter()
+            .map(|input| {
+                Ok(Box::new(CliPreparedSpawn {
+                    executor: Arc::clone(&self),
+                    parent_run_id: context.parent_run_id.clone(),
+                    parent_selection: parent_selection.cloned(),
+                    slot: input.fanout_slot_identity()?,
+                    model: model.clone(),
+                }) as Box<dyn PreparedSpawn>)
+            })
+            .collect()
+    }
+
     async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+        self.execute_with_model_selection(config, None).await
+    }
+}
+
+struct CliPreparedSpawn {
+    executor: Arc<CliSpawnAgentExecutor>,
+    parent_run_id: String,
+    parent_selection: Option<astra_turn_types::ModelSelection>,
+    slot: Option<AgentFanoutSlotIdentity>,
+    model: crate::cli::session::session_runtime::ServerModelSelection,
+}
+
+#[async_trait]
+impl PreparedSpawn for CliPreparedSpawn {
+    async fn execute(self: Box<Self>, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+        if config
+            .parent_address
+            .as_ref()
+            .map(|address| address.run_id.as_str())
+            != Some(self.parent_run_id.as_str())
+            || config.fanout_slot != self.slot
+            || config.model_selection != self.parent_selection
+            || config.thinking != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault
+        {
+            return Err(
+                "prepared CLI fanout model does not match its parent, slot, Offering, or reasoning"
+                    .to_string(),
+            );
+        }
+        self.executor
+            .execute_with_model_selection(config, Some(self.model))
+            .await
+    }
+}
+
+impl CliSpawnAgentExecutor {
+    async fn execute_with_model_selection(
+        &self,
+        config: SpawnRunConfig,
+        prepared_model: Option<crate::cli::session::session_runtime::ServerModelSelection>,
+    ) -> Result<SpawnRunResult, String> {
         let runtime_ceiling = astra_config::RuntimeConfig::cached()
             .runtime_limits
             .resolve_turn_ceiling(false)?;
@@ -747,7 +833,9 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             }
         };
         let inherited_model = self.resolve_effective_model(config.model.as_deref());
-        let model_selection = if let Some(selection) = config.model_selection.as_ref() {
+        let model_selection = if let Some(prepared_model) = prepared_model {
+            prepared_model
+        } else if let Some(selection) = config.model_selection.as_ref() {
             crate::cli::session::session_runtime::resolve_server_offering_selection(
                 &self.api,
                 &token,
@@ -1493,8 +1581,9 @@ mod tests {
     use crate::lock_recovery::LockRecovery;
     use astra_runtime::orchestration::{
         InheritedPermissions, PermissionMode, PermissionSyncContext, SpawnAgentExecutor,
-        SpawnRunConfig,
+        SpawnAgentInput, SpawnContext, SpawnRunConfig,
     };
+    use astra_services::{ModelAccessKind, ModelExecutionPlacement, ModelListItemResponse};
     use astra_turn_core::agent_live_event::{
         AgentLiveEvent, AgentLiveEventKind, AgentLiveEventSink, AgentLiveSendError,
         SharedAgentLiveEventSink,
@@ -1504,8 +1593,270 @@ mod tests {
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::cli::chat_stream::StreamEvent;
+
+    #[tokio::test]
+    async fn cli_fanout_resolves_inherited_offering_once_before_spawning() {
+        let server = MockServer::start().await;
+        let offering = ModelListItemResponse {
+            offering_id: "offer-parent".into(),
+            access_id: "self-hosted".into(),
+            access_kind: ModelAccessKind::SelfHosted,
+            access_label: "Self-hosted".into(),
+            execution_placement: ModelExecutionPlacement::Server,
+            name: "parent-model".into(),
+            provider: "openai".into(),
+            description: None,
+            is_active: true,
+            context_window: 128_000,
+            max_completion_tokens: None,
+            architecture: None,
+            thinking_capability: None,
+        };
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [offering],
+                "next_cursor": null,
+                "limit": 50,
+                "total": 1,
+                "catalog_revision": "sha256:cli-batch-test"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let executor = Arc::new(CliSpawnAgentExecutor::new(
+            api,
+            "token".into(),
+            PathBuf::from("/tmp"),
+            None,
+        ));
+        let context = SpawnContext {
+            parent_run_id: "parent-run".into(),
+            parent_agent_id: "parent-agent".into(),
+            resolved_model_name: Some("parent-model".into()),
+            recursion_depth: 0,
+            parent_is_fork_child: false,
+            working_dir: PathBuf::from("/tmp"),
+            inherited_permissions: InheritedPermissions::auto_approve(),
+            inherited_skills: Vec::new(),
+            live_event_sink: None,
+            client_tool_delivery_tx: None,
+            trace_context: None,
+            spawn_tool_call_id: None,
+            execution_metadata: None,
+            workspace_mutation: Default::default(),
+            delegation_chain: Vec::new(),
+        };
+        let inputs = (0..2)
+            .map(|slot| SpawnAgentInput {
+                description: format!("slot {slot}"),
+                prompt: "reply".into(),
+                fanout_group_id: Some("group".into()),
+                fanout_target_count: Some(2),
+                fanout_slot_index: Some(slot),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let parent = astra_turn_types::ModelSelection {
+            offering_id: "offer-parent".into(),
+        };
+        let prepared = Arc::clone(&executor)
+            .prepare_batch(&inputs, &context, Some(&parent))
+            .await
+            .expect("one exact catalog resolution for the group");
+        assert_eq!(prepared.len(), 2);
+        server.verify().await;
+
+        let (inherited_permissions, permission_context) = test_permission_context();
+        let wrong_slot = SpawnRunConfig {
+            run_id: "child-run".into(),
+            cancellation_binding_id: "child-binding".into(),
+            agent_id: "child@run".into(),
+            spawn_tool_call_id: None,
+            recursion_depth: 1,
+            agent_type: "explore".into(),
+            description: "wrong slot".into(),
+            task: "reply".into(),
+            system_prompt_addendum: String::new(),
+            model_selection: Some(parent.clone()),
+            fanout_slot: inputs[0].fanout_slot_identity().unwrap(),
+            thinking: astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
+            model: Some("parent-model".into()),
+            initial_turns: 1,
+            hard_turn_limit: Some(1),
+            allowed_tools: Vec::new(),
+            read_only: true,
+            workspace_mutation: Default::default(),
+            working_dir: PathBuf::from("/tmp"),
+            mailbox: None,
+            progress_emitter: None,
+            context_cache: None,
+            inherited_permissions,
+            parent_address: Some(astra_messaging::types::AgentAddress::new(
+                "parent-run",
+                "parent-agent",
+            )),
+            permission_context,
+            inherited_skills: Vec::new(),
+            live_event_sink: None,
+            client_tool_delivery_tx: None,
+            inherited_prefix: None,
+            execution_metadata: None,
+            is_fork_child: false,
+            delegation_chain: Vec::new(),
+            work_item: None,
+        };
+        let error = prepared
+            .into_iter()
+            .nth(1)
+            .unwrap()
+            .execute(wrong_slot)
+            .await
+            .expect_err("prepared slot must not execute another slot");
+        assert!(error.contains("does not match"), "{error}");
+        server.verify().await;
+
+        let mut unsupported = inputs;
+        unsupported[1].reasoning =
+            Some(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::Off);
+        let error = match Arc::clone(&executor)
+            .prepare_batch(&unsupported, &context, Some(&parent))
+            .await
+        {
+            Ok(_) => panic!("explicit reasoning cannot claim atomic CLI admission"),
+            Err(error) => error,
+        };
+        assert!(error.contains("cannot pre-admit"), "{error}");
+        server.verify().await;
+
+        let unavailable_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&unavailable_server)
+            .await;
+        let unavailable_api =
+            astra_thin_client::ThinClient::new(&unavailable_server.uri(), None).unwrap();
+        let unavailable_executor = Arc::new(CliSpawnAgentExecutor::new(
+            unavailable_api,
+            "token".into(),
+            PathBuf::from("/tmp"),
+            None,
+        ));
+        unsupported[1].reasoning = None;
+        assert!(
+            Arc::clone(&unavailable_executor)
+                .prepare_batch(&unsupported, &context, Some(&parent))
+                .await
+                .is_err(),
+            "a failed catalog lookup must reject the group before child creation"
+        );
+        unavailable_server.verify().await;
+
+        let revoked_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [],
+                "next_cursor": null,
+                "limit": 50,
+                "total": 0,
+                "catalog_revision": "sha256:revoked-parent"
+            })))
+            .expect(1)
+            .mount(&revoked_server)
+            .await;
+        let revoked_api = astra_thin_client::ThinClient::new(&revoked_server.uri(), None).unwrap();
+        let revoked_executor = Arc::new(CliSpawnAgentExecutor::new(
+            revoked_api,
+            "token".into(),
+            PathBuf::from("/tmp"),
+            None,
+        ));
+        let revoked_error = match Arc::clone(&revoked_executor)
+            .prepare_batch(&unsupported, &context, Some(&parent))
+            .await
+        {
+            Ok(_) => panic!("revoked parent Offering must reject the entire batch"),
+            Err(error) => error,
+        };
+        assert!(revoked_error.contains("not active"), "{revoked_error}");
+        revoked_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn cli_fanout_without_typed_parent_selection_ignores_stale_display_name() {
+        let server = MockServer::start().await;
+        let offering = ModelListItemResponse {
+            offering_id: "default-offer".into(),
+            access_id: "self-hosted".into(),
+            access_kind: ModelAccessKind::SelfHosted,
+            access_label: "Self-hosted".into(),
+            execution_placement: ModelExecutionPlacement::Server,
+            name: "default-model".into(),
+            provider: "openai".into(),
+            description: None,
+            is_active: true,
+            context_window: 128_000,
+            max_completion_tokens: None,
+            architecture: None,
+            thinking_capability: None,
+        };
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [offering],
+                "next_cursor": null, "limit": 50, "total": 1,
+                "catalog_revision": "sha256:default"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let executor = Arc::new(
+            CliSpawnAgentExecutor::new(
+                astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+                "token".into(),
+                PathBuf::from("/tmp"),
+                None,
+            )
+            .with_default_model(Some("default-model".into())),
+        );
+        let context = SpawnContext {
+            parent_run_id: "parent-run".into(),
+            parent_agent_id: "parent-agent".into(),
+            resolved_model_name: Some("stale-display-name".into()),
+            recursion_depth: 0,
+            parent_is_fork_child: false,
+            working_dir: PathBuf::from("/tmp"),
+            inherited_permissions: InheritedPermissions::auto_approve(),
+            inherited_skills: Vec::new(),
+            live_event_sink: None,
+            client_tool_delivery_tx: None,
+            trace_context: None,
+            spawn_tool_call_id: None,
+            execution_metadata: None,
+            workspace_mutation: Default::default(),
+            delegation_chain: Vec::new(),
+        };
+        let inputs = vec![SpawnAgentInput {
+            description: "review".into(),
+            prompt: "review".into(),
+            ..Default::default()
+        }];
+        assert!(
+            Arc::clone(&executor)
+                .prepare_batch(&inputs, &context, None)
+                .await
+                .is_ok()
+        );
+        server.verify().await;
+    }
 
     #[test]
     fn cancelled_loop_projection_requires_typed_user_interruption() {

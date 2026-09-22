@@ -21511,6 +21511,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         self: Arc<Self>,
         inputs: &[astra_turn_core::orchestration_spawn_tool::SpawnAgentInput],
         context: &SpawnContext,
+        _parent_selection: Option<&ModelSelection>,
     ) -> Result<Vec<Box<dyn PreparedSpawn>>, String> {
         let parent = self
             .runtime_context_for_parent_run(&context.parent_run_id)

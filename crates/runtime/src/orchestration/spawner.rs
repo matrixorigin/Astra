@@ -1212,6 +1212,7 @@ pub trait SpawnAgentExecutor: Send + Sync {
         self: Arc<Self>,
         inputs: &[SpawnAgentInput],
         _context: &SpawnContext,
+        _parent_selection: Option<&astra_turn_types::ModelSelection>,
     ) -> Result<Vec<Box<dyn PreparedSpawn>>, String>
     where
         Self: 'static,
@@ -3687,13 +3688,14 @@ impl DynamicAgentSpawner {
         &self,
         inputs: &[SpawnAgentInput],
         context: &SpawnContext,
+        parent_selection: Option<&astra_turn_types::ModelSelection>,
     ) -> Result<Vec<Box<dyn PreparedSpawn>>, SpawnError> {
         let executor = self
             .executor
             .as_ref()
             .ok_or(SpawnError::ExecutorUnavailable)?;
         let preparations = Arc::clone(executor)
-            .prepare_batch(inputs, context)
+            .prepare_batch(inputs, context, parent_selection)
             .await
             .map_err(SpawnError::DelegationFailed)?;
         if preparations.len() != inputs.len() {

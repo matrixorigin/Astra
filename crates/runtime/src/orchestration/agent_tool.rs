@@ -1361,7 +1361,10 @@ async fn handle_agent_fanout_start_action_with_deadline(
     let spawn_context = SpawnContext {
         parent_run_id: ctx.run_id.clone(),
         parent_agent_id: ctx.agent_id.clone(),
-        resolved_model_name: ctx.current_model.clone(),
+        resolved_model_name: ctx
+            .current_model_selection
+            .as_ref()
+            .and(ctx.current_model.clone()),
         recursion_depth: ctx.recursion_depth,
         parent_is_fork_child: ctx.is_fork_child,
         working_dir: ctx.working_dir.clone(),
@@ -1381,16 +1384,6 @@ async fn handle_agent_fanout_start_action_with_deadline(
     {
         return render_agent_tool_error(None, &format!("fanout preflight failed: {error}"));
     }
-    let preparations = match ctx
-        .spawner
-        .prepare_spawn_batch(&resolved_inputs, &spawn_context)
-        .await
-    {
-        Ok(preparations) => preparations,
-        Err(error) => {
-            return render_agent_tool_error(None, &format!("fanout admission failed: {error}"));
-        }
-    };
     let _capacity_reservation = match ctx
         .spawner
         .reserve_spawn_capacity(&group_id, input.target_count, &ctx.run_id)
@@ -1405,6 +1398,20 @@ async fn handle_agent_fanout_start_action_with_deadline(
         }
     };
     let capacity_reservation_owner = _capacity_reservation.owner_id().map(str::to_owned);
+    let preparations = match ctx
+        .spawner
+        .prepare_spawn_batch(
+            &resolved_inputs,
+            &spawn_context,
+            ctx.current_model_selection.as_ref(),
+        )
+        .await
+    {
+        Ok(preparations) => preparations,
+        Err(error) => {
+            return render_agent_tool_error(None, &format!("fanout admission failed: {error}"));
+        }
+    };
     if let Err(error) = ctx
         .spawner
         .declare_fanout_group(
@@ -3221,6 +3228,28 @@ mod tests {
                 permission_requests_approved: 0,
                 tools_blocked: 0,
             })
+        }
+    }
+
+    struct RejectingBatchExecutor {
+        preparations: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SpawnAgentExecutor for RejectingBatchExecutor {
+        async fn execute(&self, _: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            panic!("failed batch preparation must never start a child")
+        }
+
+        async fn prepare_batch(
+            self: Arc<Self>,
+            _: &[SpawnAgentInput],
+            _: &SpawnContext,
+            _: Option<&astra_turn_types::ModelSelection>,
+        ) -> Result<Vec<Box<dyn crate::orchestration::PreparedSpawn>>, String> {
+            self.preparations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("catalog unavailable".into())
         }
     }
 
@@ -5909,6 +5938,46 @@ mod tests {
         );
         assert_eq!(executor.spawn_count(), 0);
         assert!(spawner.fanout_group("capacity-atomic").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn fanout_capacity_rejection_skips_admission_and_failed_admission_releases_capacity() {
+        let executor = Arc::new(RejectingBatchExecutor {
+            preparations: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let transport = Arc::new(astra_messaging::InProcessTransport::new());
+        let tracker = Arc::new(DelegationTracker::new());
+        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
+        let spawner = Arc::new(
+            DynamicAgentSpawner::new(router)
+                .with_max_concurrent_agents(1)
+                .with_executor(executor.clone()),
+        );
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+        for (group_id, target_count, expected_preparations) in [
+            ("over-capacity", 2, 0),
+            ("failed-preparation", 1, 1),
+            ("retry", 1, 2),
+        ] {
+            let slots = (0..target_count)
+                .map(|slot| json!({"description": format!("slot {slot}"), "prompt": "review"}))
+                .collect::<Vec<_>>();
+            let rendered = handle_agent_fanout_tool(
+                &json!({"action": "start", "group_id": group_id, "target_count": target_count, "slots": slots}),
+                Some(&ctx),
+            )
+            .await;
+            let value: Value = serde_json::from_str(&rendered).unwrap();
+            assert_eq!(value["status"], "failed", "{value}");
+            assert_eq!(
+                executor
+                    .preparations
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                expected_preparations,
+                "{group_id}"
+            );
+            assert!(spawner.fanout_group(group_id).await.is_none());
+        }
     }
 
     #[tokio::test]

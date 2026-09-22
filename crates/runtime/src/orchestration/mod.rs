@@ -67,7 +67,7 @@ pub(crate) fn workspace_mutation_from_context(
 pub use spawner::{
     AgentHistoryRecord, AgentStatus, CANCELLATION_ORIGIN_UNVERIFIED, CancellationTransferOutcome,
     DescendantCancellationReason, DurableAgentReconciler, DynamicAgentSpawner,
-    FanoutGroupCancellation, InheritedChildPrefix, PermissionSummary, ROOT_RUN_ID,
+    FanoutGroupCancellation, InheritedChildPrefix, PermissionSummary, PreparedSpawn, ROOT_RUN_ID,
     SpawnAgentExecutor, SpawnContext, SpawnError, SpawnRunCancellationDurability, SpawnRunConfig,
     SpawnRunResult, SpawnStatusProjection, SpawnedAgentInfo, SpawnedAgentMetrics,
     SpawnedAgentState, WaitForAgentOutcome, project_subrun_status_to_spawn,
