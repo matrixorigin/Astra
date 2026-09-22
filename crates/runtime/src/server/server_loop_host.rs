@@ -8302,10 +8302,9 @@ impl ServerAgenticLoopHost {
                 Instant::now(),
             );
         }
-        let usage = usage
+        let usage = *usage
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.work_admission_usage.merge(usage);
         let observations = std::mem::take(
             &mut *self
@@ -8715,11 +8714,10 @@ impl ServerAgenticLoopHost {
             .pending_work_admission_judge
             .take()
             .expect("aborted judgment");
-        let usage = pending
+        let usage = *pending
             .usage
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let usage_attempts = usage.attempts;
         self.work_admission_usage.merge(usage);
         let node_id = self.explain_analyze_context.as_ref().map(|context| {
@@ -24078,7 +24076,6 @@ mod tests {
                     input_tokens: 17,
                     ..Default::default()
                 },
-                ..Default::default()
             })),
             started_at,
             round_index: 0,
@@ -24930,7 +24927,6 @@ mod tests {
             },
             attempts: 1,
             provider_reported: 1,
-            ..Default::default()
         }));
         host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
             wait_node_id: None,
@@ -24968,7 +24964,6 @@ mod tests {
             },
             attempts: 1,
             provider_reported: 1,
-            ..Default::default()
         }));
         host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
             wait_node_id: None,
@@ -24994,7 +24989,6 @@ mod tests {
             },
             attempts: 2,
             provider_reported: 1,
-            ..Default::default()
         };
         let mut success_host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
@@ -36661,7 +36655,6 @@ mod tests {
             },
             attempts: 1,
             provider_reported: 1,
-            ..Default::default()
         }));
         running.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
             wait_node_id: None,
