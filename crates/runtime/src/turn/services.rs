@@ -263,8 +263,10 @@ async fn apply_touched_session_deltas_in_tx(
         if *delta <= 0 {
             continue;
         }
-        astra_services::storage::add_agent_session_event_count_or_create(
-            tx,
+        // Admission already created/locked this session in the same transaction.
+        // Updating its count needs neither another fence read nor a root upsert.
+        astra_services::storage::bump_agent_session_event_count(
+            &mut **tx,
             session_id,
             user_id,
             *delta,

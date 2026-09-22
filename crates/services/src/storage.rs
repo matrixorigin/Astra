@@ -1583,45 +1583,6 @@ where
     Ok(())
 }
 
-/// Update an already-admitted session without reacquiring its lifecycle fence.
-///
-/// This is intentionally `pub(crate)`: callers must have completed
-/// [`admit_session_event_write`] in the same transaction. Keeping that fact in
-/// the function name prevents the optimized path from becoming a general
-/// session mutation API that could bypass deletion admission.
-pub(crate) async fn add_agent_session_event_count_after_admission(
-    tx: &mut Transaction<'_, MySql>,
-    session_id: &str,
-    user_id: &str,
-    delta: i64,
-    last_event_id: Option<&str>,
-) -> Result<(), sqlx::Error> {
-    if delta <= 0 {
-        return Err(sqlx::Error::Protocol(
-            "add_agent_session_event_count_after_admission requires a positive delta".into(),
-        ));
-    }
-
-    let result = query(
-        "UPDATE agent_sessions
-         SET event_count = event_count + ?,
-             last_event_id = COALESCE(?, last_event_id),
-             updated_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at),
-             last_active_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at)
-         WHERE session_id = ? AND user_id = ? AND status <> 'deleting'",
-    )
-    .bind(delta)
-    .bind(last_event_id)
-    .bind(session_id)
-    .bind(user_id)
-    .execute(&mut **tx)
-    .await?;
-    if result.rows_affected() == 0 {
-        return Err(sqlx::Error::RowNotFound);
-    }
-    Ok(())
-}
-
 pub async fn touch_agent_session_activity<'e, E>(
     executor: E,
     session_id: &str,

@@ -3016,8 +3016,8 @@ impl EventIngestionWorker {
         )
         .map_err(|error| error.to_string())?;
         if inserted_event_count > 0 {
-            crate::storage::add_agent_session_event_count_after_admission(
-                &mut tx,
+            crate::storage::bump_agent_session_event_count(
+                &mut *tx,
                 session_id,
                 user_id,
                 inserted_event_count,

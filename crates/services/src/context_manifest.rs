@@ -734,8 +734,8 @@ impl DatabaseContextManifestStore {
                 source: sqlx::Error::Protocol("session event insert affected no rows".into()),
             });
         }
-        crate::storage::add_agent_session_event_count_or_create(
-            tx,
+        crate::storage::bump_agent_session_event_count(
+            &mut **tx,
             event.session_id,
             event.user_id,
             inserted_events,

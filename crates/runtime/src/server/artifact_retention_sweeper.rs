@@ -299,8 +299,8 @@ async fn record_artifact_retention_backlog_warning(
             ));
         }
     };
-    astra_services::storage::add_agent_session_event_count_or_create(
-        &mut tx,
+    astra_services::storage::bump_agent_session_event_count(
+        &mut *tx,
         "system",
         "system",
         inserted_events,

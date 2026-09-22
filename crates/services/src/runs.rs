@@ -12271,8 +12271,8 @@ impl DatabaseRunStateStore {
         )
         .map_err(|source| db_error("record_preview_template_missing_for_tools", run_id, source))?;
         if inserted_events > 0 {
-            crate::storage::add_agent_session_event_count_or_create(
-                &mut tx,
+            crate::storage::bump_agent_session_event_count(
+                &mut *tx,
                 session_id,
                 user_id,
                 inserted_events,
