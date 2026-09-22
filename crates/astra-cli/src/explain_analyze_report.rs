@@ -1646,7 +1646,6 @@ fn auxiliary_outcome_label(outcome: ExplainAnalyzeOutcomeV1) -> &'static str {
     }
 }
 
-#[cfg(test)]
 fn auxiliary_usage_label(operation: &str, purpose: &str) -> &'static str {
     astra_services::judgment_presentation::purpose_label(operation, purpose)
 }
