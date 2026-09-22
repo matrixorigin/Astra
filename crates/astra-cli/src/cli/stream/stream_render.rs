@@ -1465,6 +1465,16 @@ struct EdgeCallbackFailure {
     kind: astra_core::ErrorKind,
 }
 
+pub(crate) fn edge_callback_detach_message(
+    operation: &str,
+    delivery: &str,
+    error: &impl std::fmt::Display,
+) -> String {
+    format!(
+        "Astra could not settle the {operation} callback {delivery}. This client detached; that is not a cancellation of the server run. A timed-out acknowledgement does not prove the server rejected the {operation}. Details: {error}"
+    )
+}
+
 fn edge_callback_error_kind(error: &astra_thin_client::ThinClientError) -> astra_core::ErrorKind {
     match error {
         astra_thin_client::ThinClientError::Api { status, .. }
@@ -1786,9 +1796,7 @@ impl<'a> CliSseStreamHost<'a> {
                 "because the server rejected its durable lifecycle state"
             };
             self.callback_failure = Some(EdgeCallbackFailure {
-                message: format!(
-                    "Astra could not settle the {operation} callback {delivery}. The affected run will be cancelled fail-closed so it does not remain stuck waiting. Details: {error}"
-                ),
+                message: edge_callback_detach_message(operation, delivery, error),
                 kind,
             });
             self.callback_failure_run_id = (!run_id.trim().is_empty()).then(|| run_id.to_string());
@@ -8987,8 +8995,8 @@ mod tests {
         apply_edge_callback_failure_result, approval_batch_group_key,
         approval_default_always_scope, approval_memory_action, approval_memory_preview,
         approval_scope_context_for_tool, approval_stale_revalidation_error,
-        catch_tool_execution_panic, dispatch_turn_event_block, edge_callback_error_kind,
-        edge_tool_is_cacheable_read, edge_tool_outcome_status,
+        catch_tool_execution_panic, dispatch_turn_event_block, edge_callback_detach_message,
+        edge_callback_error_kind, edge_tool_is_cacheable_read, edge_tool_outcome_status,
         execute_with_invocation_metadata_responsive, execute_with_metadata_responsive,
         extract_cli_diff_block, file_content_sha256, finalize_cli_skill_execution,
         format_terminal_tool_summary, format_tool_display_from_preview, is_edge_auth_failure,
@@ -10804,6 +10812,23 @@ mod tests {
         };
         apply_edge_auth_failure_result(&mut accum2, false);
         assert_eq!(accum2.error_message.as_deref(), Some("Cancelled by user"));
+    }
+
+    #[test]
+    fn edge_callback_detach_message_does_not_promise_cancellation() {
+        let message = edge_callback_detach_message(
+            "approval",
+            "after bounded transport retries",
+            &"HTTP error: error sending request",
+        );
+
+        assert!(message.contains("after bounded transport retries"));
+        assert!(message.contains("This client detached"));
+        assert!(message.contains("not a cancellation of the server run"));
+        assert!(message.contains("does not prove the server rejected the approval"));
+        assert!(!message.contains("astra session cancel"));
+        assert!(!message.contains("will be cancelled"));
+        assert!(!message.contains("fail-closed"));
     }
 
     #[test]

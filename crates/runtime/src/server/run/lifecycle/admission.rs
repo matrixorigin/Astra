@@ -13,7 +13,7 @@ use axum::Json;
 use axum::http::StatusCode;
 use serde_json::{Map, Value, json};
 
-use astra_core::{ErrorResponse, error_response_coded};
+use astra_core::{ErrorResponse, error_response_coded, error_response_coded_with_metadata};
 
 use super::run_state::{
     DurableRunEventBatchBudget, durable_event_type, durable_run_event_estimated_bytes,
@@ -454,4 +454,24 @@ pub(super) fn record_session_memory_post_loop_drain_metrics(
         &[("outcome", outcome)],
         1,
     );
+}
+
+/// An active canonical writer is a pre-admission rejection. The response names
+/// the session and the explicit cancel command so a detached client is not told
+/// that an internal controller conflict is an invalid request.
+pub(super) fn session_writer_conflict_response(
+    session_id: &str,
+) -> (StatusCode, Json<ErrorResponse>) {
+    error_response_coded_with_metadata(
+        StatusCode::CONFLICT,
+        format!(
+            "another run still owns session {session_id}; wait for it to finish, or stop it with `astra session cancel {session_id}` before sending another message"
+        ),
+        "session_writer_conflict",
+        json!({
+            "admission_state": "rejected",
+            "recovery_action": "wait_or_cancel_session",
+            "session_id": session_id,
+        }),
+    )
 }

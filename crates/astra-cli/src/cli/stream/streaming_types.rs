@@ -470,6 +470,10 @@ pub(crate) struct PartialTurnData {
     /// The local client can no longer settle or observe an admitted durable
     /// run, so that exact owner must receive an explicit cancellation request.
     pub remote_cancel_required: bool,
+    /// An edge callback acknowledgement failed and this client detached.
+    /// The sentence in `TurnFailure::error` states that fact only. The outer
+    /// lifecycle owner adds whether the server run is still active.
+    pub callback_client_detached: bool,
     /// Exact durable owner: a callback-producer child when callback delivery
     /// failed, otherwise the immutable physical SSE root.
     pub remote_cancel_run_id: Option<String>,
@@ -482,6 +486,17 @@ pub(crate) struct PartialTurnData {
     /// JSON surfaces preserve a typed, resumable terminal instead of dropping
     /// the entire envelope when the loop returns `TurnFailure`.
     pub interruption: Option<serde_json::Value>,
+}
+
+/// Recovery shown when this client detached and the server run was not confirmed cancelled.
+pub(crate) fn unconfirmed_durable_run_recovery(session_id: Option<&str>) -> String {
+    let command = match session_id.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(session_id) => format!("`astra session cancel {session_id}`"),
+        None => "`astra session cancel <session_id>`".to_string(),
+    };
+    format!(
+        "The server run was not cancelled. Wait for it to finish, or stop it with {command} before sending another message."
+    )
 }
 
 pub(crate) fn unsettled_physical_owner_run_id(

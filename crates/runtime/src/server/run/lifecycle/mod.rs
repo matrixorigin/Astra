@@ -5807,11 +5807,7 @@ impl AgenticRunLifecycleService {
                         if let Ok(distributed_permit) = distributed_result {
                             let _ = distributed_permit.release().await;
                         }
-                        return Err(error_response_coded(
-                            StatusCode::CONFLICT,
-                            "another controller owns this canonical session branch",
-                            "session_writer_conflict",
-                        ));
+                        return Err(session_writer_conflict_response(session_id));
                     }
                     astra_services::AcquireWriterAndReserveTurnOutcome::ReservationConflict {
                         lease,

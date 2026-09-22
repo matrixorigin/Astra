@@ -408,6 +408,10 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     /// settle or observe an admitted durable run, the outer owner must
     /// terminate the exact affected run instead of leaving a ghost controller.
     pub remote_cancel_required: bool,
+    /// Set when an edge callback acknowledgement failed. Distinct from other
+    /// reasons `remote_cancel_required` becomes true, so headless settlement
+    /// can describe that callback without rewriting stdout or binding failures.
+    pub callback_client_detached: bool,
     /// Exact durable owner to cancel. Callback failures may name a projected
     /// child; physical-stream failures use the immutable root owner.
     pub remote_cancel_run_id: Option<String>,
@@ -1511,6 +1515,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         }
         let unsettled_physical_owner_run_id =
             crate::cli::stream::streaming_types::unsettled_physical_owner_run_id(&turn_result.core);
+        self.callback_client_detached |= turn_result.callback_delivery_failed;
         self.remote_cancel_required |=
             turn_result.callback_delivery_failed || unsettled_physical_owner_run_id.is_some();
         if self.remote_cancel_run_id.is_none() {

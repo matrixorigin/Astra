@@ -8,6 +8,21 @@ use astra_services::runs::{RunStatusCasRequest, RunUsageOwnerUpdateRequest};
 mod cancellation_db_tests;
 
 #[test]
+fn session_writer_conflict_tells_the_caller_to_wait_or_cancel() {
+    let (status, Json(body)) = session_writer_conflict_response("sess-active");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body.error_code.as_deref(), Some("session_writer_conflict"));
+    assert_eq!(
+        body.detail,
+        "another run still owns session sess-active; wait for it to finish, or stop it with `astra session cancel sess-active` before sending another message"
+    );
+    let metadata = body.metadata.expect("writer conflict metadata");
+    assert_eq!(metadata["admission_state"], "rejected");
+    assert_eq!(metadata["recovery_action"], "wait_or_cancel_session");
+    assert_eq!(metadata["session_id"], "sess-active");
+}
+
+#[test]
 fn explain_artifact_publication_requires_a_durable_terminal_status() {
     assert!(explain_artifact_publishable_status(RunStatus::Completed));
     assert!(explain_artifact_publishable_status(RunStatus::Delegated));
@@ -10072,15 +10087,11 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
             authorized_request("same-session-conflict", &blocked_session),
         )
         .await);
+    let (_, Json(expected_conflict)) = session_writer_conflict_response(&blocked_session);
     assert_eq!(same_session.0, StatusCode::CONFLICT);
-    assert_eq!(
-        same_session.1.0.error_code.as_deref(),
-        Some("session_writer_conflict")
-    );
-    assert_eq!(
-        same_session.1.0.detail,
-        "another controller owns this canonical session branch"
-    );
+    assert_eq!(same_session.1.0.error_code, expected_conflict.error_code);
+    assert_eq!(same_session.1.0.detail, expected_conflict.detail);
+    assert_eq!(same_session.1.0.metadata, expected_conflict.metadata);
     assert_eq!(
         llm.requests.load(Ordering::SeqCst),
         1,

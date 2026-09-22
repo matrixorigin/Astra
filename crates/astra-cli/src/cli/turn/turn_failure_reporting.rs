@@ -64,6 +64,31 @@ pub(crate) fn report_admission_rejection(
     let draft_restored =
         !line.trim().is_empty() && ui.restore_input(line, state.session_id.as_deref());
     let metadata = failure.partial.error_metadata.as_ref();
+    if failure.partial.error_code.as_deref() == Some("session_writer_conflict") {
+        let session_id = metadata
+            .and_then(|value| value.get("session_id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .or(state.session_id.as_deref());
+        let mut message = String::from("Another run still owns this session\n");
+        if draft_restored {
+            message.push_str("  Your message was not sent; the draft is back in the composer.\n");
+        } else {
+            message
+                .push_str("  Your message was not sent; retry it after the active run releases this session.\n");
+        }
+        match session_id {
+            Some(session_id) => message.push_str(&format!(
+                "  Wait for that run to finish, or stop it with `astra session cancel {session_id}` and retry.\n"
+            )),
+            None => message.push_str(
+                "  Wait for that run to finish, or stop it with `astra session cancel <session_id>` and retry.\n",
+            ),
+        }
+        message.push_str("  No model or tool ran.");
+        ui.show_error(&message);
+        return;
+    }
     if failure.partial.error_code.as_deref() == Some("execution_workspace_claimed") {
         let owner = metadata
             .and_then(|value| value.get("owner_session_id"))
@@ -775,6 +800,38 @@ mod tests {
                 .any(|event| event.event_type == session_journal::JournalEventType::TurnError),
             "turn error should be persisted after journal bootstrap"
         );
+    }
+
+    #[test]
+    fn writer_conflict_names_the_active_session_and_explicit_cancel() {
+        let mut state = SessionState {
+            session_id: Some("sess-from-state".into()),
+            ..SessionState::default()
+        };
+        let failure = crate::TurnFailure {
+            error: "[invalid_request] Error: another controller owns this canonical session branch"
+                .into(),
+            partial: crate::PartialTurnData {
+                error_code: Some("session_writer_conflict".into()),
+                error_metadata: Some(serde_json::json!({
+                    "admission_state": "rejected",
+                    "recovery_action": "wait_or_cancel_session",
+                    "session_id": "sess-active"
+                })),
+                admission_rejected: true,
+                ..Default::default()
+            },
+        };
+        let mut ui = crate::tests::TestUi::default();
+
+        report_admission_rejection(&mut state, "list workspaces", &failure, &mut ui);
+
+        assert_eq!(ui.restored_inputs, vec!["list workspaces"]);
+        let shown = ui.errors.join("\n");
+        assert!(shown.contains("Another run still owns this session"));
+        assert!(shown.contains("astra session cancel sess-active"));
+        assert!(!shown.contains("invalid_request"));
+        assert!(!shown.contains("will be cancelled"));
     }
 
     #[test]

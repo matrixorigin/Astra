@@ -156,6 +156,8 @@ async fn settle_request_session_binding_failure_with_cancel_deadline(
     }
     match result {
         Err(mut turn_failure) => {
+            let callback_detach_without_binding =
+                binding_failure.is_none() && turn_failure.partial.callback_client_detached;
             let mut error = if let Some(failure) = binding_failure {
                 let mut error = failure.message;
                 if turn_failure.error != error && !turn_failure.error.is_empty() {
@@ -171,6 +173,14 @@ async fn settle_request_session_binding_failure_with_cancel_deadline(
                     error.push_str("; ");
                 }
                 error.push_str(cancellation_error);
+            }
+            if callback_detach_without_binding {
+                note_headless_callback_cancel_outcome(
+                    &mut error,
+                    exact_run_id.as_deref(),
+                    turn_failure.partial.session_id.as_deref(),
+                    cancellation_error.as_deref(),
+                );
             }
             turn_failure.error = error;
             if cancellation_error.is_none() {
@@ -217,6 +227,32 @@ async fn settle_request_session_binding_failure_with_cancel_deadline(
                 ..Default::default()
             },
         }),
+    }
+}
+
+fn note_headless_callback_cancel_outcome(
+    error: &mut String,
+    run_id: Option<&str>,
+    session_id: Option<&str>,
+    cancellation_error: Option<&str>,
+) {
+    if !error.is_empty() {
+        error.push(' ');
+    }
+    match cancellation_error {
+        None => {
+            let run_id = run_id
+                .map(str::trim)
+                .filter(|run_id| !run_id.is_empty())
+                .unwrap_or("the exact run");
+            error.push_str(&format!("Exact server run {run_id} cancellation settled."));
+        }
+        Some(_) => {
+            error.push_str("Exact server run cancellation is not confirmed. ");
+            error.push_str(
+                &crate::cli::stream::streaming_types::unconfirmed_durable_run_recovery(session_id),
+            );
+        }
     }
 }
 
@@ -484,6 +520,109 @@ mod tests {
         assert_eq!(failure.partial.token_usage_coverage.attempts, 7);
         assert_eq!(failure.partial.token_usage_coverage.provider_reported, 6);
         assert_eq!(failure.partial.token_usage_coverage.unavailable, 1);
+    }
+
+    #[tokio::test]
+    async fn callback_detach_headless_cancel_success_reports_settled_run() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/chat/runs/run-callback"))
+            .and(header("authorization", "Bearer token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "run_id": "run-callback",
+                "status": "cancelled",
+                "execution_settled": true,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let settled = settle_request_session_binding_failure(
+            &api,
+            "token",
+            None,
+            None,
+            Err(crate::cli::stream::streaming_types::TurnFailure {
+                error: crate::cli::stream::stream_render::edge_callback_detach_message(
+                    "approval",
+                    "after bounded transport retries",
+                    &"HTTP error: error sending request",
+                ),
+                partial: crate::PartialTurnData {
+                    session_id: Some("sess-active".into()),
+                    callback_client_detached: true,
+                    remote_cancel_required: true,
+                    remote_cancel_run_id: Some("run-callback".into()),
+                    ..Default::default()
+                },
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(settled.error.contains("This client detached"));
+        assert!(
+            settled
+                .error
+                .contains("Exact server run run-callback cancellation settled.")
+        );
+        assert!(!settled.error.contains("astra session cancel"));
+        assert!(!settled.error.contains("not confirmed"));
+        assert!(!settled.error.contains("will be cancelled"));
+        assert!(!settled.partial.remote_cancel_required);
+    }
+
+    #[tokio::test]
+    async fn callback_detach_headless_cancel_failure_keeps_explicit_recovery() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/chat/runs/run-callback"))
+            .and(header("authorization", "Bearer token"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let unsettled = settle_request_session_binding_failure_with_cancel_deadline(
+            &api,
+            "token",
+            None,
+            None,
+            Err(crate::cli::stream::streaming_types::TurnFailure {
+                error: crate::cli::stream::stream_render::edge_callback_detach_message(
+                    "approval",
+                    "after bounded transport retries",
+                    &"HTTP error: error sending request",
+                ),
+                partial: crate::PartialTurnData {
+                    session_id: Some("sess-active".into()),
+                    callback_client_detached: true,
+                    remote_cancel_required: true,
+                    remote_cancel_run_id: Some("run-callback".into()),
+                    ..Default::default()
+                },
+            }),
+            std::time::Duration::from_millis(75),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(unsettled.error.contains("This client detached"));
+        assert!(
+            unsettled
+                .error
+                .contains("Exact server run cancellation is not confirmed.")
+        );
+        assert!(unsettled.error.contains("astra session cancel sess-active"));
+        assert!(!unsettled.error.contains("cancellation settled."));
+        assert!(unsettled.partial.remote_cancel_required);
     }
 
     #[tokio::test]

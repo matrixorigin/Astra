@@ -232,12 +232,15 @@ async fn await_stream_with_interrupts<'a>(
     let drain_timeout = std::time::Duration::from_secs(10);
     tokio::select! {
         biased;
-        result = &mut stream_fut => {
-            if let Err(failure) = &result
+        mut result = &mut stream_fut => {
+            if let Err(failure) = &mut result
                 && failure.partial.remote_cancel_required
             {
                 prepared.run_control.request_cancel_for_runtime();
                 cancel_token_for_signal.cancel();
+                if failure.partial.callback_client_detached {
+                    note_interactive_callback_detach(failure);
+                }
                 let fallback_run_id = incremental_state.snapshot().run_id;
                 report_server_run_detach_after_internal_failure(
                     failure
@@ -283,6 +286,19 @@ async fn await_stream_with_interrupts<'a>(
             (drained, true)
         }
     }
+}
+
+pub(crate) fn note_interactive_callback_detach(failure: &mut crate::TurnFailure) {
+    if !failure.partial.callback_client_detached {
+        return;
+    }
+    let recovery = crate::cli::stream::streaming_types::unconfirmed_durable_run_recovery(
+        failure.partial.session_id.as_deref(),
+    );
+    if !failure.error.is_empty() {
+        failure.error.push(' ');
+    }
+    failure.error.push_str(&recovery);
 }
 
 pub(crate) fn report_server_run_detach_after_internal_failure(
@@ -369,11 +385,41 @@ fn notify_server_to_cancel_run(
 mod tests {
     use super::{
         PreparedTurnStreamState, TurnExecutionInput, build_turn_stream_params,
-        prepare_turn_stream_state, report_server_run_detach_after_internal_failure,
+        note_interactive_callback_detach, prepare_turn_stream_state,
+        report_server_run_detach_after_internal_failure,
     };
     use crate::cli::session::session_state::SessionState;
     use crate::cli::turn::local_run_control::LocalRunControl;
     use std::sync::Arc;
+
+    #[test]
+    fn interactive_callback_detach_tells_the_user_the_server_run_remains() {
+        let mut failure = crate::TurnFailure {
+            error: crate::cli::stream::stream_render::edge_callback_detach_message(
+                "approval",
+                "after bounded transport retries",
+                &"HTTP error: error sending request",
+            ),
+            partial: crate::PartialTurnData {
+                session_id: Some("sess-active".into()),
+                callback_client_detached: true,
+                remote_cancel_required: true,
+                ..Default::default()
+            },
+        };
+
+        note_interactive_callback_detach(&mut failure);
+
+        assert!(failure.error.contains("This client detached"));
+        assert!(
+            failure
+                .error
+                .contains("not a cancellation of the server run")
+        );
+        assert!(failure.error.contains("astra session cancel sess-active"));
+        assert!(!failure.error.contains("cancellation settled"));
+        assert!(!failure.error.contains("will be cancelled"));
+    }
 
     #[test]
     fn internal_callback_failure_does_not_fabricate_user_cancellation() {
