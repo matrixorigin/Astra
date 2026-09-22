@@ -5369,6 +5369,15 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
     begin_inference_provider_attempt(&shared_pool, &second_attempt)
         .await
         .expect("begin retry as a distinct physical request");
+    for attempt in [&first_attempt, &second_attempt] {
+        assert_eq!(
+            begin_inference_provider_attempt(&shared_pool, attempt)
+                .await
+                .expect_err("repeated attempt admission must not duplicate accepted context")
+                .kind,
+            ServiceErrorKind::Conflict
+        );
+    }
     let success = InferenceInvocationTerminal::succeeded(
         InferenceUsage {
             input: astra_turn_types::NormalizedPromptCacheUsage::new(120, 80, 10),

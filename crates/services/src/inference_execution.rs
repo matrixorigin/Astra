@@ -4597,10 +4597,14 @@ pub async fn begin_inference_provider_attempt(
                 }
                 return Err(error);
             }
-            if let Err(error) = insert_model_request_context_event(
+            // The successful insert above owns this new row in the same
+            // transaction. Its expiry is NULL; locking and reading it again
+            // cannot add protection against a concurrent expiry operation.
+            if let Err(error) = insert_model_request_context_event_with_expiry(
                 &mut tx,
                 attempt,
                 ModelRequestEventStage::Accepted,
+                None,
                 None,
             )
             .await
