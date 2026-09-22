@@ -112,10 +112,12 @@ pub fn skill_auto_route_judge_messages(
 pub fn parse_skill_auto_route_response(
     raw: &str,
     ctx: &SkillAutoRouteJudgeContext,
+    model: &str,
+    provenance: Option<astra_turn_types::JudgmentResponseProvenance>,
 ) -> Result<Option<String>, SkillAutoRouteJudgeError> {
     let request = skill_auto_route_judgment_request(ctx)?;
     let normalized =
-        normalize_judgment_response(&request, raw, "skill-route-chat").map_err(|error| {
+        normalize_judgment_response(&request, raw, model, provenance).map_err(|error| {
             SkillAutoRouteJudgeError::Malformed {
                 raw: format!("{error}; raw: {}", truncate(raw, 256)),
             }
@@ -231,15 +233,25 @@ mod tests {
             (r#"{"true":["0"],"uncertain":["1"]}"#, vec![1.0, 0.5], None),
         ] {
             assert_eq!(
-                parse_skill_auto_route_response(chat, &ctx)
-                    .unwrap()
-                    .as_deref(),
+                parse_skill_auto_route_response(
+                    chat,
+                    &ctx,
+                    "chat-fixture",
+                    Some(astra_turn_types::JudgmentResponseProvenance::DiscreteDecision)
+                )
+                .unwrap()
+                .as_deref(),
                 expected
             );
             assert_eq!(
-                parse_skill_auto_route_response(&native(&values), &ctx)
-                    .unwrap()
-                    .as_deref(),
+                parse_skill_auto_route_response(
+                    &native(&values),
+                    &ctx,
+                    "native-fixture",
+                    Some(astra_turn_types::JudgmentResponseProvenance::ProviderProbability)
+                )
+                .unwrap()
+                .as_deref(),
                 expected
             );
         }
@@ -255,14 +267,25 @@ mod tests {
             vec![0.5, 0.0],
         ] {
             assert_eq!(
-                parse_skill_auto_route_response(&native(&values), &ctx).unwrap(),
+                parse_skill_auto_route_response(
+                    &native(&values),
+                    &ctx,
+                    "native-fixture",
+                    Some(astra_turn_types::JudgmentResponseProvenance::ProviderProbability)
+                )
+                .unwrap(),
                 None
             );
         }
         assert_eq!(
-            parse_skill_auto_route_response(&native(&[0.8, 0.2]), &ctx)
-                .unwrap()
-                .as_deref(),
+            parse_skill_auto_route_response(
+                &native(&[0.8, 0.2]),
+                &ctx,
+                "native-fixture",
+                Some(astra_turn_types::JudgmentResponseProvenance::ProviderProbability)
+            )
+            .unwrap()
+            .as_deref(),
             Some("review-changes")
         );
     }
@@ -282,14 +305,27 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    parse_skill_auto_route_response(raw, &ctx),
+                    parse_skill_auto_route_response(
+                        raw,
+                        &ctx,
+                        "chat-fixture",
+                        Some(astra_turn_types::JudgmentResponseProvenance::DiscreteDecision)
+                    ),
                     Err(SkillAutoRouteJudgeError::Malformed { .. })
                 ),
                 "{raw}"
             );
         }
         for values in [vec![0.9], vec![0.9, 0.0, 0.0], vec![1.1, 0.0]] {
-            assert!(parse_skill_auto_route_response(&native(&values), &ctx).is_err());
+            assert!(
+                parse_skill_auto_route_response(
+                    &native(&values),
+                    &ctx,
+                    "native-fixture",
+                    Some(astra_turn_types::JudgmentResponseProvenance::ProviderProbability)
+                )
+                .is_err()
+            );
         }
     }
 

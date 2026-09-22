@@ -352,11 +352,11 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    fn eventstream_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
+    pub(crate) fn eventstream_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
         fn string_header(out: &mut Vec<u8>, name: &str, value: &str) {
             out.push(name.len() as u8);
             out.extend_from_slice(name.as_bytes());

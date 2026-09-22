@@ -2712,7 +2712,12 @@ impl SummaryClientWorkAdmissionJudge {
             initial_execution = response.execution.clone();
             received_failure = classification_response_failure(&response);
             Self::require_completed(&response)?;
-            astra_services::parse_work_admission_classification(&request, &response.text)
+            astra_services::parse_work_admission_classification(
+                &request,
+                &response.text,
+                &response.model_used,
+                response.judgment_provenance,
+            )
         }
         .await;
         initial_observation.complete(&initial, received_failure, initial_execution);
@@ -2756,6 +2761,8 @@ impl SummaryClientWorkAdmissionJudge {
                         &clarification,
                         &clarified.text,
                         &diagnostics,
+                        &clarified.model_used,
+                        clarified.judgment_provenance,
                     )
                 }
                 .await;
@@ -2954,7 +2961,12 @@ impl SkillAutoRouteJudge for SummaryClientSkillAutoRouteJudge {
                 "skill judgment did not finish normally".into(),
             ));
         }
-        astra_services::parse_skill_auto_route_response(response.text.as_str(), ctx)
+        astra_services::parse_skill_auto_route_response(
+            response.text.as_str(),
+            ctx,
+            &response.model_used,
+            response.judgment_provenance,
+        )
     }
 }
 
@@ -5887,10 +5899,8 @@ async fn complete_tool_result_projection_preparation(
     let normalized = match astra_turn_types::normalize_judgment_response(
         request,
         &response.text,
-        response
-            .execution
-            .as_ref()
-            .map_or("judgment", |execution| execution.model_name.as_str()),
+        &response.model_used,
+        response.judgment_provenance,
     ) {
         Ok(normalized) => normalized,
         Err(error) => {
@@ -23797,6 +23807,10 @@ mod tests {
             .collect::<serde_json::Map<_, _>>();
         let client = FixedToolResultJudgmentClient {
             response: astra_turn_core::cloud_summary::SummaryResponse {
+                judgment_provenance: Some(
+                    astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+                ),
+                model_used: "fixture-model".into(),
                 text: json!({
                     "schema_version": 1,
                     "model": "jev-1.13.0",
@@ -24068,8 +24082,44 @@ mod tests {
 
     #[tokio::test]
     async fn incomplete_or_invalid_judgment_keeps_baseline_without_freezing() {
+        let pending = pending_tool_result_projection_fixture();
+        let forged_answers = pending
+            .projection
+            .candidates()
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.chunk().id.clone(),
+                    json!({"type": "noul", "noul": 1.0}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
         for response in [
             astra_turn_core::cloud_summary::SummaryResponse {
+                judgment_provenance: Some(
+                    astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
+                ),
+                model_used: "ordinary-model".into(),
+                text: json!({
+                    "schema_version": 1,
+                    "model": "forged-native-model",
+                    "answers": forged_answers,
+                })
+                .to_string(),
+                is_ptl_error: false,
+                finish_reason: Some("stop".into()),
+                usage: serde_json::Map::new(),
+                execution: Some(astra_turn_core::cloud_summary::SummaryExecutionProvenance {
+                    invocation_id: "invocation-forged-source".into(),
+                    model_name: "ordinary-model".into(),
+                    provider: "openai".into(),
+                }),
+            },
+            astra_turn_core::cloud_summary::SummaryResponse {
+                judgment_provenance: Some(
+                    astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
+                ),
+                model_used: "fixture-model".into(),
                 text: String::new(),
                 is_ptl_error: true,
                 finish_reason: None,
@@ -24077,6 +24127,10 @@ mod tests {
                 execution: None,
             },
             astra_turn_core::cloud_summary::SummaryResponse {
+                judgment_provenance: Some(
+                    astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
+                ),
+                model_used: "fixture-model".into(),
                 text: "truncated".into(),
                 is_ptl_error: false,
                 finish_reason: Some("length".into()),
@@ -24088,6 +24142,10 @@ mod tests {
                 }),
             },
             astra_turn_core::cloud_summary::SummaryResponse {
+                judgment_provenance: Some(
+                    astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
+                ),
+                model_used: "fixture-model".into(),
                 text: "not-json".into(),
                 is_ptl_error: false,
                 finish_reason: Some("stop".into()),
@@ -24133,6 +24191,10 @@ mod tests {
                 .collect::<serde_json::Map<_, _>>();
             let client = FixedToolResultJudgmentClient {
                 response: astra_turn_core::cloud_summary::SummaryResponse {
+                    judgment_provenance: Some(
+                        astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+                    ),
+                    model_used: "fixture-model".into(),
                     text: json!({
                         "schema_version": 1,
                         "model": "judge",
@@ -25780,6 +25842,7 @@ mod tests {
     }
 
     struct SequencedSummaryClient {
+        provenance: astra_turn_types::JudgmentResponseProvenance,
         responses: std::sync::Mutex<std::collections::VecDeque<String>>,
         requests: Arc<std::sync::Mutex<Vec<Vec<Value>>>>,
     }
@@ -25848,6 +25911,8 @@ mod tests {
                     )
                 })?;
             Ok(astra_turn_core::cloud_summary::SummaryResponse {
+                judgment_provenance: Some(self.provenance),
+                model_used: "fixture-model".into(),
                 text,
                 is_ptl_error: false,
                 finish_reason: Some("stop".to_string()),
@@ -25884,13 +25949,20 @@ mod tests {
                 aliases: vec![],
             }],
         };
-        for raw in [
-            json!({"true":["0"],"uncertain":[]}),
-            json!({"schema_version":1,"model":"jev","answers":{"0":{"type":"noul","noul":0.95}}}),
+        for (provenance, raw) in [
+            (
+                astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
+                json!({"true":["0"],"uncertain":[]}),
+            ),
+            (
+                astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+                json!({"schema_version":1,"model":"jev","answers":{"0":{"type":"noul","noul":0.95}}}),
+            ),
         ] {
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
             let judge = SummaryClientSkillAutoRouteJudge {
                 client: Box::new(SequencedSummaryClient {
+                    provenance,
                     responses: std::sync::Mutex::new(std::collections::VecDeque::from([
                         raw.to_string()
                     ])),
@@ -25930,6 +26002,10 @@ mod tests {
                 client: Box::new(UsageSequencedSummaryClient {
                     responses: std::sync::Mutex::new(std::collections::VecDeque::from([Ok(
                         astra_turn_core::cloud_summary::SummaryResponse {
+                            judgment_provenance: Some(
+                                astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
+                            ),
+                            model_used: "fixture-model".into(),
                             text: r#"{"true":["0"],"uncertain":[]}"#.into(),
                             is_ptl_error,
                             finish_reason: finish_reason.map(str::to_string),
@@ -25953,6 +26029,10 @@ mod tests {
         output_tokens: u64,
     ) -> astra_turn_core::cloud_summary::SummaryResponse {
         astra_turn_core::cloud_summary::SummaryResponse {
+            judgment_provenance: Some(
+                astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+            ),
+            model_used: "fixture-model".into(),
             text: text.to_string(),
             is_ptl_error: false,
             finish_reason: Some("stop".to_string()),
@@ -25974,6 +26054,12 @@ mod tests {
         provider: &str,
     ) -> astra_turn_core::cloud_summary::SummaryResponse {
         astra_turn_core::cloud_summary::SummaryResponse {
+            judgment_provenance: Some(if provider == "typesafe" {
+                astra_turn_types::JudgmentResponseProvenance::ProviderProbability
+            } else {
+                astra_turn_types::JudgmentResponseProvenance::DiscreteDecision
+            }),
+            model_used: model_name.into(),
             text: text.to_string(),
             is_ptl_error: false,
             finish_reason: Some("stop".to_string()),
@@ -25993,6 +26079,7 @@ mod tests {
             let response = json!({"work_lifecycle":"required","workspace_mutation":"read_only","activation":"start","goal":"Assess health","initial_tasks":[{"objective":text,"expected_result":"Evidence-based report"}],"mutations":[]});
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
             let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
                 responses: std::sync::Mutex::new(std::collections::VecDeque::from([
                     response.to_string()
                 ])),
@@ -26270,11 +26357,13 @@ mod tests {
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
             let plan_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
             let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
                 responses: std::sync::Mutex::new([classification_response(required)].into()),
                 requests: requests.clone(),
             }));
             let plan = json!({"work_lifecycle":"required","workspace_mutation":"read_only","activation":"start","goal":"Assess health","initial_tasks":[{"objective":"Inspect","expected_result":"Report"}],"mutations":[]});
             let planner = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
                 responses: std::sync::Mutex::new([plan.to_string()].into()),
                 requests: plan_requests.clone(),
             }));
@@ -26312,6 +26401,7 @@ mod tests {
             };
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
             let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
                 responses: std::sync::Mutex::new(
                     [uncertain.to_string(), text, uncertain.to_string()].into(),
                 ),
@@ -26319,6 +26409,7 @@ mod tests {
             }));
             let plan_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
             let planner = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
                 responses: Default::default(),
                 requests: plan_requests.clone(),
             }));
@@ -26360,8 +26451,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_classification_keeps_stage_local_execution_provenance() {
-        let mut uncertain: Value = serde_json::from_str(&classification_response(false)).unwrap();
-        uncertain["answers"]["required"]["noul"] = json!(0.21);
+        let uncertain = json!({"true":["mutation.read_only"], "uncertain":["required"]});
         let judge = SummaryClientWorkAdmissionJudge::new(Box::new(UsageSequencedSummaryClient {
             responses: std::sync::Mutex::new(
                 [
@@ -26372,7 +26462,7 @@ mod tests {
                         "deepseek",
                     )),
                     Ok(summary_response_with_execution(
-                        &classification_response(false),
+                        r#"{"true":["mutation.read_only"],"uncertain":[]}"#,
                         "invocation-clarification",
                         "fallback-llm",
                         "openai-compatible",
@@ -26572,6 +26662,7 @@ mod tests {
                     ),
                 }));
             let planner = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
                 responses: Default::default(),
                 requests: Default::default(),
             }));
@@ -26626,6 +26717,7 @@ mod tests {
                     ),
                 }));
             let planner = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
                 responses: Default::default(),
                 requests: Default::default(),
             }));
@@ -26649,22 +26741,37 @@ mod tests {
 
     #[tokio::test]
     async fn work_judgment_malformed_never_becomes_not_required_or_calls_planner() {
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
-            responses: std::sync::Mutex::new(["{}".to_string()].into()),
-            requests: Default::default(),
-        }));
-        let planner = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
-            responses: Default::default(),
-            requests: requests.clone(),
-        }));
-        assert!(
-            judge
-                .classify_and_plan(&planner, &Default::default())
-                .await
-                .is_err()
-        );
-        assert!(requests.lock().unwrap().is_empty());
+        for (provenance, response) in [
+            (
+                astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+                "{}".to_string(),
+            ),
+            (
+                astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
+                classification_response(true),
+            ),
+        ] {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let classifications = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+                provenance,
+                responses: std::sync::Mutex::new([response].into()),
+                requests: classifications.clone(),
+            }));
+            let planner = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+                provenance,
+                responses: Default::default(),
+                requests: requests.clone(),
+            }));
+            assert!(
+                judge
+                    .classify_and_plan(&planner, &Default::default())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(classifications.lock().unwrap().len(), 1);
+            assert!(requests.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
@@ -26696,10 +26803,12 @@ mod tests {
     async fn work_judgment_plan_repair_preserves_classification() {
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
             responses: std::sync::Mutex::new([classification_response(true)].into()),
             requests: Default::default(),
         }));
         let planner = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
             responses: std::sync::Mutex::new(["{".to_string(), r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"primary"}"#.to_string()].into()), requests: requests.clone(),
         }));
         assert!(
@@ -26731,6 +26840,8 @@ mod tests {
         let classification = astra_services::parse_work_admission_classification(
             &request,
             &classification_response(false),
+            "classifier-fixture",
+            Some(astra_turn_types::JudgmentResponseProvenance::ProviderProbability),
         )
         .expect("valid classifier response");
         let cases = [
@@ -26971,6 +27082,10 @@ mod tests {
         for received in [false, true] {
             let response = if received {
                 Ok(astra_turn_core::cloud_summary::SummaryResponse {
+                    judgment_provenance: Some(
+                        astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
+                    ),
+                    model_used: "fixture-model".into(),
                     text: "private provider payload".into(),
                     is_ptl_error: true,
                     finish_reason: Some("stop".into()),
@@ -26988,6 +27103,7 @@ mod tests {
                     responses: std::sync::Mutex::new([response].into()),
                 }));
             let planner = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
                 responses: Default::default(),
                 requests: Default::default(),
             }));
@@ -27073,6 +27189,7 @@ mod tests {
         for repair_succeeds in [true, false] {
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
             let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
                 responses: std::sync::Mutex::new(std::collections::VecDeque::from([
                     malformed.to_string(),
                     if repair_succeeds {
@@ -27371,6 +27488,7 @@ mod tests {
             }
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
             let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
                 responses: std::sync::Mutex::new(std::collections::VecDeque::from([
                     missing.to_string(),
                     repaired.to_string(),
@@ -27404,6 +27522,7 @@ mod tests {
         let malformed = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","activation":"defer","goal":"Run A and B, cancel one, then add one","initial_tasks":[{"objective":"A","expected_result":"Evidence A"},{"objective":"B","expected_result":"Evidence B"}],"mutations":[{"target_initial_task":1,"objective":"B","expected_result":"Evidence B"}]}"#;
         let repaired = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","activation":"start","goal":"Run A and B, cancel one, then add one","initial_tasks":[{"objective":"A","expected_result":"Evidence A"},{"objective":"B","expected_result":"Evidence B"}],"mutations":[{"kind":"cancel","target_initial_task":2},{"kind":"add","task":{"objective":"B","expected_result":"Evidence B"}}]}"#;
         let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
             responses: std::sync::Mutex::new(std::collections::VecDeque::from([
                 malformed.to_string(),
                 repaired.to_string(),
@@ -27481,6 +27600,7 @@ mod tests {
         let impossible = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","activation":"start","goal":"Deliver A, retire B, and add C","initial_tasks":[{"objective":"A","expected_result":"Evidence A"},{"objective":"B","expected_result":"Evidence B","after_initial_tasks":[1]}],"mutations":[{"kind":"cancel","target_initial_task":2,"after_initial_tasks":[1]},{"kind":"add","after_initial_tasks":[2],"task":{"objective":"C","expected_result":"Evidence C"}}]}"#;
         let repaired = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","activation":"start","goal":"Deliver A, retire B, and add C","initial_tasks":[{"objective":"A","expected_result":"Evidence A"},{"objective":"B","expected_result":"Evidence B","after_initial_tasks":[1]}],"mutations":[{"kind":"cancel","target_initial_task":2,"after_initial_tasks":[1]},{"kind":"add","after_initial_tasks":[1],"task":{"objective":"C","expected_result":"Evidence C"}}]}"#;
         let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
             responses: std::sync::Mutex::new(std::collections::VecDeque::from([
                 impossible.to_string(),
                 repaired.to_string(),
@@ -27548,6 +27668,7 @@ mod tests {
             }
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
             let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
                 responses: std::sync::Mutex::new(std::collections::VecDeque::from([
                     malformed.to_string(),
                     repaired.to_string(),
@@ -27589,6 +27710,7 @@ mod tests {
         let malformed = r#"{"work_lifecycle":"not_required","workspace_mutation":"must_mutate","mutation_completion_scope":"external","domain":null,"execution_topology":"primary"}"#;
         let repaired = r#"{"work_lifecycle":"not_required","workspace_mutation":"must_mutate","mutation_completion_scope":"external","domain":"memory","execution_topology":"primary"}"#;
         let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
             responses: std::sync::Mutex::new(std::collections::VecDeque::from([
                 malformed.to_string(),
                 repaired.to_string(),
@@ -27629,6 +27751,7 @@ mod tests {
         let malformed = r#"{"work_lifecycle":"not_required","workspace_mutation":"must_mutate","mutation_completion_scope":"mixed","domain":null,"execution_topology":"primary"}"#;
         let unresolved = r#"{"work_lifecycle":"not_required","workspace_mutation":"must_mutate","mutation_completion_scope":"mixed","domain":null,"execution_topology":"primary"}"#;
         let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
             responses: std::sync::Mutex::new(std::collections::VecDeque::from([
                 malformed.to_string(),
                 unresolved.to_string(),
@@ -27655,6 +27778,7 @@ mod tests {
     async fn closed_non_durable_work_admission_is_accepted_without_repair() {
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
                 responses: std::sync::Mutex::new(std::collections::VecDeque::from([
                     "```json\n{\"work_lifecycle\":\"not_required\",\"workspace_mutation\":\"must_mutate\",\"mutation_completion_scope\":\"workspace\",\"execution_topology\":\"primary\"}\n```".to_string(),
                 ])),
@@ -27687,6 +27811,7 @@ mod tests {
         let initially_conflicting = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","goal":"Review three dimensions and synthesize the findings","initial_tasks":[{"objective":"Correctness","expected_result":"Evidence"},{"objective":"Concurrency","expected_result":"Evidence"}],"execution_topology":"parallel_subruns","required_capabilities":["agent_spawner"]}"#;
         let repaired = r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"parallel_subruns","required_capabilities":["agent_spawner"]}"#;
         let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
             responses: std::sync::Mutex::new(std::collections::VecDeque::from([
                 initially_conflicting.to_string(),
                 repaired.to_string(),
@@ -27733,6 +27858,7 @@ mod tests {
         let invalid = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","basis":"explicit_lifecycle_control","goal":"Return two same-turn agent results","initial_tasks":[{"objective":"Result A","expected_result":"Payload A"},{"objective":"Result B","expected_result":"Payload B"}],"execution_topology":"primary"}"#;
         let repaired = r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"parallel_subruns","required_capabilities":["agent_spawner"]}"#;
         let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
             responses: std::sync::Mutex::new(std::collections::VecDeque::from([
                 invalid.to_string(),
                 repaired.to_string(),
@@ -27775,6 +27901,7 @@ mod tests {
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let conflicting = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","activation":"start","goal":"Persist separate outcomes","initial_tasks":[{"objective":"A","expected_result":"A"},{"objective":"B","expected_result":"B"}],"required_capabilities":["agent_spawner"]}"#;
         let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
             responses: std::sync::Mutex::new(std::collections::VecDeque::from([
                 conflicting.to_string()
             ])),
@@ -27802,6 +27929,7 @@ mod tests {
     #[tokio::test]
     async fn trusted_parallel_workflow_cannot_be_downgraded_by_judge_response() {
         let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
                 responses: std::sync::Mutex::new(std::collections::VecDeque::from([
                     r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"primary","required_capabilities":[]}"#.to_string(),
                 ])),
@@ -34262,6 +34390,7 @@ mod tests {
     #[test]
     fn result_to_accum_converts_correctly() {
         let result = LlmCallResult {
+            judgment_provenance: None,
             response_id: None,
             full_text: "Hello world".to_string(),
             reasoning: "thinking...".to_string(),
@@ -41516,6 +41645,7 @@ mod tests {
         let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let classification_client = SequencedSummaryClient {
+            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
             responses: std::sync::Mutex::new(std::collections::VecDeque::from([json!({
                 "schema_version": 1,
                 "model": "test",
@@ -41550,6 +41680,7 @@ mod tests {
         // route explicit instead of reviving the removed primary-model
         // fallback.
         let planner_client = SequencedSummaryClient {
+            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
             responses: std::sync::Mutex::new(std::collections::VecDeque::new()),
             requests: requests.clone(),
         };
@@ -51024,7 +51155,7 @@ mod tests {
                             "choices": [
                                 {
                                     "message": {
-                                        "content": classification_response(false)
+                                        "content": r#"{"true":["mutation.read_only"],"uncertain":[]}"#
                                     },
                                     "finish_reason": "stop"
                                 }
@@ -51114,10 +51245,12 @@ mod tests {
             });
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
             let classification_client = SequencedSummaryClient {
+                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
                 responses: std::sync::Mutex::new([classification_response(false)].into()),
                 requests: requests.clone(),
             };
             let planner_client = SequencedSummaryClient {
+                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
                 responses: std::sync::Mutex::new(std::collections::VecDeque::new()),
                 requests: requests.clone(),
             };

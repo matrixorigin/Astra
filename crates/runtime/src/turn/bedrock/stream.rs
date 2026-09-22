@@ -473,6 +473,7 @@ impl BedrockStreamAccumulator {
         });
 
         LlmCallResult {
+            judgment_provenance: None,
             response_id: self.provider_response_id,
             full_text: self.full_text,
             reasoning: self.reasoning,

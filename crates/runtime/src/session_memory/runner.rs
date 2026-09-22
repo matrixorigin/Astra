@@ -1117,7 +1117,7 @@ async fn update_memory_with_llm(
         }
         Ok(result) => result,
     };
-    let content = parsed.trim();
+    let content = parsed.text.trim();
     if content.is_empty() {
         return Err(LlmExtractionFailure {
             reason: SessionMemoryExtractionErrorReason::EmptyResponse,
@@ -2000,14 +2000,19 @@ mod tests {
         async fn complete(
             &self,
             request: MemoryInferenceRequest<'_>,
-        ) -> Result<String, astra_core::ClassifiedError> {
+        ) -> Result<crate::memory_hooks::MemoryInferenceResponse, astra_core::ClassifiedError>
+        {
             self.purposes.lock().unwrap().push(request.purpose);
             self.scopes
                 .lock()
                 .unwrap()
                 .push(request.invocation_scope.clone());
             self.deadlines.lock().unwrap().push(request.deadline);
-            Ok(r#"{"session_title":"Captured purpose"}"#.to_string())
+            Ok(crate::memory_hooks::MemoryInferenceResponse {
+                text: r#"{"session_title":"Captured purpose"}"#.to_string(),
+                model_used: self.model_name().into(),
+                judgment_provenance: None,
+            })
         }
     }
 
@@ -2023,7 +2028,8 @@ mod tests {
         async fn complete(
             &self,
             _request: MemoryInferenceRequest<'_>,
-        ) -> Result<String, astra_core::ClassifiedError> {
+        ) -> Result<crate::memory_hooks::MemoryInferenceResponse, astra_core::ClassifiedError>
+        {
             Err(astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::ProviderDeadline,
                 "provider request deadline expired",
@@ -2045,7 +2051,8 @@ mod tests {
         async fn complete(
             &self,
             _request: MemoryInferenceRequest<'_>,
-        ) -> Result<String, astra_core::ClassifiedError> {
+        ) -> Result<crate::memory_hooks::MemoryInferenceResponse, astra_core::ClassifiedError>
+        {
             self.calls.fetch_add(1, Ordering::SeqCst);
             std::future::pending().await
         }
@@ -2067,9 +2074,14 @@ mod tests {
         async fn complete(
             &self,
             _request: MemoryInferenceRequest<'_>,
-        ) -> Result<String, astra_core::ClassifiedError> {
+        ) -> Result<crate::memory_hooks::MemoryInferenceResponse, astra_core::ClassifiedError>
+        {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.response.to_string())
+            Ok(crate::memory_hooks::MemoryInferenceResponse {
+                text: self.response.to_string(),
+                model_used: self.model_name().into(),
+                judgment_provenance: None,
+            })
         }
     }
 

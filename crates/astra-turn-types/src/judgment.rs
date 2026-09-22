@@ -215,7 +215,7 @@ struct DiscreteJudgmentResponse {
     uncertain: Vec<String>,
 }
 
-/// Decode either native provider probabilities or chat's fixed discrete choices.
+/// Decode only the format authorized by the actual execution adapter.
 ///
 /// Discrete yes/uncertain/no map to 1/0.5/0 solely for shared decision validation;
 /// provenance preserves that these values are decisions, not model probabilities.
@@ -223,11 +223,19 @@ pub fn normalize_judgment_response(
     request: &JudgmentRequest,
     raw: &str,
     model_identity: &str,
+    provenance: Option<JudgmentResponseProvenance>,
 ) -> Result<NormalizedJudgmentResponse, JudgmentCodecError> {
     request.validate().map_err(JudgmentCodecError::Invalid)?;
-    let payload: Value = serde_json::from_str(raw)?;
-    let (response, provenance) =
-        if payload.get("true").is_some() || payload.get("uncertain").is_some() {
+    if model_identity.trim().is_empty() {
+        return Err(JudgmentCodecError::Invalid(
+            "missing execution model identity",
+        ));
+    }
+    let provenance = provenance.ok_or(JudgmentCodecError::Invalid(
+        "missing execution judgment provenance",
+    ))?;
+    let mut response = match provenance {
+        JudgmentResponseProvenance::DiscreteDecision => {
             let decisions: DiscreteJudgmentResponse = serde_json::from_str(raw)?;
             let mut values = BTreeMap::new();
             for (ids, value) in [(decisions.yes, 1.0), (decisions.uncertain, 0.5)] {
@@ -240,31 +248,27 @@ pub fn normalize_judgment_response(
                     }
                 }
             }
-            (
-                JudgmentResponse {
-                    schema_version: 1,
-                    model: model_identity.into(),
-                    answers: request
-                        .questions
-                        .keys()
-                        .map(|id| {
-                            (
-                                id.clone(),
-                                JudgmentAnswer::Noul {
-                                    noul: values.get(id).copied().unwrap_or(0.0),
-                                },
-                            )
-                        })
-                        .collect(),
-                },
-                JudgmentResponseProvenance::DiscreteDecision,
-            )
-        } else {
-            (
-                serde_json::from_str(raw)?,
-                JudgmentResponseProvenance::ProviderProbability,
-            )
-        };
+            JudgmentResponse {
+                schema_version: 1,
+                model: model_identity.into(),
+                answers: request
+                    .questions
+                    .keys()
+                    .map(|id| {
+                        (
+                            id.clone(),
+                            JudgmentAnswer::Noul {
+                                noul: values.get(id).copied().unwrap_or(0.0),
+                            },
+                        )
+                    })
+                    .collect(),
+            }
+        }
+        JudgmentResponseProvenance::ProviderProbability => serde_json::from_str(raw)?,
+    };
+    // Answer content cannot declare the execution's identity or capability.
+    response.model = model_identity.into();
     response
         .validate_for(request)
         .map_err(JudgmentCodecError::Invalid)?;
@@ -277,6 +281,32 @@ pub fn normalize_judgment_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decode_chat(
+        request: &JudgmentRequest,
+        raw: &str,
+        model: &str,
+    ) -> Result<NormalizedJudgmentResponse, JudgmentCodecError> {
+        normalize_judgment_response(
+            request,
+            raw,
+            model,
+            Some(JudgmentResponseProvenance::DiscreteDecision),
+        )
+    }
+
+    fn decode_native(
+        request: &JudgmentRequest,
+        raw: &str,
+        model: &str,
+    ) -> Result<NormalizedJudgmentResponse, JudgmentCodecError> {
+        normalize_judgment_response(
+            request,
+            raw,
+            model,
+            Some(JudgmentResponseProvenance::ProviderProbability),
+        )
+    }
 
     fn request() -> JudgmentRequest {
         JudgmentRequest {
@@ -335,7 +365,7 @@ mod tests {
 
     #[test]
     fn discrete_choices_preserve_abstention_and_provenance() {
-        let normalized = normalize_judgment_response(
+        let normalized = decode_chat(
             &request(),
             r#"{"true":["a"],"uncertain":["b"]}"#,
             "chat-model",
@@ -349,9 +379,7 @@ mod tests {
         for (id, expected) in [("a", 1.0), ("b", 0.5), ("c", 0.0)] {
             assert_eq!(normalized.response.answers[id].probability(), expected);
         }
-        let empty =
-            normalize_judgment_response(&request(), r#"{"true":[],"uncertain":[]}"#, "chat-model")
-                .unwrap();
+        let empty = decode_chat(&request(), r#"{"true":[],"uncertain":[]}"#, "chat-model").unwrap();
         assert!(
             empty
                 .response
@@ -362,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn native_probabilities_and_identity_are_preserved() {
+    fn execution_source_and_identity_cannot_be_overridden_by_payload() {
         let native = JudgmentResponse {
             schema_version: 1,
             model: "native-model".into(),
@@ -371,17 +399,29 @@ mod tests {
                 .map(|(id, noul)| (id.into(), JudgmentAnswer::Noul { noul }))
                 .collect(),
         };
-        let normalized = normalize_judgment_response(
+        let normalized = decode_native(
             &request(),
             &serde_json::to_string(&native).unwrap(),
-            "other",
+            "actual-native-model",
         )
         .unwrap();
         assert_eq!(
             normalized.provenance,
             JudgmentResponseProvenance::ProviderProbability
         );
-        assert_eq!(normalized.response, native);
+        assert_eq!(normalized.response.answers, native.answers);
+        assert_eq!(normalized.response.model, "actual-native-model");
+        assert!(decode_chat(&request(), &serde_json::to_string(&native).unwrap(), "chat").is_err());
+        assert!(decode_native(&request(), r#"{"true":[],"uncertain":[]}"#, "native").is_err());
+        assert!(
+            normalize_judgment_response(
+                &request(),
+                &serde_json::to_string(&native).unwrap(),
+                "native",
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -398,14 +438,9 @@ mod tests {
             r#"{"true":[],"true":["a"],"uncertain":[]}"#,
             r#"["a"]"#,
         ] {
-            assert!(
-                normalize_judgment_response(&request(), raw, "chat").is_err(),
-                "{raw}"
-            );
+            assert!(decode_chat(&request(), raw, "chat").is_err(), "{raw}");
         }
-        assert!(
-            normalize_judgment_response(&request(), r#"{"true":[],"uncertain":[]}"#, " ").is_err()
-        );
+        assert!(decode_chat(&request(), r#"{"true":[],"uncertain":[]}"#, " ").is_err());
     }
 
     #[test]
@@ -422,29 +457,17 @@ mod tests {
         };
         native.answers.remove("a");
         assert!(
-            normalize_judgment_response(
-                &request,
-                &serde_json::to_string(&native).unwrap(),
-                "native"
-            )
-            .is_err()
+            decode_native(&request, &serde_json::to_string(&native).unwrap(), "native").is_err()
         );
         native
             .answers
             .insert("a".into(), JudgmentAnswer::Noul { noul: 1.1 });
         assert!(
-            normalize_judgment_response(
-                &request,
-                &serde_json::to_string(&native).unwrap(),
-                "native"
-            )
-            .is_err()
+            decode_native(&request, &serde_json::to_string(&native).unwrap(), "native").is_err()
         );
         let mut invalid = request;
         invalid.schema_version = 2;
-        assert!(
-            normalize_judgment_response(&invalid, r#"{"true":[],"uncertain":[]}"#, "chat").is_err()
-        );
+        assert!(decode_chat(&invalid, r#"{"true":[],"uncertain":[]}"#, "chat").is_err());
     }
 
     #[test]
@@ -478,13 +501,8 @@ mod tests {
             )]
             .into(),
         };
-        assert!(
-            normalize_judgment_response(&request, r#"{"true":[0],"uncertain":[]}"#, "chat")
-                .is_err()
-        );
-        let valid =
-            normalize_judgment_response(&request, r#"{"true":["0"],"uncertain":[]}"#, "chat")
-                .unwrap();
+        assert!(decode_chat(&request, r#"{"true":[0],"uncertain":[]}"#, "chat").is_err());
+        let valid = decode_chat(&request, r#"{"true":["0"],"uncertain":[]}"#, "chat").unwrap();
         assert_eq!(valid.response.answers["0"].probability(), 1.0);
         assert_eq!(
             valid.provenance,

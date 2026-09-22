@@ -96,7 +96,14 @@ pub(crate) async fn execute(
                 .first()
                 .map(|choice| choice.finish_reason.as_str());
             let normalized = if finish_reason == Some("stop") {
-                text.map(|text| normalize_judgment_response(&judgment, text, &response.model))
+                text.map(|text| {
+                    normalize_judgment_response(
+                        &judgment,
+                        text,
+                        &response.model,
+                        response.judgment_provenance,
+                    )
+                })
             } else {
                 None
             };
@@ -169,7 +176,14 @@ mod tests {
 
     #[tokio::test]
     async fn session_judge_resolves_typesafe_through_typed_catalog_before_execution() {
-        let server = session_server(completion_with_finish_reason("stop"), Some(200)).await;
+        let native =
+            json!({"schema_version":1,"model":"jev","answers":{"0":{"type":"noul","noul":0.9}}})
+                .to_string();
+        let server = session_server(ResponseTemplate::new(200).set_body_json(json!({
+            "id":"completion-1", "object":"chat.completion", "offering_id":"offering-1", "model":"jev",
+            "judgment_provenance":"provider_probability",
+            "choices":[{"index":0,"message":{"role":"assistant","content":native},"finish_reason":"stop"}]
+        })), Some(200)).await;
         Mock::given(method("GET"))
             .and(path("/models"))
             .and(wiremock::matchers::query_param("purpose", "typed_judgment"))
@@ -234,6 +248,7 @@ mod tests {
     fn completion_with_finish_reason(reason: &str) -> ResponseTemplate {
         ResponseTemplate::new(200).set_body_json(json!({
             "id": "completion-1", "object": "chat.completion", "offering_id": "offering-1", "model": "judge",
+            "judgment_provenance": "discrete_decision",
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "{\"true\":[],\"uncertain\":[]}"}, "finish_reason": reason}],
             "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110},
         }))
@@ -357,7 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_decisions_close_completed_session_without_retry() {
-        let body = json!({"id":"completion-1","object":"chat.completion","offering_id":"offering-1","model":"judge","choices":[{"index":0,"message":{"role":"assistant","content":"{\"true\":[\"unknown\"],\"uncertain\":[]}"},"finish_reason":"stop"}]});
+        let body = json!({"id":"completion-1","object":"chat.completion","offering_id":"offering-1","model":"judge","judgment_provenance":"discrete_decision","choices":[{"index":0,"message":{"role":"assistant","content":"{\"true\":[\"unknown\"],\"uncertain\":[]}"},"finish_reason":"stop"}]});
         let server =
             session_server(ResponseTemplate::new(200).set_body_json(body), Some(200)).await;
         let api = ThinClient::new(&server.uri(), None).unwrap();
@@ -368,15 +383,31 @@ mod tests {
         assert_eq!(server.received_requests().await.unwrap().len(), 3);
     }
     #[tokio::test]
-    async fn native_judgment_preserves_provider_probabilities_and_provenance() {
-        let text = json!({"schema_version":1,"model":"native-judge","answers":{"0":{"type":"noul","noul":0.93}}}).to_string();
-        let body = json!({"id":"completion-1","object":"chat.completion","offering_id":"offering-1","model":"native-judge","choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}]});
-        let server =
-            session_server(ResponseTemplate::new(200).set_body_json(body), Some(200)).await;
-        let api = ThinClient::new(&server.uri(), None).unwrap();
-        let result = execute(&api, "test-token", "offering-1", &judgment_input(), 37).await;
-        assert_eq!(result["ok"], true);
-        assert_eq!(result["provenance"], "provider_probability");
-        assert_eq!(result["judgment"]["answers"]["0"]["noul"], 0.93);
+    async fn judgment_source_and_identity_come_from_server_execution_metadata() {
+        for (provenance, valid) in [
+            (Some("provider_probability"), true),
+            (Some("discrete_decision"), false),
+            (None, false),
+        ] {
+            let text = json!({"schema_version":1,"model":"untrusted-answer-model","answers":{"0":{"type":"noul","noul":0.93}}}).to_string();
+            let body = json!({"id":"completion-1","object":"chat.completion","offering_id":"offering-1","model":"native-judge","judgment_provenance":provenance,"choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}]});
+            let server =
+                session_server(ResponseTemplate::new(200).set_body_json(body), Some(200)).await;
+            let api = ThinClient::new(&server.uri(), None).unwrap();
+            let result = execute(&api, "test-token", "offering-1", &judgment_input(), 37).await;
+            assert_eq!(result["ok"], valid, "{result}");
+            if valid {
+                assert_eq!(result["provenance"], "provider_probability");
+                assert_eq!(result["judgment"]["model"], "native-judge");
+                assert_eq!(result["judgment"]["answers"]["0"]["noul"], 0.93);
+            } else {
+                assert!(result["judgment"].is_null());
+            }
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                3,
+                "one completion and owned session create/close; no repair inference"
+            );
+        }
     }
 }

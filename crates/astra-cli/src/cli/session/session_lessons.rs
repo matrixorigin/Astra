@@ -389,8 +389,15 @@ mod tests {
         async fn complete(
             &self,
             _: astra_runtime::memory_hooks::MemoryInferenceRequest<'_>,
-        ) -> Result<String, astra_core::ClassifiedError> {
-            Ok(r#"{"true":["1"],"uncertain":[]}"#.into())
+        ) -> Result<astra_runtime::memory_hooks::MemoryInferenceResponse, astra_core::ClassifiedError>
+        {
+            Ok(astra_runtime::memory_hooks::MemoryInferenceResponse {
+                text: r#"{"true":["1"],"uncertain":[]}"#.into(),
+                model_used: self.model_name().into(),
+                judgment_provenance: Some(
+                    astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
+                ),
+            })
         }
     }
 

@@ -189,6 +189,9 @@ const fn default_timeout_ms() -> u64 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletionResponse {
+    /// Server-authored execution format; assistant content cannot select it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judgment_provenance: Option<astra_turn_types::JudgmentResponseProvenance>,
     pub id: String,
     pub object: String,
     pub offering_id: String,

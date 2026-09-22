@@ -1244,6 +1244,21 @@ scope is an authenticated agent run, a real session-owned operation, or a
 durable Harness run. Memory and compaction require session ownership; Skillify
 requires Harness ownership. Neither fabricates a run or session identity.
 
+Typed judgment responses carry execution-owned `judgment_provenance` alongside
+text and the adapter's model identity. TypeSafe System One supplies
+`provider_probability`; ordinary model execution supplies `discrete_decision`.
+Both streaming and non-streaming adapters preserve this distinction through
+summary, memory and Server completion boundaries. Ordinary prose responses
+omit the field. Judgment consumers reject missing provenance, mismatched answer
+formats and missing execution identity: answer JSON and model-name strings do
+not select the decoder or establish native probability capability. The model
+identity is the existing adapter's execution identity, not a guarantee that
+every upstream provider exposes a resolved model version.
+
+These response facts do not add a ledger, query or persistence projection.
+Malformed judgments use the consumer's existing failure/baseline behavior;
+they are not semantic abstentions authorizing another clarification request.
+
 This contract intentionally replaces the former `selected_model` and raw
 model/provider/gateway request shapes. There is no dual interpretation or
 legacy fallback: clients upgrade by selecting an `offering_id` obtained from

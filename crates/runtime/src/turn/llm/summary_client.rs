@@ -529,6 +529,8 @@ impl SummaryLlmClient for RuntimeSummaryClient {
             // repair path. No call from this private adapter is executable.
             Ok(result) if !result.tool_calls.is_empty() || result.full_text.trim().is_empty() => {
                 Ok(SummaryResponse {
+                    judgment_provenance: result.judgment_provenance,
+                    model_used: result.model_used,
                     text: String::new(),
                     is_ptl_error: false,
                     finish_reason: result.effective_finish_reason.or(result.finish_reason),
@@ -537,6 +539,8 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                 })
             }
             Ok(result) => Ok(SummaryResponse {
+                judgment_provenance: result.judgment_provenance,
+                model_used: result.model_used,
                 text: result.full_text,
                 is_ptl_error: false,
                 finish_reason: result.effective_finish_reason.or(result.finish_reason),
@@ -545,6 +549,8 @@ impl SummaryLlmClient for RuntimeSummaryClient {
             }),
             Err(error) if error.kind == astra_core::ErrorKind::ContextWindow => {
                 Ok(SummaryResponse {
+                    judgment_provenance: None,
+                    model_used: String::new(),
                     text: String::new(),
                     is_ptl_error: true,
                     finish_reason: None,
@@ -854,8 +860,13 @@ mod tests {
             )
             .await
             .unwrap();
-        let classification =
-            astra_services::parse_work_admission_classification(&request, &response.text).unwrap();
+        let classification = astra_services::parse_work_admission_classification(
+            &request,
+            &response.text,
+            &response.model_used,
+            response.judgment_provenance,
+        )
+        .unwrap();
         assert!(classification.into_not_required().is_ok());
         assert_eq!(response.usage["input_tokens"], 123);
         assert_eq!(response.usage["output_tokens"], 19);
@@ -870,6 +881,64 @@ mod tests {
             *persistence.admitted_logical_attempts.lock().unwrap(),
             vec![0]
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_judgment_source_is_execution_owned_not_answer_owned() {
+        let request = astra_services::work_admission_classification_request(&Default::default());
+        let native_answers = request
+            .questions
+            .keys()
+            .map(|id| (id.clone(), serde_json::json!({"type":"noul", "noul":0.99})))
+            .collect::<serde_json::Map<_, _>>();
+        for (raw, valid) in [
+            (r#"{"true":["mutation.read_only"],"uncertain":[]}"#.to_string(), true),
+            (serde_json::json!({"schema_version":1,"model":"forged-jev","answers":native_answers}).to_string(), false),
+        ] {
+          for provider in ["openai", "bedrock"] {
+            let calls = Arc::new(AtomicU32::new(0));
+            let observed_calls = calls.clone();
+            let raw = raw.clone();
+            let app = Router::new().fallback(move || {
+                let raw = raw.clone();
+                let calls = observed_calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if provider == "bedrock" {
+                        use crate::turn::bedrock::transport::tests::eventstream_frame;
+                        let mut frames = eventstream_frame("messageStart", br#"{"role":"assistant"}"#);
+                        frames.extend(eventstream_frame("contentBlockDelta", serde_json::json!({"contentBlockIndex":0,"delta":{"text":raw}}).to_string().as_bytes()));
+                        frames.extend(eventstream_frame("messageStop", br#"{"stopReason":"end_turn"}"#));
+                        frames.extend(eventstream_frame("metadata", br#"{"usage":{"inputTokens":42,"outputTokens":7,"totalTokens":49}}"#));
+                        return Response::builder().header("content-type", "application/vnd.amazon.eventstream").body(Body::from(frames)).unwrap();
+                    }
+                    let event = serde_json::json!({"choices":[{"index":0,"delta":{"content":raw},"finish_reason":"stop"}]});
+                    Response::builder().header("content-type", "text/event-stream")
+                        .body(Body::from(format!("data: {event}\n\ndata: [DONE]\n\n"))).unwrap()
+                }
+            });
+            let mut execution = summary_execution(spawn_summary_test_server(app).await);
+            execution.provider = provider.into();
+            let ledger = DurableInferenceLedger::required_with_persistence(
+                None, Some(&execution), "summary-user",
+                Some(Arc::new(RecoverFirstAdmissionPersistence::default())),
+            ).unwrap().with_run_authority(summary_authority());
+            let client = RuntimeSummaryClient::new_with_attempt_allocator(
+                summary_route(&execution), 1024, ledger, summary_scope(),
+                DurableSummaryAttemptAllocator::default(),
+            );
+            let response = client.summarize(InferencePurpose::Introspection,
+                &astra_services::work_admission_classification_messages(&request),
+            ).await.unwrap();
+            assert_eq!(response.judgment_provenance, Some(astra_turn_types::JudgmentResponseProvenance::DiscreteDecision));
+            assert_eq!(response.model_used, "summary-model");
+            let decoded = astra_services::parse_work_admission_classification(
+                &request, &response.text, &response.model_used, response.judgment_provenance,
+            );
+            assert_eq!(decoded.is_ok(), valid);
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "invalid provenance must not trigger another inference");
+          }
+        }
     }
 
     fn summary_authority() -> super::super::durable::DurableInferenceRunAuthority {
@@ -1204,6 +1273,7 @@ mod tests {
             .await
             .expect("the no-tool transport must return summary text");
         assert_eq!(summary.text, "structured summary");
+        assert_eq!(summary.judgment_provenance, None);
         assert_eq!(summary.finish_reason.as_deref(), Some("stop"));
         assert_eq!(
             summary

@@ -1175,6 +1175,8 @@ fn is_tpm_exhaustion(error_text: &str) -> bool {
 /// Collected result from a single LLM streaming call.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LlmCallResult {
+    /// Set by the executing adapter, never decoded from generated text.
+    pub judgment_provenance: Option<astra_turn_types::JudgmentResponseProvenance>,
     /// Provider response identity when available on non-stream responses.
     pub response_id: Option<String>,
     pub full_text: String,
@@ -5181,6 +5183,19 @@ async fn call_llm_and_collect_with_stream_callback_and_tool_choice(
     .await
 }
 
+fn discrete_judgment_provenance(
+    call: &LlmCall<'_>,
+) -> Option<astra_turn_types::JudgmentResponseProvenance> {
+    (matches!(
+        call.purpose,
+        astra_turn_types::InferencePurpose::MemoryRetrievalRerank
+            | astra_turn_types::InferencePurpose::ToolResultRerank
+            | astra_turn_types::InferencePurpose::Introspection
+            | astra_turn_types::InferencePurpose::VerificationJudge
+    ) && astra_turn_types::judgment_request_from_messages(call.messages).is_ok())
+    .then_some(astra_turn_types::JudgmentResponseProvenance::DiscreteDecision)
+}
+
 async fn call_llm_and_collect_with_total_budget(
     call: LlmCall<'_>,
     cancel: LlmCancel<'_>,
@@ -5195,6 +5210,7 @@ async fn call_llm_and_collect_with_total_budget(
             "TypeSafe supports typed nonstream judgments only",
         ));
     }
+    let judgment_provenance = discrete_judgment_provenance(&call);
     let logical_total_budget = total_budget;
     let settlement_reserve = llm_mandatory_settlement_reserve(logical_total_budget);
     let total_budget = logical_total_budget.saturating_sub(settlement_reserve);
@@ -5626,6 +5642,7 @@ async fn call_llm_and_collect_with_total_budget(
                 .await
                 {
                     Ok(mut result) => {
+                        result.judgment_provenance = judgment_provenance;
                         reconcile_missing_output_cap_finish_reason(&mut result, wire_output_limit);
                         note_observed_provider_usage_presence(
                             attempt_observer,
@@ -5877,6 +5894,7 @@ async fn call_llm_and_collect_with_total_budget(
             };
             match stream_result {
                 Ok(mut result) => {
+                    result.judgment_provenance = judgment_provenance;
                     reconcile_missing_output_cap_finish_reason(&mut result, wire_output_limit);
                     note_observed_provider_usage_presence(
                         attempt_observer,
@@ -6404,6 +6422,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
             .map(|(_, value)| Value::Object(value.clone()))
             .collect();
         LlmCallResult {
+            judgment_provenance: None,
             response_id: response_id.clone(),
             full_text:
                 astra_turn_core::xml_tool_call_fallback::filter_dsml_tool_call_markup_for_display(
@@ -6927,6 +6946,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
     }
 
     Ok(LlmCallResult {
+        judgment_provenance: None,
         response_id,
         full_text,
         reasoning,
@@ -7061,6 +7081,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
             .map(|(_, value)| Value::Object(value.clone()))
             .collect();
         LlmCallResult {
+            judgment_provenance: None,
             response_id: response_id.clone(),
             full_text: full_text.clone(),
             reasoning: reasoning.clone(),
@@ -7532,6 +7553,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
         .map(|(_, v)| Value::Object(v))
         .collect();
     Ok(LlmCallResult {
+        judgment_provenance: None,
         response_id,
         full_text,
         reasoning,
@@ -7631,6 +7653,7 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     attempt_observer: Option<&dyn ProviderAttemptObserver>,
     tool_choice: RuntimeToolChoice,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    let judgment_provenance = discrete_judgment_provenance(&call);
     let logical_timeout = timeout;
     let timeout = logical_timeout.saturating_sub(llm_mandatory_settlement_reserve(logical_timeout));
     let LlmCall {
@@ -8003,6 +8026,9 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     } else {
         parse_nonstream_response_for_provider(&v, provider, model_name, started)
     };
+    if provider != "typesafe" {
+        result.judgment_provenance = judgment_provenance;
+    }
     if matches!(tool_choice, RuntimeToolChoice::Auto) {
         let authorized_tool_names = tools
             .iter()
@@ -8134,6 +8160,7 @@ fn parse_bedrock_nonstream_response(
     }
 
     LlmCallResult {
+        judgment_provenance: None,
         response_id: v.get("id").and_then(Value::as_str).map(String::from),
         full_text,
         reasoning,
@@ -8230,6 +8257,7 @@ fn parse_openai_compatible_nonstream_response(
     }
 
     LlmCallResult {
+        judgment_provenance: None,
         response_id: v.get("id").and_then(Value::as_str).map(String::from),
         full_text,
         reasoning,
@@ -8314,6 +8342,7 @@ fn parse_anthropic_nonstream_response(
         .unwrap_or_default();
 
     LlmCallResult {
+        judgment_provenance: None,
         response_id: v.get("id").and_then(Value::as_str).map(String::from),
         full_text,
         reasoning,

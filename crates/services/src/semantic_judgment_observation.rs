@@ -1873,6 +1873,8 @@ mod tests {
         request_judgment_result(&crate::parse_work_admission_classification(
             &request,
             r#"{"true":["mutation.read_only"],"uncertain":[]}"#,
+            "chat-fixture",
+            Some(astra_turn_types::JudgmentResponseProvenance::DiscreteDecision),
         ))
     }
 
@@ -1882,6 +1884,8 @@ mod tests {
         request_judgment_result(&crate::parse_work_admission_classification(
             &request,
             r#"{"true":["mutation.read_only"],"uncertain":["required"]}"#,
+            "chat-fixture",
+            Some(astra_turn_types::JudgmentResponseProvenance::DiscreteDecision),
         ))
     }
 
@@ -2000,6 +2004,8 @@ mod tests {
         let result = crate::parse_work_admission_classification(
             &request,
             &serde_json::to_string(&response).unwrap(),
+            "native-fixture",
+            Some(astra_turn_types::JudgmentResponseProvenance::ProviderProbability),
         );
         let RequestJudgmentResultV1::Abstained { assessment, .. } =
             request_judgment_result(&result)
@@ -2059,6 +2065,8 @@ mod tests {
         let mut result = crate::parse_work_admission_classification(
             &request,
             r#"{"true":["mutation.read_only"],"uncertain":["required"]}"#,
+            "chat-fixture",
+            Some(astra_turn_types::JudgmentResponseProvenance::DiscreteDecision),
         );
         let Err(crate::TurnIntentJudgeError::Uncertain { diagnostics }) = &mut result else {
             panic!("uncertain");
