@@ -21,6 +21,11 @@ allowed_tools:
 
 Audit failure behavior in order. Reachability comes before severity.
 
+For independent review, follow the model-evidence and read-only contract in
+[review-changes](../review_changes/SKILL.md). Audit current runtime recovery, not
+excluded old-version compatibility/migration paths. Recommend removing obsolete
+paths rather than adding compensating state machines.
+
 ## Task
 
 $ARGUMENTS
@@ -100,6 +105,11 @@ State:
 - Are transitions valid from every previous state?
 - Are duplicate, stale, out-of-order, and cancellation cases handled?
 - Is persistent state written atomically enough for restore/sync?
+- After disconnect or timeout, is the commit outcome known? Can retries duplicate
+  side effects, paid model calls, receipts, or parent wakes? Is idempotency scoped
+  to the correct owner and stable across recovery?
+- Can a stale cache, reused session ID, or shared batch cross tenant boundaries,
+  miss revocation, or make one session's failure poison unrelated sessions?
 - Can any consumer derive terminal state from a child/transport event, lookup
   miss, timeout, or cached projection instead of the producer-owned lifecycle?
 - For grouped work, can one slot transition trigger parent analysis before the
@@ -112,6 +122,15 @@ Resource:
 - Are channels bounded or drained?
 - Are locks held across await points?
 - Is accumulation bounded by size, count, time, or compaction?
+- Under the claimed concurrent-session load, can hot keys, per-session
+  transactions, a global batch/lock, or schema initialization exhaust the pool or
+  starve other users? Check pool acquisition, lock hold, and transaction lifetime.
+- Do cancellation, partial failure, shutdown, and retry exhaustion release
+  connections, permits, waiters, and reservations without fabricating success?
+
+A timeout is not harmless merely because a rerun passes. Trace the actual
+wait/ownership chain and distinguish harness/setup failure, resource contention,
+and runtime failure. Propose a canonical-owner fix, not just a larger timeout.
 
 ## Step 4: Assign R3 Severity
 

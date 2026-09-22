@@ -29,9 +29,25 @@ Explore -> Integrate -> Execute -> Verify
         Re-open only on explicit invalidation
 ```
 
-The goal is to identify the owning crate, preserve the intent of existing edits,
-convert known facts into an executable checklist, change the smallest correct
-surface, and verify with the narrowest gate that proves the behavior.
+Start from the user-visible behavior, not a patch size or an existing design.
+Identify the canonical owner, preserve unrelated edits, compare simplifying,
+replacing, and leaving the implementation unchanged, then verify the chosen
+behavior. A small diff is not a systemic fix by itself.
+
+## Product and Engineering Constraints
+
+- Define defaults, explicit user choices, failure/recovery behavior, and acceptance
+  criteria before a non-trivial implementation. Put requested product plans in
+  `plans/`; label target behavior separately from what current code proves.
+- Treat Astra as a fresh system: no old-version compatibility, data migrations,
+  dual reads/writes, legacy parsers, or transitional shims unless the user
+  explicitly changes that requirement. This is not permission to delete live data.
+- Consolidate or remove redundant implementations, tables, projections, and tests
+  within the changed ownership boundary. Search callers and relevant recent main
+  commits; do not expand into unrelated cleanup or optimize for lines deleted.
+- For complex design use GPT-6 medium; for independent review before committing
+  use GPT-6 high, unless the current task explicitly specifies otherwise. Follow
+  the model-evidence rules in [review-changes](../review_changes/SKILL.md).
 
 ## Hard Rule: Structured Control Flow
 
@@ -41,9 +57,9 @@ transitions must use typed facts: enums, `ErrorKind`, `result_class`,
 `exit_semantics`, structured tool-result JSON, protocol parsers, AST/token
 parsers, or exact machine-owned sentinel fields.
 
-Allowed text matching is rare: UI display/search, tests of rendered text, or
-legacy protocol fallback named with a `fallback` suffix. A fallback must not be
-the primary safety/admission/blocking/evaluation decision.
+Text matching is allowed for UI display/search and tests of rendered text.
+Do not preserve a legacy control-flow parser by calling it a fallback. Typed,
+policy-authorized recovery from a current provider failure is a different concern.
 
 ## Hard Rule: One Owner, One Wired Path
 
@@ -57,7 +73,7 @@ or compatibility layer:
 3. Extend the owner when possible. A new owner is justified only by a distinct
    authority, deployment, security, or resource-lifecycle boundary.
 4. If replacing a path, migrate its callers and delete the old implementation,
-   old state/table/shim, and tests that only exercised the old island in the
+   obsolete schema definitions/shims and tests that only exercised the old island in the
    same change. Do not keep code for unspecified "future extensibility".
 5. Report the complexity delta: implementations, status vocabularies, writers,
    tables, compatibility paths, and net code. Added tests do not cancel out a
@@ -73,6 +89,28 @@ only the canonical group terminal transition may authorize parent synthesis.
 For persistence, a mock-only test is insufficient. Prove schema bootstrap,
 query/transaction semantics, failure behavior, and the public caller against
 the real configured database whenever the change crosses that boundary.
+
+## I/O, Scale, and Observation
+
+- Require a current correctness or product reason for each database/network
+  operation. Reuse authoritative turn/session facts; keep schema/bootstrap checks
+  out of the normal turn hot path when the lifecycle already guarantees readiness.
+- Prefer bounded batching and caching where semantics permit. Specify tenant/session
+  keys, capacity, invalidation, freshness, and failure ownership; a cache must not
+  bypass authorization or revocation. Choose transaction boundaries by atomicity
+  and contention, not automatically one per user/session or one global batch.
+- For session hot paths, account for new and existing sessions, cold/warm caches,
+  and expected thousands to tens of thousands of concurrent sessions. Examine
+  queries, pool wait, transaction/lock duration, fairness, backpressure, and memory
+  bounds. Smaller-scale tests do not prove larger-scale capacity.
+- Keep Trace, Explain, Introspect, Reflect, and usage accounting as projections
+  of canonical facts, including parent/child runs, routing/judgment/reflection
+  calls and paid retries. Explain decisions, applied actions, and observed effects;
+  do not claim a logged recommendation changed execution.
+- Keep estimates and provider usage distinct; missing usage is not zero. Count
+  each physical call once, including auxiliary calls; cache reads and reasoning
+  subsets must not be double-counted. Show cache percentage with its denominator
+  and coverage; preserve drill-down counts. Do not sum overlapping spans as latency.
 
 ## Task
 
@@ -98,6 +136,9 @@ Rules:
 - If you cannot explain the intent of a previous edit, inspect more before replacing it.
 - Do not read every design document up front; load context only when it changes a decision.
 - Stop exploring when you can name the owner, contract boundary, and intended behavior.
+- When responding to PR feedback, read the latest comments against the current
+  head, validate their claims, and record adopted or rejected findings with reasons.
+  If remote evidence is unavailable, label that limit instead of claiming freshness.
 
 ## Phase 2: Integrate Findings
 
@@ -166,7 +207,8 @@ cargo check -p <crate>
 - CLI behavior: CLI parser/rendering test or focused command test.
 - Skill/docs change: frontmatter/path/stale-reference validation, not a Rust build.
 
-7. If compatibility is explicitly out of scope, delete the obsolete path instead of layering a second model.
+7. Remove superseded paths and duplicate/weak tests; retain each still-valid
+   contract in the owning test rather than adding another suite around old behavior.
 
 ## Phase 4: Failure Triage
 
@@ -182,6 +224,11 @@ Use the first matching row before widening the search.
 | Bad persisted state | Journal event, DB projection, status transition, request_id/session_id chain |
 | Prompt/tool regression | Tool surface tier, capability source, selected skill list, budget pressure |
 
+A timeout or flake is evidence to investigate, including connection-pool waits,
+lock contention, and fixture lifecycle. Do not call a rerun, a raised timeout, a
+smaller workload, or weaker assertions a fix. Bound diagnostic runs and explain
+why an expensive run is necessary; avoid repeated long full-suite runs.
+
 ## Phase 5: Verification Gates
 
 Run `make` targets and raw cargo commands from the repository root.
@@ -193,7 +240,7 @@ Run `make` targets and raw cargo commands from the repository root.
 | Shared Rust API | `cargo check --workspace --all-targets` plus affected crate tests |
 | Runtime/server lifecycle | Focused runtime tests, then `cargo check -p astra-runtime` |
 | Turn behavior | `cargo check -p astra-turn-core` plus focused turn tests |
-| Services/storage/MatrixOne | Focused service/storage tests; note if online DB checks were skipped |
+| Services/storage/MatrixOne | Focused tests plus real DB validation for changed schema/query/transaction/bootstrap behavior; unavailable required DB evidence means incomplete verification |
 | Skills/docs only | Validate frontmatter, metadata JSON, path references, and `.claude`/`.agent` sync |
 | Shell/deployment | Run the exact make/script/config dry-run that owns the behavior |
 | Frontend/SDK | Use the relevant `package.json` script or existing make target |
@@ -216,6 +263,16 @@ End with:
 - Why the final model is simpler or more correct.
 - Verification commands and outcomes.
 - Skipped checks and residual risk, if any.
+- What was deleted/consolidated, what remains, and measured benefits versus
+  unverified expectations; use comparable workloads for performance claims.
+
+Use coherent reviewed milestones for authorized commits/pushes, not a new PR for
+each tiny edit. Re-review material changes after review, preserve valid evidence
+for unchanged code, and report CI state without waiting unless asked. Pending CI
+is not a pass or permission to merge. Follow AGENTS.md delivery safety: before
+every push resolve and report remote URL, source branch, destination ref, and
+remote default branch; never push a MatrixOrigin default branch. Keep credentials,
+private endpoints, and unsanitized session/benchmark evidence out of commits.
 
 ## Appendix: Ownership Map
 

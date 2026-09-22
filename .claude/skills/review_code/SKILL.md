@@ -27,8 +27,12 @@ matching. Safety, admission, routing, blocking, retry, recovery, evaluation, and
 state transitions must use typed fields such as enums, `ErrorKind`,
 `result_class`, `exit_semantics`, structured JSON, protocol parsers, AST/token
 parsers, or exact machine-owned sentinel fields. Text matching is acceptable
-only for UI display/search, rendered-text tests, or explicitly named legacy
-`fallback` parsers that are not the primary decision path.
+only for UI display/search and rendered-text tests, not legacy fallback paths.
+
+Use the model-evidence and read-only review contract in
+[review-changes](../review_changes/SKILL.md) when independent review is required.
+Judge coverage of the current product contract, not old-version compatibility or
+migration behavior that the user has excluded.
 
 ## Task
 
@@ -54,13 +58,15 @@ For each changed behavior, identify:
 | Change signal | Required evidence |
 | --- | --- |
 | Public function/API/CLI command | Happy path plus at least one invalid input/error path |
-| DB write or projection | Test asserts persisted state, not just `Ok(())` |
+| DB query/write/bootstrap or transaction | Real supported DB, public caller, and persisted state/error assertions; mocks or an unopened connection do not prove DB semantics |
 | Restore/sync/checkpoint | Test covers missing, stale, duplicate, or partial data |
 | Auth/permission/capability | Denied case and allowed case |
 | State machine/lifecycle | Out-of-order, double-submit, retry, cancellation, terminal-state behavior; every consumer uses the producer-owned status vocabulary |
 | Async task/channel/lock | Cancellation/timeout/cleanup or bounded queue behavior |
 | Fanout/background work | Partial child completion does not wake/synthesize; lookup miss is not terminal; one canonical group wake after settlement |
 | Prompt/tool/skill selection | Test proves the selection rule, not just string presence |
+| Session I/O, batching, cache | New/existing sessions, cold/warm cache, invalidation/revocation, owner isolation, causal query/transaction counts, and representative contention |
+| Trace/Explain/usage | Parent/child and auxiliary calls, paid retry counts, cache denominator/coverage, missing usage, estimates, and concurrent span timing |
 
 Use `rg` to find tests before reading them:
 
@@ -82,6 +88,18 @@ Weak test:
 - Mocks away the behavior being changed.
 - Tests a helper while the bug lives at the integration boundary.
 - Snapshot/string test is brittle and does not assert the contract.
+- Duplicates another test without proving a distinct invariant, or preserves a
+  removed implementation. Recommend consolidation/deletion, retaining unique
+  current-contract assertions; do not inflate test count as a quality metric.
+- Makes a timeout green by increasing its budget, lowering concurrency, removing
+  assertions, or retrying until success without explaining the original failure.
+
+For performance claims, require comparable baseline/candidate workloads and
+record achieved concurrency, hardware/database/provider configuration, cache
+state, duration, throughput, latency distribution, and failures as relevant.
+Sequential sessions or a small smoke run do not prove thousands of concurrent
+sessions. A bounded test is useful evidence with stated limits, not a scale claim.
+Unavailable required DB/live evidence is a verification gap, not a pass.
 
 Covered:
 

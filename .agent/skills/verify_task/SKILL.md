@@ -68,12 +68,17 @@ Run only gates that can be affected by the change.
 | Shared Rust API | `cargo check --workspace --all-targets` plus affected tests |
 | Runtime/server lifecycle | Focused runtime tests, then `cargo check -p astra-runtime` |
 | Turn/tool/prompt behavior | Focused turn/runtime tests plus prompt/tool surface assertions |
-| Services/storage/MatrixOne | Focused services tests; online DB check only when configured and relevant |
+| Services/storage/MatrixOne | Focused tests plus real DB/public-caller verification for changed schema/query/transaction/bootstrap behavior; record unavailable required DB evidence as missing and apply the verdict rules below |
 | CLI/TUI | Focused `astra-cli` tests or command dry run |
 | Frontend/SDK | Relevant package script or existing make target |
 | Shell/deployment | Exact owning make/script dry run |
 
 Run raw cargo commands from the repository root; `Cargo.toml` is the workspace manifest.
+
+Keep checks bounded and relevant; skill/docs changes do not need database tests
+or a Rust build. Reuse valid evidence for unchanged code and isolate failed cases
+instead of repeatedly launching long suites. Do not raise timeouts, lower load,
+weaken assertions, or rerun until green as a substitute for a fix.
 
 ## Phase 3: Execute And Interpret
 
@@ -86,6 +91,24 @@ For each criterion record:
 
 If a command fails, stop broadening and diagnose the failed gate first. A later broad
 test cannot make an earlier required failure irrelevant.
+
+For optimization claims, compare the same workload and state assumptions before
+and after. Record actual concurrency, new/existing sessions, cache state, I/O and
+transaction counts, throughput, latency distribution, failures, and resource use
+where relevant. Separate setup from steady-state time without hiding setup failures.
+Report untested scale as unknown, not extrapolated capacity.
+
+For model-cost/observation changes, reconcile primary, child, auxiliary, and retry
+calls against the canonical ledger; distinguish estimates, missing usage, and
+provider-reported totals. Check cache percentage denominator/coverage and avoid
+double-counting cache/reasoning subsets or overlapping time spans. Cost estimates
+must identify pricing source/date, cache pricing, currency and any exchange-rate
+assumption. A cheaper judgment does not prove lower total task cost or equal quality.
+
+Before an authorized commit, check independent review evidence for the current
+diff using the model rules in [review-changes](../review_changes/SKILL.md).
+Do not substitute self-review or stale approval. Report CI as pending/failed/passed;
+do not wait for CI unless asked, and never report pending CI as a completed gate.
 
 ## Phase 4: Delivery Report
 
@@ -104,13 +127,18 @@ Commands:
 
 Residual Risk:
 - <only real gaps, such as online DB not available>
+
+Change and benefit:
+- <behavior, removed/replaced implementations/tests, measured gains and tradeoffs>
+- <reproduction command or manual verification steps; scope and evidence limits>
 ```
 
-Verdict rules:
+Apply the first matching verdict rule below. Missing evidence never overrides a
+known required failure.
 
 | Evidence | Verdict |
 | --- | --- |
-| All required criteria pass | verified |
-| Required pass, optional/skipped checks have justified residual risk | verified with warnings |
 | Any required criterion fails | failed |
-| Verification could not run enough evidence to judge | inconclusive |
+| No required criterion fails, but a required check lacks evidence, including DB or independent review when required | inconclusive |
+| All required criteria pass, only optional checks are skipped with justified residual risk | verified with warnings |
+| All required criteria pass | verified |
