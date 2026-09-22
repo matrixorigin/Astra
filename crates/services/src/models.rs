@@ -1849,7 +1849,7 @@ pub async fn revalidate_admitted_model_executions(
             continue;
         }
         let execution = if let Some(row) = personal.get(offering_id) {
-            admitted_user_model_from_row(row, offering_id, encryptor, &pool).await?
+            admitted_user_model_from_row(row, offering_id, encryptor)?
         } else {
             let cache_key = ActiveLlmModelCacheKey::for_offering_id(matrixone, offering_id);
             let row = deployment.get(offering_id).ok_or_else(|| {
@@ -1894,14 +1894,24 @@ pub async fn revalidate_admitted_model_executions(
         resolved.insert(offering_id.as_str(), execution.clone());
         ordered.push(execution);
     }
+    let compatible_endpoints = ordered
+        .iter()
+        .filter(|execution| {
+            execution.access_kind == ModelAccessKind::CloudByok
+                && execution.provider == crate::byok_endpoint::COMPATIBLE_PROVIDER
+        })
+        .map(|execution| execution.base_url.as_str())
+        .collect::<Vec<_>>();
+    crate::byok_endpoint::require_endpoint_policies(&pool, &compatible_endpoints)
+        .await
+        .map_err(ModelOfferingResolutionError::Backend)?;
     Ok(ordered)
 }
 
-async fn admitted_user_model_from_row(
+fn admitted_user_model_from_row(
     row: &sqlx::mysql::MySqlRow,
     offering_id: &str,
     encryptor: &FernetTokenEncryptor,
-    pool: &sqlx::MySqlPool,
 ) -> Result<AdmittedModelExecution, ModelOfferingResolutionError> {
     let alias: String = row.try_get("model_alias").map_err(|error| {
         ModelOfferingResolutionError::Backend(format!(
@@ -1941,11 +1951,6 @@ async fn admitted_user_model_from_row(
     let base_url: String = row
         .try_get("base_url")
         .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
-    if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
-        crate::byok_endpoint::require_endpoint_policy(pool, &base_url)
-            .await
-            .map_err(ModelOfferingResolutionError::Backend)?;
-    }
     let upstream: String = row
         .try_get("model_name")
         .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;

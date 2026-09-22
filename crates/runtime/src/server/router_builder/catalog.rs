@@ -26,6 +26,10 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             get(data_layer::models::get_model_access_handler),
         )
         .route(
+            "/model-access/admit",
+            post(data_layer::models::admit_child_models_handler),
+        )
+        .route(
             "/models",
             post(data_layer::models::create_model_handler)
                 .get(data_layer::models::list_models_handler),

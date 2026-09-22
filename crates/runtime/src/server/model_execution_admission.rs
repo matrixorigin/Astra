@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use astra_core::ErrorResponse;
+use astra_server_types::{ModelAdmissionResponseV1, ModelAdmissionResultV1, ModelAdmissionSlotV1};
 use astra_services::{
     AdmittedModelExecution, ModelService,
     runs::{ResolvedModelSelection, RuntimeAuthRequest, RuntimeCapabilityDescriptorRequest},
@@ -9,6 +10,65 @@ use astra_turn_types::ModelSelection;
 use axum::{Json, http::StatusCode};
 
 use crate::error_response_coded;
+
+/// All-or-error child-model preflight. Execution material stays on Server;
+/// only a safe display projection crosses back to CLI.
+pub(crate) async fn admit_child_model_slots(
+    model_service: &Arc<dyn ModelService>,
+    user_id: String,
+    slots: Vec<ModelAdmissionSlotV1>,
+    reasoning: Vec<astra_turn_core::orchestration_spawn_tool::ReasoningSelection>,
+) -> Result<ModelAdmissionResponseV1, (StatusCode, Json<ErrorResponse>)> {
+    use astra_core::model_wire::purpose::ModelRequestPurpose;
+    if reasoning.len() != slots.len() {
+        return Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "model admission reasoning count does not match slots",
+            "model_admission_batch_invalid",
+        ));
+    }
+    let executions = model_service
+        .admit_model_offerings(
+            user_id,
+            slots.iter().map(|slot| slot.offering_id.clone()).collect(),
+        )
+        .await?;
+    if executions.len() != slots.len() {
+        return Err(error_response_coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "batch model admission returned incomplete results",
+            "model_catalog_unavailable",
+        ));
+    }
+    let mut admitted = Vec::with_capacity(slots.len());
+    for ((slot, reasoning), execution) in slots.into_iter().zip(reasoning).zip(executions) {
+        if execution.offering_id != slot.offering_id {
+            return Err(error_response_coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "batch model admission returned mismatched Offering",
+                "model_catalog_unavailable",
+            ));
+        }
+        astra_services::models::validate_model_execution_purpose(
+            &execution,
+            ModelRequestPurpose::Chat,
+        )?;
+        validate_reasoning_control(&execution, &reasoning.config()).map_err(|error| {
+            error_response_coded(
+                StatusCode::BAD_REQUEST,
+                error,
+                "model_reasoning_unsupported",
+            )
+        })?;
+        admitted.push(ModelAdmissionResultV1 {
+            offering_id: slot.offering_id,
+            reasoning: slot.reasoning,
+            model_name: execution.model_name,
+            context_window: execution.context_window,
+        });
+    }
+    Ok(ModelAdmissionResponseV1 { slots: admitted })
+}
 
 /// Validate one exact reasoning control against already-admitted execution
 /// material. This is deliberately pure: callers perform it after Offering
@@ -261,6 +321,52 @@ mod tests {
         ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
             unsupported()
         }
+    }
+
+    #[tokio::test]
+    async fn child_model_batch_preflight_is_all_or_error_and_redacts_execution_material() {
+        let service: Arc<dyn ModelService> = Arc::new(StaticModelService);
+        let slot = |id: &str, reasoning: serde_json::Value| ModelAdmissionSlotV1 {
+            offering_id: id.to_string(),
+            reasoning,
+        };
+        let default = astra_turn_core::orchestration_spawn_tool::ReasoningSelection::ModelDefault;
+        let admitted = admit_child_model_slots(
+            &service,
+            "user-a".into(),
+            vec![
+                slot("offer-a", serde_json::json!({"mode":"model_default"})),
+                slot("offer-b", serde_json::json!({"mode":"model_default"})),
+            ],
+            vec![default.clone(), default],
+        )
+        .await
+        .expect("both slots admitted");
+        assert_eq!(admitted.slots.len(), 2);
+        assert_eq!(admitted.slots[1].offering_id, "offer-b");
+        let wire = serde_json::to_string(&admitted).unwrap();
+        assert!(!wire.contains("server-secret"));
+        assert!(!wire.contains("models.example"));
+
+        let error = admit_child_model_slots(
+            &service,
+            "user-a".into(),
+            vec![
+                slot("offer-a", serde_json::json!({"mode":"model_default"})),
+                slot("offer-b", serde_json::json!({"mode":"off"})),
+            ],
+            vec![
+                astra_turn_core::orchestration_spawn_tool::ReasoningSelection::ModelDefault,
+                astra_turn_core::orchestration_spawn_tool::ReasoningSelection::Off,
+            ],
+        )
+        .await
+        .expect_err("invalid final slot rejects the entire batch");
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.0.error_code.as_deref(),
+            Some("model_reasoning_unsupported")
+        );
     }
 
     #[tokio::test]

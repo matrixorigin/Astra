@@ -75,6 +75,14 @@ one bounded user-scoped batch, and binds each admitted execution to its slot.
 An inherited parent Offering reuses the parent's admission without another
 catalog read. Any invalid or revoked slot fails preparation for the entire
 fanout; admission does not authorize a partial launch.
+CLI fanout uses the same Server-owned check through one `/model-access/admit`
+request when slots explicitly select a model or reasoning control. The response
+contains only display name and context-window metadata; it is not a reusable
+authorization token, and inference still revalidates the Offering. An
+inherited-only CLI batch keeps its existing single catalog lookup. A mixed
+batch with inherited slots requires the parent's exact Offering identity;
+without it, preparation fails before remote I/O instead of guessing from a
+display name.
 
 ## Result integration
 

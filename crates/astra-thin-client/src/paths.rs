@@ -365,6 +365,7 @@ pub const HEALTH: &str = "/health";
 
 pub const MODELS: &str = "/models";
 pub const MODEL_ACCESS: &str = "/model-access";
+pub const MODEL_ACCESS_ADMIT: &str = "/model-access/admit";
 pub const ME_MODELS: &str = "/me/models";
 pub const ME_MODEL_VALIDATE_ENDPOINT: &str = "/me/models/validate-endpoint";
 

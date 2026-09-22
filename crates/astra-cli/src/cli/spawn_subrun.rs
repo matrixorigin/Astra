@@ -2,6 +2,7 @@
 //!
 //! Runs spawned agents using the same agentic loop infrastructure as delegation.
 
+use astra_server_types::{ModelAdmissionRequestV1, ModelAdmissionResponseV1, ModelAdmissionSlotV1};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -668,40 +669,118 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         context: &SpawnContext,
         parent_selection: Option<&astra_turn_types::ModelSelection>,
     ) -> Result<Vec<Box<dyn PreparedSpawn>>, String> {
-        if inputs
+        for input in inputs {
+            input.fanout_slot_identity()?;
+        }
+        let has_override = inputs
             .iter()
-            .any(|input| input.model_selection.is_some() || input.reasoning.is_some())
+            .any(|input| input.model_selection.is_some() || input.reasoning.is_some());
+        if has_override
+            && parent_selection.is_none()
+            && inputs.iter().any(|input| input.model_selection.is_none())
         {
-            return Err("this execution boundary cannot pre-admit per-slot model or reasoning selections for an atomic fanout".to_string());
+            return Err("a fanout with per-slot overrides requires an exact parent Offering for inherited slots".to_string());
         }
         let token = self.resolve_token_async().await?;
-        let model = if let Some(parent_selection) = parent_selection {
-            crate::cli::session::session_runtime::resolve_server_offering_selection(
-                &self.api,
-                &token,
-                &parent_selection.offering_id,
-            )
-            .await?
+        let selections = if !has_override {
+            // Keep the inherited-only path at its existing single catalog
+            // lookup. It does not need a new preflight request.
+            let model = if let Some(parent_selection) = parent_selection {
+                crate::cli::session::session_runtime::resolve_server_offering_selection(
+                    &self.api,
+                    &token,
+                    &parent_selection.offering_id,
+                )
+                .await?
+            } else {
+                let inherited_model = self.resolve_effective_model(None);
+                crate::cli::skill_subrun::resolve_subrun_model_selection(
+                    &self.api,
+                    &token,
+                    inherited_model.as_deref(),
+                )
+                .await?
+            };
+            vec![model; inputs.len()]
         } else {
-            // A display name without a typed Offering is not an admitted
-            // model choice. Match single-spawn fallback to the CLI default.
-            let inherited_model = self.resolve_effective_model(None);
-            crate::cli::skill_subrun::resolve_subrun_model_selection(
-                &self.api,
-                &token,
-                inherited_model.as_deref(),
+            let request = ModelAdmissionRequestV1 {
+                slots: inputs
+                    .iter()
+                    .map(|input| {
+                        let offering_id = input
+                            .model_selection
+                            .as_ref()
+                            .map(|selection| selection.offering_id.as_str())
+                            .or_else(|| parent_selection.map(|selection| selection.offering_id.as_str()))
+                            .ok_or_else(|| "child has no admitted parent or default Offering".to_string())?;
+                        astra_services::validate_model_offering_id(offering_id)
+                            .map_err(|error| error.to_string())?;
+                        let reasoning = input.reasoning.clone().unwrap_or(
+                            astra_turn_core::orchestration_spawn_tool::ReasoningSelection::ModelDefault,
+                        );
+                        Ok(ModelAdmissionSlotV1 {
+                            offering_id: offering_id.to_string(),
+                            reasoning: serde_json::to_value(reasoning).map_err(|error| error.to_string())?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+            };
+            let body = serde_json::to_value(&request).map_err(|error| error.to_string())?;
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                self.api.post_bearer_path_json_text(
+                    &token,
+                    astra_thin_client::paths::MODEL_ACCESS_ADMIT,
+                    &body,
+                ),
             )
-            .await?
+            .await
+            .map_err(|_| "model admission timed out before child launch".to_string())?
+            .map_err(|error| error.to_string())?;
+            let response: ModelAdmissionResponseV1 = serde_json::from_str(&response)
+                .map_err(|error| format!("invalid model admission response: {error}"))?;
+            if response.slots.len() != request.slots.len() {
+                return Err("model admission response has incomplete slot coverage".to_string());
+            }
+            request
+                .slots
+                .iter()
+                .zip(response.slots)
+                .map(|(requested, admitted)| {
+                    if admitted.offering_id != requested.offering_id
+                        || admitted.reasoning != requested.reasoning
+                        || admitted.model_name.trim().is_empty()
+                        || admitted.context_window == Some(0)
+                    {
+                        return Err("model admission response does not match the requested slot"
+                            .to_string());
+                    }
+                    Ok(crate::cli::session::session_runtime::ServerModelSelection {
+                        name: admitted.model_name,
+                        context_window: admitted.context_window,
+                        offering_id: admitted.offering_id,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?
         };
         inputs
             .iter()
-            .map(|input| {
+            .zip(selections)
+            .map(|(input, model)| {
                 Ok(Box::new(CliPreparedSpawn {
                     executor: Arc::clone(&self),
                     parent_run_id: context.parent_run_id.clone(),
-                    parent_selection: parent_selection.cloned(),
+                    requested_selection: input
+                        .model_selection
+                        .clone()
+                        .or_else(|| parent_selection.cloned()),
+                    reasoning: input
+                        .reasoning
+                        .as_ref()
+                        .map(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::config)
+                        .unwrap_or(astra_turn_core::thinking_config::ThinkingConfig::ModelDefault),
                     slot: input.fanout_slot_identity()?,
-                    model: model.clone(),
+                    model,
                 }) as Box<dyn PreparedSpawn>)
             })
             .collect()
@@ -715,7 +794,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
 struct CliPreparedSpawn {
     executor: Arc<CliSpawnAgentExecutor>,
     parent_run_id: String,
-    parent_selection: Option<astra_turn_types::ModelSelection>,
+    requested_selection: Option<astra_turn_types::ModelSelection>,
+    reasoning: astra_turn_core::thinking_config::ThinkingConfig,
     slot: Option<AgentFanoutSlotIdentity>,
     model: crate::cli::session::session_runtime::ServerModelSelection,
 }
@@ -729,8 +809,8 @@ impl PreparedSpawn for CliPreparedSpawn {
             .map(|address| address.run_id.as_str())
             != Some(self.parent_run_id.as_str())
             || config.fanout_slot != self.slot
-            || config.model_selection != self.parent_selection
-            || config.thinking != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault
+            || config.model_selection != self.requested_selection
+            || config.thinking != self.reasoning
         {
             return Err(
                 "prepared CLI fanout model does not match its parent, slot, Offering, or reasoning"
@@ -1589,14 +1669,81 @@ mod tests {
         SharedAgentLiveEventSink,
     };
     use astra_turn_core::interruption::InterruptionKind;
+    use astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity;
     use astra_turn_core::orchestration_types::CancellationOrigin;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::path::PathBuf;
     use std::sync::Arc;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::cli::chat_stream::StreamEvent;
+
+    fn cli_fanout_test_context() -> SpawnContext {
+        SpawnContext {
+            parent_run_id: "parent-run".into(),
+            parent_agent_id: "parent-agent".into(),
+            resolved_model_name: Some("parent-model".into()),
+            recursion_depth: 0,
+            parent_is_fork_child: false,
+            working_dir: PathBuf::from("/tmp"),
+            inherited_permissions: InheritedPermissions::auto_approve(),
+            inherited_skills: Vec::new(),
+            live_event_sink: None,
+            client_tool_delivery_tx: None,
+            trace_context: None,
+            spawn_tool_call_id: None,
+            execution_metadata: None,
+            workspace_mutation: Default::default(),
+            delegation_chain: Vec::new(),
+        }
+    }
+
+    fn prepared_cli_test_config(
+        slot: Option<AgentFanoutSlotIdentity>,
+        model_selection: Option<astra_turn_types::ModelSelection>,
+        thinking: astra_turn_core::thinking_config::ThinkingConfig,
+    ) -> SpawnRunConfig {
+        let (inherited_permissions, permission_context) = test_permission_context();
+        SpawnRunConfig {
+            run_id: "child-run".into(),
+            cancellation_binding_id: "child-binding".into(),
+            agent_id: "child@run".into(),
+            spawn_tool_call_id: None,
+            recursion_depth: 1,
+            agent_type: "explore".into(),
+            description: "test slot".into(),
+            task: "reply".into(),
+            system_prompt_addendum: String::new(),
+            model_selection,
+            fanout_slot: slot,
+            thinking,
+            model: Some("parent-model".into()),
+            initial_turns: 1,
+            hard_turn_limit: Some(0),
+            allowed_tools: Vec::new(),
+            read_only: true,
+            workspace_mutation: Default::default(),
+            working_dir: PathBuf::from("/tmp"),
+            mailbox: None,
+            progress_emitter: None,
+            context_cache: None,
+            inherited_permissions,
+            parent_address: Some(astra_messaging::types::AgentAddress::new(
+                "parent-run",
+                "parent-agent",
+            )),
+            permission_context,
+            inherited_skills: Vec::new(),
+            live_event_sink: None,
+            client_tool_delivery_tx: None,
+            inherited_prefix: None,
+            execution_metadata: None,
+            is_fork_child: false,
+            delegation_chain: Vec::new(),
+            work_item: None,
+        }
+    }
 
     #[tokio::test]
     async fn cli_fanout_resolves_inherited_offering_once_before_spawning() {
@@ -1635,23 +1782,7 @@ mod tests {
             PathBuf::from("/tmp"),
             None,
         ));
-        let context = SpawnContext {
-            parent_run_id: "parent-run".into(),
-            parent_agent_id: "parent-agent".into(),
-            resolved_model_name: Some("parent-model".into()),
-            recursion_depth: 0,
-            parent_is_fork_child: false,
-            working_dir: PathBuf::from("/tmp"),
-            inherited_permissions: InheritedPermissions::auto_approve(),
-            inherited_skills: Vec::new(),
-            live_event_sink: None,
-            client_tool_delivery_tx: None,
-            trace_context: None,
-            spawn_tool_call_id: None,
-            execution_metadata: None,
-            workspace_mutation: Default::default(),
-            delegation_chain: Vec::new(),
-        };
+        let context = cli_fanout_test_context();
         let inputs = (0..2)
             .map(|slot| SpawnAgentInput {
                 description: format!("slot {slot}"),
@@ -1672,48 +1803,28 @@ mod tests {
         assert_eq!(prepared.len(), 2);
         server.verify().await;
 
-        let (inherited_permissions, permission_context) = test_permission_context();
-        let wrong_slot = SpawnRunConfig {
-            run_id: "child-run".into(),
-            cancellation_binding_id: "child-binding".into(),
-            agent_id: "child@run".into(),
-            spawn_tool_call_id: None,
-            recursion_depth: 1,
-            agent_type: "explore".into(),
-            description: "wrong slot".into(),
-            task: "reply".into(),
-            system_prompt_addendum: String::new(),
-            model_selection: Some(parent.clone()),
-            fanout_slot: inputs[0].fanout_slot_identity().unwrap(),
-            thinking: astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
-            model: Some("parent-model".into()),
-            initial_turns: 1,
-            hard_turn_limit: Some(1),
-            allowed_tools: Vec::new(),
-            read_only: true,
-            workspace_mutation: Default::default(),
-            working_dir: PathBuf::from("/tmp"),
-            mailbox: None,
-            progress_emitter: None,
-            context_cache: None,
-            inherited_permissions,
-            parent_address: Some(astra_messaging::types::AgentAddress::new(
-                "parent-run",
-                "parent-agent",
-            )),
-            permission_context,
-            inherited_skills: Vec::new(),
-            live_event_sink: None,
-            client_tool_delivery_tx: None,
-            inherited_prefix: None,
-            execution_metadata: None,
-            is_fork_child: false,
-            delegation_chain: Vec::new(),
-            work_item: None,
-        };
+        let wrong_slot = prepared_cli_test_config(
+            inputs[0].fanout_slot_identity().unwrap(),
+            Some(parent.clone()),
+            astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
+        );
+        let mut prepared = prepared.into_iter();
+        let inherited = prepared
+            .next()
+            .unwrap()
+            .execute(prepared_cli_test_config(
+                inputs[0].fanout_slot_identity().unwrap(),
+                Some(parent.clone()),
+                astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
+            ))
+            .await
+            .expect_err("valid binding reaches the non-network turn-limit guard");
+        assert!(
+            inherited.contains("hard_turn_limit must be positive"),
+            "{inherited}"
+        );
         let error = prepared
-            .into_iter()
-            .nth(1)
+            .next()
             .unwrap()
             .execute(wrong_slot)
             .await
@@ -1724,14 +1835,20 @@ mod tests {
         let mut unsupported = inputs;
         unsupported[1].reasoning =
             Some(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::Off);
+        Mock::given(method("POST"))
+            .and(path("/model-access/admit"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("reasoning unsupported"))
+            .expect(1)
+            .mount(&server)
+            .await;
         let error = match Arc::clone(&executor)
             .prepare_batch(&unsupported, &context, Some(&parent))
             .await
         {
-            Ok(_) => panic!("explicit reasoning cannot claim atomic CLI admission"),
+            Ok(_) => panic!("unsupported reasoning must reject the entire batch"),
             Err(error) => error,
         };
-        assert!(error.contains("cannot pre-admit"), "{error}");
+        assert!(error.contains("reasoning unsupported"), "{error}");
         server.verify().await;
 
         let unavailable_server = MockServer::start().await;
@@ -1788,6 +1905,213 @@ mod tests {
         };
         assert!(revoked_error.contains("not active"), "{revoked_error}");
         revoked_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn cli_fanout_preadmits_mixed_inherited_and_explicit_models_atomically() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/model-access/admit"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "slots": [
+                    {"offering_id":"offer-flash","reasoning":{"mode":"model_default"},"model_name":"deepseek-v4-flash","context_window":128000},
+                    {"offering_id":"offer-glm","reasoning":{"mode":"adaptive","effort":"high"},"model_name":"glm-5.2","context_window":200000}
+                ]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let executor = Arc::new(CliSpawnAgentExecutor::new(
+            astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+            "token".into(),
+            PathBuf::from("/tmp"),
+            None,
+        ));
+        let context = cli_fanout_test_context();
+        let inputs = [
+            SpawnAgentInput {
+                description: "flash review".into(),
+                prompt: "review".into(),
+                fanout_group_id: Some("review".into()),
+                fanout_target_count: Some(2),
+                fanout_slot_index: Some(0),
+                ..Default::default()
+            },
+            SpawnAgentInput {
+                description: "glm review".into(),
+                prompt: "review".into(),
+                model_selection: Some(astra_turn_types::ModelSelection {
+                    offering_id: "offer-glm".into(),
+                }),
+                reasoning: Some(
+                    astra_turn_core::orchestration_spawn_tool::ReasoningSelection::Adaptive {
+                        effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+                    },
+                ),
+                fanout_group_id: Some("review".into()),
+                fanout_target_count: Some(2),
+                fanout_slot_index: Some(1),
+                ..Default::default()
+            },
+        ];
+        let parent = astra_turn_types::ModelSelection {
+            offering_id: "offer-flash".into(),
+        };
+        let prepared = Arc::clone(&executor)
+            .prepare_batch(&inputs, &context, Some(&parent))
+            .await
+            .expect("both slots admitted before launch");
+        assert_eq!(prepared.len(), 2);
+        for (prepared, input) in prepared.into_iter().zip(&inputs) {
+            let result = prepared
+                .execute(prepared_cli_test_config(
+                    input.fanout_slot_identity().unwrap(),
+                    input
+                        .model_selection
+                        .clone()
+                        .or_else(|| Some(parent.clone())),
+                    input
+                        .reasoning
+                        .as_ref()
+                        .map(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::config)
+                        .unwrap_or(astra_turn_core::thinking_config::ThinkingConfig::ModelDefault),
+                ))
+                .await
+                .expect_err("valid binding reaches the non-network turn-limit guard");
+            assert!(
+                result.contains("hard_turn_limit must be positive"),
+                "{result}"
+            );
+        }
+        let mut explicit_inputs = inputs.clone();
+        explicit_inputs[0].model_selection = Some(parent.clone());
+        let explicit = Arc::clone(&executor)
+            .prepare_batch(&explicit_inputs, &context, None)
+            .await
+            .expect("all-explicit slots need no parent lookup");
+        assert_eq!(explicit.len(), 2);
+        server.verify().await;
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "one admission POST per group; no catalog GET or child request"
+        );
+        assert_eq!(
+            requests[0].body_json::<Value>().unwrap()["slots"][1]["offering_id"],
+            "offer-glm"
+        );
+
+        let mismatch_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/model-access/admit"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "slots": [
+                    {"offering_id":"offer-flash","reasoning":{"mode":"model_default"},"model_name":"deepseek-v4-flash","context_window":128000},
+                    {"offering_id":"offer-other","reasoning":{"mode":"adaptive","effort":"high"},"model_name":"glm-5.2","context_window":200000}
+                ]
+            })))
+            .expect(1)
+            .mount(&mismatch_server)
+            .await;
+        let mismatch_executor = Arc::new(CliSpawnAgentExecutor::new(
+            astra_thin_client::ThinClient::new(&mismatch_server.uri(), None).unwrap(),
+            "token".into(),
+            PathBuf::from("/tmp"),
+            None,
+        ));
+        assert!(
+            Arc::clone(&mismatch_executor)
+                .prepare_batch(&inputs, &context, Some(&parent))
+                .await
+                .is_err()
+        );
+        mismatch_server.verify().await;
+        for status in [401, 503] {
+            let failure_server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/model-access/admit"))
+                .respond_with(ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&failure_server)
+                .await;
+            let failure_executor = Arc::new(CliSpawnAgentExecutor::new(
+                astra_thin_client::ThinClient::new(&failure_server.uri(), None).unwrap(),
+                "token".into(),
+                PathBuf::from("/tmp"),
+                None,
+            ));
+            assert!(
+                Arc::clone(&failure_executor)
+                    .prepare_batch(&inputs, &context, Some(&parent))
+                    .await
+                    .is_err(),
+                "HTTP {status} must not prepare any slot"
+            );
+            failure_server.verify().await;
+            assert_eq!(failure_server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_fanout_consumes_inherited_model_with_explicit_reasoning() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/model-access/admit"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "slots": [{
+                    "offering_id":"offer-parent",
+                    "reasoning":{"mode":"off"},
+                    "model_name":"parent-model",
+                    "context_window":128000
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let executor = Arc::new(CliSpawnAgentExecutor::new(
+            astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+            "token".into(),
+            PathBuf::from("/tmp"),
+            None,
+        ));
+        let input = SpawnAgentInput {
+            description: "reasoning override".into(),
+            prompt: "reply".into(),
+            reasoning: Some(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::Off),
+            fanout_group_id: Some("group".into()),
+            fanout_target_count: Some(1),
+            fanout_slot_index: Some(0),
+            ..Default::default()
+        };
+        let parent = astra_turn_types::ModelSelection {
+            offering_id: "offer-parent".into(),
+        };
+        let prepared = Arc::clone(&executor)
+            .prepare_batch(
+                std::slice::from_ref(&input),
+                &cli_fanout_test_context(),
+                Some(&parent),
+            )
+            .await
+            .expect("reasoning-only slot admitted");
+        let result = prepared
+            .into_iter()
+            .next()
+            .unwrap()
+            .execute(prepared_cli_test_config(
+                input.fanout_slot_identity().unwrap(),
+                Some(parent),
+                astra_turn_core::thinking_config::ThinkingConfig::Off,
+            ))
+            .await
+            .expect_err("valid binding reaches the non-network turn-limit guard");
+        assert!(
+            result.contains("hard_turn_limit must be positive"),
+            "{result}"
+        );
+        server.verify().await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1856,6 +2180,34 @@ mod tests {
                 .is_ok()
         );
         server.verify().await;
+        let mixed = [
+            SpawnAgentInput {
+                fanout_group_id: Some("mixed".into()),
+                fanout_target_count: Some(2),
+                fanout_slot_index: Some(0),
+                ..inputs[0].clone()
+            },
+            SpawnAgentInput {
+                description: "explicit".into(),
+                prompt: "reply".into(),
+                model_selection: Some(astra_turn_types::ModelSelection {
+                    offering_id: "explicit-offer".into(),
+                }),
+                fanout_group_id: Some("mixed".into()),
+                fanout_target_count: Some(2),
+                fanout_slot_index: Some(1),
+                ..Default::default()
+            },
+        ];
+        let error = match Arc::clone(&executor)
+            .prepare_batch(&mixed, &context, None)
+            .await
+        {
+            Ok(_) => panic!("untyped inherited slot cannot join an overridden fanout"),
+            Err(error) => error,
+        };
+        assert!(error.contains("exact parent Offering"), "{error}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[test]

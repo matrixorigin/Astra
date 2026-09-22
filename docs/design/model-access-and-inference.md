@@ -245,6 +245,8 @@ their own provider account.
   owner-scoped and deployment reads, preserving per-Offering freshness without
   one database round trip per child. The all-or-nothing batch is validated
   before any child is launched; inherited parent admission adds no read.
+  Strict compatible-endpoint policy checks distinct child endpoints in one
+  trusted-domain query; the default public-HTTPS policy uses no domain read.
 - Create, credential rotation and explicit probe validate connectivity with a
   small output budget using the same provider-specific wire-field rule as
   inference: OpenAI (including o-series) and the generic OpenAI-compatible

@@ -4,6 +4,7 @@ pub mod conflict_resolver;
 #[cfg(feature = "server")]
 pub mod edge_connection_pool;
 pub mod edge_ws_protocol;
+mod model_admission;
 pub mod session_run_tree;
 #[cfg(feature = "server")]
 pub mod team_orchestrator_traits;
@@ -43,6 +44,9 @@ pub use completions::{
 pub use edge_ws_protocol::{
     EDGE_AUTH_TIMEOUT_SECS, EDGE_HEARTBEAT_INTERVAL_SECS, EDGE_TOOL_RESULT_GRACE_SECS,
     EDGE_TOOL_TIMEOUT_SECS, EdgeClientMessage, EdgeServerMessage, MAX_EDGE_TOOL_TIMEOUT_SECS,
+};
+pub use model_admission::{
+    ModelAdmissionRequestV1, ModelAdmissionResponseV1, ModelAdmissionResultV1, ModelAdmissionSlotV1,
 };
 pub use session_run_tree::{
     SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction, SessionRunLifecycleStatus, SessionRunNode,

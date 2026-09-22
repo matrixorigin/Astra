@@ -569,6 +569,47 @@ async fn compatible_byok_admission_rechecks_trust_and_owner() {
         .unwrap();
     assert_eq!(admitted.wire_model_name.as_deref(), Some("upstream-model"));
     assert_eq!(admitted.provider, "openai-compatible");
+    let second_model_id = Uuid::new_v4().to_string();
+    let second_host = format!("{}.example.com", Uuid::new_v4().simple());
+    let second_domain_id = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO user_llm_models (model_id, user_id, model_alias, model_name, provider, api_key_encrypted, base_url, context_window, is_default, is_active) VALUES (?, ?, 'gateway-two', 'upstream-model', 'openai-compatible', ?, ?, 128000, 0, 1)")
+        .bind(&second_model_id)
+        .bind(&owner)
+        .bind(encryptor.encrypt("test-secret-two").unwrap())
+        .bind(format!("https://{second_host}/v1"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO runtime_llm_trusted_domains (domain_id, domain_host, domain_port, is_enabled) VALUES (?, ?, 443, 1)")
+        .bind(&second_domain_id)
+        .bind(&second_host)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let batch = service
+        .admit_model_offerings(
+            owner.clone(),
+            vec![model_id.clone(), second_model_id.clone()],
+        )
+        .await
+        .expect("distinct trusted endpoints pass one batch");
+    assert_eq!(batch.len(), 2);
+    sqlx::query("UPDATE runtime_llm_trusted_domains SET is_enabled = 0 WHERE domain_id = ?")
+        .bind(&second_domain_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        service
+            .admit_model_offerings(
+                owner.clone(),
+                vec![model_id.clone(), second_model_id.clone()]
+            )
+            .await
+            .is_err(),
+        strict,
+        "revoking the second trusted endpoint rejects the entire batch only in strict mode"
+    );
     sqlx::query("UPDATE user_llm_models SET base_url = ? WHERE model_id = ?")
         .bind(format!("https://{host}:8443/v1"))
         .bind(&model_id)
@@ -637,8 +678,19 @@ async fn compatible_byok_admission_rechecks_trust_and_owner() {
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::query("DELETE FROM user_llm_models WHERE user_id = ? AND model_id = ?")
+        .bind(&owner)
+        .bind(&second_model_id)
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM runtime_llm_trusted_domains WHERE domain_id = ?")
         .bind(&domain_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM runtime_llm_trusted_domains WHERE domain_id = ?")
+        .bind(&second_domain_id)
         .execute(&pool)
         .await
         .unwrap();
