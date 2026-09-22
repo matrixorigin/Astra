@@ -1826,7 +1826,6 @@ async fn cleanup_session_delete_fixture_for_owner(
     for table in [
         "ctx_decision_audits",
         "ctx_snapshots",
-        "transcript_pages",
         "session_artifacts",
         "eval_calibration_assessments",
         "conversation_log",
@@ -7764,24 +7763,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         .expect("insert conversation log");
     }
 
-    for (user_id, page_seq, page_hash) in [
-        (&owner_user_id, 1_i64, "page-owner"),
-        (&other_user_id, 7_i64, "page-foreign"),
-    ] {
-        sqlx::query(
-            "INSERT INTO transcript_pages \
-             (user_id, session_id, page_seq, start_item_seq, end_item_seq, item_count, page_hash) \
-             VALUES (?, ?, ?, 1, 2, 2, ?)",
-        )
-        .bind(user_id)
-        .bind(&session_id)
-        .bind(page_seq)
-        .bind(page_hash)
-        .execute(&pool)
-        .await
-        .expect("insert transcript page");
-    }
-
     for (user_id, calibration_id, marker) in [
         (&owner_user_id, &owner_calibration_id, "owner"),
         (&other_user_id, &foreign_calibration_id, "foreign"),
@@ -8100,7 +8081,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         ),
         ("conversation_log", "conversation_log"),
         ("session_artifacts", "session_artifacts"),
-        ("transcript_pages", "transcript_pages"),
         (
             "eval_calibration_assessments",
             "eval_calibration_assessments",
@@ -8362,16 +8342,6 @@ async fn session_delete_removes_owner_scoped_database_rows_and_local_files_on_li
     .await
     .expect("insert owner session");
     sqlx::query(
-        "INSERT INTO transcript_pages \
-         (user_id, session_id, page_seq, start_item_seq, end_item_seq, item_count, page_hash) \
-         VALUES (?, ?, 1, 1, 2, 2, 'page-owner')",
-    )
-    .bind(&owner_user_id)
-    .bind(&session_id)
-    .execute(&pool)
-    .await
-    .expect("insert owner transcript page");
-    sqlx::query(
         "INSERT INTO conversation_log \
          (user_id, session_id, seq, turn, entry_type, payload) \
          VALUES (?, ?, 1, 1, 0, '{\"type\":\"snapshot\",\"seq\":1,\"turn\":1,\"messages\":[],\"session_state\":{}}')",
@@ -8430,7 +8400,6 @@ async fn session_delete_removes_owner_scoped_database_rows_and_local_files_on_li
 
     for label in [
         "agent_sessions",
-        "transcript_pages",
         "ctx_snapshots",
         "ctx_decision_audits",
         "conversation_log",
@@ -9054,12 +9023,11 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
         .await
         .expect("publish personal skill version fixture");
     state_projection_store
-        .activate_personal_skill_from_ui_with_probe(
+        .activate_personal_skill_from_ui(
             &user_id,
             &state_session,
             &active_skill_name,
             &active_skill_version.version_id,
-            None,
         )
         .await
         .expect("activate personal skill");

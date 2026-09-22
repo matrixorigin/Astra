@@ -3,7 +3,7 @@
 //!
 //! Extracted from [`super`] to keep the lifecycle module manageable.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,19 +46,12 @@ use crate::{
     DatabaseEvaluationService, DatabaseEventService, DatabaseTraceEventWriter,
     EventCreateRequestData, EventService,
 };
-use astra_services::db_row::{RowDecoder, RowExt};
+use astra_services::storage::admit_session_event_write;
 
 use super::{
     build_runtime_event_service, build_runtime_turn_evaluation_event, flush_turn_observability,
     persist_runtime_promotion_events, persist_turn_evaluation_journal,
 };
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct TranscriptPageItemRow {
-    item_seq: i64,
-    role: String,
-    content_hash: String,
-}
 
 const DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY: usize = 4;
 const METRIC_TURN_OBSERVER_DISPATCHES_TOTAL: &str = "astra_turn_observer_dispatches_total";
@@ -191,15 +184,6 @@ fn run_token_usage_json(state: &AgenticLoopState) -> Option<Value> {
     object.remove("prompt_cache_hit_ratio");
     object.insert("scope".into(), json!("runtime_accounted_usage"));
     Some(usage)
-}
-
-fn decode_transcript_page_item_row(row: &impl RowExt) -> Result<TranscriptPageItemRow, String> {
-    let dec = RowDecoder::new(row, "transcript page item row");
-    Ok(TranscriptPageItemRow {
-        item_seq: dec.positive_i64("item_seq")?,
-        role: dec.non_empty_string("role")?,
-        content_hash: dec.non_empty_string("content_hash")?,
-    })
 }
 
 /// Bundles all handles needed by post-loop best-effort persistence calls.
@@ -1239,8 +1223,8 @@ async fn persist_server_loop_canonical_append_inner(
     }
 
     // The transcript gets one ordered durable sequence in this same
-    // transaction. Delegated runs include their terminal assistant here;
-    // roots defer it until the canonical context cursor is committed.
+    // transaction, including recoverable root terminal assistant evidence.
+    // Cursor promotion later certifies the contiguous committed projection.
     if let Err(error) = persist_server_loop_transcript_items_in_tx(
         &mut tx,
         append.user_id,
@@ -2128,7 +2112,7 @@ async fn persist_server_loop_transcript_items_in_tx(
     .into_iter()
     .filter(|item| capture_outcome.accepts_projection(&item.source_event_id))
     .collect::<Vec<_>>();
-    persist_session_transcript_items_inner_in_tx(tx, user_id, session_id, &items)
+    append_session_transcript_items_admitted_in_tx(tx, user_id, session_id, &items)
         .await
         .map_err(|error| error.to_string())
 }
@@ -2152,9 +2136,12 @@ pub(crate) async fn persist_session_transcript_items(
             return Err(format!("failed to begin transcript transaction: {error}"));
         }
     };
-    if let Err(error) =
-        persist_session_transcript_items_inner_in_tx(&mut tx, user_id, session_id, items).await
-    {
+    let result = async {
+        admit_session_event_write(&mut tx, session_id, user_id, false).await?;
+        append_session_transcript_items_admitted_in_tx(&mut tx, user_id, session_id, items).await
+    }
+    .await;
+    if let Err(error) = result {
         astra_core::agent_error!(
             "server-loop",
             "failed to persist transcript items for session {session_id}: {error}"
@@ -2447,7 +2434,7 @@ async fn update_run_assistant_transcript_reasoning_in_tx(
     .bind(item_seq)
     .execute(&mut **tx)
     .await?;
-    sync_transcript_page_inner(tx, user_id, session_id, transcript_page_seq(item_seq)).await
+    Ok(())
 }
 
 async fn load_durable_run_transcript_projection(
@@ -2537,9 +2524,21 @@ pub(crate) async fn materialize_server_run_transcript_evidence(
         .begin()
         .await
         .map_err(|error| error.to_string())?;
-    if let Err(error) =
-        persist_session_transcript_items_inner_in_tx(&mut tx, user_id, session_id, &evidence_items)
-            .await
+    if let Err(error) = admit_session_event_write(&mut tx, session_id, user_id, false).await {
+        return Err(rollback_materialized_transcript_transaction(
+            tx,
+            "admitting transcript materialization",
+            error,
+        )
+        .await);
+    }
+    if let Err(error) = append_session_transcript_items_admitted_in_tx(
+        &mut tx,
+        user_id,
+        session_id,
+        &evidence_items,
+    )
+    .await
     {
         return Err(rollback_materialized_transcript_transaction(
             tx,
@@ -3072,192 +3071,169 @@ fn build_server_loop_trace_events(
     events
 }
 
-/// Variant that uses an existing transaction instead of creating its own.
-/// The caller owns commit/rollback.
-pub(crate) async fn persist_session_transcript_items_inner_in_tx(
+// Bounds apply to SQL parameters and their encoded payload, independently.
+// A single indivisible item may exceed the byte target; it is sent alone.
+const TRANSCRIPT_BATCH_BINDS: usize = 512;
+const TRANSCRIPT_BATCH_BYTES: usize = 256 * 1024;
+const TRANSCRIPT_MEMBERSHIP_ROWS: usize = 128;
+const TRANSCRIPT_INSERT_BINDS: usize = 9;
+
+/// Append only after canonical session admission in this same transaction.
+/// The caller owns commit/rollback, including any enclosing event capture.
+/// Identity equality belongs to the database column's collation, not Rust.
+pub(crate) async fn append_session_transcript_items_admitted_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     user_id: &str,
     session_id: &str,
     items: &[TranscriptPersistItem],
 ) -> Result<(), sqlx::Error> {
-    let owned_session = sqlx::query(
-        "SELECT 1 AS owned
-         FROM agent_sessions
-         WHERE session_id = ? AND user_id = ?
-         LIMIT 1
-         FOR UPDATE",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if owned_session.is_none() {
-        return Err(sqlx::Error::RowNotFound);
-    }
-
-    let row = sqlx::query(
-        "SELECT COALESCE(MAX(item_seq), 0) + 1 AS next_seq
-         FROM session_transcript_items
-         WHERE session_id = ? AND user_id = ?",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .fetch_one(&mut **tx)
-    .await?;
-    let mut next_seq = row.try_get::<i64, _>("next_seq")?;
-    let mut dirty_pages = BTreeSet::new();
-
-    for item in items {
-        let existing = sqlx::query(
-            "SELECT 1 AS existing
-             FROM session_transcript_items
-             WHERE session_id = ? AND user_id = ? AND source_event_id = ?
-             LIMIT 1",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .bind(&item.source_event_id)
-        .fetch_optional(&mut **tx)
-        .await?;
-        if existing.is_some() {
-            continue;
+    let mut next_seq = None;
+    let mut offset = 0;
+    while offset < items.len() {
+        let mut end = offset;
+        let mut bytes = user_id.len() + session_id.len();
+        while end < items.len()
+            && end - offset < TRANSCRIPT_MEMBERSHIP_ROWS
+            && end - offset + 2 < TRANSCRIPT_BATCH_BINDS
+        {
+            let item_bytes = items[end].source_event_id.len() + 64;
+            if end > offset && bytes.saturating_add(item_bytes) > TRANSCRIPT_BATCH_BYTES {
+                break;
+            }
+            bytes = bytes.saturating_add(item_bytes);
+            end += 1;
+        }
+        let chunk = &items[offset..end];
+        // The empty column arm supplies source_event_id's database type and
+        // collation, including when the table has no rows. GROUP BY resolves
+        // unseen equivalent IDs inside this chunk; MIN retains first input.
+        // Earlier chunks are inserted before the next read, so the same
+        // database equality also resolves duplicates across chunk boundaries.
+        let mut membership = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "WITH candidates AS (
+                SELECT -1 AS input_ordinal, source_event_id
+                FROM session_transcript_items WHERE 1 = 0",
+        );
+        for (ordinal, item) in chunk.iter().enumerate() {
+            membership.push(" UNION ALL SELECT ");
+            membership.push(ordinal);
+            membership.push(", ");
+            membership.push_bind(&item.source_event_id);
+        }
+        membership.push(
+            ") SELECT MIN(c.input_ordinal) AS input_ordinal
+             FROM candidates c
+             LEFT JOIN session_transcript_items stored
+               ON stored.source_event_id = c.source_event_id
+              AND stored.user_id = ",
+        );
+        membership.push_bind(user_id);
+        membership.push(" AND stored.session_id = ");
+        membership.push_bind(session_id);
+        membership.push(
+            " WHERE stored.item_seq IS NULL
+              GROUP BY c.source_event_id ORDER BY input_ordinal ASC",
+        );
+        let ordinals = membership
+            .build_query_scalar::<i64>()
+            .fetch_all(&mut **tx)
+            .await?;
+        if !ordinals.is_empty() && next_seq.is_none() {
+            next_seq = Some(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COALESCE(MAX(item_seq), 0) + 1
+                     FROM session_transcript_items
+                     WHERE session_id = ? AND user_id = ?",
+                )
+                .bind(session_id)
+                .bind(user_id)
+                .fetch_one(&mut **tx)
+                .await?,
+            );
         }
 
-        let item_seq = next_seq;
-        let payload_json = item
-            .payload
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|error| {
-                sqlx::Error::Protocol(format!(
-                    "serialize transcript payload for {}: {error}",
-                    item.source_event_id
-                ))
+        let mut pending = Vec::new();
+        let mut pending_bytes = 0_usize;
+        for ordinal in ordinals {
+            let item = chunk
+                .get(usize::try_from(ordinal).map_err(|_| {
+                    sqlx::Error::Protocol("negative transcript input ordinal".to_string())
+                })?)
+                .ok_or_else(|| {
+                    sqlx::Error::Protocol("transcript input ordinal out of bounds".to_string())
+                })?;
+            let payload_json = item
+                .payload
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| {
+                    sqlx::Error::Protocol(format!("serialize transcript payload: {error}"))
+                })?;
+            let item_bytes = session_id.len()
+                + user_id.len()
+                + item.run_id.as_ref().map_or(0, String::len)
+                + item.role.len()
+                + item.content.len()
+                + payload_json.as_ref().map_or(0, String::len)
+                + item.source_event_id.len()
+                + 128;
+            pending.push((item, payload_json, item_bytes));
+        }
+        let mut start = 0;
+        while start < pending.len() {
+            let mut stop = start;
+            while stop < pending.len()
+                && (stop - start + 1) * TRANSCRIPT_INSERT_BINDS <= TRANSCRIPT_BATCH_BINDS
+            {
+                let item_bytes = pending[stop].2;
+                if stop > start && pending_bytes.saturating_add(item_bytes) > TRANSCRIPT_BATCH_BYTES
+                {
+                    break;
+                }
+                pending_bytes = pending_bytes.saturating_add(item_bytes);
+                stop += 1;
+            }
+            let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
+                "INSERT INTO session_transcript_items
+                 (session_id, item_seq, user_id, run_id, role, content, payload_json,
+                  source_event_id, content_hash, created_at) ",
+            );
+            // At least one new identity established the sole lazy MAX read.
+            let sequence = next_seq
+                .as_mut()
+                .expect("new transcript sequence allocated");
+            sequence.checked_add((stop - start) as i64).ok_or_else(|| {
+                sqlx::Error::Protocol("transcript sequence exhausted".to_string())
             })?;
-        sqlx::query(
-            "INSERT INTO session_transcript_items
-             (session_id, item_seq, user_id, run_id, role, content, payload_json,
-              source_event_id, source_event_idx, content_hash, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NOW(6))",
-        )
-        .bind(session_id)
-        .bind(item_seq)
-        .bind(user_id)
-        .bind(&item.run_id)
-        .bind(item.role)
-        .bind(&item.content)
-        .bind(&payload_json)
-        .bind(&item.source_event_id)
-        .bind(transcript_content_hash(
-            item.role,
-            &item.content,
-            payload_json.as_deref(),
-        ))
-        .execute(&mut **tx)
-        .await?;
-        dirty_pages.insert(transcript_page_seq(item_seq));
-        next_seq += 1;
+            insert.push_values(&pending[start..stop], |mut row, (item, payload, _)| {
+                row.push_bind(session_id)
+                    .push_bind(*sequence)
+                    .push_bind(user_id)
+                    .push_bind(&item.run_id)
+                    .push_bind(item.role)
+                    .push_bind(&item.content)
+                    .push_bind(payload)
+                    .push_bind(&item.source_event_id)
+                    .push_bind(transcript_content_hash(
+                        item.role,
+                        &item.content,
+                        payload.as_deref(),
+                    ))
+                    .push("NOW(6)");
+                *sequence += 1;
+            });
+            insert.push(astra_core::matrixone_null_shape_comment(
+                pending[start..stop]
+                    .iter()
+                    .flat_map(|(item, payload, _)| [item.run_id.is_some(), payload.is_some()]),
+            ));
+            insert.build().execute(&mut **tx).await?;
+            start = stop;
+            pending_bytes = 0;
+        }
+        offset = end;
     }
-
-    for page_seq in dirty_pages {
-        sync_transcript_page_inner(tx, user_id, session_id, page_seq).await?;
-    }
-
-    Ok(())
-}
-
-const TRANSCRIPT_PAGE_SIZE: i64 = 50;
-
-pub(crate) fn transcript_page_seq(item_seq: i64) -> i64 {
-    ((item_seq.max(1) - 1) / TRANSCRIPT_PAGE_SIZE) + 1
-}
-
-pub(crate) fn transcript_page_bounds(page_seq: i64) -> (i64, i64) {
-    let page_seq = page_seq.max(1);
-    let start = ((page_seq - 1) * TRANSCRIPT_PAGE_SIZE) + 1;
-    let end = start + TRANSCRIPT_PAGE_SIZE - 1;
-    (start, end)
-}
-
-async fn sync_transcript_page_inner(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    user_id: &str,
-    session_id: &str,
-    page_seq: i64,
-) -> Result<(), sqlx::Error> {
-    let (start_item_seq, end_item_seq) = transcript_page_bounds(page_seq);
-    let rows = sqlx::query(
-        "SELECT item_seq, role, content_hash
-         FROM session_transcript_items
-         WHERE session_id = ? AND user_id = ? AND item_seq BETWEEN ? AND ?
-         ORDER BY item_seq ASC",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .bind(start_item_seq)
-    .bind(end_item_seq)
-    .fetch_all(&mut **tx)
-    .await?;
-    if rows.is_empty() {
-        sqlx::query(
-            "DELETE FROM transcript_pages WHERE session_id = ? AND user_id = ? AND page_seq = ?",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .bind(page_seq)
-        .execute(&mut **tx)
-        .await?;
-        return Ok(());
-    }
-
-    let page_items = rows
-        .iter()
-        .map(decode_transcript_page_item_row)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(sqlx::Error::Protocol)?;
-    let Some(first_page_item) = page_items.first() else {
-        return Err(sqlx::Error::Protocol(
-            "non-empty transcript page rows decoded into an empty page item set".to_string(),
-        ));
-    };
-    let Some(last_page_item) = page_items.last() else {
-        return Err(sqlx::Error::Protocol(
-            "non-empty transcript page rows decoded into an empty page item set".to_string(),
-        ));
-    };
-    let first_item_seq = first_page_item.item_seq;
-    let last_item_seq = last_page_item.item_seq;
-    let mut hasher = Sha256::new();
-    for item in &page_items {
-        hasher.update(item.item_seq.to_string().as_bytes());
-        hasher.update([0]);
-        hasher.update(item.role.as_bytes());
-        hasher.update([0]);
-        hasher.update(item.content_hash.as_bytes());
-        hasher.update([0xff]);
-    }
-    let page_hash = format!("{:x}", hasher.finalize());
-    sqlx::query(
-        "INSERT INTO transcript_pages
-         (user_id, session_id, page_seq, start_item_seq, end_item_seq, item_count, page_hash, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
-         ON DUPLICATE KEY UPDATE
-           start_item_seq = VALUES(start_item_seq),
-           end_item_seq = VALUES(end_item_seq),
-           item_count = VALUES(item_count),
-           page_hash = VALUES(page_hash),
-           updated_at = NOW(6)",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .bind(page_seq)
-    .bind(first_item_seq)
-    .bind(last_item_seq)
-    .bind(rows.len() as i64)
-    .bind(page_hash)
-    .execute(&mut **tx)
-    .await?;
     Ok(())
 }
 
@@ -4853,133 +4829,6 @@ mod tests {
         assert_eq!(token_usage["total"], 22);
     }
 
-    struct FakeRunLifecyclePersistenceRow {
-        failed_column: Option<&'static str>,
-        item_seq: i64,
-        role: &'static str,
-        content_hash: &'static str,
-    }
-
-    impl Default for FakeRunLifecyclePersistenceRow {
-        fn default() -> Self {
-            Self {
-                failed_column: None,
-                item_seq: 7,
-                role: "assistant",
-                content_hash: "sha256:page-item",
-            }
-        }
-    }
-
-    impl FakeRunLifecyclePersistenceRow {
-        fn fail_on(column: &'static str) -> Self {
-            Self {
-                failed_column: Some(column),
-                ..Self::default()
-            }
-        }
-
-        fn with_item_seq(item_seq: i64) -> Self {
-            Self {
-                item_seq,
-                ..Self::default()
-            }
-        }
-
-        fn with_role(role: &'static str) -> Self {
-            Self {
-                role,
-                ..Self::default()
-            }
-        }
-
-        fn with_content_hash(content_hash: &'static str) -> Self {
-            Self {
-                content_hash,
-                ..Self::default()
-            }
-        }
-    }
-
-    impl RowExt for FakeRunLifecyclePersistenceRow {
-        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
-            if self.failed_column == Some(column) {
-                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
-            }
-            match column {
-                "item_seq" => Ok(self.item_seq),
-                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
-            }
-        }
-
-        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
-            if self.failed_column == Some(column) {
-                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
-            }
-            match column {
-                "role" => Ok(self.role.to_string()),
-                "content_hash" => Ok(self.content_hash.to_string()),
-                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
-            }
-        }
-    }
-
-    #[test]
-    fn transcript_page_item_row_decode_preserves_database_values() {
-        let row =
-            decode_transcript_page_item_row(&FakeRunLifecyclePersistenceRow::default()).unwrap();
-
-        assert_eq!(
-            row,
-            TranscriptPageItemRow {
-                item_seq: 7,
-                role: "assistant".to_string(),
-                content_hash: "sha256:page-item".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn transcript_page_item_row_decode_fails_loudly_on_any_selected_column_error() {
-        for column in ["item_seq", "role", "content_hash"] {
-            let error =
-                decode_transcript_page_item_row(&FakeRunLifecyclePersistenceRow::fail_on(column))
-                    .unwrap_err();
-            assert!(
-                error.contains("transcript page item row") && error.contains(column),
-                "decode error should identify selected column `{column}`: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn transcript_page_item_row_decode_rejects_invalid_page_identity() {
-        for item_seq in [0, -1] {
-            let error = decode_transcript_page_item_row(
-                &FakeRunLifecyclePersistenceRow::with_item_seq(item_seq),
-            )
-            .unwrap_err();
-            assert!(
-                error.contains("item_seq") && error.contains("positive integer"),
-                "invalid item_seq should fail loudly: {error}"
-            );
-        }
-
-        for (column, row) in [
-            ("role", FakeRunLifecyclePersistenceRow::with_role("   ")),
-            (
-                "content_hash",
-                FakeRunLifecyclePersistenceRow::with_content_hash(""),
-            ),
-        ] {
-            let error = decode_transcript_page_item_row(&row).unwrap_err();
-            assert!(
-                error.contains(column) && error.contains("non-empty string"),
-                "empty transcript page identity column should fail loudly for `{column}`: {error}"
-            );
-        }
-    }
-
     async fn cleanup_transcript_fixture_for_owner(
         db: &sqlx::Pool<sqlx::MySql>,
         session_id: &str,
@@ -4993,18 +4842,20 @@ mod tests {
         .execute(db)
         .await
         .expect("cleanup transcript fixture projection head");
-        sqlx::query("DELETE FROM transcript_pages WHERE session_id = ? AND user_id = ?")
-            .bind(session_id)
-            .bind(user_id)
-            .execute(db)
-            .await
-            .expect("cleanup transcript fixture transcript_pages");
         sqlx::query("DELETE FROM session_transcript_items WHERE session_id = ? AND user_id = ?")
             .bind(session_id)
             .bind(user_id)
             .execute(db)
             .await
             .expect("cleanup transcript fixture session_transcript_items");
+        sqlx::query(
+            "DELETE FROM agent_session_lifecycle_fences WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .execute(db)
+        .await
+        .expect("cleanup transcript fixture lifecycle fence");
         sqlx::query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
             .bind(session_id)
             .bind(user_id)
@@ -5026,12 +4877,6 @@ mod tests {
         .execute(db)
         .await
         .expect("cleanup core persist projection head");
-        sqlx::query("DELETE FROM transcript_pages WHERE session_id = ? AND user_id = ?")
-            .bind(session_id)
-            .bind(user_id)
-            .execute(db)
-            .await
-            .expect("cleanup core persist transcript_pages");
         sqlx::query("DELETE FROM session_transcript_items WHERE session_id = ? AND user_id = ?")
             .bind(session_id)
             .bind(user_id)
@@ -5056,6 +4901,14 @@ mod tests {
             .execute(db)
             .await
             .expect("cleanup core persist agent_sessions");
+        sqlx::query(
+            "DELETE FROM agent_session_lifecycle_fences WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .execute(db)
+        .await
+        .expect("cleanup core persist lifecycle fence");
     }
 
     #[tokio::test]
@@ -6368,7 +6221,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-    async fn transcript_persistence_writes_owner_scoped_pages_and_rejects_wrong_owner() {
+    async fn transcript_persistence_batches_items_and_enforces_admission() {
         let pool = setup_pool().await;
         let db = pool.get().clone();
         let session_id = Uuid::new_v4().to_string();
@@ -6378,6 +6231,23 @@ mod tests {
 
         cleanup_transcript_fixture_for_owner(&db, &session_id, &owner_user_id).await;
         cleanup_transcript_fixture_for_owner(&db, &session_id, &other_user_id).await;
+        persist_session_transcript_items(&pool, &owner_user_id, &session_id, &[])
+            .await
+            .expect("empty standalone append needs no root");
+        persist_session_transcript_items(
+            &pool,
+            &owner_user_id,
+            &session_id,
+            &[TranscriptPersistItem {
+                run_id: None,
+                role: "user",
+                content: "missing root".into(),
+                payload: None,
+                source_event_id: "missing-root".into(),
+            }],
+        )
+        .await
+        .expect_err("standalone append cannot lazily create a root");
 
         sqlx::query(
             "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count)
@@ -6400,17 +6270,6 @@ mod tests {
         .execute(&db)
         .await
         .expect("insert foreign dirty transcript item");
-        sqlx::query(
-            "INSERT INTO transcript_pages
-             (user_id, session_id, page_seq, start_item_seq, end_item_seq, item_count, page_hash, created_at, updated_at)
-             VALUES (?, ?, 1, 1, 1, 1, 'foreign-page', NOW(6), NOW(6))",
-        )
-        .bind(&other_user_id)
-        .bind(&session_id)
-        .execute(&db)
-        .await
-        .expect("insert foreign dirty transcript page");
-
         let items = [
             TranscriptPersistItem {
                 run_id: Some(run_id.clone()),
@@ -6437,21 +6296,6 @@ mod tests {
         persist_session_transcript_items(&pool, &owner_user_id, &session_id, &items)
             .await
             .expect("owner transcript persist");
-
-        let page = sqlx::query(
-            "SELECT user_id, start_item_seq, end_item_seq, item_count
-             FROM transcript_pages
-             WHERE user_id = ? AND session_id = ? AND page_seq = 1",
-        )
-        .bind(&owner_user_id)
-        .bind(&session_id)
-        .fetch_one(&db)
-        .await
-        .expect("owner transcript page");
-        assert_eq!(page.try_get::<String, _>("user_id").unwrap(), owner_user_id);
-        assert_eq!(page.try_get::<i64, _>("start_item_seq").unwrap(), 1);
-        assert_eq!(page.try_get::<i64, _>("end_item_seq").unwrap(), 3);
-        assert_eq!(page.try_get::<i64, _>("item_count").unwrap(), 3);
 
         let owner_rows = sqlx::query(
             "SELECT role, content
@@ -6499,29 +6343,12 @@ mod tests {
             "transcript item identity must include owner"
         );
 
-        let same_page_seq_rows = sqlx::query(
-            "SELECT COUNT(*) AS c
-             FROM transcript_pages
-             WHERE session_id = ? AND page_seq = 1",
-        )
-        .bind(&session_id)
-        .fetch_one(&db)
-        .await
-        .expect("count shared page_seq rows")
-        .try_get::<i64, _>("c")
-        .expect("decode shared page_seq count");
-        assert_eq!(
-            same_page_seq_rows, 2,
-            "transcript page identity must include owner"
-        );
-
-        let mut wrong_owner_tx = db.begin().await.expect("begin wrong-owner transcript tx");
-        let wrong_owner = persist_session_transcript_items_inner_in_tx(
-            &mut wrong_owner_tx,
+        let _wrong_owner = persist_session_transcript_items(
+            &pool,
             &other_user_id,
             &session_id,
             &[TranscriptPersistItem {
-                run_id: Some(run_id),
+                run_id: Some(run_id.clone()),
                 role: "assistant",
                 content: "wrong owner".to_string(),
                 payload: None,
@@ -6530,15 +6357,6 @@ mod tests {
         )
         .await
         .expect_err("wrong owner must not persist transcript rows");
-        wrong_owner_tx
-            .rollback()
-            .await
-            .expect("rollback wrong-owner transcript tx");
-        assert!(
-            matches!(&wrong_owner, sqlx::Error::RowNotFound),
-            "wrong owner should fail closed before writing, got {wrong_owner}"
-        );
-
         let wrong_owner_rows = sqlx::query(
             "SELECT COUNT(*) AS c
              FROM session_transcript_items
@@ -6569,6 +6387,257 @@ mod tests {
         .expect("decode wrong owner attempted content count");
         assert_eq!(wrong_owner_attempt_rows, 0);
 
+        // Probe equality using the actual column, so both binary and
+        // case-insensitive databases exercise their own identity contract.
+        let make_item = |id: &str, content: &str| TranscriptPersistItem {
+            run_id: None,
+            role: "user",
+            content: content.to_string(),
+            payload: None,
+            source_event_id: id.to_string(),
+        };
+        persist_session_transcript_items(
+            &pool,
+            &owner_user_id,
+            &session_id,
+            &[make_item("CaseProbe", "probe")],
+        )
+        .await
+        .expect("seed collation probe");
+        let case_equivalent: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_transcript_items
+             WHERE user_id = ? AND session_id = ? AND source_event_id = ?",
+        )
+        .bind(&owner_user_id)
+        .bind(&session_id)
+        .bind("caseprobe")
+        .fetch_one(&db)
+        .await
+        .expect("read column equality");
+
+        let mut mixed = vec![
+            make_item(&items[0].source_event_id, "conflicting replay"),
+            make_item("within-chunk", "first within"),
+            make_item("WITHIN-CHUNK", "case variant"),
+            make_item("within-chunk", "conflicting duplicate"),
+            make_item("across-chunks", "first across"),
+            make_item("equal-text-one", "equal text"),
+            make_item("equal-text-two", "equal text"),
+        ];
+        let filler_count = TRANSCRIPT_MEMBERSHIP_ROWS * 2 + 3;
+        for index in 0..filler_count {
+            mixed.push(make_item(&format!("filler-{index}"), &"x".repeat(6000)));
+        }
+        mixed.push(make_item("ACROSS-CHUNKS", "case variant across"));
+        mixed.push(make_item("across-chunks", "conflicting across"));
+        mixed.push(make_item("last-new", "last"));
+        persist_session_transcript_items(&pool, &owner_user_id, &session_id, &mixed)
+            .await
+            .expect("mixed replay and new identities across bounded chunks");
+        // An exact replay must keep all existing sequences and first content.
+        persist_session_transcript_items(&pool, &owner_user_id, &session_id, &mixed)
+            .await
+            .expect("all replay");
+        let actual = sqlx::query_as::<_, (i64, String, String)>(
+            "SELECT item_seq, source_event_id, content FROM session_transcript_items
+             WHERE user_id = ? AND session_id = ? ORDER BY item_seq",
+        )
+        .bind(&owner_user_id)
+        .bind(&session_id)
+        .fetch_all(&db)
+        .await
+        .expect("read ordered batch");
+        let mut expected = items
+            .iter()
+            .map(|item| (item.source_event_id.clone(), item.content.clone()))
+            .collect::<Vec<_>>();
+        expected.push(("CaseProbe".into(), "probe".into()));
+        expected.push(("within-chunk".into(), "first within".into()));
+        if case_equivalent == 0 {
+            expected.push(("WITHIN-CHUNK".into(), "case variant".into()));
+        }
+        expected.extend([
+            ("across-chunks".into(), "first across".into()),
+            ("equal-text-one".into(), "equal text".into()),
+            ("equal-text-two".into(), "equal text".into()),
+        ]);
+        for index in 0..filler_count {
+            expected.push((format!("filler-{index}"), "x".repeat(6000)));
+        }
+        if case_equivalent == 0 {
+            expected.push(("ACROSS-CHUNKS".into(), "case variant across".into()));
+        }
+        expected.push(("last-new".into(), "last".into()));
+        assert_eq!(actual.len(), expected.len());
+        for (index, ((sequence, id, content), expected)) in actual.iter().zip(&expected).enumerate()
+        {
+            assert_eq!(*sequence, index as i64 + 1);
+            assert_eq!((id, content), (&expected.0, &expected.1));
+        }
+
+        let mut admitted = db.begin().await.expect("hold session admission");
+        admit_session_event_write(&mut admitted, &session_id, &owner_user_id, false)
+            .await
+            .expect("admit first concurrent writer");
+        append_session_transcript_items_admitted_in_tx(
+            &mut admitted,
+            &owner_user_id,
+            &session_id,
+            &[make_item("concurrent-shared", "first writer")],
+        )
+        .await
+        .expect("first writer's uncommitted item");
+        let overlapping = [
+            make_item("concurrent-shared", "second writer conflict"),
+            make_item("concurrent-new", "second writer new"),
+        ];
+        let mut waiting = Box::pin(persist_session_transcript_items(
+            &pool,
+            &owner_user_id,
+            &session_id,
+            &overlapping,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut waiting)
+                .await
+                .is_err(),
+            "same-session admission must wait"
+        );
+        let independent_session = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count)
+             VALUES (?, ?, 'independent transcript', 'active', 0)",
+        )
+        .bind(&independent_session)
+        .bind(&other_user_id)
+        .execute(&db)
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            persist_session_transcript_items(
+                &pool,
+                &other_user_id,
+                &independent_session,
+                &[make_item("concurrent-shared", "independent owner/session")],
+            ),
+        )
+        .await
+        .expect("unrelated session is not serialized")
+        .expect("independent writer succeeds");
+        admitted.commit().await.expect("release first writer");
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("same-session writer resumes")
+            .expect("overlap replays");
+        let concurrent = sqlx::query_as::<_, (i64, String, String)>(
+            "SELECT item_seq, source_event_id, content FROM session_transcript_items
+             WHERE user_id = ? AND session_id = ? AND item_seq > ? ORDER BY item_seq",
+        )
+        .bind(&owner_user_id)
+        .bind(&session_id)
+        .bind(expected.len() as i64)
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            concurrent,
+            vec![
+                (
+                    expected.len() as i64 + 1,
+                    "concurrent-shared".into(),
+                    "first writer".into()
+                ),
+                (
+                    expected.len() as i64 + 2,
+                    "concurrent-new".into(),
+                    "second writer new".into()
+                ),
+            ]
+        );
+        cleanup_transcript_fixture_for_owner(&db, &independent_session, &other_user_id).await;
+
+        // The old unconditional MAX + 1 overflows here even for empty/replay
+        // appends. Neither operation needs allocation or an ownership lookup.
+        sqlx::query(
+            "UPDATE session_transcript_items SET item_seq = ?
+             WHERE user_id = ? AND session_id = ? AND source_event_id = 'last-new'",
+        )
+        .bind(i64::MAX)
+        .bind(&owner_user_id)
+        .bind(&session_id)
+        .execute(&db)
+        .await
+        .expect("seed allocation boundary");
+        persist_session_transcript_items(&pool, &owner_user_id, &session_id, &mixed)
+            .await
+            .expect("all replay must not allocate");
+        let mut empty_tx = db.begin().await.expect("empty transaction");
+        append_session_transcript_items_admitted_in_tx(
+            &mut empty_tx,
+            &owner_user_id,
+            &session_id,
+            &[],
+        )
+        .await
+        .expect("empty append has no SQL");
+        empty_tx.rollback().await.expect("finish empty transaction");
+
+        // Root status and both durable deletion fence states reject even a
+        // replay. Standalone writes must use the canonical admission boundary.
+        sqlx::query(
+            "UPDATE agent_sessions SET status = 'deleting' WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&owner_user_id)
+        .bind(&session_id)
+        .execute(&db)
+        .await
+        .unwrap();
+        persist_session_transcript_items(&pool, &owner_user_id, &session_id, &items)
+            .await
+            .expect_err("deleting root rejects transcript append");
+        sqlx::query(
+            "UPDATE agent_sessions SET status = 'active' WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&owner_user_id)
+        .bind(&session_id)
+        .execute(&db)
+        .await
+        .unwrap();
+        for completed in [false, true] {
+            let sql = if completed {
+                "UPDATE agent_session_lifecycle_fences SET database_deleted_at = NOW(6)
+                 WHERE user_id = ? AND session_id = ?"
+            } else {
+                "UPDATE agent_session_lifecycle_fences SET delete_requested_at = NOW(6)
+                 WHERE user_id = ? AND session_id = ?"
+            };
+            let mut deleting = db.begin().await.expect("begin deletion fence");
+            sqlx::query(sql)
+                .bind(&owner_user_id)
+                .bind(&session_id)
+                .execute(&mut *deleting)
+                .await
+                .expect("set deletion fence");
+            let mut racing = Box::pin(persist_session_transcript_items(
+                &pool,
+                &owner_user_id,
+                &session_id,
+                &items,
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut racing)
+                    .await
+                    .is_err(),
+                "append waits for pending deletion transaction"
+            );
+            deleting.commit().await.expect("publish deletion fence");
+            tokio::time::timeout(Duration::from_secs(5), racing)
+                .await
+                .expect("append observes committed deletion")
+                .expect_err("deletion fence rejects transcript append");
+        }
+
         cleanup_transcript_fixture_for_owner(&db, &session_id, &owner_user_id).await;
         cleanup_transcript_fixture_for_owner(&db, &session_id, &other_user_id).await;
     }
@@ -6595,7 +6664,7 @@ mod tests {
             astra_services::runs::DatabaseRunStateStore::new(pool.clone())
                 .with_owner_pod_id("transcript-commit-owner"),
         );
-        let engine = crate::server::run::engine::RunEngine::new(store);
+        let engine = crate::server::run::engine::RunEngine::new(store.clone());
         let authority = engine
             .start_run(&run_id, &user_id, &session_id)
             .await
@@ -6615,6 +6684,18 @@ mod tests {
         .expect("terminal assistant item")
         .source_event_id;
 
+        let early_items = transcript_items_from_server_loop(
+            &user_id,
+            &session_id,
+            &run_id,
+            None,
+            "inspect identity",
+            &state,
+            false,
+        );
+        persist_session_transcript_items(&pool, &user_id, &session_id, &early_items[..1])
+            .await
+            .expect("early user is visible before terminal capture");
         let committed = persist_server_loop_canonical_append(
             &pool,
             CanonicalLoopAppend {
@@ -6704,6 +6785,128 @@ mod tests {
             );
         }
 
+        let early_user_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_transcript_items
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND role = 'user'",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&run_id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            early_user_count, 1,
+            "terminal replay preserves early user identity"
+        );
+
+        store
+            .append_event(
+                &user_id,
+                &session_id,
+                &run_id,
+                json!({
+                    "event_type": "reasoning_message_content",
+                    "data": {"content": "durable reasoning"}
+                }),
+            )
+            .await
+            .expect("durable reasoning event");
+        materialize_server_run_transcript_evidence(
+            &pool,
+            &user_id,
+            &session_id,
+            &run_id,
+            None,
+            None,
+        )
+        .await
+        .expect("reasoning-only materialization acquires admission");
+        let enriched: String = sqlx::query_scalar(
+            "SELECT payload_json FROM session_transcript_items
+             WHERE user_id = ? AND session_id = ? AND source_event_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&expected)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&enriched).unwrap()["reasoning"],
+            "durable reasoning"
+        );
+        let replay = terminal_assistant_transcript_item(
+            &user_id,
+            &session_id,
+            &run_id,
+            None,
+            "inspect identity",
+            &state,
+        )
+        .unwrap();
+        persist_session_transcript_items(&pool, &user_id, &session_id, &[replay])
+            .await
+            .expect("replay after enrichment");
+        let after_replay: String = sqlx::query_scalar(
+            "SELECT payload_json FROM session_transcript_items
+             WHERE user_id = ? AND session_id = ? AND source_event_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&expected)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(after_replay, enriched);
+        sqlx::query(
+            "UPDATE agent_sessions SET status = 'deleting' WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .execute(&db)
+        .await
+        .unwrap();
+        materialize_server_run_transcript_evidence(
+            &pool,
+            &user_id,
+            &session_id,
+            &run_id,
+            None,
+            None,
+        )
+        .await
+        .expect_err("reasoning-only materialization rejects deleting root");
+        sqlx::query(
+            "UPDATE agent_sessions SET status = 'active' WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .execute(&db)
+        .await
+        .unwrap();
+        for sql in [
+            "UPDATE agent_session_lifecycle_fences SET delete_requested_at = NOW(6) WHERE user_id = ? AND session_id = ?",
+            "UPDATE agent_session_lifecycle_fences SET database_deleted_at = NOW(6) WHERE user_id = ? AND session_id = ?",
+        ] {
+            sqlx::query(sql)
+                .bind(&user_id)
+                .bind(&session_id)
+                .execute(&db)
+                .await
+                .unwrap();
+            materialize_server_run_transcript_evidence(
+                &pool,
+                &user_id,
+                &session_id,
+                &run_id,
+                None,
+                None,
+            )
+            .await
+            .expect_err("reasoning-only materialization rejects durable deletion");
+        }
+
         cleanup_core_persist_fixture_for_owner(&db, &session_id, &user_id).await;
     }
 
@@ -6781,6 +6984,88 @@ mod tests {
         .expect("decode rolled-back transcript count");
         assert_eq!(ghost_transcript, 0);
 
+        // Fail sequence allocation after one complete membership chunk and
+        // several insert chunks, inside the actual canonical capture boundary.
+        let store = Arc::new(
+            DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("transcript-chunk-rollback"),
+        );
+        let engine = crate::server::run::engine::RunEngine::new(store);
+        let authority = engine
+            .start_run(&run_id, &owner_user_id, &session_id)
+            .await
+            .expect("start rollback run");
+        sqlx::query(
+            "INSERT INTO session_transcript_items
+             (user_id, session_id, item_seq, role, content, content_hash)
+             VALUES (?, ?, ?, 'system', 'existing boundary', 'boundary-hash')",
+        )
+        .bind(&owner_user_id)
+        .bind(&session_id)
+        .bind(i64::MAX - TRANSCRIPT_MEMBERSHIP_ROWS as i64 - 1)
+        .execute(&db)
+        .await
+        .expect("seed sequence exhaustion boundary");
+        for index in 0..TRANSCRIPT_MEMBERSHIP_ROWS / 2 {
+            state
+                .stall
+                .tool_call_records
+                .push(astra_services::session_journal::ToolCallRecord {
+                    tool_call_id: Some(format!("rollback-call-{index}")),
+                    name: "read_file".to_string(),
+                    ok: true,
+                    args_full: Some(r#"{"path":"fixture.rs"}"#.to_string()),
+                    result_full: Some("fixture content".to_string()),
+                    ..Default::default()
+                });
+        }
+        let failure = persist_server_loop_canonical_append(
+            &pool,
+            CanonicalLoopAppend {
+                user_id: &owner_user_id,
+                session_id: &session_id,
+                run_id: &run_id,
+                expected_owner_generation: Some(authority.owner_generation),
+                owner_lease_duration: Some(Duration::from_secs(45)),
+                parent_run_id: None,
+                parent_event_id: None,
+                agent_id: Some("root-agent"),
+                parent_agent_id: None,
+                trace_context: None,
+                user_message: "chunk rollback",
+                model_name: Some("test-model"),
+                include_terminal_assistant: true,
+            },
+            &state,
+        )
+        .await
+        .expect_err("later transcript chunk aborts canonical capture");
+        assert!(
+            failure.contains("transcript sequence exhausted"),
+            "{failure}"
+        );
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_transcript_items WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&owner_user_id)
+        .bind(&session_id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 1, "earlier insert chunks roll back together");
+        let captured: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND run_id = ?",
+        )
+        .bind(&owner_user_id)
+        .bind(&session_id)
+        .bind(&run_id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            captured, 0,
+            "canonical event capture rolls back with transcript chunks"
+        );
+
         cleanup_core_persist_fixture_for_owner(&db, &session_id, &wrong_user_id).await;
         cleanup_core_persist_fixture_for_owner(&db, &session_id, &owner_user_id).await;
     }
@@ -6832,17 +7117,16 @@ mod tests {
             config_version_id: None,
         };
         for _ in 0..2 {
-            let mut tx = db.begin().await.expect("begin exact projection retry");
-            commit_run_transcript_projection_in_tx(
-                &mut tx,
+            materialize_server_run_transcript_evidence(
+                &pool,
                 &user_id,
                 &session_id,
                 &run_one,
-                &cursor_one,
+                None,
+                Some(&cursor_one),
             )
             .await
-            .expect("exact projection retry");
-            tx.commit().await.expect("commit exact projection retry");
+            .expect("cursor-only materialization and exact retry");
         }
 
         let run_three = Uuid::new_v4().to_string();
@@ -6905,6 +7189,24 @@ mod tests {
         .try_get::<Option<i64>, _>("canonical_completed_turn")
         .expect("decode gap item");
         assert_eq!(uncommitted, None);
+        sqlx::query(
+            "UPDATE agent_sessions SET status = 'deleting' WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .execute(&db)
+        .await
+        .unwrap();
+        materialize_server_run_transcript_evidence(
+            &pool,
+            &user_id,
+            &session_id,
+            &run_one,
+            None,
+            Some(&cursor_one),
+        )
+        .await
+        .expect_err("cursor-only materialization rejects deleting root");
 
         cleanup_transcript_fixture_for_owner(&db, &session_id, &user_id).await;
     }

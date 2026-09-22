@@ -4349,11 +4349,11 @@ async fn persist_runtime_promotion_events(
 pub(crate) use persistence::{
     CanonicalLoopAppend, CanonicalTerminalSettlement, PostLoopPersistContext,
     TranscriptPersistItem, TranscriptPersistPayload,
+    append_session_transcript_items_admitted_in_tx,
     build_run_turn_complete_event_with_interruption, materialize_server_run_transcript_evidence,
     persist_server_loop_canonical_append, persist_server_loop_canonical_terminal_settlement,
-    persist_session_transcript_items, persist_session_transcript_items_inner_in_tx,
-    restore_session_state_compact, restore_step_checkpoint_runtime_state, server_trace_context,
-    trace_context_from_subrun_context,
+    persist_session_transcript_items, restore_session_state_compact,
+    restore_step_checkpoint_runtime_state, server_trace_context, trace_context_from_subrun_context,
 };
 use run_state::*;
 

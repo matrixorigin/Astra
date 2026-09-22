@@ -5018,7 +5018,6 @@ fn project_local_agent_transcript_page(
     astra_thin_client::SessionTranscriptPage {
         session_id: session_id.to_string(),
         items,
-        page_refs: Vec::new(),
         next_before_seq,
         has_more,
     }
@@ -5068,7 +5067,6 @@ fn project_local_root_transcript_page(
     astra_thin_client::SessionTranscriptPage {
         session_id: session_id.to_string(),
         items,
-        page_refs: Vec::new(),
         next_before_seq,
         has_more,
     }
@@ -14147,7 +14145,6 @@ mod tests {
         let durable_page = astra_thin_client::SessionTranscriptPage {
             session_id: "session-1".into(),
             items: Vec::new(),
-            page_refs: Vec::new(),
             next_before_seq: None,
             has_more: false,
         };
@@ -14167,7 +14164,6 @@ mod tests {
                 source_event_id: Some("tui:7".into()),
                 created_at: "2026-07-12T00:00:00Z".into(),
             }],
-            page_refs: Vec::new(),
             next_before_seq: None,
             has_more: false,
         };
@@ -14197,7 +14193,6 @@ mod tests {
                 "assistant",
                 "newest replicated answer",
             )],
-            page_refs: Vec::new(),
             next_before_seq: None,
             has_more: false,
         };
@@ -14209,7 +14204,6 @@ mod tests {
                 root_transcript_item(3, "user", "follow-up"),
                 root_transcript_item(4, "assistant", "follow-up answer"),
             ],
-            page_refs: Vec::new(),
             next_before_seq: Some(1),
             has_more: true,
         };
@@ -14247,14 +14241,12 @@ mod tests {
                 root_transcript_item(40, "user", "server request"),
                 root_transcript_item(41, "assistant", "server answer"),
             ],
-            page_refs: Vec::new(),
             next_before_seq: Some(40),
             has_more: true,
         };
         let local_page = astra_thin_client::SessionTranscriptPage {
             session_id: "session-1".into(),
             items: vec![root_transcript_item(1, "user", "local request")],
-            page_refs: Vec::new(),
             next_before_seq: None,
             has_more: false,
         };
@@ -14283,14 +14275,12 @@ mod tests {
         let durable = astra_thin_client::SessionTranscriptPage {
             session_id: "session-1".into(),
             items: vec![thin],
-            page_refs: Vec::new(),
             next_before_seq: None,
             has_more: false,
         };
         let local = astra_thin_client::SessionTranscriptPage {
             session_id: "session-1".into(),
             items: vec![rich],
-            page_refs: Vec::new(),
             next_before_seq: None,
             has_more: false,
         };
@@ -14308,7 +14298,6 @@ mod tests {
         let durable_page = astra_thin_client::SessionTranscriptPage {
             session_id: "session-1".into(),
             items: Vec::new(),
-            page_refs: Vec::new(),
             next_before_seq: None,
             has_more: false,
         };
@@ -14328,7 +14317,6 @@ mod tests {
                 source_event_id: Some("journal:run-review:7".into()),
                 created_at: "2026-07-12T00:00:00Z".into(),
             }],
-            page_refs: Vec::new(),
             next_before_seq: None,
             has_more: false,
         };
@@ -14358,7 +14346,6 @@ mod tests {
                 "assistant",
                 "latest server suffix",
             )],
-            page_refs: Vec::new(),
             next_before_seq: None,
             has_more: false,
         };
@@ -14369,7 +14356,6 @@ mod tests {
                 agent_transcript_item(2, "tool", "inspection output"),
                 agent_transcript_item(3, "assistant", "review conclusion"),
             ],
-            page_refs: Vec::new(),
             next_before_seq: None,
             has_more: false,
         };
@@ -14410,14 +14396,12 @@ mod tests {
         let durable = astra_thin_client::SessionTranscriptPage {
             session_id: "session-1".into(),
             items: vec![thin],
-            page_refs: Vec::new(),
             next_before_seq: None,
             has_more: false,
         };
         let local = astra_thin_client::SessionTranscriptPage {
             session_id: "session-1".into(),
             items: vec![rich],
-            page_refs: Vec::new(),
             next_before_seq: None,
             has_more: false,
         };

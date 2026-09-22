@@ -2,15 +2,11 @@ mod test_support;
 
 use test_support::require_db_it_env;
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::Arc;
 
 use astra_services::{
     BubbleUpTarget, DatabasePersonalSkillStore, DatabaseRunStateStore,
-    DatabaseStateProjectionStore, DelegationProjectionUpsert, SkillActivationLlmProbe,
-    SubmitUserSkillVersion,
+    DatabaseStateProjectionStore, DelegationProjectionUpsert, SubmitUserSkillVersion,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -426,7 +422,7 @@ async fn l2_39_user_scope_memory_loads_into_anchor_budget() {
 
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_41_personal_skill_activation_pins_frozen_version_id() {
+async fn personal_skill_activation_pins_version_and_records_ui_events() {
     let pool = setup_pool().await;
     let (session_id, user_id, _) = ids();
     insert_session(&pool, &session_id, &user_id).await;
@@ -446,34 +442,9 @@ async fn l2_41_personal_skill_activation_pins_frozen_version_id() {
     .unwrap()
     .try_get::<String, _>("payload_json")
     .unwrap();
-    assert!(payload.contains(&version_id));
-}
-
-#[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_42_skill_activation_is_ui_structured_event_not_llm_turn() {
-    let pool = setup_pool().await;
-    let (session_id, user_id, _) = ids();
-    insert_session(&pool, &session_id, &user_id).await;
-    #[derive(Default)]
-    struct CountingLlmProbe(AtomicUsize);
-    impl SkillActivationLlmProbe for CountingLlmProbe {
-        fn record_llm_call(&self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-    let probe = CountingLlmProbe::default();
-    let version_id = publish_personal_skill_version(&pool, &user_id, "debugger").await;
-    DatabaseStateProjectionStore::new(pool.clone())
-        .activate_personal_skill_from_ui_with_probe(
-            &user_id,
-            &session_id,
-            "debugger",
-            &version_id,
-            Some(&probe),
-        )
-        .await
-        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(payload["version_id"], version_id);
+    assert_eq!(payload["activation_source"], "ui_structured_intent");
     let row = sqlx::query(
         "SELECT
           (SELECT COUNT(*) FROM agent_events
@@ -490,11 +461,6 @@ async fn l2_42_skill_activation_is_ui_structured_event_not_llm_turn() {
     .unwrap();
     assert_eq!(row.try_get::<i64, _>("ui_events").unwrap(), 1);
     assert_eq!(row.try_get::<i64, _>("state_events").unwrap(), 1);
-    assert_eq!(
-        probe.0.load(Ordering::SeqCst),
-        0,
-        "UI structured skill activation must not call an LLM client"
-    );
 }
 
 #[tokio::test]

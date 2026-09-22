@@ -3778,7 +3778,6 @@ mod tests {
                     "reasoning_status": "done",
                     "created_at": "2026-07-11T00:00:00"
                 }],
-                "page_refs": [],
                 "next_before_seq": 41,
                 "has_more": false
             })))
@@ -3821,7 +3820,6 @@ mod tests {
                     "content": "Root answer only.",
                     "created_at": "2026-07-11T00:00:00"
                 }],
-                "page_refs": [],
                 "next_before_seq": 41,
                 "has_more": false
             })))

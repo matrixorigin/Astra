@@ -370,7 +370,6 @@ fn char_literal() { let slash = '/'; }
             "run_display_projections",
             "conversation_log",
             "session_transcript_items",
-            "transcript_pages",
             "session_tool_output_batches",
             "session_tool_outputs",
             "tool_invocation_ledger",

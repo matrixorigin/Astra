@@ -374,9 +374,8 @@ pub use skills::{
     UnconfiguredSkillService,
 };
 pub use state_projection::{
-    BubbleUpTarget, DatabaseStateProjectionStore, DelegationProjectionUpsert,
-    SkillActivationLlmProbe, StateItemUpsert, StateProjectionError, UserAnchorMemoryItem,
-    validate_state_mutation,
+    BubbleUpTarget, DatabaseStateProjectionStore, DelegationProjectionUpsert, StateItemUpsert,
+    StateProjectionError, UserAnchorMemoryItem, validate_state_mutation,
 };
 pub use state_sync::{
     LocalOnlySyncService, MatrixOneSyncService, StateSyncService, SyncDirection, SyncResult,

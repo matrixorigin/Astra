@@ -177,10 +177,6 @@ pub struct BubbleUpTarget {
     pub depth: u32,
 }
 
-pub trait SkillActivationLlmProbe: Send + Sync {
-    fn record_llm_call(&self);
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UserAnchorMemoryItem {
     pub item_id: String,
@@ -832,20 +828,6 @@ impl DatabaseStateProjectionStore {
         session_id: &str,
         skill_name: &str,
         version_id: &str,
-    ) -> Result<(), StateProjectionError> {
-        self.activate_personal_skill_from_ui_with_probe(
-            user_id, session_id, skill_name, version_id, None,
-        )
-        .await
-    }
-
-    pub async fn activate_personal_skill_from_ui_with_probe(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        skill_name: &str,
-        version_id: &str,
-        _llm_probe: Option<&dyn SkillActivationLlmProbe>,
     ) -> Result<(), StateProjectionError> {
         let event_id = format!("event-{}", Uuid::new_v4());
         let item_id = bounded_state_item_id("active-skill", &[session_id, skill_name]);

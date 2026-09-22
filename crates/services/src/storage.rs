@@ -107,7 +107,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-22-v88";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-22-v89";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -4461,14 +4461,13 @@ async fn ensure_core_schema_while_leased(
             content LONGTEXT NOT NULL,
             payload_json LONGTEXT NULL,
             source_event_id VARCHAR(128) NULL,
-            source_event_idx BIGINT NULL,
             content_hash VARCHAR(128) NOT NULL,
             canonical_completed_turn BIGINT NULL,
             canonical_conversation_seq BIGINT NULL,
             canonical_root_hash VARCHAR(64) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, session_id, item_seq),
-            INDEX idx_transcript_owner_run_event (user_id, run_id, source_event_idx),
+            INDEX idx_transcript_owner_run (user_id, run_id),
             INDEX idx_transcript_owner_session_source_event (user_id, session_id, source_event_id),
             INDEX idx_transcript_owner_session_commit_item
                 (user_id, session_id, canonical_completed_turn, item_seq)
@@ -4492,27 +4491,6 @@ async fn ensure_core_schema_while_leased(
             config_version_id VARCHAR(128) NULL,
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, session_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "transcript_pages",
-        "CREATE TABLE IF NOT EXISTS transcript_pages (
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            page_seq BIGINT NOT NULL,
-            start_item_seq BIGINT NOT NULL,
-            end_item_seq BIGINT NOT NULL,
-            item_count INT NOT NULL,
-            page_hash VARCHAR(128) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, page_seq),
-            INDEX idx_transcript_pages_owner_session_end (user_id, session_id, end_item_seq),
-            INDEX idx_transcript_pages_owner_session_updated (user_id, session_id, updated_at)
         )",
     )
     .execute(&pool)
@@ -7050,8 +7028,8 @@ async fn verify_core_schema_shape(
     ensure_index_shape(
         &indexes,
         "session_transcript_items",
-        "idx_transcript_owner_run_event",
-        &["user_id", "run_id", "source_event_idx"],
+        "idx_transcript_owner_run",
+        &["user_id", "run_id"],
     )?;
     ensure_index_shape(
         &indexes,
@@ -7070,24 +7048,6 @@ async fn verify_core_schema_shape(
         "idx_transcript_owner_session_source_event",
         &["user_id", "session_id", "source_event_id"],
     )?;
-    ensure_index_shape(
-        &indexes,
-        "transcript_pages",
-        "PRIMARY",
-        &["user_id", "session_id", "page_seq"],
-    )?;
-    for (index, expected_columns) in [
-        (
-            "idx_transcript_pages_owner_session_end",
-            &["user_id", "session_id", "end_item_seq"][..],
-        ),
-        (
-            "idx_transcript_pages_owner_session_updated",
-            &["user_id", "session_id", "updated_at"][..],
-        ),
-    ] {
-        ensure_index_shape(&indexes, "transcript_pages", index, expected_columns)?;
-    }
     ensure_index_shape(
         &indexes,
         "prompt_request_records",

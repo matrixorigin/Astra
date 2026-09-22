@@ -2221,18 +2221,33 @@ async fn four_devices_hydrate_revoke_and_receive_lease_expiry_events() {
         )
         .await
         .expect("S14 second event must make run_event_high_watermark positive");
-    for seq in 1..=4_i64 {
+    let transcript_child = id("transcript-child");
+    insert_run_row(
+        &pool,
+        &user_id,
+        &session_id,
+        &transcript_child,
+        Some(&run_id),
+        &run_id,
+        &format!("{run_id}/{transcript_child}"),
+        1,
+        "completed",
+        None,
+        "node",
+    )
+    .await;
+    for seq in 1..=60_i64 {
         sqlx::query(
             "INSERT INTO session_transcript_items
-             (session_id, item_seq, user_id, run_id, role, content, source_event_idx, content_hash, created_at)
+             (session_id, item_seq, user_id, run_id, role, content, source_event_id, content_hash, created_at)
              VALUES (?, ?, ?, ?, 'assistant', ?, ?, ?, NOW(6))",
         )
         .bind(&session_id)
         .bind(seq)
         .bind(&user_id)
-        .bind(&run_id)
+        .bind(if seq % 10 == 0 { &transcript_child } else { &run_id })
         .bind(format!("transcript item {seq}"))
-        .bind(seq - 1)
+        .bind(format!("transcript-source-{seq}"))
         .bind(id("hash"))
         .execute(pool.get())
         .await
@@ -2390,6 +2405,70 @@ async fn four_devices_hydrate_revoke_and_receive_lease_expiry_events() {
                 .is_some_and(|items| items.len() == 2),
             "S14 cold-start transcript pagination must return requested page; transcript={transcript}"
         );
+
+        if device_idx == 0 {
+            for (scope, expected) in [
+                (String::new(), (1..=60_i64).collect::<Vec<_>>()),
+                (
+                    "&scope=root_conversation".to_string(),
+                    (1..=60_i64).filter(|seq| seq % 10 != 0).collect(),
+                ),
+                (
+                    format!("&run_id={run_id}"),
+                    (1..=60_i64).filter(|seq| seq % 10 != 0).collect(),
+                ),
+                (
+                    format!("&run_id={transcript_child}"),
+                    (1..=60_i64).filter(|seq| seq % 10 == 0).collect(),
+                ),
+            ] {
+                let mut before = 61;
+                let mut seen = Vec::new();
+                loop {
+                    let page: Value = client.get(format!(
+                        "http://{addr}/sessions/{session_id}/transcript?limit=17&before_seq={before}{scope}"
+                    )).header("authorization", HTTP_TOKEN).send().await.unwrap()
+                        .error_for_status().expect("public transcript page")
+                        .json().await.unwrap();
+                    let rows = page["items"].as_array().expect("transcript items");
+                    assert_eq!(
+                        page.as_object().unwrap().len(),
+                        4,
+                        "item/cursor response contract"
+                    );
+                    let sequences = rows
+                        .iter()
+                        .map(|item| {
+                            let seq = item["item_seq"].as_i64().unwrap();
+                            assert_eq!(item["source_event_id"], format!("transcript-source-{seq}"));
+                            seq
+                        })
+                        .collect::<Vec<_>>();
+                    assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+                    assert!(sequences.iter().all(|seq| *seq < before));
+                    if scope.is_empty() && before == 61 {
+                        sqlx::query(
+                            "INSERT INTO session_transcript_items
+                             (user_id, session_id, item_seq, run_id, role, content, source_event_id, content_hash)
+                             VALUES (?, ?, 61, ?, 'assistant', 'concurrent append', 'transcript-source-61', 'append-hash')",
+                        ).bind(&user_id).bind(&session_id).bind(&run_id)
+                            .execute(pool.get()).await.expect("append between public pages");
+                    }
+                    seen.extend(sequences);
+                    if !page["has_more"].as_bool().unwrap() {
+                        break;
+                    }
+                    let next = page["next_before_seq"].as_i64().expect("older cursor");
+                    assert!(next < before, "pagination must make progress");
+                    before = next;
+                }
+                seen.sort_unstable();
+                assert_eq!(
+                    seen, expected,
+                    "scoped pagination remains stable during append"
+                );
+            }
+        }
         let replay = get_stream(&client, addr, &run_id, 0).await;
         assert!(
             replay

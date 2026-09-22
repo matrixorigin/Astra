@@ -3,7 +3,7 @@ use crate::data_layer::storage::{
     classify_agent_event_capture_attempts, insert_trace_events, touch_agent_session_activity,
 };
 use crate::server::run::lifecycle::{
-    TranscriptPersistItem, TranscriptPersistPayload, persist_session_transcript_items_inner_in_tx,
+    TranscriptPersistItem, TranscriptPersistPayload, append_session_transcript_items_admitted_in_tx,
 };
 use crate::*;
 use astra_core::canonical_names::metadata_tool_name;
@@ -450,7 +450,7 @@ impl TurnCoreEventWriter for DatabaseTurnCoreEventWriter {
         if let Some((user_id, session_id)) = transcript_owner
             && !transcript_items.is_empty()
         {
-            persist_session_transcript_items_inner_in_tx(
+            append_session_transcript_items_admitted_in_tx(
                 &mut tx,
                 &user_id,
                 &session_id,
@@ -1511,12 +1511,6 @@ mod tests {
             })
             .await
             .expect("seed original response event");
-        sqlx::query("DELETE FROM transcript_pages WHERE user_id = ? AND session_id = ?")
-            .bind(&user_id)
-            .bind(&session_id)
-            .execute(&pool)
-            .await
-            .expect("remove seeded transcript page");
         sqlx::query(
             "DELETE FROM session_transcript_items \
              WHERE user_id = ? AND session_id = ? AND source_event_id = ?",
@@ -1644,7 +1638,6 @@ mod tests {
         assert_eq!(collision_receipts, 1);
 
         for statement in [
-            "DELETE FROM transcript_pages WHERE user_id = ? AND session_id = ?",
             "DELETE FROM session_transcript_items WHERE user_id = ? AND session_id = ?",
             "DELETE FROM agent_event_edges WHERE user_id = ? AND session_id = ?",
             "DELETE FROM agent_events WHERE user_id = ? AND session_id = ?",

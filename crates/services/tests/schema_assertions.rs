@@ -2175,11 +2175,11 @@ async fn phase2_web_hydration_schema_contract() {
             &pool,
             &schema,
             "session_transcript_items",
-            "idx_transcript_owner_run_event"
+            "idx_transcript_owner_run"
         )
         .await,
-        ["user_id", "run_id", "source_event_idx"],
-        "transcript source event lookups must be owner-bound"
+        ["user_id", "run_id"],
+        "transcript run lookups must be owner-bound"
     );
     assert_eq!(
         index_columns(
@@ -2191,35 +2191,6 @@ async fn phase2_web_hydration_schema_contract() {
         .await,
         ["user_id", "session_id", "source_event_id"],
         "transcript source-event idempotency lookups must be owner/session-bound"
-    );
-    let transcript_page_columns = column_names(&pool, &schema, "transcript_pages").await;
-    assert!(
-        transcript_page_columns
-            .iter()
-            .any(|column| column == "user_id"),
-        "transcript_pages must carry physical owner scope"
-    );
-    assert!(
-        column_default(&pool, &schema, "transcript_pages", "user_id")
-            .await
-            .is_none_or(|default| !default.trim_matches('\'').is_empty()),
-        "transcript_pages.user_id must not use an empty-string owner sentinel"
-    );
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "transcript_pages").await,
-        ["user_id", "session_id", "page_seq"],
-        "transcript page identity must be owner/session scoped"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "transcript_pages",
-            "idx_transcript_pages_owner_session_end"
-        )
-        .await,
-        ["user_id", "session_id", "end_item_seq"],
-        "transcript page lookups must use owner/session/end index"
     );
     let ctx_snapshot_columns = column_names(&pool, &schema, "ctx_snapshots").await;
     assert!(

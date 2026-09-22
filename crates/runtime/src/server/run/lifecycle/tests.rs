@@ -207,7 +207,7 @@ fn typed_subrun_workspace_intent_and_completion_profile_cannot_contradict() {
 
 use crate::server::run::lifecycle::persistence::{
     build_tool_trace_events, extract_session_state_compact, messages_for_csl_persist,
-    redact_trace_value, transcript_page_bounds, transcript_page_seq,
+    redact_trace_value,
 };
 use astra_services::runs::{
     DatabaseRunStateStore, DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord,
@@ -4598,21 +4598,6 @@ fn stream_turn_complete_is_only_for_completed_or_paused_turns() {
     assert!(!should_emit_stream_turn_complete(&RunStatus::Cancelled));
     assert!(!should_emit_stream_turn_complete(&RunStatus::Waiting));
     assert!(!should_emit_stream_turn_complete(&RunStatus::Running));
-}
-
-#[test]
-fn transcript_page_seq_rolls_over_every_fifty_items() {
-    assert_eq!(transcript_page_seq(1), 1);
-    assert_eq!(transcript_page_seq(50), 1);
-    assert_eq!(transcript_page_seq(51), 2);
-    assert_eq!(transcript_page_seq(101), 3);
-}
-
-#[test]
-fn transcript_page_bounds_cover_exact_page_window() {
-    assert_eq!(transcript_page_bounds(1), (1, 50));
-    assert_eq!(transcript_page_bounds(2), (51, 100));
-    assert_eq!(transcript_page_bounds(3), (101, 150));
 }
 
 #[test]

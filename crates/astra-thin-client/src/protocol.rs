@@ -184,19 +184,9 @@ pub struct SessionTranscriptToolResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SessionTranscriptPageRef {
-    pub page_seq: i64,
-    pub start_item_seq: i64,
-    pub end_item_seq: i64,
-    pub item_count: i64,
-    pub page_hash: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionTranscriptPage {
     pub session_id: String,
     pub items: Vec<SessionTranscriptItem>,
-    pub page_refs: Vec<SessionTranscriptPageRef>,
     pub next_before_seq: Option<i64>,
     pub has_more: bool,
 }
