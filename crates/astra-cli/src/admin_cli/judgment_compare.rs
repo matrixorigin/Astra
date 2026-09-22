@@ -86,8 +86,13 @@ fn validate_cases(cases: &[Case]) -> Result<(), String> {
     }
     Ok(())
 }
-fn selection(text: &str, case: &Case) -> Result<Vec<String>, String> {
-    let normalized = normalize_judgment_response(&case.request, text, "comparison-model")
+fn selection(
+    text: &str,
+    case: &Case,
+    model: &str,
+    provenance: Option<JudgmentResponseProvenance>,
+) -> Result<Vec<String>, String> {
+    let normalized = normalize_judgment_response(&case.request, text, model, provenance)
         .map_err(|_| "invalid_judgment".to_owned())?;
     let mut selected: Vec<String> = normalized
         .response
@@ -323,7 +328,12 @@ pub(super) async fn run(
                             row["status"] = json!("incomplete");
                             row["error"] = json!("completion_did_not_finish_normally");
                         } else {
-                            match selection(text, case) {
+                            match selection(
+                                text,
+                                case,
+                                &response.model,
+                                response.judgment_provenance,
+                            ) {
                                 Ok(selected) => {
                                     row["status"] = json!("valid");
                                     if let Some(expected) = &case.expected {
@@ -443,7 +453,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let completion = |id: &str, text: &str| json!({"id":"response","object":"chat.completion","offering_id":id,"model":id,"choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}]});
+        let completion = |id: &str, text: &str| json!({"id":"response","object":"chat.completion","offering_id":id,"model":id,"judgment_provenance":"discrete_decision","choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}]});
         let truncated_completion = |id: &str, text: &str| json!({"id":"response","object":"chat.completion","offering_id":id,"model":id,"choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"length"}]});
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
@@ -590,10 +600,36 @@ mod tests {
             .into(),
         };
         let text = serde_json::to_string(&response).unwrap();
-        assert_eq!(selection(&text, &case).unwrap(), vec!["0"]);
+        assert_eq!(
+            selection(
+                &text,
+                &case,
+                "native-fixture",
+                Some(JudgmentResponseProvenance::ProviderProbability)
+            )
+            .unwrap(),
+            vec!["0"]
+        );
         case.threshold = 0.8;
-        assert!(selection(&text, &case).unwrap().is_empty());
-        assert!(selection(r#"{"true":["unknown"],"uncertain":[]}"#, &case).is_err());
+        assert!(
+            selection(
+                &text,
+                &case,
+                "native-fixture",
+                Some(JudgmentResponseProvenance::ProviderProbability)
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            selection(
+                r#"{"true":["unknown"],"uncertain":[]}"#,
+                &case,
+                "chat-fixture",
+                Some(JudgmentResponseProvenance::DiscreteDecision)
+            )
+            .is_err()
+        );
         assert_eq!(order(0), [0, 1]);
         assert_eq!(order(1), [1, 0]);
     }

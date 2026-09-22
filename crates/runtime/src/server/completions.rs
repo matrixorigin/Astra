@@ -269,10 +269,11 @@ pub(super) async fn completions_handler(
     );
 
     Ok(Json(CompletionResponse {
+        judgment_provenance: parsed.judgment_provenance,
         id: response_id,
         object: "chat.completion".to_string(),
         offering_id: admitted.offering_id,
-        model: admitted.model_name,
+        model: parsed.model_used,
         choices: vec![CompletionChoice {
             index: 0,
             message: CompletionMessage {
@@ -603,6 +604,7 @@ mod tests {
     #[test]
     fn completion_response_serializes() {
         let resp = CompletionResponse {
+            judgment_provenance: None,
             id: "test".into(),
             object: "chat.completion".into(),
             offering_id: "offer-test".into(),

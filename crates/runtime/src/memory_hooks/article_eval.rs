@@ -87,7 +87,7 @@ impl MemoryInferencePort for Recorder<'_> {
     async fn complete(
         &self,
         r: MemoryInferenceRequest<'_>,
-    ) -> Result<String, astra_core::ClassifiedError> {
+    ) -> Result<super::MemoryInferenceResponse, astra_core::ClassifiedError> {
         let started = Instant::now();
         let result = call_llm_nonstream(
             global_llm_client(),
@@ -110,7 +110,11 @@ impl MemoryInferencePort for Recorder<'_> {
         record["max_output_tokens"] = json!(r.max_output_tokens);
         record["deadline_ms"] = json!(r.deadline.as_millis());
         self.calls.lock().unwrap().push(record);
-        result.map(|v| v.full_text)
+        result.map(|v| super::MemoryInferenceResponse {
+            text: v.full_text,
+            model_used: v.model_used,
+            judgment_provenance: v.judgment_provenance,
+        })
     }
 }
 

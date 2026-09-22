@@ -760,8 +760,13 @@ mod tests {
         );
         for (id, expected, _) in RUBRIC {
             let raw = serde_json::json!({"true":[id],"uncertain":[]}).to_string();
-            let normalized =
-                astra_turn_types::normalize_judgment_response(&request, &raw, "chat").unwrap();
+            let normalized = astra_turn_types::normalize_judgment_response(
+                &request,
+                &raw,
+                "chat",
+                Some(JudgmentResponseProvenance::DiscreteDecision),
+            )
+            .unwrap();
             let envelope = serde_json::json!({"ok":true,"judgment":normalized.response,"provenance":normalized.provenance}).to_string();
             assert_eq!(
                 parse_judgment_score(&envelope, &request).unwrap().score,
@@ -773,7 +778,15 @@ mod tests {
             r#"{"true":["0"],"uncertain":[]}"#,
             r#"{"true":["rubric_fully_yes"],"uncertain":[],"false":["rubric_no"]}"#,
         ] {
-            assert!(astra_turn_types::normalize_judgment_response(&request, raw, "chat").is_err());
+            assert!(
+                astra_turn_types::normalize_judgment_response(
+                    &request,
+                    raw,
+                    "chat",
+                    Some(JudgmentResponseProvenance::DiscreteDecision)
+                )
+                .is_err()
+            );
         }
     }
 

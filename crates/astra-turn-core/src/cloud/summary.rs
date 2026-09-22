@@ -141,6 +141,9 @@ fn system_has_append_only_runtime_authority_policy(messages: &[Value]) -> bool {
 /// Result of a single LLM summary call.
 #[derive(Debug, Clone)]
 pub struct SummaryResponse {
+    /// Execution-adapter fact, absent for ordinary prose completions.
+    pub judgment_provenance: Option<astra_turn_types::JudgmentResponseProvenance>,
+    pub model_used: String,
     /// The generated summary text.
     pub text: String,
     /// Whether the request exceeded the context window (PTL error).
@@ -419,6 +422,8 @@ pub mod test_support {
         pub fn success(text: &str) -> Self {
             Self {
                 responses: vec![Ok(SummaryResponse {
+                    judgment_provenance: None,
+                    model_used: "fixture-model".into(),
                     text: text.to_string(),
                     is_ptl_error: false,
                     finish_reason: Some("stop".to_string()),
@@ -435,6 +440,8 @@ pub mod test_support {
             Self {
                 responses: vec![
                     Ok(SummaryResponse {
+                        judgment_provenance: None,
+                        model_used: "fixture-model".into(),
                         text: String::new(),
                         is_ptl_error: true,
                         finish_reason: None,
@@ -442,6 +449,8 @@ pub mod test_support {
                         execution: None,
                     }),
                     Ok(SummaryResponse {
+                        judgment_provenance: None,
+                        model_used: "fixture-model".into(),
                         text: success_text.to_string(),
                         is_ptl_error: false,
                         finish_reason: Some("stop".to_string()),
@@ -458,6 +467,8 @@ pub mod test_support {
         pub fn always_ptl() -> Self {
             Self {
                 responses: vec![Ok(SummaryResponse {
+                    judgment_provenance: None,
+                    model_used: "fixture-model".into(),
                     text: String::new(),
                     is_ptl_error: true,
                     finish_reason: None,

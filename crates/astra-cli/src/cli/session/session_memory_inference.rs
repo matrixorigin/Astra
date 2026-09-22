@@ -126,7 +126,7 @@ impl MemoryInferencePort for CliServerMemoryInferenceClient {
     async fn complete(
         &self,
         request: MemoryInferenceRequest<'_>,
-    ) -> Result<String, ClassifiedError> {
+    ) -> Result<astra_runtime::memory_hooks::MemoryInferenceResponse, ClassifiedError> {
         let operation = match request.purpose {
             astra_turn_types::InferencePurpose::MemoryExtraction => {
                 astra_thin_client::CompletionOperation::MemoryExtraction
@@ -171,7 +171,13 @@ impl MemoryInferencePort for CliServerMemoryInferenceClient {
             .choices
             .into_iter()
             .next()
-            .map(|choice| choice.message.content)
+            .map(
+                |choice| astra_runtime::memory_hooks::MemoryInferenceResponse {
+                    text: choice.message.content,
+                    model_used: response.model,
+                    judgment_provenance: response.judgment_provenance,
+                },
+            )
             .ok_or_else(|| {
                 ClassifiedError::new(
                     ErrorKind::ServerError,
@@ -265,6 +271,7 @@ mod tests {
                             "object": "chat.completion",
                             "offering_id": "memory-offering",
                             "model": "memory-model",
+                            "judgment_provenance": "discrete_decision",
                             "choices": [{
                                 "index": 0,
                                 "message": {"role": "assistant", "content": "[0]"},
@@ -309,7 +316,12 @@ mod tests {
             .expect("completion response");
         let body = request_rx.await.expect("captured request");
 
-        assert_eq!(output, "[0]");
+        assert_eq!(output.text, "[0]");
+        assert_eq!(output.model_used, "memory-model");
+        assert_eq!(
+            output.judgment_provenance,
+            Some(astra_turn_types::JudgmentResponseProvenance::DiscreteDecision)
+        );
         assert_eq!(
             body.operation,
             astra_thin_client::CompletionOperation::MemoryRetrievalRerank

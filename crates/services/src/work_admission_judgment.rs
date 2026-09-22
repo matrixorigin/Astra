@@ -172,6 +172,8 @@ fn field_evidence(value: f64) -> WorkAdmissionFieldEvidence {
 fn decode_evidence(
     request: &JudgmentRequest,
     raw: &str,
+    model: &str,
+    provenance: Option<JudgmentResponseProvenance>,
 ) -> Result<
     (
         BTreeMap<String, WorkAdmissionFieldEvidence>,
@@ -183,7 +185,7 @@ fn decode_evidence(
     if request.questions != canonical.questions {
         return Err(malformed(raw, "noncanonical classification questions"));
     }
-    let normalized = normalize_judgment_response(request, raw, "chat-classification")
+    let normalized = normalize_judgment_response(request, raw, model, provenance)
         .map_err(|e| malformed(raw, e.to_string()))?;
     Ok((
         normalized
@@ -231,6 +233,8 @@ pub fn parse_work_admission_clarification(
     request: &JudgmentRequest,
     raw: &str,
     diagnostics: &WorkAdmissionUncertainty,
+    model: &str,
+    provenance: Option<JudgmentResponseProvenance>,
 ) -> Result<WorkAdmissionClassification, TurnIntentJudgeError> {
     let error = TurnIntentJudgeError::Uncertain {
         diagnostics: Box::new(diagnostics.clone()),
@@ -242,7 +246,7 @@ pub fn parse_work_admission_clarification(
             "clarification request does not match original evidence",
         ));
     }
-    let (evidence, _) = decode_evidence(request, raw)?;
+    let (evidence, _) = decode_evidence(request, raw, model, provenance)?;
     let changed = diagnostics
         .locked_fields
         .iter()
@@ -261,7 +265,7 @@ pub fn parse_work_admission_clarification(
             detail: "clarification changed or abstained on locked necessary facts".into(),
         });
     }
-    parse_work_admission_classification(request, raw)
+    parse_work_admission_classification(request, raw, model, provenance)
 }
 
 fn validate_necessary_evidence(
@@ -351,8 +355,10 @@ fn validate_necessary_evidence(
 pub fn parse_work_admission_classification(
     request: &JudgmentRequest,
     raw: &str,
+    model: &str,
+    provenance: Option<JudgmentResponseProvenance>,
 ) -> Result<WorkAdmissionClassification, TurnIntentJudgeError> {
-    let (evidence, provenance) = decode_evidence(request, raw)?;
+    let (evidence, provenance) = decode_evidence(request, raw, model, provenance)?;
     validate_necessary_evidence(request, &evidence, provenance)?;
     // Necessary fields were validated together above. Optional descriptive
     // fields may remain unresolved without becoming fabricated parser errors.
@@ -482,6 +488,32 @@ mod tests {
     use super::*;
     use astra_turn_types::{JudgmentAnswer, JudgmentResponse};
 
+    fn parse_chat(
+        request: &JudgmentRequest,
+        raw: &str,
+    ) -> Result<WorkAdmissionClassification, TurnIntentJudgeError> {
+        super::parse_work_admission_classification(
+            request,
+            raw,
+            "chat-fixture",
+            Some(JudgmentResponseProvenance::DiscreteDecision),
+        )
+    }
+
+    fn clarify_chat(
+        request: &JudgmentRequest,
+        raw: &str,
+        diagnostics: &WorkAdmissionUncertainty,
+    ) -> Result<WorkAdmissionClassification, TurnIntentJudgeError> {
+        super::parse_work_admission_clarification(
+            request,
+            raw,
+            diagnostics,
+            "chat-fixture",
+            Some(JudgmentResponseProvenance::DiscreteDecision),
+        )
+    }
+
     fn response(request: &JudgmentRequest, yes: &[&str]) -> JudgmentResponse {
         JudgmentResponse {
             schema_version: 1,
@@ -504,7 +536,12 @@ mod tests {
         request: &JudgmentRequest,
         response: &JudgmentResponse,
     ) -> Result<WorkAdmissionClassification, TurnIntentJudgeError> {
-        parse_work_admission_classification(request, &serde_json::to_string(response).unwrap())
+        super::parse_work_admission_classification(
+            request,
+            &serde_json::to_string(response).unwrap(),
+            "native-fixture",
+            Some(JudgmentResponseProvenance::ProviderProbability),
+        )
     }
 
     #[test]
@@ -601,7 +638,7 @@ mod tests {
             assert!(criteria.as_ref().unwrap().yes.contains(instructions));
             assert!(criteria.as_ref().unwrap().no.contains(instructions));
         }
-        let error = parse_work_admission_classification(&request,
+        let error = parse_chat(&request,
             r#"{"true":["required","mutation.must_mutate","domain.memory"],"uncertain":["scope.workspace","scope.external","scope.mixed","scope.unknown"]}"#,
         ).unwrap_err();
         let clarification = work_admission_clarification_request(&request, &error).unwrap();
@@ -703,11 +740,8 @@ mod tests {
                     yes.push("required");
                 }
                 let native = parse(&request, &response(&request, &yes)).unwrap();
-                let chat = parse_work_admission_classification(
-                    &request,
-                    &json!({"true": yes, "uncertain": []}).to_string(),
-                )
-                .unwrap();
+                let chat = parse_chat(&request, &json!({"true": yes, "uncertain": []}).to_string())
+                    .unwrap();
                 assert_eq!(native, chat);
                 assert_eq!(
                     serde_json::to_value(chat.workspace_mutation).unwrap(),
@@ -836,7 +870,7 @@ mod tests {
                     let mut yes = vec![domain_id.as_str(), mutation_id.as_str()];
                     if mutation == "must_mutate" { yes.push(&scope_id); }
                     let native = parse(&request, &response(&request, &yes)).unwrap();
-                    let chat = parse_work_admission_classification(&request,
+                    let chat = parse_chat(&request,
                         &json!({"true": yes, "uncertain": []}).to_string(),
                     ).unwrap();
                     assert_eq!(chat, native);
@@ -954,7 +988,7 @@ mod tests {
                 ..
             }
         )));
-        let error = parse_work_admission_classification(
+        let error = parse_chat(
             &request,
             r#"{"true":["mutation.read_only","parallel_subruns"],"uncertain":["required"]}"#,
         )
@@ -975,15 +1009,28 @@ mod tests {
             astra_turn_types::judgment_request_from_messages(&messages).unwrap(),
             clarified
         );
-        for raw in [
-            r#"{"true":["mutation.read_only","parallel_subruns"],"uncertain":[]}"#.to_string(),
-            serde_json::to_string(&response(
-                &clarified,
-                &["mutation.read_only", "parallel_subruns"],
-            ))
-            .unwrap(),
+        for (provenance, raw) in [
+            (
+                JudgmentResponseProvenance::DiscreteDecision,
+                r#"{"true":["mutation.read_only","parallel_subruns"],"uncertain":[]}"#.to_string(),
+            ),
+            (
+                JudgmentResponseProvenance::ProviderProbability,
+                serde_json::to_string(&response(
+                    &clarified,
+                    &["mutation.read_only", "parallel_subruns"],
+                ))
+                .unwrap(),
+            ),
         ] {
-            let result = parse_work_admission_clarification(&clarified, &raw, diagnostics).unwrap();
+            let result = super::parse_work_admission_clarification(
+                &clarified,
+                &raw,
+                diagnostics,
+                "fixture-model",
+                Some(provenance),
+            )
+            .unwrap();
             assert_eq!(result.work_lifecycle, WorkLifecycleIntent::NotRequired);
             assert_eq!(
                 result.execution_topology,
@@ -995,7 +1042,7 @@ mod tests {
     #[test]
     fn clarification_cannot_reverse_or_abstain_on_locked_yes_or_no() {
         let request = work_admission_classification_request(&Default::default());
-        let error = parse_work_admission_classification(
+        let error = parse_chat(
             &request,
             r#"{"true":["mutation.read_only","parallel_subruns"],"uncertain":["required"]}"#,
         )
@@ -1013,6 +1060,8 @@ mod tests {
                 &clarified,
                 &serde_json::to_string(&answers).unwrap(),
                 &diagnostics,
+                "native-judge",
+                Some(JudgmentResponseProvenance::ProviderProbability),
             )
             .unwrap_err();
             assert!(
@@ -1027,7 +1076,7 @@ mod tests {
         let mut request = work_admission_classification_request(&Default::default());
         request.state["context"] = json!({"user_intent": "private diagnostic marker"});
         let raw = r#"{"true":["mutation.read_only"],"uncertain":["required"]}"#;
-        let error = parse_work_admission_classification(&request, raw).unwrap_err();
+        let error = parse_chat(&request, raw).unwrap_err();
         let TurnIntentJudgeError::Uncertain { ref diagnostics } = error else {
             panic!("{error}")
         };
@@ -1043,9 +1092,8 @@ mod tests {
         assert!(work_admission_clarification_request(&foreign, &error).is_none());
         let mut foreign_recovery = clarified.clone();
         foreign_recovery.state["context"] = foreign.state["context"].clone();
-        assert!(parse_work_admission_clarification(&foreign_recovery, raw, diagnostics).is_err());
-        let still_uncertain =
-            parse_work_admission_clarification(&clarified, raw, diagnostics).unwrap_err();
+        assert!(clarify_chat(&foreign_recovery, raw, diagnostics).is_err());
+        let still_uncertain = clarify_chat(&clarified, raw, diagnostics).unwrap_err();
         assert!(matches!(
             still_uncertain,
             TurnIntentJudgeError::Uncertain { .. }
@@ -1058,7 +1106,7 @@ mod tests {
     fn malformed_and_semantic_conflicts_do_not_offer_clarification() {
         let request = work_admission_classification_request(&Default::default());
         for raw in ["{}", "not json", r#"{"true":["invented"],"uncertain":[]}"#] {
-            let error = parse_work_admission_classification(&request, raw).unwrap_err();
+            let error = parse_chat(&request, raw).unwrap_err();
             assert!(matches!(error, TurnIntentJudgeError::Malformed { .. }));
             assert!(work_admission_clarification_request(&request, &error).is_none());
         }
@@ -1069,7 +1117,7 @@ mod tests {
             r#"{"true":[],"uncertain":["required"]}"#,
             r#"{"true":["required","mutation.must_mutate","scope.external","domain.none"],"uncertain":[]}"#,
         ] {
-            let error = parse_work_admission_classification(&request, raw).unwrap_err();
+            let error = parse_chat(&request, raw).unwrap_err();
             if raw.contains(r#""uncertain":["required"]"#) {
                 assert!(matches!(error, TurnIntentJudgeError::Uncertain { .. }));
                 assert!(work_admission_clarification_request(&request, &error).is_some());
@@ -1083,7 +1131,7 @@ mod tests {
     #[test]
     fn clarification_validates_newly_necessary_fields_and_rejects_schema_drift() {
         let request = work_admission_classification_request(&Default::default());
-        let error = parse_work_admission_classification(
+        let error = parse_chat(
             &request,
             r#"{"true":["mutation.read_only"],"uncertain":["required","defer"]}"#,
         )
@@ -1094,17 +1142,17 @@ mod tests {
         };
         let raw = r#"{"true":["required","mutation.read_only"],"uncertain":["defer"]}"#;
         assert!(matches!(
-            parse_work_admission_clarification(&clarified, raw, &diagnostics),
+            clarify_chat(&clarified, raw, &diagnostics),
             Err(TurnIntentJudgeError::Uncertain { .. })
         ));
         let mut altered = clarified.clone();
         altered.questions.remove("defer");
         assert!(matches!(
-            parse_work_admission_clarification(&altered, raw, &diagnostics),
+            clarify_chat(&altered, raw, &diagnostics),
             Err(TurnIntentJudgeError::Malformed { .. })
         ));
         assert!(matches!(
-            parse_work_admission_classification(&altered, raw),
+            parse_chat(&altered, raw),
             Err(TurnIntentJudgeError::Malformed { .. })
         ));
     }
@@ -1112,7 +1160,7 @@ mod tests {
     #[test]
     fn inactive_branch_facts_are_not_locked() {
         let request = work_admission_classification_request(&Default::default());
-        let error = parse_work_admission_classification(
+        let error = parse_chat(
             &request,
             r#"{"true":["mutation.read_only","defer"],"uncertain":["required"]}"#,
         )
@@ -1121,7 +1169,7 @@ mod tests {
             panic!("{error}")
         };
         assert!(!diagnostics.locked_fields.contains_key("defer"));
-        let classification = parse_work_admission_classification(
+        let classification = parse_chat(
             &request,
             r#"{"true":["scope.external","domain.github"],"uncertain":["mutation.must_mutate"]}"#,
         )
@@ -1160,7 +1208,7 @@ mod tests {
     #[test]
     fn not_required_keeps_lifecycle_decided_when_mutation_is_uncertain() {
         let request = work_admission_classification_request(&TurnIntentJudgeContext::default());
-        let classification = parse_work_admission_classification(
+        let classification = parse_chat(
             &request,
             r#"{"true":[],"uncertain":["mutation.read_only"]}"#,
         )
@@ -1190,7 +1238,7 @@ mod tests {
     #[test]
     fn required_work_still_requires_mutation_contract() {
         let request = work_admission_classification_request(&TurnIntentJudgeContext::default());
-        let error = parse_work_admission_classification(
+        let error = parse_chat(
             &request,
             r#"{"true":["required"],"uncertain":["mutation.read_only"]}"#,
         )
@@ -1310,7 +1358,7 @@ mod tests {
             )
             .is_err()
         );
-        assert!(parse_work_admission_classification(&request, "not json").is_err());
+        assert!(parse_chat(&request, "not json").is_err());
     }
     #[test]
     fn inactive_fields_and_optional_hints_may_abstain() {
@@ -1342,7 +1390,7 @@ mod tests {
     #[test]
     fn non_work_external_mutation_without_domain_is_safe() {
         let request = work_admission_classification_request(&TurnIntentJudgeContext::default());
-        let classification = parse_work_admission_classification(
+        let classification = parse_chat(
             &request,
             r#"{"true":["mutation.must_mutate","scope.external"],"uncertain":[]}"#,
         )
@@ -1440,11 +1488,8 @@ mod tests {
                 "domain.github",
             ],
         ] {
-            let chat = parse_work_admission_classification(
-                &request,
-                &json!({"true":yes, "uncertain":[]}).to_string(),
-            )
-            .unwrap();
+            let chat =
+                parse_chat(&request, &json!({"true":yes, "uncertain":[]}).to_string()).unwrap();
             let native = parse(&request, &response(&request, &yes)).unwrap();
             assert_eq!(chat, native);
         }
@@ -1453,8 +1498,7 @@ mod tests {
     #[test]
     fn sparse_chat_rejects_empty_incomplete_duplicate_and_unknown_decisions() {
         let request = work_admission_classification_request(&TurnIntentJudgeContext::default());
-        let empty =
-            parse_work_admission_classification(&request, r#"{"true":[],"uncertain":[]}"#).unwrap();
+        let empty = parse_chat(&request, r#"{"true":[],"uncertain":[]}"#).unwrap();
         assert_eq!(empty.work_lifecycle, WorkLifecycleIntent::NotRequired);
         assert_eq!(empty.workspace_mutation, WorkspaceMutationIntent::Unknown);
         for invalid in [
@@ -1468,10 +1512,7 @@ mod tests {
             r#"{"true":["mutation.read_only"]}"#,
             r#"["mutation.read_only"]"#,
         ] {
-            assert!(
-                parse_work_admission_classification(&request, invalid).is_err(),
-                "{invalid}"
-            );
+            assert!(parse_chat(&request, invalid).is_err(), "{invalid}");
         }
     }
     #[test]
@@ -1479,11 +1520,10 @@ mod tests {
         let request = work_admission_classification_request(&TurnIntentJudgeContext::default());
         for uncertain in ["required", "parallel_subruns"] {
             let payload = json!({"true":["mutation.read_only"], "uncertain":[uncertain]});
-            assert!(parse_work_admission_classification(&request, &payload.to_string()).is_err());
+            assert!(parse_chat(&request, &payload.to_string()).is_err());
         }
         let mutation_uncertain = json!({"true":[], "uncertain":["mutation.read_only"]});
-        let classification =
-            parse_work_admission_classification(&request, &mutation_uncertain.to_string()).unwrap();
+        let classification = parse_chat(&request, &mutation_uncertain.to_string()).unwrap();
         assert_eq!(
             classification.work_lifecycle,
             WorkLifecycleIntent::NotRequired
@@ -1497,12 +1537,11 @@ mod tests {
             MutationCompletionScope::Unknown
         );
         let required = json!({"true":["required","mutation.read_only"], "uncertain":["defer"]});
-        assert!(parse_work_admission_classification(&request, &required.to_string()).is_err());
+        assert!(parse_chat(&request, &required.to_string()).is_err());
         let external = json!({"true":["required","mutation.must_mutate","scope.external"], "uncertain":["domain.github"]});
-        assert!(parse_work_admission_classification(&request, &external.to_string()).is_err());
+        assert!(parse_chat(&request, &external.to_string()).is_err());
         let optional = json!({"true":["mutation.read_only"], "uncertain":["defer","scope.workspace","domain.github","capability.web"]});
-        let classification =
-            parse_work_admission_classification(&request, &optional.to_string()).unwrap();
+        let classification = parse_chat(&request, &optional.to_string()).unwrap();
         assert_eq!(classification.domain, None);
         assert!(classification.required_capabilities.is_empty());
     }

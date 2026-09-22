@@ -156,7 +156,10 @@ async fn readwrite_memoria_extraction_cannot_spend_deployment_credentials() {
             temperature: 0.0,
             deadline: Duration::from_secs(5),
         };
-        assert_eq!(client.complete(request).await.unwrap(), "NO_CHANGE");
+        let response = client.complete(request).await.unwrap();
+        assert_eq!(response.text, "NO_CHANGE");
+        assert_eq!(response.model_used, model_name);
+        assert_eq!(response.judgment_provenance, None);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         // An already constructed background client must revalidate before I/O.
         sqlx::query("INSERT INTO auth_external_identities (provider_id,external_subject,astra_user_id) VALUES ('memoria:test-background-owner', ?, ?)")

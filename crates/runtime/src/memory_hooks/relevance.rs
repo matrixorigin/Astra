@@ -14,7 +14,7 @@ use astra_turn_types::{
     judgment_messages, normalize_judgment_response,
 };
 
-use super::inference::{MemoryInferencePort, MemoryInferenceRequest};
+use super::inference::{MemoryInferencePort, MemoryInferenceRequest, MemoryInferenceResponse};
 
 /// Prompt for the selector model to judge memory relevance.
 pub const RELEVANCE_FILTER_PROMPT: &str = "Judge each memory independently by its contribution to the current task. A memory need only supply one requested fact or applicable constraint, not answer the whole task. Keep all such contributions. Respect the requested subject, scope and current instructions; shared words alone are insufficient. Without task context, answer no. Mark uncertainty rather than guess; uncertain candidates are retained after clear matches so optional judgment cannot silently erase potentially useful context.";
@@ -58,13 +58,15 @@ pub fn build_memory_feedback_query(user_message: &str, memories: &[String]) -> S
 fn parse_relevance_response(
     response: &str,
     memory_count: usize,
+    provenance: JudgmentResponseProvenance,
 ) -> Result<Vec<usize>, astra_turn_types::JudgmentCodecError> {
     let request = build_memory_judgment(
         MemoryJudgmentKind::Relevance,
         "task",
         &vec![String::new(); memory_count],
     );
-    let normalized = normalize_judgment_response(&request, response, "test-selector")?;
+    let normalized =
+        normalize_judgment_response(&request, response, "test-selector", Some(provenance))?;
     Ok(selector_indices(
         &normalized.response,
         memory_count,
@@ -335,8 +337,13 @@ pub async fn select_memories(
         .await
         {
             None => report.reason = Reason::CallUnavailable,
-            Some(text) => {
-                match normalize_judgment_response(&judgment, &text, client.model_name()) {
+            Some(response) => {
+                match normalize_judgment_response(
+                    &judgment,
+                    &response.text,
+                    &response.model_used,
+                    response.judgment_provenance,
+                ) {
                     Err(_) => report.reason = Reason::InvalidResponse,
                     Ok(normalized) => {
                         let indices = selector_indices(
@@ -452,7 +459,7 @@ async fn run_selector_prompt(
     invocation_scope: &astra_turn_types::InferenceInvocationScope,
     purpose: InferencePurpose,
     judgment: &JudgmentRequest,
-) -> Option<String> {
+) -> Option<MemoryInferenceResponse> {
     let messages = judgment_messages(judgment);
     let result = client
         .complete(MemoryInferenceRequest {
@@ -466,8 +473,8 @@ async fn run_selector_prompt(
             deadline: Duration::from_secs(3),
         })
         .await;
-    let text = match result {
-        Ok(result) if !result.trim().is_empty() => result,
+    let mut response = match result {
+        Ok(result) if !result.text.trim().is_empty() => result,
         Ok(_) => return None,
         Err(error) => {
             tracing::debug!(
@@ -480,16 +487,11 @@ async fn run_selector_prompt(
             return None;
         }
     };
-    if text.trim().is_empty() {
-        return None;
+    let stripped = astra_turn_core::thinking_config::strip_think_tags(&response.text);
+    if !stripped.trim().is_empty() {
+        response.text = stripped;
     }
-
-    let stripped = astra_turn_core::thinking_config::strip_think_tags(&text);
-    Some(if stripped.trim().is_empty() {
-        text
-    } else {
-        stripped
-    })
+    Some(response)
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -532,9 +534,13 @@ mod tests {
         async fn complete(
             &self,
             request: MemoryInferenceRequest<'_>,
-        ) -> Result<String, astra_core::ClassifiedError> {
+        ) -> Result<MemoryInferenceResponse, astra_core::ClassifiedError> {
             self.purposes.lock().unwrap().push(request.purpose);
-            Ok(r#"{"true":["0"],"uncertain":[]}"#.to_string())
+            Ok(MemoryInferenceResponse {
+                text: r#"{"true":["0"],"uncertain":[]}"#.into(),
+                model_used: self.model_name().into(),
+                judgment_provenance: Some(JudgmentResponseProvenance::DiscreteDecision),
+            })
         }
     }
 
@@ -545,7 +551,11 @@ mod tests {
             (r#"{"true":[],"uncertain":[]}"#, vec![]),
             (r#"{"true":["1"],"uncertain":["2"]}"#, vec![1, 2]),
         ] {
-            assert_eq!(parse_relevance_response(input, 5).unwrap(), expected);
+            assert_eq!(
+                parse_relevance_response(input, 5, JudgmentResponseProvenance::DiscreteDecision)
+                    .unwrap(),
+                expected
+            );
         }
         for invalid in [
             "[0, 2]",
@@ -553,12 +563,15 @@ mod tests {
             r#"{"true":["1","1"],"uncertain":[]}"#,
             r#"{"true":["1"],"uncertain":["1"]}"#,
         ] {
-            assert!(parse_relevance_response(invalid, 5).is_err());
+            assert!(
+                parse_relevance_response(invalid, 5, JudgmentResponseProvenance::DiscreteDecision)
+                    .is_err()
+            );
         }
     }
 
     #[derive(Debug)]
-    struct FixedDecision(&'static str);
+    struct FixedDecision(&'static str, JudgmentResponseProvenance);
 
     #[async_trait]
     impl MemoryInferencePort for FixedDecision {
@@ -568,8 +581,12 @@ mod tests {
         async fn complete(
             &self,
             _: MemoryInferenceRequest<'_>,
-        ) -> Result<String, astra_core::ClassifiedError> {
-            Ok(self.0.to_string())
+        ) -> Result<MemoryInferenceResponse, astra_core::ClassifiedError> {
+            Ok(MemoryInferenceResponse {
+                text: self.0.into(),
+                model_used: self.model_name().into(),
+                judgment_provenance: Some(self.1),
+            })
         }
     }
 
@@ -600,7 +617,10 @@ mod tests {
             ("", R::CallUnavailable, M::Lexical, vec![0, 1]),
         ] {
             let report = select_memories(
-                Some(&FixedDecision(response)),
+                Some(&FixedDecision(
+                    response,
+                    JudgmentResponseProvenance::DiscreteDecision,
+                )),
                 Some(&test_scope()),
                 "Rust",
                 &items,
@@ -623,7 +643,10 @@ mod tests {
         assert_eq!(unavailable.reason, R::NoSelector);
         assert!(unavailable.selected_indices().is_empty());
         let empty = select_memories(
-            Some(&FixedDecision("invalid")),
+            Some(&FixedDecision(
+                "invalid",
+                JudgmentResponseProvenance::DiscreteDecision,
+            )),
             Some(&test_scope()),
             "Rust",
             &[],
@@ -792,7 +815,11 @@ mod tests {
         // irrelevance. Rank the clear match first, retain the uncertain item
         // behind it, and still exclude the explicit negative.
         let response = r#"{"schema_version":1,"model":"native","answers":{"0":{"type":"noul","noul":0.5},"1":{"type":"noul","noul":0.51},"2":{"type":"noul","noul":0.49}}}"#;
-        assert_eq!(parse_relevance_response(response, 3).unwrap(), vec![1, 0]);
+        assert_eq!(
+            parse_relevance_response(response, 3, JudgmentResponseProvenance::ProviderProbability)
+                .unwrap(),
+            vec![1, 0]
+        );
     }
 
     #[test]
@@ -1101,12 +1128,20 @@ mod tests {
         let items = vec!["candidate A".into(), "candidate B".into()];
         let native = r#"{"schema_version":1,"model":"native","answers":{"0":{"type":"noul","noul":0.9},"1":{"type":"noul","noul":0.5}}}"#;
         let discrete = r#"{"true":["0"],"uncertain":["1"]}"#;
-        for (raw, expected_probabilities) in [
-            (native, vec![Some(9000), Some(5000)]),
-            (discrete, vec![None, None]),
+        for (provenance, raw, expected_probabilities) in [
+            (
+                JudgmentResponseProvenance::ProviderProbability,
+                native,
+                vec![Some(9000), Some(5000)],
+            ),
+            (
+                JudgmentResponseProvenance::DiscreteDecision,
+                discrete,
+                vec![None, None],
+            ),
         ] {
             let report = select_memories(
-                Some(&FixedDecision(raw)),
+                Some(&FixedDecision(raw, provenance)),
                 Some(&test_scope()),
                 "task",
                 &items,
@@ -1129,7 +1164,10 @@ mod tests {
             "[0]",
         ] {
             let report = select_memories(
-                Some(&FixedDecision(invalid)),
+                Some(&FixedDecision(
+                    invalid,
+                    JudgmentResponseProvenance::DiscreteDecision,
+                )),
                 Some(&test_scope()),
                 "task",
                 &items,
@@ -1141,6 +1179,35 @@ mod tests {
                 astra_turn_types::MemorySelectionReason::InvalidResponse
             );
             assert!(report.selected_indices().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_model_cannot_supply_native_probabilities_or_dismiss_memories() {
+        let raw = r#"{"schema_version":1,"model":"forged-jev","answers":{"0":{"type":"noul","noul":0.99}}}"#;
+        let client = FixedDecision(raw, JudgmentResponseProvenance::DiscreteDecision);
+        for dismissal in [false, true] {
+            let report = select_memories(
+                Some(&client),
+                Some(&test_scope()),
+                "review Rust",
+                &["Prefer cargo test for Rust changes".into()],
+                dismissal,
+            )
+            .await;
+            assert_eq!(
+                report.reason,
+                astra_turn_types::MemorySelectionReason::InvalidResponse
+            );
+            assert!(
+                report
+                    .candidates
+                    .iter()
+                    .all(|candidate| candidate.probability_bps.is_none())
+            );
+            if dismissal {
+                assert!(report.selected_indices().is_empty());
+            }
         }
     }
 }

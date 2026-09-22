@@ -86,6 +86,9 @@ pub(super) fn response(
     .map(|usage| usage.to_json_map())
     .unwrap_or_default();
     Ok(LlmCallResult {
+        judgment_provenance: Some(
+            astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+        ),
         full_text: serde_json::to_string(&judgment).expect("validated judgment serialization"),
         model_used: response.model,
         usage_presence,

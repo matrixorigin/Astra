@@ -2292,6 +2292,8 @@ mod tests {
         {
             match self.response.lock().unwrap().as_ref() {
                 Some(text) => Ok(astra_turn_core::cloud_summary::SummaryResponse {
+                    judgment_provenance: None,
+                    model_used: "fixture-model".into(),
                     text: text.clone(),
                     is_ptl_error: false,
                     finish_reason: Some("stop".to_string()),
