@@ -24,6 +24,13 @@ pub(crate) fn prepare_child_model_slots(
     slots
         .into_iter()
         .map(|wire| {
+            if wire.max_output_tokens == Some(0) {
+                return Err(error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    "output-token limit must be positive",
+                    "model_reasoning_invalid",
+                ));
+            }
             astra_services::validate_model_offering_id(&wire.offering_id).map_err(|_| {
                 error_response_coded(
                     StatusCode::BAD_REQUEST,
@@ -38,6 +45,12 @@ pub(crate) fn prepare_child_model_slots(
                         "child reasoning selection is invalid",
                         "model_reasoning_invalid",
                     )
+                })?;
+            reasoning
+                .config()
+                .validate_output_budget(wire.max_output_tokens.map_or(u64::MAX, u64::from))
+                .map_err(|error| {
+                    error_response_coded(StatusCode::BAD_REQUEST, error, "model_reasoning_invalid")
                 })?;
             Ok(PreparedModelAdmissionSlot { wire, reasoning })
         })
@@ -88,7 +101,20 @@ pub(crate) async fn admit_child_model_slots(
                 "model_reasoning_unsupported",
             )
         })?;
+        if let Some(limit) = slot.wire.max_output_tokens {
+            slot.reasoning
+                .config()
+                .validate_output_budget(u64::from(limit))
+                .map_err(|error| {
+                    error_response_coded(
+                        StatusCode::BAD_REQUEST,
+                        error,
+                        "model_reasoning_unsupported",
+                    )
+                })?;
+        }
         admitted.push(ModelAdmissionResultV1 {
+            max_output_tokens: slot.wire.max_output_tokens,
             offering_id: slot.wire.offering_id,
             reasoning: slot.wire.reasoning,
             model_name: execution.model_name,
@@ -111,6 +137,12 @@ pub(crate) fn validate_reasoning_control(
     use astra_turn_core::thinking_config::ThinkingConfig;
 
     let capability = execution.thinking_capability;
+    let budget = crate::prompts::budget_for_model_with_metadata(
+        Some(&execution.model_name),
+        execution.context_window,
+        execution.max_completion_tokens,
+    );
+    thinking.validate_output_budget(crate::prompts::capped_output_tokens(&budget) as u64)?;
     let protocol = execution.thinking_protocol.unwrap_or_default();
     let supported = match thinking {
         ThinkingConfig::ModelDefault => true,
@@ -119,7 +151,7 @@ pub(crate) fn validate_reasoning_control(
             Some(ThinkingCapability::Both | ThinkingCapability::None)
         ),
         ThinkingConfig::Enabled { budget_tokens } => {
-            *budget_tokens > 0
+            *budget_tokens >= 1024
                 && capability == Some(ThinkingCapability::Both)
                 && matches!(execution.provider.as_str(), "anthropic" | "bedrock")
         }
@@ -355,6 +387,7 @@ mod tests {
     async fn child_model_batch_preflight_is_all_or_error_and_redacts_execution_material() {
         let service: Arc<dyn ModelService> = Arc::new(StaticModelService);
         let slot = |id: &str, reasoning: serde_json::Value| ModelAdmissionSlotV1 {
+            max_output_tokens: None,
             offering_id: id.to_string(),
             reasoning,
         };
@@ -397,10 +430,12 @@ mod tests {
     fn child_model_slot_shape_is_rejected_before_admission() {
         let error = prepare_child_model_slots(vec![
             ModelAdmissionSlotV1 {
+                max_output_tokens: None,
                 offering_id: "offer-a".into(),
                 reasoning: serde_json::json!({"mode":"model_default"}),
             },
             ModelAdmissionSlotV1 {
+                max_output_tokens: None,
                 offering_id: "offer-b".into(),
                 reasoning: serde_json::json!({"mode":"unknown"}),
             },

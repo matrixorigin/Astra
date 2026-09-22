@@ -8856,6 +8856,7 @@ esac
             delegation_chain: Vec::new(),
             current_model: Some("test-model".into()),
             current_model_selection: None,
+            parent_model_reasoning: None,
             recursion_depth: 0,
             is_fork_child: false,
             working_dir: work_dir.to_path_buf(),

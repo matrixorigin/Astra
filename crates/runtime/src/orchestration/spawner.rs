@@ -822,6 +822,8 @@ pub(crate) fn agent_status_to_progress_event(
 /// Context provided by the parent agent when spawning a child.
 #[derive(Debug, Clone)]
 pub struct SpawnContext {
+    pub parent_model_reasoning:
+        Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning>,
     /// The parent's run ID.
     pub parent_run_id: String,
     /// The parent's agent ID (for tracking delegation chains).
@@ -954,6 +956,8 @@ impl From<&SpawnedAgentState> for SpawnedAgentInfo {
 
 /// Configuration for a spawned agent run.
 pub struct SpawnRunConfig {
+    /// Explicit ceiling for the first child model round, including retries.
+    pub max_output_tokens: Option<u32>,
     /// Unique run ID.
     pub run_id: String,
     /// Opaque capability for this exact executor invocation.
@@ -3632,6 +3636,26 @@ impl DynamicAgentSpawner {
         if context.parent_is_fork_child && input.inherit_prefix.is_some() {
             return Err(SpawnError::NestedForkInheritanceRejected);
         }
+        if input.max_output_tokens == Some(0) {
+            return Err(SpawnError::InvalidInput(
+                "output-token limit must be positive".into(),
+            ));
+        }
+        if let astra_turn_core::thinking_config::ThinkingConfig::Enabled { budget_tokens } =
+            astra_turn_core::orchestration_spawn_tool::resolve_child_thinking(
+                input.reasoning.as_ref(),
+                input.model_selection.as_ref(),
+                context.parent_model_reasoning.as_ref(),
+            )
+            && (budget_tokens < 1024
+                || input
+                    .max_output_tokens
+                    .is_some_and(|limit| budget_tokens >= limit))
+        {
+            return Err(SpawnError::InvalidInput(
+                "reasoning budget must be at least 1024 and below the output-token limit".into(),
+            ));
+        }
         let agent_def = self
             .agent_registry
             .get(&input.agent_type)
@@ -3945,6 +3969,11 @@ impl DynamicAgentSpawner {
 
         // 3. Determine model and turns
         let model = context.resolved_model_name.clone();
+        let thinking = astra_turn_core::orchestration_spawn_tool::resolve_child_thinking(
+            input.reasoning.as_ref(),
+            input.model_selection.as_ref(),
+            context.parent_model_reasoning.as_ref(),
+        );
         // 3b. Resolve fork-prefix inheritance before any side effects
         // (mailbox, worktree, active_agents state). A hard-fail from
         // `required=true` must NOT leave half-constructed state
@@ -3975,19 +4004,12 @@ impl DynamicAgentSpawner {
                 // by the sink the caller installs.
                 let child_provider =
                     astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(model);
-                let prefix_thinking = input
-                    .reasoning
-                    .as_ref()
-                    .map(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::config)
-                    .unwrap_or(astra_turn_core::thinking_config::ThinkingConfig::ModelDefault);
                 let child_thinking = Some({
                     // Prefix compatibility and capture must share one canonical
                     // thinking identity. The selected model is the best provider
                     // hint available at this pure orchestration boundary.
                     astra_turn_core::thinking_config::fork_capture_thinking_slice(
-                        &prefix_thinking,
-                        model,
-                        model,
+                        &thinking, model, model,
                     )
                 });
                 let resolve_ctx = SpawnResolveContext {
@@ -4416,6 +4438,7 @@ impl DynamicAgentSpawner {
             context.workspace_mutation
         };
         let run_config = SpawnRunConfig {
+            max_output_tokens: input.max_output_tokens,
             run_id: run_id.clone(),
             cancellation_binding_id,
             agent_id: agent_id.clone(),
@@ -4427,11 +4450,7 @@ impl DynamicAgentSpawner {
             system_prompt_addendum: coordination_addendum,
             model_selection: input.model_selection.clone(),
             fanout_slot: fanout_slot.clone(),
-            thinking: input
-                .reasoning
-                .as_ref()
-                .map(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::config)
-                .unwrap_or(astra_turn_core::thinking_config::ThinkingConfig::ModelDefault),
+            thinking,
             model,
             initial_turns,
             hard_turn_limit,
@@ -7412,6 +7431,7 @@ mod tests {
             ..Default::default()
         };
         let context = SpawnContext {
+            parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
             resolved_model_name: None,
@@ -7446,6 +7466,7 @@ mod tests {
             ..Default::default()
         };
         let context = SpawnContext {
+            parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
             resolved_model_name: None,
@@ -7493,6 +7514,7 @@ mod tests {
             ..Default::default()
         };
         let context = SpawnContext {
+            parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
             resolved_model_name: None,
@@ -7582,6 +7604,7 @@ mod tests {
             ..Default::default()
         };
         let context = SpawnContext {
+            parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
             resolved_model_name: None,
@@ -7688,6 +7711,7 @@ mod tests {
         let spawner = DynamicAgentSpawner::new(mock_router())
             .with_executor(factory.clone() as Arc<dyn SpawnAgentExecutor>);
         let context = SpawnContext {
+            parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
             resolved_model_name: None,
@@ -7745,6 +7769,7 @@ mod tests {
         );
 
         let context = SpawnContext {
+            parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
             resolved_model_name: None,
@@ -7800,6 +7825,7 @@ mod tests {
             .await
             .unwrap();
         let context = SpawnContext {
+            parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
             resolved_model_name: None,
@@ -8728,6 +8754,7 @@ mod tests {
         let spawner = DynamicAgentSpawner::new(router.clone())
             .with_executor(Arc::new(ImmediateSuccessExecutor));
         let context = SpawnContext {
+            parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
             resolved_model_name: None,
@@ -8794,6 +8821,7 @@ mod tests {
         let executor = Arc::new(CapturingDepthExecutor::new());
         let spawner = DynamicAgentSpawner::new(mock_router()).with_executor(executor.clone());
         let context = SpawnContext {
+            parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
             resolved_model_name: None,
@@ -8864,6 +8892,7 @@ mod tests {
             },
         ));
         let context = SpawnContext {
+            parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
             resolved_model_name: None,
@@ -8903,6 +8932,7 @@ mod tests {
     async fn test_spawn_rejects_when_recursion_depth_limit_reached() {
         let spawner = DynamicAgentSpawner::new(mock_router());
         let context = SpawnContext {
+            parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
             resolved_model_name: None,
@@ -8942,6 +8972,7 @@ mod tests {
             },
         ));
         let context = SpawnContext {
+            parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
             resolved_model_name: None,
@@ -9059,6 +9090,7 @@ mod tests {
             },
         ));
         let context = SpawnContext {
+            parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
             resolved_model_name: None,
@@ -9102,6 +9134,7 @@ mod tests {
         ));
         let mut progress = spawner.subscribe_progress();
         let context = SpawnContext {
+            parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
             resolved_model_name: None,
@@ -10693,6 +10726,7 @@ mod tests {
         let spawner = DynamicAgentSpawner::new(mock_router())
             .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
         let context = SpawnContext {
+            parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
             resolved_model_name: None,
@@ -10724,6 +10758,7 @@ mod tests {
     #[test]
     fn test_spawn_context_empty_skills_default() {
         let context = SpawnContext {
+            parent_model_reasoning: None,
             parent_run_id: "run-1".to_string(),
             parent_agent_id: "agent-1".to_string(),
             resolved_model_name: None,
@@ -10804,6 +10839,7 @@ mod tests {
 
     fn make_bg_context() -> SpawnContext {
         SpawnContext {
+            parent_model_reasoning: None,
             parent_run_id: "root".to_string(),
             parent_agent_id: "root".to_string(),
             resolved_model_name: None,
@@ -14524,8 +14560,7 @@ mod tests {
 
     use astra_turn_core::fork_capture::{CaptureRequest, capture_parent_prefix};
     use astra_turn_core::fork_prefix::{
-        CacheMode, ProviderKind, SystemBlock, ThinkingConfigSlice, ToolSchemaEntry,
-        hash_tool_schema,
+        CacheMode, ProviderKind, SystemBlock, ToolSchemaEntry, hash_tool_schema,
     };
     use astra_turn_core::fork_prefix_store::{InMemoryPrefixStore, PrefixCaptureSink};
     use astra_turn_core::fork_resolve::PrefixResolveOutcome;
@@ -14546,11 +14581,13 @@ mod tests {
             parent_turn_seq: 1,
             provider: ProviderKind::Anthropic,
             model_id: model.to_string(),
-            thinking: Some(ThinkingConfigSlice {
-                enabled: false,
-                budget_tokens: 0,
-                kind: "disabled".into(),
-            }),
+            thinking: astra_turn_core::thinking_config::fork_capture_thinking_slice(
+                &astra_turn_core::thinking_config::ThinkingConfig::Enabled {
+                    budget_tokens: 8000,
+                },
+                "anthropic",
+                model,
+            ),
             system_blocks: vec![SystemBlock {
                 bytes: b"sys".to_vec(),
                 has_cache_control: true,
@@ -14580,6 +14617,16 @@ mod tests {
 
     fn parent_context(run_id: &str) -> SpawnContext {
         SpawnContext {
+            parent_model_reasoning: Some(
+                astra_turn_core::orchestration_spawn_tool::ParentModelReasoning {
+                    selection: astra_turn_types::ModelSelection {
+                        offering_id: "captured-parent-offering".into(),
+                    },
+                    thinking: astra_turn_core::thinking_config::ThinkingConfig::Enabled {
+                        budget_tokens: 8000,
+                    },
+                },
+            ),
             parent_run_id: run_id.to_string(),
             parent_agent_id: "parent".to_string(),
             resolved_model_name: Some(TEST_CHILD_MODEL.to_string()),
@@ -14679,6 +14726,24 @@ mod tests {
             matches!(outcome, PrefixResolveOutcome::Resolved { .. }),
             "expected Resolved, got {outcome:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_model_default_does_not_reuse_an_enabled_prefix() {
+        let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
+        let exec = Arc::new(CapturingPrefixExecutor::new());
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_prefix_store(store.clone())
+            .with_executor(exec.clone() as Arc<dyn SpawnAgentExecutor>);
+        capture_parent_for(&*store, "run-parent-A", TEST_CHILD_MODEL);
+        let mut input = child_with_inherit(true);
+        input.reasoning =
+            Some(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::ModelDefault);
+        assert!(matches!(
+            spawner.spawn(input, &parent_context("run-parent-A")).await,
+            Err(SpawnError::PrefixInheritanceRequired { .. })
+        ));
+        assert!(exec.take_captured().is_none());
     }
 
     #[tokio::test]

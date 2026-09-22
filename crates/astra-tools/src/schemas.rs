@@ -1304,9 +1304,11 @@ fn fanout_model_selection_schema() -> Value {
 
 fn fanout_reasoning_schema() -> Value {
     json!({
+        "description": "Exact reasoning control. Omit to inherit parent thinking for the same Offering; model_default explicitly uses the target default. Different Offerings never inherit parent controls.",
         "oneOf": [
             {"type": "object", "properties": {"mode": {"const": "model_default"}}, "required": ["mode"], "additionalProperties": false},
             {"type": "object", "properties": {"mode": {"const": "off"}}, "required": ["mode"], "additionalProperties": false},
+            {"type": "object", "properties": {"mode": {"const": "enabled"}, "budget_tokens": {"type": "integer", "minimum": 1024, "maximum": 4294967295_u64}}, "required": ["mode", "budget_tokens"], "additionalProperties": false},
             {"type": "object", "properties": {"mode": {"const": "adaptive"}, "effort": {"type": "string", "enum": ["low", "medium", "high", "max"]}}, "required": ["mode", "effort"], "additionalProperties": false}
         ]
     })
@@ -1930,14 +1932,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "required": ["offering_id"],
                             "additionalProperties": false
                         },
-                        "reasoning": {
-                            "description": "Reasoning control independent of model identity. Omit or use model_default to use the target Offering default.",
-                            "oneOf": [
-                                {"type":"object","properties":{"mode":{"const":"model_default"}},"required":["mode"],"additionalProperties":false},
-                                {"type":"object","properties":{"mode":{"const":"off"}},"required":["mode"],"additionalProperties":false},
-                                {"type":"object","properties":{"mode":{"const":"adaptive"},"effort":{"type":"string","enum":["low","medium","high","max"]}},"required":["mode","effort"],"additionalProperties":false}
-                            ]
-                        },
+                        "reasoning": fanout_reasoning_schema(),
                         "name": {"type": "string", "description": "Action label when accepted by the selected action."},
                         "input": {"type": "object", "description": "Optional run_chain template input."},
                         "rollback_on_failure": {"type": "boolean", "description": "Rollback bounded chain mutations after failure."},
@@ -2025,7 +2020,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                     "prompt": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS, "description": "Concise child task brief. The child inherits current provider bindings and can use only its exposed tools; never paste file contents, diffs, or prior tool output here."},
                                     "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Child persona. Omit for bounded read-only explore; choose task/general-purpose explicitly for mutation or full-surface work."},
                                     "max_turns": {"type": "integer", "minimum": 1},
-                                    "max_output_tokens": {"type": "integer"},
+                                    "max_output_tokens": {"type": "integer", "minimum": 1},
                                     "complexity": {"type": "string", "enum": ["light","normal","deep"]},
                                     "isolated": {"type": "boolean"},
                                     "allowed_tools": {"type": "array", "items": {"type": "string"}},
@@ -2042,7 +2037,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "properties": {
                                 "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Shared child persona. Omit for bounded read-only explore; choose task/general-purpose explicitly for mutation or full-surface work."},
                                 "max_turns": {"type": "integer", "minimum": 1},
-                                "max_output_tokens": {"type": "integer"},
+                                "max_output_tokens": {"type": "integer", "minimum": 1},
                                 "complexity": {"type": "string", "enum": ["light","normal","deep"]},
                                 "isolated": {"type": "boolean"},
                                 "allowed_tools": {"type": "array", "items": {"type": "string"}},
@@ -2690,7 +2685,7 @@ mod tests {
         );
         assert_eq!(
             slot_props["reasoning"]["oneOf"].as_array().unwrap().len(),
-            3
+            4
         );
         assert_eq!(
             params["properties"]["defaults"]["properties"]["model_selection"]["required"],

@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 pub enum ReasoningSelection {
     ModelDefault,
     Off,
+    Enabled {
+        budget_tokens: u32,
+    },
     Adaptive {
         effort: crate::thinking_config::ThinkingEffort,
     },
@@ -25,11 +28,50 @@ impl ReasoningSelection {
         match self {
             Self::ModelDefault => crate::thinking_config::ThinkingConfig::ModelDefault,
             Self::Off => crate::thinking_config::ThinkingConfig::Off,
+            Self::Enabled { budget_tokens } => crate::thinking_config::ThinkingConfig::Enabled {
+                budget_tokens: *budget_tokens,
+            },
             Self::Adaptive { effort } => {
                 crate::thinking_config::ThinkingConfig::Adaptive { effort: *effort }
             }
         }
     }
+}
+
+impl From<crate::thinking_config::ThinkingConfig> for ReasoningSelection {
+    fn from(config: crate::thinking_config::ThinkingConfig) -> Self {
+        use crate::thinking_config::ThinkingConfig;
+        match config {
+            ThinkingConfig::ModelDefault => Self::ModelDefault,
+            ThinkingConfig::Off => Self::Off,
+            ThinkingConfig::Enabled { budget_tokens } => Self::Enabled { budget_tokens },
+            ThinkingConfig::Adaptive { effort } => Self::Adaptive { effort },
+        }
+    }
+}
+
+/// Immutable effective parent setting, paired with its exact Offering identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParentModelReasoning {
+    pub selection: ModelSelection,
+    pub thinking: crate::thinking_config::ThinkingConfig,
+}
+
+/// Resolve after slot/shared/profile defaults. Explicit model-default stops
+/// inheritance; controls from another Offering must never cross this boundary.
+pub fn resolve_child_thinking(
+    requested: Option<&ReasoningSelection>,
+    child: Option<&ModelSelection>,
+    parent: Option<&ParentModelReasoning>,
+) -> crate::thinking_config::ThinkingConfig {
+    requested
+        .map(ReasoningSelection::config)
+        .unwrap_or_else(|| {
+            parent
+                .filter(|parent| child.is_none_or(|child| child == &parent.selection))
+                .map(|parent| parent.thinking.clone())
+                .unwrap_or(crate::thinking_config::ThinkingConfig::ModelDefault)
+        })
 }
 /// Request to inherit the parent's cacheable prefix when spawning.
 ///
@@ -191,8 +233,8 @@ pub struct SpawnAgentInput {
     #[serde(default)]
     pub model_selection: Option<ModelSelection>,
 
-    /// Optional reasoning override. Omit it, or use `model_default`, to use the
-    /// selected Offering's default.
+    /// Optional reasoning override. Omission inherits the effective parent
+    /// setting only for the same Offering; model_default explicitly opts out.
     #[serde(default)]
     pub reasoning: Option<ReasoningSelection>,
 }
@@ -576,13 +618,69 @@ mod tests {
     }
 
     #[test]
-    fn explicit_budget_is_not_a_public_spawn_control() {
-        let error = serde_json::from_value::<SpawnAgentInput>(serde_json::json!({
+    fn explicit_budget_preserves_exact_control() {
+        let input = serde_json::from_value::<SpawnAgentInput>(serde_json::json!({
             "description": "inspect",
+            "prompt": "inspect",
             "reasoning": {"mode": "enabled", "budget_tokens": 8_000}
         }))
-        .expect_err("budget controls remain internal until exact wire support is admitted");
-        assert!(error.to_string().contains("unknown variant"));
+        .unwrap();
+        assert_eq!(
+            input.reasoning.unwrap().config(),
+            crate::thinking_config::ThinkingConfig::Enabled {
+                budget_tokens: 8_000
+            }
+        );
+    }
+
+    #[test]
+    fn child_reasoning_inherits_only_the_matching_offering() {
+        use crate::thinking_config::{ThinkingConfig, ThinkingEffort};
+        let selection = ModelSelection {
+            offering_id: "parent".into(),
+        };
+        let other = ModelSelection {
+            offering_id: "other".into(),
+        };
+        for thinking in [
+            ThinkingConfig::Off,
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High,
+            },
+            ThinkingConfig::Enabled {
+                budget_tokens: 8_000,
+            },
+        ] {
+            let parent = ParentModelReasoning {
+                selection: selection.clone(),
+                thinking: thinking.clone(),
+            };
+            assert_eq!(resolve_child_thinking(None, None, Some(&parent)), thinking);
+            assert_eq!(
+                resolve_child_thinking(None, Some(&selection), Some(&parent)),
+                thinking
+            );
+            assert_eq!(
+                resolve_child_thinking(None, Some(&other), Some(&parent)),
+                ThinkingConfig::ModelDefault
+            );
+            assert_eq!(
+                resolve_child_thinking(
+                    Some(&ReasoningSelection::ModelDefault),
+                    Some(&selection),
+                    Some(&parent)
+                ),
+                ThinkingConfig::ModelDefault
+            );
+            assert_eq!(
+                ReasoningSelection::from(thinking.clone()).config(),
+                thinking
+            );
+        }
+        assert_eq!(
+            resolve_child_thinking(None, Some(&selection), None),
+            ThinkingConfig::ModelDefault
+        );
     }
 
     #[test]

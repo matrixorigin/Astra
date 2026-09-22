@@ -9,6 +9,8 @@ use serde_json::Value;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelAdmissionSlotV1 {
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
     pub offering_id: String,
     /// Serialized `ReasoningSelection`; Server validates the exact type.
     pub reasoning: Value,
@@ -23,6 +25,7 @@ pub struct ModelAdmissionRequestV1 {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelAdmissionResultV1 {
+    pub max_output_tokens: Option<u32>,
     pub offering_id: String,
     pub reasoning: Value,
     pub model_name: String,

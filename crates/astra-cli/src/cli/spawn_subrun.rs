@@ -657,12 +657,37 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         context: &SpawnContext,
         parent_selection: Option<&astra_turn_types::ModelSelection>,
     ) -> Result<Vec<Box<dyn PreparedSpawn>>, String> {
+        use astra_turn_core::orchestration_spawn_tool::{
+            ReasoningSelection, resolve_child_thinking,
+        };
+        use astra_turn_core::thinking_config::ThinkingConfig;
+
         for input in inputs {
             input.fanout_slot_identity()?;
         }
-        let has_override = inputs
+        let parent_selection = parent_selection.or_else(|| {
+            context
+                .parent_model_reasoning
+                .as_ref()
+                .map(|parent| &parent.selection)
+        });
+        let thinking: Vec<_> = inputs
             .iter()
-            .any(|input| input.model_selection.is_some() || input.reasoning.is_some());
+            .map(|input| {
+                resolve_child_thinking(
+                    input.reasoning.as_ref(),
+                    input.model_selection.as_ref().or(parent_selection),
+                    context.parent_model_reasoning.as_ref(),
+                )
+            })
+            .collect();
+        let has_override = inputs.iter().any(|input| {
+            input.model_selection.is_some()
+                || input.reasoning.is_some()
+                || input.max_output_tokens.is_some()
+        }) || thinking
+            .iter()
+            .any(|thinking| *thinking != ThinkingConfig::ModelDefault);
         if has_override
             && parent_selection.is_none()
             && inputs.iter().any(|input| input.model_selection.is_none())
@@ -694,21 +719,26 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             let request = ModelAdmissionRequestV1 {
                 slots: inputs
                     .iter()
-                    .map(|input| {
+                    .zip(&thinking)
+                    .map(|(input, thinking)| {
                         let offering_id = input
                             .model_selection
                             .as_ref()
                             .map(|selection| selection.offering_id.as_str())
-                            .or_else(|| parent_selection.map(|selection| selection.offering_id.as_str()))
-                            .ok_or_else(|| "child has no admitted parent or default Offering".to_string())?;
+                            .or_else(|| {
+                                parent_selection.map(|selection| selection.offering_id.as_str())
+                            })
+                            .ok_or_else(|| {
+                                "child has no admitted parent or default Offering".to_string()
+                            })?;
                         astra_services::validate_model_offering_id(offering_id)
                             .map_err(|error| error.to_string())?;
-                        let reasoning = input.reasoning.clone().unwrap_or(
-                            astra_turn_core::orchestration_spawn_tool::ReasoningSelection::ModelDefault,
-                        );
+                        let reasoning = ReasoningSelection::from(thinking.clone());
                         Ok(ModelAdmissionSlotV1 {
                             offering_id: offering_id.to_string(),
-                            reasoning: serde_json::to_value(reasoning).map_err(|error| error.to_string())?,
+                            max_output_tokens: input.max_output_tokens,
+                            reasoning: serde_json::to_value(reasoning)
+                                .map_err(|error| error.to_string())?,
                         })
                     })
                     .collect::<Result<Vec<_>, String>>()?,
@@ -736,6 +766,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 .zip(response.slots)
                 .map(|(requested, admitted)| {
                     if admitted.offering_id != requested.offering_id
+                        || admitted.max_output_tokens != requested.max_output_tokens
                         || admitted.reasoning != requested.reasoning
                         || admitted.model_name.trim().is_empty()
                         || admitted.context_window == Some(0)
@@ -754,7 +785,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         inputs
             .iter()
             .zip(selections)
-            .map(|(input, model)| {
+            .zip(thinking)
+            .map(|((input, model), thinking)| {
                 Ok(Box::new(CliPreparedSpawn {
                     executor: Arc::clone(&self),
                     parent_run_id: context.parent_run_id.clone(),
@@ -762,11 +794,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                         .model_selection
                         .clone()
                         .or_else(|| parent_selection.cloned()),
-                    reasoning: input
-                        .reasoning
-                        .as_ref()
-                        .map(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::config)
-                        .unwrap_or(astra_turn_core::thinking_config::ThinkingConfig::ModelDefault),
+                    reasoning: thinking,
+                    max_output_tokens: input.max_output_tokens,
                     slot: input.fanout_slot_identity()?,
                     model,
                 }) as Box<dyn PreparedSpawn>)
@@ -784,6 +813,7 @@ struct CliPreparedSpawn {
     parent_run_id: String,
     requested_selection: Option<astra_turn_types::ModelSelection>,
     reasoning: astra_turn_core::thinking_config::ThinkingConfig,
+    max_output_tokens: Option<u32>,
     slot: Option<AgentFanoutSlotIdentity>,
     model: crate::cli::session::session_runtime::ServerModelSelection,
 }
@@ -799,6 +829,7 @@ impl PreparedSpawn for CliPreparedSpawn {
             || config.fanout_slot != self.slot
             || config.model_selection != self.requested_selection
             || config.thinking != self.reasoning
+            || config.max_output_tokens != self.max_output_tokens
         {
             return Err(
                 "prepared CLI fanout model does not match its parent, slot, Offering, or reasoning"
@@ -817,6 +848,9 @@ impl CliSpawnAgentExecutor {
         config: SpawnRunConfig,
         prepared_model: Option<crate::cli::session::session_runtime::ServerModelSelection>,
     ) -> Result<SpawnRunResult, String> {
+        if let Some(limit) = config.max_output_tokens {
+            config.thinking.validate_output_budget(u64::from(limit))?;
+        }
         let runtime_ceiling = astra_config::RuntimeConfig::cached()
             .runtime_limits
             .resolve_turn_ceiling(false)?;
@@ -954,6 +988,7 @@ impl CliSpawnAgentExecutor {
             valid_tool_names: valid_tool_names.clone(),
             perm_manager,
             max_completion_tokens: None,
+            initial_output_limit: config.max_output_tokens,
             effort: None,
             agent_type: Some(config.agent_type.clone()),
             cancel_token: Some(child_cancel_token.clone()),
@@ -1672,6 +1707,7 @@ mod tests {
             parent_run_id: "parent-run".into(),
             parent_agent_id: "parent-agent".into(),
             resolved_model_name: Some("parent-model".into()),
+            parent_model_reasoning: None,
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
@@ -1706,6 +1742,7 @@ mod tests {
             model_selection,
             fanout_slot: slot,
             thinking,
+            max_output_tokens: None,
             model: Some("parent-model".into()),
             initial_turns: 1,
             hard_turn_limit: Some(0),
@@ -2074,6 +2111,193 @@ mod tests {
         );
         server.verify().await;
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cli_fanout_inherits_only_same_offering_effective_reasoning() {
+        use astra_turn_core::orchestration_spawn_tool::{ParentModelReasoning, ReasoningSelection};
+        use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
+
+        for inherited in [
+            ThinkingConfig::Off,
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High,
+            },
+            ThinkingConfig::Enabled {
+                budget_tokens: 4096,
+            },
+        ] {
+            let server = MockServer::start().await;
+            let parent = astra_turn_types::ModelSelection {
+                offering_id: "offer-parent".into(),
+            };
+            let other = astra_turn_types::ModelSelection {
+                offering_id: "offer-other".into(),
+            };
+            let context = SpawnContext {
+                parent_model_reasoning: Some(ParentModelReasoning {
+                    selection: parent.clone(),
+                    thinking: inherited.clone(),
+                }),
+                ..cli_fanout_test_context()
+            };
+            let inputs: Vec<_> = [
+                (None, None),
+                (Some(parent.clone()), None),
+                (Some(other.clone()), None),
+                (None, Some(ReasoningSelection::ModelDefault)),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (model_selection, reasoning))| SpawnAgentInput {
+                description: format!("slot {index}"),
+                prompt: "review".into(),
+                model_selection,
+                reasoning,
+                fanout_group_id: Some("reasoning".into()),
+                fanout_target_count: Some(4),
+                fanout_slot_index: Some(index),
+                ..Default::default()
+            })
+            .collect();
+            let effective = [
+                inherited.clone(),
+                inherited.clone(),
+                ThinkingConfig::ModelDefault,
+                ThinkingConfig::ModelDefault,
+            ];
+            let slots: Vec<_> = inputs.iter().zip(&effective).map(|(input, thinking)| json!({
+                "offering_id": input.model_selection.as_ref().unwrap_or(&parent).offering_id,
+                "reasoning": ReasoningSelection::from(thinking.clone()),
+                "model_name": "admitted-model",
+                "context_window": 128000,
+            })).collect();
+            Mock::given(method("POST"))
+                .and(path("/model-access/admit"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"slots": slots})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let executor = Arc::new(test_executor(&server.uri()));
+            let prepared = executor
+                .prepare_batch(&inputs, &context, Some(&parent))
+                .await
+                .unwrap();
+            assert_eq!(prepared.len(), 4);
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1, "no catalog GET before admission");
+            let body = requests[0].body_json::<Value>().unwrap();
+            for (index, ((prepared, input), thinking)) in
+                prepared.into_iter().zip(&inputs).zip(effective).enumerate()
+            {
+                assert_eq!(
+                    body["slots"][index]["reasoning"],
+                    serde_json::to_value(ReasoningSelection::from(thinking.clone())).unwrap()
+                );
+                let error = prepared
+                    .execute(prepared_cli_test_config(
+                        input.fanout_slot_identity().unwrap(),
+                        input
+                            .model_selection
+                            .clone()
+                            .or_else(|| Some(parent.clone())),
+                        thinking,
+                    ))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.contains("hard_turn_limit must be positive"),
+                    "{error}"
+                );
+            }
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_fanout_inherited_budget_requires_exact_admission_and_consumption() {
+        use astra_turn_core::orchestration_spawn_tool::ParentModelReasoning;
+        use astra_turn_core::thinking_config::ThinkingConfig;
+        let parent = astra_turn_types::ModelSelection {
+            offering_id: "offer-parent".into(),
+        };
+        let input = SpawnAgentInput {
+            description: "review".into(),
+            prompt: "review".into(),
+            max_output_tokens: Some(8192),
+            ..Default::default()
+        };
+        let context = SpawnContext {
+            parent_model_reasoning: Some(ParentModelReasoning {
+                selection: parent.clone(),
+                thinking: ThinkingConfig::Enabled {
+                    budget_tokens: 4096,
+                },
+            }),
+            ..cli_fanout_test_context()
+        };
+        for (status, admitted_budget, admitted_cap, consumed_budget, consumed_cap) in [
+            (400, 4096, Some(8192), 4096, Some(8192)),
+            (200, 1024, Some(8192), 4096, Some(8192)),
+            (200, 4096, None, 4096, Some(8192)),
+            (200, 4096, Some(4096), 4096, Some(8192)),
+            (200, 4096, Some(8192), 1024, Some(8192)),
+            (200, 4096, Some(8192), 4096, None),
+            (200, 4096, Some(8192), 4096, Some(8192)),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/model-access/admit"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(json!({"slots": [{
+                    "offering_id": "offer-parent", "reasoning": {"mode": "enabled", "budget_tokens": admitted_budget},
+                    "model_name": "parent-model", "context_window": 128000,
+                    "max_output_tokens": admitted_cap,
+                }]})))
+                .expect(1).mount(&server).await;
+            let result = Arc::new(test_executor(&server.uri()))
+                .prepare_batch(std::slice::from_ref(&input), &context, None)
+                .await;
+            if status != 200 || admitted_budget != 4096 || admitted_cap != Some(8192) {
+                assert!(
+                    result.is_err(),
+                    "rejection/mismatched budget must not prepare a child"
+                );
+            } else {
+                let prepared = result.unwrap().pop().unwrap();
+                let mut config = prepared_cli_test_config(
+                    None,
+                    Some(parent.clone()),
+                    ThinkingConfig::Enabled {
+                        budget_tokens: consumed_budget,
+                    },
+                );
+                config.max_output_tokens = consumed_cap;
+                let error = prepared.execute(config).await.unwrap_err();
+                if consumed_budget == 4096 && consumed_cap == Some(8192) {
+                    assert!(
+                        error.contains("hard_turn_limit must be positive"),
+                        "{error}"
+                    );
+                } else {
+                    assert!(error.contains("does not match"), "{error}");
+                }
+            }
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests.len(),
+                1,
+                "inherited nondefault uses admission instead of catalog"
+            );
+            assert_eq!(
+                requests[0].body_json::<Value>().unwrap()["slots"][0]["reasoning"],
+                json!({"mode":"enabled", "budget_tokens":4096})
+            );
+            assert_eq!(
+                requests[0].body_json::<Value>().unwrap()["slots"][0]["max_output_tokens"],
+                8192
+            );
+            server.verify().await;
+        }
     }
 
     #[tokio::test]
@@ -2526,6 +2750,7 @@ mod tests {
                 cancellation_binding_id: "test-run-live-output-binding".into(),
                 agent_id: "reviewer@run-live-output".into(),
                 spawn_tool_call_id: Some("call-spawn-live".into()),
+                max_output_tokens: Some(32768),
                 recursion_depth: 1,
                 agent_type: "task".into(),
                 description: "Live output child".into(),
@@ -2538,12 +2763,25 @@ mod tests {
                 ..prepared_cli_test_config(
                     None,
                     None,
-                    astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
+                    astra_turn_core::thinking_config::ThinkingConfig::Enabled {
+                        budget_tokens: 16384,
+                    },
                 )
             })
             .await
             .expect("spawned run");
         assert_eq!(result.status, "completed");
+        let requests = mock.received_requests();
+        assert!(!requests.is_empty(), "child must send an actual request");
+        assert_eq!(requests[0]["context"]["max_output_tokens"], 32768);
+        assert_eq!(
+            requests[0]["context"]["thinking"],
+            serde_json::to_value(astra_turn_core::thinking_config::ThinkingConfig::Enabled {
+                budget_tokens: 16384
+            })
+            .unwrap(),
+            "typed child budget must bypass lightweight-turn scaling"
+        );
         let events = live_sink.events.lock_recover();
         assert!(matches!(
             events.first().map(|event| &event.kind),
@@ -2561,6 +2799,36 @@ mod tests {
             )),
             "events: {events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn child_rejects_invalid_exact_budget_before_lookup_or_inference() {
+        use astra_turn_core::thinking_config::ThinkingConfig;
+        let server = MockServer::start().await;
+        for (budget, cap) in [(512, 8192), (8192, 8192), (16384, 8192)] {
+            let mut config = prepared_cli_test_config(
+                None,
+                None,
+                ThinkingConfig::Enabled {
+                    budget_tokens: budget,
+                },
+            );
+            config.max_output_tokens = Some(cap);
+            config.hard_turn_limit = Some(1);
+            let error = test_executor(&server.uri())
+                .execute(config)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error,
+                ThinkingConfig::Enabled {
+                    budget_tokens: budget
+                }
+                .validate_output_budget(u64::from(cap))
+                .unwrap_err()
+            );
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     /// Bug1 regression: when inherited prefix ends with a user or tool

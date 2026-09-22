@@ -838,6 +838,8 @@ impl Drop for ExecutionOwnerGenerationGuard {
 
 /// Configuration for a sub-run spawned by delegation.
 pub struct SubRunConfig {
+    /// Explicit ceiling for the first model round, including retries.
+    pub max_output_tokens: Option<u32>,
     /// Unique ID for this sub-run.
     pub run_id: String,
     /// Durable parent run that delegated this child. This is identity data for
@@ -3376,6 +3378,7 @@ impl DelegationEngine {
                 self.resolve_inherited_prefix_for_delegate(&request.parent_run_id, delegate_model);
 
             configs.push(SubRunConfig {
+                max_output_tokens: None,
                 run_id: sub_run_id,
                 parent_run_id: request.parent_run_id.clone(),
                 agent_profile: profile,
@@ -3732,6 +3735,7 @@ impl DelegationEngine {
                                 delegate_model,
                             );
                             Ok(SubRunConfig {
+                                max_output_tokens: None,
                                 run_id: uuid::Uuid::new_v4().to_string(),
                                 parent_run_id: request.parent_run_id.clone(),
                                 agent_profile: profile,
@@ -3948,6 +3952,7 @@ impl DelegationEngine {
             let retry_task = enhanced_task.clone();
 
             let config = SubRunConfig {
+                max_output_tokens: None,
                 run_id: sub_run_id.clone(),
                 parent_run_id: request.parent_run_id.clone(),
                 agent_profile: profile,
@@ -4042,6 +4047,7 @@ impl DelegationEngine {
                             )
                         })?;
                         Ok(SubRunConfig {
+                            max_output_tokens: None,
                             run_id: uuid::Uuid::new_v4().to_string(),
                             parent_run_id: request.parent_run_id.clone(),
                             agent_profile: profile,
@@ -4262,6 +4268,7 @@ impl DelegationEngine {
             let prod_retry_task = prod_enhanced_task.clone();
 
             let prod_config = SubRunConfig {
+                max_output_tokens: None,
                 run_id: prod_run_id.clone(),
                 parent_run_id: request.parent_run_id.clone(),
                 agent_profile: producer_profile.clone(),
@@ -4348,6 +4355,7 @@ impl DelegationEngine {
                     per_round_timeout,
                     || {
                         Ok(SubRunConfig {
+                            max_output_tokens: None,
                             run_id: uuid::Uuid::new_v4().to_string(),
                             parent_run_id: request.parent_run_id.clone(),
                             agent_profile: pp.clone(),
@@ -4497,6 +4505,7 @@ impl DelegationEngine {
                 team_prompts::wrap_task_with_coordination(&rev_coordination, &request.task);
 
             let rev_config = SubRunConfig {
+                max_output_tokens: None,
                 run_id: rev_run_id.clone(),
                 parent_run_id: request.parent_run_id.clone(),
                 agent_profile: reviewer_profile.clone(),
@@ -4758,6 +4767,7 @@ impl DelegationEngine {
             fork_profile.max_delegation_depth = 0;
 
             let config = SubRunConfig {
+                max_output_tokens: None,
                 run_id: run_id.clone(),
                 parent_run_id: request.parent_run_id.clone(),
                 agent_profile: fork_profile,
@@ -7590,6 +7600,7 @@ mod tests {
     async fn stub_executor_returns_completed() {
         let executor = StubSubRunExecutor;
         let config = SubRunConfig {
+            max_output_tokens: None,
             execution_owner_generation: None,
             execution_owner_generation_sink: None,
             run_id: "r1".into(),

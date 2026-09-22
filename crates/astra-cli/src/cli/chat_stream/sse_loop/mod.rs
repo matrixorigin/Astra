@@ -431,6 +431,7 @@ pub(crate) async fn stream_chat_sse(
                 agent_id: root_agent_id.to_string(),
                 delegation_chain: Vec::new(),
                 current_model: p.model.map(str::to_string),
+                parent_model_reasoning: None,
                 current_model_selection: p.offering_id.as_ref().map(|offering_id| {
                     astra_turn_types::ModelSelection {
                         offering_id: offering_id.clone(),

@@ -7036,6 +7036,16 @@ impl AgenticRunLifecycleService {
             delegation_chain: Vec::new(),
             current_model: request.model.clone(),
             current_model_selection: request.model_selection.clone(),
+            parent_model_reasoning: request.model_selection.clone().map(|selection| {
+                astra_turn_core::orchestration_spawn_tool::ParentModelReasoning {
+                    selection,
+                    thinking: Self::thinking_from_chat_context(
+                        &request.context,
+                        request.model.as_deref(),
+                    )
+                    .expect("request thinking validated before dynamic tool wiring"),
+                }
+            }),
             recursion_depth: 0,
             is_fork_child: false,
             working_dir: workspace.to_path_buf(),
@@ -8796,6 +8806,14 @@ impl AgenticRunLifecycleService {
         // ordinary chat default without inventing an explicit `off` request.
         let thinking = Self::thinking_from_chat_context(&request.context, request.model.as_deref())
             .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+        let initial_output_limit =
+            Self::initial_output_limit_from_chat_context(&request.context)
+                .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+        if let Some(limit) = initial_output_limit {
+            thinking
+                .validate_output_budget(u64::from(limit))
+                .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+        }
         if request
             .context
             .as_ref()
@@ -11653,6 +11671,20 @@ impl AgenticRunLifecycleService {
             session_id.to_string(),
         )
         .with_model(request.model.clone())
+        .with_initial_output_limit(
+            Self::initial_output_limit_from_chat_context(&request.context)
+                .expect("output limit validated before host construction"),
+        )
+        .with_preserved_thinking(
+            request
+                .context
+                .as_ref()
+                .is_some_and(|context| context.contains_key("thinking"))
+                && Self::thinking_from_chat_context(&request.context, request.model.as_deref())
+                    .is_ok_and(|thinking| {
+                        thinking != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault
+                    }),
+        )
         .with_model_service(Some(self.model_service.clone()))
         .with_admitted_execution_deadline(request.admitted_execution_deadline)
         .with_admitted_model_execution(request.admitted_model_execution.clone())
@@ -12624,6 +12656,22 @@ impl AgenticRunLifecycleService {
             .map(|name| astra_turn_core::thinking_config::resolve_model_thinking_request(name).1)
             .unwrap_or_default())
     }
+    fn initial_output_limit_from_chat_context(
+        context: &Option<Map<String, Value>>,
+    ) -> Result<Option<u32>, String> {
+        context
+            .as_ref()
+            .and_then(|context| context.get("max_output_tokens"))
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| "context.max_output_tokens must be a positive u32".to_string())
+            })
+            .transpose()
+    }
+
     /// Extract edge tools from the request context, or provide empty defaults.
     /// Parse the request context into a typed [`EdgeContext`].
     fn extract_edge_context(
@@ -21469,6 +21517,7 @@ impl DurableSubrunControlAuthority {
 }
 
 struct ServerPreparedSpawn {
+    max_output_tokens: Option<u32>,
     executor: Arc<ServerSpawnAgentExecutor>,
     parent: ServerSpawnRuntimeContext,
     execution: astra_services::AdmittedModelExecution,
@@ -21487,6 +21536,7 @@ impl PreparedSpawn for ServerPreparedSpawn {
         if parent_run_id != Some(self.parent.parent_run_id.as_str())
             || config.fanout_slot != self.slot
             || config.thinking != self.thinking
+            || config.max_output_tokens != self.max_output_tokens
             || match (&self.requested_selection, &config.model_selection) {
                 (Some(expected), actual) => actual != &Some(expected.clone()),
                 (None, Some(actual)) => actual.offering_id != self.execution.offering_id,
@@ -21572,11 +21622,11 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         let mut prepared: Vec<Box<dyn PreparedSpawn>> = Vec::with_capacity(inputs.len());
         for input in inputs {
             let slot = input.fanout_slot_identity()?;
-            let thinking = input
-                .reasoning
-                .as_ref()
-                .map(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::config)
-                .unwrap_or(astra_turn_core::thinking_config::ThinkingConfig::ModelDefault);
+            let thinking = astra_turn_core::orchestration_spawn_tool::resolve_child_thinking(
+                input.reasoning.as_ref(),
+                input.model_selection.as_ref(),
+                context.parent_model_reasoning.as_ref(),
+            );
             let execution = match input.model_selection.as_ref() {
                 Some(selection)
                     if inherited
@@ -21602,7 +21652,11 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             crate::server::model_execution_admission::validate_reasoning_control(
                 &execution, &thinking,
             )?;
+            if let Some(limit) = input.max_output_tokens {
+                thinking.validate_output_budget(u64::from(limit))?;
+            }
             prepared.push(Box::new(ServerPreparedSpawn {
+                max_output_tokens: input.max_output_tokens,
                 executor: Arc::clone(&self),
                 parent: parent.clone(),
                 execution,
@@ -21760,6 +21814,7 @@ impl ServerSpawnAgentExecutor {
         let mut child_permissions = config.inherited_permissions.clone();
         child_permissions.allowed_tools = request_constraints.allowed_tools.clone();
         let subrun = SubRunConfig {
+            max_output_tokens: config.max_output_tokens,
             execution_owner_generation: None,
             execution_owner_generation_sink: Some(Arc::clone(
                 &child_runtime_context.execution_owner_generation,
@@ -23339,6 +23394,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             config.session_id.clone(),
         )
         .with_model(child_model_name.clone())
+        .with_initial_output_limit(config.max_output_tokens)
+        .with_preserved_thinking(config.thinking != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault)
         .with_model_service(self.model_service.clone())
         .with_admitted_model_execution(admitted_model_execution)
         .with_inference_owner_pod_id(
@@ -23832,6 +23889,12 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     delegation_chain: config.delegation_chain.clone(),
                     current_model: child_model_name.clone(),
                     current_model_selection: config.agent_profile.model_selection.clone(),
+                    parent_model_reasoning: config.agent_profile.model_selection.clone().map(|selection| {
+                        astra_turn_core::orchestration_spawn_tool::ParentModelReasoning {
+                            selection,
+                            thinking: config.thinking.clone(),
+                        }
+                    }),
                     recursion_depth: config.recursion_depth,
                     is_fork_child: config.inherited_prefix.is_some(),
                     working_dir: agent_working_dir,

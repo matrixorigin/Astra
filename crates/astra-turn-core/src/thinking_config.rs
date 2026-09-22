@@ -70,6 +70,18 @@ fn default_effort() -> ThinkingEffort {
 }
 
 impl ThinkingConfig {
+    /// Exact budget controls cannot be silently shrunk to fit output policy.
+    pub fn validate_output_budget(&self, output_limit: u64) -> Result<(), String> {
+        if let Self::Enabled { budget_tokens } = self
+            && (*budget_tokens < 1024 || u64::from(*budget_tokens) >= output_limit)
+        {
+            return Err(format!(
+                "reasoning budget {budget_tokens} must be at least 1024 and below output limit {output_limit}"
+            ));
+        }
+        Ok(())
+    }
+
     /// Final OpenAI-chat emission shared with the model probe's wire contract.
     /// This is deliberately independent of model names and endpoint heuristics.
     pub fn apply_openai_protocol(
@@ -680,6 +692,28 @@ pub fn strip_think_tags(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exact_budget_must_fit_without_adjustment() {
+        let thinking = super::ThinkingConfig::Enabled {
+            budget_tokens: 8_000,
+        };
+        assert!(thinking.validate_output_budget(8_000).is_err());
+        assert!(thinking.validate_output_budget(8_001).is_ok());
+        assert!(thinking.validate_output_budget(4_000).is_err());
+        assert!(
+            super::ThinkingConfig::Enabled {
+                budget_tokens: 1023
+            }
+            .validate_output_budget(8_000)
+            .is_err()
+        );
+        assert_eq!(
+            thinking,
+            super::ThinkingConfig::Enabled {
+                budget_tokens: 8_000
+            }
+        );
+    }
     use super::*;
 
     // ─── Bedrock Converse wire format ───────────────────────────────────

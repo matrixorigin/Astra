@@ -421,6 +421,8 @@ pub struct AgentToolContext {
     /// child model when the tool call omits an explicit override.
     pub current_model: Option<String>,
     pub current_model_selection: Option<astra_turn_types::ModelSelection>,
+    pub parent_model_reasoning:
+        Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning>,
     /// Current nested agent/sub-run depth of the agent.
     pub recursion_depth: u8,
     /// Whether this agent already inherited a fork prefix.
@@ -1355,6 +1357,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
         .map(|(_, _, input)| input.clone())
         .collect();
     let spawn_context = SpawnContext {
+        parent_model_reasoning: ctx.parent_model_reasoning.clone(),
         parent_run_id: ctx.run_id.clone(),
         parent_agent_id: ctx.agent_id.clone(),
         resolved_model_name: ctx
@@ -2477,6 +2480,7 @@ async fn handle_agent_spawn_input_with_capacity_reservation(
     let mut input = input;
     input.model_selection = model_selection;
     let spawn_ctx = SpawnContext {
+        parent_model_reasoning: ctx.parent_model_reasoning.clone(),
         parent_run_id: ctx.run_id.clone(),
         parent_agent_id: ctx.agent_id.clone(),
         resolved_model_name,
@@ -3593,6 +3597,7 @@ mod tests {
         current_model: Option<&str>,
     ) -> AgentToolContext {
         AgentToolContext {
+            parent_model_reasoning: None,
             run_id: "run-parent".into(),
             agent_id: "root-agent".into(),
             delegation_chain: Vec::new(),
@@ -3758,6 +3763,54 @@ mod tests {
                 effort: ThinkingEffort::High,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_inherits_effective_reasoning_without_crossing_offerings() {
+        use astra_turn_core::orchestration_spawn_tool::ParentModelReasoning;
+        use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
+        for (selection, reasoning, expected) in [
+            (
+                None,
+                None,
+                ThinkingConfig::Adaptive {
+                    effort: ThinkingEffort::High,
+                },
+            ),
+            (
+                Some("offer-parent-test"),
+                None,
+                ThinkingConfig::Adaptive {
+                    effort: ThinkingEffort::High,
+                },
+            ),
+            (Some("other-offering"), None, ThinkingConfig::ModelDefault),
+            (
+                None,
+                Some(json!({"mode":"model_default"})),
+                ThinkingConfig::ModelDefault,
+            ),
+        ] {
+            let executor = Arc::new(CapturingModelExecutor::new());
+            let mut ctx = test_spawn_context(test_spawner(executor.clone()), Some("parent-model"));
+            ctx.parent_model_reasoning = Some(ParentModelReasoning {
+                selection: ctx.current_model_selection.clone().unwrap(),
+                thinking: ThinkingConfig::Adaptive {
+                    effort: ThinkingEffort::High,
+                },
+            });
+            let mut args = json!({"description":"inspect", "prompt":"inspect"});
+            if let Some(selection) = selection {
+                args["model_selection"] = json!({"offering_id":selection});
+            }
+            if let Some(reasoning) = reasoning {
+                args["reasoning"] = reasoning;
+            }
+            let result = handle_agent_spawn_action(&args, Some(&ctx)).await;
+            let completed = collect_spawn_receipt(&result, &ctx).await;
+            assert_eq!(completed["status"], "completed", "{completed}");
+            assert_eq!(executor.take_captured_thinking(), Some(expected));
+        }
     }
 
     #[tokio::test]

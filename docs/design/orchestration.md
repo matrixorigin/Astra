@@ -46,6 +46,24 @@ summary
 
 Per-agent model override is an orchestration decision, but it must still respect budget, policy, and trace requirements.
 
+Dynamic spawn and fanout resolve reasoning separately from the Offering.
+After per-slot and shared defaults, an omitted reasoning control inherits the
+effective parent setting only when the Offering identity matches. An explicit
+`model_default` suppresses inheritance; a different Offering starts with its own
+default. The parent snapshot carries the effective control, including per-turn
+adjustments, rather than reconstructing it from a display model name.
+
+Batch admission, prefix compatibility and child execution consume the same
+resolver. Unsupported inherited controls fail admission just like unsupported
+explicit controls. Fixed token budgets remain exact and must fit the output
+limit; they are not translated into effort levels. This resolution is in-memory
+and requires no parent-run lookup or additional persistence.
+`max_output_tokens` is a ceiling for the first child model round, including its
+retries. CLI carries it as validated `context.max_output_tokens`; internal
+delegation carries the same typed cap. Catalog output limits remain separate.
+Final request assembly cannot enlarge that cap or replace an exact reasoning
+control through route defaults, convergence, or settlement heuristics.
+
 ## Failure handling
 
 - Child failure is recorded as branch failure.
