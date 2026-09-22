@@ -8800,8 +8800,10 @@ impl AgenticRunLifecycleService {
             .is_some_and(|context| context.contains_key("thinking"))
             && let Some(execution) = request.admitted_model_execution.as_ref()
         {
-            ServerSpawnAgentExecutor::validate_spawn_thinking(execution, &thinking)
-                .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+            crate::server::model_execution_admission::validate_reasoning_control(
+                execution, &thinking,
+            )
+            .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
         }
         let provider_model_descriptor = Self::provider_model_descriptor(request)?;
         if provider_model_descriptor.is_some() {
@@ -20505,53 +20507,6 @@ impl ServerSpawnAgentExecutor {
         .map_err(|error| error.to_string())
     }
 
-    fn validate_spawn_thinking(
-        execution: &astra_services::AdmittedModelExecution,
-        thinking: &astra_turn_core::thinking_config::ThinkingConfig,
-    ) -> Result<(), String> {
-        use astra_core::model_wire::thinking::ThinkingProtocol;
-        use astra_services::models::ThinkingCapability;
-        use astra_turn_core::thinking_config::ThinkingConfig;
-
-        let capability = execution.thinking_capability;
-        let protocol = execution.thinking_protocol.unwrap_or_default();
-        let supported = match thinking {
-            ThinkingConfig::ModelDefault => true,
-            ThinkingConfig::Off => {
-                matches!(
-                    capability,
-                    Some(ThinkingCapability::Both | ThinkingCapability::None)
-                )
-            }
-            ThinkingConfig::Enabled { budget_tokens } => {
-                *budget_tokens > 0
-                    && capability == Some(ThinkingCapability::Both)
-                    && matches!(execution.provider.as_str(), "anthropic" | "bedrock")
-            }
-            ThinkingConfig::Adaptive { .. } => {
-                matches!(
-                    capability,
-                    Some(ThinkingCapability::Both | ThinkingCapability::EffortOnly)
-                ) && (matches!(execution.provider.as_str(), "anthropic" | "bedrock")
-                    || matches!(
-                        protocol,
-                        ThinkingProtocol::ReasoningEffort | ThinkingProtocol::ThinkingObject
-                    ))
-            }
-        };
-        if supported {
-            Ok(())
-        } else {
-            Err(format!(
-                "Offering '{}' cannot execute requested reasoning control '{}' (capability: {}, protocol: {:?})",
-                execution.offering_id,
-                thinking,
-                capability.map_or("unknown", ThinkingCapability::as_str),
-                protocol
-            ))
-        }
-    }
-
     /// Publish the child as the next possible parent before its loop starts.
     ///
     /// Dynamic agents use the same session-owned spawner at every depth.  A
@@ -21537,7 +21492,10 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         let admitted_model_execution = self
             .select_spawn_model_execution(&context, config.model_selection.as_ref())
             .await?;
-        Self::validate_spawn_thinking(&admitted_model_execution, &config.thinking)?;
+        crate::server::model_execution_admission::validate_reasoning_control(
+            &admitted_model_execution,
+            &config.thinking,
+        )?;
         let dynamic_agent_spawner = context.spawner.upgrade().ok_or_else(|| {
             "server dynamic agent lifecycle is no longer available for this session".to_string()
         })?;

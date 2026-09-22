@@ -6381,7 +6381,7 @@ fn server_spawn_reasoning_validation_is_capability_strict() {
     execution.thinking_capability = Some(ThinkingCapability::EffortOnly);
     execution.thinking_protocol = Some(ThinkingProtocol::ReasoningEffort);
     assert!(
-        ServerSpawnAgentExecutor::validate_spawn_thinking(
+        crate::server::model_execution_admission::validate_reasoning_control(
             &execution,
             &ThinkingConfig::Adaptive {
                 effort: ThinkingEffort::High,
@@ -6390,14 +6390,17 @@ fn server_spawn_reasoning_validation_is_capability_strict() {
         .is_ok()
     );
     assert!(
-        ServerSpawnAgentExecutor::validate_spawn_thinking(&execution, &ThinkingConfig::Off)
-            .is_err(),
+        crate::server::model_execution_admission::validate_reasoning_control(
+            &execution,
+            &ThinkingConfig::Off,
+        )
+        .is_err(),
         "an always-thinking Offering cannot promise explicit off"
     );
 
     execution.thinking_capability = None;
     assert!(
-        ServerSpawnAgentExecutor::validate_spawn_thinking(
+        crate::server::model_execution_admission::validate_reasoning_control(
             &execution,
             &ThinkingConfig::ModelDefault,
         )
@@ -6405,7 +6408,7 @@ fn server_spawn_reasoning_validation_is_capability_strict() {
         "unknown capability may preserve its own default"
     );
     assert!(
-        ServerSpawnAgentExecutor::validate_spawn_thinking(
+        crate::server::model_execution_admission::validate_reasoning_control(
             &execution,
             &ThinkingConfig::Adaptive {
                 effort: ThinkingEffort::High,

@@ -10,6 +10,55 @@ use axum::{Json, http::StatusCode};
 
 use crate::error_response_coded;
 
+/// Validate one exact reasoning control against already-admitted execution
+/// material. This is deliberately pure: callers perform it after Offering
+/// admission and before dispatch, including ordinary chat, single spawn, and
+/// future batch admission.
+pub(crate) fn validate_reasoning_control(
+    execution: &AdmittedModelExecution,
+    thinking: &astra_turn_core::thinking_config::ThinkingConfig,
+) -> Result<(), String> {
+    use astra_core::model_wire::thinking::ThinkingProtocol;
+    use astra_services::models::ThinkingCapability;
+    use astra_turn_core::thinking_config::ThinkingConfig;
+
+    let capability = execution.thinking_capability;
+    let protocol = execution.thinking_protocol.unwrap_or_default();
+    let supported = match thinking {
+        ThinkingConfig::ModelDefault => true,
+        ThinkingConfig::Off => matches!(
+            capability,
+            Some(ThinkingCapability::Both | ThinkingCapability::None)
+        ),
+        ThinkingConfig::Enabled { budget_tokens } => {
+            *budget_tokens > 0
+                && capability == Some(ThinkingCapability::Both)
+                && matches!(execution.provider.as_str(), "anthropic" | "bedrock")
+        }
+        ThinkingConfig::Adaptive { .. } => {
+            matches!(
+                capability,
+                Some(ThinkingCapability::Both | ThinkingCapability::EffortOnly)
+            ) && (matches!(execution.provider.as_str(), "anthropic" | "bedrock")
+                || matches!(
+                    protocol,
+                    ThinkingProtocol::ReasoningEffort | ThinkingProtocol::ThinkingObject
+                ))
+        }
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(format!(
+            "Offering '{}' cannot execute requested reasoning control '{}' (capability: {}, protocol: {:?})",
+            execution.offering_id,
+            thinking,
+            capability.map_or("unknown", ThinkingCapability::as_str),
+            protocol
+        ))
+    }
+}
+
 /// Admit one Offering into the single execution-material contract consumed by
 /// every agent and inference adapter.
 ///

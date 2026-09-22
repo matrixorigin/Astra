@@ -1317,6 +1317,69 @@ struct LifecycleActivityGuard {
     count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+/// Short-lived capacity ownership for an already-validated spawn batch.
+/// Dropping the guard releases only slots that were not consumed by actual
+/// child reservations.
+pub(crate) struct SpawnCapacityReservation {
+    group_id: Option<String>,
+    owner_id: Option<String>,
+    reservations: Arc<std::sync::Mutex<HashMap<String, SpawnCapacityReservationState>>>,
+}
+
+struct SpawnCapacityReservationState {
+    owner_id: String,
+    parent_run_id: String,
+    target_count: usize,
+    remaining_slots: HashSet<usize>,
+}
+
+impl SpawnCapacityReservationState {
+    fn owns_group_slot(
+        &self,
+        owner_id: Option<&str>,
+        parent_run_id: &str,
+        identity: &AgentFanoutSlotIdentity,
+    ) -> bool {
+        self.owner_id == owner_id.unwrap_or_default()
+            && self.parent_run_id == parent_run_id
+            && self.target_count == identity.target_count
+            && identity.slot_index < self.target_count
+    }
+
+    fn owns_slot(
+        &self,
+        owner_id: Option<&str>,
+        parent_run_id: &str,
+        identity: &AgentFanoutSlotIdentity,
+    ) -> bool {
+        self.owns_group_slot(owner_id, parent_run_id, identity)
+            && self.remaining_slots.contains(&identity.slot_index)
+    }
+}
+
+impl SpawnCapacityReservation {
+    pub(crate) fn owner_id(&self) -> Option<&str> {
+        self.owner_id.as_deref()
+    }
+}
+
+impl Drop for SpawnCapacityReservation {
+    fn drop(&mut self) {
+        if let Some(group_id) = self.group_id.as_ref() {
+            let mut reservations = self
+                .reservations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if reservations
+                .get(group_id)
+                .is_some_and(|state| Some(state.owner_id.as_str()) == self.owner_id.as_deref())
+            {
+                reservations.remove(group_id);
+            }
+        }
+    }
+}
+
 impl Drop for LifecycleActivityGuard {
     fn drop(&mut self) {
         // Publish every mutation performed while the guard was held before
@@ -1443,6 +1506,11 @@ pub struct DynamicAgentSpawner {
     /// queue (it sees the rejection in the tool result and can retry
     /// or re-plan).
     max_concurrent_agents: Option<usize>,
+    /// Capacity reserved by a validated fanout batch but not yet consumed by
+    /// its concrete child states. Protected under the same lock ordering as
+    /// `active_agents`; it is process-local lifecycle state, not a ledger.
+    spawn_capacity_reservations:
+        Arc<std::sync::Mutex<HashMap<String, SpawnCapacityReservationState>>>,
     /// Fanout group accounting keyed by group id. Group target_count
     /// is a user/model invariant, not a derived live-agent count.
     /// Capped at [`MAX_FANOUT_GROUPS`] to prevent unbounded memory
@@ -1620,6 +1688,7 @@ impl DynamicAgentSpawner {
             prefix_resolve_outcomes: Arc::new(RwLock::new(HashMap::new())),
             trace_writer: None,
             max_concurrent_agents: None,
+            spawn_capacity_reservations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             fanout_groups: Arc::new(RwLock::new(HashMap::new())),
             fanout_agent_index: Arc::new(RwLock::new(HashMap::new())),
             fanout_terminal_result_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -2755,6 +2824,24 @@ impl DynamicAgentSpawner {
         SpawnError,
     > {
         let mut groups = self.fanout_groups.write().await;
+        let evicted_agent_ids = self.validate_fanout_group_locked(
+            &mut groups,
+            identity,
+            group_title,
+            created_by_tool_use_id,
+            parent_run_id,
+        )?;
+        Ok((groups, evicted_agent_ids))
+    }
+
+    fn validate_fanout_group_locked(
+        &self,
+        groups: &mut HashMap<String, AgentFanoutGroupProjection>,
+        identity: &AgentFanoutSlotIdentity,
+        group_title: Option<&str>,
+        created_by_tool_use_id: Option<&str>,
+        parent_run_id: &str,
+    ) -> Result<Vec<String>, SpawnError> {
         let is_new = !groups.contains_key(&identity.group_id);
         let evicted_agent_ids = if is_new {
             if let Some(existing) = groups
@@ -2766,7 +2853,7 @@ impl DynamicAgentSpawner {
                     existing.group_id, existing.target_count
                 )));
             }
-            self.evict_terminal_fanout_group_if_full(&mut groups)?
+            self.evict_terminal_fanout_group_if_full(groups)?
         } else {
             Vec::new()
         };
@@ -2816,7 +2903,7 @@ impl DynamicAgentSpawner {
                 identity.group_id, group.target_count
             )));
         }
-        Ok((groups, evicted_agent_ids))
+        Ok(evicted_agent_ids)
     }
 
     async fn record_fanout_spawn_accepted(
@@ -2882,6 +2969,7 @@ impl DynamicAgentSpawner {
     async fn record_fanout_spawn_rejected(
         &self,
         identity: &AgentFanoutSlotIdentity,
+        reservation_owner_id: Option<&str>,
         group_title: Option<&str>,
         agent_type: &str,
         description: &str,
@@ -2889,42 +2977,58 @@ impl DynamicAgentSpawner {
         created_by_tool_use_id: Option<&str>,
         parent_run_id: &str,
     ) -> Result<(), SpawnError> {
-        let (mut groups, evicted_agent_ids) = self
-            .get_or_validate_fanout_group(
+        let mut groups = self.fanout_groups.write().await;
+        let evicted_agent_ids = {
+            let reservations = self
+                .spawn_capacity_reservations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if reservations
+                .get(&identity.group_id)
+                .is_some_and(|reservation| {
+                    !reservation.owns_group_slot(reservation_owner_id, parent_run_id, identity)
+                })
+            {
+                return Err(SpawnError::Race(format!(
+                    "fanout group '{}' capacity reservation is not owned by this exact parent, target, and slot",
+                    identity.group_id
+                )));
+            }
+            let evicted_agent_ids = self.validate_fanout_group_locked(
+                &mut groups,
                 identity,
                 group_title,
                 created_by_tool_use_id,
                 parent_run_id,
-            )
-            .await?;
-        // Acquire index lock while still holding `groups` to close the
-        // TOCTOU window (see `record_fanout_spawn_accepted`).
+            )?;
+            let group = groups.get_mut(&identity.group_id).ok_or_else(|| {
+                SpawnError::Race(format!(
+                    "fanout group '{}' disappeared while its write guard was held",
+                    identity.group_id
+                ))
+            })?;
+            let active_before = group.summary().active;
+            group
+                .set_slot_request(
+                    identity.slot_index,
+                    identity.slot_id.clone(),
+                    agent_type,
+                    description,
+                )
+                .map_err(SpawnError::InvalidInput)?;
+            group
+                .record_spawn_rejected(identity.slot_index, reason)
+                .map_err(SpawnError::InvalidInput)?;
+            let active_after = group.summary().active;
+            group.touch();
+            self.adjust_cached_active_fanout_slots(active_before, active_after);
+            self.publish_fanout_group(group);
+            evicted_agent_ids
+        };
         let mut index = self.fanout_agent_index.write().await;
         for evicted_agent_id in &evicted_agent_ids {
             index.remove(evicted_agent_id);
         }
-        let group = groups.get_mut(&identity.group_id).ok_or_else(|| {
-            SpawnError::Race(format!(
-                "fanout group '{}' disappeared while its write guard was held",
-                identity.group_id
-            ))
-        })?;
-        let active_before = group.summary().active;
-        group
-            .set_slot_request(
-                identity.slot_index,
-                identity.slot_id.clone(),
-                agent_type,
-                description,
-            )
-            .map_err(SpawnError::InvalidInput)?;
-        group
-            .record_spawn_rejected(identity.slot_index, reason)
-            .map_err(SpawnError::InvalidInput)?;
-        let active_after = group.summary().active;
-        group.touch();
-        self.adjust_cached_active_fanout_slots(active_before, active_after);
-        self.publish_fanout_group(group);
         Ok(())
     }
 
@@ -2933,12 +3037,14 @@ impl DynamicAgentSpawner {
         fanout_slot: Option<&AgentFanoutSlotIdentity>,
         input: &SpawnAgentInput,
         context: &SpawnContext,
+        reservation_owner_id: Option<&str>,
         reason: impl Into<String>,
     ) {
         if let Some(identity) = fanout_slot {
             let _ = self
                 .record_fanout_spawn_rejected(
                     identity,
+                    reservation_owner_id,
                     input.fanout_group_title.as_deref(),
                     &input.agent_type,
                     &input.description,
@@ -3462,10 +3568,168 @@ impl DynamicAgentSpawner {
     /// Spawn a new agent from the given specification.
     ///
     /// This is called by the `agent(action='spawn')` handler.
+    fn prepare_static_spawn(
+        &self,
+        input: &SpawnAgentInput,
+        context: &SpawnContext,
+    ) -> Result<
+        (
+            astra_turn_core::orchestration_builtin_agents::AgentTypeDefinition,
+            Vec<String>,
+            u8,
+            u32,
+            Option<u32>,
+        ),
+        SpawnError,
+    > {
+        if context.parent_is_fork_child && input.inherit_prefix.is_some() {
+            return Err(SpawnError::NestedForkInheritanceRejected);
+        }
+        let agent_def = self
+            .agent_registry
+            .get(&input.agent_type)
+            .ok_or_else(|| SpawnError::UnknownAgentType(input.agent_type.clone()))?;
+        let effective_allowed_tools =
+            effective_spawn_allowed_tools(input.allowed_tools.as_deref(), &agent_def.allowed_tools);
+        let child_recursion_depth =
+            astra_turn_core::agentic_recursion_guard::checked_child_recursion_depth(
+                context.recursion_depth,
+            )
+            .map_err(SpawnError::DepthLimitExceeded)?;
+        let initial_turns = astra_turn_core::orchestration_spawn_tool::resolve_turn_budget(
+            input.max_turns,
+            input.complexity.as_deref(),
+            agent_def.max_turns,
+        );
+        let hard_turn_limit = input.max_turns.map(|turns| turns.max(1));
+        Ok((
+            agent_def,
+            effective_allowed_tools,
+            child_recursion_depth,
+            initial_turns,
+            hard_turn_limit,
+        ))
+    }
+
+    /// Validate deterministic, I/O-free properties for one or more spawn
+    /// requests. Single spawn is a batch of one; fanout uses the same contract
+    /// before declaring its group. Authorization and capacity belong to the
+    /// later shared admission boundary.
+    pub(crate) fn validate_spawn_inputs(
+        &self,
+        inputs: &[SpawnAgentInput],
+        context: &SpawnContext,
+    ) -> Result<(), SpawnError> {
+        if self.executor.is_none() {
+            return Err(SpawnError::ExecutorUnavailable);
+        }
+        for input in inputs {
+            input
+                .fanout_slot_identity()
+                .map_err(SpawnError::InvalidInput)?
+                .ok_or_else(|| {
+                    SpawnError::InvalidInput(
+                        "fanout batch contains a spawn without slot identity".to_string(),
+                    )
+                })?;
+            self.prepare_static_spawn(input, context)?;
+        }
+        Ok(())
+    }
+
+    /// Reserve capacity for a whole validated group under the same lifecycle
+    /// fences used by concrete child insertion. A successful reservation is
+    /// consumed one slot at a time by `spawn`; no child can observe a partial
+    /// capacity decision.
+    pub(crate) async fn reserve_spawn_capacity(
+        &self,
+        group_id: &str,
+        count: usize,
+        parent_run_id: &str,
+    ) -> Result<SpawnCapacityReservation, SpawnError> {
+        if count == 0 {
+            return Err(SpawnError::InvalidInput(
+                "spawn capacity reservation must be non-empty".to_string(),
+            ));
+        }
+        let cancellation_fence = self.cancelling_parent_runs.read().await;
+        if cancellation_fence.contains(parent_run_id) {
+            return Err(SpawnError::Race(format!(
+                "parent run '{parent_run_id}' is cancelled; descendant spawn rejected"
+            )));
+        }
+        let active_agents = self.active_agents.write().await;
+        let admission = self
+            .background_task_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*admission {
+            return Err(SpawnError::LifecycleShuttingDown);
+        }
+        if self.max_concurrent_agents.is_none() {
+            return Ok(SpawnCapacityReservation {
+                group_id: None,
+                owner_id: None,
+                reservations: Arc::clone(&self.spawn_capacity_reservations),
+            });
+        }
+        let mut reservations = self
+            .spawn_capacity_reservations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reservations.contains_key(group_id) {
+            return Err(SpawnError::Race(format!(
+                "fanout group '{group_id}' already owns a capacity reservation"
+            )));
+        }
+        let reserved: usize = reservations
+            .values()
+            .map(|state| state.remaining_slots.len())
+            .sum();
+        if let Some(limit) = self.max_concurrent_agents {
+            let occupied = active_agents.len().saturating_add(reserved);
+            if occupied.saturating_add(count) > limit {
+                return Err(SpawnError::ConcurrencyLimitExceeded {
+                    active: occupied,
+                    limit,
+                });
+            }
+        }
+        let owner_id = Uuid::new_v4().to_string();
+        reservations.insert(
+            group_id.to_string(),
+            SpawnCapacityReservationState {
+                owner_id: owner_id.clone(),
+                parent_run_id: parent_run_id.to_string(),
+                target_count: count,
+                remaining_slots: (0..count).collect(),
+            },
+        );
+        drop(reservations);
+        drop(admission);
+        drop(active_agents);
+        drop(cancellation_fence);
+        Ok(SpawnCapacityReservation {
+            group_id: Some(group_id.to_string()),
+            owner_id: Some(owner_id),
+            reservations: Arc::clone(&self.spawn_capacity_reservations),
+        })
+    }
+
     pub async fn spawn(
         &self,
         input: SpawnAgentInput,
         context: &SpawnContext,
+    ) -> Result<SpawnAgentOutput, SpawnError> {
+        self.spawn_with_capacity_reservation(input, context, None)
+            .await
+    }
+
+    pub(crate) async fn spawn_with_capacity_reservation(
+        &self,
+        input: SpawnAgentInput,
+        context: &SpawnContext,
+        reservation_owner_id: Option<&str>,
     ) -> Result<SpawnAgentOutput, SpawnError> {
         let _activity = self.begin_lifecycle_activity();
         if !*self
@@ -3477,7 +3741,12 @@ impl DynamicAgentSpawner {
         }
         let shutdown = self.background_task_shutdown.clone();
         let preparation_installed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let prepared = self.prepare_and_spawn(input, context, Arc::clone(&preparation_installed));
+        let prepared = self.prepare_and_spawn(
+            input,
+            context,
+            reservation_owner_id,
+            Arc::clone(&preparation_installed),
+        );
         tokio::pin!(prepared);
         tokio::select! {
             biased;
@@ -3496,6 +3765,7 @@ impl DynamicAgentSpawner {
         &self,
         input: SpawnAgentInput,
         context: &SpawnContext,
+        reservation_owner_id: Option<&str>,
         preparation_installed: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<SpawnAgentOutput, SpawnError> {
         #[cfg(test)]
@@ -3508,16 +3778,49 @@ impl DynamicAgentSpawner {
         let fanout_slot = input
             .fanout_slot_identity()
             .map_err(SpawnError::InvalidInput)?;
-        if context.parent_is_fork_child && input.inherit_prefix.is_some() {
-            self.record_fanout_spawn_rejected_for_input(
-                fanout_slot.as_ref(),
-                &input,
-                context,
-                "nested fork inheritance is rejected",
-            )
-            .await;
-            return Err(SpawnError::NestedForkInheritanceRejected);
+        if let Some(identity) = fanout_slot.as_ref() {
+            let reservations = self
+                .spawn_capacity_reservations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if reservations
+                .get(&identity.group_id)
+                .is_some_and(|reservation| {
+                    !reservation.owns_slot(reservation_owner_id, &context.parent_run_id, identity)
+                })
+            {
+                return Err(SpawnError::Race(format!(
+                    "fanout group '{}' capacity reservation is not owned by this exact parent, target, and slot",
+                    identity.group_id
+                )));
+            }
         }
+        let static_preparation = match self.prepare_static_spawn(&input, context) {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                let rejection_reason = match &error {
+                    SpawnError::UnknownAgentType(agent_type) => {
+                        format!("unknown agent type: {agent_type}")
+                    }
+                    SpawnError::DepthLimitExceeded(reason) => {
+                        format!("recursion depth limit exceeded: {reason}")
+                    }
+                    SpawnError::NestedForkInheritanceRejected => {
+                        "nested fork inheritance is rejected".to_string()
+                    }
+                    _ => error.to_string(),
+                };
+                self.record_fanout_spawn_rejected_for_input(
+                    fanout_slot.as_ref(),
+                    &input,
+                    context,
+                    reservation_owner_id,
+                    rejection_reason,
+                )
+                .await;
+                return Err(error);
+            }
+        };
 
         // Enforce fanout boundary: once a parent run uses a fixed-size
         // fanout group, bare spawns in that run are replacement/retry
@@ -3539,38 +3842,13 @@ impl DynamicAgentSpawner {
             }
         }
 
-        // 1. Validate agent type
-        let agent_def = match self.agent_registry.get(&input.agent_type) {
-            Some(agent_def) => agent_def,
-            None => {
-                self.record_fanout_spawn_rejected_for_input(
-                    fanout_slot.as_ref(),
-                    &input,
-                    context,
-                    format!("unknown agent type: {}", input.agent_type),
-                )
-                .await;
-                return Err(SpawnError::UnknownAgentType(input.agent_type.clone()));
-            }
-        };
-        let effective_allowed_tools =
-            effective_spawn_allowed_tools(input.allowed_tools.as_deref(), &agent_def.allowed_tools);
-        let child_recursion_depth =
-            match astra_turn_core::agentic_recursion_guard::checked_child_recursion_depth(
-                context.recursion_depth,
-            ) {
-                Ok(depth) => depth,
-                Err(error) => {
-                    self.record_fanout_spawn_rejected_for_input(
-                        fanout_slot.as_ref(),
-                        &input,
-                        context,
-                        format!("recursion depth limit exceeded: {error}"),
-                    )
-                    .await;
-                    return Err(SpawnError::DepthLimitExceeded(error));
-                }
-            };
+        let (
+            agent_def,
+            effective_allowed_tools,
+            child_recursion_depth,
+            initial_turns,
+            hard_turn_limit,
+        ) = static_preparation;
 
         // 2. Generate IDs
         let agent_name = input
@@ -3583,19 +3861,6 @@ impl DynamicAgentSpawner {
 
         // 3. Determine model and turns
         let model = context.resolved_model_name.clone();
-        // Budget resolution composes numeric and complexity ceilings by
-        // taking the smaller value; with only one constraint, that constraint
-        // is authoritative. See `resolve_turn_budget`.
-        let initial_turns = astra_turn_core::orchestration_spawn_tool::resolve_turn_budget(
-            input.max_turns,
-            input.complexity.as_deref(),
-            agent_def.max_turns,
-        );
-        // Preserve provenance: only an explicit numeric caller limit is a
-        // hard boundary. Agent-type defaults and qualitative complexity are
-        // initial scheduling slices that may renew while observed work keeps
-        // making progress.
-        let hard_turn_limit = input.max_turns.map(|turns| turns.max(1));
         // 3b. Resolve fork-prefix inheritance before any side effects
         // (mailbox, worktree, active_agents state). A hard-fail from
         // `required=true` must NOT leave half-constructed state
@@ -3672,6 +3937,7 @@ impl DynamicAgentSpawner {
                 fanout_slot.as_ref(),
                 &input,
                 context,
+                reservation_owner_id,
                 format!("required prefix inheritance failed: {reason:?}"),
             )
             .await;
@@ -3736,7 +4002,7 @@ impl DynamicAgentSpawner {
                 identity.group_id
             )));
         }
-        let capacity_rejection = {
+        let admission_rejection = {
             // Hold the cancellation read fence through reservation. Therefore
             // cancellation either snapshots this child or wins first and
             // rejects it; no descendant can appear after the snapshot.
@@ -3747,6 +4013,7 @@ impl DynamicAgentSpawner {
                     fanout_slot.as_ref(),
                     &input,
                     context,
+                    reservation_owner_id,
                     format!(
                         "parent run '{}' is cancelled; descendant spawn rejected",
                         context.parent_run_id
@@ -3773,23 +4040,63 @@ impl DynamicAgentSpawner {
                 drop(cancellation_fence);
                 return Err(SpawnError::LifecycleShuttingDown);
             }
-            let capacity_rejection = self.max_concurrent_agents.and_then(|limit| {
-                let active = active_agents.len();
-                (active >= limit).then_some((active, limit))
+            let mut reservations = self
+                .spawn_capacity_reservations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let reserved_for_slot = fanout_slot.as_ref().is_some_and(|identity| {
+                reservations
+                    .get(&identity.group_id)
+                    .is_some_and(|reservation| {
+                        reservation.owns_slot(
+                            reservation_owner_id,
+                            &context.parent_run_id,
+                            identity,
+                        )
+                    })
             });
-            if capacity_rejection.is_none() {
+            let reservation_rejection = fanout_slot.as_ref().and_then(|identity| {
+                (reservations.contains_key(&identity.group_id) && !reserved_for_slot).then(|| {
+                    format!(
+                        "fanout group '{}' capacity reservation is not owned by this exact parent, target, and slot",
+                        identity.group_id
+                    )
+                })
+            });
+            let reserved_total: usize = reservations
+                .values()
+                .map(|reservation| reservation.remaining_slots.len())
+                .sum();
+            let capacity_rejection = self.max_concurrent_agents.and_then(|limit| {
+                let occupied = active_agents.len().saturating_add(reserved_total);
+                (!reserved_for_slot && occupied >= limit).then_some((occupied, limit))
+            });
+            if reservation_rejection.is_none() && capacity_rejection.is_none() {
+                if reserved_for_slot && let Some(identity) = fanout_slot.as_ref() {
+                    reservations
+                        .get_mut(&identity.group_id)
+                        .expect("matched capacity reservation must remain locked")
+                        .remaining_slots
+                        .remove(&identity.slot_index);
+                }
                 active_agents.insert(agent_id.clone(), state);
             }
+            drop(reservations);
             drop(admission);
             drop(active_agents);
             drop(cancellation_fence);
-            capacity_rejection
+            (reservation_rejection, capacity_rejection)
         };
+        let (reservation_rejection, capacity_rejection) = admission_rejection;
+        if let Some(reason) = reservation_rejection {
+            return Err(SpawnError::Race(reason));
+        }
         if let Some((active, limit)) = capacity_rejection {
             if let Some(identity) = fanout_slot.as_ref() {
                 let _ = self
                     .record_fanout_spawn_rejected(
                         identity,
+                        reservation_owner_id,
                         input.fanout_group_title.as_deref(),
                         &input.agent_type,
                         &input.description,
@@ -3819,6 +4126,7 @@ impl DynamicAgentSpawner {
                     fanout_slot.as_ref(),
                     &input,
                     context,
+                    reservation_owner_id,
                     format!("mailbox registration failed: {error}"),
                 )
                 .await;
@@ -3844,6 +4152,7 @@ impl DynamicAgentSpawner {
                     fanout_slot.as_ref(),
                     &input,
                     context,
+                    reservation_owner_id,
                     format!("agent {agent_id} was cancelled during mailbox registration"),
                 )
                 .await;
@@ -3883,6 +4192,7 @@ impl DynamicAgentSpawner {
                         fanout_slot.as_ref(),
                         &input,
                         context,
+                        reservation_owner_id,
                         format!("worktree creation failed: {e}"),
                     )
                     .await;
@@ -3915,6 +4225,7 @@ impl DynamicAgentSpawner {
                 fanout_slot.as_ref(),
                 &input,
                 context,
+                reservation_owner_id,
                 format!("agent {agent_id} was cancelled before spawn completed"),
             )
             .await;
@@ -5793,6 +6104,7 @@ impl DynamicAgentSpawner {
             prefix_resolve_outcomes: Arc::clone(&self.prefix_resolve_outcomes),
             trace_writer: self.trace_writer.clone(),
             max_concurrent_agents: self.max_concurrent_agents,
+            spawn_capacity_reservations: Arc::clone(&self.spawn_capacity_reservations),
             fanout_groups: Arc::clone(&self.fanout_groups),
             fanout_agent_index: Arc::clone(&self.fanout_agent_index),
             fanout_terminal_result_cache: Arc::clone(&self.fanout_terminal_result_cache),
@@ -10813,6 +11125,191 @@ mod tests {
             "capacity reservation must not allow active_agents to exceed the cap"
         );
 
+        factory2.unblock();
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_secs(2))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn fanout_capacity_reservation_requires_its_private_owner() {
+        for capacity in [1, 2] {
+            let factory = BlockingExecutorFactory::new();
+            let factory2 = Arc::clone(&factory);
+            let spawner = DynamicAgentSpawner::new(mock_router())
+                .with_executor(factory as Arc<dyn SpawnAgentExecutor>)
+                .with_max_concurrent_agents(capacity);
+            let context = make_bg_context();
+            let group_id = format!("owned-group-{capacity}");
+            let reservation = spawner
+                .reserve_spawn_capacity(&group_id, 1, &context.parent_run_id)
+                .await
+                .unwrap();
+            let owner = reservation.owner_id().unwrap().to_string();
+            spawner
+                .declare_fanout_group(&group_id, "owned group", 1, None, &context.parent_run_id)
+                .await
+                .unwrap();
+            let mut input = make_bg_input();
+            input.fanout_group_id = Some(group_id.clone());
+            input.fanout_target_count = Some(1);
+            input.fanout_slot_index = Some(0);
+
+            let mut invalid_input = input.clone();
+            invalid_input.agent_type = "not-a-real-agent-type".to_string();
+            let invalid_rejected = spawner
+                .spawn_with_capacity_reservation(invalid_input, &context, Some("not-the-owner"))
+                .await;
+            assert!(
+                matches!(invalid_rejected, Err(SpawnError::Race(ref reason)) if reason.contains("not owned")),
+                "ownership must be checked before any static-failure mutation: {invalid_rejected:?}"
+            );
+            assert_eq!(
+                spawner.fanout_group(&group_id).await.unwrap().slots[0].status,
+                AgentFanoutSlotStatus::Planned,
+                "an invalid non-owner request must not poison the rightful owner's slot"
+            );
+
+            let rejected = spawner
+                .spawn_with_capacity_reservation(input.clone(), &context, Some("not-the-owner"))
+                .await;
+
+            assert!(
+                matches!(rejected, Err(SpawnError::Race(ref reason)) if reason.contains("not owned")),
+                "an unrelated caller must not consume reserved capacity: {rejected:?}"
+            );
+            assert_eq!(
+                spawner.fanout_group(&group_id).await.unwrap().slots[0].status,
+                AgentFanoutSlotStatus::Planned,
+                "ownership rejection must not poison the rightful owner's slot"
+            );
+            assert!(
+                spawner
+                    .spawn_capacity_reservations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)[&group_id]
+                    .remaining_slots
+                    .contains(&0),
+                "a rejected caller must leave the owner's slot reserved"
+            );
+            let launched = spawner
+                .spawn_with_capacity_reservation(input, &context, Some(&owner))
+                .await;
+            assert!(
+                matches!(launched, Ok(SpawnAgentOutput::Launched { .. })),
+                "the rightful owner must still launch with capacity {capacity}: {launched:?}"
+            );
+            drop(reservation);
+            factory2.unblock();
+            spawner
+                .shutdown_and_wait(std::time::Duration::from_secs(2))
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_rejection_waiting_on_group_lock_cannot_poison_new_reservation() {
+        let factory = BlockingExecutorFactory::new();
+        let factory2 = Arc::clone(&factory);
+        let spawner = Arc::new(
+            DynamicAgentSpawner::new(mock_router())
+                .with_executor(factory as Arc<dyn SpawnAgentExecutor>)
+                .with_max_concurrent_agents(1),
+        );
+        let context = make_bg_context();
+        let group_id = "reservation-created-during-rejection";
+        let mut input = make_bg_input();
+        input.fanout_group_id = Some(group_id.to_string());
+        input.fanout_target_count = Some(1);
+        input.fanout_slot_index = Some(0);
+        let identity = input.fanout_slot_identity().unwrap().unwrap();
+
+        // The non-owner reaches rejection recording while the group lock is
+        // held. The rightful batch then reserves the group before that
+        // recording can mutate it.
+        let group_lock = spawner.fanout_groups.write().await;
+        let rejected_spawner = Arc::clone(&spawner);
+        let rejected_context = context.clone();
+        let rejected_input = input.clone();
+        let rejected = tokio::spawn(async move {
+            rejected_spawner
+                .record_fanout_spawn_rejected_for_input(
+                    Some(&identity),
+                    &rejected_input,
+                    &rejected_context,
+                    None,
+                    "invalid non-owner request",
+                )
+                .await;
+        });
+        tokio::task::yield_now().await;
+        let reservation = spawner
+            .reserve_spawn_capacity(group_id, 1, &context.parent_run_id)
+            .await
+            .unwrap();
+        let owner = reservation.owner_id().unwrap().to_string();
+        drop(group_lock);
+        rejected.await.unwrap();
+
+        spawner
+            .declare_fanout_group(group_id, "rightful group", 1, None, &context.parent_run_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            spawner.fanout_group(group_id).await.unwrap().slots[0].status,
+            AgentFanoutSlotStatus::Planned
+        );
+        let launched = spawner
+            .spawn_with_capacity_reservation(input, &context, Some(&owner))
+            .await;
+        assert!(matches!(launched, Ok(SpawnAgentOutput::Launched { .. })));
+        drop(reservation);
+        factory2.unblock();
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_secs(2))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn consumed_fanout_reservation_remains_owned_until_guard_drop() {
+        let factory = BlockingExecutorFactory::new();
+        let factory2 = Arc::clone(&factory);
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(factory as Arc<dyn SpawnAgentExecutor>)
+            .with_max_concurrent_agents(2);
+        let context = make_bg_context();
+        let reservation = spawner
+            .reserve_spawn_capacity("stable-owner", 1, &context.parent_run_id)
+            .await
+            .unwrap();
+        let owner = reservation.owner_id().unwrap().to_string();
+        let mut input = make_bg_input();
+        input.fanout_group_id = Some("stable-owner".to_string());
+        input.fanout_target_count = Some(1);
+        input.fanout_slot_index = Some(0);
+
+        let launched = spawner
+            .spawn_with_capacity_reservation(input, &context, Some(&owner))
+            .await;
+        assert!(matches!(launched, Ok(SpawnAgentOutput::Launched { .. })));
+        assert!(
+            matches!(
+                spawner
+                    .reserve_spawn_capacity("stable-owner", 1, &context.parent_run_id)
+                    .await,
+                Err(SpawnError::Race(_))
+            ),
+            "consuming the last slot must not expose the group id to a new owner"
+        );
+
+        drop(reservation);
+        assert!(
+            spawner
+                .reserve_spawn_capacity("stable-owner", 1, &context.parent_run_id)
+                .await
+                .is_ok(),
+            "the group id should become reusable only after its owner guard drops"
+        );
         factory2.unblock();
         spawner
             .shutdown_and_wait(std::time::Duration::from_secs(2))

@@ -1314,8 +1314,74 @@ async fn handle_agent_fanout_start_action_with_deadline(
         })
         .to_string();
     }
-    let slots = std::mem::take(&mut input.slots);
     let tool_call_id = input._tool_call_id.clone();
+    let planned_slots: Vec<_> = match std::mem::take(&mut input.slots)
+        .into_iter()
+        .enumerate()
+        .map(|(slot_index, slot)| {
+            let slot_id = slot.slot_id.clone();
+            let spawn_args = fanout_slot_spawn_args(
+                &input,
+                slot,
+                &group_id,
+                &title,
+                input.target_count,
+                slot_index,
+                tool_call_id.as_deref(),
+            );
+            let spawn_input = normalize_agent_spawn_args(&spawn_args)
+                .and_then(|normalized| {
+                    serde_json::from_value::<SpawnAgentInput>(normalized)
+                        .map_err(|error| error.to_string())
+                })
+                .map_err(|error| format!("invalid resolved fanout slot {slot_index}: {error}"))?;
+            Ok((slot_index, slot_id, spawn_args, spawn_input))
+        })
+        .collect::<Result<_, String>>()
+    {
+        Ok(planned) => planned,
+        Err(error) => return render_agent_tool_error(None, &error),
+    };
+    let resolved_inputs: Vec<_> = planned_slots
+        .iter()
+        .map(|(_, _, _, input)| input.clone())
+        .collect();
+    if let Err(error) = ctx.spawner.validate_spawn_inputs(
+        &resolved_inputs,
+        &SpawnContext {
+            parent_run_id: ctx.run_id.clone(),
+            parent_agent_id: ctx.agent_id.clone(),
+            resolved_model_name: ctx.current_model.clone(),
+            recursion_depth: ctx.recursion_depth,
+            parent_is_fork_child: ctx.is_fork_child,
+            working_dir: ctx.working_dir.clone(),
+            inherited_permissions: ctx.inherited_permissions.clone(),
+            inherited_skills: ctx.active_skills.clone(),
+            live_event_sink: ctx.live_event_sink.clone(),
+            client_tool_delivery_tx: ctx.client_tool_delivery_tx.clone(),
+            trace_context: ctx.trace_context.clone(),
+            spawn_tool_call_id: tool_call_id.clone(),
+            execution_metadata: ctx.execution_metadata.clone(),
+            workspace_mutation: ctx.workspace_mutation.get(),
+            delegation_chain: ctx.delegation_chain.clone(),
+        },
+    ) {
+        return render_agent_tool_error(None, &format!("fanout preflight failed: {error}"));
+    }
+    let _capacity_reservation = match ctx
+        .spawner
+        .reserve_spawn_capacity(&group_id, input.target_count, &ctx.run_id)
+        .await
+    {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            return render_agent_tool_error(
+                None,
+                &format!("fanout capacity admission failed: {error}"),
+            );
+        }
+    };
+    let capacity_reservation_owner = _capacity_reservation.owner_id().map(str::to_owned);
     if let Err(error) = ctx
         .spawner
         .declare_fanout_group(
@@ -1331,22 +1397,17 @@ async fn handle_agent_fanout_start_action_with_deadline(
     }
 
     // Spawn all slots concurrently — no head-of-line blocking.
-    let futs: Vec<_> = slots
+    let futs: Vec<_> = planned_slots
         .into_iter()
-        .enumerate()
-        .map(|(slot_index, slot)| {
-            let slot_id = slot.slot_id.clone();
-            let spawn_args = fanout_slot_spawn_args(
-                &input,
-                slot,
-                &group_id,
-                &title,
-                input.target_count,
-                slot_index,
-                tool_call_id.as_deref(),
-            );
+        .map(|(slot_index, slot_id, spawn_args, _)| {
+            let capacity_reservation_owner = capacity_reservation_owner.clone();
             Box::pin(async move {
-                let rendered = handle_agent_spawn_action(&spawn_args, Some(ctx)).await;
+                let rendered = handle_agent_spawn_action_with_capacity_reservation(
+                    &spawn_args,
+                    Some(ctx),
+                    capacity_reservation_owner.as_deref(),
+                )
+                .await;
                 let rendered_value = parsed_agent_output_or_bounded_error(rendered);
                 json!({
                     "slot_index": slot_index,
@@ -2319,6 +2380,14 @@ fn fanout_slot_status_label(status: AgentFanoutSlotStatus) -> &'static str {
 
 /// Handle `agent(action='spawn')`.
 pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolContext>) -> String {
+    handle_agent_spawn_action_with_capacity_reservation(args, ctx, None).await
+}
+
+async fn handle_agent_spawn_action_with_capacity_reservation(
+    args: &Value,
+    ctx: Option<&AgentToolContext>,
+    reservation_owner_id: Option<&str>,
+) -> String {
     let input: SpawnAgentInput = match normalize_agent_spawn_args(args)
         .and_then(|patched_args| serde_json::from_value(patched_args).map_err(|e| e.to_string()))
     {
@@ -2418,8 +2487,11 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
     // parent tool pipeline's large synchronous stack.
     tokio::task::yield_now().await;
     let spawner = Arc::clone(&ctx.spawner);
+    let reservation_owner_id = reservation_owner_id.map(str::to_owned);
     let spawn = AbortOnDropJoinHandle::new(tokio::spawn(async move {
-        spawner.spawn(input, &spawn_ctx).await
+        spawner
+            .spawn_with_capacity_reservation(input, &spawn_ctx, reservation_owner_id.as_deref())
+            .await
     }));
     match spawn.await {
         Ok(Ok(output)) => render_spawn_agent_output(output, ctx.transcript_location),
@@ -5654,9 +5726,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_fanout_get_results_preserves_spawn_rejected_slot_status() {
-        let spawner = test_spawner(Arc::new(CapturingModelExecutor::new()));
-        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+    async fn agent_fanout_static_preflight_rejects_the_whole_group_before_execution() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
         let start = handle_agent_fanout_tool(
             &json!({
                 "action": "start",
@@ -5664,13 +5737,13 @@ mod tests {
                 "target_count": 2,
                 "slots": [
                     {
+                        "description": "Review runtime",
+                        "prompt": "Review runtime changes"
+                    },
+                    {
                         "description": "Review storage",
                         "prompt": "Review storage changes",
                         "agent_type": "not-a-real-agent-type"
-                    },
-                    {
-                        "description": "Review runtime",
-                        "prompt": "Review runtime changes"
                     }
                 ]
             }),
@@ -5678,30 +5751,54 @@ mod tests {
         )
         .await;
         let start_value: Value = serde_json::from_str(&start).unwrap();
-        assert_eq!(start_value["status"], "completed_with_issues");
-        assert_eq!(start_value["spawn_rejected"], 1);
+        assert_eq!(start_value["status"], "failed");
+        assert!(
+            start_value["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("Unknown agent type")),
+            "group rejection should preserve the invalid slot reason: {start_value}"
+        );
+        assert_eq!(executor.spawn_count(), 0);
+        assert!(spawner.fanout_group("review-atomic").await.is_none());
+    }
 
-        let result = handle_agent_fanout_tool(
-            &json!({"action": "get_results", "group_id": "review-atomic"}),
+    #[tokio::test]
+    async fn agent_fanout_reserves_capacity_for_the_whole_group() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let transport = Arc::new(astra_messaging::InProcessTransport::new());
+        let tracker = Arc::new(DelegationTracker::new());
+        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
+        let spawner = Arc::new(
+            DynamicAgentSpawner::new(router)
+                .with_max_concurrent_agents(1)
+                .with_executor(executor.clone()),
+        );
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+
+        let rendered = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "capacity-atomic",
+                "target_count": 2,
+                "slots": [
+                    {"description": "Review one", "prompt": "Review one"},
+                    {"description": "Review two", "prompt": "Review two"}
+                ]
+            }),
             Some(&ctx),
         )
         .await;
-        let value: Value = serde_json::from_str(&result).unwrap();
+        let value: Value = serde_json::from_str(&rendered).unwrap();
 
-        assert_eq!(value["status"], "completed_with_issues");
-        assert_eq!(value["results"].as_array().unwrap().len(), 2);
-        assert_eq!(value["results"][0]["slot_index"], 0);
-        assert_eq!(value["results"][0]["status"], "spawn_rejected");
+        assert_eq!(value["status"], "failed");
         assert!(
-            value["results"][0]["error"]
+            value["error"]
                 .as_str()
-                .is_some_and(|error| error.contains("unknown agent type")),
-            "rejected slot result should preserve the rejection reason: {value}"
+                .is_some_and(|error| error.contains("Concurrent agent cap reached")),
+            "{value}"
         );
-        assert_eq!(value["results"][1]["slot_index"], 1);
-        assert_eq!(value["results"][1]["result"]["status"], "completed");
-        assert_eq!(value["completed"], 1);
-        assert_eq!(value["spawn_rejected"], 1);
+        assert_eq!(executor.spawn_count(), 0);
+        assert!(spawner.fanout_group("capacity-atomic").await.is_none());
     }
 
     #[tokio::test]
@@ -5754,56 +5851,6 @@ mod tests {
                 .is_some_and(|text| text.contains("already used agent_fanout")),
             "{blocked_value}"
         );
-    }
-
-    #[tokio::test]
-    async fn agent_fanout_stop_slot_reports_rejected_slot_as_not_stoppable() {
-        let spawner = test_spawner(Arc::new(CapturingModelExecutor::new()));
-        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
-        let start = handle_agent_fanout_tool(
-            &json!({
-                "action": "start",
-                "group_id": "review-atomic",
-                "target_count": 1,
-                "slots": [
-                    {
-                        "description": "Review storage",
-                        "prompt": "Review storage changes",
-                        "agent_type": "not-a-real-agent-type"
-                    }
-                ]
-            }),
-            Some(&ctx),
-        )
-        .await;
-        let start_value: Value = serde_json::from_str(&start).unwrap();
-        assert_eq!(start_value["status"], "completed_with_issues");
-        assert_eq!(start_value["spawn_rejected"], 1);
-
-        let result = handle_agent_fanout_tool(
-            &json!({
-                "action": "stop_slot",
-                "group_id": "review-atomic",
-                "slot_index": 0
-            }),
-            Some(&ctx),
-        )
-        .await;
-        let value: Value = serde_json::from_str(&result).unwrap();
-
-        assert_eq!(value["status"], "completed");
-        assert_eq!(value["stop_outcome"], "not_stoppable");
-        assert_eq!(value["reason"], "no_accepted_agent");
-        assert_eq!(value["slot_index"], 0);
-        assert_eq!(value["slot_status"], "spawn_rejected");
-        assert!(
-            value["terminal_reason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("unknown agent type")),
-            "stop_slot should preserve why the slot cannot be stopped: {value}"
-        );
-        assert_eq!(value["fanout"]["spawn_rejected"], 1);
-        assert_eq!(value["fanout"]["slots"][0]["status"], "spawn_rejected");
     }
 
     #[tokio::test]
