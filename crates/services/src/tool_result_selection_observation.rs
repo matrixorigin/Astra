@@ -274,7 +274,7 @@ impl ToolResultJudgmentExplanation {
             detail.push_str(trigger);
         }
         detail.push_str(&format!(
-            " · {} · {} · later task effect not recorded",
+            " · {} · {}",
             self.outcome_label(),
             self.application.render_compact(),
         ));
@@ -469,6 +469,7 @@ impl ToolResultJudgmentView {
             if self.explanations_truncated || self.explanations.len() > 8 {
                 line.push_str("; additional decision details omitted");
             }
+            line.push_str(". Later task effect not recorded");
         }
         line.push('.');
         line
@@ -1528,19 +1529,33 @@ mod tests {
         );
         assert!(view.render().contains("0 evaluation(s)"));
 
+        let mut second_selected_observation = selected_observation.clone();
+        second_selected_observation.correlation.evaluation_id = "selection-terminal-2".into();
         let matched = project_tool_result_judgments(
-            [row(
-                "user-1",
-                "session-1",
-                "selection-terminal",
-                &selected_observation,
-            )],
+            [
+                row(
+                    "user-1",
+                    "session-1",
+                    "selection-terminal",
+                    &selected_observation,
+                ),
+                row(
+                    "user-1",
+                    "session-1",
+                    "selection-terminal-2",
+                    &second_selected_observation,
+                ),
+            ],
             projection_input(&applications),
         );
-        assert_eq!(matched.explanations.len(), 1);
+        assert_eq!(matched.explanations.len(), 2);
         assert_eq!(matched.explanations[0].application.matched_receipts, 1);
         assert_eq!(matched.explanations[0].application.included, 1);
-        assert!(matched.render().contains("later task effect not recorded"));
+        let rendered = matched.render();
+        assert_eq!(
+            rendered.matches("Later task effect not recorded").count(),
+            1
+        );
 
         let mut invocation_mismatch = selected_observation.clone();
         if let astra_turn_types::ToolResultSelectionOutcomeV1::Decided { execution, .. } =
