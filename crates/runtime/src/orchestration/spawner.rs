@@ -977,6 +977,8 @@ pub struct SpawnRunConfig {
     /// Exact authorized Offering requested for this child. `None` means
     /// inherit the parent's admitted Offering.
     pub model_selection: Option<astra_turn_types::ModelSelection>,
+    /// Fixed fanout slot this execution consumes, when launched as a batch.
+    pub fanout_slot: Option<AgentFanoutSlotIdentity>,
     /// Effective reasoning control, including an explicit target-model default.
     pub thinking: astra_turn_core::thinking_config::ThinkingConfig,
     /// Resolved model name used only for cache compatibility and display.
@@ -1182,9 +1184,47 @@ pub struct SpawnRunResult {
 /// Similar to `SubRunExecutor` but specifically for dynamic agent spawning.
 /// CLI layer implements this to run the agentic loop.
 #[async_trait]
+pub trait PreparedSpawn: Send {
+    async fn execute(self: Box<Self>, config: SpawnRunConfig) -> Result<SpawnRunResult, String>;
+}
+
+struct DeferredPreparedSpawn<T: SpawnAgentExecutor + ?Sized> {
+    executor: Arc<T>,
+}
+
+#[async_trait]
+impl<T: SpawnAgentExecutor + ?Sized + 'static> PreparedSpawn for DeferredPreparedSpawn<T> {
+    async fn execute(self: Box<Self>, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+        self.executor.execute(config).await
+    }
+}
+
+#[async_trait]
 pub trait SpawnAgentExecutor: Send + Sync {
     /// Execute a spawned agent run.
     async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String>;
+
+    /// Prepare every member of a fixed batch before any child starts. The
+    /// default preserves in-memory executors; production executors with model
+    /// admission override it and return preparations that consume that exact
+    /// admission rather than repeating the lookup on execution.
+    async fn prepare_batch(
+        self: Arc<Self>,
+        inputs: &[SpawnAgentInput],
+        _context: &SpawnContext,
+    ) -> Result<Vec<Box<dyn PreparedSpawn>>, String>
+    where
+        Self: 'static,
+    {
+        Ok(inputs
+            .iter()
+            .map(|_| {
+                Box::new(DeferredPreparedSpawn {
+                    executor: Arc::clone(&self),
+                }) as Box<dyn PreparedSpawn>
+            })
+            .collect())
+    }
 
     /// Cancel executor-owned control and durable state before the spawner
     /// aborts the task future. Implementations that only execute in-memory
@@ -3637,6 +3677,29 @@ impl DynamicAgentSpawner {
         Ok(())
     }
 
+    pub(crate) async fn prepare_spawn_batch(
+        &self,
+        inputs: &[SpawnAgentInput],
+        context: &SpawnContext,
+    ) -> Result<Vec<Box<dyn PreparedSpawn>>, SpawnError> {
+        let executor = self
+            .executor
+            .as_ref()
+            .ok_or(SpawnError::ExecutorUnavailable)?;
+        let preparations = Arc::clone(executor)
+            .prepare_batch(inputs, context)
+            .await
+            .map_err(SpawnError::DelegationFailed)?;
+        if preparations.len() != inputs.len() {
+            return Err(SpawnError::DelegationFailed(format!(
+                "spawn executor prepared {} slots for {} requested slots",
+                preparations.len(),
+                inputs.len()
+            )));
+        }
+        Ok(preparations)
+    }
+
     /// Reserve capacity for a whole validated group under the same lifecycle
     /// fences used by concrete child insertion. A successful reservation is
     /// consumed one slot at a time by `spawn`; no child can observe a partial
@@ -3731,6 +3794,17 @@ impl DynamicAgentSpawner {
         context: &SpawnContext,
         reservation_owner_id: Option<&str>,
     ) -> Result<SpawnAgentOutput, SpawnError> {
+        self.spawn_prepared_with_capacity_reservation(input, context, reservation_owner_id, None)
+            .await
+    }
+
+    pub(crate) async fn spawn_prepared_with_capacity_reservation(
+        &self,
+        input: SpawnAgentInput,
+        context: &SpawnContext,
+        reservation_owner_id: Option<&str>,
+        preparation: Option<Box<dyn PreparedSpawn>>,
+    ) -> Result<SpawnAgentOutput, SpawnError> {
         let _activity = self.begin_lifecycle_activity();
         if !*self
             .background_task_admission
@@ -3745,6 +3819,7 @@ impl DynamicAgentSpawner {
             input,
             context,
             reservation_owner_id,
+            preparation,
             Arc::clone(&preparation_installed),
         );
         tokio::pin!(prepared);
@@ -3766,6 +3841,7 @@ impl DynamicAgentSpawner {
         input: SpawnAgentInput,
         context: &SpawnContext,
         reservation_owner_id: Option<&str>,
+        preparation: Option<Box<dyn PreparedSpawn>>,
         preparation_installed: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<SpawnAgentOutput, SpawnError> {
         #[cfg(test)]
@@ -4342,6 +4418,7 @@ impl DynamicAgentSpawner {
             task: input.prompt.clone(),
             system_prompt_addendum: coordination_addendum,
             model_selection: input.model_selection.clone(),
+            fanout_slot: fanout_slot.clone(),
             thinking: input
                 .reasoning
                 .as_ref()
@@ -4440,9 +4517,13 @@ impl DynamicAgentSpawner {
         let run_id_for_output = run_id.clone();
         let run_id_for_finalize_panic = run_id.clone();
         let spawn_future = async move {
-            let result = AssertUnwindSafe(executor.execute(run_config))
-                .catch_unwind()
-                .await;
+            let execution = async move {
+                match preparation {
+                    Some(preparation) => preparation.execute(run_config).await,
+                    None => executor.execute(run_config).await,
+                }
+            };
+            let result = AssertUnwindSafe(execution).catch_unwind().await;
             // Phase 2: turn the result into a terminal output by finalizing
             // the agent. Wrap finalization in `catch_unwind` so a panic in
             // `finalize_background_agent` (or the status/output builders)

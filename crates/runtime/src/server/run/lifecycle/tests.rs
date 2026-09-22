@@ -4690,6 +4690,7 @@ fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunC
         task: "do work".to_string(),
         system_prompt_addendum: String::new(),
         model_selection: None,
+        fanout_slot: None,
         thinking: astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
         model: None,
         initial_turns: 3,
@@ -6324,6 +6325,8 @@ async fn server_dynamic_child_becomes_a_valid_parent_for_grandchildren() {
 
 #[tokio::test]
 async fn server_spawn_inheritance_reuses_parent_model_admission_without_lookup() {
+    use astra_turn_core::thinking_config::ThinkingConfig;
+
     let executor = ServerSpawnAgentExecutor::new(
         test_settings(),
         test_encryptor(),
@@ -6336,21 +6339,101 @@ async fn server_spawn_inheritance_reuses_parent_model_admission_without_lookup()
         .expect("parent model admission");
 
     let inherited = executor
-        .select_spawn_model_execution(&parent, None)
+        .prepare_spawn_model(&parent, None, &ThinkingConfig::ModelDefault)
         .await
         .expect("omitted selection inherits");
     let explicit_same = executor
-        .select_spawn_model_execution(
+        .prepare_spawn_model(
             &parent,
             Some(&ModelSelection {
                 offering_id: expected.offering_id.clone(),
             }),
+            &ThinkingConfig::ModelDefault,
         )
         .await
         .expect("same Offering reuses admission");
 
     assert_eq!(inherited, expected);
     assert_eq!(explicit_same, expected);
+    assert!(
+        executor
+            .prepare_spawn_model(&parent, None, &ThinkingConfig::Off)
+            .await
+            .is_err(),
+        "batch preparation must reject unsupported reasoning before child creation"
+    );
+}
+
+#[tokio::test]
+async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
+    use astra_turn_core::orchestration_spawn_tool::SpawnAgentInput;
+
+    let executor = Arc::new(ServerSpawnAgentExecutor::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+    ));
+    executor
+        .set_runtime_context(test_spawn_runtime_context("root-run", "user-a"))
+        .await;
+    let context = crate::orchestration::SpawnContext {
+        parent_run_id: "root-run".to_string(),
+        parent_agent_id: "root-agent".to_string(),
+        resolved_model_name: None,
+        recursion_depth: 0,
+        parent_is_fork_child: false,
+        inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
+        inherited_skills: Vec::new(),
+        working_dir: PathBuf::from("/tmp/astra"),
+        live_event_sink: None,
+        client_tool_delivery_tx: None,
+        trace_context: None,
+        spawn_tool_call_id: None,
+        execution_metadata: None,
+        workspace_mutation: Default::default(),
+        delegation_chain: Vec::new(),
+    };
+    let inputs: Vec<_> = (0..2)
+        .map(|slot_index| SpawnAgentInput {
+            description: format!("review slot {slot_index}"),
+            prompt: "review".to_string(),
+            fanout_group_id: Some("model-batch".to_string()),
+            fanout_target_count: Some(2),
+            fanout_slot_index: Some(slot_index),
+            ..Default::default()
+        })
+        .collect();
+    let prepared = Arc::clone(&executor)
+        .prepare_batch(&inputs, &context)
+        .await
+        .expect("inherited Offering is prepared without a catalog lookup");
+    assert_eq!(prepared.len(), 2);
+
+    let mut mismatched = test_spawn_run_config(vec![], true);
+    mismatched.parent_address = Some(astra_messaging::types::AgentAddress::new(
+        "root-run",
+        "root-agent",
+    ));
+    mismatched.fanout_slot = inputs[0].fanout_slot_identity().unwrap();
+    let error = prepared
+        .into_iter()
+        .nth(1)
+        .unwrap()
+        .execute(mismatched)
+        .await
+        .expect_err("a prepared slot must not execute another slot");
+    assert!(error.contains("does not match"), "{error}");
+
+    let mut unsupported = inputs;
+    unsupported[1].reasoning =
+        Some(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::Off);
+    assert!(
+        Arc::clone(&executor)
+            .prepare_batch(&unsupported, &context)
+            .await
+            .is_err(),
+        "one unsupported reasoning control must reject the whole batch"
+    );
 }
 
 #[tokio::test]

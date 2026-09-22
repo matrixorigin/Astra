@@ -102,11 +102,13 @@ fn valid_runtime_http_endpoint(endpoint: &str) -> bool {
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
 use crate::observability::ObservabilityHub;
+use crate::orchestration::spawner::PreparedSpawn;
 use crate::orchestration::{
     AgentProgressEvent, AgentToolContext, AgentTranscriptLocation, CancellationOrigin,
     DurableAgentReconciler, DynamicAgentSpawner, InheritedPermissions, PermissionMode,
     PermissionSyncContext, ProgressBroadcaster, ProgressEventType, SpawnAgentExecutor,
-    SpawnRunCancellationDurability, SpawnRunConfig, SpawnRunResult, SpawnedAgentState,
+    SpawnContext, SpawnRunCancellationDurability, SpawnRunConfig, SpawnRunResult,
+    SpawnedAgentState,
 };
 use crate::server::run::cloud_workspace_provisioning::CloudWorkspaceProvisioner;
 use crate::server::run::workspace_provisioning::{
@@ -20452,6 +20454,13 @@ impl ServerSpawnAgentExecutor {
                 "server dynamic agent executor requires parent run lineage".to_string()
             })?;
 
+        self.runtime_context_for_parent_run(parent_run_id).await
+    }
+
+    async fn runtime_context_for_parent_run(
+        &self,
+        parent_run_id: &str,
+    ) -> Result<ServerSpawnRuntimeContext, String> {
         let registry = self.runtime_context_registry.read().await;
         registry
             .current_context_id_by_run
@@ -20505,6 +20514,17 @@ impl ServerSpawnAgentExecutor {
         )
         .await
         .map_err(|error| error.to_string())
+    }
+
+    async fn prepare_spawn_model(
+        &self,
+        parent: &ServerSpawnRuntimeContext,
+        selection: Option<&ModelSelection>,
+        thinking: &astra_turn_core::thinking_config::ThinkingConfig,
+    ) -> Result<astra_services::AdmittedModelExecution, String> {
+        let execution = self.select_spawn_model_execution(parent, selection).await?;
+        crate::server::model_execution_admission::validate_reasoning_control(&execution, thinking)?;
+        Ok(execution)
     }
 
     /// Publish the child as the next possible parent before its loop starts.
@@ -21448,8 +21468,99 @@ impl DurableSubrunControlAuthority {
     }
 }
 
+struct ServerPreparedSpawn {
+    executor: Arc<ServerSpawnAgentExecutor>,
+    parent: ServerSpawnRuntimeContext,
+    execution: astra_services::AdmittedModelExecution,
+    requested_selection: Option<ModelSelection>,
+    thinking: astra_turn_core::thinking_config::ThinkingConfig,
+    slot: Option<astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity>,
+}
+
+#[async_trait]
+impl PreparedSpawn for ServerPreparedSpawn {
+    async fn execute(self: Box<Self>, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+        let parent_run_id = config
+            .parent_address
+            .as_ref()
+            .map(|address| address.run_id.as_str());
+        if parent_run_id != Some(self.parent.parent_run_id.as_str())
+            || config.fanout_slot != self.slot
+            || config.thinking != self.thinking
+            || match (&self.requested_selection, &config.model_selection) {
+                (Some(expected), actual) => actual != &Some(expected.clone()),
+                (None, Some(actual)) => actual.offering_id != self.execution.offering_id,
+                (None, None) => false,
+            }
+        {
+            return Err("prepared child execution does not match its admitted parent, slot, Offering, or reasoning".to_string());
+        }
+        let current = self.executor.runtime_context_for_config(&config).await?;
+        if current.runtime_context_id != self.parent.runtime_context_id {
+            return Err("prepared child parent generation is no longer current".to_string());
+        }
+        self.executor
+            .execute_with_admitted_model(config, self.parent, self.execution)
+            .await
+    }
+}
+
 #[async_trait]
 impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
+    async fn prepare_batch(
+        self: Arc<Self>,
+        inputs: &[astra_turn_core::orchestration_spawn_tool::SpawnAgentInput],
+        context: &SpawnContext,
+    ) -> Result<Vec<Box<dyn PreparedSpawn>>, String> {
+        let parent = self
+            .runtime_context_for_parent_run(&context.parent_run_id)
+            .await?;
+        let mut admitted: HashMap<String, astra_services::AdmittedModelExecution> = HashMap::new();
+        let mut prepared: Vec<Box<dyn PreparedSpawn>> = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let slot = input.fanout_slot_identity()?;
+            let thinking = input
+                .reasoning
+                .as_ref()
+                .map(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::config)
+                .unwrap_or(astra_turn_core::thinking_config::ThinkingConfig::ModelDefault);
+            let offering_id = input
+                .model_selection
+                .as_ref()
+                .map(|selection| selection.offering_id.as_str())
+                .or_else(|| {
+                    parent
+                        .admitted_model_execution
+                        .as_ref()
+                        .map(|execution| execution.offering_id.as_str())
+                })
+                .ok_or_else(|| {
+                    "server dynamic child cannot inherit a missing parent model admission"
+                        .to_string()
+                })?;
+            let execution = if let Some(execution) = admitted.get(offering_id) {
+                execution.clone()
+            } else {
+                let execution = self
+                    .select_spawn_model_execution(&parent, input.model_selection.as_ref())
+                    .await?;
+                admitted.insert(offering_id.to_string(), execution.clone());
+                execution
+            };
+            crate::server::model_execution_admission::validate_reasoning_control(
+                &execution, &thinking,
+            )?;
+            prepared.push(Box::new(ServerPreparedSpawn {
+                executor: Arc::clone(&self),
+                parent: parent.clone(),
+                execution,
+                requested_selection: input.model_selection.clone(),
+                thinking,
+                slot,
+            }));
+        }
+        Ok(prepared)
+    }
     async fn cancel_spawned_run(
         &self,
         run_id: &str,
@@ -21490,12 +21601,20 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
     async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
         let context = self.runtime_context_for_config(&config).await?;
         let admitted_model_execution = self
-            .select_spawn_model_execution(&context, config.model_selection.as_ref())
+            .prepare_spawn_model(&context, config.model_selection.as_ref(), &config.thinking)
             .await?;
-        crate::server::model_execution_admission::validate_reasoning_control(
-            &admitted_model_execution,
-            &config.thinking,
-        )?;
+        self.execute_with_admitted_model(config, context, admitted_model_execution)
+            .await
+    }
+}
+
+impl ServerSpawnAgentExecutor {
+    async fn execute_with_admitted_model(
+        &self,
+        config: SpawnRunConfig,
+        context: ServerSpawnRuntimeContext,
+        admitted_model_execution: astra_services::AdmittedModelExecution,
+    ) -> Result<SpawnRunResult, String> {
         let dynamic_agent_spawner = context.spawner.upgrade().ok_or_else(|| {
             "server dynamic agent lifecycle is no longer available for this session".to_string()
         })?;
