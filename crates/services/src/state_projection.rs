@@ -10,17 +10,6 @@ use crate::CancellationSafePoolConnection;
 use crate::context_manifest::artifact_id_from_raw_ref;
 use crate::db_row::RowExt as StateProjectionDbRow;
 
-pub const PROTECTED_COMPACTION_CATEGORIES: &[&str] = &[
-    "plan_state",
-    "decision",
-    "finding",
-    "benchmark",
-    "citation",
-    "todo_state",
-    "error_state",
-    "delegation_state",
-];
-
 const STATE_ITEM_ID_MAX_BYTES: usize = 128;
 
 /// Builds a stable state-item identity without exceeding the storage contract.
@@ -65,98 +54,6 @@ fn bounded_bubble_state_item_id(source_run_id: &str, depth: u32) -> String {
         "bubble",
         &[source_run_id, &depth],
     )
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CompactionInvariant {
-    pub id: &'static str,
-    pub description: &'static str,
-    pub sql: &'static str,
-    pub binds_compaction_run_id: bool,
-}
-
-pub const COMPACTION_INVARIANT_SQL: &[CompactionInvariant] = &[
-    CompactionInvariant {
-        id: "no_archived_active_durable_facts",
-        description: "Active durable facts must survive compaction.",
-        sql: "SELECT COUNT(*) AS violations FROM session_state_items \
-	              WHERE user_id = ? AND session_id = ? \
-	                AND category IN ('plan_state', 'decision', 'finding', 'benchmark', 'citation') \
-	                AND status NOT IN ('active', 'backlog')",
-        binds_compaction_run_id: false,
-    },
-    CompactionInvariant {
-        id: "no_archived_active_operational_state",
-        description: "Active todo, error, and delegation state must survive compaction.",
-        sql: "SELECT COUNT(*) AS violations FROM session_state_items \
-	              WHERE user_id = ? AND session_id = ? \
-	                AND category IN ('todo_state', 'error_state', 'delegation_state') \
-	                AND status NOT IN ('active', 'backlog')",
-        binds_compaction_run_id: false,
-    },
-    CompactionInvariant {
-        id: "plan_state_not_replaced",
-        description: "Compaction must not replace/archive/delete plan_state.",
-        sql: "SELECT COUNT(*) AS violations FROM session_state_item_events \
-	              WHERE user_id = ? AND session_id = ? \
-	                AND category = 'plan_state' \
-	                AND mutation IN ('replace', 'archive', 'delete')",
-        binds_compaction_run_id: false,
-    },
-    CompactionInvariant {
-        id: "no_active_run_compaction",
-        description: "Session-level compaction must not run while a run is active.",
-        sql: "SELECT COUNT(*) AS violations FROM agent_runs \
-	              WHERE user_id = ? AND session_id = ? AND status IN ('running', 'waiting')",
-        binds_compaction_run_id: false,
-    },
-    CompactionInvariant {
-        id: "exactly_one_post_compaction_manifest",
-        description: "Each compaction writes exactly one post_compaction manifest.",
-        sql: "SELECT ABS(COUNT(*) - 1) AS violations FROM context_manifests \
-	              WHERE user_id = ? AND session_id = ? AND run_id = ? AND reason = 'post_compaction'",
-        binds_compaction_run_id: true,
-    },
-    CompactionInvariant {
-        id: "plan_todo_zone_cap",
-        description: "Post-compaction plan_todo context must stay within 800 tokens.",
-        sql: "SELECT COUNT(*) AS violations \
-	              FROM context_manifest_items i \
-	              JOIN context_manifests m ON m.user_id = i.user_id AND m.manifest_id = i.manifest_id \
-	              WHERE m.user_id = ? AND m.session_id = ? AND m.run_id = ? AND m.reason = 'post_compaction' \
-	                AND i.zone = 'plan_todo' AND i.token_estimate > 800",
-        binds_compaction_run_id: true,
-    },
-    CompactionInvariant {
-        id: "user_scope_not_compacted",
-        description: "User-scope state must not be archived by session compaction.",
-        sql: "SELECT COUNT(*) AS violations FROM session_state_items \
-	              WHERE user_id = ? AND session_id = ? AND scope = 'user' AND status NOT IN ('active', 'backlog')",
-        binds_compaction_run_id: false,
-    },
-    CompactionInvariant {
-        id: "no_delete_mutations_for_protected_state",
-        description: "Compaction must not write delete mutations for protected projection state.",
-        sql: "SELECT COUNT(*) AS violations FROM session_state_item_events \
-	              WHERE user_id = ? AND session_id = ? AND mutation = 'delete' \
-	                AND category IN ('plan_state', 'decision', 'finding', 'benchmark', 'citation', \
-	                                 'todo_state', 'error_state', 'delegation_state')",
-        binds_compaction_run_id: false,
-    },
-];
-
-fn compaction_invariant_batch_sql() -> String {
-    COMPACTION_INVARIANT_SQL
-        .iter()
-        .enumerate()
-        .map(|(idx, invariant)| {
-            format!(
-                "SELECT '{}' AS invariant_id, violations FROM ({}) AS invariant_{}",
-                invariant.id, invariant.sql, idx
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" UNION ALL ")
 }
 
 #[derive(Debug, Error)]
@@ -335,25 +232,6 @@ fn state_projection_row_i64(
         })
 }
 
-fn state_projection_row_non_negative_i64(
-    row: &impl StateProjectionDbRow,
-    operation: &'static str,
-    entity: &str,
-    column: &'static str,
-) -> Result<i64, StateProjectionError> {
-    let value = state_projection_row_i64(row, operation, entity, column)?;
-    if value < 0 {
-        return Err(StateProjectionError::InvalidDatabaseValue {
-            operation,
-            entity: entity.to_string(),
-            column,
-            value: value.to_string(),
-            reason: "expected non-negative integer",
-        });
-    }
-    Ok(value)
-}
-
 fn state_projection_row_u32(
     row: &impl StateProjectionDbRow,
     operation: &'static str,
@@ -452,42 +330,6 @@ pub struct DatabaseStateProjectionStore {
 impl DatabaseStateProjectionStore {
     pub fn new(pool: SharedPool) -> Self {
         Self { pool }
-    }
-
-    pub async fn run_compaction_assertions(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        compaction_run_id: &str,
-    ) -> Result<Vec<(String, i64)>, StateProjectionError> {
-        let sql = compaction_invariant_batch_sql();
-        let mut query = sqlx::query(&sql);
-        for invariant in COMPACTION_INVARIANT_SQL {
-            query = query.bind(user_id).bind(session_id);
-            if invariant.binds_compaction_run_id {
-                query = query.bind(compaction_run_id);
-            }
-        }
-
-        let rows = query.fetch_all(self.pool.get()).await.map_err(|source| {
-            StateProjectionError::Database {
-                operation: "run_compaction_invariant",
-                entity: "compaction_invariants".to_string(),
-                source,
-            }
-        })?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let invariant_id = row.try_get::<String, _>("invariant_id").unwrap_or_default();
-            let violations = state_projection_row_non_negative_i64(
-                &row,
-                "run_compaction_invariant",
-                &invariant_id,
-                "violations",
-            )?;
-            out.push((invariant_id, violations));
-        }
-        Ok(out)
     }
 
     pub async fn upsert_state_item(
@@ -1617,7 +1459,6 @@ mod tests {
                 return Ok(*value);
             }
             Ok(match column {
-                "violations" => 1,
                 "token_estimate" => 42,
                 "depth" => 2,
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
@@ -1670,55 +1511,6 @@ mod tests {
     }
 
     #[test]
-    fn compaction_invariants_are_owner_bound() {
-        for invariant in COMPACTION_INVARIANT_SQL {
-            assert!(
-                invariant.sql.contains("user_id = ?"),
-                "{} must bind user_id explicitly",
-                invariant.id
-            );
-        }
-    }
-
-    #[test]
-    fn context_manifest_compaction_join_is_owner_bound() {
-        let invariant = COMPACTION_INVARIANT_SQL
-            .iter()
-            .find(|invariant| invariant.id == "plan_todo_zone_cap")
-            .expect("plan_todo_zone_cap invariant");
-        let normalized = invariant
-            .sql
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(normalized.contains(
-            "JOIN context_manifests m ON m.user_id = i.user_id AND m.manifest_id = i.manifest_id"
-        ));
-    }
-
-    #[test]
-    fn compaction_invariant_batch_sql_keeps_one_row_per_invariant() {
-        let sql = compaction_invariant_batch_sql();
-        for invariant in COMPACTION_INVARIANT_SQL {
-            assert!(
-                sql.contains(&format!("SELECT '{}' AS invariant_id", invariant.id)),
-                "batch SQL missing invariant id {}",
-                invariant.id
-            );
-        }
-        assert_eq!(
-            sql.matches(" UNION ALL ").count(),
-            COMPACTION_INVARIANT_SQL.len().saturating_sub(1),
-            "batch SQL must combine invariants into one round trip"
-        );
-        assert_eq!(
-            sql.matches(") AS invariant_").count(),
-            COMPACTION_INVARIANT_SQL.len(),
-            "each invariant subquery must have a stable alias"
-        );
-    }
-
-    #[test]
     fn state_mutation_validator_accepts_only_current_operations() {
         for mutation in [
             "insert",
@@ -1738,38 +1530,6 @@ mod tests {
             error,
             StateProjectionError::InvalidMutation { mutation } if mutation == "teleport"
         ));
-    }
-
-    #[test]
-    fn state_projection_counter_decoders_fail_loudly() {
-        assert_eq!(
-            state_projection_row_non_negative_i64(
-                &FakeStateProjectionRow::complete(),
-                "run_compaction_invariant",
-                "session-1",
-                "violations",
-            )
-            .expect("violations decodes"),
-            1
-        );
-        assert_database_error_mentions(
-            state_projection_row_non_negative_i64(
-                &FakeStateProjectionRow::fail_on("violations"),
-                "run_compaction_invariant",
-                "session-1",
-                "violations",
-            ),
-            "violations",
-        );
-        assert_invalid_database_value(
-            state_projection_row_non_negative_i64(
-                &FakeStateProjectionRow::with_i64("violations", -1),
-                "run_compaction_invariant",
-                "session-1",
-                "violations",
-            ),
-            "violations",
-        );
     }
 
     #[test]

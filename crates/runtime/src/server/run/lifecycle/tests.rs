@@ -1304,6 +1304,14 @@ async fn exercise_primary_continuation_entry(
                 compact < first_model,
                 "compaction must precede first provider round"
             );
+            assert!(
+                window.events[first_model..]
+                    .iter()
+                    .filter(|event| event.event_type == StepEventType::LlmRoundStarted)
+                    .count()
+                    > 1,
+                "real compaction must be followed by multiple provider calls"
+            );
         }
         let terminal: (String, String, Option<String>) = sqlx::query_as("SELECT executor_run_id, status, outcome FROM work_item_attempts WHERE owner_id = ? AND attempt_id = ?")
             .bind(owner).bind(attempt).fetch_one(pool.get()).await.unwrap();
@@ -1322,6 +1330,29 @@ async fn exercise_primary_continuation_entry(
         .await
         .unwrap();
         assert_eq!(count, 1, "continuation must not duplicate delivered work");
+        // Both the compacted turn and its restored successor keep real Work
+        // authority without manufacturing answer-derived decisions or summaries.
+        for table in ["session_state_items", "session_state_item_events"] {
+            let count: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ? \
+                 AND category IN ('decision', 'summary')"
+            ))
+            .bind(owner)
+            .bind(session)
+            .fetch_one(pool.get())
+            .await
+            .expect("count answer-derived projections");
+            assert_eq!(count, 0, "continuation must not invent {table}");
+        }
+        let audits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ctx_decision_audits WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(owner)
+        .bind(session)
+        .fetch_one(pool.get())
+        .await
+        .expect("count synthetic decision audits");
+        assert_eq!(audits, 0);
         created.push(run.run_id);
     }
     for run in created {

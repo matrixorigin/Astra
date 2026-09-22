@@ -69,18 +69,6 @@ pub struct TurnToolEventPersistPlan {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct TurnDecisionAuditRecord {
-    pub decision_id: String,
-    pub user_id: String,
-    pub session_id: String,
-    pub event_id: String,
-    pub decision_type: String,
-    pub decision_output: serde_json::Value,
-    pub model_used: Option<String>,
-    pub context_capture_id: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub struct TurnSkillSelectionRecord {
     pub event_id: String,
     pub session_id: String,
@@ -126,10 +114,7 @@ pub struct TurnReflectionLessonRequest {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TurnHookDbPersistPlan {
-    pub decision_audit: Option<TurnDecisionAuditRecord>,
     pub skill_selection: Option<TurnSkillSelectionRecord>,
-    pub reflection_mark: Option<TurnReflectionMark>,
-    pub reflection_lesson: Option<TurnReflectionLessonRecord>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -181,114 +166,4 @@ pub struct TurnAuxiliaryEventRecord {
     pub causal_chain_id: String,
     pub metadata: Option<serde_json::Value>,
     pub reasoning_content: Option<String>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tool_event_persist_plan_default_empty() {
-        let plan = TurnToolEventPersistPlan::default();
-        assert!(plan.events.is_empty());
-    }
-
-    #[test]
-    fn hook_db_persist_plan_default_all_none() {
-        let plan = TurnHookDbPersistPlan::default();
-        assert!(plan.decision_audit.is_none());
-        assert!(plan.skill_selection.is_none());
-        assert!(plan.reflection_mark.is_none());
-        assert!(plan.reflection_lesson.is_none());
-    }
-
-    #[test]
-    fn core_persist_outcome_default_none() {
-        let outcome = TurnCorePersistOutcome::default();
-        assert!(outcome.llm_response_event_id.is_none());
-    }
-
-    #[test]
-    fn core_event_record_carries_agent_id() {
-        let record = TurnCoreEventRecord {
-            event_id: "e1".into(),
-            user_id: "u1".into(),
-            session_id: "s1".into(),
-            run_id: Some("r1".into()),
-            agent_id: Some("astra-cli".into()),
-            event_type: "user_query".into(),
-            content: "hi".into(),
-            parent_event_id: None,
-            parent_event_ids: Vec::new(),
-            causal_chain_id: "c1".into(),
-            turn_seq: Some(1),
-            llm_model_used: None,
-            token_usage: None,
-            llm_params: None,
-            reasoning_content: None,
-        };
-        assert_eq!(record.agent_id.as_deref(), Some("astra-cli"));
-    }
-
-    #[test]
-    fn core_event_record_agent_id_none() {
-        let record = TurnCoreEventRecord {
-            event_id: "e1".into(),
-            user_id: "u1".into(),
-            session_id: "s1".into(),
-            run_id: None,
-            agent_id: None,
-            event_type: "user_query".into(),
-            content: "hi".into(),
-            parent_event_id: None,
-            parent_event_ids: Vec::new(),
-            causal_chain_id: "c1".into(),
-            turn_seq: Some(1),
-            llm_model_used: None,
-            token_usage: None,
-            llm_params: None,
-            reasoning_content: None,
-        };
-        assert!(record.agent_id.is_none());
-    }
-
-    #[test]
-    fn tool_event_record_carries_agent_id() {
-        let record = TurnToolEventRecord {
-            event_id: "e1".into(),
-            user_id: "u1".into(),
-            session_id: "s1".into(),
-            run_id: Some("r1".into()),
-            tool_call_id: Some("call-1".into()),
-            agent_id: Some("custom-agent".into()),
-            event_type: "tool_call_started".into(),
-            content: "{}".into(),
-            parent_event_id: None,
-            parent_event_ids: Vec::new(),
-            causal_chain_id: "c1".into(),
-            metadata: None,
-            skill_name: None,
-            skill_version: None,
-            reasoning_content: None,
-        };
-        assert_eq!(record.agent_id.as_deref(), Some("custom-agent"));
-    }
-
-    #[test]
-    fn auxiliary_event_record_carries_agent_id() {
-        let record = TurnAuxiliaryEventRecord {
-            event_id: "e1".into(),
-            user_id: "u1".into(),
-            session_id: "s1".into(),
-            agent_id: Some("astra-cli".into()),
-            event_type: "routing_decision".into(),
-            content: "{}".into(),
-            parent_event_id: None,
-            parent_event_ids: Vec::new(),
-            causal_chain_id: "c1".into(),
-            metadata: None,
-            reasoning_content: None,
-        };
-        assert_eq!(record.agent_id.as_deref(), Some("astra-cli"));
-    }
 }

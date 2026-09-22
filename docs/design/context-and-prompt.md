@@ -9,8 +9,11 @@ This document defines the target behavior that implementation should converge to
 
 Context manifests project observed LLM calls. The retained 8k template supplies
 coarse projection budgets; context assembly owns actual request budgeting.
-Retrieval-stage metadata and compaction invariant queries describe and check
-runtime facts, but do not themselves execute retrieval or compaction. Synthetic
+The `post_compaction` reason describes a call after compaction state was recorded;
+multiple subsequent calls can carry it. Trace-gated, best-effort manifests are
+not one-per-compaction certificates, and their count does not prove preservation.
+Preservation belongs at acceptance of a canonical rewrite. Retrieval-stage
+metadata describes runtime facts, but does not itself execute retrieval. Synthetic
 confidence, expiry, seven-child rendering, and 10GB retrieval assertions are not
 evidence that those policies or execution paths are implemented.
 

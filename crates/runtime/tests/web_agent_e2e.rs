@@ -2063,7 +2063,7 @@ async fn execute_mock_tool_turn(
 }
 
 async fn run_mock_tool_scenario(case: MockToolScenario) {
-    let (app, hook_writer, _observer) = build_test_app_with_hooks();
+    let (app, hook_writer, observer) = build_test_app_with_hooks();
     let edge_tools: Vec<Value> = case
         .edge_tools
         .iter()
@@ -2089,32 +2089,15 @@ async fn run_mock_tool_scenario(case: MockToolScenario) {
             case.name
         );
 
-        let hw = hook_writer.clone();
         poll_until(
-            move || {
-                let hw = hw.clone();
-                async move { !hw.plans.lock().await.is_empty() }
+            || {
+                let observer = observer.clone();
+                async move { !observer.requests.lock().await.is_empty() }
             },
             5,
         )
         .await;
-
-        let plans = hook_writer.plans.lock().await;
-        let plan = plans.last().expect("text-only hook plan");
-        let audit = plan
-            .decision_audit
-            .as_ref()
-            .expect("text-only decision audit");
-        assert_eq!(
-            audit.decision_type, "response_generation",
-            "{}: text-only case should persist response_generation",
-            case.name
-        );
-        assert!(
-            plan.skill_selection.is_none(),
-            "{}: text-only case should not persist skill_selection",
-            case.name
-        );
+        assert!(hook_writer.plans.lock().await.is_empty());
         return;
     }
 
@@ -2155,12 +2138,6 @@ async fn run_mock_tool_scenario(case: MockToolScenario) {
 
     let plans = hook_writer.plans.lock().await;
     let plan = plans.last().expect("tool hook plan");
-    let audit = plan.decision_audit.as_ref().expect("tool decision audit");
-    assert_eq!(
-        audit.decision_type, "tool_surface",
-        "{}: tool case should persist tool_surface",
-        case.name
-    );
     let skill = plan.skill_selection.as_ref().expect("tool skill selection");
     let selected_skills: std::collections::HashSet<&str> =
         skill.selected_skills.iter().map(String::as_str).collect();
@@ -5712,9 +5689,9 @@ async fn client_disconnect_run_still_finalizes() {
 
 // ── Hook DB + Observer Persistence Tests ─────────────────────────────────────
 
-/// Text-only response produces a "response_generation" decision audit with no skills.
+/// Ordinary answers reach the observer without writing a hook projection.
 #[tokio::test]
-async fn hook_db_decision_audit_text_only() {
+async fn hook_db_text_only_skips_writer() {
     let (app, hook_writer, observer_worker) = build_test_app_with_hooks();
 
     let events = chat_stream_collect(
@@ -5729,33 +5706,15 @@ async fn hook_db_decision_audit_text_only() {
     .await;
     assert!(!events.is_empty());
 
-    // Wait for background persistence to complete.
-    let hw = hook_writer.clone();
     poll_until(
         || {
-            let hw = hw.clone();
-            async move { !hw.plans.lock().await.is_empty() }
+            let observer = observer_worker.clone();
+            async move { !observer.requests.lock().await.is_empty() }
         },
         5,
     )
     .await;
-
-    let plans = hook_writer.plans.lock().await;
-    assert_eq!(plans.len(), 1, "exactly one hook persist call");
-    let plan = &plans[0];
-
-    let audit = plan
-        .decision_audit
-        .as_ref()
-        .expect("decision_audit present");
-    assert_eq!(audit.decision_type, "response_generation");
-    assert!(!audit.decision_id.is_empty());
-    let output = &audit.decision_output;
-    assert!(output["tool_calls"].as_array().unwrap().is_empty());
-    assert!(output["text"].as_str().unwrap().contains("Hi there"));
-
-    // No skill selection for text-only.
-    assert!(plan.skill_selection.is_none());
+    assert!(hook_writer.plans.lock().await.is_empty());
 
     // Observer should have been called with messages.
     let requests = observer_worker.requests.lock().await;
@@ -5764,9 +5723,9 @@ async fn hook_db_decision_audit_text_only() {
     assert!(!requests[0].messages.is_empty());
 }
 
-/// Tool-call response produces a "tool_surface" decision audit with skill selection.
+/// Tool selection retains the existing skill-selection record.
 #[tokio::test]
-async fn hook_db_decision_audit_with_tools() {
+async fn hook_db_skill_selection_with_tools() {
     let (app, hook_writer, _observer) = build_test_app_with_hooks();
 
     let resp = chat_stream_start(
@@ -5810,14 +5769,6 @@ async fn hook_db_decision_audit_with_tools() {
     assert_eq!(plans.len(), 1);
     let plan = &plans[0];
 
-    let audit = plan
-        .decision_audit
-        .as_ref()
-        .expect("decision_audit present");
-    assert_eq!(audit.decision_type, "tool_surface");
-    let tool_calls = audit.decision_output["tool_calls"].as_array().unwrap();
-    assert!(tool_calls.iter().any(|t| t.as_str() == Some("list_dir")));
-
     let skill = plan
         .skill_selection
         .as_ref()
@@ -5827,38 +5778,6 @@ async fn hook_db_decision_audit_with_tools() {
     assert!(skill.selected_skills.contains(&"list_dir".to_string()));
     assert_eq!(skill.user_query, "list files");
     assert_eq!(skill.execution_success, Some(1));
-}
-
-/// Model name is propagated to decision audit.
-#[tokio::test]
-async fn hook_db_decision_audit_model_name() {
-    let (app, hook_writer, _observer) = build_test_app_with_hooks();
-
-    chat_stream_collect(
-        &app,
-        json!({
-            "message": "test",
-            "model_selection": { "offering_id": "model-test-model-v1" },
-            "context": {
-                "test_llm_rounds": [{ "full_text": "ok" }]
-            }
-        }),
-    )
-    .await;
-    let hw = hook_writer.clone();
-    poll_until(
-        || {
-            let hw = hw.clone();
-            async move { !hw.plans.lock().await.is_empty() }
-        },
-        5,
-    )
-    .await;
-
-    let plans = hook_writer.plans.lock().await;
-    assert_eq!(plans.len(), 1);
-    let audit = plans[0].decision_audit.as_ref().unwrap();
-    assert_eq!(audit.model_used.as_deref(), Some("test-model-v1"));
 }
 
 /// Observer receives correct session_id and turn_count.
@@ -5958,8 +5877,6 @@ async fn hook_db_multiple_tools_selected() {
 
     let plans = hook_writer.plans.lock().await;
     assert_eq!(plans.len(), 1);
-    let audit = plans[0].decision_audit.as_ref().expect("decision_audit");
-    assert_eq!(audit.decision_type, "tool_surface");
 
     let skill = plans[0].skill_selection.as_ref().expect("skill_selection");
     // All unique tool names should be captured.

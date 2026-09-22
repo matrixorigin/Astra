@@ -885,11 +885,11 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         semantic_owner="astra_services::state_projection",
         state_class="durable state projection audit event",
         primary_query="state item audit by item_id/created_at/event_id and owner session audit by user_id/session_id/created_at/event_id",
-        retention_policy="retain with session_state_items while compaction invariants, projection debugging, and user/session audit need mutation history",
+        retention_policy="retain with session_state_items while projection debugging and user/session audit need mutation history",
         rebuildability="not fully rebuildable after source mutation context is gone",
         merge_guidance="keep separate from session_state_items; the item table is current projection state, while this table records mutation history",
         migration_owner="astra_services::storage / state_projection",
-        product_owner="session state projection, compaction invariants, active skill/delegation audit",
+        product_owner="session state projection, active skill/delegation audit",
     ),
     "session_delegations": TableMetadata(
         semantic_owner="astra_services::state_projection / runtime delegation engine",

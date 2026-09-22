@@ -8,7 +8,7 @@ use std::sync::{
 };
 
 use astra_services::{
-    BubbleUpTarget, COMPACTION_INVARIANT_SQL, DatabasePersonalSkillStore, DatabaseRunStateStore,
+    BubbleUpTarget, DatabasePersonalSkillStore, DatabaseRunStateStore,
     DatabaseStateProjectionStore, DelegationProjectionUpsert, SkillActivationLlmProbe,
     SubmitUserSkillVersion,
 };
@@ -138,14 +138,6 @@ async fn insert_state_item(
     item_id
 }
 
-fn invariant_count(results: &[(String, i64)], id: &str) -> i64 {
-    results
-        .iter()
-        .find(|(name, _)| name == id)
-        .expect("invariant result must exist")
-        .1
-}
-
 async fn explain_analyze_text(pool: &astra_core::SharedPool, sql: &str) -> String {
     let rows = sqlx::raw_sql(sql).fetch_all(pool.get()).await.unwrap();
     let mut text = String::new();
@@ -185,166 +177,6 @@ async fn index_columns(pool: &astra_core::SharedPool, table: &str, key: &str) ->
     .into_iter()
     .map(|row| row.try_get::<String, _>("COLUMN_NAME").unwrap())
     .collect()
-}
-
-#[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn compaction_invariant_queries_detect_protected_state_and_manifest_violations() {
-    let pool = setup_pool().await;
-    let (session_id, user_id, run_id) = ids();
-    insert_session(&pool, &session_id, &user_id).await;
-    insert_run(
-        &pool,
-        &session_id,
-        &user_id,
-        &run_id,
-        None,
-        &run_id,
-        &run_id,
-        0,
-        "completed",
-    )
-    .await;
-    for category in [
-        "plan_state",
-        "decision",
-        "finding",
-        "benchmark",
-        "citation",
-        "todo_state",
-        "error_state",
-        "delegation_state",
-    ] {
-        insert_state_item(
-            &pool,
-            &session_id,
-            &user_id,
-            "session",
-            category,
-            &format!("{category}-key"),
-            "active",
-            1,
-            20,
-        )
-        .await;
-    }
-    let store = DatabaseStateProjectionStore::new(pool.clone());
-    let missing = store
-        .run_compaction_assertions(&user_id, &session_id, &run_id)
-        .await
-        .unwrap();
-    assert_eq!(
-        invariant_count(&missing, "exactly_one_post_compaction_manifest"),
-        1
-    );
-    let manifest_id = format!("manifest-{}", Uuid::new_v4());
-    sqlx::query(
-        "INSERT INTO context_manifests
-         (user_id, session_id, manifest_id, run_id, turn_id, model_provider, model_name,
-          context_window_tokens, max_output_tokens, total_estimated_tokens, policy_version,
-          reason, manifest_json, payload_hash, ingestion_write_id)
-         VALUES (?, ?, ?, ?, 'fixture-turn', 'test', 'test', 8000, 500, 640, 'test',
-                 'post_compaction', '{}', 'fixture-hash', 'fixture-write')",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&manifest_id)
-    .bind(&run_id)
-    .execute(pool.get())
-    .await
-    .unwrap();
-    // Equal manifest IDs must not join another owner's over-budget item.
-    let foreign_user = format!("foreign-{user_id}");
-    for (owner, tokens) in [(&user_id, 640_i32), (&foreign_user, 801_i32)] {
-        sqlx::query(
-            "INSERT INTO context_manifest_items
-             (user_id, session_id, manifest_id, item_order, zone, source_table, source_id,
-              included, token_estimate, budget_tokens, reason, render_mode)
-             VALUES (?, ?, ?, 0, 'plan_todo', 'session_state_items', 'fixture',
-                     1, ?, 800, 'post_compaction', 'summary')",
-        )
-        .bind(owner)
-        .bind(&session_id)
-        .bind(&manifest_id)
-        .bind(tokens)
-        .execute(pool.get())
-        .await
-        .unwrap();
-    }
-    let results = store
-        .run_compaction_assertions(&user_id, &session_id, &run_id)
-        .await
-        .unwrap();
-    assert_eq!(results.len(), COMPACTION_INVARIANT_SQL.len());
-    assert!(results.iter().all(|(_, violations)| *violations == 0));
-    let plan = explain_analyze_text(
-        &pool,
-        &format!(
-            "EXPLAIN ANALYZE SELECT item_id FROM session_state_items FORCE INDEX (idx_state_owner_session_status_category) \
-             WHERE user_id = '{}' AND session_id = '{}' AND category = 'plan_state' AND status = 'active' ORDER BY updated_at DESC LIMIT 5",
-            user_id, session_id
-        ),
-    )
-    .await;
-    assert!(
-        plan.contains("session_state_items"),
-        "query was not analyzed:\n{plan}"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            "session_state_items",
-            "idx_state_owner_session_status_category"
-        )
-        .await,
-        ["user_id", "session_id", "status", "category"],
-        "state lookup index must preserve owner/session/status/category ordering"
-    );
-
-    // Corrupt the fixture deliberately: assertions must observe protected-state loss.
-    sqlx::query("UPDATE session_state_items SET status = 'archived', scope = 'user' WHERE user_id = ? AND session_id = ?")
-        .bind(&user_id).bind(&session_id).execute(pool.get()).await.unwrap();
-    for mutation in ["replace", "archive", "delete"] {
-        sqlx::query(
-            "INSERT INTO session_state_item_events
-             (event_id, item_id, user_id, session_id, category, item_key, mutation)
-             VALUES (?, 'fixture', ?, ?, 'plan_state', 'fixture', ?)",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(&user_id)
-        .bind(&session_id)
-        .bind(mutation)
-        .execute(pool.get())
-        .await
-        .unwrap();
-    }
-    sqlx::query("UPDATE context_manifest_items SET token_estimate = 801 WHERE user_id = ? AND manifest_id = ?")
-        .bind(&user_id).bind(&manifest_id).execute(pool.get()).await.unwrap();
-    let violations = store
-        .run_compaction_assertions(&user_id, &session_id, &run_id)
-        .await
-        .unwrap();
-    for (id, expected) in [
-        ("no_archived_active_durable_facts", 5),
-        ("no_archived_active_operational_state", 3),
-        ("plan_state_not_replaced", 3),
-        ("no_delete_mutations_for_protected_state", 1),
-        ("user_scope_not_compacted", 8),
-        ("plan_todo_zone_cap", 1),
-    ] {
-        assert_eq!(invariant_count(&violations, id), expected, "{id}");
-    }
-    let foreign = store
-        .run_compaction_assertions(&foreign_user, &session_id, &run_id)
-        .await
-        .unwrap();
-    for (id, count) in foreign {
-        assert_eq!(
-            count,
-            i64::from(id == "exactly_one_post_compaction_manifest"),
-            "{id}"
-        );
-    }
 }
 
 #[tokio::test]
@@ -821,59 +653,6 @@ async fn delegation_projection_refresh_uses_current_run_status() {
         row.try_get::<String, _>("state_status").unwrap(),
         "completed"
     );
-}
-
-#[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn compaction_active_run_invariant_is_owner_bound() {
-    let pool = setup_pool().await;
-    let (session_id, user_id, run_id) = ids();
-    let foreign_user = format!("foreign-{user_id}");
-    insert_session(&pool, &session_id, &user_id).await;
-    let store = DatabaseStateProjectionStore::new(pool.clone());
-    for status in ["running", "waiting"] {
-        let foreign_run = format!("foreign-{status}-{run_id}");
-        insert_run(
-            &pool,
-            &session_id,
-            &foreign_user,
-            &foreign_run,
-            None,
-            &foreign_run,
-            &foreign_run,
-            0,
-            status,
-        )
-        .await;
-    }
-    let results = store
-        .run_compaction_assertions(&user_id, &session_id, &run_id)
-        .await
-        .unwrap();
-    assert_eq!(invariant_count(&results, "no_active_run_compaction"), 0);
-    for (index, status) in ["running", "waiting"].into_iter().enumerate() {
-        let active_run = format!("{status}-{run_id}");
-        insert_run(
-            &pool,
-            &session_id,
-            &user_id,
-            &active_run,
-            None,
-            &active_run,
-            &active_run,
-            0,
-            status,
-        )
-        .await;
-        let results = store
-            .run_compaction_assertions(&user_id, &session_id, &run_id)
-            .await
-            .unwrap();
-        assert_eq!(
-            invariant_count(&results, "no_active_run_compaction"),
-            index as i64 + 1
-        );
-    }
 }
 
 #[tokio::test]

@@ -71,9 +71,7 @@ use astra_services::work::{
     WorkSubjectRef,
 };
 use astra_services::{AdmittedModelExecution, EdgeContext};
-use astra_services::{
-    DatabaseContextManifestStore, DatabaseStateProjectionStore, RetrievalStage, StateItemUpsert,
-};
+use astra_services::{DatabaseContextManifestStore, RetrievalStage};
 use astra_services::{
     WorkspaceCleanupDebtEntry, WorkspaceRecordEntry as StoredWorkspaceRecordEntry,
     WorkspaceRecordStoreError, WorkspaceStateStore,
@@ -132,9 +130,8 @@ use astra_turn_core::agent_live_event::{
     AgentLiveTermination, SharedAgentLiveEventSink,
 };
 use astra_turn_core::contracts::{
-    TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan, TurnDecisionAuditRecord,
-    TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker,
-    TurnSkillSelectionRecord,
+    TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan, TurnHookDbPersistPlan,
+    TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker, TurnSkillSelectionRecord,
 };
 use astra_turn_core::interruption::{InterruptionKind, ResumeAction, ResumeMode};
 use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};

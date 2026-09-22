@@ -622,55 +622,40 @@ impl DatabaseTraceEventWriter {
 #[async_trait]
 impl TurnHookDbWriter for DatabaseTurnHookDbWriter {
     async fn persist(&self, plan: TurnHookDbPersistPlan) -> Result<(), String> {
-        if plan.decision_audit.is_none() && plan.skill_selection.is_none() {
+        let Some(skill_selection) = plan.skill_selection else {
             return Ok(());
-        }
+        };
         let pool = self.get_pool()?;
         // Resolve catalog metadata before opening the write transaction. This
         // lookup uses the pool itself; doing it after `begin()` would hold one
         // connection while waiting for a second connection and can deadlock a
         // small pool (and unnecessarily consumes two leases in production).
-        let skill_versions = if let Some(skill_selection) = plan.skill_selection.as_ref() {
-            Some(
-                resolve_active_skill_versions(
-                    &pool,
-                    skill_selection
-                        .selected_skills
-                        .iter()
-                        .map(String::as_str)
-                        .collect(),
-                )
-                .await
-                .map_err(|error| error.to_string())?,
-            )
-        } else {
-            None
-        };
+        let skill_versions = resolve_active_skill_versions(
+            &pool,
+            skill_selection
+                .selected_skills
+                .iter()
+                .map(String::as_str)
+                .collect(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
-        if let Some(decision_audit) = plan.decision_audit.as_ref() {
-            insert_turn_decision_audit(&mut tx, decision_audit)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-        if let Some(skill_selection) = plan.skill_selection.as_ref() {
-            insert_turn_skill_selection(&mut tx, skill_selection)
-                .await
-                .map_err(|error| error.to_string())?;
-            if let Some(first_skill_name) = skill_selection.selected_skills.first()
-                && let Some(skill_version) = skill_versions
-                    .as_ref()
-                    .and_then(|versions| versions.get(first_skill_name))
-            {
-                update_turn_skill_selection_version(
-                    &mut tx,
-                    &skill_selection.event_id,
-                    &skill_selection.user_id,
-                    &skill_selection.session_id,
-                    skill_version,
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            }
+        insert_turn_skill_selection(&mut tx, &skill_selection)
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(first_skill_name) = skill_selection.selected_skills.first()
+            && let Some(skill_version) = skill_versions.get(first_skill_name)
+        {
+            update_turn_skill_selection_version(
+                &mut tx,
+                &skill_selection.event_id,
+                &skill_selection.user_id,
+                &skill_selection.session_id,
+                skill_version,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
         }
         tx.commit().await.map_err(|error| error.to_string())?;
         Ok(())
@@ -1829,26 +1814,10 @@ mod tests {
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("not configured"));
 
-        // HookDbWriter
+        // An empty hook must succeed without even a configured pool.
         let w = DatabaseTurnHookDbWriter::new(settings.clone());
-        let r = w
-            .persist(TurnHookDbPersistPlan {
-                decision_audit: Some(TurnDecisionAuditRecord {
-                    decision_id: "d1".into(),
-                    user_id: "u".into(),
-                    event_id: "e2".into(),
-                    session_id: "s".into(),
-                    decision_type: "tool_surface".into(),
-                    decision_output: json!({}),
-                    model_used: None,
-                    context_capture_id: None,
-                }),
-                skill_selection: None,
-                reflection_lesson: None,
-                reflection_mark: None,
-            })
-            .await;
-        assert!(r.is_err());
+        let r = w.persist(TurnHookDbPersistPlan::default()).await;
+        assert!(r.is_ok());
 
         // ToolEventWriter
         let w = DatabaseTurnToolEventWriter::new(settings.clone());

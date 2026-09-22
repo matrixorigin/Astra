@@ -14,8 +14,7 @@ use astra_services::observation_capture::{
     canonical_observation_payload_hash, classify_capture, record_observation_collision,
 };
 use astra_turn_core::contracts::{
-    TurnAuxiliaryEventRecord, TurnCoreEventRecord, TurnDecisionAuditRecord,
-    TurnSkillSelectionRecord, TurnToolEventRecord,
+    TurnAuxiliaryEventRecord, TurnCoreEventRecord, TurnSkillSelectionRecord, TurnToolEventRecord,
 };
 use astra_turn_core::hook_plans::SnapshotLinkPlan;
 use astra_turn_core::trace_event::TraceEvent;
@@ -768,28 +767,6 @@ pub(crate) async fn insert_tool_turn_event(
         .await?;
     }
     Ok(inserted)
-}
-
-pub(crate) async fn insert_turn_decision_audit(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    record: &TurnDecisionAuditRecord,
-) -> Result<(), sqlx::Error> {
-    query(
-        "INSERT INTO ctx_decision_audits \
-         (decision_id, user_id, session_id, event_id, decision_type, decision_output, model_used, context_capture_id, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())",
-    )
-    .bind(&record.decision_id)
-    .bind(&record.user_id)
-    .bind(&record.session_id)
-    .bind(&record.event_id)
-    .bind(&record.decision_type)
-    .bind(record.decision_output.to_string())
-    .bind(&record.model_used)
-    .bind(&record.context_capture_id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
 }
 
 #[cfg(test)]

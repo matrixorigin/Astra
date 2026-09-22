@@ -374,9 +374,9 @@ pub use skills::{
     UnconfiguredSkillService,
 };
 pub use state_projection::{
-    BubbleUpTarget, COMPACTION_INVARIANT_SQL, CompactionInvariant, DatabaseStateProjectionStore,
-    DelegationProjectionUpsert, PROTECTED_COMPACTION_CATEGORIES, SkillActivationLlmProbe,
-    StateItemUpsert, StateProjectionError, UserAnchorMemoryItem, validate_state_mutation,
+    BubbleUpTarget, DatabaseStateProjectionStore, DelegationProjectionUpsert,
+    SkillActivationLlmProbe, StateItemUpsert, StateProjectionError, UserAnchorMemoryItem,
+    validate_state_mutation,
 };
 pub use state_sync::{
     LocalOnlySyncService, MatrixOneSyncService, StateSyncService, SyncDirection, SyncResult,

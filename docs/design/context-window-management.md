@@ -75,6 +75,11 @@ artifact_refs
 risk_notes
 ```
 
+These are outputs of actual context rewriting, not a generic completion message
+written after a database scan. Per-call manifests can share `post_compaction`
+across several model calls; neither their count nor a scan of all session state
+certifies a rewrite. Verify preservation at the canonical rewrite boundary.
+
 ## Prompt cache interaction
 
 Compaction should update dynamic blocks without changing stable contract sections unless the agent contract actually changed.

@@ -28,6 +28,12 @@ This is a normative design contract, not an implementation status report.
 
 ## Default C3 events
 
+An assistant answer is C1 conversation content, not an automatic decision fact.
+Explicit decision records link to the event that establishes the decision and
+its owner; copying answer text or tool names into an audit row cannot establish
+authorization or the admitted tool surface. Canonical answer and usage producers
+remain independent of that explicit decisions API.
+
 The default trace schema should include:
 
 - `llm_round_completed`;

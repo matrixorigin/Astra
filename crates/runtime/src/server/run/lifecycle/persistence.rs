@@ -24,18 +24,14 @@ use astra_services::runs::{
 };
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
 use astra_services::skills::SkillService;
-use astra_services::state_projection::bounded_state_item_id;
 use astra_services::{CancellationSafePoolConnection, EdgeContext};
-use astra_services::{
-    DatabaseContextManifestStore, DatabaseStateProjectionStore, RetrievalStage, StateItemUpsert,
-};
 use astra_services::{
     WorkspaceCleanupDebtEntry, WorkspaceRecordEntry as StoredWorkspaceRecordEntry,
     WorkspaceRecordStoreError, WorkspaceStateStore,
 };
 use astra_turn_core::contracts::{
-    TurnDecisionAuditRecord, TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest,
-    TurnObserverWorker, TurnSkillSelectionRecord,
+    TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker,
+    TurnSkillSelectionRecord,
 };
 use astra_turn_core::observer::filter_memory_operation_turns;
 use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
@@ -197,10 +193,6 @@ fn run_token_usage_json(state: &AgenticLoopState) -> Option<Value> {
     Some(usage)
 }
 
-fn decode_post_compaction_manifest_count(row: &impl RowExt) -> Result<i64, String> {
-    RowDecoder::new(row, "post-compaction context manifest count").non_negative_i64("count")
-}
-
 fn decode_transcript_page_item_row(row: &impl RowExt) -> Result<TranscriptPageItemRow, String> {
     let dec = RowDecoder::new(row, "transcript page item row");
     Ok(TranscriptPageItemRow {
@@ -322,9 +314,9 @@ impl PostLoopPersistContext {
     ) -> Result<(), String> {
         let mut errors = Vec::new();
         if let Err(error) = core_trace_result {
-            // Hook rows, memory extraction, session-end hooks, promotion
-            // events, and state projections are derived from the canonical
-            // turn. Publishing any of them after the canonical transaction
+            // Hook rows, memory extraction, session-end hooks, and promotion
+            // events are derived from the canonical turn. Publishing any of
+            // them after the canonical transaction
             // failed creates a second, contradictory source of truth. Retain
             // the classified terminal failure and append-only provider/tool
             // evidence, but fail closed before derived state escapes.
@@ -339,9 +331,8 @@ impl PostLoopPersistContext {
             .await;
 
         // The remaining consumers all read the immutable completed loop state
-        // and write independent sinks. Streaming callers complete this phase
-        // before publishing terminal SSE; the writes are awaited together so
-        // their independent database latency remains overlapped.
+        // and write independent sinks. The writes are awaited together;
+        // their completion is not the streaming terminal-delivery boundary.
         let hook_persist = async {
             let Some(writer) = self.hook_db_writer.as_ref() else {
                 return Ok(());
@@ -352,7 +343,6 @@ impl PostLoopPersistContext {
                 &self.session_id,
                 &self.user_message,
                 state,
-                self.model_name.as_deref(),
             )
             .await
         };
@@ -381,21 +371,11 @@ impl PostLoopPersistContext {
             &self.run_id,
             &state.telemetry.promotion_events,
         );
-        let projection_persist = persist_server_loop_projection_state(
-            self.shared_pool.as_ref(),
-            &self.user_id,
-            &self.session_id,
-            &self.run_id,
-            self.agent_id.as_deref(),
-            self.model_name.as_deref(),
-            state,
-        );
-        let (hook_result, observer_result, (), promotion_result, projection_result) = tokio::join!(
+        let (hook_result, observer_result, (), promotion_result) = tokio::join!(
             hook_persist,
             observer_dispatch,
             session_end,
             promotion_persist,
-            projection_persist,
         );
         if let Err(error) = hook_result {
             errors.push(format!("hook events persist failed: {error}"));
@@ -405,9 +385,6 @@ impl PostLoopPersistContext {
         }
         if let Err(error) = promotion_result {
             errors.push(format!("promotion events persist failed: {error}"));
-        }
-        if let Err(error) = projection_result {
-            errors.push(format!("projection state persist failed: {error}"));
         }
 
         // Use loop_success to conditionally log severity
@@ -1438,190 +1415,6 @@ async fn persist_server_loop_canonical_append_inner(
             .unwrap_or_default(),
         terminal_assistant_source_event_id,
     })
-}
-
-async fn persist_server_loop_projection_state(
-    shared_pool: Option<&SharedPool>,
-    user_id: &str,
-    session_id: &str,
-    run_id: &str,
-    agent_id: Option<&str>,
-    model_name: Option<&str>,
-    state: &AgenticLoopState,
-) -> Result<(), String> {
-    let Some(pool) = shared_pool else {
-        return Ok(());
-    };
-    let store = DatabaseStateProjectionStore::new(pool.clone());
-    let final_text = state.final_text.trim();
-    if !final_text.is_empty() {
-        let preview = truncate_for_projection(final_text, 480);
-        let result = store
-            .upsert_state_item(StateItemUpsert {
-                item_id: Some(bounded_state_item_id(
-                    "decision",
-                    &[session_id, run_id, &state.session_turn.to_string()],
-                )),
-                user_id: user_id.to_string(),
-                session_id: session_id.to_string(),
-                scope: "session".to_string(),
-                category: "decision".to_string(),
-                item_key: format!("turn:{}:final_response", state.session_turn),
-                status: "active".to_string(),
-                priority: 50,
-                source: "agentic_loop".to_string(),
-                provenance_event_id: None,
-                run_id: Some(run_id.to_string()),
-                title: Some(format!("Turn {} final decision", state.session_turn)),
-                summary_text: Some(preview.clone()),
-                payload_json: json!({
-                    "run_id": run_id,
-                    "agent_id": agent_id,
-                    "model_name": model_name,
-                    "session_turn": state.session_turn,
-                    "summary": preview,
-                    "source": "server_agentic_loop_final_text",
-                }),
-                token_estimate: astra_turn_core::section_types::estimate_text_tokens(final_text)
-                    .clamp(20, 240),
-                mutation: "insert".to_string(),
-            })
-            .await;
-        if let Err(error) = result {
-            tracing::warn!(
-                target: "astra_runtime::state_projection",
-                session_id = %session_id,
-                run_id = %run_id,
-                error = %error,
-                "failed to persist agentic-loop decision projection"
-            );
-        }
-    }
-
-    let post_compaction_count_row = match sqlx::query(
-        "SELECT COUNT(*) AS count FROM context_manifests \
-         WHERE user_id = ? AND session_id = ? AND run_id = ? AND reason = 'post_compaction'",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .bind(run_id)
-    .fetch_one(pool.get())
-    .await
-    {
-        Ok(row) => row,
-        Err(error) => {
-            let error_msg = format!(
-                "failed to inspect post-compaction context manifest count: {}",
-                error
-            );
-            tracing::warn!(
-                target: "astra_runtime::state_projection",
-                session_id = %session_id,
-                run_id = %run_id,
-                error = %error,
-                "failed to inspect post-compaction context manifest count"
-            );
-            return Err(error_msg);
-        }
-    };
-    let post_compaction_count =
-        match decode_post_compaction_manifest_count(&post_compaction_count_row) {
-            Ok(count) => count,
-            Err(error) => {
-                let error_msg = format!(
-                    "failed to decode post-compaction context manifest count: {}",
-                    error
-                );
-                tracing::warn!(
-                    target: "astra_runtime::state_projection",
-                    session_id = %session_id,
-                    run_id = %run_id,
-                    error = %error,
-                    "failed to decode post-compaction context manifest count"
-                );
-                return Err(error_msg);
-            }
-        };
-    if post_compaction_count > 0 {
-        match store
-            .run_compaction_assertions(user_id, session_id, run_id)
-            .await
-        {
-            Ok(results) if results.iter().all(|(_, violations)| *violations == 0) => {
-                let result = store
-                    .upsert_state_item(StateItemUpsert {
-                        item_id: Some(bounded_state_item_id("summary", &[session_id, run_id])),
-                        user_id: user_id.to_string(),
-                        session_id: session_id.to_string(),
-                        scope: "session".to_string(),
-                        category: "summary".to_string(),
-                        item_key: format!("compaction:{run_id}"),
-                        status: "active".to_string(),
-                        priority: 40,
-                        source: "agentic_loop_compaction".to_string(),
-                        provenance_event_id: None,
-                        run_id: Some(run_id.to_string()),
-                        title: Some("Post-compaction summary".to_string()),
-                        summary_text: Some(
-                            "Compaction completed with invariant checks passing".to_string(),
-                        ),
-                        payload_json: json!({
-                            "reason": "post_compaction",
-                            "invariant_results": results,
-                        }),
-                        token_estimate: 80,
-                        mutation: "insert".to_string(),
-                    })
-                    .await;
-                if let Err(error) = result {
-                    let error_msg = format!(
-                        "failed to persist post-compaction summary projection: {}",
-                        error
-                    );
-                    tracing::warn!(
-                        target: "astra_runtime::state_projection",
-                        session_id = %session_id,
-                        run_id = %run_id,
-                        error = %error,
-                        "failed to persist post-compaction summary projection"
-                    );
-                    return Err(error_msg);
-                }
-            }
-            Ok(results) => {
-                let error_msg = format!("post-compaction invariant check failed: {:?}", results);
-                tracing::warn!(
-                    target: "astra_runtime::state_projection",
-                    session_id = %session_id,
-                    run_id = %run_id,
-                    ?results,
-                    "post-compaction invariant check failed after loop"
-                );
-                return Err(error_msg);
-            }
-            Err(error) => {
-                let error_msg =
-                    format!("failed to run post-compaction invariant checks: {}", error);
-                tracing::warn!(
-                    target: "astra_runtime::state_projection",
-                    session_id = %session_id,
-                    run_id = %run_id,
-                    error = %error,
-                    "failed to run post-compaction invariant checks"
-                );
-                return Err(error_msg);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn truncate_for_projection(text: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    for ch in text.chars().take(max_chars) {
-        out.push(ch);
-    }
-    out
 }
 
 pub(crate) fn extract_session_state_compact(
@@ -3480,48 +3273,19 @@ fn transcript_content_hash(role: &str, content: &str, payload_json: Option<&str>
     format!("{:x}", hasher.finalize())
 }
 
-/// Persist decision audit + skill selection to hook DB tables after the
-/// server-driven agentic loop completes.  This ensures the decisions API
-/// (`ctx_decision_audits`, `skill_selection_events`) has data for server-loop
-/// sessions, matching what the bridge path persisted via hook side effects.
-#[allow(clippy::too_many_arguments)]
+/// Persist the existing skill-selection telemetry after the server loop.
 async fn persist_server_loop_hook_events(
     hook_db_writer: &dyn TurnHookDbWriter,
     user_id: &str,
     session_id: &str,
     user_message: &str,
     state: &AgenticLoopState,
-    model_name: Option<&str>,
 ) -> Result<(), String> {
     // Use the telemetry accumulator — state.telemetry.all_tools_used tracks every
     // tool name across all rounds.  state.messages does NOT carry assistant
     // tool_call objects in the server loop path.
     let tool_call_names: Vec<String> = state.telemetry.all_tools_used.iter().cloned().collect();
     let selected_skills = state.telemetry.all_selected_skills.clone();
-    let event_id = Uuid::now_v7().to_string();
-
-    let decision_audit = Some(TurnDecisionAuditRecord {
-        decision_id: Uuid::now_v7().to_string(),
-        user_id: user_id.to_string(),
-        session_id: session_id.to_string(),
-        event_id: event_id.clone(),
-        decision_type: if tool_call_names.is_empty() {
-            "response_generation".to_string()
-        } else {
-            "tool_surface".to_string()
-        },
-        decision_output: json!({
-            "text": truncate_for_audit(&state.final_text, 500),
-            "tool_calls": tool_call_names,
-            "model_used": model_name,
-            "total_tool_calls": state.total_tool_calls,
-            "total_prompt_tokens": state.provider_input_tokens(),
-            "total_completion_tokens": state.total_completion,
-        }),
-        model_used: model_name.map(|s| s.to_string()),
-        context_capture_id: None,
-    });
-
     let skill_selection = if let Some(first_skill) = selected_skills.first() {
         Some(TurnSkillSelectionRecord {
             event_id: Uuid::now_v7().to_string(),
@@ -3553,12 +3317,10 @@ async fn persist_server_loop_hook_events(
                 execution_time_ms: None,
             })
     };
-    let plan = TurnHookDbPersistPlan {
-        decision_audit,
-        skill_selection,
-        reflection_mark: None,
-        reflection_lesson: None,
-    };
+    if skill_selection.is_none() {
+        return Ok(());
+    }
+    let plan = TurnHookDbPersistPlan { skill_selection };
 
     hook_db_writer
         .persist(plan)
@@ -3967,11 +3729,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_loop_empty_hook_skips_writer_and_selected_skill_is_retained() {
+        let writer = CaptureHookDbWriter::default();
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.final_text = "Ordinary answer".into();
+        persist_server_loop_hook_events(&writer, "user-1", "session-1", "work", &state)
+            .await
+            .expect("empty hook succeeds");
+        assert!(writer.plans.lock().expect("capture lock").is_empty());
+
+        state.telemetry.all_selected_skills.push("review".into());
+        persist_server_loop_hook_events(&writer, "user-1", "session-1", "work", &state)
+            .await
+            .expect("selected skill persists");
+        let plans = writer.plans.lock().expect("capture lock");
+        assert_eq!(plans.len(), 1);
+        let skill = plans[0].skill_selection.as_ref().expect("selected skill");
+        assert_eq!(skill.skill_name, "review");
+        assert_eq!(skill.selected_skills, vec!["review".to_string()]);
+        assert_eq!(skill.selection_method, "llm_skill_choice");
+        assert_eq!(skill.execution_success, Some(1));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn ordinary_post_loop_needs_no_database_but_selected_skills_still_persist() {
+        let pool = setup_pool().await;
+        let user = format!("post-loop-user-{}", Uuid::new_v4());
+        let session = format!("post-loop-session-{}", Uuid::new_v4());
+        crate::server::run::insert_active_run_session_fixture(&pool, &user, &session).await;
+        let mut persist = test_post_loop_persist_context(&session, None);
+        persist.user_id = user.clone();
+        persist.shared_pool = Some(pool.clone());
+        persist.hook_db_writer = Some(Arc::new(
+            crate::turn::services::DatabaseTurnHookDbWriter::new(pool.settings().clone())
+                .with_pool(pool.clone()),
+        ));
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.final_text = "Ordinary answer".into();
+        state.telemetry.all_selected_skills.push("review".into());
+        persist
+            .run_after_core(&state, true, Ok(()), true)
+            .await
+            .unwrap();
+        let selected: Vec<String> = sqlx::query_scalar(
+            "SELECT skill_name FROM skill_selection_events WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&user)
+        .bind(&session)
+        .fetch_all(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(selected, ["review"]);
+        sqlx::query("DELETE FROM skill_selection_events WHERE user_id = ? AND session_id = ?")
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        crate::server::run::cleanup_run_session_fixture(&pool, &user, &session).await;
+        pool.close().await;
+
+        // Await the entire post-loop boundary, not just terminal SSE. A closed
+        // pool makes an accidental COUNT/transaction deterministic, not a race
+        // between our assertions and background persistence.
+        state.telemetry.all_selected_skills.clear();
+        persist
+            .run_after_core(&state, true, Ok(()), true)
+            .await
+            .expect("ordinary post-loop must not access the closed database");
+        state.telemetry.all_selected_skills.push("review".into());
+        assert!(
+            persist
+                .run_after_core(&state, true, Ok(()), true)
+                .await
+                .is_err(),
+            "positive control: a real skill write must still require the database"
+        );
+    }
+
+    #[tokio::test]
     async fn canonical_failure_does_not_publish_derived_hook_state() {
         let writer = Arc::new(CaptureHookDbWriter::default());
         let mut persist = test_post_loop_persist_context("canonical-failure-session", None);
         persist.hook_db_writer = Some(writer.clone());
-        let state = crate::turn::agentic_loop::host::make_test_loop_state();
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.telemetry.all_selected_skills.push("review".into());
 
         let error = persist
             .run_after_core(
@@ -5010,37 +4853,8 @@ mod tests {
         assert_eq!(token_usage["total"], 22);
     }
 
-    #[tokio::test]
-    async fn server_loop_hook_audit_prompt_tokens_include_cache_buckets() {
-        let writer = CaptureHookDbWriter::default();
-        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
-        state.final_text = "done".to_string();
-        state.total_prompt = 10;
-        state.total_cache_read = 4;
-        state.total_cache_creation = 3;
-        state.total_completion = 5;
-
-        persist_server_loop_hook_events(
-            &writer,
-            "user-1",
-            "session-1",
-            "work",
-            &state,
-            Some("model-a"),
-        )
-        .await
-        .expect("hook event persistence should succeed");
-
-        let plans = writer.plans.lock().expect("capture lock");
-        assert_eq!(plans.len(), 1);
-        let decision = plans[0].decision_audit.as_ref().expect("decision audit");
-        assert_eq!(decision.decision_output["total_prompt_tokens"], 17);
-        assert_eq!(decision.decision_output["total_completion_tokens"], 5);
-    }
-
     struct FakeRunLifecyclePersistenceRow {
         failed_column: Option<&'static str>,
-        count: i64,
         item_seq: i64,
         role: &'static str,
         content_hash: &'static str,
@@ -5050,7 +4864,6 @@ mod tests {
         fn default() -> Self {
             Self {
                 failed_column: None,
-                count: 2,
                 item_seq: 7,
                 role: "assistant",
                 content_hash: "sha256:page-item",
@@ -5062,13 +4875,6 @@ mod tests {
         fn fail_on(column: &'static str) -> Self {
             Self {
                 failed_column: Some(column),
-                ..Self::default()
-            }
-        }
-
-        fn with_count(count: i64) -> Self {
-            Self {
-                count,
                 ..Self::default()
             }
         }
@@ -5101,7 +4907,6 @@ mod tests {
                 return Err(sqlx::Error::ColumnNotFound(column.to_string()));
             }
             match column {
-                "count" => Ok(self.count),
                 "item_seq" => Ok(self.item_seq),
                 _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
             }
@@ -5117,37 +4922,6 @@ mod tests {
                 _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
             }
         }
-    }
-
-    #[test]
-    fn post_compaction_manifest_count_decode_preserves_zero_and_fails_loudly() {
-        assert_eq!(
-            decode_post_compaction_manifest_count(&FakeRunLifecyclePersistenceRow::with_count(0))
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            decode_post_compaction_manifest_count(&FakeRunLifecyclePersistenceRow::with_count(2))
-                .unwrap(),
-            2
-        );
-
-        let missing = decode_post_compaction_manifest_count(
-            &FakeRunLifecyclePersistenceRow::fail_on("count"),
-        )
-        .unwrap_err();
-        assert!(
-            missing.contains("post-compaction context manifest count") && missing.contains("count"),
-            "missing count should fail loudly: {missing}"
-        );
-
-        let negative =
-            decode_post_compaction_manifest_count(&FakeRunLifecyclePersistenceRow::with_count(-1))
-                .unwrap_err();
-        assert!(
-            negative.contains("count") && negative.contains("non-negative integer"),
-            "negative count should fail loudly: {negative}"
-        );
     }
 
     #[test]
