@@ -388,7 +388,9 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
-    let astra_bin = resolve_astra_bin(args.astra_bin.clone())?;
+    // All consumers must execute the same artifact, even after changing CWD.
+    let astra_bin = std::fs::canonicalize(resolve_astra_bin(args.astra_bin.clone())?)
+        .context("resolve absolute astra binary path")?;
 
     // ── Dashboard-only mode ─────────────────────────────────────────
     // When --live-dashboard is passed without a full CLI run config,

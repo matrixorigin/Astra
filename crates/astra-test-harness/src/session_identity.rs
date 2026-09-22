@@ -72,9 +72,7 @@ pub(crate) async fn cancel_server_session(
     }
     command
         .args(["session", "cancel", session_id])
-        .kill_on_drop(true)
-        .env("NO_PROXY", "localhost,127.0.0.1")
-        .env("no_proxy", "localhost,127.0.0.1");
+        .kill_on_drop(true);
     let output = tokio::time::timeout(Duration::from_secs(15), command.output())
         .await
         .map_err(|_| "session cancellation timed out after 15s".to_string())
@@ -135,9 +133,7 @@ pub(crate) async fn delete_server_session(
     }
     command
         .args(["session", "delete", session_id])
-        .kill_on_drop(true)
-        .env("NO_PROXY", "localhost,127.0.0.1")
-        .env("no_proxy", "localhost,127.0.0.1");
+        .kill_on_drop(true);
     let output = tokio::time::timeout(Duration::from_secs(15), command.output())
         .await
         .map_err(|_| "session deletion timed out after 15s".to_string())

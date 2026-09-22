@@ -85,8 +85,6 @@ async fn load_dashboard_model_catalog(
         std::time::Duration::from_secs(30),
         tokio::process::Command::new(admin_bin)
             .args(["admin", "model", "list"])
-            .env("NO_PROXY", "localhost,127.0.0.1")
-            .env("no_proxy", "localhost,127.0.0.1")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
@@ -971,8 +969,6 @@ async fn login_handler(
             "--password",
             &req.password,
         ])
-        .env("NO_PROXY", "localhost,127.0.0.1")
-        .env("no_proxy", "localhost,127.0.0.1")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()

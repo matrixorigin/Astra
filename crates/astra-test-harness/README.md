@@ -70,6 +70,10 @@ it does not validate a native MOI endpoint and then execute on a legacy one.
 An automatic switch to the isolated `harness-auto` profile rechecks readiness
 and revision before registration and again before retrying the model probe.
 Artifact-only `--build-info-json` remains independent of profiles/configuration.
+The CLI binary is resolved to an absolute path before constructing any consumer,
+so a case's working directory cannot select a different relative executable.
+All CLI subprocesses inherit the caller's proxy and bypass environment unchanged;
+ThinClient owns loopback bypass and remote endpoint proxy handling.
 In revision-bound mode, selected cases cannot override endpoint/profile,
 credential/settings roots, home directories, access tokens or proxy variables
 through `cli_env`, or routing flags through `extra_cli_args`. These are rejected

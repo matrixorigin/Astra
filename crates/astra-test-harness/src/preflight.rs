@@ -178,8 +178,6 @@ async fn capture_readiness_probe(
     tokio::time::timeout(Duration::from_secs(5), async {
         let mut child = astra_command(astra_bin, profile)
             .arg(argument)
-            .env("NO_PROXY", "localhost,127.0.0.1")
-            .env("no_proxy", "localhost,127.0.0.1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
@@ -695,11 +693,7 @@ async fn check_model(
     ]);
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        command
-            .env("NO_PROXY", "localhost,127.0.0.1")
-            .env("no_proxy", "localhost,127.0.0.1")
-            .current_dir(probe_workspace)
-            .output(),
+        command.current_dir(probe_workspace).output(),
     )
     .await;
 
@@ -768,11 +762,7 @@ async fn check_model(
                 ]);
                 let retry = tokio::time::timeout(
                     Duration::from_secs(30),
-                    retry_command
-                        .env("NO_PROXY", "localhost,127.0.0.1")
-                        .env("no_proxy", "localhost,127.0.0.1")
-                        .current_dir(probe_workspace)
-                        .output(),
+                    retry_command.current_dir(probe_workspace).output(),
                 )
                 .await;
                 match retry {
@@ -910,8 +900,6 @@ async fn try_auto_register(
             "--password",
             "harness-auto-pw",
         ])
-        .env("NO_PROXY", "localhost,127.0.0.1")
-        .env("no_proxy", "localhost,127.0.0.1")
         .current_dir(probe_workspace)
         .output()
         .await;
@@ -927,8 +915,6 @@ async fn try_auto_register(
             "--password",
             "harness-auto-pw",
         ])
-        .env("NO_PROXY", "localhost,127.0.0.1")
-        .env("no_proxy", "localhost,127.0.0.1")
         .current_dir(probe_workspace)
         .output()
         .await;

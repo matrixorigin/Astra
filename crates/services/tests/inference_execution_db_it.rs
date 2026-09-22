@@ -5353,6 +5353,16 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
     first_terminal.expect("finish first attempt");
     concurrent_terminal.expect("concurrent exact attempt terminal is idempotent");
 
+    // No other attempt is open: exercise duplicate terminal admission itself,
+    // not the invocation-level guard for an already-open retry.
+    assert_eq!(
+        begin_inference_provider_attempt(&shared_pool, &first_attempt)
+            .await
+            .expect_err("terminal attempt must not duplicate accepted context")
+            .kind,
+        ServiceErrorKind::Conflict
+    );
+
     let premature_success = InferenceInvocationTerminal::succeeded(
         InferenceUsage::default(),
         Some("provider-not-recorded".to_string()),
@@ -5369,15 +5379,13 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
     begin_inference_provider_attempt(&shared_pool, &second_attempt)
         .await
         .expect("begin retry as a distinct physical request");
-    for attempt in [&first_attempt, &second_attempt] {
-        assert_eq!(
-            begin_inference_provider_attempt(&shared_pool, attempt)
-                .await
-                .expect_err("repeated attempt admission must not duplicate accepted context")
-                .kind,
-            ServiceErrorKind::Conflict
-        );
-    }
+    assert_eq!(
+        begin_inference_provider_attempt(&shared_pool, &second_attempt)
+            .await
+            .expect_err("open attempt must not duplicate accepted context")
+            .kind,
+        ServiceErrorKind::Conflict
+    );
     let success = InferenceInvocationTerminal::succeeded(
         InferenceUsage {
             input: astra_turn_types::NormalizedPromptCacheUsage::new(120, 80, 10),
