@@ -1997,7 +1997,7 @@ fn observation_evidence_identities(
     let result_key = if record.name == "introspect"
         && args_value
             .as_ref()
-            .is_some_and(|args| args.get("artifact").is_none())
+            .is_some_and(|args| args.get("artifact").is_none() && args.get("explain").is_none())
     {
         let result = delivered_model_result(record).filter(|value| !value.is_empty());
         let Some(result) = result else {
@@ -2041,7 +2041,7 @@ fn observation_coverage(record: &ToolCallRecord) -> Option<Vec<String>> {
         return None;
     }
     let args = serde_json::from_str::<serde_json::Value>(args).ok()?;
-    if args.get("artifact").is_some() {
+    if args.get("artifact").is_some() || args.get("explain").is_some() {
         return None;
     }
     let result = delivered_model_result(record).filter(|value| !value.is_empty())?;
@@ -2090,7 +2090,7 @@ fn observation_scope(record: &ToolCallRecord) -> Option<ObservationScope> {
         return None;
     }
     let args = serde_json::from_str::<serde_json::Value>(args).ok()?;
-    if args.get("artifact").is_some() {
+    if args.get("artifact").is_some() || args.get("explain").is_some() {
         return None;
     }
     Some(ObservationScope::from_request(
@@ -2114,7 +2114,7 @@ fn observation_request_key(
     let Some(args) = args else {
         return operation_identity_key(record);
     };
-    if args.get("artifact").is_some() {
+    if args.get("artifact").is_some() || args.get("explain").is_some() {
         return operation_identity_key(record);
     }
     let request = crate::introspect::IntrospectRequest::from_args(args);
@@ -2160,7 +2160,7 @@ fn trailing_exact_observation_evidence(facts: &[ToolEvaluationFact]) -> usize {
     // result and must fail closed.
     if facts
         .last()
-        .is_some_and(|fact| fact.tool_name == "introspect" && first_coverage.is_none())
+        .is_some_and(|fact| fact.observation_scope.is_some() && first_coverage.is_none())
     {
         return 0;
     }
@@ -4218,6 +4218,36 @@ mod tests {
 
     #[test]
     fn repeated_observation_evidence_requires_same_read_and_delivered_result() {
+        for selector in [
+            serde_json::json!({"artifact": "artifact://session/explain-analyze/report-1", "offset": 0}),
+            serde_json::json!({"explain": {"target": "previous"}}),
+            serde_json::json!({"explain": {"target": "run", "run_id": "run-1"}}),
+        ] {
+            let mut report = journal_ok_call("introspect");
+            report.args_full = Some(selector.to_string());
+            report.result_full = Some("bounded report window".into());
+            let fact = ToolEvaluationFact::from_record(&report);
+            assert!(observation_scope(&report).is_none());
+            assert!(fact.observation_coverage().is_none());
+            assert_eq!(
+                trailing_repeated_observation_evidence(&[fact.clone(), fact]),
+                2
+            );
+
+            let mut next_window = report.clone();
+            let mut args = selector;
+            args["max_bytes"] = serde_json::json!(1024);
+            next_window.args_full = Some(args.to_string());
+            assert_eq!(
+                trailing_repeated_observation_evidence(&[
+                    ToolEvaluationFact::from_record(&report),
+                    ToolEvaluationFact::from_record(&next_window),
+                ]),
+                1,
+                "report requests retain exact identities, even when their returned bytes match"
+            );
+        }
+
         let read = || {
             let mut record = journal_ok_call("read_file");
             record.disposition =

@@ -149,7 +149,7 @@ fn observation_entrypoints_are_eager_and_advanced_contracts_searchable() {
         .find(|schema| schema["function"]["name"] == "introspect")
         .expect("introspect schema");
     let properties = &introspect_schema["function"]["parameters"]["properties"];
-    for field in ["artifact", "offset", "max_bytes"] {
+    for field in ["explain", "artifact", "offset", "max_bytes"] {
         assert!(
             properties.get(field).is_some(),
             "missing recovery field {field}"

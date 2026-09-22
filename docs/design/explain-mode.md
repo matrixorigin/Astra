@@ -337,7 +337,7 @@ surface may render them:
 | --- | --- | --- | --- |
 | CLI/local runtime | Local typed stream and session journal | CLI/TUI may write a local HTML companion by default (or explicit Markdown/text) and print its path | The local `introspect` reader can consume the opaque session handle |
 | Server + TUI/CLI | Server lifecycle is authoritative; the client consumes the same typed stream and durable replay | The client may render a local companion for the human, but must not treat its path as server authority | The model can recover only through a reader backed by the same server/session store; otherwise the required context reports the artifact as unavailable |
-| Server only | Server emits the versioned stream and durable run cursor | Web/SDK owns rendering or export; no server process writes a user's local path | The server-owned database handle is discovered on the next turn and read through server `introspect` |
+| Server only | Server emits the versioned stream and durable run cursor | Web/SDK owns rendering or export; no server process writes a user's local path | Server `introspect(explain={target:"previous"})` discovers and reads the first window on demand |
 | Server + Edge | Server and Edge facts retain producer, clock, parent, and gap metadata; reconnect uses the durable server cursor | The attached client renders one graph from merged facts; Edge never creates a second Explain semantics | Edge-local paths stay local; recovery uses the authorized host artifact backend and reports missing cross-host readers explicitly |
 
 Client-side rendering must therefore degrade to “shown locally, unavailable to
@@ -359,8 +359,9 @@ local readers support UTF-8 JSON windows with `offset` and a bounded
 `max_bytes` (64 KiB maximum), and return a continuation offset. They never
 expose a physical path. A failed write publishes an `unavailable` status for
 that run and turn when the store is reachable. Server discovery is bound first
-to the latest durable `run_started` record that explicitly requested Explain
-Analyze, then to that run's deterministic artifact identity; a missing or
+to the latest durable root `run_started` record that explicitly requested Explain
+Analyze, excluding the current root execution, then to that run's deterministic
+artifact identity; a missing or
 invalid artifact is reported as unavailable and never falls back to an older
 run. The local index uses the same fail-closed status model for the host it
 owns.
@@ -388,22 +389,38 @@ large files, provider captures, screenshots, exports, and future multimodal
 payloads on the same reference model without widening Explain Analyze into a
 raw trace or file browser.
 
-The server advertises the latest handle through the typed required-context lane
-on the next turn. The CLI/TUI may also print the path of a derived HTML report
-by default, or an explicitly selected Markdown/text representation, for the
-human operator. That path is a presentation affordance; the model receives the
-server-owned opaque handle and reads the canonical artifact through the bounded
-reader. The physical path is never treated as model authority. A client-local
-companion is explicitly unavailable to a remote model when no shared artifact
-backend exists.
-The next turn receives only a short artifact handle through `introspect`. An
-agent that is explicitly asked to analyze the previous explain report reads
-that handle through the bounded artifact window API, then cites the recorded
-node and event identities in its answer. The entire event set is never added
-to the prompt automatically. Missing, partial, or unavailable
-artifacts are reported as such, and an Explain artifact never grants access to
-raw prompts, chain-of-thought, credentials, tool arguments, tool output, or
-trace payloads.
+Server chat preparation performs no Explain discovery, artifact fetch, or
+recovery. The canonical tool schema and catalog advertise the explicit selector:
+
+- `introspect(explain={target:"previous"}, offset=0, max_bytes=65536)` selects
+  the latest Explain root in the active session, excluding the current root
+  installed by the trusted lifecycle owner. Durable ordering remains
+  updated time, created time, then run ID, all descending.
+- `introspect(explain={target:"run",run_id:"…"}, offset=0, max_bytes=65536)`
+  selects that exact Explain root after authenticated owner and active-session
+  checks. It never widens scope to another session.
+- Selection returns run, turn, execution-owner generation, capture status,
+  concrete opaque handle, first bounded window, and continuation together.
+  Subsequent pages use `introspect(artifact="…", offset=…, max_bytes=…)`;
+  the moving `previous` selector is never a pagination cursor.
+- `explain` and `artifact` are mutually exclusive; discovery requires offset
+  zero. `live_only` and `local_only` exclude server snapshot discovery.
+  Unsupported execution contexts, including the local CLI/Edge selector, return
+  an explicit error. Existing local handle readers retain their source policy
+  and active-session checks; neither boundary accepts arbitrary server paths.
+
+Readable discovery fetches the snapshot once and shares validation and UTF-8
+window formatting with the canonical handle reader. Byte-window completion is
+separate from capture completeness: partial facts, gaps, truncated coverage and
+unknown usage stay incomplete even after the final byte. Missing, corrupt,
+expired, mismatched or unavailable selected reports never fall back to older
+reports. Only physical absence may invoke exact completed-run recovery.
+
+The CLI/TUI may print a derived HTML, Markdown or text report path for the human
+operator. That path remains a presentation affordance, never model authority.
+A client-local companion is unavailable to a remote model without a shared
+authorized backend. Explain artifacts never grant access to raw prompts,
+chain-of-thought, credentials, tool arguments, tool output or trace payloads.
 
 ## Correctness and failure behavior
 
@@ -415,11 +432,11 @@ trace payloads.
   derived-report path never substitutes for server publication success.
 - Failed publication is a run observation, not an immutable empty snapshot.
   Missing reports can be recovered from the exact completed run's durable
-  facts on discovery or buffered-completion resume. Paused or cancelled runs
+  facts on explicit discovery or buffered-completion resume. Paused or cancelled runs
   cannot promote buffered successful facts into a completed report. Recovery
   preserves turn and generation identity and records its publication result;
   it does not rerun the model or overwrite a successful conflicting snapshot.
-- Artifact discovery is background capability metadata. The agent explains
+- Artifact discovery is an explicit observation request. The agent explains
   unavailability when asked about that report, rather than inserting unrelated
   storage warnings into ordinary answers. Clients surface failures when they
   occur, independently of what the model chooses to say.

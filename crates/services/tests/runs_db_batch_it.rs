@@ -1955,7 +1955,7 @@ async fn explain_root_discovery_is_owner_scoped_root_only_and_decodes_narrow_ide
 
     assert_eq!(
         store
-            .find_latest_explain_analyze_root(&user_id, &session_id)
+            .find_latest_explain_analyze_root(&user_id, &session_id, None)
             .await
             .expect("discover latest Explain root"),
         Some((newer_root.clone(), 1)),
@@ -1963,10 +1963,18 @@ async fn explain_root_discovery_is_owner_scoped_root_only_and_decodes_narrow_ide
     );
     assert_eq!(
         store
-            .find_latest_explain_analyze_root("not-the-owner", &session_id)
+            .find_latest_explain_analyze_root("not-the-owner", &session_id, None)
             .await
             .expect("wrong owner lookup"),
         None
+    );
+
+    assert_eq!(
+        store
+            .find_latest_explain_analyze_root(&user_id, &session_id, Some(&newer_root))
+            .await
+            .expect("exclude current root"),
+        Some((older_root.clone(), 1)),
     );
 
     sqlx::query("UPDATE agent_runs SET run_generation = -1 WHERE user_id = ? AND run_id = ?")
@@ -1976,7 +1984,7 @@ async fn explain_root_discovery_is_owner_scoped_root_only_and_decodes_narrow_ide
         .await
         .expect("seed invalid stored generation");
     let error = store
-        .find_latest_explain_analyze_root(&user_id, &session_id)
+        .find_latest_explain_analyze_root(&user_id, &session_id, None)
         .await
         .expect_err("negative generation must fail closed");
     assert!(error.contains("run_generation") || error.contains("negative"));

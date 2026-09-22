@@ -1114,7 +1114,17 @@ fn observation_recovery_and_reflection_are_eager() {
         .find(|schema| schema["function"]["name"] == "introspect")
         .expect("introspect recovery schema must be eager");
     let properties = &introspect["function"]["parameters"]["properties"];
-    for field in ["artifact", "offset", "max_bytes"] {
+    assert_eq!(
+        properties["explain"]["properties"]["target"]["enum"],
+        serde_json::json!(["previous", "run"])
+    );
+    assert!(
+        introspect["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("current root")
+    );
+    for field in ["explain", "artifact", "offset", "max_bytes"] {
         assert!(
             properties.get(field).is_some(),
             "eager introspect schema must expose artifact recovery field {field}"

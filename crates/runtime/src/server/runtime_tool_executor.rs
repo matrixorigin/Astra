@@ -749,6 +749,8 @@ pub struct RuntimeToolExecutor {
     pub(super) user_id: String,
     /// Session ID for isolation.
     pub(crate) session_id: String,
+    /// Installed only by the root lifecycle owner, never from tool arguments.
+    explain_root: Option<(crate::server::run::engine::RunEngine, String)>,
     /// Memoria client for memory operations.
     memoria_client: astra_tools::memoria::MemoriaToolGateway,
     /// Reflect service for persisted server/cloud observation evidence.
@@ -969,6 +971,15 @@ impl RuntimeToolExecutor {
         }
     }
 
+    pub(crate) fn with_explain_root(
+        mut self,
+        engine: crate::server::run::engine::RunEngine,
+        root_run_id: String,
+    ) -> Self {
+        self.explain_root = Some((engine, root_run_id));
+        self
+    }
+
     /// Create a new server tool executor for a session.
     pub fn new(
         workspace_root: PathBuf,
@@ -998,6 +1009,7 @@ impl RuntimeToolExecutor {
             workspace_root: workspace_root.clone(),
             user_id,
             session_id: session_id.clone(),
+            explain_root: None,
             sandbox_policy,
             default_executor,
             tool_engine,

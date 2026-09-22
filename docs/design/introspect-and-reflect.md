@@ -30,6 +30,17 @@ Introspect reports system facts. Reflect reasons over those facts.
 
 Introspection must be factual, structured, and bounded. Reflection may synthesize strategy, uncertainty, and next actions, but should not mutate state by itself.
 
+Explain snapshots are discovered lazily through the same `introspect` tool:
+`explain={target:"previous"}` excludes the current server root, while
+`explain={target:"run",run_id:"…"}` selects an exact authorized root in the
+active session. Discovery returns the first bounded window and a fixed opaque
+artifact handle for subsequent pages. Ordinary server chat preparation does
+not discover or recover reports. Local CLI/Edge selectors explicitly report
+unsupported; existing local handles remain usable through their local reader.
+Identity, physical-absence-only recovery, capture completeness and window
+semantics belong to [Explain mode](explain-mode.md).
+
+
 Internal judgment usage is a physical-attempt fact. Session reflection reports
 provider, offering, model, operation, attempt count, and known input/output tokens from
 the authenticated inference ledger. An attempt without complete usage remains

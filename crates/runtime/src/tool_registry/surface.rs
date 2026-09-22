@@ -409,11 +409,11 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
                 "replace_all",
                 "allow_structural_change",
             ][..],
-            "Replace text in one file. Select str_replace with tool_search first for batch edits or structural-change overrides.",
+            "Replace file text. Batch/structural overrides: tool_search select:str_replace.",
         ),
         "ask_user" => (
             &["context", "questions"][..],
-            "Ask the user focused clarification questions. Select ask_user with tool_search first for choices, headers, or multi-select.",
+            "Ask focused questions. Choices/headers/multi-select: tool_search select:ask_user.",
         ),
         "introspect" => (
             &[
@@ -426,10 +426,11 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
                 "include_context",
                 "format",
                 "artifact",
+                "explain",
                 "offset",
                 "max_bytes",
             ][..],
-            "Read bounded session observations or artifacts; use artifact, offset, and max_bytes for Explain snapshots. Use reflect for history.",
+            "Observe. Server Explain: target=previous excludes current root; target=run needs run_id. Page via artifact.",
         ),
         "reflect" => (
             &["question"][..],
@@ -437,7 +438,7 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
         ),
         "memory" => (
             &["action", "content", "query", "memory_type", "scope"][..],
-            "Store/recall memory: remember requires content; recall requires query; scope=session isolates this session. Other actions (forget/update): tool_search select:memory; invoke_tool.",
+            "remember:content; recall:query; scope=session. forget/update: tool_search select:memory; invoke_tool.",
         ),
         "read_file" => (
             &["path", "start_line", "end_line", "outline"][..],

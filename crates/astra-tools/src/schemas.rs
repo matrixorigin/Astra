@@ -2040,7 +2040,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "introspect",
-                "description": "Read bounded live/runtime observations or a persisted tool-result artifact. Start with facet=overview and depth=summary; use hint for quick checks. Do not repeat an identical introspect request unless state or a requested deep audit changed; a cached repeat adds no evidence. Live horizons are not historical truth; use reflect for persisted causal evidence. `urn:astra:observation:*` and `urn:astra:evidence:*` are citations, not artifact handles. Use `artifact://session/tool-result/<opaque_token>` for artifacts; omit it for live state.",
+                "description": "Read bounded live/runtime observations or artifacts. Server Explain: explain={target:previous} excludes the current root; target=run requires run_id. Returns the first window and fixed artifact handle. CLI/Edge selectors are unsupported. Start with facet=overview and depth=summary; use hint for quick checks. Do not repeat an identical introspect request unless state or a requested deep audit changed; a cached repeat adds no evidence. Live horizons are not historical truth; use reflect for persisted causal evidence. `urn:astra:observation:*` and `urn:astra:evidence:*` are citations, not artifact handles. Use `artifact://session/tool-result/<opaque_token>` for artifacts; omit it for live state.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2052,7 +2052,17 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "source_policy": {"type": "string", "enum": ["auto","live_only","live_first","durable_first","local_only","cloud_only"], "description": "Source preference; unavailable coverage is reported."},
                         "include_context": {"type": "boolean", "description": "Include available observed prompt/context facts."},
                         "format": {"type": "string", "enum": ["text","json"], "description": "Output format; default text."},
-                        "artifact": {"type": "string", "description": "Artifact handle only: `artifact://session/tool-result/<opaque_token>`; observation/evidence URNs are citations, not handles."},
+                        "artifact": {"type": "string", "description": "Opaque tool-result or Explain handle; paginate with offset/max_bytes. Never a file path."},
+                        "explain": {
+                            "type": "object",
+                            "properties": {
+                                "target": {"type": "string", "enum": ["previous", "run"]},
+                                "run_id": {"type": "string", "minLength": 1}
+                            },
+                            "required": ["target"],
+                            "additionalProperties": false,
+                            "description": "Server only. run requires run_id; previous forbids it. Exclusive with artifact; offset must be 0. Exact active-session identity, no older fallback."
+                        },
                         "offset": {"type": "integer", "minimum": 0, "description": "Artifact byte offset; default 0."},
                         "max_bytes": {"type": "integer", "minimum": 1, "maximum": 65536, "description": "Artifact window bytes."}
                     },
@@ -3366,6 +3376,7 @@ mod tests {
             "include_context",
             "format",
             "artifact",
+            "explain",
             "offset",
             "max_bytes",
         ] {
@@ -3376,7 +3387,7 @@ mod tests {
         }
         assert_eq!(
             properties.len(),
-            11,
+            12,
             "introspect prose compression must not add or remove parameters"
         );
         assert!(
@@ -3402,6 +3413,12 @@ mod tests {
             ],
             "introspect source_policy schema must not regress to old edge/server/cloud aliases"
         );
+        assert_eq!(
+            enum_values(&properties["explain"]["properties"]["target"]),
+            vec!["previous", "run"]
+        );
+        assert_eq!(properties["explain"]["additionalProperties"], false);
+        assert!(description.contains("current root"));
         assert_eq!(properties["max_bytes"]["maximum"], 65_536);
         assert_eq!(properties["max_bytes"]["minimum"], 1);
         assert_eq!(properties["offset"]["minimum"], 0);
@@ -3410,8 +3427,8 @@ mod tests {
             .expect("introspect schema must serialize")
             .len();
         assert!(
-            serialized_bytes <= 2_400,
-            "introspect eager schema uses {serialized_bytes} bytes; keep the fixed-prefix contract at or below 2400 bytes"
+            serialized_bytes <= 3_000,
+            "introspect eager schema uses {serialized_bytes} bytes; keep the fixed-prefix contract at or below 3000 bytes"
         );
     }
 

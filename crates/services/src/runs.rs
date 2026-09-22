@@ -4779,7 +4779,8 @@ pub trait RunStateStore: Send + Sync {
         kind: DurableRunInteractionKind,
     ) -> Result<Option<DurableRunInteractionProjection>, String>;
 
-    /// Find the newest root run that explicitly requested Explain Analyze.
+    /// Find the newest root run that explicitly requested Explain Analyze,
+    /// excluding the caller's trusted current root when supplied.
     /// Shared stores must answer this from their durable indexed
     /// authority; callers must never infer it from a bounded UI run tree.
     ///
@@ -4787,6 +4788,7 @@ pub trait RunStateStore: Send + Sync {
         &self,
         user_id: &str,
         session_id: &str,
+        excluded_root: Option<&str>,
     ) -> Result<Option<(String, u64)>, String>;
 
     /// Read only the newest typed terminal cancellation origin.
@@ -7253,6 +7255,7 @@ impl RunStateStore for InMemoryRunStateStore {
         &self,
         user_id: &str,
         session_id: &str,
+        excluded_root: Option<&str>,
     ) -> Result<Option<(String, u64)>, String> {
         let runs = self.runs.read().await;
         let mut candidates = runs
@@ -7260,6 +7263,7 @@ impl RunStateStore for InMemoryRunStateStore {
             .filter(|run| {
                 run.user_id == user_id
                     && run.session_id == session_id
+                    && excluded_root != Some(run.run_id.as_str())
                     && run_requested_explain_analyze(run)
             })
             .cloned()
@@ -15280,10 +15284,11 @@ impl RunStateStore for DatabaseRunStateStore {
         &self,
         user_id: &str,
         session_id: &str,
+        excluded_root: Option<&str>,
     ) -> Result<Option<(String, u64)>, String> {
         let row = sqlx::query(
             "SELECT runs.run_id, runs.run_generation FROM agent_runs runs \
-             WHERE runs.user_id = ? AND runs.session_id = ? AND runs.depth = 0 \
+             WHERE runs.user_id = ? AND runs.session_id = ? AND runs.depth = 0 AND (? IS NULL OR runs.run_id <> ?) \
                AND EXISTS ( \
                    SELECT 1 FROM agent_run_events events \
                    WHERE events.user_id = runs.user_id AND events.run_id = runs.run_id \
@@ -15295,6 +15300,8 @@ impl RunStateStore for DatabaseRunStateStore {
         )
             .bind(user_id)
             .bind(session_id)
+            .bind(excluded_root)
+            .bind(excluded_root)
             .fetch_optional(self.pool.get())
             .await
             .map_err(|source| {
@@ -26036,11 +26043,19 @@ mod tests {
 
         assert_eq!(
             store
-                .find_latest_explain_analyze_root("u1", "s1")
+                .find_latest_explain_analyze_root("u1", "s1", None)
                 .await
                 .unwrap()
                 .map(|(run_id, _)| run_id),
             Some("explain-target".to_string())
+        );
+
+        assert_eq!(
+            store
+                .find_latest_explain_analyze_root("u1", "s1", Some("explain-target"))
+                .await
+                .unwrap(),
+            None,
         );
 
         let mut newer_paused = durable_run_record("explain-paused");
@@ -26054,11 +26069,19 @@ mod tests {
 
         assert_eq!(
             store
-                .find_latest_explain_analyze_root("u1", "s1")
+                .find_latest_explain_analyze_root("u1", "s1", None)
                 .await
                 .unwrap()
                 .map(|(run_id, _)| run_id),
             Some("explain-paused".to_string())
+        );
+        assert_eq!(
+            store
+                .find_latest_explain_analyze_root("u1", "s1", Some("explain-paused"))
+                .await
+                .unwrap()
+                .map(|(run, _)| run),
+            Some("explain-target".into()),
         );
     }
 

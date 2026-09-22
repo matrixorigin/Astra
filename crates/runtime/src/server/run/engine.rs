@@ -3769,9 +3769,10 @@ impl RunEngine {
         &self,
         user_id: &str,
         session_id: &str,
+        excluded_root: Option<&str>,
     ) -> Result<Option<(String, u64)>, String> {
         self.store
-            .find_latest_explain_analyze_root(user_id, session_id)
+            .find_latest_explain_analyze_root(user_id, session_id, excluded_root)
             .await
     }
 
@@ -6773,9 +6774,10 @@ mod tests {
             &self,
             user_id: &str,
             session_id: &str,
+            excluded_root: Option<&str>,
         ) -> Result<Option<(String, u64)>, String> {
             self.inner
-                .find_latest_explain_analyze_root(user_id, session_id)
+                .find_latest_explain_analyze_root(user_id, session_id, excluded_root)
                 .await
         }
 

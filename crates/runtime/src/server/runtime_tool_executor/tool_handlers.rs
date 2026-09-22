@@ -867,6 +867,30 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
         args: &Value,
         _cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        if args.get("explain").is_some() {
+            let Some((engine, root)) = context.explain_root.as_ref() else {
+                return astra_tools::ToolResult::error(
+                    "Explain discovery requires a server root execution context".to_string(),
+                );
+            };
+            return match crate::server::explain_analyze_artifact::resolve_selector(
+                context.context_manifest_pool.as_ref(),
+                context.session_artifact_store.as_deref(),
+                engine,
+                &context.user_id,
+                &context.session_id,
+                root,
+                args,
+            )
+            .await
+            {
+                Ok(output) => {
+                    tool_result_from_output(output).with_source_bounded_model_projection()
+                }
+                Err(error) => astra_tools::ToolResult::error(format!("Error: {error}"))
+                    .with_source_bounded_model_projection(),
+            };
+        }
         if args.get("artifact").is_some() {
             // Explain Analyze snapshots are owned by the server run/session
             // store.  Resolve this typed handle before the legacy local
