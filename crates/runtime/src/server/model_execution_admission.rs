@@ -11,26 +11,54 @@ use axum::{Json, http::StatusCode};
 
 use crate::error_response_coded;
 
+#[derive(Debug)]
+pub(crate) struct PreparedModelAdmissionSlot {
+    wire: ModelAdmissionSlotV1,
+    reasoning: astra_turn_core::orchestration_spawn_tool::ReasoningSelection,
+}
+
+pub(crate) fn prepare_child_model_slots(
+    slots: Vec<ModelAdmissionSlotV1>,
+) -> Result<Vec<PreparedModelAdmissionSlot>, (StatusCode, Json<ErrorResponse>)> {
+    use astra_turn_core::orchestration_spawn_tool::ReasoningSelection;
+    slots
+        .into_iter()
+        .map(|wire| {
+            astra_services::validate_model_offering_id(&wire.offering_id).map_err(|_| {
+                error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    "model_selection.offering_id is invalid",
+                    "model_selection_invalid",
+                )
+            })?;
+            let reasoning = serde_json::from_value::<ReasoningSelection>(wire.reasoning.clone())
+                .map_err(|_| {
+                    error_response_coded(
+                        StatusCode::BAD_REQUEST,
+                        "child reasoning selection is invalid",
+                        "model_reasoning_invalid",
+                    )
+                })?;
+            Ok(PreparedModelAdmissionSlot { wire, reasoning })
+        })
+        .collect()
+}
+
 /// All-or-error child-model preflight. Execution material stays on Server;
 /// only a safe display projection crosses back to CLI.
 pub(crate) async fn admit_child_model_slots(
     model_service: &Arc<dyn ModelService>,
     user_id: String,
-    slots: Vec<ModelAdmissionSlotV1>,
-    reasoning: Vec<astra_turn_core::orchestration_spawn_tool::ReasoningSelection>,
+    slots: Vec<PreparedModelAdmissionSlot>,
 ) -> Result<ModelAdmissionResponseV1, (StatusCode, Json<ErrorResponse>)> {
     use astra_core::model_wire::purpose::ModelRequestPurpose;
-    if reasoning.len() != slots.len() {
-        return Err(error_response_coded(
-            StatusCode::BAD_REQUEST,
-            "model admission reasoning count does not match slots",
-            "model_admission_batch_invalid",
-        ));
-    }
     let executions = model_service
         .admit_model_offerings(
             user_id,
-            slots.iter().map(|slot| slot.offering_id.clone()).collect(),
+            slots
+                .iter()
+                .map(|slot| slot.wire.offering_id.clone())
+                .collect(),
         )
         .await?;
     if executions.len() != slots.len() {
@@ -41,8 +69,8 @@ pub(crate) async fn admit_child_model_slots(
         ));
     }
     let mut admitted = Vec::with_capacity(slots.len());
-    for ((slot, reasoning), execution) in slots.into_iter().zip(reasoning).zip(executions) {
-        if execution.offering_id != slot.offering_id {
+    for (slot, execution) in slots.into_iter().zip(executions) {
+        if execution.offering_id != slot.wire.offering_id {
             return Err(error_response_coded(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "batch model admission returned mismatched Offering",
@@ -53,7 +81,7 @@ pub(crate) async fn admit_child_model_slots(
             &execution,
             ModelRequestPurpose::Chat,
         )?;
-        validate_reasoning_control(&execution, &reasoning.config()).map_err(|error| {
+        validate_reasoning_control(&execution, &slot.reasoning.config()).map_err(|error| {
             error_response_coded(
                 StatusCode::BAD_REQUEST,
                 error,
@@ -61,8 +89,8 @@ pub(crate) async fn admit_child_model_slots(
             )
         })?;
         admitted.push(ModelAdmissionResultV1 {
-            offering_id: slot.offering_id,
-            reasoning: slot.reasoning,
+            offering_id: slot.wire.offering_id,
+            reasoning: slot.wire.reasoning,
             model_name: execution.model_name,
             context_window: execution.context_window,
         });
@@ -330,15 +358,14 @@ mod tests {
             offering_id: id.to_string(),
             reasoning,
         };
-        let default = astra_turn_core::orchestration_spawn_tool::ReasoningSelection::ModelDefault;
         let admitted = admit_child_model_slots(
             &service,
             "user-a".into(),
-            vec![
+            prepare_child_model_slots(vec![
                 slot("offer-a", serde_json::json!({"mode":"model_default"})),
                 slot("offer-b", serde_json::json!({"mode":"model_default"})),
-            ],
-            vec![default.clone(), default],
+            ])
+            .unwrap(),
         )
         .await
         .expect("both slots admitted");
@@ -351,14 +378,11 @@ mod tests {
         let error = admit_child_model_slots(
             &service,
             "user-a".into(),
-            vec![
+            prepare_child_model_slots(vec![
                 slot("offer-a", serde_json::json!({"mode":"model_default"})),
                 slot("offer-b", serde_json::json!({"mode":"off"})),
-            ],
-            vec![
-                astra_turn_core::orchestration_spawn_tool::ReasoningSelection::ModelDefault,
-                astra_turn_core::orchestration_spawn_tool::ReasoningSelection::Off,
-            ],
+            ])
+            .unwrap(),
         )
         .await
         .expect_err("invalid final slot rejects the entire batch");
@@ -366,6 +390,26 @@ mod tests {
         assert_eq!(
             error.1.0.error_code.as_deref(),
             Some("model_reasoning_unsupported")
+        );
+    }
+
+    #[test]
+    fn child_model_slot_shape_is_rejected_before_admission() {
+        let error = prepare_child_model_slots(vec![
+            ModelAdmissionSlotV1 {
+                offering_id: "offer-a".into(),
+                reasoning: serde_json::json!({"mode":"model_default"}),
+            },
+            ModelAdmissionSlotV1 {
+                offering_id: "offer-b".into(),
+                reasoning: serde_json::json!({"mode":"unknown"}),
+            },
+        ])
+        .expect_err("the final malformed slot must fail in the pure pre-auth phase");
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.0.error_code.as_deref(),
+            Some("model_reasoning_invalid")
         );
     }
 
