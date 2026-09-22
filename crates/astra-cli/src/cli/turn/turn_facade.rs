@@ -248,9 +248,10 @@ fn note_headless_callback_cancel_outcome(
             error.push_str(&format!("Exact server run {run_id} cancellation settled."));
         }
         Some(_) => {
-            error.push_str("Exact server run cancellation is not confirmed. ");
             error.push_str(
-                &crate::cli::stream::streaming_types::unconfirmed_durable_run_recovery(session_id),
+                &crate::cli::stream::streaming_types::headless_unconfirmed_cancel_notice(
+                    session_id,
+                ),
             );
         }
     }
@@ -615,12 +616,23 @@ mod tests {
         .unwrap_err();
 
         assert!(unsettled.error.contains("This client detached"));
+        assert!(unsettled.error.contains(
+            "Exact server run cancellation could not be confirmed; the run may still be active."
+        ));
         assert!(
-            unsettled
+            !unsettled
                 .error
-                .contains("Exact server run cancellation is not confirmed.")
+                .contains("The server run was not cancelled.")
         );
-        assert!(unsettled.error.contains("astra session cancel sess-active"));
+        let cancel_at = unsettled
+            .error
+            .find("astra session cancel sess-active")
+            .expect("cancel command");
+        let resume_at = unsettled
+            .error
+            .find("astra --resume sess-active")
+            .expect("resume after session cancel");
+        assert!(cancel_at < resume_at);
         assert!(!unsettled.error.contains("cancellation settled."));
         assert!(unsettled.partial.remote_cancel_required);
     }

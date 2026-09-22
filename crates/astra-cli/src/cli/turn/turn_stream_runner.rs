@@ -292,7 +292,7 @@ pub(crate) fn note_interactive_callback_detach(failure: &mut crate::TurnFailure)
     if !failure.partial.callback_client_detached {
         return;
     }
-    let recovery = crate::cli::stream::streaming_types::unconfirmed_durable_run_recovery(
+    let recovery = crate::cli::stream::streaming_types::interactive_detach_recovery(
         failure.partial.session_id.as_deref(),
     );
     if !failure.error.is_empty() {
@@ -416,7 +416,16 @@ mod tests {
                 .error
                 .contains("not a cancellation of the server run")
         );
-        assert!(failure.error.contains("astra session cancel sess-active"));
+        let cancel_at = failure
+            .error
+            .find("astra session cancel sess-active")
+            .expect("cancel command");
+        let resume_at = failure
+            .error
+            .find("astra --resume sess-active")
+            .expect("resume after session cancel");
+        assert!(cancel_at < resume_at);
+        assert!(failure.error.contains("The server run was not cancelled."));
         assert!(!failure.error.contains("cancellation settled"));
         assert!(!failure.error.contains("will be cancelled"));
     }

@@ -639,6 +639,22 @@ mod tests {
     use crate::cli::session::session_state::SessionState;
     use crate::cli::stream::streaming_types::UsageAttribution;
 
+    #[tokio::test]
+    async fn bound_interactive_session_is_not_resumed_before_the_next_turn() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut state = SessionState {
+            session_id: Some("sess-active".into()),
+            ..SessionState::default()
+        };
+
+        let session_id = ensure_interactive_session_identity(&mut state, &api, None, "token")
+            .await
+            .unwrap();
+
+        assert_eq!(session_id, "sess-active");
+        assert_eq!(state.session_id.as_deref(), Some("sess-active"));
+    }
+
     #[test]
     fn partial_usage_snapshot_survives_without_token_numbers() {
         let partial = crate::PartialTurnData {

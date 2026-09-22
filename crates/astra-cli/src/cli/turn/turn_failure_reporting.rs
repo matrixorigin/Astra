@@ -70,20 +70,32 @@ pub(crate) fn report_admission_rejection(
             .and_then(serde_json::Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .or(state.session_id.as_deref());
-        let mut message = String::from("Another run still owns this session\n");
+        let cursor_only = metadata
+            .and_then(|value| value.get("recovery_action"))
+            .and_then(serde_json::Value::as_str)
+            == Some("retry_session");
+        let mut message = if cursor_only {
+            String::from("The session cursor changed before this turn was admitted\n")
+        } else {
+            String::from("Another run still owns this session\n")
+        };
         if draft_restored {
             message.push_str("  Your message was not sent; the draft is back in the composer.\n");
+        } else if cursor_only {
+            message.push_str("  Your message was not sent; retry it.\n");
         } else {
-            message
-                .push_str("  Your message was not sent; retry it after the active run releases this session.\n");
+            message.push_str(
+                "  Your message was not sent; retry it after the active run releases this session.\n",
+            );
         }
-        match session_id {
-            Some(session_id) => message.push_str(&format!(
-                "  Wait for that run to finish, or stop it with `astra session cancel {session_id}` and retry.\n"
-            )),
-            None => message.push_str(
-                "  Wait for that run to finish, or stop it with `astra session cancel <session_id>` and retry.\n",
-            ),
+        if cursor_only {
+            message.push_str("  No run is holding this session, so do not cancel it.\n");
+        } else {
+            message.push_str("  ");
+            message.push_str(
+                &crate::cli::stream::streaming_types::session_stop_then_resume(session_id),
+            );
+            message.push('\n');
         }
         message.push_str("  No model or tool ran.");
         ui.show_error(&message);
@@ -829,9 +841,45 @@ mod tests {
         assert_eq!(ui.restored_inputs, vec!["list workspaces"]);
         let shown = ui.errors.join("\n");
         assert!(shown.contains("Another run still owns this session"));
-        assert!(shown.contains("astra session cancel sess-active"));
+        let cancel_at = shown
+            .find("astra session cancel sess-active")
+            .expect("cancel command");
+        let resume_at = shown
+            .find("astra --resume sess-active")
+            .expect("resume command");
+        assert!(
+            cancel_at < resume_at,
+            "session cancel leaves the Session cancelled, so resume must follow it"
+        );
         assert!(!shown.contains("invalid_request"));
         assert!(!shown.contains("will be cancelled"));
+    }
+
+    #[test]
+    fn cursor_only_writer_conflict_asks_for_retry_without_cancellation() {
+        let mut state = SessionState::default();
+        let failure = crate::TurnFailure {
+            error: "conflict".into(),
+            partial: crate::PartialTurnData {
+                error_code: Some("session_writer_conflict".into()),
+                error_metadata: Some(serde_json::json!({
+                    "admission_state": "rejected",
+                    "recovery_action": "retry_session",
+                    "session_id": "sess-active"
+                })),
+                admission_rejected: true,
+                ..Default::default()
+            },
+        };
+        let mut ui = crate::tests::TestUi::default();
+
+        report_admission_rejection(&mut state, "list workspaces", &failure, &mut ui);
+
+        let shown = ui.errors.join("\n");
+        assert!(shown.contains("session cursor changed"));
+        assert!(shown.contains("do not cancel"));
+        assert!(!shown.contains("astra session cancel"));
+        assert!(!shown.contains("astra --resume"));
     }
 
     #[test]

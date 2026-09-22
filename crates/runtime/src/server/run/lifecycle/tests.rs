@@ -9,16 +9,32 @@ mod cancellation_db_tests;
 
 #[test]
 fn session_writer_conflict_tells_the_caller_to_wait_or_cancel() {
-    let (status, Json(body)) = session_writer_conflict_response("sess-active");
+    let (status, Json(body)) = session_writer_conflict_response("sess-active", Some(1));
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body.error_code.as_deref(), Some("session_writer_conflict"));
     assert_eq!(
         body.detail,
-        "another run still owns session sess-active; wait for it to finish, or stop it with `astra session cancel sess-active` before sending another message"
+        "another run still owns session sess-active; wait for it to finish, or stop it with `astra session cancel sess-active`, then run `astra --resume sess-active` before sending another message"
     );
     let metadata = body.metadata.expect("writer conflict metadata");
     assert_eq!(metadata["admission_state"], "rejected");
     assert_eq!(metadata["recovery_action"], "wait_or_cancel_session");
+    assert_eq!(metadata["session_id"], "sess-active");
+}
+
+#[test]
+fn cursor_conflict_without_a_live_writer_asks_for_retry() {
+    let (status, Json(body)) = session_writer_conflict_response("sess-active", None);
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body.error_code.as_deref(), Some("session_writer_conflict"));
+    assert_eq!(
+        body.detail,
+        "the canonical session cursor changed before this turn was admitted; retry the message"
+    );
+    assert!(!body.detail.contains("astra session cancel"));
+    let metadata = body.metadata.expect("cursor conflict metadata");
+    assert_eq!(metadata["admission_state"], "rejected");
+    assert_eq!(metadata["recovery_action"], "retry_session");
     assert_eq!(metadata["session_id"], "sess-active");
 }
 
@@ -10087,7 +10103,7 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
             authorized_request("same-session-conflict", &blocked_session),
         )
         .await);
-    let (_, Json(expected_conflict)) = session_writer_conflict_response(&blocked_session);
+    let (_, Json(expected_conflict)) = session_writer_conflict_response(&blocked_session, Some(1));
     assert_eq!(same_session.0, StatusCode::CONFLICT);
     assert_eq!(same_session.1.0.error_code, expected_conflict.error_code);
     assert_eq!(same_session.1.0.detail, expected_conflict.detail);

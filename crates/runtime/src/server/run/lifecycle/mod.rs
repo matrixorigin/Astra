@@ -5802,12 +5802,16 @@ impl AgenticRunLifecycleService {
                         reservation,
                     } => (lease, reservation),
                     astra_services::AcquireWriterAndReserveTurnOutcome::WriterConflict {
+                        active_lease_expires_at_unix_ms,
                         ..
                     } => {
                         if let Ok(distributed_permit) = distributed_result {
                             let _ = distributed_permit.release().await;
                         }
-                        return Err(session_writer_conflict_response(session_id));
+                        return Err(session_writer_conflict_response(
+                            session_id,
+                            active_lease_expires_at_unix_ms,
+                        ));
                     }
                     astra_services::AcquireWriterAndReserveTurnOutcome::ReservationConflict {
                         lease,
