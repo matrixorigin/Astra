@@ -30,7 +30,10 @@ async fn manifest_replay_and_collision_preserve_original_and_tenant_identity() {
     let store = DatabaseContextManifestStore::new(pool.clone());
     let mut original = manifest(&manifest_id, &user, &session, None);
     original.reason = "unknown-reason-for-test".into();
-    let items = vec![item(&session, 1), item(&session, 0)];
+    let mut dropped = item(&session, 1);
+    dropped.included = false;
+    dropped.reason = "budget_exceeded".into();
+    let items = vec![dropped, item(&session, 0)];
     assert_eq!(
         store
             .save_manifest(original.clone(), items.clone())
@@ -73,6 +76,33 @@ async fn manifest_replay_and_collision_preserve_original_and_tenant_identity() {
     .await
     .unwrap();
     assert_eq!(original_items, 2);
+    let persisted = sqlx::query(
+        "SELECT item_order, included, reason FROM context_manifest_items
+         WHERE user_id = ? AND manifest_id = ? ORDER BY item_order",
+    )
+    .bind(&user)
+    .bind(&manifest_id)
+    .fetch_all(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(persisted[0].try_get::<i16, _>("included").unwrap(), 1);
+    assert_eq!(persisted[1].try_get::<i16, _>("included").unwrap(), 0);
+    assert_eq!(
+        persisted[1].try_get::<String, _>("reason").unwrap(),
+        "budget_exceeded"
+    );
+    let dropped_count: i32 = sqlx::query_scalar(
+        "SELECT dropped_count FROM context_manifests WHERE user_id = ? AND manifest_id = ?",
+    )
+    .bind(&user)
+    .bind(&manifest_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        dropped_count, 1,
+        "replay and collision preserve computed dropped count"
+    );
     let changed_items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM context_manifest_items WHERE user_id = ? AND manifest_id = ? AND source_id = 'different-source'")
         .bind(&user).bind(&manifest_id).fetch_one(pool.get()).await.unwrap();
     assert_eq!(changed_items, 0);
@@ -231,6 +261,31 @@ async fn cross_session_artifact_references_replay_once_with_owner_isolation() {
             "only the manifest owner's source artifact is referenced once"
         );
     }
+    sqlx::query(
+        "UPDATE session_artifacts SET status = 'expired', metadata = ?
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(json!({"summary": "persisted owner summary"}).to_string())
+    .bind(&owner)
+    .bind(&source_session)
+    .bind(&artifact_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    let rendered = store
+        .render_artifact_manifest_item(&owner, &source_session, &artifact_id, None)
+        .await
+        .unwrap();
+    assert!(rendered.contains("historical, raw no longer available, summary preserved"));
+    assert!(rendered.contains("persisted owner summary"));
+    let foreign_rendered = store
+        .render_artifact_manifest_item(&foreign, &source_session, &artifact_id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        foreign_rendered, "{}",
+        "equal artifact IDs must not expose another owner's summary or status"
+    );
 }
 
 async fn insert_session(pool: &SharedPool, user_id: &str, session_id: &str) {

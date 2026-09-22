@@ -7,6 +7,13 @@ Context and prompt owns context assembly, prompt-cache stability, dynamic state 
 
 This document defines the target behavior that implementation should converge toward.
 
+Context manifests project observed LLM calls. The retained 8k template supplies
+coarse projection budgets; context assembly owns actual request budgeting.
+Retrieval-stage metadata and compaction invariant queries describe and check
+runtime facts, but do not themselves execute retrieval or compaction. Synthetic
+confidence, expiry, seven-child rendering, and 10GB retrieval assertions are not
+evidence that those policies or execution paths are implemented.
+
 The database-inspired foundation for this design is described in
 [ContextPipe: Database-Inspired Context Assembly for Long-Horizon
 Agents](https://arxiv.org/abs/2609.00749), accepted at

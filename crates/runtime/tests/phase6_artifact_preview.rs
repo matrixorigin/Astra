@@ -7,8 +7,8 @@ use astra_services::{
     DatabaseRunStateStore, DatabaseSessionArtifactStore, DatabaseSessionService,
     DatabaseStateProjectionStore, SessionArtifactContentChunkV1,
     SessionArtifactContentDescriptorV1, SessionArtifactContentStore, SessionArtifactJsonRecord,
-    SessionArtifactStoreError, SessionService, StateItemUpsert, budget_for_turn_intent,
-    build_presigned_artifact_download, expired_artifact_placeholder, runs::ToolOutputBatchItem,
+    SessionArtifactStoreError, SessionService, StateItemUpsert, build_presigned_artifact_download,
+    runs::ToolOutputBatchItem,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -1092,34 +1092,6 @@ async fn l2_55_presigned_download_contains_ttl_and_signature() {
 
 shared_db_test! {
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_56_expired_artifact_renders_historical_placeholder() {
-    let placeholder = expired_artifact_placeholder("artifact-x", Some("row count preserved"));
-    assert!(placeholder.contains("historical, raw no longer available"));
-    assert!(placeholder.contains("summary preserved"));
-    assert!(placeholder.contains("row count preserved"));
-}
-
-}
-
-shared_db_test! {
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_57_benchmark_comparison_expands_tool_previews_from_recent_tail() {
-    let normal = budget_for_turn_intent(Some("normal"));
-    let benchmark = budget_for_turn_intent(Some("benchmark_comparison"));
-    assert!(!normal.flex_applied);
-    assert!(benchmark.flex_applied);
-    assert_eq!(benchmark.budget.tool_previews, 2_500);
-    assert_eq!(benchmark.budget.recent_tail, 1_600);
-    assert_eq!(
-        benchmark.borrowed_from_recent_tail,
-        normal.budget.recent_tail - benchmark.budget.recent_tail
-    );
-}
-
-}
-
-shared_db_test! {
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
 async fn l3_17_s08_dba_audit_large_artifacts_batch_and_gc() {
     let pool = setup_pool().await;
     let (user_id, session_id, run_id) = ids();
@@ -1209,7 +1181,7 @@ async fn l3_17_s08_dba_audit_large_artifacts_batch_and_gc() {
 
 shared_db_test! {
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l3_18_s12_14_day_review_retention_and_benchmark_budget_flex() {
+async fn l3_18_s12_14_day_review_retention() {
     let pool = setup_pool().await;
     let (user_id, session_id, _) = ids();
     insert_session(&pool, &user_id, &session_id).await;
@@ -1275,8 +1247,5 @@ async fn l3_18_s12_14_day_review_retention_and_benchmark_budget_flex() {
     assert_eq!(row.try_get::<i64, _>("long_term_extended").unwrap(), 10);
     assert_eq!(row.try_get::<i64, _>("default_processed").unwrap(), 240);
     assert_eq!(row.try_get::<i64, _>("default_still_active").unwrap(), 0);
-    let budget = budget_for_turn_intent(Some("benchmark_comparison"));
-    assert_eq!(budget.budget.tool_previews, 2_500);
-    assert!(budget.borrowed_from_recent_tail > 0);
 }
 }

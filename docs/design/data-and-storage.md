@@ -60,6 +60,9 @@ Retention is a product contract:
 - Poison records should be isolated.
 - Invalid records should not block later independent facts.
 - Slot/lease semantics must avoid permanent deadlock through expiry or repair.
+- Run mutations retain the deletion-fence → session → execution-slot → run
+  lock order. A caller's exact-owner/session/run locking read also establishes
+  existence; it does not need a separate existence query in that transaction.
 - Data deletion must propagate to derived artifacts.
 
 ## Versioning

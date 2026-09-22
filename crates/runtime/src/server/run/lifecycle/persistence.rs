@@ -532,12 +532,10 @@ impl PostLoopPersistContext {
             .begin()
             .await
             .map_err(|error| error.to_string())?;
-        astra_services::storage::admit_session_scoped_run_write(
+        astra_services::storage::admit_session_execution_write(
             &mut tx,
             &self.session_id,
             &self.user_id,
-            &self.run_id,
-            false,
         )
         .await
         .map_err(|error| format!("terminal trace session admission failed: {error}"))?;
@@ -553,7 +551,12 @@ impl PostLoopPersistContext {
         .fetch_optional(&mut *tx)
         .await
         .map_err(|error| error.to_string())?
-        .ok_or_else(|| "authoritative terminal run disappeared before trace repair".to_string())?;
+        .ok_or_else(|| {
+            format!(
+                "terminal trace session admission failed: {}",
+                sqlx::Error::RowNotFound
+            )
+        })?;
         let status = row
             .try_get::<String, _>("status")
             .map_err(|error| error.to_string())?;
@@ -1126,7 +1129,6 @@ async fn persist_server_loop_canonical_append_inner(
         append.session_id,
         append.user_id,
         append.run_id,
-        false,
     )
     .await
     .map_err(|error| format!("canonical session admission failed: {error}"))?;
@@ -5280,6 +5282,97 @@ mod tests {
             .execute(db)
             .await
             .expect("cleanup core persist agent_sessions");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn terminal_trace_repair_requires_exact_identity_and_generation_not_live_lease() {
+        let pool = setup_pool().await;
+        let db = pool.get();
+        let user = Uuid::new_v4().to_string();
+        let session = Uuid::new_v4().to_string();
+        let other_session = Uuid::new_v4().to_string();
+        let run = Uuid::new_v4().to_string();
+        for sid in [&session, &other_session] {
+            sqlx::query("INSERT INTO agent_sessions (session_id,user_id,title,status,event_count) VALUES (?,?,'trace-repair','active',0)")
+                .bind(sid).bind(&user).execute(db).await.unwrap();
+        }
+        let store = Arc::new(astra_services::runs::DatabaseRunStateStore::new(
+            pool.clone(),
+        ));
+        let engine = crate::server::run::engine::RunEngine::new(store);
+        let authority = engine.start_run(&run, &user, &session).await.unwrap();
+        sqlx::query("UPDATE agent_runs SET status = 'cancelled', owner_lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE user_id = ? AND run_id = ?")
+            .bind(&user).bind(&run).execute(db).await.unwrap();
+        let mut persist = test_post_loop_persist_context(&session, None);
+        persist.shared_pool = Some(pool.clone());
+        persist.user_id = user.clone();
+        persist.expected_owner_generation = Some(authority.owner_generation);
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state
+            .stall
+            .tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                tool_call_id: Some("repair-tool".into()),
+                name: "read_file".into(),
+                ok: true,
+                ..Default::default()
+            });
+        for (sid, rid) in [(&session, "absent-run"), (&other_session, run.as_str())] {
+            persist.session_id = sid.clone();
+            persist.run_id = rid.to_string();
+            assert_eq!(
+                persist
+                    .persist_trace_after_authoritative_terminal(&state, "cancelled")
+                    .await
+                    .unwrap_err(),
+                format!(
+                    "terminal trace session admission failed: {}",
+                    sqlx::Error::RowNotFound
+                )
+            );
+            assert_eq!(assert_session_event_count(db, &user, sid).await, 0);
+        }
+        persist.session_id = session.clone();
+        persist.run_id = run.clone();
+        persist.expected_owner_generation = Some(authority.owner_generation + 1);
+        assert!(
+            persist
+                .persist_trace_after_authoritative_terminal(&state, "cancelled")
+                .await
+                .unwrap_err()
+                .contains("authority mismatch")
+        );
+        assert_eq!(assert_session_event_count(db, &user, &session).await, 0);
+        persist.expected_owner_generation = Some(authority.owner_generation);
+        persist
+            .persist_trace_after_authoritative_terminal(&state, "cancelled")
+            .await
+            .unwrap();
+        let count = assert_session_event_count(db, &user, &session).await;
+        assert!(count > 0);
+        persist
+            .persist_trace_after_authoritative_terminal(&state, "cancelled")
+            .await
+            .unwrap();
+        assert_eq!(assert_session_event_count(db, &user, &session).await, count);
+        for table in [
+            "agent_run_events",
+            "agent_session_execution_slots",
+            "agent_runs",
+        ] {
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE user_id = ? AND run_id = ?"
+            ))
+            .bind(&user)
+            .bind(&run)
+            .execute(db)
+            .await
+            .unwrap();
+        }
+        for sid in [&session, &other_session] {
+            cleanup_core_persist_fixture_for_owner(db, sid, &user).await;
+        }
     }
 
     #[tokio::test]

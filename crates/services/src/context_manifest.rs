@@ -8,23 +8,16 @@ use crate::observation_capture::{
 };
 use astra_core::{SharedPool, matrixone_null_shape_comment, matrixone_statement_with_null_shape};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sqlx::{Connection, MySql, QueryBuilder};
 use thiserror::Error;
 use uuid::Uuid;
 
 pub const BUDGET_V1_8K_TOTAL_CAP: u32 = 7_300;
 pub const BUDGET_V1_8K_PROMPT_CAP: u32 = 8_000;
-pub const DELEGATION_ZONE_CAP: u32 = 1_500;
-pub const DELEGATION_BLOCKER_ZONE_CAP: u32 = DELEGATION_ZONE_CAP * 2;
-pub const DELEGATION_CHILD_FLOOR: u32 = 200;
-pub const RECENT_TAIL_BLOCKER_FLOOR: u32 = 1_600;
 pub const BENCHMARK_TOOL_PREVIEW_BUDGET: u32 = 2_500;
 pub const RECENT_TAIL_BENCHMARK_FLOOR: u32 = 1_600;
 pub const SYSTEM_TOOL_SCHEMAS_MAX: u32 = 3_400;
 pub const TURN_INTENT_BENCHMARK_COMPARISON: &str = "benchmark_comparison";
-pub const DELEGATION_MAX_RENDERED_CHILDREN: usize =
-    (DELEGATION_ZONE_CAP / DELEGATION_CHILD_FLOOR) as usize;
 pub const SESSION_ARTIFACT_STATUS_EXPIRED: &str = "expired";
 
 /// Keep one manifest write bounded even when a future context assembler emits
@@ -187,141 +180,6 @@ pub fn budget_for_turn_intent(turn_intent: Option<&str>) -> TurnIntentBudgetAllo
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DelegationBudget {
-    pub active_children: usize,
-    pub rendered_children: usize,
-    pub overflow_children: usize,
-    pub per_child_budget: u32,
-    pub rendered_total: u32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DelegationBudgetAllocation {
-    pub child_budget: DelegationBudget,
-    pub requested_delegation_zone_budget: u32,
-    pub delegation_zone_budget: u32,
-    pub recent_tail_budget: u32,
-    pub borrowed_from_recent_tail: u32,
-    pub unfunded_blocker_tokens: u32,
-    pub blocker_active: bool,
-}
-
-pub fn delegation_budget(active_children: usize) -> DelegationBudget {
-    if active_children == 0 {
-        return DelegationBudget {
-            active_children,
-            rendered_children: 0,
-            overflow_children: 0,
-            per_child_budget: 0,
-            rendered_total: 0,
-        };
-    }
-    let rendered_children = active_children.min(DELEGATION_MAX_RENDERED_CHILDREN);
-    let per_child_budget =
-        DELEGATION_CHILD_FLOOR.max(DELEGATION_ZONE_CAP / rendered_children as u32);
-    DelegationBudget {
-        active_children,
-        rendered_children,
-        overflow_children: active_children.saturating_sub(rendered_children),
-        per_child_budget,
-        rendered_total: per_child_budget * rendered_children as u32,
-    }
-}
-
-pub fn delegation_budget_allocation(
-    active_children: usize,
-    blocker_children: usize,
-) -> DelegationBudgetAllocation {
-    let base = BudgetV1_8k::standard();
-    let blocker_active = blocker_children > 0;
-    let requested = if blocker_active {
-        DELEGATION_BLOCKER_ZONE_CAP
-    } else {
-        DELEGATION_ZONE_CAP
-    };
-    let borrowable = base.recent_tail.saturating_sub(RECENT_TAIL_BLOCKER_FLOOR);
-    let needed = requested.saturating_sub(DELEGATION_ZONE_CAP);
-    let borrowed = if blocker_active {
-        borrowable.min(needed)
-    } else {
-        0
-    };
-    let effective_cap = DELEGATION_ZONE_CAP + borrowed;
-    let rendered_children = if active_children == 0 {
-        0
-    } else {
-        active_children.min((effective_cap / DELEGATION_CHILD_FLOOR) as usize)
-    };
-    let child_budget = if rendered_children == 0 {
-        DelegationBudget {
-            active_children,
-            rendered_children: 0,
-            overflow_children: active_children,
-            per_child_budget: 0,
-            rendered_total: 0,
-        }
-    } else {
-        let per_child_budget = DELEGATION_CHILD_FLOOR.max(effective_cap / rendered_children as u32);
-        DelegationBudget {
-            active_children,
-            rendered_children,
-            overflow_children: active_children.saturating_sub(rendered_children),
-            per_child_budget,
-            rendered_total: per_child_budget * rendered_children as u32,
-        }
-    };
-    DelegationBudgetAllocation {
-        child_budget,
-        requested_delegation_zone_budget: requested,
-        delegation_zone_budget: effective_cap,
-        recent_tail_budget: base.recent_tail.saturating_sub(borrowed),
-        borrowed_from_recent_tail: borrowed,
-        unfunded_blocker_tokens: requested.saturating_sub(effective_cap),
-        blocker_active,
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ConfidenceAction {
-    AutoAccept,
-    AskUser,
-    Reject,
-}
-
-pub fn next_action_confidence_action(
-    confidence: f32,
-    ask_user_count_1h: u32,
-    source: &str,
-    provenance_event_id: Option<&str>,
-) -> ConfidenceAction {
-    if source == "small_model" && provenance_event_id.is_none() {
-        return ConfidenceAction::AskUser;
-    }
-    let fatigue_downgrade_allowed = matches!(source, "structured_event" | "rule");
-    let adjusted = if fatigue_downgrade_allowed && ask_user_count_1h >= 3 {
-        confidence - 0.1
-    } else {
-        confidence
-    };
-    if adjusted >= 0.8 {
-        ConfidenceAction::AutoAccept
-    } else if adjusted >= 0.5 {
-        ConfidenceAction::AskUser
-    } else {
-        ConfidenceAction::Reject
-    }
-}
-
-pub fn suggested_next_action_expires_at(kind: &str, now: chrono::DateTime<chrono::Utc>) -> String {
-    let expires = match kind {
-        "approval" => now + chrono::Duration::hours(24),
-        "todo" => now + chrono::Duration::days(7),
-        _ => now + chrono::Duration::hours(1),
-    };
-    expires.to_rfc3339()
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RetrievalStage {
     Structured,
     Fts,
@@ -350,29 +208,6 @@ impl RetrievalStage {
             RetrievalStage::Structured => Some(RetrievalStage::Fts),
             RetrievalStage::Fts => Some(RetrievalStage::Vector),
             RetrievalStage::Vector => None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RenderMode {
-    PlainText,
-    Markdown,
-    CodeBlockPreserved,
-    ToolPreview,
-    Summary,
-    ReferenceOnly,
-}
-
-impl RenderMode {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            RenderMode::PlainText => "plain_text",
-            RenderMode::Markdown => "markdown",
-            RenderMode::CodeBlockPreserved => "code_block_preserved",
-            RenderMode::ToolPreview => "tool_preview",
-            RenderMode::Summary => "summary",
-            RenderMode::ReferenceOnly => "reference_only",
         }
     }
 }
@@ -429,8 +264,6 @@ pub enum ContextManifestError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("cross-session retrieval missing user_id filter")]
-    CrossSessionAuthMissing,
     #[error("session is not active: owner={user_id}, session={session_id}")]
     SessionNotActive { user_id: String, session_id: String },
 }
@@ -978,15 +811,6 @@ fn context_manifest_item_nullable_shape(item: &ContextManifestItemWrite) -> [boo
     [item.source_hash.is_some(), item.raw_ref.is_some()]
 }
 
-pub fn content_hash_with_normalize_version(
-    content_hash: &str,
-    normalize_version: Option<&str>,
-) -> String {
-    let version = normalize_version.unwrap_or("raw_v1");
-    let digest = Sha256::digest(format!("{content_hash}|{version}").as_bytes());
-    format!("sha256:{digest:x}")
-}
-
 pub fn expired_artifact_placeholder(artifact_id: &str, summary: Option<&str>) -> String {
     match summary.filter(|value| !value.trim().is_empty()) {
         Some(summary) => format!(
@@ -1064,19 +888,71 @@ fn aggregate_artifact_references(
     references
 }
 
-pub fn cross_session_retrieval_requires_user_filter(
-    user_id_filter: Option<&str>,
-) -> Result<(), ContextManifestError> {
-    if user_id_filter.is_some_and(|value| !value.trim().is_empty()) {
-        Ok(())
-    } else {
-        Err(ContextManifestError::CrossSessionAuthMissing)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retrieval_stage_metadata_is_stable() {
+        for (stage, timeout, event, next) in [
+            (
+                RetrievalStage::Structured,
+                50,
+                "retrieval.structured_stale",
+                Some(RetrievalStage::Fts),
+            ),
+            (
+                RetrievalStage::Fts,
+                200,
+                "retrieval.fts_stale",
+                Some(RetrievalStage::Vector),
+            ),
+            (RetrievalStage::Vector, 500, "retrieval.vector_stale", None),
+        ] {
+            assert_eq!(stage.timeout_ms(), timeout);
+            assert_eq!(stage.event_type("stale"), event);
+            assert_eq!(stage.next_stage(), next);
+        }
+    }
+
+    #[test]
+    fn projection_budget_preserves_normal_and_benchmark_caps() {
+        let standard = BudgetV1_8k::standard();
+        assert_eq!(
+            (standard.anchor, standard.plan_todo, standard.recent_tail),
+            (200, 400, 2000)
+        );
+        assert_eq!(
+            (standard.summary, standard.retrieved, standard.tool_previews),
+            (500, 1000, 500)
+        );
+        assert_eq!(standard.system_tool_schemas, 3400);
+        assert_eq!(
+            (standard.reserved_output, standard.safety_buffer),
+            (500, 200)
+        );
+        for intent in [None, Some("normal"), Some("unknown")] {
+            let normal = budget_for_turn_intent(intent);
+            assert_eq!(normal.budget, standard);
+            assert!(!normal.flex_applied);
+            assert_eq!(normal.borrowed_from_recent_tail, 0);
+        }
+        let benchmark = budget_for_turn_intent(Some(TURN_INTENT_BENCHMARK_COMPARISON));
+        assert!(benchmark.flex_applied);
+        assert_eq!(
+            benchmark.budget.tool_previews,
+            BENCHMARK_TOOL_PREVIEW_BUDGET
+        );
+        assert_eq!(benchmark.budget.recent_tail, RECENT_TAIL_BENCHMARK_FLOOR);
+        assert_eq!(
+            benchmark.borrowed_from_recent_tail,
+            standard.recent_tail - benchmark.budget.recent_tail
+        );
+        for budget in [standard, benchmark.budget] {
+            assert_eq!(budget.prompt_cap(), BUDGET_V1_8K_PROMPT_CAP);
+            assert_eq!(budget.input_context_cap(), BUDGET_V1_8K_TOTAL_CAP);
+        }
+    }
 
     #[test]
     fn context_manifest_session_admission_only_reclassifies_row_not_found() {

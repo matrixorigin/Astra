@@ -7,10 +7,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::CancellationSafePoolConnection;
-use crate::context_manifest::{
-    BudgetV1_8k, ContextManifestItemWrite, ContextManifestWrite, DatabaseContextManifestStore,
-    artifact_id_from_raw_ref,
-};
+use crate::context_manifest::artifact_id_from_raw_ref;
 use crate::db_row::RowExt as StateProjectionDbRow;
 
 pub const PROTECTED_COMPACTION_CATEGORIES: &[&str] = &[
@@ -190,13 +187,6 @@ pub enum StateProjectionError {
         value: String,
         reason: &'static str,
     },
-    #[error("session {session_id} has active run count {active_count}; compaction rejected")]
-    ActiveRunCompaction {
-        session_id: String,
-        active_count: i64,
-    },
-    #[error("compaction invariant failed: {id} violations={violations}")]
-    CompactionInvariantFailed { id: String, violations: i64 },
     #[error("session is not active: owner={user_id}, session={session_id}")]
     SessionNotActive { user_id: String, session_id: String },
     #[error(
@@ -464,41 +454,6 @@ impl DatabaseStateProjectionStore {
         Self { pool }
     }
 
-    /// Check whether the session can be compacted (no active runs).
-    pub async fn can_compact_session(
-        &self,
-        user_id: &str,
-        session_id: &str,
-    ) -> Result<(), StateProjectionError> {
-        let row = sqlx::query(
-            "SELECT COUNT(*) AS active_count FROM agent_runs \
-             WHERE user_id = ? AND session_id = ? AND status IN ('running', 'waiting')",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .fetch_one(self.pool.get())
-        .await
-        .map_err(|source| StateProjectionError::Database {
-            operation: "can_compact_session",
-            entity: session_id.to_string(),
-            source,
-        })?;
-        let active_count = state_projection_row_non_negative_i64(
-            &row,
-            "can_compact_session",
-            session_id,
-            "active_count",
-        )?;
-        if active_count == 0 {
-            Ok(())
-        } else {
-            Err(StateProjectionError::ActiveRunCompaction {
-                session_id: session_id.to_string(),
-                active_count,
-            })
-        }
-    }
-
     pub async fn run_compaction_assertions(
         &self,
         user_id: &str,
@@ -533,128 +488,6 @@ impl DatabaseStateProjectionStore {
             out.push((invariant_id, violations));
         }
         Ok(out)
-    }
-
-    pub async fn compact_session_state(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        compaction_run_id: &str,
-        plan_todo_tokens: u32,
-    ) -> Result<Vec<(String, i64)>, StateProjectionError> {
-        self.can_compact_session(user_id, session_id).await?;
-        let budget = BudgetV1_8k::standard();
-        let manifest_id = format!("manifest-{}", Uuid::new_v4());
-        let manifest = ContextManifestWrite {
-            manifest_id: manifest_id.clone(),
-            user_id: user_id.to_string(),
-            session_id: session_id.to_string(),
-            run_id: Some(compaction_run_id.to_string()),
-            turn_id: format!("{compaction_run_id}:compaction"),
-            model_provider: "runtime".to_string(),
-            model_name: "compaction_engine".to_string(),
-            context_window_tokens: 8_000,
-            max_output_tokens: budget.reserved_output,
-            total_estimated_tokens: plan_todo_tokens.min(800),
-            policy_version: "context_manifest_v1".to_string(),
-            tokenizer_id: Some("estimated_v1".to_string()),
-            budget_template_id: Some("budget_v1_8k".to_string()),
-            turn_intent: Some("compaction".to_string()),
-            reason: "post_compaction".to_string(),
-            manifest_json: json!({
-                "source": "phase4_compaction_engine",
-                "invariants": COMPACTION_INVARIANT_SQL.iter().map(|i| i.id).collect::<Vec<_>>(),
-                "zones": {
-                    "plan_todo": {"used_tokens": plan_todo_tokens.min(800), "budget_tokens": 800}
-                }
-            }),
-        };
-        let items = vec![ContextManifestItemWrite {
-            session_id: session_id.to_string(),
-            item_order: 0,
-            zone: "plan_todo".to_string(),
-            source_table: "session_state_items".to_string(),
-            source_id: format!("{session_id}:plan_todo"),
-            source_hash: None,
-            included: true,
-            token_estimate: plan_todo_tokens.min(800),
-            budget_tokens: 800,
-            reason: "post_compaction".to_string(),
-            render_mode: "summary".to_string(),
-            raw_ref: Some(format!(
-                "conversation_log://{session_id}/compaction@{manifest_id}"
-            )),
-        }];
-        let capture = DatabaseContextManifestStore::new(self.pool.clone())
-            .save_manifest(manifest, items)
-            .await
-            .map_err(|source| StateProjectionError::Database {
-                operation: "save_post_compaction_manifest",
-                entity: session_id.to_string(),
-                source: match source {
-                    crate::context_manifest::ContextManifestError::Database { source, .. } => {
-                        source
-                    }
-                    other => sqlx::Error::Protocol(other.to_string()),
-                },
-            })?;
-        if matches!(
-            capture,
-            crate::observation_capture::DurableCaptureOutcome::Collision { .. }
-        ) {
-            return Err(StateProjectionError::Database {
-                operation: "save_post_compaction_manifest",
-                entity: session_id.to_string(),
-                source: sqlx::Error::Protocol("context manifest identity collision".into()),
-            });
-        }
-        self.upsert_state_item(StateItemUpsert {
-            item_id: Some(bounded_state_item_id(
-                "summary",
-                &[session_id, compaction_run_id],
-            )),
-            user_id: user_id.to_string(),
-            session_id: session_id.to_string(),
-            scope: "session".to_string(),
-            category: "summary".to_string(),
-            item_key: format!("compaction:{compaction_run_id}"),
-            status: "active".to_string(),
-            priority: 40,
-            source: "compaction_engine".to_string(),
-            provenance_event_id: None,
-            run_id: Some(compaction_run_id.to_string()),
-            title: Some("Post-compaction summary".to_string()),
-            summary_text: Some(format!(
-                "Post-compaction plan/todo skeleton retained within {} tokens",
-                plan_todo_tokens.min(800)
-            )),
-            payload_json: json!({
-                "reason": "post_compaction",
-                "plan_todo_tokens": plan_todo_tokens.min(800),
-                "source_manifest_run_id": compaction_run_id,
-            }),
-            token_estimate: 120,
-            mutation: "insert".to_string(),
-        })
-        .await?;
-
-        // A local-only advisory lock would not serialize against run starts
-        // unless every run-start path acquired the same lock. Re-check the DB
-        // invariant instead of silently accepting stale compaction output.
-        self.can_compact_session(user_id, session_id).await?;
-
-        let results = self
-            .run_compaction_assertions(user_id, session_id, compaction_run_id)
-            .await?;
-        for (id, violations) in &results {
-            if *violations != 0 {
-                return Err(StateProjectionError::CompactionInvariantFailed {
-                    id: id.clone(),
-                    violations: *violations,
-                });
-            }
-        }
-        Ok(results)
     }
 
     pub async fn upsert_state_item(
@@ -1784,8 +1617,7 @@ mod tests {
                 return Ok(*value);
             }
             Ok(match column {
-                "active_count" => 1,
-                "violations" => 0,
+                "violations" => 1,
                 "token_estimate" => 42,
                 "depth" => 2,
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
@@ -1913,30 +1745,30 @@ mod tests {
         assert_eq!(
             state_projection_row_non_negative_i64(
                 &FakeStateProjectionRow::complete(),
-                "can_compact_session",
+                "run_compaction_invariant",
                 "session-1",
-                "active_count",
+                "violations",
             )
-            .expect("active_count decodes"),
+            .expect("violations decodes"),
             1
         );
         assert_database_error_mentions(
             state_projection_row_non_negative_i64(
-                &FakeStateProjectionRow::fail_on("active_count"),
-                "can_compact_session",
+                &FakeStateProjectionRow::fail_on("violations"),
+                "run_compaction_invariant",
                 "session-1",
-                "active_count",
+                "violations",
             ),
-            "active_count",
+            "violations",
         );
         assert_invalid_database_value(
             state_projection_row_non_negative_i64(
-                &FakeStateProjectionRow::with_i64("active_count", -1),
-                "can_compact_session",
+                &FakeStateProjectionRow::with_i64("violations", -1),
+                "run_compaction_invariant",
                 "session-1",
-                "active_count",
+                "violations",
             ),
-            "active_count",
+            "violations",
         );
     }
 

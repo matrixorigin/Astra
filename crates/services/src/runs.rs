@@ -2035,17 +2035,9 @@ async fn load_run_metadata_for_exact_session_tx<T>(
 where
     T: TransactionConnection,
 {
-    match crate::storage::admit_session_scoped_run_write(
-        tx,
-        expected_session_id,
-        user_id,
-        run_id,
-        false,
-    )
-    .await
-    {
-        Ok(true) => {}
-        Ok(false) | Err(sqlx::Error::RowNotFound) => return Ok(None),
+    match crate::storage::admit_session_execution_write(tx, expected_session_id, user_id).await {
+        Ok(()) => {}
+        Err(sqlx::Error::RowNotFound) => return Ok(None),
         Err(source) => {
             return Err(db_error("admit_session_scoped_run_write", run_id, source));
         }
@@ -3849,17 +3841,15 @@ pub(crate) async fn admit_run_action_in_existing_transaction(
         return Err("transactional action admission requires an owner pod id".to_string());
     }
     let expected_owner_generation = database_action_owner_generation(request)?;
-    match crate::storage::admit_session_scoped_run_write(
+    match crate::storage::admit_session_execution_write(
         tx,
         request.expected_session_id,
         request.user_id,
-        request.run_id,
-        false,
     )
     .await
     {
-        Ok(true) => {}
-        Ok(false) | Err(sqlx::Error::RowNotFound) => {
+        Ok(()) => {}
+        Err(sqlx::Error::RowNotFound) => {
             return Ok(TransactionalRunActionAdmission::Missing);
         }
         Err(source) => {
@@ -13388,22 +13378,19 @@ impl DatabaseRunStateStore {
             .begin()
             .await
             .map_err(|source| db_error("insert_run_begin", &record.run_id, source).to_string())?;
-        let (_, execution_admission_facts) =
-            crate::storage::admit_session_scoped_run_write_with_facts(
-                &mut tx,
-                &record.session_id,
-                &record.user_id,
-                &record.run_id,
-                true,
-            )
-            .await
-            .map_err(|source| {
-                if matches!(source, sqlx::Error::RowNotFound) {
-                    "session is not active".to_string()
-                } else {
-                    db_error("insert_run_session_admission", &record.run_id, source).to_string()
-                }
-            })?;
+        let execution_admission_facts = crate::storage::admit_session_execution_write_with_facts(
+            &mut tx,
+            &record.session_id,
+            &record.user_id,
+        )
+        .await
+        .map_err(|source| {
+            if matches!(source, sqlx::Error::RowNotFound) {
+                "session is not active".to_string()
+            } else {
+                db_error("insert_run_session_admission", &record.run_id, source).to_string()
+            }
+        })?;
         let existing_session: Option<String> = sqlx::query_scalar(
             "SELECT session_id FROM agent_runs WHERE user_id = ? AND run_id = ? LIMIT 1 FOR UPDATE",
         )
@@ -25876,6 +25863,26 @@ mod tests {
         assert_eq!(snapshot.applied.unwrap().selection, selected);
         assert!(
             store
+                .permission_mode_snapshot(&user, &session, "absent-run")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        sqlx::query("UPDATE agent_runs SET depth = 1 WHERE user_id = ? AND run_id = ?")
+            .bind(&user)
+            .bind(&id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .permission_mode_snapshot(&user, &session, &id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
                 .permission_mode_snapshot("other", &session, &id)
                 .await
                 .unwrap()
@@ -31382,6 +31389,38 @@ mod tests {
                 bound_session_id: session_a.clone()
             }
         );
+        assert!(
+            store
+                .permission_mode_snapshot(&user_id, &session_b, &run_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut tx = pool.get().begin().await.unwrap();
+        assert!(
+            load_run_metadata_for_exact_session_tx(&mut tx, &user_id, &session_b, &run_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            admit_run_action_in_existing_transaction(
+                &mut tx,
+                AtomicRunActionAdmissionRequest {
+                    user_id: &user_id,
+                    run_id: &run_id,
+                    expected_session_id: &session_b,
+                    action_id: "wrong-session-action",
+                    expected_control_epoch: -1,
+                    expected_owner_generation: 1,
+                },
+                &store.owner_pod_id,
+            )
+            .await
+            .unwrap(),
+            TransactionalRunActionAdmission::Missing
+        ));
+        tx.rollback().await.unwrap();
         let after: (String, String, i64, String) = sqlx::query_as(
             "SELECT session_id, status, last_event_idx,
                     DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s.%f')

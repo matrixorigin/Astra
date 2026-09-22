@@ -2167,26 +2167,21 @@ async fn lock_invocation_scope_authority(
                     "run-scoped inference requires exact durable execution authority",
                 )
             })?;
-            let run_exists = match crate::storage::admit_session_scoped_run_write(
-                tx,
-                session_id,
-                &input.user_id,
-                run_id,
-                false,
-            )
-            .await
-            {
-                Ok(run_exists) => run_exists,
-                Err(sqlx::Error::RowNotFound) => false,
-                Err(error) => {
-                    return Err(ServiceError::with_source(
-                        ServiceErrorKind::Persistence,
-                        "lock canonical inference session/run scope",
-                        error,
-                    ));
-                }
-            };
-            if !run_exists {
+            let scope_admitted =
+                match crate::storage::admit_session_execution_write(tx, session_id, &input.user_id)
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(sqlx::Error::RowNotFound) => false,
+                    Err(error) => {
+                        return Err(ServiceError::with_source(
+                            ServiceErrorKind::Persistence,
+                            "lock canonical inference session/run scope",
+                            error,
+                        ));
+                    }
+                };
+            if !scope_admitted {
                 InvocationScopeAuthority::Unavailable
             } else {
                 let row = sqlx::query(

@@ -348,13 +348,9 @@ impl DatabaseRunStateStore {
         // This hot round-boundary lookup must not fetch checkpoint_json or
         // hydrate the run history. Retain the canonical session/run ownership
         // fence, then read only the root marker and two indexed event rows.
-        match crate::storage::admit_session_scoped_run_write(
-            &mut tx, session_id, user_id, run_id, false,
-        )
-        .await
-        {
-            Ok(true) => {}
-            Ok(false) | Err(sqlx::Error::RowNotFound) => {
+        match crate::storage::admit_session_execution_write(&mut tx, session_id, user_id).await {
+            Ok(()) => {}
+            Err(sqlx::Error::RowNotFound) => {
                 tx.rollback().await.map_err(|e| e.to_string())?;
                 connection.release();
                 return Ok(None);
@@ -362,7 +358,7 @@ impl DatabaseRunStateStore {
             Err(error) => return Err(error.to_string()),
         }
         let root: Option<i32> = sqlx::query_scalar(
-            "SELECT 1 FROM agent_runs WHERE user_id=? AND session_id=? AND run_id=? AND depth=0 LIMIT 1",
+            "SELECT 1 FROM agent_runs WHERE user_id=? AND session_id=? AND run_id=? AND depth=0 LIMIT 1 FOR UPDATE",
         ).bind(user_id).bind(session_id).bind(run_id).fetch_optional(&mut *tx).await.map_err(|e|e.to_string())?;
         if root.is_none() {
             tx.rollback().await.map_err(|e| e.to_string())?;

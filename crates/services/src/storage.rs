@@ -1192,36 +1192,19 @@ where
     })
 }
 
-/// Admit the session and execution slot before locking an exact run.
-/// `allow_missing_run` is reserved for run creation.
+/// Admit a session/slot and require an exact run when the caller has no
+/// authoritative run lookup of its own. Callers that read the run should use
+/// session/execution admission followed by that locking read, not both.
 pub async fn admit_session_scoped_run_write<T>(
     tx: &mut T,
     session_id: &str,
     user_id: &str,
     run_id: &str,
-    allow_missing_run: bool,
-) -> Result<bool, sqlx::Error>
+) -> Result<(), sqlx::Error>
 where
     T: TransactionConnection,
 {
-    admit_session_scoped_run_write_with_facts(tx, session_id, user_id, run_id, allow_missing_run)
-        .await
-        .map(|(run_exists, _)| run_exists)
-}
-
-/// Admit a session-scoped run and return the already-locked execution facts
-/// for callers that immediately mutate the same run/slot.
-pub(crate) async fn admit_session_scoped_run_write_with_facts<T>(
-    tx: &mut T,
-    session_id: &str,
-    user_id: &str,
-    run_id: &str,
-    allow_missing_run: bool,
-) -> Result<(bool, SessionExecutionAdmissionFacts), sqlx::Error>
-where
-    T: TransactionConnection,
-{
-    let facts = admit_session_execution_write_with_facts(tx, session_id, user_id).await?;
+    admit_session_execution_write(tx, session_id, user_id).await?;
     let run_exists: Option<i32> = query_scalar(
         "SELECT 1 FROM agent_runs
          WHERE user_id = ? AND session_id = ? AND run_id = ? LIMIT 1 FOR UPDATE",
@@ -1231,10 +1214,10 @@ where
     .bind(run_id)
     .fetch_optional(&mut **tx)
     .await?;
-    if run_exists.is_none() && !allow_missing_run {
+    if run_exists.is_none() {
         return Err(sqlx::Error::RowNotFound);
     }
-    Ok((run_exists.is_some(), facts))
+    Ok(())
 }
 
 pub async fn agent_event_exists_for_user_session<'e, E>(
