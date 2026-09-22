@@ -1132,6 +1132,7 @@ async fn superseded_payload_owner_can_terminalize_after_its_child_becomes_head()
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
 async fn canonical_transition_wal_is_linear_and_recoverable_across_many_rounds() {
+    let started = std::time::Instant::now();
     let (shared_pool, _) = common::setup_pool_and_settings().await;
     let pool = shared_pool.get();
     let suffix = Uuid::new_v4().simple().to_string();
@@ -1142,12 +1143,19 @@ async fn canonical_transition_wal_is_linear_and_recoverable_across_many_rounds()
 
     let durable_base = astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&[])
         .expect("empty durable base");
-    const ROUNDS: u32 = 300;
+    // Keep the full 300-round workload explicitly reproducible, while the
+    // ordinary DB contract checks the same retry/CAS/recovery invariants on a
+    // short chain. Offline transition tests also cover 256-entry linear growth.
+    let rounds: u32 = if std::env::var("ASTRA_TEST_STORAGE_SCALE").as_deref() == Ok("1") {
+        300
+    } else {
+        32
+    };
     let mut history = Vec::new();
     let mut parent_transition_id = None;
     let mut parent_result = None;
     let mut first_retry_attempt_id = None;
-    for round in 0..ROUNDS {
+    for round in 0..rounds {
         let recovery_delta = if round > 0 {
             let provider_response = serde_json::json!({
                 "role": "assistant",
@@ -1234,7 +1242,7 @@ async fn canonical_transition_wal_is_linear_and_recoverable_across_many_rounds()
         &user_id,
         &session_id,
         &run_id,
-        ROUNDS,
+        rounds,
         "canonical_head_stale_parent",
     ))
     .expect("plan stale-parent invocation");
@@ -1284,7 +1292,7 @@ async fn canonical_transition_wal_is_linear_and_recoverable_across_many_rounds()
     .fetch_all(pool)
     .await
     .expect("measure bounded canonical WAL");
-    assert_eq!(wal_payload_bytes.len(), ROUNDS as usize);
+    assert_eq!(wal_payload_bytes.len(), rounds as usize);
     let minimum = wal_payload_bytes.iter().skip(1).copied().min().unwrap();
     let maximum = wal_payload_bytes.iter().skip(1).copied().max().unwrap();
     let total = wal_payload_bytes.iter().copied().sum::<i64>();
@@ -1293,7 +1301,7 @@ async fn canonical_transition_wal_is_linear_and_recoverable_across_many_rounds()
         "each linked entry must stay proportional to its own append"
     );
     assert!(
-        total <= i64::from(ROUNDS) * 2_048,
+        total <= i64::from(rounds) * 2_048,
         "total WAL bytes must grow linearly with the number of fixed-size appends"
     );
     let attempts: i64 = sqlx::query_scalar(
@@ -1305,7 +1313,7 @@ async fn canonical_transition_wal_is_linear_and_recoverable_across_many_rounds()
     .fetch_one(pool)
     .await
     .expect("count canonical audit rows");
-    assert_eq!(attempts, i64::from(ROUNDS) + 1);
+    assert_eq!(attempts, i64::from(rounds) + 1);
     let root_owner = sqlx::query(
         "SELECT attempt_id, physical_attempt
          FROM inference_canonical_transition_wal
@@ -1328,7 +1336,7 @@ async fn canonical_transition_wal_is_linear_and_recoverable_across_many_rounds()
             .await
             .expect("load the canonical WAL chain");
     assert_eq!(receipts.len(), 1);
-    assert_eq!(receipts[0].transitions.len(), ROUNDS as usize);
+    assert_eq!(receipts[0].transitions.len(), rounds as usize);
     assert_eq!(
         receipts[0]
             .transitions
@@ -1359,6 +1367,122 @@ async fn canonical_transition_wal_is_linear_and_recoverable_across_many_rounds()
     .expect("count retired canonical heads");
     assert_eq!(heads, 0);
     cleanup(pool, &user_id, &session_id, &run_id).await;
+    eprintln!(
+        "canonical WAL: {rounds} rounds, {total} payload bytes, {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn request_context_overflow_prunes_oldest_pairs_only_after_the_limit() {
+    let (shared, _) = common::setup_pool_and_settings().await;
+    let pool = shared.get();
+    let user = Uuid::new_v4().to_string();
+    let foreign_user = Uuid::new_v4().to_string();
+    let session = Uuid::new_v4().to_string();
+    let other_session = Uuid::new_v4().to_string();
+    let run = Uuid::new_v4().to_string();
+    seed_run(pool, &user, &session, &run).await;
+    // 1,023 complete pairs; seed in batches instead of issuing 2,046 writes.
+    // Foreign owner/session rows must neither trigger nor participate in pruning.
+    let mut rows = Vec::new();
+    for (owner, sid, pairs) in [
+        (&user, &session, 1023),
+        (&foreign_user, &session, 1),
+        (&user, &other_session, 1),
+    ] {
+        for pair in 0..pairs {
+            for stage in ["accepted", "terminal"] {
+                rows.push((
+                    owner,
+                    sid,
+                    format!("{sid}-{pair:04}-{stage}"),
+                    format!("{sid}-{pair:04}"),
+                    stage,
+                ));
+            }
+        }
+    }
+    for chunk in rows.chunks(128) {
+        let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "INSERT INTO model_request_context_events (user_id, session_id, event_id, attempt_id, invocation_id, event_stage, terminal_status, topology, provider, model_family, purpose, event_json, created_at) ",
+        );
+        insert.push_values(chunk, |mut row, (owner, sid, event, attempt, stage)| {
+            row.push_bind(owner)
+                .push_bind(sid)
+                .push_bind(event)
+                .push_bind(attempt)
+                .push("'retention-fixture'")
+                .push_bind(stage)
+                .push(if *stage == "terminal" {
+                    "'cancelled'"
+                } else {
+                    "NULL"
+                })
+                .push("'server_only'")
+                .push("'openai'")
+                .push("'test'")
+                .push("'primary_agent'")
+                .push("'{}'")
+                .push("DATE_SUB(NOW(6), INTERVAL 1 MINUTE)");
+        });
+        insert.build().execute(pool).await.unwrap();
+    }
+    for (round, expected) in [(0, 2048_i64), (1, 1538)] {
+        let plan = plan_inference_invocation(run_input(
+            &user,
+            &session,
+            &run,
+            round,
+            "retention-boundary",
+        ))
+        .unwrap();
+        let attempt = provider_attempt(&plan, 0);
+        admit_inference_invocation_with_first_provider_attempt(&shared, &plan, &attempt)
+            .await
+            .unwrap();
+        let terminal = InferenceInvocationTerminal {
+            status: InferenceTerminalStatus::Cancelled,
+            usage: InferenceUsage::default(),
+            usage_status: InferenceUsageStatus::Unavailable,
+            provider_response_id: None,
+            error_kind: None,
+            error_message: None,
+        };
+        finish_inference_provider_attempt(&shared, &attempt, &terminal)
+            .await
+            .unwrap();
+        finish_inference_invocation(&shared, &plan, &terminal)
+            .await
+            .unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_request_context_events WHERE user_id = ? AND session_id = ?")
+            .bind(&user).bind(&session).fetch_one(pool).await.unwrap();
+        assert_eq!(count, expected, "round {round}: exact limit vs overflow");
+        let current: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_request_context_events WHERE user_id = ? AND attempt_id = ?")
+            .bind(&user).bind(attempt.attempt_id()).fetch_one(pool).await.unwrap();
+        assert_eq!(current, 2, "newest pair survives");
+    }
+    let oldest: String = sqlx::query_scalar("SELECT MIN(attempt_id) FROM model_request_context_events WHERE user_id = ? AND session_id = ? AND invocation_id = 'retention-fixture'")
+        .bind(&user).bind(&session).fetch_one(pool).await.unwrap();
+    assert_eq!(oldest, format!("{session}-0256"));
+    let split: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM (SELECT attempt_id FROM model_request_context_events WHERE user_id = ? AND session_id = ? GROUP BY attempt_id HAVING COUNT(*) <> 2) AS incomplete")
+        .bind(&user).bind(&session).fetch_one(pool).await.unwrap();
+    assert_eq!(split, 0, "compaction never splits a complete pair");
+    for (owner, sid) in [(&foreign_user, &session), (&user, &other_session)] {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_request_context_events WHERE user_id = ? AND session_id = ?")
+            .bind(owner).bind(sid).fetch_one(pool).await.unwrap();
+        assert_eq!(count, 2);
+        sqlx::query(
+            "DELETE FROM model_request_context_events WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(owner)
+        .bind(sid)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    cleanup(pool, &user, &session, &run).await;
 }
 
 #[tokio::test]

@@ -4,7 +4,7 @@ use crate::CancellationSafePoolConnection;
 use crate::db_row::RowExt as ContextManifestDbRow;
 use crate::observation_capture::{
     DurableCaptureOutcome, ObservationCollisionReceipt, ObservationPayloadDomain,
-    canonical_observation_payload_hash, classify_capture, record_observation_collision,
+    canonical_observation_payload_hash, classify_capture, record_observation_collisions,
 };
 use astra_core::{SharedPool, matrixone_null_shape_comment, matrixone_statement_with_null_shape};
 use serde::{Deserialize, Serialize};
@@ -616,9 +616,9 @@ impl DatabaseContextManifestStore {
             attempted_payload_hash,
         } = &outcome
         {
-            record_observation_collision(
+            record_observation_collisions(
                 &mut tx,
-                ObservationCollisionReceipt {
+                &[ObservationCollisionReceipt {
                     user_id: &manifest.user_id,
                     domain: ObservationPayloadDomain::ContextManifest,
                     identity_id: &manifest.manifest_id,
@@ -626,7 +626,7 @@ impl DatabaseContextManifestStore {
                     stored_payload_hash,
                     attempted_payload_hash,
                     source: "context_manifest",
-                },
+                }],
             )
             .await
             .map_err(|source| ContextManifestError::Database {
