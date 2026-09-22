@@ -2752,6 +2752,23 @@ fn active_submission_belongs_to_next_turn(
         || submission_belongs_to_next_turn(output_has_settled, foreground_lifecycle_transferred)
 }
 
+/// Current-run guidance is closed once the server definitively fences it.
+/// Later input stays on the next-turn queue. Visible output settlement is a
+/// separate fact and is intentionally not inferred from this flag.
+fn active_submission_routes_to_next_turn(
+    text: &str,
+    output_has_settled: bool,
+    foreground_lifecycle_transferred: bool,
+    guidance_admission_closed: bool,
+) -> bool {
+    guidance_admission_closed
+        || active_submission_belongs_to_next_turn(
+            text,
+            output_has_settled,
+            foreground_lifecycle_transferred,
+        )
+}
+
 /// Handle the one active-run slash command that is a pure navigation action.
 /// Keeping this branch shared by the event loop and its regression test is
 /// deliberate: opening `/tasks` must never fall through to guidance delivery
@@ -3126,6 +3143,9 @@ async fn submit_active_run_guidance(
                     GuidanceSubmissionError::Rejected(error) => {
                         return Err(GuidanceSubmissionError::Rejected(error));
                     }
+                    GuidanceSubmissionError::SettlementFenced => {
+                        return Err(GuidanceSubmissionError::SettlementFenced);
+                    }
                     GuidanceSubmissionError::Unconfirmed(error) => {
                         last_unconfirmed = Some(error);
                     }
@@ -3277,19 +3297,62 @@ fn expire_guidance_closure_as_unconfirmed(
     Some(unconfirmed_ids.into_iter().collect())
 }
 
+/// Machine code returned when durable admission rolls back current-run
+/// guidance because the run is already settling. The submission did not commit.
+const RUN_INTENT_SETTLEMENT_FENCED_ERROR_CODE: &str = "run_intent_settlement_fenced";
+
+const SETTLEMENT_FENCED_FOLLOW_UP_NOTICE: &str =
+    "This run is settling. Your message is queued and will be sent as the next turn.";
+
 #[derive(Debug, PartialEq, Eq)]
 enum GuidanceSubmissionError {
     /// The request is known not to have transferred ownership to the run.
     Rejected(String),
+    /// The server rolled this guidance back at the settlement fence. Ownership
+    /// did not transfer, so the original text can move to the next-turn queue.
+    /// Do not retry it against the fenced run.
+    SettlementFenced,
     /// The request may have committed, but its acknowledgement was lost or
     /// malformed. Keep the stable local identity pending until durable run
     /// events settle it; never manufacture a second intent id.
     Unconfirmed(String),
 }
 
+fn api_error_code(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error_code")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
+/// Drop the uncommitted local intent and keep its text on the next-turn lane.
+/// Returns whether the text was queued. The caller must not post it again
+/// until the current turn owner hands control back.
+fn release_settlement_fenced_guidance(
+    run_control: &crate::cli::turn::local_run_control::LocalRunControl,
+    bottom_pane: &mut BottomPane,
+    intent_id: &str,
+    text: &str,
+) -> bool {
+    run_control.release_remote_user_intent_submission(intent_id);
+    bottom_pane.remove_local_user_intent(intent_id);
+    bottom_pane.queue_next_turn_submission(text.to_string())
+}
+
 impl GuidanceSubmissionError {
     fn from_thin_client(error: astra_thin_client::ThinClientError) -> Self {
         match error {
+            astra_thin_client::ThinClientError::Api { status, ref body }
+                if status == reqwest::StatusCode::CONFLICT
+                    && api_error_code(body).as_deref()
+                        == Some(RUN_INTENT_SETTLEMENT_FENCED_ERROR_CODE) =>
+            {
+                Self::SettlementFenced
+            }
             astra_thin_client::ThinClientError::Api { status, body }
                 if status.is_client_error() && status != reqwest::StatusCode::REQUEST_TIMEOUT =>
             {
@@ -8160,6 +8223,10 @@ pub(crate) async fn run_tui_session(
                                         ActiveRunGuidanceSubmission,
                                     >(1);
                                     let mut guidance_submission_in_flight = false;
+                                    // The server has definitively closed current-run guidance.
+                                    // Later input stays queued for the next turn. This does not
+                                    // mean the visible reply has settled.
+                                    let mut guidance_admission_closed = false;
                                     let mut guidance_submission_task: Option<
                                         tokio::task::JoinHandle<()>,
                                     > = None;
@@ -8382,6 +8449,23 @@ pub(crate) async fn run_tui_session(
                                                             chat_widget.commit_system(
                                                                 history_cell::system::SystemCell::error(error),
                                                             );
+                                                        }
+                                                        Err(GuidanceSubmissionError::SettlementFenced) => {
+                                                            let queued = release_settlement_fenced_guidance(
+                                                                &preinstalled_run_control,
+                                                                &mut bottom_pane,
+                                                                &submission.intent_id,
+                                                                &submission.text,
+                                                            );
+                                                            guidance_admission_closed = true;
+                                                            if queued {
+                                                                chat_widget.commit_system(
+                                                                    history_cell::system::SystemCell::info(
+                                                                        SETTLEMENT_FENCED_FOLLOW_UP_NOTICE
+                                                                            .to_string(),
+                                                                    ),
+                                                                );
+                                                            }
                                                         }
                                                         Err(GuidanceSubmissionError::Unconfirmed(error)) => {
                                                             preinstalled_run_control.release_remote_user_intent_submission(
@@ -8784,17 +8868,17 @@ pub(crate) async fn run_tui_session(
                                                                             frame_requester.schedule_frame();
                                                                             continue;
                                                                         }
-                                                                        if active_submission_belongs_to_next_turn(
+                                                                        if active_submission_routes_to_next_turn(
                                                                             &queued_text,
                                                                             output_settled_at.is_some(),
                                                                             foreground_lifecycle_transferred,
+                                                                            guidance_admission_closed,
                                                                         ) {
-                                                                            // The response stream has ended, so this
-                                                                            // is a real next-turn message rather than
-                                                                            // guidance for a run that can no longer
-                                                                            // consume it. Re-dispatch it as soon as
-                                                                            // the durable current-turn settlement hands
-                                                                            // ownership back to the outer loop.
+                                                                            // The response stream has ended, foreground
+                                                                            // ownership has moved, or the server has
+                                                                            // fenced current-run guidance. Hold the
+                                                                            // text until this turn hands ownership
+                                                                            // back; do not post it to the fenced run.
                                                                             bottom_pane.queue_next_turn_submission(queued_text);
                                                                             frame_requester.schedule_frame();
                                                                             continue;
@@ -13718,6 +13802,28 @@ mod tests {
     }
 
     #[test]
+    fn closed_guidance_routes_later_input_to_the_next_turn() {
+        assert!(!active_submission_routes_to_next_turn(
+            "list my workspaces",
+            false,
+            false,
+            false,
+        ));
+        assert!(active_submission_routes_to_next_turn(
+            "list my workspaces",
+            false,
+            false,
+            true,
+        ));
+        assert!(active_submission_routes_to_next_turn(
+            "please continue",
+            true,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
     fn only_completed_ownership_transfer_can_replay_after_interrupted_parent() {
         assert!(!should_start_queued_followups(false, true, false, false));
         assert!(should_start_queued_followups(false, true, true, false));
@@ -16834,6 +16940,100 @@ mod tests {
             incompatible,
             GuidanceSubmissionError::Unconfirmed(_)
         ));
+
+        let fenced = GuidanceSubmissionError::from_thin_client(
+            astra_thin_client::ThinClientError::Api {
+                status: reqwest::StatusCode::CONFLICT,
+                body: serde_json::json!({
+                    "detail": "This run is settling and no longer accepts current-run guidance. Submit it as the next session turn instead.",
+                    "error_code": "run_intent_settlement_fenced",
+                    "request_id": "256cd25fa6dde3ee22694940bf00125f"
+                })
+                .to_string(),
+            },
+        );
+        assert_eq!(fenced, GuidanceSubmissionError::SettlementFenced);
+        assert!(!SETTLEMENT_FENCED_FOLLOW_UP_NOTICE.contains("HTTP"));
+        assert!(!SETTLEMENT_FENCED_FOLLOW_UP_NOTICE.contains("request_id"));
+
+        let identity_conflict =
+            GuidanceSubmissionError::from_thin_client(astra_thin_client::ThinClientError::Api {
+                status: reqwest::StatusCode::CONFLICT,
+                body: serde_json::json!({
+                    "detail": "intent_id is already bound to different immutable guidance facts",
+                    "error_code": "run_intent_identity_conflict"
+                })
+                .to_string(),
+            });
+        match identity_conflict {
+            GuidanceSubmissionError::Rejected(message) => {
+                assert!(message.contains("HTTP"));
+                assert!(message.contains("run_intent_identity_conflict"));
+            }
+            other => panic!("identity conflict must stay a rejection, got {other:?}"),
+        }
+
+        let timed_out_fence =
+            GuidanceSubmissionError::from_thin_client(astra_thin_client::ThinClientError::Api {
+                status: reqwest::StatusCode::REQUEST_TIMEOUT,
+                body: serde_json::json!({
+                    "error_code": "run_intent_settlement_fenced"
+                })
+                .to_string(),
+            });
+        assert!(matches!(
+            timed_out_fence,
+            GuidanceSubmissionError::Unconfirmed(_)
+        ));
+    }
+
+    #[test]
+    fn settlement_fenced_follow_up_is_queued_without_keeping_the_rejected_intent() {
+        let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+        let mut bottom_pane = BottomPane::new();
+        bottom_pane
+            .try_accept_user_intent(
+                "intent-fenced",
+                astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                astra_turn_types::UserIntentStatus::AcceptedLocal,
+                "list my workspaces",
+            )
+            .expect("local guidance intent");
+        run_control.expect_remote_user_intent_submission("intent-fenced");
+
+        assert!(release_settlement_fenced_guidance(
+            &run_control,
+            &mut bottom_pane,
+            "intent-fenced",
+            "list my workspaces",
+        ));
+        assert!(run_control.pending_remote_submission_ids().is_empty());
+        assert!(
+            bottom_pane
+                .take_client_recoverable_user_intents()
+                .is_empty()
+        );
+
+        let mut queued = bottom_pane.take_queued_next_turn_submissions();
+        let mut followups = std::collections::VecDeque::new();
+        assert!(
+            settle_followup_submissions(&mut followups, std::iter::empty(), &mut queued, true)
+                .is_none()
+        );
+        assert_eq!(
+            followups.into_iter().collect::<Vec<_>>(),
+            vec!["list my workspaces".to_string()]
+        );
+
+        let mut restored_queue =
+            std::collections::VecDeque::from(["list my workspaces".to_string()]);
+        let restored = settle_followup_submissions(
+            &mut std::collections::VecDeque::new(),
+            std::iter::empty(),
+            &mut restored_queue,
+            false,
+        );
+        assert_eq!(restored.as_deref(), Some("list my workspaces"));
     }
 
     #[test]
