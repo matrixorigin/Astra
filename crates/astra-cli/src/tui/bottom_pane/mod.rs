@@ -660,6 +660,21 @@ impl BottomPane {
         true
     }
 
+    pub(crate) fn queued_next_turn_submission_count(&self) -> usize {
+        self.queued_next_turn_submissions.len()
+    }
+
+    /// Insert at the position this text had when the user submitted it.
+    /// Entries queued later stay behind it. An index past the end appends.
+    pub(crate) fn insert_next_turn_submission(&mut self, index: usize, text: String) -> bool {
+        if text.trim().is_empty() {
+            return false;
+        }
+        let index = index.min(self.queued_next_turn_submissions.len());
+        self.queued_next_turn_submissions.insert(index, text);
+        true
+    }
+
     pub fn take_queued_next_turn_submissions(&mut self) -> std::collections::VecDeque<String> {
         std::mem::take(&mut self.queued_next_turn_submissions)
     }

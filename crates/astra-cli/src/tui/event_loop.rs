@@ -3330,6 +3330,8 @@ fn api_error_code(body: &str) -> Option<String> {
 }
 
 /// Drop the uncommitted local intent and keep its text on the next-turn lane.
+/// `queue_index` is the queue length when this guidance was submitted, so a
+/// late fence response does not land behind messages the user sent afterward.
 /// Returns whether the text was queued. The caller must not post it again
 /// until the current turn owner hands control back.
 fn release_settlement_fenced_guidance(
@@ -3337,10 +3339,11 @@ fn release_settlement_fenced_guidance(
     bottom_pane: &mut BottomPane,
     intent_id: &str,
     text: &str,
+    queue_index: usize,
 ) -> bool {
     run_control.release_remote_user_intent_submission(intent_id);
     bottom_pane.remove_local_user_intent(intent_id);
-    bottom_pane.queue_next_turn_submission(text.to_string())
+    bottom_pane.insert_next_turn_submission(queue_index, text.to_string())
 }
 
 impl GuidanceSubmissionError {
@@ -8227,6 +8230,10 @@ pub(crate) async fn run_tui_session(
                                     // Later input stays queued for the next turn. This does not
                                     // mean the visible reply has settled.
                                     let mut guidance_admission_closed = false;
+                                    // Queue length when the in-flight guidance was submitted.
+                                    // A delayed fence inserts there, ahead of messages queued
+                                    // while that POST was still pending.
+                                    let mut in_flight_guidance_queue_index: Option<usize> = None;
                                     let mut guidance_submission_task: Option<
                                         tokio::task::JoinHandle<()>,
                                     > = None;
@@ -8387,6 +8394,7 @@ pub(crate) async fn run_tui_session(
                                                         task.abort();
                                                     }
                                                     guidance_submission_in_flight = false;
+                                                    in_flight_guidance_queue_index = None;
                                                     for intent_id in unconfirmed_ids {
                                                         bottom_pane
                                                             .mark_user_intent_unconfirmed(&intent_id);
@@ -8420,6 +8428,7 @@ pub(crate) async fn run_tui_session(
                                                 Some(submission) = guidance_submission_rx.recv() => {
                                                     guidance_submission_in_flight = false;
                                                     guidance_submission_task = None;
+                                                    let submitted_queue_index = in_flight_guidance_queue_index.take();
                                                     match submission.result {
                                                         Ok(receipt) => {
                                                             debug_assert_eq!(receipt.intent_id, submission.intent_id);
@@ -8451,11 +8460,18 @@ pub(crate) async fn run_tui_session(
                                                             );
                                                         }
                                                         Err(GuidanceSubmissionError::SettlementFenced) => {
+                                                            let queue_index = submitted_queue_index.unwrap_or_else(
+                                                                || {
+                                                                    bottom_pane
+                                                                        .queued_next_turn_submission_count()
+                                                                },
+                                                            );
                                                             let queued = release_settlement_fenced_guidance(
                                                                 &preinstalled_run_control,
                                                                 &mut bottom_pane,
                                                                 &submission.intent_id,
                                                                 &submission.text,
+                                                                queue_index,
                                                             );
                                                             guidance_admission_closed = true;
                                                             if queued {
@@ -8947,6 +8963,10 @@ pub(crate) async fn run_tui_session(
                                                                         let submission_tx = guidance_submission_tx.clone();
                                                                         preinstalled_run_control
                                                                             .expect_remote_user_intent_submission(&intent_id);
+                                                                        in_flight_guidance_queue_index = Some(
+                                                                            bottom_pane
+                                                                                .queued_next_turn_submission_count(),
+                                                                        );
                                                                         guidance_submission_in_flight = true;
                                                                         guidance_submission_task = Some(tokio::spawn(async move {
                                                                             let result = submit_active_run_guidance(
@@ -17006,6 +17026,7 @@ mod tests {
             &mut bottom_pane,
             "intent-fenced",
             "list my workspaces",
+            0,
         ));
         assert!(run_control.pending_remote_submission_ids().is_empty());
         assert!(
@@ -17034,6 +17055,102 @@ mod tests {
             false,
         );
         assert_eq!(restored.as_deref(), Some("list my workspaces"));
+    }
+
+    #[test]
+    fn settlement_fenced_follow_up_keeps_submission_order() {
+        let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+        let mut bottom_pane = BottomPane::new();
+        let queue_index = bottom_pane.queued_next_turn_submission_count();
+        bottom_pane
+            .try_accept_user_intent(
+                "intent-a",
+                astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                astra_turn_types::UserIntentStatus::AcceptedLocal,
+                "message A",
+            )
+            .expect("local guidance intent");
+        run_control.expect_remote_user_intent_submission("intent-a");
+        assert!(bottom_pane.queue_next_turn_submission("message B".to_string()));
+        assert!(release_settlement_fenced_guidance(
+            &run_control,
+            &mut bottom_pane,
+            "intent-a",
+            "message A",
+            queue_index,
+        ));
+        let mut queued = bottom_pane.take_queued_next_turn_submissions();
+        let mut followups = std::collections::VecDeque::new();
+        assert!(
+            settle_followup_submissions(&mut followups, std::iter::empty(), &mut queued, true)
+                .is_none()
+        );
+        assert_eq!(
+            followups.into_iter().collect::<Vec<_>>(),
+            vec!["message A".to_string(), "message B".to_string()]
+        );
+        let mut restored_queue =
+            std::collections::VecDeque::from(["message A".to_string(), "message B".to_string()]);
+        let restored = settle_followup_submissions(
+            &mut std::collections::VecDeque::new(),
+            std::iter::empty(),
+            &mut restored_queue,
+            false,
+        );
+        assert_eq!(restored.as_deref(), Some("message A\n\nmessage B"));
+
+        let mut bottom_pane = BottomPane::new();
+        assert!(bottom_pane.queue_next_turn_submission("/session".to_string()));
+        let queue_index = bottom_pane.queued_next_turn_submission_count();
+        bottom_pane
+            .try_accept_user_intent(
+                "intent-a",
+                astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                astra_turn_types::UserIntentStatus::AcceptedLocal,
+                "message A",
+            )
+            .expect("local guidance intent");
+        run_control.expect_remote_user_intent_submission("intent-a");
+        assert!(bottom_pane.queue_next_turn_submission("message B".to_string()));
+
+        assert!(release_settlement_fenced_guidance(
+            &run_control,
+            &mut bottom_pane,
+            "intent-a",
+            "message A",
+            queue_index,
+        ));
+
+        let mut queued = bottom_pane.take_queued_next_turn_submissions();
+        let mut followups = std::collections::VecDeque::new();
+        assert!(
+            settle_followup_submissions(&mut followups, std::iter::empty(), &mut queued, true)
+                .is_none()
+        );
+        assert_eq!(
+            followups.into_iter().collect::<Vec<_>>(),
+            vec![
+                "/session".to_string(),
+                "message A".to_string(),
+                "message B".to_string(),
+            ]
+        );
+
+        let mut restored_queue = std::collections::VecDeque::from([
+            "/session".to_string(),
+            "message A".to_string(),
+            "message B".to_string(),
+        ]);
+        let restored = settle_followup_submissions(
+            &mut std::collections::VecDeque::new(),
+            std::iter::empty(),
+            &mut restored_queue,
+            false,
+        );
+        assert_eq!(
+            restored.as_deref(),
+            Some("/session\n\nmessage A\n\nmessage B")
+        );
     }
 
     #[test]
