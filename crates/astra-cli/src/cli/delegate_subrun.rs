@@ -1067,6 +1067,7 @@ mod tests {
             context: HashMap::new(),
             forward_headers: HashMap::new(),
             admitted_model_execution: None,
+            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
             interaction_mode: astra_services::runs::RequestedTurnInteractionMode::Headless,
             request_constraints: Default::default(),
             recursion_depth: 0,

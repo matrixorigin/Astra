@@ -491,11 +491,8 @@ impl AgenticLoopHost for SubRunHost {
         // and makes soft runtime evidence look like user content.
         let runtime_volatile_injections = state.lease_volatile_pending()?;
 
-        let effective_model = self.model.as_deref();
         let effective_offering_id = self.offering_id.clone();
-        let thinking = effective_model
-            .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).1)
-            .unwrap_or_default();
+        let thinking = state.thinking.clone();
         let interaction_mode = TurnInteractionMode::NonInteractive;
         let interaction_scoped_restrictions =
             interaction_scoped_tool_restrictions(interaction_mode);

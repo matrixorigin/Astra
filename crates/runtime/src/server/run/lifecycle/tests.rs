@@ -4690,6 +4690,7 @@ fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunC
         task: "do work".to_string(),
         system_prompt_addendum: String::new(),
         model_selection: None,
+        thinking: astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
         model: None,
         initial_turns: 3,
         hard_turn_limit: None,
@@ -6368,6 +6369,51 @@ async fn server_spawn_cannot_inherit_when_parent_has_no_model_admission() {
         .expect_err("missing parent admission must fail closed");
 
     assert!(error.contains("missing parent model admission"), "{error}");
+}
+
+#[test]
+fn server_spawn_reasoning_validation_is_capability_strict() {
+    use astra_core::model_wire::thinking::ThinkingProtocol;
+    use astra_services::models::ThinkingCapability;
+    use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
+
+    let mut execution = test_admitted_model_execution();
+    execution.thinking_capability = Some(ThinkingCapability::EffortOnly);
+    execution.thinking_protocol = Some(ThinkingProtocol::ReasoningEffort);
+    assert!(
+        ServerSpawnAgentExecutor::validate_spawn_thinking(
+            &execution,
+            &ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High,
+            },
+        )
+        .is_ok()
+    );
+    assert!(
+        ServerSpawnAgentExecutor::validate_spawn_thinking(&execution, &ThinkingConfig::Off)
+            .is_err(),
+        "an always-thinking Offering cannot promise explicit off"
+    );
+
+    execution.thinking_capability = None;
+    assert!(
+        ServerSpawnAgentExecutor::validate_spawn_thinking(
+            &execution,
+            &ThinkingConfig::ModelDefault,
+        )
+        .is_ok(),
+        "unknown capability may preserve its own default"
+    );
+    assert!(
+        ServerSpawnAgentExecutor::validate_spawn_thinking(
+            &execution,
+            &ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High,
+            },
+        )
+        .is_err(),
+        "unknown capability is not evidence that high is supported"
+    );
 }
 
 #[tokio::test]
@@ -11144,6 +11190,7 @@ async fn work_runtime_binding_validation_is_explicit_owner_safe_and_branch_exact
         context: HashMap::new(),
         forward_headers: HashMap::new(),
         admitted_model_execution: None,
+        thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Headless,
         request_constraints: RequestConstraints::default(),
         recursion_depth: 1,
@@ -11804,6 +11851,7 @@ fn test_executable_subrun_config(
         context: HashMap::new(),
         forward_headers: HashMap::new(),
         admitted_model_execution: Some(admitted_model_execution),
+        thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Headless,
         request_constraints: RequestConstraints::new(Some(HashSet::new()), None, None, None),
         recursion_depth: 1,
@@ -12484,6 +12532,7 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
         context: HashMap::new(),
         forward_headers: HashMap::new(),
         admitted_model_execution: Some(test_admitted_model_execution()),
+        thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Auto,
         request_constraints: RequestConstraints::default(),
         recursion_depth: 1,
@@ -12594,6 +12643,7 @@ async fn generic_subrun_does_not_inherit_parent_canonical_work_identity() {
         context: HashMap::new(),
         forward_headers: HashMap::new(),
         admitted_model_execution: None,
+        thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Headless,
         request_constraints: RequestConstraints::default(),
         recursion_depth: 1,
@@ -12690,6 +12740,7 @@ async fn server_subrun_rejects_work_item_without_parent_work_before_child_insert
         context: HashMap::new(),
         forward_headers: HashMap::new(),
         admitted_model_execution: None,
+        thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Headless,
         request_constraints: RequestConstraints::default(),
         recursion_depth: 1,
@@ -13170,6 +13221,7 @@ async fn server_subrun_error_after_durable_start_commits_exact_failed_terminal()
         context: HashMap::new(),
         forward_headers: HashMap::new(),
         admitted_model_execution: Some(test_admitted_model_execution()),
+        thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Headless,
         request_constraints: RequestConstraints::default(),
         recursion_depth: 1,
@@ -14385,6 +14437,33 @@ async fn validate_request_constraints_rejects_removed_or_malformed_thinking_shap
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
         assert!(error.1.0.detail.contains("invalid thinking configuration"));
     }
+}
+
+#[tokio::test]
+async fn validate_request_constraints_rejects_unsupported_explicit_thinking() {
+    let service = test_service();
+    let mut request = prepared_test_request("hello");
+    let mut execution = test_admitted_model_execution();
+    execution.thinking_capability = None;
+    execution.thinking_protocol = None;
+    request.admitted_model_execution = Some(execution);
+    request.context.get_or_insert_with(Default::default).insert(
+        "thinking".to_string(),
+        json!({"mode": "adaptive", "effort": "high"}),
+    );
+
+    let error = service
+        .validate_request_constraints("u1", &request)
+        .await
+        .expect_err("unsupported explicit thinking must fail before inference");
+    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    assert!(
+        error
+            .1
+            .0
+            .detail
+            .contains("cannot execute requested reasoning")
+    );
 }
 
 #[tokio::test]

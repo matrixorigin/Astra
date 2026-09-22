@@ -135,6 +135,7 @@ pub struct SpawnResolveContext {
     pub child_provider: ProviderKind,
     /// The child's model id (post-resolution).
     pub child_model_id: String,
+    pub child_thinking: Option<Option<crate::fork_prefix::ThinkingConfigSlice>>,
     /// The child's max_output_tokens, if set. Interacts with the
     /// captured prefix's thinking budget (see
     /// `ForkPrefix::validate_spawn`).
@@ -192,6 +193,7 @@ pub fn resolve_inherit_prefix(
     let validation_ctx = SpawnValidationContext {
         child_provider: ctx.child_provider.clone(),
         child_model_id: ctx.child_model_id.clone(),
+        child_thinking: ctx.child_thinking.clone(),
         child_max_output_tokens: ctx.child_max_output_tokens,
     };
 
@@ -289,6 +291,7 @@ mod tests {
             caller_run_id: Some("run-parent".into()),
             child_provider: ProviderKind::Anthropic,
             child_model_id: "claude-opus-4-6".into(),
+            child_thinking: None,
             child_max_output_tokens: None,
         }
     }

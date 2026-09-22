@@ -693,7 +693,8 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     let requested_model = astra_core::model_override::normalize_model_override(ctx.model);
     let thinking_config = match requested_model {
         Some(m) => {
-            let (_, cfg) = astra_turn_core::thinking_config::resolve_model_thinking(m);
+            let (base_model, cfg) = astra_turn_core::thinking_config::resolve_model_thinking(m);
+            let cfg = normalize_unspecified_thinking(m, &base_model, cfg);
             // Per-turn dampener: the model suffix encodes the user's CEILING
             // (e.g. `thinking:high`), not a command to burn that budget on every
             // turn regardless of content. Short read-only questions get a
@@ -702,7 +703,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
             let signals = thinking_complexity_signals(ctx.message, ctx.turn_intent);
             cfg.scale_for_turn(signals)
         }
-        None => astra_turn_core::thinking_config::ThinkingConfig::Off,
+        None => astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
     };
     crate::cli::history_work::record_json_history(
         astra_core::history_work::HistoryWorkSite::CliPromptPayloadClone,
@@ -1365,6 +1366,25 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     }
 }
 
+fn normalize_unspecified_thinking(
+    requested_model: &str,
+    base_model: &str,
+    config: astra_turn_core::thinking_config::ThinkingConfig,
+) -> astra_turn_core::thinking_config::ThinkingConfig {
+    if requested_model == base_model
+        && matches!(
+            config,
+            astra_turn_core::thinking_config::ThinkingConfig::Off
+        )
+    {
+        // No suffix is absence of an override, not an explicit request to
+        // disable reasoning on the admitted Offering.
+        astra_turn_core::thinking_config::ThinkingConfig::ModelDefault
+    } else {
+        config
+    }
+}
+
 fn thinking_complexity_signals(
     message: &str,
     turn_intent: Option<&TurnIntent>,
@@ -1909,9 +1929,10 @@ mod tests {
     use super::{
         PrepareChatTurnRequest, PrepareTurnTelemetry, attach_typed_edge_skill_catalog,
         build_retained_history_turns, chat_turn_budget_pressure, inject_runtime_turn_overrides,
-        msg_content, prepare_chat_turn_payload, project_cross_session_memory_hits,
-        retained_history_messages, runtime_filter_turn_schemas_and_report,
-        server_loop_admission_payload, server_loop_admission_payload_with_execution_time_budget,
+        msg_content, normalize_unspecified_thinking, prepare_chat_turn_payload,
+        project_cross_session_memory_hits, retained_history_messages,
+        runtime_filter_turn_schemas_and_report, server_loop_admission_payload,
+        server_loop_admission_payload_with_execution_time_budget,
         surface_report_from_visible_schemas, thinking_complexity_signals,
     };
     use astra_config::user_profile::{Scenario, TurnIntent, WorkspaceMutationIntent};
@@ -2118,6 +2139,27 @@ mod tests {
     }
     use astra_turn_core::chat_turn_payload::attach_turn_identity;
     use serde_json::{Value, json};
+
+    #[test]
+    fn model_selector_parse_preserves_absence_and_explicit_effort() {
+        use astra_turn_core::thinking_config::ThinkingConfig;
+
+        let (plain_base, plain) =
+            astra_turn_core::thinking_config::resolve_model_thinking("model-a");
+        assert_eq!(
+            normalize_unspecified_thinking("model-a", plain_base, plain),
+            ThinkingConfig::ModelDefault
+        );
+        let selector = "model-a(thinking:high)";
+        let (effort_base, effort) =
+            astra_turn_core::thinking_config::resolve_model_thinking(selector);
+        assert_eq!(
+            normalize_unspecified_thinking(selector, effort_base, effort),
+            ThinkingConfig::Adaptive {
+                effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+            }
+        );
+    }
 
     #[test]
     fn thinking_complexity_consumes_typed_llm_intent_without_text_matching() {

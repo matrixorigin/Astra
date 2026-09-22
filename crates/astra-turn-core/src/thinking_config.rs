@@ -21,6 +21,9 @@ use serde_json::{Value, json};
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ThinkingConfig {
+    /// Preserve the admitted Offering/provider default without emitting or
+    /// removing reasoning controls.
+    ModelDefault,
     /// Thinking disabled (default).
     #[default]
     Off,
@@ -74,6 +77,9 @@ impl ThinkingConfig {
         body: &mut Value,
         protocol: astra_core::model_wire::thinking::ThinkingProtocol,
     ) {
+        if matches!(self, Self::ModelDefault) {
+            return;
+        }
         let effort = match self {
             Self::Adaptive { effort } => Some(effort_str(*effort)),
             _ => None,
@@ -86,13 +92,14 @@ impl ThinkingConfig {
     }
 
     pub fn is_enabled(&self) -> bool {
-        !self.is_off()
+        matches!(self, Self::Enabled { .. } | Self::Adaptive { .. })
     }
 
     /// Apply thinking config to a Bedrock Converse request body.
     /// Sets `additionalModelRequestFields.thinking` and removes incompatible fields.
     pub fn apply_bedrock(&self, body: &mut Value) {
         match self {
+            Self::ModelDefault => {}
             Self::Off => {}
             Self::Enabled { budget_tokens } => {
                 body["additionalModelRequestFields"] = json!({
@@ -126,6 +133,7 @@ impl ThinkingConfig {
     /// Sets top-level `thinking` field and removes incompatible fields.
     pub fn apply_anthropic(&self, body: &mut Value) {
         match self {
+            Self::ModelDefault => {}
             Self::Off => {}
             Self::Enabled { budget_tokens } => {
                 body["thinking"] = json!({
@@ -156,6 +164,7 @@ impl ThinkingConfig {
     /// Only Adaptive maps to `reasoning_effort`; Enabled is a no-op for OpenAI.
     pub fn apply_openai(&self, body: &mut Value) {
         match self {
+            Self::ModelDefault => {}
             Self::Off => {}
             Self::Enabled { .. } => {
                 // OpenAI doesn't have a budget-based thinking mode.
@@ -216,6 +225,7 @@ pub fn fork_capture_thinking_slice(
     model: &str,
 ) -> Option<crate::fork_prefix::ThinkingConfigSlice> {
     match thinking {
+        ThinkingConfig::ModelDefault => None,
         ThinkingConfig::Off => {
             crate::reasoning_capabilities::reasoning_capabilities(provider, model)
                 .requires_replay()
@@ -285,6 +295,7 @@ impl fmt::Display for ThinkingEffort {
 impl fmt::Display for ThinkingConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ThinkingConfig::ModelDefault => write!(f, "model_default"),
             ThinkingConfig::Off => write!(f, "off"),
             ThinkingConfig::Enabled { budget_tokens } => {
                 write!(f, "enabled(budget:{})", budget_tokens)
@@ -346,6 +357,7 @@ impl ThinkingConfig {
             return self.clone();
         }
         match self {
+            ThinkingConfig::ModelDefault => ThinkingConfig::ModelDefault,
             ThinkingConfig::Off => ThinkingConfig::Off,
             ThinkingConfig::Enabled { budget_tokens } => {
                 // Cap at 4k for lightweight turns. This covers Anthropic's minimum
@@ -397,6 +409,7 @@ fn remove_key(body: &mut Value, key: &str) {
 /// Encode a ThinkingConfig as a model name suffix for storage in state.model.
 pub fn thinking_suffix_for(config: &ThinkingConfig) -> String {
     match config {
+        ThinkingConfig::ModelDefault => String::new(),
         ThinkingConfig::Off => String::new(),
         ThinkingConfig::Enabled { budget_tokens } => {
             format!("(thinking:budget:{})", budget_tokens)
@@ -1491,5 +1504,16 @@ mod fork_capture_thinking_slice_tests {
         assert!(slice.enabled);
         assert_eq!(slice.budget_tokens, 5000);
         assert_eq!(slice.kind, "enabled");
+    }
+
+    #[test]
+    fn model_default_preserves_existing_wire_controls() {
+        let mut body = json!({"reasoning_effort":"high","enable_thinking":true});
+        ThinkingConfig::ModelDefault.apply_openai_protocol(
+            &mut body,
+            astra_core::model_wire::thinking::ThinkingProtocol::ReasoningEffort,
+        );
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["enable_thinking"], true);
     }
 }

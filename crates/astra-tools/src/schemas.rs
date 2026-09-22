@@ -1911,6 +1911,14 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "required": ["offering_id"],
                             "additionalProperties": false
                         },
+                        "reasoning": {
+                            "description": "Reasoning control independent of model identity. Omit or use model_default to use the target Offering default.",
+                            "oneOf": [
+                                {"type":"object","properties":{"mode":{"const":"model_default"}},"required":["mode"],"additionalProperties":false},
+                                {"type":"object","properties":{"mode":{"const":"off"}},"required":["mode"],"additionalProperties":false},
+                                {"type":"object","properties":{"mode":{"const":"adaptive"},"effort":{"type":"string","enum":["low","medium","high","max"]}},"required":["mode","effort"],"additionalProperties":false}
+                            ]
+                        },
                         "name": {"type": "string", "description": "Action label when accepted by the selected action."},
                         "input": {"type": "object", "description": "Optional run_chain template input."},
                         "rollback_on_failure": {"type": "boolean", "description": "Rollback bounded chain mutations after failure."},
@@ -1953,7 +1961,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "send_message": ["to", "message"]
                     },
                     "x-astra-per-action-allowed": {
-                        "spawn": ["action", "description", "prompt", "agent_type", "model_selection", "name", "max_turns", "max_output_tokens", "complexity", "isolated", "allowed_tools", "inherit_prefix", "work_item"],
+                        "spawn": ["action", "description", "prompt", "agent_type", "model_selection", "reasoning", "name", "max_turns", "max_output_tokens", "complexity", "isolated", "allowed_tools", "inherit_prefix", "work_item"],
                         "get_result": ["action", "agent_id"],
                         "run_chain": ["action", "name", "description", "steps", "input", "rollback_on_failure"],
                         "send_message": ["action", "to", "message", "message_type", "request_id"]

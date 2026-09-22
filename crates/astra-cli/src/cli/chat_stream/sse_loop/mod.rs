@@ -1038,7 +1038,7 @@ pub(crate) async fn stream_chat_sse(
         budget_wrapup_ignored_rounds: 0,
         compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
         skill_produced_output: false,
-        thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
+        thinking: astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
         permission_context: Some(root_permission_context),
         applied_permission_mode: None,
         permission_handler: None,

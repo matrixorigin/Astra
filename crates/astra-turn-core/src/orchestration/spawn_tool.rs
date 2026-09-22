@@ -3,6 +3,34 @@
 use super::fanout_group::AgentFanoutSlotIdentity;
 use astra_turn_types::ModelSelection;
 use serde::{Deserialize, Serialize};
+
+/// Child reasoning intent, kept independent from model identity.
+///
+/// `ModelDefault` means that Astra sends no explicit reasoning override. The
+/// other variants are exact controls and must be validated against the
+/// admitted Offering before any provider request is made.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReasoningSelection {
+    ModelDefault,
+    Off,
+    Adaptive {
+        effort: crate::thinking_config::ThinkingEffort,
+    },
+}
+
+impl ReasoningSelection {
+    #[must_use]
+    pub fn config(&self) -> crate::thinking_config::ThinkingConfig {
+        match self {
+            Self::ModelDefault => crate::thinking_config::ThinkingConfig::ModelDefault,
+            Self::Off => crate::thinking_config::ThinkingConfig::Off,
+            Self::Adaptive { effort } => {
+                crate::thinking_config::ThinkingConfig::Adaptive { effort: *effort }
+            }
+        }
+    }
+}
 /// Request to inherit the parent's cacheable prefix when spawning.
 ///
 /// When present in a `SpawnAgentInput`, the runtime looks up the
@@ -162,6 +190,11 @@ pub struct SpawnAgentInput {
     /// aliases are not execution identities.
     #[serde(default)]
     pub model_selection: Option<ModelSelection>,
+
+    /// Optional reasoning override. Omit it, or use `model_default`, to use the
+    /// selected Offering's default.
+    #[serde(default)]
+    pub reasoning: Option<ReasoningSelection>,
 }
 
 impl SpawnAgentInput {
@@ -258,6 +291,7 @@ impl Default for SpawnAgentInput {
             fanout_slot_id: None,
             work_item: None,
             model_selection: None,
+            reasoning: None,
         }
     }
 }
@@ -512,6 +546,43 @@ mod tests {
             error.to_string().contains("unknown field `model`"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn spawn_parses_reasoning_independently_from_model_identity() {
+        let input: SpawnAgentInput = serde_json::from_str(
+            r#"{"description":"Review","prompt":"Check it","model_selection":{"offering_id":"offer-b"},"reasoning":{"mode":"adaptive","effort":"high"}}"#,
+        )
+        .expect("typed reasoning selection");
+
+        assert_eq!(
+            input.reasoning.map(|selection| selection.config()),
+            Some(crate::thinking_config::ThinkingConfig::Adaptive {
+                effort: crate::thinking_config::ThinkingEffort::High,
+            })
+        );
+    }
+
+    #[test]
+    fn model_default_is_distinct_from_explicit_off() {
+        assert_eq!(
+            ReasoningSelection::ModelDefault.config(),
+            crate::thinking_config::ThinkingConfig::ModelDefault
+        );
+        assert_eq!(
+            ReasoningSelection::Off.config(),
+            crate::thinking_config::ThinkingConfig::Off
+        );
+    }
+
+    #[test]
+    fn explicit_budget_is_not_a_public_spawn_control() {
+        let error = serde_json::from_value::<SpawnAgentInput>(serde_json::json!({
+            "description": "inspect",
+            "reasoning": {"mode": "enabled", "budget_tokens": 8_000}
+        }))
+        .expect_err("budget controls remain internal until exact wire support is admitted");
+        assert!(error.to_string().contains("unknown variant"));
     }
 
     #[test]

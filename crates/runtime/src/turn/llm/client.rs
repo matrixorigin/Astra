@@ -3799,7 +3799,7 @@ fn build_provider_request_body_with_cache_capability(
                 // We honor the user's configured ceiling when it already exceeds
                 // the required floor (respects deliberate budget caps) and only
                 // bump when the configured value is demonstrably too low.
-                let effective_max = if !thinking.is_off() {
+                let effective_max = if thinking.is_enabled() {
                     let required_floor: usize = match thinking {
                         ThinkingConfig::Enabled { budget_tokens } => {
                             (*budget_tokens as usize).saturating_add(8192)
@@ -3844,6 +3844,7 @@ fn build_provider_request_body_with_cache_capability(
                 // DashScope/Qwen uses a binary `enable_thinking` flag; there is no
                 // equivalent of `reasoning_effort`.
                 match thinking {
+                    ThinkingConfig::ModelDefault => {}
                     ThinkingConfig::Off => {
                         // Native thinkers (Qwen3, Qwen3.5) think by default.
                         // Explicitly suppress to avoid wasting tokens on reasoning
@@ -19259,6 +19260,23 @@ mod tests {
             Some(4_096),
             "thinking=off must never bump user's max"
         );
+        assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn deepseek_max_tokens_unchanged_for_model_default() {
+        use astra_turn_core::thinking_config::ThinkingConfig;
+        let body = build_provider_request_body(
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+            "deepseek-chat",
+            "deepseek",
+            Some(4_096),
+            None,
+            false,
+            &ThinkingConfig::ModelDefault,
+        );
+        assert_eq!(body["max_tokens"].as_u64(), Some(4_096));
         assert!(body.get("max_completion_tokens").is_none());
     }
 

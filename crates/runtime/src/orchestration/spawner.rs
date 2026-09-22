@@ -977,6 +977,8 @@ pub struct SpawnRunConfig {
     /// Exact authorized Offering requested for this child. `None` means
     /// inherit the parent's admitted Offering.
     pub model_selection: Option<astra_turn_types::ModelSelection>,
+    /// Effective reasoning control, including an explicit target-model default.
+    pub thinking: astra_turn_core::thinking_config::ThinkingConfig,
     /// Resolved model name used only for cache compatibility and display.
     /// This is never an execution selector.
     pub model: Option<String>,
@@ -1117,6 +1119,7 @@ impl std::fmt::Debug for SpawnRunConfig {
             .field("task", &self.task)
             .field("model", &self.model)
             .field("model_selection", &self.model_selection)
+            .field("thinking", &self.thinking)
             .field("initial_turns", &self.initial_turns)
             .field("hard_turn_limit", &self.hard_turn_limit)
             .field("mailbox", &self.mailbox.is_some())
@@ -3623,10 +3626,26 @@ impl DynamicAgentSpawner {
                 // by the sink the caller installs.
                 let child_provider =
                     astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(model);
+                let prefix_thinking = input
+                    .reasoning
+                    .as_ref()
+                    .map(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::config)
+                    .unwrap_or(astra_turn_core::thinking_config::ThinkingConfig::ModelDefault);
+                let child_thinking = Some({
+                    // Prefix compatibility and capture must share one canonical
+                    // thinking identity. The selected model is the best provider
+                    // hint available at this pure orchestration boundary.
+                    astra_turn_core::thinking_config::fork_capture_thinking_slice(
+                        &prefix_thinking,
+                        model,
+                        model,
+                    )
+                });
                 let resolve_ctx = SpawnResolveContext {
                     caller_run_id: Some(context.parent_run_id.clone()),
                     child_provider,
                     child_model_id: model.clone(),
+                    child_thinking,
                     child_max_output_tokens: input.max_output_tokens,
                 };
                 resolve_inherit_prefix(Some(spec), &resolve_ctx, store.as_ref())
@@ -4012,6 +4031,11 @@ impl DynamicAgentSpawner {
             task: input.prompt.clone(),
             system_prompt_addendum: coordination_addendum,
             model_selection: input.model_selection.clone(),
+            thinking: input
+                .reasoning
+                .as_ref()
+                .map(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::config)
+                .unwrap_or(astra_turn_core::thinking_config::ThinkingConfig::ModelDefault),
             model,
             initial_turns,
             hard_turn_limit,

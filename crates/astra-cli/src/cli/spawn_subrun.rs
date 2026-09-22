@@ -950,10 +950,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             );
         let max_turns = agentic_turn_budget.initial_turns;
 
-        let child_thinking = effective_model
-            .as_deref()
-            .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).1)
-            .unwrap_or_default();
+        let child_thinking = config.thinking.clone();
         let runtime_manifest = runtime_manifest_for_model(
             "cli_spawn_subrun",
             "cli_spawn_subrun",
@@ -1852,6 +1849,7 @@ mod tests {
                 task: "review".into(),
                 system_prompt_addendum: String::new(),
                 model_selection: None,
+                thinking: astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
                 model: Some("test-model".into()),
                 initial_turns: 1,
                 hard_turn_limit: Some(1),
@@ -1920,6 +1918,7 @@ mod tests {
                 task: "Return one concise finding.".into(),
                 system_prompt_addendum: String::new(),
                 model_selection: None,
+                thinking: astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
                 model: Some("mock-model".into()),
                 initial_turns: 1,
                 hard_turn_limit: Some(1),

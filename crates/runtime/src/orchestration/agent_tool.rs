@@ -3028,6 +3028,7 @@ mod tests {
     struct CapturingModelExecutor {
         captured_model: Mutex<Option<String>>,
         captured_model_selection: Mutex<Option<astra_turn_types::ModelSelection>>,
+        captured_thinking: Mutex<Option<astra_turn_core::thinking_config::ThinkingConfig>>,
         captured_execution_metadata: Mutex<Option<Value>>,
         captured_max_turns: Mutex<Option<u32>>,
         captured_hard_turn_limit: Mutex<Option<Option<u32>>>,
@@ -3039,6 +3040,7 @@ mod tests {
             Self {
                 captured_model: Mutex::new(None),
                 captured_model_selection: Mutex::new(None),
+                captured_thinking: Mutex::new(None),
                 captured_execution_metadata: Mutex::new(None),
                 captured_max_turns: Mutex::new(None),
                 captured_hard_turn_limit: Mutex::new(None),
@@ -3052,6 +3054,12 @@ mod tests {
 
         fn take_captured_model_selection(&self) -> Option<astra_turn_types::ModelSelection> {
             self.captured_model_selection.lock().unwrap().take()
+        }
+
+        fn take_captured_thinking(
+            &self,
+        ) -> Option<astra_turn_core::thinking_config::ThinkingConfig> {
+            self.captured_thinking.lock().unwrap().take()
         }
 
         fn take_captured_execution_metadata(&self) -> Option<Value> {
@@ -3077,6 +3085,7 @@ mod tests {
             *self.spawn_count.lock().unwrap() += 1;
             *self.captured_model.lock().unwrap() = config.model.clone();
             *self.captured_model_selection.lock().unwrap() = config.model_selection.clone();
+            *self.captured_thinking.lock().unwrap() = Some(config.thinking.clone());
             *self.captured_execution_metadata.lock().unwrap() = config.execution_metadata.clone();
             *self.captured_max_turns.lock().unwrap() = Some(config.initial_turns);
             *self.captured_hard_turn_limit.lock().unwrap() = Some(config.hard_turn_limit);
@@ -3607,6 +3616,33 @@ mod tests {
                 .take_captured_model_selection()
                 .map(|selection| selection.offering_id),
             Some("offer-deepseek-flash".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_spawn_agent_tool_forwards_explicit_reasoning_control() {
+        use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
+
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let result = handle_agent_spawn_action(
+            &json!({
+                "description": "Deep review",
+                "prompt": "Review the latest commit",
+                "reasoning": {"mode": "adaptive", "effort": "high"}
+            }),
+            Some(&ctx),
+        )
+        .await;
+
+        let completed = collect_spawn_receipt(&result, &ctx).await;
+        assert_eq!(completed["status"], "completed", "{completed}");
+        assert_eq!(
+            executor.take_captured_thinking(),
+            Some(ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High,
+            })
         );
     }
 
