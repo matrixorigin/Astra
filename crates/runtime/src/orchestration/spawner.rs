@@ -974,8 +974,11 @@ pub struct SpawnRunConfig {
     pub task: String,
     /// System prompt addendum from agent type definition.
     pub system_prompt_addendum: String,
-    /// Explicit model override to use. `None` means "inherit the
-    /// session/server default" instead of forcing a built-in alias.
+    /// Exact authorized Offering requested for this child. `None` means
+    /// inherit the parent's admitted Offering.
+    pub model_selection: Option<astra_turn_types::ModelSelection>,
+    /// Resolved model name used only for cache compatibility and display.
+    /// This is never an execution selector.
     pub model: Option<String>,
     /// Initial adaptive execution slice selected by the agent persona and an
     /// optional complexity hint. This is a convergence checkpoint, not a hard
@@ -1113,6 +1116,7 @@ impl std::fmt::Debug for SpawnRunConfig {
             .field("description", &self.description)
             .field("task", &self.task)
             .field("model", &self.model)
+            .field("model_selection", &self.model_selection)
             .field("initial_turns", &self.initial_turns)
             .field("hard_turn_limit", &self.hard_turn_limit)
             .field("mailbox", &self.mailbox.is_some())
@@ -4007,6 +4011,7 @@ impl DynamicAgentSpawner {
             description: input.description.clone(),
             task: input.prompt.clone(),
             system_prompt_addendum: coordination_addendum,
+            model_selection: input.model_selection.clone(),
             model,
             initial_turns,
             hard_turn_limit,

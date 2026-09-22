@@ -420,6 +420,7 @@ pub struct AgentToolContext {
     /// Current active model for the parent turn. Used as the default
     /// child model when the tool call omits an explicit override.
     pub current_model: Option<String>,
+    pub current_model_selection: Option<astra_turn_types::ModelSelection>,
     /// Current nested agent/sub-run depth of the agent.
     pub recursion_depth: u8,
     /// Whether this agent already inherited a fork prefix.
@@ -880,8 +881,6 @@ struct AgentFanoutStartSlot {
     #[serde(default)]
     agent_type: Option<String>,
     #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
     max_turns: Option<u32>,
     #[serde(default)]
     max_output_tokens: Option<u32>,
@@ -902,8 +901,6 @@ struct AgentFanoutStartSlot {
 struct AgentFanoutDefaults {
     #[serde(default)]
     agent_type: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
     #[serde(default)]
     max_turns: Option<u32>,
     #[serde(default)]
@@ -964,7 +961,6 @@ const FANOUT_START_FIELDS: &[&str] = &[
 ];
 const FANOUT_DEFAULTS_FIELDS: &[&str] = &[
     "agent_type",
-    "model",
     "max_turns",
     "max_output_tokens",
     "complexity",
@@ -976,7 +972,6 @@ const FANOUT_SLOT_FIELDS: &[&str] = &[
     "description",
     "prompt",
     "agent_type",
-    "model",
     "max_turns",
     "max_output_tokens",
     "complexity",
@@ -2148,12 +2143,6 @@ fn fanout_slot_spawn_args(
             .or_else(|| defaults.and_then(|d| d.agent_type.clone()))
             .or_else(|| Some("explore".to_string())),
     );
-    insert_optional_string(
-        object,
-        "model",
-        slot.model
-            .or_else(|| defaults.and_then(|d| d.model.clone())),
-    );
     insert_optional_u32(object, "max_turns", effective_max_turns);
     insert_optional_u32(
         object,
@@ -2386,9 +2375,20 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
             .await;
     }
 
-    let resolved_model_name =
-        astra_core::model_override::normalize_model_override_owned(input.model.clone())
-            .or_else(|| ctx.current_model.clone());
+    // An explicit Offering can resolve to a different provider/model than the
+    // parent. Until admission returns that exact identity, prefix inheritance
+    // must not guess from the parent's display model.
+    let model_selection = input
+        .model_selection
+        .clone()
+        .or_else(|| ctx.current_model_selection.clone());
+    let resolved_model_name = model_selection
+        .as_ref()
+        .zip(ctx.current_model_selection.as_ref())
+        .filter(|(selected, current)| selected.offering_id == current.offering_id)
+        .and_then(|_| ctx.current_model.clone());
+    let mut input = input;
+    input.model_selection = model_selection;
     let spawn_ctx = SpawnContext {
         parent_run_id: ctx.run_id.clone(),
         parent_agent_id: ctx.agent_id.clone(),
@@ -3027,6 +3027,7 @@ mod tests {
 
     struct CapturingModelExecutor {
         captured_model: Mutex<Option<String>>,
+        captured_model_selection: Mutex<Option<astra_turn_types::ModelSelection>>,
         captured_execution_metadata: Mutex<Option<Value>>,
         captured_max_turns: Mutex<Option<u32>>,
         captured_hard_turn_limit: Mutex<Option<Option<u32>>>,
@@ -3037,6 +3038,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 captured_model: Mutex::new(None),
+                captured_model_selection: Mutex::new(None),
                 captured_execution_metadata: Mutex::new(None),
                 captured_max_turns: Mutex::new(None),
                 captured_hard_turn_limit: Mutex::new(None),
@@ -3046,6 +3048,10 @@ mod tests {
 
         fn take_captured_model(&self) -> Option<String> {
             self.captured_model.lock().unwrap().take()
+        }
+
+        fn take_captured_model_selection(&self) -> Option<astra_turn_types::ModelSelection> {
+            self.captured_model_selection.lock().unwrap().take()
         }
 
         fn take_captured_execution_metadata(&self) -> Option<Value> {
@@ -3070,6 +3076,7 @@ mod tests {
         async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
             *self.spawn_count.lock().unwrap() += 1;
             *self.captured_model.lock().unwrap() = config.model.clone();
+            *self.captured_model_selection.lock().unwrap() = config.model_selection.clone();
             *self.captured_execution_metadata.lock().unwrap() = config.execution_metadata.clone();
             *self.captured_max_turns.lock().unwrap() = Some(config.initial_turns);
             *self.captured_hard_turn_limit.lock().unwrap() = Some(config.hard_turn_limit);
@@ -3467,6 +3474,9 @@ mod tests {
             agent_id: "root-agent".into(),
             delegation_chain: Vec::new(),
             current_model: current_model.map(str::to_string),
+            current_model_selection: current_model.map(|_| astra_turn_types::ModelSelection {
+                offering_id: "offer-parent-test".into(),
+            }),
             recursion_depth: 0,
             is_fork_child: false,
             working_dir: PathBuf::from("."),
@@ -3535,6 +3545,12 @@ mod tests {
             executor.take_captured_model().as_deref(),
             Some("MiniMax-M2.7")
         );
+        assert_eq!(
+            executor
+                .take_captured_model_selection()
+                .map(|selection| selection.offering_id),
+            Some("offer-parent-test".to_string())
+        );
     }
 
     #[test]
@@ -3570,7 +3586,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_spawn_agent_tool_forwards_explicit_model_override() {
+    async fn handle_spawn_agent_tool_forwards_exact_offering_selection() {
         let executor = Arc::new(CapturingModelExecutor::new());
         let spawner = test_spawner(executor.clone());
         let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
@@ -3578,16 +3594,19 @@ mod tests {
             "description": "Cross-model review",
             "prompt": "Review the latest commit",
             "agent_type": "general-purpose",
-            "model": "deepseek-v4-flash"
+            "model_selection": {"offering_id": "offer-deepseek-flash"}
         });
 
         let result = handle_agent_spawn_action(&args, Some(&ctx)).await;
 
         let completed = collect_spawn_receipt(&result, &ctx).await;
         assert_eq!(completed["status"], "completed", "{completed}");
+        assert_eq!(executor.take_captured_model(), None);
         assert_eq!(
-            executor.take_captured_model().as_deref(),
-            Some("deepseek-v4-flash")
+            executor
+                .take_captured_model_selection()
+                .map(|selection| selection.offering_id),
+            Some("offer-deepseek-flash".to_string())
         );
     }
 
@@ -3927,6 +3946,12 @@ mod tests {
         assert_eq!(
             executor.take_captured_model().as_deref(),
             Some("MiniMax-M2.7")
+        );
+        assert_eq!(
+            executor
+                .take_captured_model_selection()
+                .map(|selection| selection.offering_id),
+            Some("offer-parent-test".to_string())
         );
     }
 
@@ -4790,7 +4815,6 @@ mod tests {
             description: "Review storage".into(),
             prompt: "Review storage layer".into(),
             agent_type: None,
-            model: None,
             max_turns: None,
             max_output_tokens: None,
             complexity: None,
@@ -4829,7 +4853,6 @@ mod tests {
             description: "Review correctness".into(),
             prompt: "Review correctness deeply".into(),
             agent_type: None,
-            model: None,
             max_turns: None,
             max_output_tokens: None,
             complexity: None,
@@ -4865,7 +4888,6 @@ mod tests {
             description: "Investigate runtime".into(),
             prompt: "Investigate runtime failures".into(),
             agent_type: None,
-            model: None,
             max_turns: None,
             max_output_tokens: None,
             complexity: None,
@@ -4889,7 +4911,7 @@ mod tests {
     }
 
     #[test]
-    fn fanout_slot_omits_implicit_explore_budget_and_propagates_model() {
+    fn fanout_slot_omits_implicit_explore_budget() {
         let input = AgentFanoutStartInput {
             _action: Some("start".into()),
             _tool_call_id: None,
@@ -4904,7 +4926,6 @@ mod tests {
             description: "Fetch one source".into(),
             prompt: "Fetch one source and return its URL".into(),
             agent_type: None,
-            model: Some("deepseek-v4-flash".into()),
             max_turns: None,
             max_output_tokens: None,
             complexity: None,
@@ -4915,7 +4936,6 @@ mod tests {
         let args = fanout_slot_spawn_args(&input, slot, "fetch-1", "parallel fetch", 1, 0, None);
 
         assert_eq!(args["agent_type"], "explore");
-        assert_eq!(args["model"], "deepseek-v4-flash");
         assert!(
             args.get("max_turns").is_none(),
             "an implicit persona budget must remain a renewable child slice"
@@ -4941,7 +4961,6 @@ mod tests {
             description: "Review correctness".into(),
             prompt: "Review correctness and return evidence".into(),
             agent_type: None,
-            model: None,
             max_turns: None,
             max_output_tokens: None,
             complexity: None,

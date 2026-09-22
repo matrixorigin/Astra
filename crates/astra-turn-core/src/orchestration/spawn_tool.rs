@@ -1,6 +1,7 @@
 //! Spawn agent tool schema and types.
 
 use super::fanout_group::AgentFanoutSlotIdentity;
+use astra_turn_types::ModelSelection;
 use serde::{Deserialize, Serialize};
 /// Request to inherit the parent's cacheable prefix when spawning.
 ///
@@ -156,11 +157,11 @@ pub struct SpawnAgentInput {
     #[serde(default)]
     pub work_item: Option<WorkItemExecutionSpec>,
 
-    /// Explicit child model override. When absent, the child inherits the
-    /// parent's admitted model. This field is appended because the serialized
-    /// field order participates in fork-prefix schema identity.
+    /// Exact authorized Offering selected for this child. When absent, the
+    /// child inherits the parent's admitted Offering. Display names and model
+    /// aliases are not execution identities.
     #[serde(default)]
-    pub model: Option<String>,
+    pub model_selection: Option<ModelSelection>,
 }
 
 impl SpawnAgentInput {
@@ -256,7 +257,7 @@ impl Default for SpawnAgentInput {
             fanout_slot_index: None,
             fanout_slot_id: None,
             work_item: None,
-            model: None,
+            model_selection: None,
         }
     }
 }
@@ -489,11 +490,28 @@ mod tests {
     }
 
     #[test]
-    fn spawn_accepts_an_explicit_model_override_for_admitted_routing() {
-        let json = r#"{"description":"Test","prompt":"Do the thing","model":"gpt-4o"}"#;
+    fn spawn_accepts_an_exact_offering_for_admitted_routing() {
+        let json = r#"{"description":"Test","prompt":"Do the thing","model_selection":{"offering_id":"offer-gpt-4o"}}"#;
         let input = serde_json::from_str::<SpawnAgentInput>(json)
             .expect("an explicit child model override is part of the typed spawn contract");
-        assert_eq!(input.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(
+            input
+                .model_selection
+                .as_ref()
+                .map(|selection| selection.offering_id.as_str()),
+            Some("offer-gpt-4o")
+        );
+    }
+
+    #[test]
+    fn spawn_rejects_the_removed_model_name_override() {
+        let json = r#"{"description":"Test","prompt":"Do the thing","model":"gpt-4o"}"#;
+        let error = serde_json::from_str::<SpawnAgentInput>(json)
+            .expect_err("model names are not execution identities");
+        assert!(
+            error.to_string().contains("unknown field `model`"),
+            "{error}"
+        );
     }
 
     #[test]

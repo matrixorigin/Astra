@@ -746,13 +746,22 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 return Err(err);
             }
         };
-        let effective_model = self.resolve_effective_model(config.model.as_deref());
-        let model_selection = crate::cli::skill_subrun::resolve_subrun_model_selection(
-            &self.api,
-            &token,
-            effective_model.as_deref(),
-        )
-        .await?;
+        let inherited_model = self.resolve_effective_model(config.model.as_deref());
+        let model_selection = if let Some(selection) = config.model_selection.as_ref() {
+            crate::cli::session::session_runtime::resolve_server_offering_selection(
+                &self.api,
+                &token,
+                &selection.offering_id,
+            )
+            .await?
+        } else {
+            crate::cli::skill_subrun::resolve_subrun_model_selection(
+                &self.api,
+                &token,
+                inherited_model.as_deref(),
+            )
+            .await?
+        };
         let effective_model = Some(model_selection.name);
 
         let mut executor = edge_tools::ToolExecutor::new(&effective_root)
@@ -1842,6 +1851,7 @@ mod tests {
                 description: "Review token failure".into(),
                 task: "review".into(),
                 system_prompt_addendum: String::new(),
+                model_selection: None,
                 model: Some("test-model".into()),
                 initial_turns: 1,
                 hard_turn_limit: Some(1),
@@ -1909,6 +1919,7 @@ mod tests {
                 description: "Live output child".into(),
                 task: "Return one concise finding.".into(),
                 system_prompt_addendum: String::new(),
+                model_selection: None,
                 model: Some("mock-model".into()),
                 initial_turns: 1,
                 hard_turn_limit: Some(1),

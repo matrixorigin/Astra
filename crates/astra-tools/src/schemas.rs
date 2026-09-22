@@ -1904,7 +1904,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "description": {"type": "string", "description": "Short operation description when required by the selected action."},
                         "prompt": {"type": "string", "description": "Full child task brief for spawn. Non-empty and required with description."},
                         "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Sub-agent persona (spawn). Default: general-purpose."},
-                        "model": {"type": "string", "description": "Model override (spawn). Default: parent's model."},
+                        "model_selection": {
+                            "type": "object",
+                            "description": "Exact active Offering for this child. Omit to inherit the parent's admitted execution.",
+                            "properties": {"offering_id": {"type": "string", "minLength": 1, "maxLength": 64}},
+                            "required": ["offering_id"],
+                            "additionalProperties": false
+                        },
                         "name": {"type": "string", "description": "Action label when accepted by the selected action."},
                         "input": {"type": "object", "description": "Optional run_chain template input."},
                         "rollback_on_failure": {"type": "boolean", "description": "Rollback bounded chain mutations after failure."},
@@ -1947,7 +1953,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "send_message": ["to", "message"]
                     },
                     "x-astra-per-action-allowed": {
-                        "spawn": ["action", "description", "prompt", "agent_type", "model", "name", "max_turns", "max_output_tokens", "complexity", "isolated", "allowed_tools", "inherit_prefix", "work_item"],
+                        "spawn": ["action", "description", "prompt", "agent_type", "model_selection", "name", "max_turns", "max_output_tokens", "complexity", "isolated", "allowed_tools", "inherit_prefix", "work_item"],
                         "get_result": ["action", "agent_id"],
                         "run_chain": ["action", "name", "description", "steps", "input", "rollback_on_failure"],
                         "send_message": ["action", "to", "message", "message_type", "request_id"]
@@ -1991,7 +1997,6 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                     "description": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS, "description": "Short UI summary for this slot."},
                                     "prompt": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS, "description": "Concise child task brief. The child inherits current provider bindings and can use only its exposed tools; never paste file contents, diffs, or prior tool output here."},
                                     "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Child persona. Omit for bounded read-only explore; choose task/general-purpose explicitly for mutation or full-surface work."},
-                                    "model": {"type": "string"},
                                     "max_turns": {"type": "integer", "minimum": 1},
                                     "max_output_tokens": {"type": "integer"},
                                     "complexity": {"type": "string", "enum": ["light","normal","deep"]},
@@ -2007,7 +2012,6 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "additionalProperties": false,
                             "properties": {
                                 "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Shared child persona. Omit for bounded read-only explore; choose task/general-purpose explicitly for mutation or full-surface work."},
-                                "model": {"type": "string"},
                                 "max_turns": {"type": "integer", "minimum": 1},
                                 "max_output_tokens": {"type": "integer"},
                                 "complexity": {"type": "string", "enum": ["light","normal","deep"]},

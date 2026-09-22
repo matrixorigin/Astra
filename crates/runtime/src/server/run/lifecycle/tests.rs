@@ -4689,6 +4689,7 @@ fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunC
         description: "Test child task".to_string(),
         task: "do work".to_string(),
         system_prompt_addendum: String::new(),
+        model_selection: None,
         model: None,
         initial_turns: 3,
         hard_turn_limit: None,
@@ -6273,7 +6274,14 @@ async fn server_dynamic_child_becomes_a_valid_parent_for_grandchildren() {
     let root = executor.runtime_context_for_config(&child).await.unwrap();
     let child_constraints = spawn_child_request_constraints(&root.request_constraints, &child);
     executor
-        .register_child_runtime_context(&root, &child, child_constraints)
+        .register_child_runtime_context(
+            &root,
+            &child,
+            child_constraints,
+            root.admitted_model_execution
+                .clone()
+                .expect("root model admission"),
+        )
         .await
         .expect("publish child runtime context");
 
@@ -6314,6 +6322,55 @@ async fn server_dynamic_child_becomes_a_valid_parent_for_grandchildren() {
 }
 
 #[tokio::test]
+async fn server_spawn_inheritance_reuses_parent_model_admission_without_lookup() {
+    let executor = ServerSpawnAgentExecutor::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+    );
+    let parent = test_spawn_runtime_context("root-run", "user-a");
+    let expected = parent
+        .admitted_model_execution
+        .clone()
+        .expect("parent model admission");
+
+    let inherited = executor
+        .select_spawn_model_execution(&parent, None)
+        .await
+        .expect("omitted selection inherits");
+    let explicit_same = executor
+        .select_spawn_model_execution(
+            &parent,
+            Some(&ModelSelection {
+                offering_id: expected.offering_id.clone(),
+            }),
+        )
+        .await
+        .expect("same Offering reuses admission");
+
+    assert_eq!(inherited, expected);
+    assert_eq!(explicit_same, expected);
+}
+
+#[tokio::test]
+async fn server_spawn_cannot_inherit_when_parent_has_no_model_admission() {
+    let executor = ServerSpawnAgentExecutor::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+    );
+    let mut parent = test_spawn_runtime_context("root-run", "user-a");
+    parent.admitted_model_execution = None;
+
+    let error = executor
+        .select_spawn_model_execution(&parent, None)
+        .await
+        .expect_err("missing parent admission must fail closed");
+
+    assert!(error.contains("missing parent model admission"), "{error}");
+}
+
+#[tokio::test]
 async fn server_dynamic_child_controls_are_private_but_parent_cancellation_propagates() {
     let executor = ServerSpawnAgentExecutor::new(
         test_settings(),
@@ -6339,6 +6396,10 @@ async fn server_dynamic_child_controls_are_private_but_parent_cancellation_propa
             &parent,
             &child,
             spawn_child_request_constraints(&parent.request_constraints, &child),
+            parent
+                .admitted_model_execution
+                .clone()
+                .expect("parent model admission"),
         )
         .await
         .expect("publish child runtime context");
@@ -6367,6 +6428,10 @@ async fn server_dynamic_child_controls_are_private_but_parent_cancellation_propa
             &parent,
             &sibling,
             spawn_child_request_constraints(&parent.request_constraints, &sibling),
+            parent
+                .admitted_model_execution
+                .clone()
+                .expect("parent model admission"),
         )
         .await
         .expect("publish sibling runtime context");

@@ -33014,6 +33014,7 @@ mod tests {
             agent_id: "agent1".into(),
             delegation_chain: Vec::new(),
             current_model: Some("test-model".into()),
+            current_model_selection: None,
             recursion_depth: 0,
             is_fork_child: false,
             working_dir: work_dir.to_path_buf(),

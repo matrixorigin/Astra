@@ -6302,6 +6302,7 @@ mod tests {
             agent_id: "root-agent".into(),
             delegation_chain: Vec::new(),
             current_model: None,
+            current_model_selection: None,
             recursion_depth: 0,
             is_fork_child: false,
             working_dir: PathBuf::from("."),
