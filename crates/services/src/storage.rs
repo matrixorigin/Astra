@@ -8130,30 +8130,6 @@ pub async fn log_session_audit(
     }
 }
 
-pub async fn update_turn_skill_selection_version(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    event_id: &str,
-    user_id: &str,
-    session_id: &str,
-    skill_version: &str,
-) -> Result<(), sqlx::Error> {
-    let result = query(
-        "UPDATE skill_selection_events
-         SET skill_version = ?
-         WHERE event_id = ? AND user_id = ? AND session_id = ?",
-    )
-    .bind(skill_version)
-    .bind(event_id)
-    .bind(user_id)
-    .bind(session_id)
-    .execute(&mut **tx)
-    .await?;
-    if result.rows_affected() == 0 {
-        return Err(sqlx::Error::RowNotFound);
-    }
-    Ok(())
-}
-
 pub async fn resolve_active_skill_versions(
     pool: &sqlx::Pool<MySql>,
     skill_names: BTreeSet<&str>,

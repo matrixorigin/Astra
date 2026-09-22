@@ -89,6 +89,15 @@ Retention is a product contract:
   lock order. A caller's exact-owner/session/run locking read also establishes
   existence; it does not need a separate existence query in that transaction.
 - Data deletion must propagate to derived artifacts.
+- Decision audits and skill selections acquire canonical non-lazy session
+  admission in the same transaction as INSERT. Decision reference checks and
+  receipt decoding complete before commit; a receipt failure rolls back the
+  insert. Skill catalog resolution precedes BEGIN and the first selected
+  skill's resolved version is bound in INSERT, retaining the supplied version
+  when unresolved. Neither path allocates sequences or changes event counters;
+  an empty skill hook performs no database I/O. Their checked-out connection is
+  released only after completed commit or rollback; cancellation closes that
+  checkout. A lost commit acknowledgement still has an unknown outcome.
 
 ## Versioning
 

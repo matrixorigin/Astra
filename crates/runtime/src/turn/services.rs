@@ -66,6 +66,8 @@ pub struct DatabaseTurnToolEventWriter {
 #[derive(Clone, Debug)]
 pub struct DatabaseTurnHookDbWriter {
     pool: Option<SharedPool>,
+    #[cfg(feature = "e2e-hooks")]
+    retained_write_hook: Option<Arc<astra_services::decisions::RetainedWriteTestHook>>,
 }
 
 #[derive(Clone, Debug)]
@@ -118,8 +120,21 @@ impl DatabaseTurnToolEventWriter {
 }
 
 impl DatabaseTurnHookDbWriter {
+    #[cfg(feature = "e2e-hooks")]
+    pub fn with_retained_write_test_hook(
+        mut self,
+        hook: Arc<astra_services::decisions::RetainedWriteTestHook>,
+    ) -> Self {
+        self.retained_write_hook = Some(hook);
+        self
+    }
+
     pub fn new(_matrixone: MatrixOneSettings) -> Self {
-        Self { pool: None }
+        Self {
+            pool: None,
+            #[cfg(feature = "e2e-hooks")]
+            retained_write_hook: None,
+        }
     }
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.pool = Some(pool);
@@ -622,7 +637,7 @@ impl DatabaseTraceEventWriter {
 #[async_trait]
 impl TurnHookDbWriter for DatabaseTurnHookDbWriter {
     async fn persist(&self, plan: TurnHookDbPersistPlan) -> Result<(), String> {
-        let Some(skill_selection) = plan.skill_selection else {
+        let Some(mut skill_selection) = plan.skill_selection else {
             return Ok(());
         };
         let pool = self.get_pool()?;
@@ -640,25 +655,53 @@ impl TurnHookDbWriter for DatabaseTurnHookDbWriter {
         )
         .await
         .map_err(|error| error.to_string())?;
-        let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
-        insert_turn_skill_selection(&mut tx, &skill_selection)
-            .await
-            .map_err(|error| error.to_string())?;
         if let Some(first_skill_name) = skill_selection.selected_skills.first()
             && let Some(skill_version) = skill_versions.get(first_skill_name)
         {
-            update_turn_skill_selection_version(
-                &mut tx,
-                &skill_selection.event_id,
-                &skill_selection.user_id,
-                &skill_selection.session_id,
-                skill_version,
-            )
+            skill_selection.skill_version = Some(skill_version.clone());
+        }
+        let mut connection = astra_services::CancellationSafePoolConnection::acquire(&pool)
             .await
             .map_err(|error| error.to_string())?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|error| error.to_string())?;
+        let result = async {
+            astra_services::storage::admit_session_event_write(
+                &mut tx,
+                &skill_selection.session_id,
+                &skill_selection.user_id,
+                false,
+            )
+            .await?;
+            insert_turn_skill_selection(&mut tx, &skill_selection).await?;
+            #[cfg(feature = "e2e-hooks")]
+            if let Some(hook) = &self.retained_write_hook
+                && hook
+                    .after_insert(&skill_selection.user_id, &skill_selection.session_id)
+                    .await
+            {
+                return Err(sqlx::Error::Protocol(
+                    "injected retained write failure".into(),
+                ));
+            }
+            Ok::<(), sqlx::Error>(())
         }
-        tx.commit().await.map_err(|error| error.to_string())?;
-        Ok(())
+        .await;
+        match result {
+            Ok(()) => {
+                tx.commit().await.map_err(|error| error.to_string())?;
+                connection.release();
+                Ok(())
+            }
+            Err(error) => {
+                if tx.rollback().await.is_ok() {
+                    connection.release();
+                }
+                Err(error.to_string())
+            }
+        }
     }
 }
 

@@ -52,7 +52,6 @@ pub use self_model::introspection;
 pub(crate) use data_layer::storage::{
     ensure_core_schema, insert_core_turn_event, insert_tool_turn_event,
     insert_turn_skill_selection, resolve_active_skill_versions, update_snapshot_llm_ids,
-    update_turn_skill_selection_version,
 };
 
 // ── Public modules: runtime core ─────────────────────────────────────────────

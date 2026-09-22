@@ -384,7 +384,6 @@ pub use state_sync::{
 pub use storage::{
     CleanupResult, RetentionPolicy, cleanup_expired_data, database_user_from_row,
     ensure_core_schema, log_session_audit, resolve_active_skill_versions, session_record_from_row,
-    update_turn_skill_selection_version,
 };
 pub use sync_engine::{
     CloudTransport, DomainAdapter, DomainSyncResult, MergeResult, NoopTransport, PayloadFormat,

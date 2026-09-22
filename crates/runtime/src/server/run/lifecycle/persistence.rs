@@ -3706,6 +3706,22 @@ mod tests {
 
     #[tokio::test]
     async fn server_loop_empty_hook_skips_writer_and_selected_skill_is_retained() {
+        let database_writer =
+            crate::turn::services::DatabaseTurnHookDbWriter::new(MatrixOneSettings::default());
+        database_writer
+            .persist(TurnHookDbPersistPlan {
+                skill_selection: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            database_writer
+                .persist(TurnHookDbPersistPlan {
+                    skill_selection: Some(retained_skill_record("user-1", "session-1", "review")),
+                })
+                .await
+                .is_err()
+        );
         let writer = CaptureHookDbWriter::default();
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.final_text = "Ordinary answer".into();
@@ -3725,6 +3741,22 @@ mod tests {
         assert_eq!(skill.selected_skills, vec!["review".to_string()]);
         assert_eq!(skill.selection_method, "llm_skill_choice");
         assert_eq!(skill.execution_success, Some(1));
+    }
+
+    fn retained_skill_record(user: &str, session: &str, skill: &str) -> TurnSkillSelectionRecord {
+        TurnSkillSelectionRecord {
+            event_id: Uuid::new_v4().to_string(),
+            user_id: user.into(),
+            session_id: session.into(),
+            agent_id: None,
+            user_query: "retained write".into(),
+            selected_skills: vec![skill.into()],
+            skill_name: skill.into(),
+            skill_version: Some("supplied".into()),
+            selection_method: "llm_skill_choice".into(),
+            execution_success: Some(1),
+            execution_time_ms: None,
+        }
     }
 
     #[tokio::test]
@@ -3757,6 +3789,232 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(selected, ["review"]);
+        let skill = format!("retained-{}", Uuid::new_v4());
+        let skill_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO skills_registry (skill_id, skill_name, version, description, skill_definition, is_active, status, source, category, created_by) VALUES (?, ?, '2.0', 'retained test', '{}', 1, 'active', 'user', 'general', ?)")
+            .bind(&skill_id).bind(&skill).bind(&user).execute(pool.get()).await.unwrap();
+        let mut settings = pool.settings().clone();
+        settings.db_pool_max_connections = 1;
+        settings.db_pool_min_connections = 1;
+        let single = astra_core::SharedPool::new(&settings).await.unwrap();
+        let writer = crate::turn::services::DatabaseTurnHookDbWriter::new(settings.clone())
+            .with_pool(single.clone());
+        let other_user = Uuid::new_v4().to_string();
+        let other_session = Uuid::new_v4().to_string();
+        for (owner, sid) in [(&other_user, &session), (&user, &other_session)] {
+            crate::server::run::insert_active_run_session_fixture(&pool, owner, sid).await;
+        }
+        let original = retained_skill_record(&user, &session, &skill);
+        for (selected, expected) in [
+            (vec![skill.clone()], "2.0"),
+            (vec![format!("missing-{skill}"), skill.clone()], "supplied"),
+            (vec![], "supplied"),
+        ] {
+            let record = TurnSkillSelectionRecord {
+                event_id: Uuid::new_v4().to_string(),
+                selected_skills: selected,
+                ..original.clone()
+            };
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                writer.persist(TurnHookDbPersistPlan {
+                    skill_selection: Some(record.clone()),
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let version: String = sqlx::query_scalar(
+                "SELECT skill_version FROM skill_selection_events WHERE event_id = ?",
+            )
+            .bind(&record.event_id)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+            assert_eq!(version, expected);
+            for (owner, sid) in [
+                (&user, &session),
+                (&other_user, &session),
+                (&user, &other_session),
+            ] {
+                let replay = TurnSkillSelectionRecord {
+                    user_id: owner.clone(),
+                    session_id: sid.clone(),
+                    skill_version: Some("overwrite".into()),
+                    selected_skills: vec![],
+                    ..record.clone()
+                };
+                assert!(
+                    writer
+                        .persist(TurnHookDbPersistPlan {
+                            skill_selection: Some(replay)
+                        })
+                        .await
+                        .is_err()
+                );
+                assert_eq!(assert_session_event_count(pool.get(), owner, sid).await, 0);
+            }
+            let stored: (String, String, String) = sqlx::query_as("SELECT user_id, session_id, skill_version FROM skill_selection_events WHERE event_id = ?")
+                .bind(&record.event_id).fetch_one(pool.get()).await.unwrap();
+            assert_eq!(
+                stored,
+                (user.clone(), session.clone(), expected.to_string())
+            );
+        }
+        // The real receipt read shares the only checkout with admission/INSERT.
+        use astra_services::{ContextService, DecisionService, EventService};
+        let event = DatabaseEventService::new(settings.clone())
+            .with_pool(pool.clone())
+            .create_event(
+                user.clone(),
+                EventCreateRequestData {
+                    ingestion_source: astra_services::EventIngestionSource::Client,
+                    event_id: None,
+                    session_id: session.clone(),
+                    event_type: "retained_test".into(),
+                    content: "{}".into(),
+                    agent_id: None,
+                    agent_version: None,
+                    parent_event_id: None,
+                    parent_event_ids: None,
+                    causal_chain_id: None,
+                    metadata: None,
+                },
+            )
+            .await
+            .unwrap();
+        let snapshot = astra_services::DatabaseContextService::new(settings.clone())
+            .with_pool(pool.clone())
+            .create_snapshot(
+                user.clone(),
+                astra_services::SnapshotCreateRequestData {
+                    session_id: session.clone(),
+                    event_id: event.record.event_id.clone(),
+                    context_data: json!({"retained": true}),
+                },
+            )
+            .await
+            .unwrap();
+        let decision_service = astra_services::DatabaseDecisionService::new(settings.clone())
+            .with_pool(single.clone());
+        let request = astra_services::DecisionCreateRequestData {
+            session_id: session.clone(),
+            event_id: event.record.event_id.clone(),
+            context_capture_id: snapshot.context_capture_id,
+            decision_type: "retained_test".into(),
+            decision_output: json!({"ok": true}),
+            model_params: None,
+        };
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            decision_service.record_decision(user.clone(), request.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            assert_session_event_count(pool.get(), &user, &session).await,
+            1
+        );
+        for (owner, sid) in [(&other_user, &session), (&user, &other_session)] {
+            crate::server::run::cleanup_run_session_fixture(&pool, owner, sid).await;
+        }
+        let missing = TurnSkillSelectionRecord {
+            session_id: Uuid::new_v4().to_string(),
+            ..original.clone()
+        };
+        assert!(
+            writer
+                .persist(TurnHookDbPersistPlan {
+                    skill_selection: Some(missing)
+                })
+                .await
+                .is_err()
+        );
+        sqlx::query("UPDATE agent_session_lifecycle_fences SET delete_requested_at = NOW(6) WHERE user_id = ? AND session_id = ?")
+            .bind(&user).bind(&session).execute(pool.get()).await.unwrap();
+        assert!(
+            writer
+                .persist(TurnHookDbPersistPlan {
+                    skill_selection: Some(original.clone())
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            decision_service
+                .record_decision(user.clone(), request.clone())
+                .await
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::NOT_FOUND
+        );
+        use astra_services::SessionService;
+        astra_services::DatabaseSessionService::new(settings.clone())
+            .with_pool(pool.clone())
+            .delete_session(session.clone(), user.clone())
+            .await
+            .unwrap();
+        assert!(
+            writer
+                .persist(TurnHookDbPersistPlan {
+                    skill_selection: Some(original.clone())
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            decision_service
+                .record_decision(user.clone(), request.clone())
+                .await
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::NOT_FOUND
+        );
+        for table in [
+            "agent_sessions",
+            "skill_selection_events",
+            "ctx_decision_audits",
+        ] {
+            let count: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
+            ))
+            .bind(&user)
+            .bind(&session)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+            assert_eq!(count, 0, "{table}");
+        }
+        sqlx::query("DELETE FROM skills_registry WHERE skill_id = ?")
+            .bind(&skill_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        single.close().await;
+        assert_eq!(
+            decision_service
+                .record_decision(user.clone(), request)
+                .await
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "unavailable storage is not a missing session"
+        );
+        writer
+            .persist(TurnHookDbPersistPlan {
+                skill_selection: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            writer
+                .persist(TurnHookDbPersistPlan {
+                    skill_selection: Some(original)
+                })
+                .await
+                .is_err()
+        );
         sqlx::query("DELETE FROM skill_selection_events WHERE user_id = ? AND session_id = ?")
             .bind(&user)
             .bind(&session)
@@ -3782,6 +4040,406 @@ mod tests {
                 .is_err(),
             "positive control: a real skill write must still require the database"
         );
+    }
+
+    #[cfg(feature = "e2e-hooks")]
+    async fn wait_for_retained_fence_query(pool: &astra_core::SharedPool, connection_id: u64) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let queries: Vec<String> = sqlx::query_scalar(
+                    "SELECT info FROM information_schema.processlist WHERE db = ? AND conn_id = ? AND info IS NOT NULL",
+                ).bind(&pool.settings().database).bind(connection_id).fetch_all(pool.get()).await.unwrap();
+                if queries.iter().any(|query| query.contains("agent_session_lifecycle_fences")) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("observe the exact connection executing the blocked fence SQL");
+    }
+
+    #[cfg(feature = "e2e-hooks")]
+    async fn write_retained_fixture(
+        pool: astra_core::SharedPool,
+        user: String,
+        request: astra_services::DecisionCreateRequestData,
+        skill: TurnSkillSelectionRecord,
+        decision: bool,
+        hook: Option<Arc<astra_services::decisions::RetainedWriteTestHook>>,
+    ) -> Result<(), String> {
+        if decision {
+            use astra_services::DecisionService;
+            let mut writer = astra_services::DatabaseDecisionService::new(pool.settings().clone())
+                .with_pool(pool);
+            if let Some(hook) = hook {
+                writer = writer.with_retained_write_test_hook(hook);
+            }
+            writer
+                .record_decision(user, request)
+                .await
+                .map(|_| ())
+                .map_err(|error| {
+                    assert!(matches!(
+                        error.0,
+                        axum::http::StatusCode::NOT_FOUND
+                            | axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    ));
+                    error.1.0.detail
+                })
+        } else {
+            let mut writer =
+                crate::turn::services::DatabaseTurnHookDbWriter::new(pool.settings().clone())
+                    .with_pool(pool);
+            if let Some(hook) = hook {
+                writer = writer.with_retained_write_test_hook(hook);
+            }
+            writer
+                .persist(TurnHookDbPersistPlan {
+                    skill_selection: Some(skill),
+                })
+                .await
+        }
+    }
+
+    #[cfg(feature = "e2e-hooks")]
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1 and e2e-hooks"]
+    async fn retained_writers_order_delete_rollback_and_cancellation_on_live_matrixone() {
+        use astra_services::{ContextService, DecisionCreateRequestData, SessionService};
+        use tokio_util::task::AbortOnDropHandle;
+        // Bound setup, contended operations and cleanup together, below nextest's
+        // 15-second limit. Dropping the scenario also aborts its spawned writers.
+        tokio::time::timeout(Duration::from_secs(12), async {
+        let observer = setup_pool().await;
+        let mut settings = observer.settings().clone();
+        settings.db_pool_max_connections = 1;
+        settings.db_pool_min_connections = 1;
+        let worker = astra_core::SharedPool::new(&settings).await.unwrap();
+        let deleter = astra_core::SharedPool::new(&settings).await.unwrap();
+        let skill_name = format!("retained-race-{}", Uuid::new_v4());
+        let skill_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO skills_registry (skill_id, skill_name, version, is_active) VALUES (?, ?, '3.0', 1)")
+            .bind(&skill_id).bind(&skill_name).execute(observer.get()).await.unwrap();
+        for decision in [false, true] {
+            for outcome in [
+                "error",
+                "cancel",
+                "cancel_admission",
+                "writer_first",
+                "delete_first",
+            ] {
+                let user = Uuid::new_v4().to_string();
+                let session = Uuid::new_v4().to_string();
+                crate::server::run::insert_active_run_session_fixture(&observer, &user, &session)
+                    .await;
+                let event = DatabaseEventService::new(settings.clone())
+                    .with_pool(observer.clone())
+                    .create_event(
+                        user.clone(),
+                        EventCreateRequestData {
+                            ingestion_source: astra_services::EventIngestionSource::Client,
+                            event_id: None,
+                            session_id: session.clone(),
+                            event_type: "retained_race".into(),
+                            content: "{}".into(),
+                            agent_id: None,
+                            agent_version: None,
+                            parent_event_id: None,
+                            parent_event_ids: None,
+                            causal_chain_id: None,
+                            metadata: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let snapshot = astra_services::DatabaseContextService::new(settings.clone())
+                    .with_pool(observer.clone())
+                    .create_snapshot(
+                        user.clone(),
+                        astra_services::SnapshotCreateRequestData {
+                            session_id: session.clone(),
+                            event_id: event.record.event_id,
+                            context_data: json!({"race": outcome}),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let request = DecisionCreateRequestData {
+                    session_id: session.clone(),
+                    event_id: snapshot.event_id.clone(),
+                    context_capture_id: snapshot.context_capture_id,
+                    decision_type: "retained_race".into(),
+                    decision_output: json!({"ok": true}),
+                    model_params: None,
+                };
+                let skill = retained_skill_record(&user, &session, &skill_name);
+                if matches!(outcome, "delete_first" | "cancel_admission") {
+                    let connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+                        .fetch_one(worker.get())
+                        .await
+                        .unwrap();
+                    let mut holder = observer.get().begin().await.unwrap();
+                    admit_session_event_write(&mut holder, &session, &user, false)
+                        .await
+                        .unwrap();
+                    let task = AbortOnDropHandle::new(tokio::spawn(write_retained_fixture(
+                        worker.clone(),
+                        user.clone(),
+                        request.clone(),
+                        skill.clone(),
+                        decision,
+                        None,
+                    )));
+                    wait_for_retained_fence_query(&observer, connection_id).await;
+                    // Real writers for A/T and B/S must finish while A/S is fenced.
+                    for (independent_user, independent_session) in [
+                        (user.clone(), Uuid::new_v4().to_string()),
+                        (Uuid::new_v4().to_string(), session.clone()),
+                    ] {
+                        crate::server::run::insert_active_run_session_fixture(
+                            &observer,
+                            &independent_user,
+                            &independent_session,
+                        )
+                        .await;
+                        let event = DatabaseEventService::new(settings.clone())
+                            .with_pool(observer.clone())
+                            .create_event(
+                                independent_user.clone(),
+                                EventCreateRequestData {
+                                    ingestion_source: astra_services::EventIngestionSource::Client,
+                                    event_id: None,
+                                    session_id: independent_session.clone(),
+                                    event_type: "retained_independent".into(),
+                                    content: "{}".into(),
+                                    agent_id: None,
+                                    agent_version: None,
+                                    parent_event_id: None,
+                                    parent_event_ids: None,
+                                    causal_chain_id: None,
+                                    metadata: None,
+                                },
+                            )
+                            .await
+                            .unwrap();
+                        let independent_request = DecisionCreateRequestData {
+                            session_id: independent_session.clone(),
+                            event_id: event.record.event_id,
+                            context_capture_id: String::new(),
+                            ..request.clone()
+                        };
+                        tokio::time::timeout(
+                            Duration::from_secs(10),
+                            write_retained_fixture(
+                                observer.clone(),
+                                independent_user.clone(),
+                                independent_request,
+                                retained_skill_record(
+                                    &independent_user,
+                                    &independent_session,
+                                    &skill_name,
+                                ),
+                                decision,
+                                None,
+                            ),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        assert_eq!(
+                            assert_session_event_count(
+                                observer.get(),
+                                &independent_user,
+                                &independent_session
+                            )
+                            .await,
+                            1
+                        );
+                        // Deleting an unrelated identity must also make progress.
+                        tokio::time::timeout(
+                            Duration::from_secs(10),
+                            astra_services::DatabaseSessionService::new(settings.clone())
+                                .with_pool(observer.clone())
+                                .delete_session(independent_session, independent_user),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    }
+                    if outcome == "cancel_admission" {
+                        // Cancel during the observed MySQL exchange, not merely
+                        // at the post-INSERT test pause.
+                        task.abort();
+                        assert!(task.await.unwrap_err().is_cancelled());
+                        holder.rollback().await.unwrap();
+                    } else {
+                        sqlx::query("UPDATE agent_session_lifecycle_fences SET delete_requested_at = NOW(6) WHERE user_id = ? AND session_id = ?")
+                            .bind(&user).bind(&session).execute(&mut *holder).await.unwrap();
+                        holder.commit().await.unwrap();
+                        assert!(
+                            tokio::time::timeout(Duration::from_secs(10), task)
+                                .await
+                                .unwrap()
+                                .unwrap()
+                                .is_err()
+                        );
+                        assert_eq!(
+                            assert_session_event_count(worker.get(), &user, &session).await,
+                            1
+                        );
+                    }
+                } else {
+                    let hook = Arc::new(astra_services::decisions::RetainedWriteTestHook {
+                        user_id: user.clone(),
+                        session_id: session.clone(),
+                        inserted: Notify::new(),
+                        resume: Notify::new(),
+                        fail: outcome == "error",
+                    });
+                    let task = AbortOnDropHandle::new(tokio::spawn(write_retained_fixture(
+                        worker.clone(),
+                        user.clone(),
+                        request.clone(),
+                        skill.clone(),
+                        decision,
+                        Some(hook.clone()),
+                    )));
+                    tokio::time::timeout(Duration::from_secs(10), hook.inserted.notified())
+                        .await
+                        .unwrap();
+                    if outcome == "writer_first" {
+                        let connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+                            .fetch_one(deleter.get())
+                            .await
+                            .unwrap();
+                        let service = astra_services::DatabaseSessionService::new(settings.clone())
+                            .with_pool(deleter.clone());
+                        let sid = session.clone();
+                        let uid = user.clone();
+                        let deletion = AbortOnDropHandle::new(
+                            tokio::spawn(async move { service.delete_session(sid, uid).await }));
+                        wait_for_retained_fence_query(&observer, connection_id).await;
+                        hook.resume.notify_one();
+                        tokio::time::timeout(Duration::from_secs(10), task)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .unwrap();
+                        tokio::time::timeout(Duration::from_secs(10), deletion)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .unwrap();
+                    } else {
+                        if outcome == "cancel" {
+                            task.abort();
+                            assert!(task.await.unwrap_err().is_cancelled());
+                        } else {
+                            hook.resume.notify_one();
+                            let error = tokio::time::timeout(Duration::from_secs(10), task)
+                                .await
+                                .unwrap()
+                                .unwrap()
+                                .unwrap_err();
+                            assert!(
+                                error.contains(if decision {
+                                    "model_params"
+                                } else {
+                                    "injected retained write failure"
+                                }),
+                                "{error}"
+                            );
+                        }
+                    }
+                }
+                if matches!(outcome, "error" | "cancel" | "cancel_admission") {
+                        // Both cancellation points and receipt failure must leave
+                        // the same single-connection pool reusable and no stray rows.
+                        {
+                            let mut tx = worker.get().begin().await.unwrap();
+                            admit_session_event_write(&mut tx, &session, &user, false)
+                                .await
+                                .unwrap();
+                            tx.rollback().await.unwrap();
+                        }
+                        for table in ["skill_selection_events", "ctx_decision_audits"] {
+                            let count: i64 = sqlx::query_scalar(&format!(
+                                "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
+                            ))
+                            .bind(&user)
+                            .bind(&session)
+                            .fetch_one(worker.get())
+                            .await
+                            .unwrap();
+                            assert_eq!(count, 0, "{decision}/{outcome}/{table}");
+                        }
+                        assert_eq!(
+                            assert_session_event_count(worker.get(), &user, &session).await,
+                            1
+                        );
+                        tokio::time::timeout(
+                            Duration::from_secs(10),
+                            write_retained_fixture(
+                                worker.clone(),
+                                user.clone(),
+                                request.clone(),
+                                skill.clone(),
+                                decision,
+                                None,
+                            ),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        assert_eq!(
+                            assert_session_event_count(worker.get(), &user, &session).await,
+                            1
+                        );
+                }
+                if outcome != "writer_first" {
+                    astra_services::DatabaseSessionService::new(settings.clone())
+                        .with_pool(observer.clone())
+                        .delete_session(session.clone(), user.clone())
+                        .await
+                        .unwrap();
+                }
+                assert!(
+                    write_retained_fixture(
+                        worker.clone(),
+                        user.clone(),
+                        request,
+                        skill,
+                        decision,
+                        None
+                    )
+                    .await
+                    .is_err()
+                );
+                for table in [
+                    "agent_sessions",
+                    "skill_selection_events",
+                    "ctx_decision_audits",
+                ] {
+                    let count: i64 = sqlx::query_scalar(&format!(
+                        "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
+                    ))
+                    .bind(&user)
+                    .bind(&session)
+                    .fetch_one(observer.get())
+                    .await
+                    .unwrap();
+                    assert_eq!(count, 0, "{decision}/{outcome}/{table}");
+                }
+            }
+        }
+        sqlx::query("DELETE FROM skills_registry WHERE skill_id = ?")
+            .bind(&skill_id)
+            .execute(observer.get())
+            .await
+            .unwrap();
+        worker.close().await;
+        deleter.close().await;
+        observer.close().await;
+        }).await.expect("retained-write scenarios, including setup and cleanup, must finish");
     }
 
     #[tokio::test]

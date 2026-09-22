@@ -6,8 +6,9 @@ use uuid::Uuid;
 
 use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
+use crate::CancellationSafePoolConnection;
 use crate::pagination::MAX_API_LIST_LIMIT;
-use crate::storage::{agent_event_exists_for_user_session, agent_session_exists_for_user};
+use crate::storage::admit_session_event_write;
 
 // ── Data types ───────────────────────────────────────────────────────────────
 
@@ -161,13 +162,50 @@ pub trait DecisionService: Send + Sync {
 pub struct DatabaseDecisionService {
     matrixone: MatrixOneSettings,
     pool: Option<SharedPool>,
+    #[cfg(feature = "e2e-hooks")]
+    retained_write_hook: Option<std::sync::Arc<RetainedWriteTestHook>>,
+}
+
+/// Instance-local, exact-owner/session pause after a real retained INSERT.
+/// Available only to opt-in database tests; it does not replace persistence.
+#[cfg(feature = "e2e-hooks")]
+#[derive(Debug)]
+pub struct RetainedWriteTestHook {
+    pub user_id: String,
+    pub session_id: String,
+    pub inserted: tokio::sync::Notify,
+    pub resume: tokio::sync::Notify,
+    pub fail: bool,
+}
+
+#[cfg(feature = "e2e-hooks")]
+impl RetainedWriteTestHook {
+    pub async fn after_insert(&self, user_id: &str, session_id: &str) -> bool {
+        if self.user_id != user_id || self.session_id != session_id {
+            return false;
+        }
+        self.inserted.notify_one();
+        self.resume.notified().await;
+        self.fail
+    }
 }
 
 impl DatabaseDecisionService {
+    #[cfg(feature = "e2e-hooks")]
+    pub fn with_retained_write_test_hook(
+        mut self,
+        hook: std::sync::Arc<RetainedWriteTestHook>,
+    ) -> Self {
+        self.retained_write_hook = Some(hook);
+        self
+    }
+
     pub fn new(matrixone: MatrixOneSettings) -> Self {
         Self {
             matrixone,
             pool: None,
+            #[cfg(feature = "e2e-hooks")]
+            retained_write_hook: None,
         }
     }
 
@@ -260,87 +298,136 @@ impl DecisionService for DatabaseDecisionService {
         request: DecisionCreateRequestData,
     ) -> Result<DecisionRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
-
-        if !agent_session_exists_for_user(&pool, &request.session_id, &user_id)
-            .await
-            .map_err(internal_error)?
-        {
-            return Err(error_response(
-                StatusCode::NOT_FOUND,
-                format!("Session {} not found", request.session_id),
-            ));
-        }
-        if !agent_event_exists_for_user_session(
-            &pool,
-            &request.event_id,
-            &request.session_id,
-            &user_id,
-        )
-        .await
-        .map_err(internal_error)?
-        {
-            return Err(error_response(
-                StatusCode::NOT_FOUND,
-                format!("Event {} not found", request.event_id),
-            ));
-        }
-        if !request.context_capture_id.trim().is_empty() {
-            let row = query(
-                "SELECT 1 AS owned FROM ctx_snapshots \
-                 WHERE context_capture_id = ? AND session_id = ? AND user_id = ? LIMIT 1",
-            )
-            .bind(&request.context_capture_id)
-            .bind(&request.session_id)
-            .bind(&user_id)
-            .fetch_optional(&pool)
+        let mut connection = CancellationSafePoolConnection::acquire(&pool)
             .await
             .map_err(internal_error)?;
-            if row.is_none() {
+        let mut tx = connection.begin().await.map_err(internal_error)?;
+        let result = async {
+            admit_session_event_write(&mut tx, &request.session_id, &user_id, false)
+                .await
+                .map_err(|error| match error {
+                    sqlx::Error::RowNotFound => error_response(
+                        StatusCode::NOT_FOUND,
+                        format!("Session {} not found", request.session_id),
+                    ),
+                    error => internal_error(error),
+                })?;
+            let mut references = QueryBuilder::<MySql>::new(
+                "SELECT EXISTS(SELECT 1 FROM agent_events WHERE event_id = ",
+            );
+            references
+                .push_bind(&request.event_id)
+                .push(" AND session_id = ")
+                .push_bind(&request.session_id)
+                .push(" AND user_id = ")
+                .push_bind(&user_id)
+                .push(") AS event_owned");
+            let validate_snapshot = !request.context_capture_id.trim().is_empty();
+            if validate_snapshot {
+                references
+                    .push(", EXISTS(SELECT 1 FROM ctx_snapshots WHERE context_capture_id = ")
+                    .push_bind(&request.context_capture_id)
+                    .push(" AND session_id = ")
+                    .push_bind(&request.session_id)
+                    .push(" AND user_id = ")
+                    .push_bind(&user_id)
+                    .push(") AS snapshot_owned");
+            }
+            let references = references
+                .build()
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(internal_error)?;
+            if !references
+                .try_get::<bool, _>("event_owned")
+                .map_err(internal_error)?
+            {
+                return Err(error_response(
+                    StatusCode::NOT_FOUND,
+                    format!("Event {} not found", request.event_id),
+                ));
+            }
+            if validate_snapshot
+                && !references
+                    .try_get::<bool, _>("snapshot_owned")
+                    .map_err(internal_error)?
+            {
                 return Err(error_response(
                     StatusCode::NOT_FOUND,
                     format!("Snapshot {} not found", request.context_capture_id),
                 ));
             }
-        }
 
-        let decision_id = Uuid::new_v4().to_string();
-        let output_str = request.decision_output.to_string();
-        let params_str = request
-            .model_params
-            .as_ref()
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "{}".to_string());
+            let decision_id = Uuid::new_v4().to_string();
+            let output_str = request.decision_output.to_string();
+            let params_str = request
+                .model_params
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "{}".to_string());
 
-        query(
-            "INSERT INTO ctx_decision_audits \
-             (decision_id, user_id, session_id, event_id, context_capture_id, decision_type, \
-              decision_output, model_params, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())",
-        )
-        .bind(&decision_id)
-        .bind(&user_id)
-        .bind(&request.session_id)
-        .bind(&request.event_id)
-        .bind(&request.context_capture_id)
-        .bind(&request.decision_type)
-        .bind(&output_str)
-        .bind(&params_str)
-        .execute(&pool)
-        .await
-        .map_err(internal_error)?;
-
-        let select_sql = format!(
-            "SELECT {} FROM ctx_decision_audits WHERE decision_id = ? AND user_id = ?",
-            DECISION_SELECT_COLS
-        );
-        let row = query(&select_sql)
+            query(
+                "INSERT INTO ctx_decision_audits \
+                 (decision_id, user_id, session_id, event_id, context_capture_id, decision_type, \
+                  decision_output, model_params, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+            )
             .bind(&decision_id)
             .bind(&user_id)
-            .fetch_one(&pool)
+            .bind(&request.session_id)
+            .bind(&request.event_id)
+            .bind(&request.context_capture_id)
+            .bind(&request.decision_type)
+            .bind(&output_str)
+            .bind(&params_str)
+            .execute(&mut *tx)
             .await
             .map_err(internal_error)?;
 
-        Self::decision_record_from_row(row)
+            let select_sql = format!(
+                "SELECT {} FROM ctx_decision_audits WHERE decision_id = ? AND user_id = ?",
+                DECISION_SELECT_COLS
+            );
+            #[cfg(feature = "e2e-hooks")]
+            if let Some(hook) = &self.retained_write_hook
+                && hook.after_insert(&user_id, &request.session_id).await
+            {
+                // Exercise the real receipt decoder and rollback, after INSERT.
+                query(
+                    "UPDATE ctx_decision_audits SET model_params = NULL \
+                     WHERE decision_id = ? AND user_id = ?",
+                )
+                .bind(&decision_id)
+                .bind(&user_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(internal_error)?;
+            }
+            let row = query(&select_sql)
+                .bind(&decision_id)
+                .bind(&user_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(internal_error)?;
+
+            Self::decision_record_from_row(row)
+        }
+        .await;
+        match result {
+            Ok(record) => {
+                tx.commit().await.map_err(internal_error)?;
+                connection.release();
+                Ok(record)
+            }
+            Err(error) => {
+                // Keep the primary error even if rollback fails. The armed
+                // guard closes the checkout on cancellation or uncertain I/O.
+                if tx.rollback().await.is_ok() {
+                    connection.release();
+                }
+                Err(error)
+            }
+        }
     }
 
     async fn list_decisions(
