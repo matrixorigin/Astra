@@ -1216,6 +1216,12 @@ pub trait SpawnAgentExecutor: Send + Sync {
     where
         Self: 'static,
     {
+        if inputs
+            .iter()
+            .any(|input| input.model_selection.is_some() || input.reasoning.is_some())
+        {
+            return Err("this execution boundary cannot pre-admit per-slot model or reasoning selections for an atomic fanout".to_string());
+        }
         Ok(inputs
             .iter()
             .map(|_| {

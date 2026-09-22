@@ -1,0 +1,58 @@
+name: flash_fanout_invalid_final_slot
+description: |
+  A final-slot Offering that cannot be admitted must reject the entire group.
+  Durable agent_spawned absence proves no earlier valid slot leaked through.
+prompt: |
+  Call agent_fanout.start exactly once with target_count 2. Use description
+  "first slot" for slot 0 and "second slot" for slot 1. Slot 0 asks for
+  the exact reply FLASH-VALID-SLOT and inherits your model. Slot 1 asks for
+  FLASH-INVALID-SLOT and explicitly sets model_selection to
+  {"offering_id":"invalid-offering-no-such-id"}. Both slots are explore.
+  Do not retry, replace, or launch separate agents. Report the admission
+  failure without claiming either slot ran.
+debug_log: true
+capability: delegation
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: agent_fanout
+    min: 1
+    max: 1
+    document: arguments
+    path: /action
+    equals: start
+  - type: journal_tool_json
+    name: agent_fanout
+    document: arguments
+    path: /target_count
+    equals: 2
+  - type: journal_tool_json
+    name: agent_fanout
+    document: arguments
+    path: /slots/0/description
+    equals: first slot
+  - type: journal_tool_json
+    name: agent_fanout
+    document: arguments
+    path: /slots/1/model_selection/offering_id
+    equals: invalid-offering-no-such-id
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /status
+    equals: failed
+  - type: journal_tool_json_contains
+    name: agent_fanout
+    document: result
+    path: /error
+    contains: "Offering 'invalid-offering-no-such-id' is not available"
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 0
+    max: 0
+  - type: session_event_count
+    event_type: agent_terminated
+    min: 0
+    max: 0

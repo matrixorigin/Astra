@@ -119,6 +119,9 @@ pub enum Criterion {
         event_type: String,
         #[serde(default = "default_event_min")]
         min: u32,
+        /// Optional upper bound; `min: 0, max: 0` proves absence.
+        #[serde(default)]
+        max: Option<u32>,
         /// When true, skip-pass when session is unavailable. Use
         /// sparingly — only for cases that are meaningful even
         /// without the journal check.
@@ -1643,6 +1646,7 @@ fn evaluate_one(
         Criterion::SessionEventCount {
             event_type,
             min,
+            max,
             optional,
         } => {
             let Some(sess) = session else {
@@ -1673,12 +1677,15 @@ fn evaluate_one(
                 };
             };
             let n = sess.count_events(event_type);
-            let pass = n as u32 >= *min;
+            let pass = n as u32 >= *min && max.is_none_or(|max| n as u32 <= max);
             CriterionResult {
                 criterion: c.clone(),
                 severity: criterion_severity(c),
                 passed: pass,
-                detail: format!("session events type={event_type} count={n} (expected >= {min})"),
+                detail: format!(
+                    "session events type={event_type} count={n} (expected {min}..={})",
+                    max.map_or("unbounded".to_string(), |max| max.to_string())
+                ),
                 full_detail: None,
                 score: if pass { Some(1.0) } else { Some(0.0) },
             }
@@ -4480,13 +4487,18 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             Ok(())
         }
         Criterion::SessionEventCount {
-            min, event_type, ..
+            min,
+            max,
+            event_type,
+            ..
         } => {
-            if *min == 0 {
+            if *min == 0 && max.is_none() {
                 return Err(format!(
-                    "SessionEventCount.min must be >= 1 (min=0 is trivially-true for \
-                     event_type={event_type:?}; did you mean >= 1?)"
+                    "SessionEventCount with min=0 requires max for event_type={event_type:?}"
                 ));
+            }
+            if max.is_some_and(|max| max < *min) {
+                return Err("SessionEventCount.max must be >= min".into());
             }
             Ok(())
         }
@@ -5329,6 +5341,7 @@ mod tests {
             &[Criterion::SessionEventCount {
                 event_type: "llm_round".into(),
                 min: 2,
+                max: None,
                 optional: false,
             }],
             &out,
@@ -5348,6 +5361,7 @@ mod tests {
             &[Criterion::SessionEventCount {
                 event_type: "llm_round".into(),
                 min: 2,
+                max: None,
                 optional: false,
             }],
             &out,
@@ -5364,6 +5378,7 @@ mod tests {
             &[Criterion::SessionEventCount {
                 event_type: "llm_round".into(),
                 min: 2,
+                max: None,
                 optional: true,
             }],
             &out,
@@ -7603,14 +7618,40 @@ mod tests {
     }
 
     #[test]
-    fn validate_session_event_count_rejects_min_zero() {
+    fn validate_session_event_count_rejects_unbounded_min_zero() {
         let err = validate_criterion(&Criterion::SessionEventCount {
             event_type: "llm_round".into(),
             min: 0,
+            max: None,
             optional: false,
         })
         .expect_err("min=0 is trivially-true — should reject");
-        assert!(err.contains("min must be >= 1"));
+        assert!(err.contains("min=0 requires max"));
+    }
+
+    #[test]
+    fn session_event_count_can_prove_no_child_start() {
+        let session = mk_session(&[("llm_round", serde_json::json!({}))]);
+        let criterion = Criterion::SessionEventCount {
+            event_type: "agent_spawned".into(),
+            min: 0,
+            max: Some(0),
+            optional: false,
+        };
+        validate_criterion(&criterion).expect("bounded absence check");
+        let result = evaluate_deterministic_with_session(
+            &[criterion.clone()],
+            &outcome_with_tools(&[]),
+            Some(&session),
+        );
+        assert!(result[0].passed, "{}", result[0].detail);
+        let started = mk_session(&[("agent_spawned", serde_json::json!({}))]);
+        let result = evaluate_deterministic_with_session(
+            &[criterion],
+            &outcome_with_tools(&[]),
+            Some(&started),
+        );
+        assert!(!result[0].passed, "{}", result[0].detail);
     }
 
     #[test]

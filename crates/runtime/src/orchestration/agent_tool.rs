@@ -890,6 +890,10 @@ struct AgentFanoutStartSlot {
     isolated: Option<bool>,
     #[serde(default)]
     allowed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    model_selection: Option<astra_turn_types::ModelSelection>,
+    #[serde(default)]
+    reasoning: Option<astra_turn_core::orchestration_spawn_tool::ReasoningSelection>,
 }
 
 /// Shared runtime configuration defaults for all slots in a fanout group.
@@ -911,6 +915,10 @@ struct AgentFanoutDefaults {
     isolated: Option<bool>,
     #[serde(default)]
     allowed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    model_selection: Option<astra_turn_types::ModelSelection>,
+    #[serde(default)]
+    reasoning: Option<astra_turn_core::orchestration_spawn_tool::ReasoningSelection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -966,6 +974,8 @@ const FANOUT_DEFAULTS_FIELDS: &[&str] = &[
     "complexity",
     "isolated",
     "allowed_tools",
+    "model_selection",
+    "reasoning",
 ];
 const FANOUT_SLOT_FIELDS: &[&str] = &[
     "id",
@@ -977,6 +987,8 @@ const FANOUT_SLOT_FIELDS: &[&str] = &[
     "complexity",
     "isolated",
     "allowed_tools",
+    "model_selection",
+    "reasoning",
 ];
 const FANOUT_GET_RESULTS_FIELDS: &[&str] = &[
     "action",
@@ -988,7 +1000,7 @@ const FANOUT_GET_RESULTS_FIELDS: &[&str] = &[
 ];
 const FANOUT_STOP_SLOT_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id", "slot_index"];
 const FANOUT_STOP_GROUP_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id"];
-const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"}],\"defaults\":{\"agent_type\":\"code-review\"}}. Put concise work instructions in each slots[i].prompt. If no agent_type is supplied at slot or defaults level, fanout uses the bounded read-only `explore` persona; request `task` or `general-purpose` explicitly when a child must mutate or use the full surface. Children inherit the current execution binding and can use only tools exposed in their own tool surfaces; do not start workspace-dependent slots while the workspace provider is unavailable. Never paste file contents, diffs, or prior tool output. There is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. A per-slot tool allowlist, when truly required, is named `allowed_tools`; `tools` is not a valid field. Fanout waits for accepted children by default; only an explicit user Ctrl+B action moves the live group to the background. Do not pass run_in_background.";
+const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"}],\"defaults\":{\"agent_type\":\"code-review\"}}. Put concise work instructions in each slots[i].prompt. If no agent_type is supplied at slot or defaults level, fanout uses the bounded read-only `explore` persona; request `task` or `general-purpose` explicitly when a child must mutate or use the full surface. Children inherit the parent Offering unless an exact model_selection is set in a slot or defaults; reasoning is a separate control. A boundary without atomic model admission rejects these overrides before any child starts. Children can use only tools exposed in their own tool surfaces; do not start workspace-dependent slots while the workspace provider is unavailable. Never paste file contents, diffs, or prior tool output. There is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. A per-slot tool allowlist, when truly required, is named `allowed_tools`; `tools` is not a valid field. Fanout waits for accepted children by default; only an explicit user Ctrl+B action moves the live group to the background. Do not pass run_in_background.";
 const FANOUT_GET_RESULTS_SHAPE: &str = "Use one JSON object: {\"action\":\"get_results\",\"group_id\":\"returned-group-id\"}. For large results, use {\"action\":\"get_results\",\"group_id\":\"returned-group-id\",\"slot_index\":0,\"offset\":0,\"max_bytes\":8192}.";
 const FANOUT_STOP_SLOT_SHAPE: &str = "Use one JSON object: {\"action\":\"stop_slot\",\"group_id\":\"returned-group-id\",\"slot_index\":0}.";
 const FANOUT_STOP_GROUP_SHAPE: &str =
@@ -2236,6 +2248,18 @@ fn fanout_slot_spawn_args(
         slot.isolated.or_else(|| defaults.and_then(|d| d.isolated)),
     );
     insert_optional_string(object, "fanout_slot_id", slot.slot_id);
+    if let Some(selection) = slot
+        .model_selection
+        .or_else(|| defaults.and_then(|d| d.model_selection.clone()))
+    {
+        object.insert("model_selection".to_string(), json!(selection));
+    }
+    if let Some(reasoning) = slot
+        .reasoning
+        .or_else(|| defaults.and_then(|d| d.reasoning.clone()))
+    {
+        object.insert("reasoning".to_string(), json!(reasoning));
+    }
     if let Some(allowed_tools) = slot
         .allowed_tools
         .or_else(|| defaults.and_then(|d| d.allowed_tools.clone()))
@@ -4947,6 +4971,8 @@ mod tests {
             complexity: None,
             isolated: None,
             allowed_tools: None,
+            model_selection: None,
+            reasoning: None,
         };
 
         let args = fanout_slot_spawn_args(&input, slot, "review-1", "review fanout", 3, 1, None);
@@ -4957,6 +4983,63 @@ mod tests {
         assert_eq!(args["fanout_slot_index"], 1);
         assert_eq!(args["fanout_slot_id"], "storage");
         assert!(args.get("name").is_none());
+    }
+
+    #[test]
+    fn fanout_model_and_reasoning_resolve_slot_over_shared_default() {
+        let mut input: AgentFanoutStartInput = serde_json::from_value(json!({
+            "action": "start",
+            "target_count": 2,
+            "defaults": {
+                "model_selection": {"offering_id": "shared"},
+                "reasoning": {"mode": "adaptive", "effort": "low"}
+            },
+            "slots": [
+                {"description": "shared", "prompt": "one"},
+                {"description": "override", "prompt": "two",
+                 "model_selection": {"offering_id": "specific"},
+                 "reasoning": {"mode": "model_default"}}
+            ]
+        }))
+        .expect("typed fanout selection");
+        let override_input = input.slots.pop().expect("override slot");
+        let shared_input = input.slots.pop().expect("shared slot");
+        let shared = fanout_slot_spawn_args(&input, shared_input, "group", "group", 2, 0, None);
+        let override_slot =
+            fanout_slot_spawn_args(&input, override_input, "group", "group", 2, 1, None);
+        assert_eq!(shared["model_selection"]["offering_id"], "shared");
+        assert_eq!(shared["reasoning"]["effort"], "low");
+        assert_eq!(override_slot["model_selection"]["offering_id"], "specific");
+        assert_eq!(override_slot["reasoning"]["mode"], "model_default");
+        assert!(
+            serde_json::from_value::<AgentFanoutStartInput>(json!({
+                "action": "start", "target_count": 1,
+                "slots": [{"description": "bad", "prompt": "bad", "model": "unresolved-alias"}]
+            }))
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_model_override_rejects_non_admitting_executor_before_group_creation() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner.clone(), Some("parent-model"));
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "start", "target_count": 2,
+                "slots": [
+                    {"description": "one", "prompt": "one"},
+                    {"description": "two", "prompt": "two",
+                     "model_selection": {"offering_id": "specific"}}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        assert!(result.contains("cannot pre-admit"), "{result}");
+        assert!(spawner.list_fanout_groups().await.is_empty());
+        assert_eq!(executor.take_captured_model(), None);
     }
 
     #[test]
@@ -4985,6 +5068,8 @@ mod tests {
             complexity: None,
             isolated: None,
             allowed_tools: None,
+            model_selection: None,
+            reasoning: None,
         };
 
         let args = fanout_slot_spawn_args(&input, slot, "review-1", "review fanout", 4, 1, None);
@@ -5020,6 +5105,8 @@ mod tests {
             complexity: None,
             isolated: None,
             allowed_tools: None,
+            model_selection: None,
+            reasoning: None,
         };
 
         let args = fanout_slot_spawn_args(
@@ -5058,6 +5145,8 @@ mod tests {
             complexity: None,
             isolated: None,
             allowed_tools: None,
+            model_selection: None,
+            reasoning: None,
         };
 
         let args = fanout_slot_spawn_args(&input, slot, "fetch-1", "parallel fetch", 1, 0, None);
@@ -5093,6 +5182,8 @@ mod tests {
             complexity: None,
             isolated: None,
             allowed_tools: None,
+            model_selection: None,
+            reasoning: None,
         };
 
         let args = fanout_slot_spawn_args(

@@ -216,7 +216,7 @@ focus without duplicating the whole scripted journey.
 | `text_json_path_absent { path }`                    | selected JSON pointer is absent (`null` is still present)      | envelope |
 | `text_json_dag { nodes_path, node_id_path, node_required_string_paths?, edges_path, predecessor_path, successor_path }` | required node strings are non-empty, endpoints are unique/resolved, and the graph is acyclic | envelope |
 | `fork_cache_outcome { expect }`                     | `[fork-cache]` event `outcome` ∈ `expect`                    | stderr      |
-| `session_event_count { event_type, min, optional }` | journal has ≥ `min` events of that type                      | journal     |
+| `session_event_count { event_type, min, max?, optional }` | journal event count is within bounds; `min: 0, max: 0` proves absence | journal |
 | `journal_tool_called { name, optional }`            | tool name appears in journal `tool_calls`                    | journal     |
 | `journal_turn_tool_hidden { name }`                 | tool is absent from every canonical coordinator tool surface | journal     |
 | `journal_tool_call_count { name, min, max }`        | complete durable calls for `name` are within the range       | journal     |

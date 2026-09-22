@@ -6434,6 +6434,19 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
             .is_err(),
         "one unsupported reasoning control must reject the whole batch"
     );
+
+    let mut invalid_offering = unsupported;
+    invalid_offering[1].reasoning = None;
+    invalid_offering[1].model_selection = Some(astra_turn_types::ModelSelection {
+        offering_id: String::new(),
+    });
+    assert!(
+        Arc::clone(&executor)
+            .prepare_batch(&invalid_offering, &context)
+            .await
+            .is_err(),
+        "an invalid final-slot Offering must reject the whole batch"
+    );
 }
 
 #[tokio::test]

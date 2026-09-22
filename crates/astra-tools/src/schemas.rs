@@ -1293,6 +1293,25 @@ macro_rules! heap_schema_vec {
     }};
 }
 
+fn fanout_model_selection_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"offering_id": {"type": "string", "minLength": 1, "maxLength": 64}},
+        "required": ["offering_id"],
+        "additionalProperties": false
+    })
+}
+
+fn fanout_reasoning_schema() -> Value {
+    json!({
+        "oneOf": [
+            {"type": "object", "properties": {"mode": {"const": "model_default"}}, "required": ["mode"], "additionalProperties": false},
+            {"type": "object", "properties": {"mode": {"const": "off"}}, "required": ["mode"], "additionalProperties": false},
+            {"type": "object", "properties": {"mode": {"const": "adaptive"}, "effort": {"type": "string", "enum": ["low", "medium", "high", "max"]}}, "required": ["mode", "effort"], "additionalProperties": false}
+        ]
+    })
+}
+
 fn all_tool_schemas_core() -> Vec<Value> {
     heap_schema_vec![
         submit_task_resolution_schema(),
@@ -1979,7 +1998,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `get_results`: requires `action` and returned `group_id` for an explicitly backgrounded group. It takes a short non-blocking snapshot; terminal updates also arrive through the parent mailbox, so do not busy-poll. Use optional `slot_index`, `offset`, and `max_bytes` for one bounded result window; `results[].next_call` gives the next window.\n\
          - `stop_slot`: requires `action`, `group_id`, and `slot_index`; it stops one running child.\n\n\
          - `stop_group`: requires `action` and `group_id`; it requests cancellation for every non-terminal child in one group operation.\n\n\
-         Use this for independent parallel work only when the user request or loaded workflow contains an explicit topology directive. Quality, scope, and complexity requirements alone do not imply extra agents or parallel execution; when neither authority explicitly requires delegation or parallelism, keep the work in the parent turn. Put each concise child instruction only in `slots[i].prompt`. Children inherit the current execution binding; only tools exposed in a child's own tool surface are usable. If `agent_type` is omitted, the server uses the bounded read-only `explore` persona; request `task` or `general-purpose` explicitly for mutation or full-surface work. Do not start workspace-dependent slots when the current workspace provider is unavailable. Never paste file contents, diffs, or prior tool output into a slot prompt. Fanout already decomposes work: keep each slot narrowly scoped and normally use `normal`; omit `max_turns` unless the user supplied a bound or the slot is small enough to reserve its final model boundary for synthesis. Do not mark every review slot `deep`. A per-slot or shared tool allowlist is named `allowed_tools`; there is no `tools` field. Use no brief/agents/background fields: never send top-level `brief`, `agents`, or `run_in_background`, and never put generated `agent_id` inside a slot. Start waits for accepted children concurrently and returns one canonical group result. In the terminal only the user may press Ctrl+B to hand the live group to the background; that explicit handoff returns stable child identities and later terminal results remain available through the group mailbox/get_results contract.",
+         Use this for independent parallel work only when the user request or loaded workflow contains an explicit topology directive. Quality, scope, and complexity requirements alone do not imply extra agents or parallel execution; when neither authority explicitly requires delegation or parallelism, keep the work in the parent turn. Put each concise child instruction only in `slots[i].prompt`. Children inherit the current execution binding unless an exact authorized Offering or reasoning control is set per slot or in defaults; an execution boundary without atomic model admission rejects those overrides before starting any slot. Only tools exposed in a child's own tool surface are usable. If `agent_type` is omitted, the server uses the bounded read-only `explore` persona; request `task` or `general-purpose` explicitly for mutation or full-surface work. Do not start workspace-dependent slots when the current workspace provider is unavailable. Never paste file contents, diffs, or prior tool output into a slot prompt. Fanout already decomposes work: keep each slot narrowly scoped and normally use `normal`; omit `max_turns` unless the user supplied a bound or the slot is small enough to reserve its final model boundary for synthesis. Do not mark every review slot `deep`. A per-slot or shared tool allowlist is named `allowed_tools`; there is no `tools` field. Use no brief/agents/background fields: never send top-level `brief`, `agents`, or `run_in_background`, and never put generated `agent_id` inside a slot. Start waits for accepted children concurrently and returns one canonical group result. In the terminal only the user may press Ctrl+B to hand the live group to the background; that explicit handoff returns stable child identities and later terminal results remain available through the group mailbox/get_results contract.",
                 "parameters": {
                     "type": "object",
                     "x-astra-per-action-discovery-summaries": {
@@ -2009,7 +2028,9 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                     "max_output_tokens": {"type": "integer"},
                                     "complexity": {"type": "string", "enum": ["light","normal","deep"]},
                                     "isolated": {"type": "boolean"},
-                                    "allowed_tools": {"type": "array", "items": {"type": "string"}}
+                                    "allowed_tools": {"type": "array", "items": {"type": "string"}},
+                                    "model_selection": fanout_model_selection_schema(),
+                                    "reasoning": fanout_reasoning_schema()
                                 },
                                 "required": ["description", "prompt"]
                             }
@@ -2024,7 +2045,9 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                 "max_output_tokens": {"type": "integer"},
                                 "complexity": {"type": "string", "enum": ["light","normal","deep"]},
                                 "isolated": {"type": "boolean"},
-                                "allowed_tools": {"type": "array", "items": {"type": "string"}}
+                                "allowed_tools": {"type": "array", "items": {"type": "string"}},
+                                "model_selection": fanout_model_selection_schema(),
+                                "reasoning": fanout_reasoning_schema()
                             }
                         },
                         "slot_index": {"type": "integer", "minimum": 0, "description": "REQUIRED for stop_slot. Optional for get_results to read one slot result window."},
@@ -2662,6 +2685,19 @@ mod tests {
         );
         assert!(slot_props.get("slot_id").is_none());
         assert_eq!(
+            slot_props["model_selection"]["required"],
+            json!(["offering_id"])
+        );
+        assert_eq!(
+            slot_props["reasoning"]["oneOf"].as_array().unwrap().len(),
+            3
+        );
+        assert_eq!(
+            params["properties"]["defaults"]["properties"]["model_selection"]["required"],
+            json!(["offering_id"])
+        );
+        assert!(params["properties"]["defaults"]["properties"]["reasoning"].is_object());
+        assert_eq!(
             slot_props["description"]["maxLength"],
             crate::agent_tool_contract::AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS
         );
@@ -2686,7 +2722,9 @@ mod tests {
             .as_str()
             .expect("fanout description");
         assert!(
-            description.contains("only tools exposed in a child's own tool surface are usable")
+            description
+                .to_ascii_lowercase()
+                .contains("only tools exposed in a child's own tool surface are usable")
                 && description.contains("workspace provider is unavailable"),
             "fanout must distinguish inherited bindings from actual provider availability"
         );

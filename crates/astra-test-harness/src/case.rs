@@ -643,6 +643,14 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn shipped_subagent_model_cases_parse_with_strict_criteria() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/subagent_model_selection");
+        let cases = Case::load_dir(&dir).expect("shipped DeepSeek Flash cases");
+        assert_eq!(cases.len(), 2);
+        assert!(cases.iter().all(|case| !case.criteria.is_empty()));
+    }
+
+    #[test]
     fn loads_minimal_case() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("c.yaml");

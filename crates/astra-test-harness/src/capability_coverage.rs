@@ -272,6 +272,7 @@ mod tests {
             Criterion::SessionEventCount {
                 event_type: "turn".into(),
                 min: 1,
+                max: None,
                 optional: true,
             },
         ];
