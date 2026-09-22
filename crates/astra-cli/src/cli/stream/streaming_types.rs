@@ -1017,6 +1017,7 @@ mod usage_attribution_tests {
     ) -> astra_turn_types::ExplainAnalyzeEventV1 {
         astra_turn_types::ExplainAnalyzeEventV1 {
             schema_version: astra_turn_types::EXPLAIN_ANALYZE_SCHEMA_VERSION,
+            auxiliary_details: None,
             event_id: format!("{node_id}/finished"),
             run_id: "run-1".into(),
             turn_id: "turn-1".into(),
@@ -1076,6 +1077,7 @@ mod usage_attribution_tests {
     ) -> astra_turn_types::ExplainAnalyzeEventV1 {
         astra_turn_types::ExplainAnalyzeEventV1 {
             schema_version: astra_turn_types::EXPLAIN_ANALYZE_SCHEMA_VERSION,
+            auxiliary_details: None,
             event_id: "auxiliary/turn/finished".into(),
             run_id: "run-1".into(),
             turn_id: "turn-1".into(),
@@ -1118,6 +1120,7 @@ mod usage_attribution_tests {
         );
         let auxiliary = astra_turn_types::ExplainAnalyzeEventV1 {
             schema_version: astra_turn_types::EXPLAIN_ANALYZE_SCHEMA_VERSION,
+            auxiliary_details: None,
             event_id: "turn/finished".into(),
             run_id: "run-1".into(),
             turn_id: "turn-1".into(),

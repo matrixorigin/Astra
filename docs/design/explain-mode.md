@@ -474,12 +474,13 @@ trace payloads.
   boundary, and the replay-to-live handoff. No case may yield a complete graph
   with invented timing or missing execution nodes.
 
-### Auxiliary provider usage
+### Auxiliary provider usage and settlement
 
-A terminal turn fact can carry a read-only `auxiliary_usage` snapshot of physical
-provider attempts in the authenticated user's Session and turn. It records
-attempt identity, provider, Offering, requested upstream model, purpose/operation and
-reported token lanes. Invocation totals are not added to attempt totals.
+A terminal turn fact can carry two read-only, deliberately separate snapshots
+of auxiliary inference in the authenticated user's Session and turn.
+`auxiliary_usage` records physical provider attempts: attempt identity,
+provider, Offering, requested upstream model, purpose/operation, and reported
+token lanes. Invocation totals are not added to attempt totals.
 Repeated turn segments deduplicate attempt IDs. Missing usage remains unknown;
 partial provider usage is labeled partial. A failed or timed-out snapshot is
 marked unavailable and does not fail the user's turn. Collection has a one-second
@@ -495,11 +496,32 @@ attempts report a token lane, its sum is explicitly a lower bound; it is not
 presented as the total consumption of that group.
 
 Consumers validate fields strictly. Deploy the updated Rust/SDK readers before
-upgrading the server in a mixed-version deployment: older readers do
-not recognize `truncated=true` and reject that terminal fact. Non-overflow facts
-omit the field and retain their existing wire representation.
+upgrading the server in a mixed-version deployment: older readers do not
+recognize populated `truncated` or `auxiliary_details` fields and reject that
+terminal fact. Non-overflow usage facts omit `truncated`, but a terminal fact
+with `auxiliary_details` still requires a reader that knows the new field. This
+is therefore a coordinated schema rollout, not a claim of mixed-version wire
+compatibility.
 
-These facts are separate from timed main-model nodes: no interval is invented
-from database timestamps. TUI, text, HTML and Web show Jev auxiliary tokens
-separately from the main model's tokens. The snapshot is complete only as a
-query at terminal time; auxiliary calls performed after capture are not included.
+`auxiliary_details` complements the physical ledger with bounded semantic
+settlement and local logical-call timing. Each call records its operation,
+stage, start offset, duration, and transport-level outcome as observed around
+the `SummaryLlmClient` boundary. It does not claim provider compute time or
+reconstruct timing from database timestamps. Calls may overlap, so consumers
+must not add their durations to each other or to the parent turn interval.
+The current runtime producer covers the built-in Work-admission classifier and
+planner (including clarification and bounded repair); an empty call list does
+not prove that no other auxiliary subsystem ran.
+Pre-dispatch paths have no call interval; cancellation or dropped futures are
+recorded as cancelled when the local boundary was entered. The terminal
+admission settlement separately records whether the typed result was accepted
+by the runtime; a provider response and an adopted execution decision are not
+the same fact. The semantic result is bounded and excludes provider response
+text, prompts, and credentials.
+
+TUI, text, HTML and Web show Jev auxiliary tokens separately from the main
+model's tokens and show the logical timing/settlement facts separately from
+those tokens. Both auxiliary snapshots are bounded; their truncation or
+unavailability is rendered explicitly. The snapshot is complete only as a
+query at terminal time; auxiliary calls performed after capture are not
+included.

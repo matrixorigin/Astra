@@ -47,9 +47,12 @@ pub(crate) fn render(
 
     writer.push(&overview_card(&graph, delivery_degraded));
 
-    let auxiliary_lines = crate::explain_analyze_report::auxiliary_usage_lines(&graph);
+    let mut auxiliary_lines = crate::explain_analyze_report::auxiliary_usage_lines(&graph);
+    auxiliary_lines.extend(crate::explain_analyze_report::auxiliary_details_lines(
+        &graph,
+    ));
     if !auxiliary_lines.is_empty() {
-        writer.push("<section class=\"panel\"><h2>Auxiliary model usage</h2>");
+        writer.push("<section class=\"panel\"><h2>Auxiliary model usage and settlement</h2>");
         for line in auxiliary_lines {
             writer.push(&format!("<p>{}</p>", escape_html(&line, usize::MAX)));
         }
@@ -1021,6 +1024,7 @@ mod tests {
     ) -> ExplainAnalyzeEventV1 {
         ExplainAnalyzeEventV1 {
             auxiliary_usage: None,
+            auxiliary_details: None,
             schema_version: EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: event_id.to_string(),
             run_id: "run-1".to_string(),

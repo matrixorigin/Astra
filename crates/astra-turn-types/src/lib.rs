@@ -77,13 +77,16 @@ pub use context_window::{ContextWindowUsage, ContextWindowUsageSource, RequestTo
 pub use deferred_tool::DeferredToolActivation;
 pub use explain_analyze::{
     EXPLAIN_ANALYZE_EVENT_TYPE, EXPLAIN_ANALYZE_MAX_SAFE_INTEGER, EXPLAIN_ANALYZE_SCHEMA_VERSION,
-    ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
-    ExplainAnalyzeAuxiliaryUsageV1, ExplainAnalyzeContextAssemblyBasisV1,
-    ExplainAnalyzeContextAssemblyV1, ExplainAnalyzeContextBudgetBasisV1,
-    ExplainAnalyzeContextBudgetV1, ExplainAnalyzeContextMetricsV1,
-    ExplainAnalyzeContextSourceKindV1, ExplainAnalyzeContextSourceV1, ExplainAnalyzeCoverageGapV1,
-    ExplainAnalyzeEventV1, ExplainAnalyzeNodeKindV1, ExplainAnalyzeOutcomeV1,
-    ExplainAnalyzeTokenUsageV1, ExplainAnalyzeTransitionV1, ExplainAnalyzeUsageBasisV1,
+    ExplainAnalyzeAdmissionSettlementReasonV1, ExplainAnalyzeAdmissionSettlementStatusV1,
+    ExplainAnalyzeAdmissionSettlementV1, ExplainAnalyzeAuxiliaryAttemptV1,
+    ExplainAnalyzeAuxiliaryCallV1, ExplainAnalyzeAuxiliaryDetailsV1,
+    ExplainAnalyzeAuxiliaryUsageStatusV1, ExplainAnalyzeAuxiliaryUsageV1,
+    ExplainAnalyzeContextAssemblyBasisV1, ExplainAnalyzeContextAssemblyV1,
+    ExplainAnalyzeContextBudgetBasisV1, ExplainAnalyzeContextBudgetV1,
+    ExplainAnalyzeContextMetricsV1, ExplainAnalyzeContextSourceKindV1,
+    ExplainAnalyzeContextSourceV1, ExplainAnalyzeCoverageGapV1, ExplainAnalyzeEventV1,
+    ExplainAnalyzeNodeKindV1, ExplainAnalyzeOutcomeV1, ExplainAnalyzeTokenUsageV1,
+    ExplainAnalyzeTransitionV1, ExplainAnalyzeUsageBasisV1,
 };
 pub use explain_analyze_projection::{
     ExplainAnalyzeGraphIntegrityV1, ExplainAnalyzeGraphV1, ExplainAnalyzeProjectedNodeV1,

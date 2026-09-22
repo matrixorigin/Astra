@@ -105,6 +105,11 @@ pub(crate) fn render(
             .into_iter()
             .map(|line| format!("  {line}")),
     );
+    lines.extend(
+        auxiliary_details_lines(&graph)
+            .into_iter()
+            .map(|line| format!("  {line}")),
+    );
     append_diagnostics(&graph, &mut lines);
     lines.join("\n")
 }
@@ -459,6 +464,7 @@ mod tests {
     ) -> ExplainAnalyzeEventV1 {
         ExplainAnalyzeEventV1 {
             auxiliary_usage: None,
+            auxiliary_details: None,
             schema_version: EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: id.to_string(),
             run_id: "run-1".to_string(),
@@ -550,6 +556,118 @@ mod tests {
         assert!(output.contains("partial"), "{output}");
         assert!(output.contains("offering jev-1"), "{output}");
         assert!(output.contains("operation relevance"), "{output}");
+    }
+
+    #[test]
+    fn auxiliary_details_explain_logical_timing_and_admission_settlement() {
+        use astra_turn_types::{
+            ExplainAnalyzeAdmissionSettlementReasonV1, ExplainAnalyzeAdmissionSettlementV1,
+            ExplainAnalyzeAuxiliaryCallV1, ExplainAnalyzeAuxiliaryDetailsV1,
+            RequestJudgmentClassificationV1, RequestJudgmentMutationV1, RequestJudgmentResultV1,
+            RequestJudgmentScopeV1,
+        };
+        let start = fact(
+            "turn-start",
+            "turn",
+            None,
+            ExplainAnalyzeNodeKindV1::Turn,
+            ExplainAnalyzeTransitionV1::Started,
+            0,
+            None,
+            None,
+        );
+        let mut end = finished(start.clone(), 100);
+        end.auxiliary_details = Some(Box::new(ExplainAnalyzeAuxiliaryDetailsV1 {
+            calls: vec![ExplainAnalyzeAuxiliaryCallV1 {
+                call_id: "request_judgment:initial:0".into(),
+                operation_id: "request_judgment".into(),
+                stage: "initial".into(),
+                start_elapsed_ms: 7,
+                duration_ms: 12,
+                outcome: ExplainAnalyzeOutcomeV1::Succeeded,
+            }],
+            truncated: false,
+            admission: Some(ExplainAnalyzeAdmissionSettlementV1 {
+                status: astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::Accepted,
+                reason: ExplainAnalyzeAdmissionSettlementReasonV1::Accepted,
+                classification: Some(RequestJudgmentResultV1::Decided {
+                    classification: RequestJudgmentClassificationV1 {
+                        work_required: false,
+                        activation_deferred: false,
+                        domain: None,
+                        mutation: RequestJudgmentMutationV1::ReadOnly,
+                        scope: RequestJudgmentScopeV1::Unknown,
+                        parallel_subruns: false,
+                        capabilities: Vec::new(),
+                    },
+                }),
+                decision: Some(RequestJudgmentResultV1::Decided {
+                    classification: RequestJudgmentClassificationV1 {
+                        work_required: false,
+                        activation_deferred: false,
+                        domain: None,
+                        mutation: RequestJudgmentMutationV1::ReadOnly,
+                        scope: RequestJudgmentScopeV1::Unknown,
+                        parallel_subruns: false,
+                        capabilities: Vec::new(),
+                    },
+                }),
+            }),
+        }));
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        graph.apply(start);
+        graph.apply(end);
+        let output = auxiliary_details_lines(&graph).join("\n");
+        assert!(output.contains("Auxiliary scope · turn"), "{output}");
+        assert!(
+            output.contains("Auxiliary timing · Request classification"),
+            "{output}"
+        );
+        assert!(
+            output.contains("stage initial · 12ms · client outcome succeeded · starts +7ms"),
+            "{output}"
+        );
+        assert!(
+            output.contains("logical client interval; overlapping intervals are not added"),
+            "{output}"
+        );
+        assert!(
+            output.contains("Admission settlement · status accepted · reason"),
+            "{output}"
+        );
+        assert!(output.contains("\"result\":\"decided\""), "{output}");
+        assert!(output.contains("\"work_required\":false"), "{output}");
+        assert!(output.contains("reconciled decision"), "{output}");
+
+        let mut second_start = fact(
+            "second-turn-start",
+            "second-turn",
+            None,
+            ExplainAnalyzeNodeKindV1::Turn,
+            ExplainAnalyzeTransitionV1::Started,
+            0,
+            None,
+            None,
+        );
+        second_start.turn_id = "turn-2".into();
+        second_start.clock_domain_id = "clock-2".into();
+        let mut second_end = finished(second_start, 80);
+        second_end.auxiliary_details = Some(Box::new(ExplainAnalyzeAuxiliaryDetailsV1 {
+            calls: vec![ExplainAnalyzeAuxiliaryCallV1 {
+                call_id: "work_plan:initial:0".into(),
+                operation_id: "work_plan".into(),
+                stage: "initial".into(),
+                start_elapsed_ms: 3,
+                duration_ms: 9,
+                outcome: ExplainAnalyzeOutcomeV1::Failed,
+            }],
+            truncated: false,
+            admission: None,
+        }));
+        graph.apply(second_end);
+        let output = auxiliary_details_lines(&graph).join("\n");
+        assert!(output.contains("Auxiliary scope · second-turn"), "{output}");
+        assert!(output.contains("work_plan:initial:0"), "{output}");
     }
 
     #[test]
@@ -1308,6 +1426,93 @@ pub(crate) fn auxiliary_usage_lines(graph: &ExplainAnalyzeGraphV1) -> Vec<String
         lines.push("Auxiliary tokens · capture unavailable".into());
     }
     lines
+}
+
+/// Render the logical auxiliary call intervals and the typed admission result.
+/// These facts are intentionally separate from physical token usage: the
+/// intervals are measured at the local client boundary, are allowed to
+/// overlap, and say nothing about provider-side compute time.
+pub(crate) fn auxiliary_details_lines(graph: &ExplainAnalyzeGraphV1) -> Vec<String> {
+    let details_by_scope = graph.auxiliary_details();
+    if details_by_scope.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    for (scope, details) in details_by_scope {
+        lines.push(format!("Auxiliary scope · {scope}"));
+        let mut calls = details.calls.iter().collect::<Vec<_>>();
+        calls.sort_unstable_by(|left, right| {
+            left.start_elapsed_ms
+                .cmp(&right.start_elapsed_ms)
+                .then_with(|| left.call_id.cmp(&right.call_id))
+        });
+        lines.extend(calls.into_iter().map(|call| {
+            format!(
+                "Auxiliary timing · {} · call {} · operation {} · stage {} · {} · client outcome {} · starts +{} · logical client interval; overlapping intervals are not added",
+                auxiliary_usage_label(&call.operation_id, ""),
+                call.call_id,
+                call.operation_id,
+                call.stage,
+                format_ms(call.duration_ms),
+                auxiliary_outcome_label(call.outcome),
+                format_ms(call.start_elapsed_ms),
+            )
+        }));
+        if details.truncated {
+            lines.push(
+                "Auxiliary timing · capture truncated · only the bounded set of logical calls is shown"
+                    .into(),
+            );
+        }
+        if let Some(admission) = &details.admission {
+            let status = match admission.status {
+                astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::Accepted => "accepted",
+                astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::Rejected => "rejected",
+                astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::Unavailable => {
+                    "unavailable"
+                }
+                astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::NotDispatched => {
+                    "not dispatched"
+                }
+            };
+            let reason = serde_json::to_string(&admission.reason)
+                .unwrap_or_else(|_| r#"{"kind":"unavailable"}"#.to_string());
+            let classification = admission
+                .classification
+                .as_ref()
+                .and_then(|result| serde_json::to_string(result).ok())
+                .unwrap_or_else(|| "unavailable".to_string());
+            let decision = admission
+                .decision
+                .as_ref()
+                .and_then(|result| serde_json::to_string(result).ok())
+                .unwrap_or_else(|| "unavailable".to_string());
+            lines.push(format!(
+                "Admission settlement · status {status} · reason {reason} · classifier result {classification} · reconciled decision {decision}"
+            ));
+        }
+    }
+    lines
+}
+
+fn auxiliary_outcome_label(outcome: ExplainAnalyzeOutcomeV1) -> &'static str {
+    match outcome {
+        ExplainAnalyzeOutcomeV1::Completed => "completed",
+        ExplainAnalyzeOutcomeV1::Succeeded => "succeeded",
+        ExplainAnalyzeOutcomeV1::Failed => "failed",
+        ExplainAnalyzeOutcomeV1::Cancelled => "cancelled",
+        ExplainAnalyzeOutcomeV1::Interrupted => "interrupted",
+        ExplainAnalyzeOutcomeV1::Blocked => "blocked",
+        ExplainAnalyzeOutcomeV1::Waiting => "waiting",
+        ExplainAnalyzeOutcomeV1::Rejected => "rejected",
+        ExplainAnalyzeOutcomeV1::Reused => "reused",
+        ExplainAnalyzeOutcomeV1::Suppressed => "suppressed",
+        ExplainAnalyzeOutcomeV1::Deferred => "deferred",
+        ExplainAnalyzeOutcomeV1::Resolved => "resolved",
+        ExplainAnalyzeOutcomeV1::Fallback => "fallback",
+        ExplainAnalyzeOutcomeV1::Unavailable => "unavailable",
+        ExplainAnalyzeOutcomeV1::Delegated => "delegated",
+    }
 }
 
 fn auxiliary_usage_label(operation: &str, purpose: &str) -> &'static str {

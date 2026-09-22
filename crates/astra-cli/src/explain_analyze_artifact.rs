@@ -1002,6 +1002,7 @@ mod tests {
     pub(super) fn complete_events() -> Vec<ExplainAnalyzeEventV1> {
         let common = ExplainAnalyzeEventV1 {
             auxiliary_usage: None,
+            auxiliary_details: None,
             schema_version: EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: "clock-1:0".to_string(),
             run_id: "run-1".to_string(),

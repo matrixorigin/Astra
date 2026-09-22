@@ -330,6 +330,7 @@ mod tests {
 
         astra_turn_types::ExplainAnalyzeEventV1 {
             auxiliary_usage: None,
+            auxiliary_details: None,
             schema_version: EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: "clock:fact".into(),
             run_id: "run".into(),
@@ -453,6 +454,7 @@ mod tests {
         ];
         let finished_turn = |run_id: &str, turn_id: &str, label: &str| ExplainAnalyzeEventV1 {
             auxiliary_usage: None,
+            auxiliary_details: None,
             schema_version: EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: format!("{run_id}:finish"),
             run_id: run_id.to_string(),

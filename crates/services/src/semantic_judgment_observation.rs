@@ -36,6 +36,25 @@ pub fn request_judgment_result(
     )
 }
 
+/// Project the decision that crossed the runtime admission boundary. This is
+/// intentionally separate from the model classification observation: a
+/// successful provider response is not execution authority until this result
+/// is reconciled and adopted by the host.
+pub fn accepted_request_judgment_result(
+    decision: &crate::WorkAdmissionDecision,
+) -> astra_turn_types::RequestJudgmentResultV1 {
+    let classification = crate::WorkAdmissionClassification {
+        work_lifecycle: decision.turn_intent().work_lifecycle,
+        activation: decision.activation(),
+        domain: decision.domain(),
+        workspace_mutation: decision.workspace_mutation(),
+        mutation_completion_scope: decision.mutation_completion_scope(),
+        execution_topology: decision.execution_topology(),
+        required_capabilities: decision.required_capabilities().to_vec(),
+    };
+    request_judgment_result(&Ok(classification))
+}
+
 fn checked_request_judgment_result(
     result: &Result<crate::WorkAdmissionClassification, crate::TurnIntentJudgeError>,
 ) -> Result<astra_turn_types::RequestJudgmentResultV1, SemanticJudgmentValidationError> {

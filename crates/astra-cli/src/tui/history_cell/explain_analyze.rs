@@ -700,6 +700,15 @@ fn render_graph(
                 content_limit,
             );
         }
+        for summary in crate::explain_analyze_report::auxiliary_details_lines(graph) {
+            let _ = push_wrapped_detail(
+                &mut lines,
+                &summary,
+                width,
+                Style::default().fg(Color::DarkGray),
+                content_limit,
+            );
+        }
     }
     if !graph.diagnostics().is_empty() && !truncated && !live {
         let summary = graph
@@ -1282,6 +1291,7 @@ mod tests {
         let is_provider = kind == ExplainAnalyzeNodeKindV1::ProviderAttempt;
         ExplainAnalyzeEventV1 {
             auxiliary_usage: None,
+            auxiliary_details: None,
             schema_version: EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: event_id.into(),
             run_id: "run-1".into(),

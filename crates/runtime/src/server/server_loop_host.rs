@@ -2145,6 +2145,7 @@ type PipelineTurnOutcome = crate::turn::llm::context::LlmContextAssemblyOutput;
 struct SummaryClientWorkAdmissionJudge {
     client: Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
     usage: Arc<std::sync::Mutex<WorkAdmissionUsage>>,
+    timings: Arc<std::sync::Mutex<WorkAdmissionTimingBuffer>>,
     recovery_used: Arc<std::sync::atomic::AtomicBool>,
     classification_observations: Arc<std::sync::Mutex<Vec<ClassificationObservation>>>,
 }
@@ -2249,6 +2250,48 @@ enum JudgmentClientUnavailable {
     OutputBudget,
     RouteUnavailable,
     DurableMaterialUnavailable,
+}
+
+#[derive(Clone, Debug)]
+struct WorkAdmissionCallTiming {
+    operation_id: &'static str,
+    stage: &'static str,
+    started_at: Instant,
+    duration_ms: u64,
+    outcome: astra_turn_types::ExplainAnalyzeOutcomeV1,
+}
+
+const MAX_WORK_ADMISSION_CALL_TIMINGS: usize = 16;
+
+#[derive(Clone, Debug, Default)]
+struct WorkAdmissionTimingBuffer {
+    timings: Vec<WorkAdmissionCallTiming>,
+    truncated: bool,
+}
+
+impl WorkAdmissionTimingBuffer {
+    fn record(
+        &mut self,
+        operation_id: &'static str,
+        stage: &'static str,
+        started_at: Instant,
+        finished_at: Instant,
+        outcome: astra_turn_types::ExplainAnalyzeOutcomeV1,
+    ) {
+        if self.timings.len() >= MAX_WORK_ADMISSION_CALL_TIMINGS {
+            self.truncated = true;
+            return;
+        }
+        self.timings.push(WorkAdmissionCallTiming {
+            operation_id,
+            stage,
+            started_at,
+            duration_ms: finished_at
+                .saturating_duration_since(started_at)
+                .as_millis() as u64,
+            outcome,
+        });
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2358,6 +2401,44 @@ impl WorkAdmissionUnavailableReason {
     }
 }
 
+fn explain_admission_settlement_reason(
+    error: &astra_services::TurnIntentJudgeError,
+    has_classification: bool,
+) -> astra_turn_types::ExplainAnalyzeAdmissionSettlementReasonV1 {
+    use astra_services::TurnIntentJudgeError as Error;
+    use astra_turn_types::{
+        ExplainAnalyzeAdmissionSettlementReasonV1 as Reason,
+        SemanticJudgmentUnavailableReasonV1 as Unavailable,
+    };
+    match error {
+        Error::Uncertain { .. } => Reason::ClassifierUncertain,
+        Error::Conflicting { .. } => Reason::ClassifierConflicting,
+        Error::Malformed { .. } => {
+            if has_classification {
+                Reason::PlanningRejected
+            } else {
+                Reason::InvalidClassifierResponse
+            }
+        }
+        Error::Rejected(_) => Reason::ProviderRejected,
+        Error::UnsupportedCombination(_) => {
+            if has_classification {
+                Reason::ReconciliationRejected
+            } else {
+                Reason::InvalidClassifierResponse
+            }
+        }
+        Error::TrustedWorkflowTopologyConflict(_) => Reason::ReconciliationRejected,
+        Error::Inference(detail) => Reason::Unavailable {
+            reason: match detail.kind {
+                astra_core::ErrorKind::Cancelled => Unavailable::Cancelled,
+                astra_core::ErrorKind::ProviderDeadline => Unavailable::Deadline,
+                _ => Unavailable::ExecutionError,
+            },
+        },
+    }
+}
+
 impl WorkAdmissionUsage {
     fn begin_attempt(&mut self) {
         self.attempts = self.attempts.saturating_add(1);
@@ -2402,6 +2483,61 @@ impl WorkAdmissionUsage {
         self.provider_reported = self
             .provider_reported
             .saturating_add(other.provider_reported);
+    }
+}
+
+struct AuxiliaryCallTimingGuard {
+    timings: Arc<std::sync::Mutex<WorkAdmissionTimingBuffer>>,
+    operation_id: &'static str,
+    stage: &'static str,
+    started_at: Instant,
+    completed: bool,
+}
+
+impl AuxiliaryCallTimingGuard {
+    fn new(
+        timings: Arc<std::sync::Mutex<WorkAdmissionTimingBuffer>>,
+        operation_id: &'static str,
+        stage: &'static str,
+    ) -> Self {
+        Self {
+            timings,
+            operation_id,
+            stage,
+            started_at: Instant::now(),
+            completed: false,
+        }
+    }
+
+    fn finish(&mut self, outcome: astra_turn_types::ExplainAnalyzeOutcomeV1) {
+        self.completed = true;
+        self.timings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(
+                self.operation_id,
+                self.stage,
+                self.started_at,
+                Instant::now(),
+                outcome,
+            );
+    }
+}
+
+impl Drop for AuxiliaryCallTimingGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.timings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record(
+                    self.operation_id,
+                    self.stage,
+                    self.started_at,
+                    Instant::now(),
+                    astra_turn_types::ExplainAnalyzeOutcomeV1::Cancelled,
+                );
+        }
     }
 }
 
@@ -2494,6 +2630,7 @@ impl SummaryClientWorkAdmissionJudge {
         Self {
             client,
             usage: Arc::new(std::sync::Mutex::new(WorkAdmissionUsage::default())),
+            timings: Arc::new(std::sync::Mutex::new(WorkAdmissionTimingBuffer::default())),
             recovery_used: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             classification_observations: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
@@ -2524,9 +2661,11 @@ impl SummaryClientWorkAdmissionJudge {
         let mut received_failure = None;
         let initial = async {
             let response = self
-                .summarize(&astra_services::work_admission_classification_messages(
-                    &request,
-                ))
+                .summarize(
+                    "request_judgment",
+                    "initial",
+                    &astra_services::work_admission_classification_messages(&request),
+                )
                 .await?;
             received_failure = classification_response_failure(&response);
             Self::require_completed(&response)?;
@@ -2560,9 +2699,11 @@ impl SummaryClientWorkAdmissionJudge {
                 let mut received_failure = None;
                 let result = async {
                     let clarified = self
-                        .summarize(&astra_services::work_admission_classification_messages(
-                            &clarification,
-                        ))
+                        .summarize(
+                            "request_judgment",
+                            "clarification",
+                            &astra_services::work_admission_classification_messages(&clarification),
+                        )
                         .await?;
                     received_failure = classification_response_failure(&clarified);
                     Self::require_completed(&clarified)?;
@@ -2598,14 +2739,23 @@ impl SummaryClientWorkAdmissionJudge {
 
     async fn summarize(
         &self,
+        operation_id: &'static str,
+        stage: &'static str,
         messages: &[Value],
     ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, astra_services::TurnIntentJudgeError>
     {
         self.begin_usage_attempt();
+        let mut timing =
+            AuxiliaryCallTimingGuard::new(Arc::clone(&self.timings), operation_id, stage);
         let result = self
             .client
             .summarize(astra_turn_types::InferencePurpose::Introspection, messages)
             .await;
+        timing.finish(if result.is_ok() {
+            astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded
+        } else {
+            astra_turn_types::ExplainAnalyzeOutcomeV1::Failed
+        });
         let error_details = result
             .as_ref()
             .err()
@@ -2642,7 +2792,7 @@ impl SummaryClientWorkAdmissionJudge {
         messages: Vec<Value>,
         classification: Option<&astra_services::WorkAdmissionClassification>,
     ) -> WorkAdmissionDecisionResult {
-        let response = self.summarize(&messages).await?;
+        let response = self.summarize("work_plan", "initial", &messages).await?;
         tracing::debug!(
             target: "astra::turn_intent",
             response = %response.text,
@@ -2721,7 +2871,9 @@ impl SummaryClientWorkAdmissionJudge {
                 "role": "user",
                 "content": repair_instruction,
             }));
-            let repaired = self.summarize(&repair_messages).await?;
+            let repaired = self
+                .summarize("work_plan", "repair", &repair_messages)
+                .await?;
             tracing::debug!(
                 target: "astra::turn_intent",
                 response = %repaired.text,
@@ -3523,6 +3675,7 @@ impl ExplainAnalyzeContext {
         };
         let fact = astra_turn_types::ExplainAnalyzeEventV1 {
             auxiliary_usage: None,
+            auxiliary_details: None,
             schema_version: astra_turn_types::EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: self.next_event_id(),
             run_id: self.run_id.clone(),
@@ -3725,6 +3878,10 @@ pub struct ServerAgenticLoopHost {
     /// Provider-reported usage from the bounded Work classifier and its one
     /// repair. Folded exactly once into the user-visible turn aggregate.
     work_admission_usage: WorkAdmissionUsage,
+    /// Bounded logical-call observations have a longer lifetime than token
+    /// accounting: they survive per-round usage reconciliation until the
+    /// terminal Explain snapshot is emitted.
+    work_admission_timing_buffer: Arc<std::sync::Mutex<WorkAdmissionTimingBuffer>>,
     /// One semantic clarification per host turn; skill revisions cannot refill it.
     work_admission_recovery_used: Arc<std::sync::atomic::AtomicBool>,
     work_admission_classification_observations:
@@ -3732,6 +3889,9 @@ pub struct ServerAgenticLoopHost {
     work_admission_classification_correlation:
         Option<astra_turn_types::SemanticJudgmentCorrelationV1>,
     pending_classification_observations: Vec<astra_turn_types::SemanticJudgmentObservationV1>,
+    /// Final typed result adopted (or rejected) at the Work-admission
+    /// settlement boundary. Classification observations remain separate.
+    work_admission_explain_admission: Option<astra_turn_types::ExplainAnalyzeAdmissionSettlementV1>,
     /// The optional semantic sidecar gets at most one attempt per user turn.
     /// An unavailable classifier is not retried inside the same user turn.
     /// Absence or failure leaves primary typed proposals on normal admission.
@@ -5936,10 +6096,14 @@ impl ServerAgenticLoopHostBuilder {
                 astra_config::user_profile::WorkspaceMutationIntent::Unknown,
             pending_work_admission_judge: None,
             work_admission_usage: WorkAdmissionUsage::default(),
+            work_admission_timing_buffer: Arc::new(std::sync::Mutex::new(
+                WorkAdmissionTimingBuffer::default(),
+            )),
             work_admission_recovery_used: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             work_admission_classification_observations: Arc::new(std::sync::Mutex::new(Vec::new())),
             work_admission_classification_correlation: None,
             pending_classification_observations: Vec::new(),
+            work_admission_explain_admission: None,
             work_admission_attempted: false,
             work_admission_unavailable: false,
             work_admission_unavailable_reason: None,
@@ -7814,6 +7978,7 @@ impl ServerAgenticLoopHost {
                 intent.work_lifecycle = WorkLifecycleIntent::Unknown;
             }
             self.pending_work_admission = None;
+            self.work_admission_explain_admission = None;
             self.work_admission_attempted = false;
             self.work_admission_unavailable = false;
             self.work_admission_unavailable_reason = None;
@@ -7958,6 +8123,7 @@ impl ServerAgenticLoopHost {
         };
         let mut judge = SummaryClientWorkAdmissionJudge::new(client);
         judge.recovery_used = Arc::clone(&self.work_admission_recovery_used);
+        judge.timings = Arc::clone(&self.work_admission_timing_buffer);
         // Each preflight owns a fresh evidence buffer. Only recovery budget
         // crosses skill revisions; previous-context evidence must not do so.
         self.work_admission_classification_observations =
@@ -7977,6 +8143,7 @@ impl ServerAgenticLoopHost {
         let planner = SummaryClientWorkAdmissionJudge {
             client: planner_client,
             usage: Arc::clone(&judge.usage),
+            timings: Arc::clone(&judge.timings),
             recovery_used: Arc::clone(&judge.recovery_used),
             classification_observations: Arc::clone(&judge.classification_observations),
         };
@@ -8115,9 +8282,10 @@ impl ServerAgenticLoopHost {
                 Instant::now(),
             );
         }
-        let usage = *usage
+        let usage = usage
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         self.work_admission_usage.merge(usage);
         let observations = std::mem::take(
             &mut *self
@@ -8125,6 +8293,11 @@ impl ServerAgenticLoopHost {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
+        let classification_result = observations
+            .iter()
+            .rev()
+            .map(|observation| observation.fact.result.clone())
+            .next();
         // Preserve the original semantic evidence even if clarification later
         // fails at the provider boundary rather than producing another answer.
         self.work_admission_semantic_diagnostic = observations
@@ -8151,6 +8324,19 @@ impl ServerAgenticLoopHost {
             Ok(decision) => {
                 self.work_admission_unavailable = false;
                 self.work_admission_unavailable_reason = None;
+                let reconciled_classification =
+                    astra_services::semantic_judgment_observation::accepted_request_judgment_result(
+                        &decision,
+                    );
+                self.work_admission_explain_admission =
+                    Some(astra_turn_types::ExplainAnalyzeAdmissionSettlementV1 {
+                        status:
+                            astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::Accepted,
+                        reason:
+                            astra_turn_types::ExplainAnalyzeAdmissionSettlementReasonV1::Accepted,
+                        classification: classification_result,
+                        decision: Some(reconciled_classification),
+                    });
                 let initial_outcome_count = decision
                     .initial_work_plan()
                     .map_or(0, |(_, tasks)| tasks.len());
@@ -8191,6 +8377,29 @@ impl ServerAgenticLoopHost {
             }
             Err(error) => {
                 self.work_admission_unavailable = true;
+                self.work_admission_explain_admission = Some(
+                    astra_turn_types::ExplainAnalyzeAdmissionSettlementV1 {
+                        status: match &error {
+                            astra_services::TurnIntentJudgeError::Inference(_) => {
+                                astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::Unavailable
+                            }
+                            _ => {
+                                astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::Rejected
+                            }
+                        },
+                        reason: explain_admission_settlement_reason(
+                            &error,
+                            classification_result.as_ref().is_some_and(|result| {
+                                matches!(
+                                    result,
+                                    astra_turn_types::RequestJudgmentResultV1::Decided { .. }
+                                )
+                            }),
+                        ),
+                        classification: classification_result,
+                        decision: None,
+                    },
+                );
                 self.work_admission_semantic_diagnostic = match &error {
                     astra_services::TurnIntentJudgeError::Uncertain { diagnostics } => {
                         Some(json!(diagnostics))
@@ -8265,6 +8474,16 @@ impl ServerAgenticLoopHost {
         &mut self,
         reason: astra_turn_types::SemanticJudgmentPreDispatchReasonV1,
     ) {
+        self.work_admission_explain_admission =
+            Some(astra_turn_types::ExplainAnalyzeAdmissionSettlementV1 {
+                status: astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::NotDispatched,
+                reason:
+                    astra_turn_types::ExplainAnalyzeAdmissionSettlementReasonV1::NotDispatched {
+                        reason,
+                    },
+                classification: None,
+                decision: None,
+            });
         if let Some(correlation) = self.work_admission_classification_correlation.clone() {
             self.queue_classification_observation(
                 astra_turn_types::SemanticJudgmentObservationV1 {
@@ -8476,10 +8695,12 @@ impl ServerAgenticLoopHost {
             .pending_work_admission_judge
             .take()
             .expect("aborted judgment");
-        let usage = *pending
+        let usage = pending
             .usage
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let usage_attempts = usage.attempts;
         self.work_admission_usage.merge(usage);
         let node_id = self.explain_analyze_context.as_ref().map(|context| {
             Self::explain_phase_node(
@@ -8497,13 +8718,30 @@ impl ServerAgenticLoopHost {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
-        if observations.is_empty()
-            && usage.attempts == 0
-            && joined.as_ref().is_err_and(|error| error.is_cancelled())
-        {
+        let classification_result = observations
+            .iter()
+            .rev()
+            .map(|observation| observation.fact.result.clone())
+            .next();
+        let not_dispatched = observations.is_empty()
+            && usage_attempts == 0
+            && joined.as_ref().is_err_and(|error| error.is_cancelled());
+        if not_dispatched {
             self.record_classification_not_dispatched(
                 astra_turn_types::SemanticJudgmentPreDispatchReasonV1::Cancelled,
             );
+        } else {
+            self.work_admission_explain_admission =
+                Some(astra_turn_types::ExplainAnalyzeAdmissionSettlementV1 {
+                    status:
+                        astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::Unavailable,
+                    reason:
+                        astra_turn_types::ExplainAnalyzeAdmissionSettlementReasonV1::Unavailable {
+                            reason: interruption_reason,
+                        },
+                    classification: classification_result,
+                    decision: None,
+                });
         }
         self.retain_classification_observations(observations, interruption_reason);
         self.work_admission_semantic_diagnostic = None;
@@ -17030,6 +17268,38 @@ impl ServerAgenticLoopHost {
         Ok(())
     }
 
+    fn build_explain_analyze_auxiliary_details(
+        &self,
+        timings: &WorkAdmissionTimingBuffer,
+    ) -> Option<Box<astra_turn_types::ExplainAnalyzeAuxiliaryDetailsV1>> {
+        let context = self.explain_analyze_context.as_ref()?;
+        if timings.timings.is_empty() && self.work_admission_explain_admission.is_none() {
+            return None;
+        }
+        let calls = timings
+            .timings
+            .iter()
+            .enumerate()
+            .map(
+                |(index, timing)| astra_turn_types::ExplainAnalyzeAuxiliaryCallV1 {
+                    call_id: format!("{}:{}:{index}", timing.operation_id, timing.stage),
+                    operation_id: timing.operation_id.to_string(),
+                    stage: timing.stage.to_string(),
+                    start_elapsed_ms: context.elapsed_ms_at(timing.started_at),
+                    duration_ms: timing.duration_ms,
+                    outcome: timing.outcome,
+                },
+            )
+            .collect();
+        Some(Box::new(
+            astra_turn_types::ExplainAnalyzeAuxiliaryDetailsV1 {
+                calls,
+                truncated: timings.truncated,
+                admission: self.work_admission_explain_admission.clone(),
+            },
+        ))
+    }
+
     async fn finalize_work_admission_usage_at_turn_exit(
         &mut self,
         state: &mut AgenticLoopState,
@@ -17424,6 +17694,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     }
 
     fn on_turn_started(&mut self, state: &AgenticLoopState) {
+        self.work_admission_explain_admission = None;
+        *self
+            .work_admission_timing_buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            WorkAdmissionTimingBuffer::default();
         let Some(run_id) = state.current_run_id.clone() else {
             if let Some(executor) = state.runtime_tool_executor.as_deref() {
                 executor.set_tool_route_observer(None);
@@ -17487,6 +17763,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     ) {
         self.abort_pending_work_admission().await;
         self.flush_classification_observations(state);
+        let timing_buffer = self
+            .work_admission_timing_buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let auxiliary_details = self.build_explain_analyze_auxiliary_details(&timing_buffer);
         let Some(context) = self.explain_analyze_context.clone() else {
             if let Some(executor) = state.runtime_tool_executor.as_deref() {
                 executor.set_tool_route_observer(None);
@@ -17555,7 +17837,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 attempts: Vec::new(),
             },
         };
-
         let unfinished_context_assemblies = self
             .explain_analyze_open_nodes
             .iter()
@@ -17676,6 +17957,18 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         ) {
             event["auxiliary_usage"] =
                 serde_json::to_value(auxiliary_usage).expect("typed auxiliary usage serialization");
+            if let Some(details) = auxiliary_details {
+                let terminal_elapsed_ms = event.get("elapsed_ms").and_then(Value::as_u64);
+                if terminal_elapsed_ms.is_some_and(|elapsed_ms| details.is_valid(elapsed_ms)) {
+                    event["auxiliary_details"] = serde_json::to_value(details)
+                        .expect("typed auxiliary details serialization");
+                } else {
+                    tracing::warn!(
+                        target: "astra::explain_analyze",
+                        "dropping invalid auxiliary Explain details without affecting terminal lifecycle fact"
+                    );
+                }
+            }
             self.emit_progress_event(event);
         }
         self.explain_analyze_admission_nodes.clear();
@@ -23750,6 +24043,7 @@ mod tests {
                     input_tokens: 17,
                     ..Default::default()
                 },
+                ..Default::default()
             })),
             started_at,
             round_index: 0,
@@ -23787,6 +24081,62 @@ mod tests {
             astra_turn_types::ExplainAnalyzeNodeKindV1::Admission
                 | astra_turn_types::ExplainAnalyzeNodeKindV1::Wait
         )));
+    }
+
+    #[test]
+    fn auxiliary_call_timing_guard_records_one_cancelled_interval_on_drop() {
+        let timings = Arc::new(std::sync::Mutex::new(WorkAdmissionTimingBuffer::default()));
+        {
+            let _guard =
+                AuxiliaryCallTimingGuard::new(Arc::clone(&timings), "request_judgment", "initial");
+        }
+        let buffer = timings.lock().unwrap();
+        assert_eq!(buffer.timings.len(), 1);
+        assert_eq!(buffer.timings[0].operation_id, "request_judgment");
+        assert_eq!(buffer.timings[0].stage, "initial");
+        assert_eq!(
+            buffer.timings[0].outcome,
+            astra_turn_types::ExplainAnalyzeOutcomeV1::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn explain_terminal_publishes_cancelled_auxiliary_interval() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-explain-cancelled-call".into(),
+            "s-explain-cancelled-call".into(),
+        )
+        .build();
+        let mut state = create_test_state();
+        state.current_run_id = Some("explain-cancelled-call-run".into());
+        host.on_turn_started(&state);
+        let started_at = host
+            .explain_analyze_context
+            .as_ref()
+            .expect("Explain context")
+            .started_at;
+        host.work_admission_timing_buffer.lock().unwrap().record(
+            "request_judgment",
+            "initial",
+            started_at,
+            started_at,
+            astra_turn_types::ExplainAnalyzeOutcomeV1::Cancelled,
+        );
+
+        host.on_turn_terminal(&mut state, &Ok(AgenticLoopOutcome::Cancelled))
+            .await;
+
+        let terminal = host
+            .take_emitted_events()
+            .into_iter()
+            .find(|event| event["kind"] == "turn" && event["transition"] == "finished")
+            .expect("terminal turn fact");
+        assert_eq!(
+            terminal["auxiliary_details"]["calls"][0]["outcome"],
+            "cancelled"
+        );
     }
 
     #[tokio::test]
@@ -23919,6 +24269,14 @@ mod tests {
             assert_eq!(usage.usage.input_tokens, 12);
             assert_eq!(usage.usage.cached_input_tokens, 24);
             assert_eq!(usage.usage.output_tokens, 5);
+            let timings = judge.timings.lock().unwrap();
+            assert_eq!(timings.timings.len(), 2);
+            assert_eq!(timings.timings[0].operation_id, "request_judgment");
+            assert_eq!(timings.timings[0].stage, "initial");
+            assert_eq!(timings.timings[1].stage, "clarification");
+            assert!(timings.timings.iter().all(
+                |timing| timing.outcome == astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded
+            ));
         }
     }
 
@@ -24047,6 +24405,79 @@ mod tests {
         let instruction = requests[1].last().unwrap()["content"].as_str().unwrap();
         assert!(instruction.contains("Never reclassify or downgrade"));
         assert!(!instruction.contains("Re-evaluate the acceptance boundary"));
+    }
+
+    #[tokio::test]
+    async fn work_judgment_explain_distinguishes_classifier_failure_from_plan_failure() {
+        let request = astra_services::work_admission_classification_request(&Default::default());
+        let classification = astra_services::parse_work_admission_classification(
+            &request,
+            &classification_response(false),
+        )
+        .expect("valid classifier response");
+        let cases = [
+            (
+                astra_turn_types::RequestJudgmentResultV1::Invalid {
+                    reason: astra_turn_types::SemanticJudgmentInvalidV1::MalformedJson,
+                },
+                astra_turn_types::ExplainAnalyzeAdmissionSettlementReasonV1::InvalidClassifierResponse,
+            ),
+            (
+                astra_services::semantic_judgment_observation::request_judgment_result(
+                    &Ok(classification),
+                ),
+                astra_turn_types::ExplainAnalyzeAdmissionSettlementReasonV1::PlanningRejected,
+            ),
+        ];
+
+        for (observed, expected_reason) in cases {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u-explain-settlement".into(),
+                "s-explain-settlement".into(),
+            )
+            .build();
+            host.work_admission_classification_observations
+                .lock()
+                .unwrap()
+                .push(ClassificationObservation {
+                    fact: astra_turn_types::SemanticJudgmentFactV1 {
+                        stage: astra_turn_types::RequestJudgmentStageV1::Initial,
+                        result: observed,
+                    },
+                    diagnostic: None,
+                    interrupted: false,
+                });
+            host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
+                wait_node_id: None,
+                handle: tokio::spawn(async {
+                    (
+                        Err(astra_services::TurnIntentJudgeError::Malformed {
+                            raw: "{}".into(),
+                            detail: "test plan failure".into(),
+                        }),
+                        Instant::now(),
+                    )
+                }),
+                usage: Default::default(),
+                started_at: Instant::now(),
+                round_index: 0,
+            });
+
+            assert!(!host.resolve_pending_work_admission(true).await);
+            let settlement = host
+                .work_admission_explain_admission
+                .as_ref()
+                .expect("terminal settlement");
+            assert_eq!(
+                settlement.status,
+                astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::Rejected
+            );
+            assert_eq!(settlement.reason, expected_reason);
+            assert!(settlement.decision.is_none());
+            assert!(settlement.classification.is_some());
+        }
     }
 
     #[tokio::test]
@@ -24464,6 +24895,7 @@ mod tests {
             },
             attempts: 1,
             provider_reported: 1,
+            ..Default::default()
         }));
         host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
             wait_node_id: None,
@@ -24501,6 +24933,7 @@ mod tests {
             },
             attempts: 1,
             provider_reported: 1,
+            ..Default::default()
         }));
         host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
             wait_node_id: None,
@@ -24526,6 +24959,7 @@ mod tests {
             },
             attempts: 2,
             provider_reported: 1,
+            ..Default::default()
         };
         let mut success_host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
@@ -36192,6 +36626,7 @@ mod tests {
             },
             attempts: 1,
             provider_reported: 1,
+            ..Default::default()
         }));
         running.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
             wait_node_id: None,
@@ -38781,6 +39216,18 @@ mod tests {
             execution_topology: astra_services::WorkExecutionTopology::Primary,
             required_capabilities: Vec::new(),
         });
+        let adopted = host
+            .pending_work_admission
+            .as_ref()
+            .map(astra_services::semantic_judgment_observation::accepted_request_judgment_result)
+            .expect("admitted decision");
+        host.work_admission_explain_admission =
+            Some(astra_turn_types::ExplainAnalyzeAdmissionSettlementV1 {
+                status: astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::Accepted,
+                reason: astra_turn_types::ExplainAnalyzeAdmissionSettlementReasonV1::Accepted,
+                classification: None,
+                decision: Some(adopted),
+            });
         host.work_admission_attempted = true;
         host.work_admission_skill_revision = 0;
         host.work_admission_recovery_used
@@ -38806,6 +39253,10 @@ mod tests {
             1
         );
         assert!(host.pending_work_admission.is_none());
+        assert!(
+            host.work_admission_explain_admission.is_none(),
+            "a superseded settlement must not be published as the new turn's decision"
+        );
         assert!(!host.work_admission_attempted);
         assert!(!host.work_admission_topology_authoritative);
         assert!(

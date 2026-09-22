@@ -254,7 +254,9 @@ impl ExplainAnalyzeTokenUsageV1 {
 }
 
 /// Read-only physical-attempt usage snapshot for auxiliary inference in one turn.
-/// No timing interval is inferred from ledger timestamps.
+/// Timing and semantic settlement facts live in the separate
+/// `auxiliary_details` field on the terminal turn fact so physical usage is
+/// never confused with logical call latency or executor authority.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExplainAnalyzeAuxiliaryUsageV1 {
@@ -264,6 +266,136 @@ pub struct ExplainAnalyzeAuxiliaryUsageV1 {
     #[serde(default, skip_serializing_if = "auxiliary_capture_not_truncated")]
     pub truncated: bool,
     pub attempts: Vec<ExplainAnalyzeAuxiliaryAttemptV1>,
+}
+
+/// One locally measured logical auxiliary call. This interval covers the
+/// `SummaryLlmClient` call as observed by the runtime. It is not provider
+/// compute time and must not be added to the parent turn interval or to
+/// another call's interval.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplainAnalyzeAuxiliaryCallV1 {
+    pub call_id: String,
+    pub operation_id: String,
+    pub stage: String,
+    pub start_elapsed_ms: u64,
+    pub duration_ms: u64,
+    pub outcome: ExplainAnalyzeOutcomeV1,
+}
+
+/// The settlement status at the Work-admission boundary.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExplainAnalyzeAdmissionSettlementStatusV1 {
+    Accepted,
+    Rejected,
+    Unavailable,
+    NotDispatched,
+}
+
+/// Typed reason for the admission settlement. Provider response text is not
+/// part of the Explain contract.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExplainAnalyzeAdmissionSettlementReasonV1 {
+    Accepted,
+    ClassifierUncertain,
+    ClassifierConflicting,
+    InvalidClassifierResponse,
+    ProviderRejected,
+    PlanningRejected,
+    ReconciliationRejected,
+    Unavailable {
+        reason: crate::SemanticJudgmentUnavailableReasonV1,
+    },
+    NotDispatched {
+        reason: crate::SemanticJudgmentPreDispatchReasonV1,
+    },
+}
+
+/// Bounded classifier evidence and the runtime's admission settlement. The
+/// classification is deliberately separate from settlement: a valid
+/// classification can still be rejected later by planning or reconciliation.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplainAnalyzeAdmissionSettlementV1 {
+    pub status: ExplainAnalyzeAdmissionSettlementStatusV1,
+    pub reason: ExplainAnalyzeAdmissionSettlementReasonV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<crate::RequestJudgmentResultV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<crate::RequestJudgmentResultV1>,
+}
+
+/// Bounded semantic and timing details attached to the terminal turn fact.
+/// These details are observational and never grant execution authority.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplainAnalyzeAuxiliaryDetailsV1 {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<ExplainAnalyzeAuxiliaryCallV1>,
+    #[serde(default, skip_serializing_if = "auxiliary_details_not_truncated")]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<ExplainAnalyzeAdmissionSettlementV1>,
+}
+
+fn auxiliary_details_not_truncated(value: &bool) -> bool {
+    !value
+}
+
+impl ExplainAnalyzeAuxiliaryDetailsV1 {
+    const MAX_CALLS: usize = 16;
+
+    pub fn is_valid(&self, terminal_elapsed_ms: u64) -> bool {
+        let mut call_ids = HashSet::new();
+        self.calls.len() <= Self::MAX_CALLS
+            && self.calls.iter().all(|call| {
+                valid_id(&call.call_id)
+                    && valid_id(&call.operation_id)
+                    && valid_id(&call.stage)
+                    && call.start_elapsed_ms <= terminal_elapsed_ms
+                    && call
+                        .start_elapsed_ms
+                        .checked_add(call.duration_ms)
+                        .is_some_and(|end| end <= terminal_elapsed_ms.saturating_add(1))
+                    && call_ids.insert(&call.call_id)
+            }) && self.admission.as_ref().is_none_or(|admission| {
+            admission
+                .classification
+                .as_ref()
+                .is_none_or(|classification| classification.validate().is_ok())
+                && admission
+                    .decision
+                    .as_ref()
+                    .is_none_or(|decision| decision.validate().is_ok())
+                && match (&admission.status, &admission.reason) {
+                    (
+                        ExplainAnalyzeAdmissionSettlementStatusV1::Accepted,
+                        ExplainAnalyzeAdmissionSettlementReasonV1::Accepted,
+                    ) => admission.decision.as_ref().is_some_and(|decision| {
+                        matches!(decision, crate::RequestJudgmentResultV1::Decided { .. })
+                    }),
+                    (ExplainAnalyzeAdmissionSettlementStatusV1::Rejected, reason) => {
+                        !matches!(
+                            reason,
+                            ExplainAnalyzeAdmissionSettlementReasonV1::Accepted
+                                | ExplainAnalyzeAdmissionSettlementReasonV1::Unavailable { .. }
+                                | ExplainAnalyzeAdmissionSettlementReasonV1::NotDispatched { .. }
+                        ) && admission.decision.is_none()
+                    }
+                    (
+                        ExplainAnalyzeAdmissionSettlementStatusV1::Unavailable,
+                        ExplainAnalyzeAdmissionSettlementReasonV1::Unavailable { .. },
+                    )
+                    | (
+                        ExplainAnalyzeAdmissionSettlementStatusV1::NotDispatched,
+                        ExplainAnalyzeAdmissionSettlementReasonV1::NotDispatched { .. },
+                    ) => admission.decision.is_none(),
+                    _ => false,
+                }
+        })
+    }
 }
 
 fn auxiliary_capture_not_truncated(value: &bool) -> bool {
@@ -363,6 +495,10 @@ pub struct ExplainAnalyzeEventV1 {
     /// Auxiliary usage is separate from timed provider-attempt node usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auxiliary_usage: Option<Box<ExplainAnalyzeAuxiliaryUsageV1>>,
+    /// Auxiliary timing and accepted semantic settlement are separate from
+    /// physical provider-attempt usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auxiliary_details: Option<Box<ExplainAnalyzeAuxiliaryDetailsV1>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ExplainAnalyzeContextMetricsV1>,
     /// Known boundaries without a measured graph interval. Only terminal turn
@@ -378,6 +514,13 @@ impl ExplainAnalyzeEventV1 {
             self.kind != ExplainAnalyzeNodeKindV1::Turn
                 || self.transition != ExplainAnalyzeTransitionV1::Finished
                 || !a.is_valid()
+        }) {
+            return false;
+        }
+        if self.auxiliary_details.as_ref().is_some_and(|details| {
+            self.kind != ExplainAnalyzeNodeKindV1::Turn
+                || self.transition != ExplainAnalyzeTransitionV1::Finished
+                || !details.is_valid(self.elapsed_ms)
         }) {
             return false;
         }
@@ -422,6 +565,7 @@ impl ExplainAnalyzeEventV1 {
                     && self.duration_ms.is_none()
                     && self.outcome.is_none()
                     && self.usage.is_none()
+                    && self.auxiliary_details.is_none()
                     && self.context.is_none()
                     && self.coverage_gaps.is_empty()
             }
@@ -499,6 +643,7 @@ mod tests {
     fn started() -> ExplainAnalyzeEventV1 {
         ExplainAnalyzeEventV1 {
             auxiliary_usage: None,
+            auxiliary_details: None,
             schema_version: EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: "turn-1/provider/0/started".to_string(),
             run_id: "run-1".to_string(),
@@ -558,6 +703,94 @@ mod tests {
         assert_eq!(event.event_type(), "explain_analyze");
         assert_eq!(event.elapsed_ms - event.start_elapsed_ms.unwrap(), 74);
         assert_eq!(event.duration_ms, Some(73));
+    }
+
+    #[test]
+    fn auxiliary_details_validate_bounds_and_runtime_acceptance() {
+        let mut event = terminal(started());
+        event.kind = ExplainAnalyzeNodeKindV1::Turn;
+        event.node_id = "turn-1".to_string();
+        event.parent_node_id = None;
+        event.auxiliary_details = Some(Box::new(ExplainAnalyzeAuxiliaryDetailsV1 {
+            calls: vec![ExplainAnalyzeAuxiliaryCallV1 {
+                call_id: "request_judgment:initial:0".into(),
+                operation_id: "request_judgment".into(),
+                stage: "initial".into(),
+                start_elapsed_ms: 15,
+                duration_ms: 15,
+                outcome: ExplainAnalyzeOutcomeV1::Succeeded,
+            }],
+            truncated: false,
+            admission: Some(ExplainAnalyzeAdmissionSettlementV1 {
+                status: ExplainAnalyzeAdmissionSettlementStatusV1::Accepted,
+                reason: ExplainAnalyzeAdmissionSettlementReasonV1::Accepted,
+                classification: Some(crate::RequestJudgmentResultV1::Decided {
+                    classification: crate::RequestJudgmentClassificationV1 {
+                        work_required: false,
+                        activation_deferred: false,
+                        domain: None,
+                        mutation: crate::RequestJudgmentMutationV1::ReadOnly,
+                        scope: crate::RequestJudgmentScopeV1::Unknown,
+                        parallel_subruns: false,
+                        capabilities: Vec::new(),
+                    },
+                }),
+                decision: Some(crate::RequestJudgmentResultV1::Decided {
+                    classification: crate::RequestJudgmentClassificationV1 {
+                        work_required: false,
+                        activation_deferred: false,
+                        domain: None,
+                        mutation: crate::RequestJudgmentMutationV1::ReadOnly,
+                        scope: crate::RequestJudgmentScopeV1::Unknown,
+                        parallel_subruns: false,
+                        capabilities: Vec::new(),
+                    },
+                }),
+            }),
+        }));
+        assert!(event.is_valid());
+
+        let mut out_of_bounds = event.clone();
+        out_of_bounds.auxiliary_details.as_mut().unwrap().calls[0].start_elapsed_ms = 31;
+        assert!(!out_of_bounds.is_valid());
+
+        let mut not_decided = event;
+        not_decided
+            .auxiliary_details
+            .as_mut()
+            .unwrap()
+            .admission
+            .as_mut()
+            .unwrap()
+            .status = ExplainAnalyzeAdmissionSettlementStatusV1::Accepted;
+        not_decided
+            .auxiliary_details
+            .as_mut()
+            .unwrap()
+            .admission
+            .as_mut()
+            .unwrap()
+            .reason = ExplainAnalyzeAdmissionSettlementReasonV1::Accepted;
+        not_decided
+            .auxiliary_details
+            .as_mut()
+            .unwrap()
+            .admission
+            .as_mut()
+            .unwrap()
+            .classification = Some(crate::RequestJudgmentResultV1::Unavailable {
+            reason: crate::SemanticJudgmentUnavailableReasonV1::Deadline,
+            delivery: crate::SemanticJudgmentDeliveryV1::Unresolved,
+        });
+        not_decided
+            .auxiliary_details
+            .as_mut()
+            .unwrap()
+            .admission
+            .as_mut()
+            .unwrap()
+            .decision = None;
+        assert!(!not_decided.is_valid());
     }
 
     #[test]

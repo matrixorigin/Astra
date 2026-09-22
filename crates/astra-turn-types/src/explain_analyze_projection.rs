@@ -40,6 +40,7 @@ pub struct ExplainAnalyzeProjectedNodeV1 {
     pub usage: Option<ExplainAnalyzeTokenUsageV1>,
     pub context: Option<ExplainAnalyzeContextMetricsV1>,
     pub auxiliary_usage: Option<Box<crate::ExplainAnalyzeAuxiliaryUsageV1>>,
+    pub auxiliary_details: Option<Box<crate::ExplainAnalyzeAuxiliaryDetailsV1>>,
     pub coverage_gaps: Vec<crate::ExplainAnalyzeCoverageGapV1>,
     pub start_observed: bool,
     pub terminal_observed: bool,
@@ -407,6 +408,24 @@ impl ExplainAnalyzeGraphV1 {
             .any(|n| n.auxiliary_usage.as_ref().is_some_and(|u| u.truncated))
     }
 
+    /// Semantic settlement and logical auxiliary-call timing for every
+    /// terminal scope. Unlike physical usage, this is not reconstructed from
+    /// the inference ledger or database timestamps.
+    pub fn auxiliary_details(&self) -> Vec<(&str, &crate::ExplainAnalyzeAuxiliaryDetailsV1)> {
+        let mut details = self
+            .nodes
+            .iter()
+            .filter(|node| node.terminal_observed && !node.conflicted)
+            .filter_map(|node| {
+                node.auxiliary_details
+                    .as_deref()
+                    .map(|details| (node.node_id.as_str(), details))
+            })
+            .collect::<Vec<_>>();
+        details.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        details
+    }
+
     pub fn nodes(&self) -> &[ExplainAnalyzeProjectedNodeV1] {
         &self.nodes
     }
@@ -725,6 +744,7 @@ impl ExplainAnalyzeGraphV1 {
             usage: event.usage.clone(),
             context: event.context.clone(),
             auxiliary_usage: event.auxiliary_usage.clone(),
+            auxiliary_details: event.auxiliary_details.clone(),
             coverage_gaps: event.coverage_gaps.clone(),
             start_observed: event.transition == ExplainAnalyzeTransitionV1::Started,
             terminal_observed: terminal,
@@ -869,6 +889,7 @@ impl ExplainAnalyzeGraphV1 {
                     || node.outcome != event.outcome
                     || node.usage != event.usage
                     || node.auxiliary_usage != event.auxiliary_usage
+                    || node.auxiliary_details != event.auxiliary_details
                     || node.context != event.context
                     || node.coverage_gaps != event.coverage_gaps
                 {
@@ -888,6 +909,7 @@ impl ExplainAnalyzeGraphV1 {
                 node.usage = event.usage.clone();
                 node.context = event.context.clone();
                 node.auxiliary_usage = event.auxiliary_usage.clone();
+                node.auxiliary_details = event.auxiliary_details.clone();
                 node.coverage_gaps = event.coverage_gaps.clone();
                 node.terminal_observed = true;
             }
@@ -1105,6 +1127,7 @@ mod tests {
     ) -> ExplainAnalyzeEventV1 {
         ExplainAnalyzeEventV1 {
             auxiliary_usage: None,
+            auxiliary_details: None,
             schema_version: crate::EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: format!("{node_id}/started"),
             run_id: "run-1".to_owned(),
