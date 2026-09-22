@@ -133,8 +133,8 @@ use crate::server::tool_database_snapshots::{self, DatabaseSnapshotRollbackJourn
 use crate::server::tool_execution_result::{result_metadata_str, tool_result_from_output};
 use crate::server::tool_local_execution::{
     LocalToolExecutionLifecycle, LocalToolPreflight, LocalToolPreflightContext,
-    record_preview_template_missing, run_local_tool_policy_preflight,
-    spawn_resource_tool_call_recording, unknown_local_tool_result, validate_local_tool_arguments,
+    run_local_tool_policy_preflight, spawn_resource_tool_call_recording, unknown_local_tool_result,
+    validate_local_tool_arguments,
 };
 use crate::server::tool_plan_gate::{
     PlanModeSnapshot, is_plan_mode_blocked_tool, plan_mode_authoring_active,
@@ -749,6 +749,8 @@ pub struct RuntimeToolExecutor {
     pub(super) user_id: String,
     /// Session ID for isolation.
     pub(crate) session_id: String,
+    /// Installed only by the root lifecycle owner, never from tool arguments.
+    explain_root: Option<(crate::server::run::engine::RunEngine, String)>,
     /// Memoria client for memory operations.
     memoria_client: astra_tools::memoria::MemoriaToolGateway,
     /// Reflect service for persisted server/cloud observation evidence.
@@ -969,6 +971,15 @@ impl RuntimeToolExecutor {
         }
     }
 
+    pub(crate) fn with_explain_root(
+        mut self,
+        engine: crate::server::run::engine::RunEngine,
+        root_run_id: String,
+    ) -> Self {
+        self.explain_root = Some((engine, root_run_id));
+        self
+    }
+
     /// Create a new server tool executor for a session.
     pub fn new(
         workspace_root: PathBuf,
@@ -998,6 +1009,7 @@ impl RuntimeToolExecutor {
             workspace_root: workspace_root.clone(),
             user_id,
             session_id: session_id.clone(),
+            explain_root: None,
             sandbox_policy,
             default_executor,
             tool_engine,
@@ -4385,16 +4397,7 @@ impl RuntimeToolExecutor {
                 }
             }
             // ── Unknown tool fallback ──────────────────────────────────
-            _ => {
-                record_preview_template_missing(
-                    &self.user_id,
-                    &self.session_id,
-                    self.context_manifest_pool.as_ref(),
-                    name,
-                )
-                .await;
-                unknown_local_tool_result(name)
-            }
+            _ => unknown_local_tool_result(name),
         };
 
         let coordination_integrity_valid = workspace_authority.coordination_integrity_valid();
@@ -5109,7 +5112,8 @@ mod tests {
             _session_id: Option<&str>,
             _top_k: usize,
             _filter_session: bool,
-        ) -> Result<Vec<astra_memoria::MemoriaMemory>, String> {
+        ) -> Result<Vec<astra_memoria::MemoriaMemory>, astra_memoria::MemoriaOperationError>
+        {
             unreachable!()
         }
 

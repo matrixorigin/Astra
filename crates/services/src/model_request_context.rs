@@ -53,7 +53,6 @@ fn event_beyond_scope_limit_sql(scope: ModelRequestContextScope<'_>) -> String {
     format!(
         "SELECT event_id FROM model_request_context_events
          WHERE user_id = ? AND {} = ?
-         ORDER BY created_at DESC, event_id DESC
          LIMIT 1 OFFSET ?",
         scope.column()
     )
@@ -446,6 +445,10 @@ mod retention_tests {
         let mark_expired = mark_expired_builder.build();
 
         assert!(probe.contains("LIMIT 1 OFFSET ?"));
+        assert!(
+            !probe.contains("ORDER BY"),
+            "overflow is an existence probe"
+        );
         assert!(completed_attempts.contains("GROUP BY attempt_id"));
         assert!(completed_attempts.contains("HAVING COUNT(*) = 2"));
         assert!(completed_attempts.contains("ORDER BY MIN(created_at) ASC, attempt_id ASC"));

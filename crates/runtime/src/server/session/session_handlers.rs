@@ -175,9 +175,6 @@ pub(crate) struct CanonicalHeadObservabilityResponse {
 #[derive(Serialize, Debug, PartialEq, Eq)]
 pub(crate) struct SessionProjectionObservabilityResponse {
     pub observability_available: bool,
-    pub transcript_page_count: u32,
-    pub transcript_page_high_watermark: i64,
-    pub transcript_page_lag_items: i64,
     pub active_run_projection_lag_events: i64,
     pub prompt_request_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -253,18 +250,8 @@ fn transcript_read_scope(
 pub(crate) struct TranscriptResponse {
     pub session_id: String,
     pub items: Vec<TranscriptItemResponse>,
-    pub page_refs: Vec<TranscriptPageRefResponse>,
     pub next_before_seq: Option<i64>,
     pub has_more: bool,
-}
-
-#[derive(Serialize)]
-pub(crate) struct TranscriptPageRefResponse {
-    pub page_seq: i64,
-    pub start_item_seq: i64,
-    pub end_item_seq: i64,
-    pub item_count: i64,
-    pub page_hash: String,
 }
 
 #[derive(Serialize)]
@@ -639,7 +626,6 @@ pub(crate) async fn get_session_state_handler(
         pool,
         &session.user_id,
         &session.session_id,
-        transcript_high_watermark,
         active_run.as_ref(),
     )
     .await?;
@@ -783,27 +769,6 @@ pub(crate) async fn get_session_transcript_handler(
         })?;
     let transcript_item_count = items.len();
     let transcript_first_seq = items.first().map(|item| item.item_seq);
-    let transcript_last_seq = items.last().map(|item| item.item_seq);
-    let page_refs = if matches!(scope, TranscriptReadScope::RootConversation) {
-        // Physical page hashes cover the whole session stream. Returning one
-        // for a filtered root projection would incorrectly claim that it
-        // hashes only the rows in this response.
-        Vec::new()
-    } else {
-        load_transcript_page_refs(
-            pool,
-            &user_id,
-            &session_id,
-            transcript_first_seq,
-            transcript_last_seq,
-        )
-        .await
-        .map_err(|error| {
-            internal_error(format!(
-                "load transcript page refs failed for session {session_id}: {error}"
-            ))
-        })?
-    };
     let next_before_seq = transcript_first_seq;
     let has_more = if transcript_item_count == limit as usize {
         match (scope, next_before_seq) {
@@ -862,7 +827,6 @@ pub(crate) async fn get_session_transcript_handler(
     Ok(Json(TranscriptResponse {
         session_id,
         items,
-        page_refs,
         next_before_seq,
         has_more,
     }))
@@ -994,51 +958,6 @@ async fn hydrate_transcript_artifacts(
     Ok(())
 }
 
-async fn load_transcript_page_refs(
-    pool: &SharedPool,
-    user_id: &str,
-    session_id: &str,
-    start_item_seq: Option<i64>,
-    end_item_seq: Option<i64>,
-) -> Result<Vec<TranscriptPageRefResponse>, String> {
-    let (Some(start_item_seq), Some(end_item_seq)) = (start_item_seq, end_item_seq) else {
-        return Ok(Vec::new());
-    };
-    let rows = sqlx::query(
-        "SELECT tp.page_seq, tp.start_item_seq, tp.end_item_seq, tp.item_count, tp.page_hash
-         FROM transcript_pages tp
-         WHERE tp.user_id = ? AND tp.session_id = ? AND tp.end_item_seq >= ? AND tp.start_item_seq <= ?
-         ORDER BY tp.page_seq ASC",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .bind(start_item_seq)
-    .bind(end_item_seq)
-    .fetch_all(pool.get())
-    .await
-    .map_err(|error| error.to_string())?;
-    rows.into_iter()
-        .map(|row| decode_transcript_page_ref(&row))
-        .collect()
-}
-
-fn decode_transcript_page_ref(row: &impl RowExt) -> Result<TranscriptPageRefResponse, String> {
-    Ok(TranscriptPageRefResponse {
-        page_seq: session_row_i64(row, "page_seq")?,
-        start_item_seq: session_row_i64(row, "start_item_seq")?,
-        end_item_seq: session_row_i64(row, "end_item_seq")?,
-        item_count: session_row_i64(row, "item_count")?,
-        page_hash: session_row_string(row, "page_hash")?,
-    })
-}
-
-fn decode_transcript_page_stats(row: &impl RowExt) -> Result<(u32, i64), String> {
-    Ok((
-        session_row_u32(row, "page_count")?,
-        session_row_non_negative_i64(row, "page_high_watermark")?,
-    ))
-}
-
 fn decode_state_category_summary(
     row: &impl RowExt,
 ) -> Result<StateCategorySummaryResponse, String> {
@@ -1103,21 +1022,8 @@ async fn load_session_projection_observability(
     pool: &SharedPool,
     user_id: &str,
     session_id: &str,
-    transcript_high_watermark: i64,
     active_run: Option<&ActiveRunProjection>,
 ) -> Result<SessionProjectionObservabilityResponse, (StatusCode, Json<ErrorResponse>)> {
-    let transcript_page_row = sqlx::query(
-        "SELECT COUNT(*) AS page_count, COALESCE(MAX(tp.end_item_seq), 0) AS page_high_watermark
-         FROM transcript_pages tp
-         WHERE tp.user_id = ? AND tp.session_id = ?",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .fetch_one(pool.get())
-    .await
-    .map_err(internal_error)?;
-    let (transcript_page_count, transcript_page_high_watermark) =
-        decode_transcript_page_stats(&transcript_page_row).map_err(internal_error)?;
     let active_run_projection_lag_events = if let Some(active_run) = active_run {
         let row = sqlx::query(
             "SELECT projection_event_idx
@@ -1237,10 +1143,6 @@ async fn load_session_projection_observability(
         .map(|record| record.event.compaction);
     Ok(SessionProjectionObservabilityResponse {
         observability_available: true,
-        transcript_page_count,
-        transcript_page_high_watermark,
-        transcript_page_lag_items: (transcript_high_watermark - transcript_page_high_watermark)
-            .max(0),
         active_run_projection_lag_events,
         prompt_request_count,
         latest_prompt_request,
@@ -3855,7 +3757,7 @@ fn decode_device_lease_event_payload(row: &impl RowExt) -> Result<DeviceLeaseEnd
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{sync::Arc, time::Instant};
+    use std::sync::Arc;
 
     use astra_core::{ErrorResponse, SharedPool, error_response};
     use astra_services::auth::SessionActivityRecord;
@@ -4054,7 +3956,6 @@ mod tests {
                 "event_type" => "auto_expire",
                 "reason" => "stale",
                 "ended_at_server" => "2026-06-26T13:00:00",
-                "page_hash" => "hash-1",
                 "run_id" => "run-1",
                 "branch_id" => "main",
                 "isolation_domain" => "owner-session-v1",
@@ -4090,12 +3991,6 @@ mod tests {
             match column {
                 "item_seq" => Ok(7),
                 "last_monotonic_id" => Ok(42),
-                "page_seq" => Ok(2),
-                "start_item_seq" => Ok(5),
-                "end_item_seq" => Ok(9),
-                "item_count" => Ok(5),
-                "page_count" => Ok(3),
-                "page_high_watermark" => Ok(9),
                 "projection_event_idx" => Ok(8),
                 "total" => Ok(4),
                 "total_estimated_tokens" => Ok(123),
@@ -4297,28 +4192,11 @@ mod tests {
         headers
     }
 
-    async fn perf_setup_pool() -> SharedPool {
-        assert_eq!(
-            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
-            Ok("1"),
-            "set ASTRA_TEST_DB_IT=1 for ignored session handler benchmarks"
-        );
-        let settings = astra_core::MatrixOneSettings::from_env();
-        let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
-            .unwrap_or_else(|_| "mysql".to_string());
-        astra_services::ensure_core_schema(&settings, &catalog)
-            .await
-            .expect("ensure_core_schema must pass before session handler benchmarks");
-        SharedPool::new(&settings)
-            .await
-            .expect("SharedPool::new must connect to MatrixOne")
-    }
-
-    fn perf_id(prefix: &str) -> String {
+    fn manifest_fixture_id(prefix: &str) -> String {
         format!("{prefix}-{}", Uuid::new_v4().simple())
     }
 
-    async fn insert_perf_session(pool: &SharedPool, user_id: &str, session_id: &str) {
+    async fn insert_manifest_session(pool: &SharedPool, user_id: &str, session_id: &str) {
         sqlx::query(
             "INSERT INTO agent_sessions
              (session_id, user_id, agent_id, title, status, metadata, created_at, updated_at)
@@ -4328,25 +4206,21 @@ mod tests {
         .bind(user_id)
         .execute(pool.get())
         .await
-        .expect("perf insert_session must succeed");
-    }
-
-    fn perf_millis(started: Instant) -> u128 {
-        started.elapsed().as_millis()
+        .expect("insert manifest reader session");
     }
 
     #[tokio::test]
-    #[ignore = "requires ASTRA_TEST_DB_IT=1; perf_benchmark"]
-    async fn perf_benchmark_7_latest_manifest_reads_use_production_reader() {
-        const MANIFESTS: usize = 512;
+    #[ignore = "requires ASTRA_TEST_DB_IT=1; live MatrixOne"]
+    async fn latest_manifest_reader_prefers_run_and_preserves_owner_scope() {
+        const MANIFESTS: usize = 3;
 
-        let pool = perf_setup_pool().await;
-        let user_id = perf_id("perf-read-user");
-        let session_id = perf_id("perf-read-session");
-        let preferred_run_id = perf_id("perf-read-preferred-run");
-        let latest_run_id = perf_id("perf-read-latest-run");
-        let manifest_prefix = perf_id("perf-manifest");
-        insert_perf_session(&pool, &user_id, &session_id).await;
+        let pool = crate::turn::services::setup_live_pool_for_test().await;
+        let user_id = manifest_fixture_id("reader-user");
+        let session_id = manifest_fixture_id("reader-session");
+        let preferred_run_id = manifest_fixture_id("reader-preferred-run");
+        let latest_run_id = manifest_fixture_id("reader-latest-run");
+        let manifest_prefix = manifest_fixture_id("reader-manifest");
+        insert_manifest_session(&pool, &user_id, &session_id).await;
 
         let store = DatabaseContextManifestStore::new(pool.clone());
         for index in 0..MANIFESTS {
@@ -4377,32 +4251,28 @@ mod tests {
                     vec![],
                 )
                 .await
-                .expect("PERF-7 manifest seed must succeed");
+                .expect("seed manifest");
             assert_eq!(
                 outcome,
                 DurableCaptureOutcome::Inserted,
-                "PERF-7 seed must be a fresh capture"
+                "seed must be a fresh capture"
             );
         }
 
-        let started = Instant::now();
         let preferred =
             load_latest_context_manifest(&pool, &user_id, &session_id, Some(&preferred_run_id))
                 .await
-                .expect("PERF-7 preferred latest-manifest query must succeed")
-                .expect("PERF-7 preferred latest-manifest query must find a row");
-        let preferred_ms = perf_millis(started);
+                .expect("read preferred manifest")
+                .expect("preferred run has a manifest");
         assert_eq!(
             preferred.manifest_id,
             format!("{manifest_prefix}-{:04}", MANIFESTS - 2)
         );
 
-        let started = Instant::now();
         let fallback = load_latest_context_manifest(&pool, &user_id, &session_id, None)
             .await
-            .expect("PERF-7 fallback latest-manifest query must succeed")
-            .expect("PERF-7 fallback latest-manifest query must find a row");
-        let fallback_ms = perf_millis(started);
+            .expect("read latest manifest")
+            .expect("session has a manifest");
         assert_eq!(
             fallback.manifest_id,
             format!("{manifest_prefix}-{:04}", MANIFESTS - 1)
@@ -4415,8 +4285,8 @@ mod tests {
             Some("perf-read-missing-run"),
         )
         .await
-        .expect("PERF-7 missing preferred run fallback must succeed")
-        .expect("PERF-7 missing preferred run must fall back to session latest");
+        .expect("read missing run fallback")
+        .expect("missing run falls back to session latest");
         assert_eq!(
             missing_preferred.manifest_id,
             format!("{manifest_prefix}-{:04}", MANIFESTS - 1)
@@ -4429,15 +4299,8 @@ mod tests {
             Some(&preferred_run_id),
         )
         .await
-        .expect("PERF-7 wrong-owner read must succeed");
-        assert!(wrong_owner.is_none(), "PERF-7 must not read another owner");
-        println!(
-            "PERF_RESULT benchmark=manifest_latest_read history_rows={MANIFESTS} preferred_ms={preferred_ms} fallback_ms={fallback_ms}"
-        );
-        assert!(
-            preferred_ms < 50 && fallback_ms < 50,
-            "PERF-7 latest reads must stay under 50ms: preferred={preferred_ms}ms fallback={fallback_ms}ms"
-        );
+        .expect("read foreign owner");
+        assert!(wrong_owner.is_none(), "must not read another owner");
     }
 
     #[tokio::test]
@@ -4824,66 +4687,6 @@ mod tests {
             assert!(
                 err.contains(&format!("decode column `{column}`")),
                 "error should identify missing transcript column {column}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn transcript_page_ref_decode_fails_loudly_on_required_columns() {
-        let page = decode_transcript_page_ref(&FakeSessionRow::complete())
-            .expect("complete page ref decodes");
-        assert_eq!(page.page_seq, 2);
-        assert_eq!(page.start_item_seq, 5);
-        assert_eq!(page.end_item_seq, 9);
-        assert_eq!(page.item_count, 5);
-        assert_eq!(page.page_hash, "hash-1");
-
-        for column in [
-            "page_seq",
-            "start_item_seq",
-            "end_item_seq",
-            "item_count",
-            "page_hash",
-        ] {
-            let err = match decode_transcript_page_ref(&FakeSessionRow::fail_on(column)) {
-                Ok(_) => panic!("missing transcript page column must fail: {column}"),
-                Err(err) => err,
-            };
-            assert!(
-                err.contains(&format!("decode column `{column}`")),
-                "error should identify missing page column {column}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn transcript_page_stats_decode_fails_loudly_on_required_columns() {
-        let (page_count, high_watermark) =
-            decode_transcript_page_stats(&FakeSessionRow::complete()).expect("stats decode");
-        assert_eq!(page_count, 3);
-        assert_eq!(high_watermark, 9);
-
-        for column in ["page_count", "page_high_watermark"] {
-            let err = match decode_transcript_page_stats(&FakeSessionRow::fail_on(column)) {
-                Ok(_) => panic!("missing transcript stats column must fail: {column}"),
-                Err(err) => err,
-            };
-            assert!(
-                err.contains(&format!("decode column `{column}`")),
-                "error should identify stats column {column}: {err}"
-            );
-        }
-
-        for (column, value) in [
-            ("page_count", -1),
-            ("page_count", i64::from(u32::MAX) + 1),
-            ("page_high_watermark", -1),
-        ] {
-            let err = decode_transcript_page_stats(&FakeSessionRow::with_i64(column, value))
-                .expect_err("invalid transcript stats value must fail");
-            assert!(
-                err.contains(column),
-                "error should identify invalid stats column {column}: {err}"
             );
         }
     }

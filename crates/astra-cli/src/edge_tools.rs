@@ -3667,6 +3667,9 @@ impl ToolExecutor {
     }
 
     fn handle_introspect(&self, args: &Value) -> String {
+        if args.get("explain").is_some() {
+            return "Error: Explain selectors require the server capacity; use an existing local artifact handle for CLI/Edge snapshots".to_string();
+        }
         if args.get("artifact").is_some() {
             let request = astra_turn_core::introspect::IntrospectRequest::from_args(args);
             if !request.source_policy.allows_edge_local_artifacts() {
@@ -10515,6 +10518,21 @@ mod tests {
     mod tool_search_tests;
     mod utf16_tests;
     mod worktree_tests;
+
+    #[test]
+    fn introspect_rejects_server_explain_selectors_locally() {
+        let executor = test_executor();
+        for selector in [
+            serde_json::json!({"target": "previous"}),
+            serde_json::json!({"target": "run", "run_id": "/etc/passwd"}),
+        ] {
+            let result = executor.handle_introspect(&serde_json::json!({"explain": selector}));
+            assert!(
+                result.starts_with("Error: Explain selectors require the server capacity"),
+                "{result}"
+            );
+        }
+    }
 
     // ── introspect facet=session_memory (unhappy first) ───────────────
 

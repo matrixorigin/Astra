@@ -3,10 +3,15 @@
 use astra_core::{
     JwtSettings, MatrixOneSettings, MemoriaSettings, SharedPool, config::UcNativeSettings,
 };
+use astra_memoria::MemoriaOperationError;
+use astra_runtime::turn::memory_prefetch::{
+    prefetch_memories_with_client, prefetch_session_start_memories_with_client,
+};
 use astra_runtime::{AppState, HealthChecker, MemoriaPort, ServiceInfo, build_app};
 use astra_services::{
     AuthService, DatabaseAuthService, FernetTokenEncryptor, auth::uc::UcNativeProvider,
 };
+use astra_turn_types::MemoryRetrievalOutcome;
 use async_trait::async_trait;
 use axum::{
     Json, Router,
@@ -36,6 +41,8 @@ struct Fixture {
     issuer: String,
     status: Arc<Mutex<String>>,
     writes: Arc<Mutex<Vec<String>>>,
+    reads: Arc<Mutex<Vec<String>>>,
+    authority_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[tokio::test]
@@ -53,6 +60,8 @@ async fn uc_builtin_memory_preserves_identity_lifecycle_and_transport() {
         issuer: base.clone(),
         status: Arc::new(Mutex::new("active".into())),
         writes: Default::default(),
+        reads: Default::default(),
+        authority_calls: Default::default(),
     };
     let server = Router::new()
         .route("/protocol/openid-connect/token", post(|| async { Json(json!({"access_token":"service-only", "token_type":"Bearer", "expires_in":300})) }))
@@ -65,6 +74,7 @@ async fn uc_builtin_memory_preserves_identity_lifecycle_and_transport() {
                 "expires_at":chrono::Utc::now().timestamp()+300, "email":"fixture@example.invalid", "display_name":"fixture"}}))
         }))
         .route("/api/v1/uc/internal/users/{subject}/status", get(|State(f): State<Fixture>, Path(subject): Path<String>, headers: HeaderMap| async move {
+            f.authority_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             assert_eq!(headers["authorization"], "Bearer service-only");
             let status = f.status.lock().unwrap().clone();
             if status == "unavailable" { return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({}))); }
@@ -78,6 +88,13 @@ async fn uc_builtin_memory_preserves_identity_lifecycle_and_transport() {
             assert!(body.get("user_id").is_none_or(|id| id == owner));
             f.writes.lock().unwrap().push(owner.into());
             Json(json!({"memory_id":"stored-memory", "user_id":owner}))
+        }))
+        .route("/v1/memories/retrieve", post(|State(f): State<Fixture>, headers: HeaderMap| async move {
+            assert_eq!(headers["authorization"], "Memoria-Owner test-deployment-key");
+            let owner = headers["x-user-id"].to_str().unwrap();
+            assert!(owner.starts_with("uc_") && owner.len() <= 64);
+            f.reads.lock().unwrap().push(owner.into());
+            Json(json!({"memories":[]}))
         })).with_state(fixture.clone());
     let server = tokio::spawn(async move {
         axum::serve(listener, server).await.unwrap();
@@ -96,7 +113,6 @@ async fn uc_builtin_memory_preserves_identity_lifecycle_and_transport() {
         self_hosted_master_access: false,
         issuer: None,
         web_url: None,
-        legacy_issuer: None,
     };
     let auth = Arc::new(
         DatabaseAuthService::new(
@@ -138,6 +154,48 @@ async fn uc_builtin_memory_preserves_identity_lifecycle_and_transport() {
     };
     let alice_port = make_port(&alice.user_id);
     let bob_port = make_port(&bob.user_id);
+    // Scoped-only resolution must not consult UC; an unavailable upstream
+    // cannot change its absent-scoped-credential result.
+    *fixture.status.lock().unwrap() = "unavailable".into();
+    assert!(
+        auth.memoria_credentials()
+            .unwrap()
+            .resolve(&alice.user_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    *fixture.status.lock().unwrap() = "active".into();
+    let uc_provider_id = format!("uc:{}", settings.issuer);
+    {
+        let extra_subject = format!("ambiguous-{nonce}");
+        sqlx::query("INSERT INTO auth_external_identities (provider_id,external_subject,astra_user_id) VALUES (?, ?, ?)")
+            .bind(&uc_provider_id).bind(&extra_subject).bind(&alice.user_id)
+            .execute(pool.get()).await.unwrap();
+        assert!(alice_port.admits_operation(false).await.is_err());
+        assert_eq!(
+            prefetch_memories_with_client(&alice_port, "query", &alice.user_id, "session", 1)
+                .await
+                .outcome,
+            MemoryRetrievalOutcome::Unavailable
+        );
+        assert!(fixture.reads.lock().unwrap().is_empty());
+        sqlx::query("DELETE FROM auth_external_identities WHERE provider_id = ? AND external_subject = ? AND astra_user_id = ?")
+            .bind(&uc_provider_id).bind(&extra_subject).bind(&alice.user_id)
+            .execute(pool.get()).await.unwrap();
+    }
+    let subject: String = sqlx::query_scalar("SELECT external_subject FROM auth_external_identities WHERE provider_id = ? AND astra_user_id = ?")
+        .bind(&uc_provider_id).bind(&alice.user_id).fetch_one(pool.get()).await.unwrap();
+    sqlx::query("UPDATE auth_external_identities SET external_subject = '' WHERE provider_id = ? AND astra_user_id = ?")
+        .bind(&uc_provider_id).bind(&alice.user_id).execute(pool.get()).await.unwrap();
+    assert!(alice_port.admits_operation(false).await.is_err());
+    assert!(matches!(
+        alice_port.retrieve("query", None, 1).await,
+        Err(MemoriaOperationError::AuthorityUnavailable(_))
+    ));
+    assert!(fixture.reads.lock().unwrap().is_empty());
+    sqlx::query("UPDATE auth_external_identities SET external_subject = ? WHERE provider_id = ? AND astra_user_id = ?")
+        .bind(subject).bind(&uc_provider_id).bind(&alice.user_id).execute(pool.get()).await.unwrap();
     let a = alice_port
         .resolve_tool_transport(true)
         .await
@@ -150,6 +208,48 @@ async fn uc_builtin_memory_preserves_identity_lifecycle_and_transport() {
         .unwrap();
     assert_ne!(a.owner_user_id, b.owner_user_id);
     assert!(a.owner_scoped_master && b.owner_scoped_master);
+    let before = fixture
+        .authority_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        prefetch_memories_with_client(&alice_port, "query", &alice.user_id, "session", 1)
+            .await
+            .outcome,
+        MemoryRetrievalOutcome::Complete
+    );
+    assert_eq!(
+        fixture
+            .authority_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        before + 1
+    );
+    assert_eq!(
+        *fixture.reads.lock().unwrap(),
+        vec![a.owner_user_id.clone()]
+    );
+    let before = fixture
+        .authority_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        prefetch_session_start_memories_with_client(&alice_port, &alice.user_id, "session")
+            .await
+            .outcome,
+        MemoryRetrievalOutcome::Complete
+    );
+    assert_eq!(
+        fixture
+            .authority_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        before + 2
+    );
+    assert_eq!(fixture.reads.lock().unwrap().len(), 3);
+    assert!(matches!(
+        alice_port
+            .retrieve_for_prompt("query", &bob.user_id, "session", 1)
+            .await,
+        Err(MemoriaOperationError::Failed(_))
+    ));
+    assert_eq!(fixture.reads.lock().unwrap().len(), 3);
     // Neither merely configuring a deployment key nor a different issuer
     // grants access to the previously authenticated UC account.
     for enabled in [false, true] {
@@ -177,6 +277,11 @@ async fn uc_builtin_memory_preserves_identity_lifecycle_and_transport() {
             alice.user_id.clone(),
         );
         assert!(!port.admits_operation(false).await.unwrap());
+        assert!(matches!(
+            port.retrieve("query", None, 1).await,
+            Err(MemoriaOperationError::Disabled(_))
+        ));
+        assert_eq!(fixture.reads.lock().unwrap().len(), 3);
     }
     assert_eq!(
         alice_port
@@ -222,6 +327,23 @@ async fn uc_builtin_memory_preserves_identity_lifecycle_and_transport() {
 
     for status in ["disabled", "deleted", "pending_verification", "not-found"] {
         *fixture.status.lock().unwrap() = status.into();
+        let before = fixture
+            .authority_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            prefetch_session_start_memories_with_client(&alice_port, &alice.user_id, "session")
+                .await
+                .outcome,
+            MemoryRetrievalOutcome::NotAttempted
+        );
+        assert_eq!(
+            fixture
+                .authority_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            before + 2,
+            "disabled session-start lanes independently resolve current authority"
+        );
+        assert_eq!(fixture.reads.lock().unwrap().len(), 3);
         assert!(!alice_port.admits_operation(true).await.unwrap());
         assert!(
             alice_port
@@ -233,6 +355,13 @@ async fn uc_builtin_memory_preserves_identity_lifecycle_and_transport() {
     for status in ["unavailable", "mismatch", "unknown-status"] {
         *fixture.status.lock().unwrap() = status.into();
         assert!(alice_port.admits_operation(false).await.is_err());
+        assert_eq!(
+            prefetch_memories_with_client(&alice_port, "query", &alice.user_id, "session", 1)
+                .await
+                .outcome,
+            MemoryRetrievalOutcome::Unavailable
+        );
+        assert_eq!(fixture.reads.lock().unwrap().len(), 3);
     }
     *fixture.status.lock().unwrap() = "active".into();
     sqlx::query("UPDATE auth_users SET is_active = 0 WHERE user_id = ?")
@@ -241,6 +370,10 @@ async fn uc_builtin_memory_preserves_identity_lifecycle_and_transport() {
         .await
         .unwrap();
     assert!(!alice_port.admits_operation(false).await.unwrap());
+    assert!(matches!(
+        alice_port.retrieve("query", None, 1).await,
+        Err(MemoriaOperationError::Disabled(_))
+    ));
     assert!(bob_port.admits_operation(false).await.unwrap());
     // A retained/disconnected Memoria identity cannot become a new built-in
     // grant, even if an operator has also mapped this account to UC.
@@ -248,12 +381,21 @@ async fn uc_builtin_memory_preserves_identity_lifecycle_and_transport() {
         .bind("memoria:retained-fixture").bind(format!("retained-{nonce}")).bind(&bob.user_id)
         .execute(pool.get()).await.unwrap();
     assert!(!bob_port.admits_operation(true).await.unwrap());
+    assert!(matches!(
+        bob_port.retrieve("query", None, 1).await,
+        Err(MemoriaOperationError::Disabled(_))
+    ));
     sqlx::query("DELETE FROM auth_external_identities WHERE astra_user_id = ?")
         .bind(&bob.user_id)
         .execute(pool.get())
         .await
         .unwrap();
     assert!(!bob_port.admits_operation(false).await.unwrap());
+    assert!(matches!(
+        bob_port.retrieve("query", None, 1).await,
+        Err(MemoriaOperationError::Disabled(_))
+    ));
+    assert_eq!(fixture.reads.lock().unwrap().len(), 3);
     assert_eq!(fixture.writes.lock().unwrap().len(), 2);
     server.abort();
 }

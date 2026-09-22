@@ -4,7 +4,6 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use astra_core::SharedPool;
 use astra_services::resource_governor::ResourceGovernor;
 use serde_json::{Value, json};
 use tracing::Instrument;
@@ -109,31 +108,6 @@ pub(crate) fn spawn_resource_tool_call_recording(
         }
         .in_current_span(),
     );
-    true
-}
-
-pub(crate) async fn record_preview_template_missing(
-    user_id: &str,
-    session_id: &str,
-    context_manifest_pool: Option<&SharedPool>,
-    tool_name: &str,
-) -> bool {
-    let Some(pool) = context_manifest_pool else {
-        return false;
-    };
-    let store = astra_services::DatabaseContextManifestStore::new(pool.clone());
-    if let Err(error) = store
-        .preview_template_budget_or_fallback(user_id, session_id, None, tool_name)
-        .await
-    {
-        tracing::warn!(
-            target: "astra_runtime::tool_preview",
-            session_id = %session_id,
-            tool_name,
-            error = %error,
-            "failed to persist preview_template_missing event"
-        );
-    }
     true
 }
 
@@ -301,11 +275,6 @@ mod tests {
     #[test]
     fn resource_tool_call_recording_skips_missing_governor() {
         assert!(!spawn_resource_tool_call_recording("user-1", None));
-    }
-
-    #[tokio::test]
-    async fn preview_template_missing_skips_missing_pool() {
-        assert!(!record_preview_template_missing("user-1", "session-1", None, "ghost_tool").await);
     }
 
     #[test]

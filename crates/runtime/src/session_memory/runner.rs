@@ -681,22 +681,6 @@ pub(crate) async fn load_current_session_memory_snapshot(
         return None;
     }
 
-    // Session memory is optional context. A missing or revoked user
-    // capability is a normal no-op, not a failed typed retrieval; admit the
-    // read before calling the provider so disabled accounts do not emit
-    // misleading warning-level diagnostics on every turn.
-    match memoria.admits_operation(false).await {
-        Ok(true) => {}
-        Ok(false) => return None,
-        Err(error) => {
-            tracing::warn!(
-                session_id,
-                error = %error,
-                "session memory admission check unavailable"
-            );
-            return None;
-        }
-    }
     let query = format!("{SESSION_MEMORY_PREFIX} {session_id} session memory");
 
     match memoria
@@ -709,6 +693,11 @@ pub(crate) async fn load_current_session_memory_snapshot(
         .await
     {
         Ok(memories) => select_latest_session_memory_snapshot(&memories, session_id),
+        Err(astra_memoria::MemoriaOperationError::Disabled(_)) => None,
+        Err(astra_memoria::MemoriaOperationError::AuthorityUnavailable(error)) => {
+            tracing::warn!(session_id, error = %error, "session memory admission check unavailable");
+            None
+        }
         Err(e) => {
             tracing::warn!(
                 session_id = %session_id,
@@ -1677,7 +1666,7 @@ mod tests {
             _session_id: Option<&str>,
             _top_k: usize,
             _filter_session: bool,
-        ) -> Result<Vec<MemoriaMemory>, String> {
+        ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
             std::future::pending().await
         }
 
@@ -1704,7 +1693,7 @@ mod tests {
             _session_id: Option<&str>,
             _top_k: usize,
             _filter_session: bool,
-        ) -> Result<Vec<MemoriaMemory>, String> {
+        ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
             Ok(Vec::new())
         }
 
@@ -1731,7 +1720,7 @@ mod tests {
             _session_id: Option<&str>,
             _top_k: usize,
             _filter_session: bool,
-        ) -> Result<Vec<MemoriaMemory>, String> {
+        ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
             Ok(self.retrieve_results.lock().unwrap().clone())
         }
 
@@ -1773,7 +1762,7 @@ mod tests {
             _session_id: Option<&str>,
             _top_k: usize,
             _filter_session: bool,
-        ) -> Result<Vec<MemoriaMemory>, String> {
+        ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
             Ok(Vec::new())
         }
 
@@ -1804,7 +1793,7 @@ mod tests {
             _session_id: Option<&str>,
             _top_k: usize,
             _filter_session: bool,
-        ) -> Result<Vec<MemoriaMemory>, String> {
+        ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
             Ok(self.retrieve_results.clone())
         }
 
@@ -1835,7 +1824,7 @@ mod tests {
             _session_id: Option<&str>,
             _top_k: usize,
             _filter_session: bool,
-        ) -> Result<Vec<MemoriaMemory>, String> {
+        ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
             let mut next_id = self.next_id.lock().unwrap();
             let memory = MemoriaMemory {
                 memory_id: format!("mem-overflow-{}", *next_id),
@@ -1878,7 +1867,7 @@ mod tests {
             _session_id: Option<&str>,
             _top_k: usize,
             _filter_session: bool,
-        ) -> Result<Vec<MemoriaMemory>, String> {
+        ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
             let remaining = *self.remaining.lock().unwrap();
             if remaining == 0 {
                 return Ok(Vec::new());
@@ -1924,7 +1913,7 @@ mod tests {
             _session_id: Option<&str>,
             top_k: usize,
             _filter_session: bool,
-        ) -> Result<Vec<MemoriaMemory>, String> {
+        ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
             self.requested_top_k.lock().unwrap().push(top_k);
             Ok(self.retrieve_results.iter().take(top_k).cloned().collect())
         }
@@ -3751,12 +3740,15 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_memory_read_is_a_noop_without_provider_warning_path() {
-        struct DisabledMemoria;
+        struct DisabledMemoria(
+            std::sync::atomic::AtomicUsize,
+            astra_memoria::MemoriaOperationError,
+        );
 
         #[async_trait::async_trait]
         impl MemoriaPort for DisabledMemoria {
             async fn admits_operation(&self, _: bool) -> Result<bool, String> {
-                Ok(false)
+                panic!("read admission belongs to the operation")
             }
 
             async fn retrieve_ext(
@@ -3765,8 +3757,9 @@ mod tests {
                 _: Option<&str>,
                 _: usize,
                 _: bool,
-            ) -> Result<Vec<MemoriaMemory>, String> {
-                panic!("disabled memory must not reach provider retrieval")
+            ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(self.1.clone())
             }
 
             async fn store(
@@ -3784,11 +3777,32 @@ mod tests {
             }
         }
 
+        let memoria = DisabledMemoria(
+            std::sync::atomic::AtomicUsize::new(0),
+            astra_memoria::MemoriaOperationError::Disabled("disabled".into()),
+        );
         assert!(
-            load_current_session_memory_snapshot(&DisabledMemoria, "disabled-session")
+            load_current_session_memory_snapshot(&memoria, "disabled-session")
                 .await
                 .is_none()
         );
+        assert_eq!(memoria.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        for error in [
+            astra_memoria::MemoriaOperationError::Disabled("disabled".into()),
+            astra_memoria::MemoriaOperationError::AuthorityUnavailable("lookup failed".into()),
+            astra_memoria::MemoriaOperationError::Failed("HTTP failed".into()),
+        ] {
+            let memoria: Arc<dyn MemoriaPort> = Arc::new(DisabledMemoria(
+                std::sync::atomic::AtomicUsize::new(0),
+                error,
+            ));
+            assert_eq!(
+                retrieve_prior_session_memory_page(&memoria, "session", 10)
+                    .await
+                    .unwrap_err(),
+                SessionMemoryExtractionErrorReason::PurgeFailed
+            );
+        }
     }
 
     #[tokio::test]

@@ -172,15 +172,11 @@ pub use context::{
     SnapshotListItem, SnapshotListRecord, SnapshotRecord, UnconfiguredContextService,
 };
 pub use context_manifest::{
-    BASELINE_PREVIEW_TEMPLATES, BENCHMARK_TOOL_PREVIEW_BUDGET, BUDGET_V1_8K_PROMPT_CAP,
-    BUDGET_V1_8K_TOTAL_CAP, BudgetV1_8k, CONTEXT_MANIFEST_REASONS, ConfidenceAction,
-    ContextManifestError, ContextManifestItemWrite, ContextManifestWrite,
-    DELEGATION_BLOCKER_ZONE_CAP, DELEGATION_ZONE_CAP, DatabaseContextManifestStore,
-    DelegationBudget, DelegationBudgetAllocation, RECENT_TAIL_BENCHMARK_FLOOR, RenderMode,
-    RetrievalStage, TURN_INTENT_BENCHMARK_COMPARISON, TurnIntentBudgetAllocation,
-    artifact_id_from_raw_ref, budget_for_turn_intent, content_hash_with_normalize_version,
-    cross_session_retrieval_requires_user_filter, delegation_budget, delegation_budget_allocation,
-    expired_artifact_placeholder, next_action_confidence_action, suggested_next_action_expires_at,
+    BENCHMARK_TOOL_PREVIEW_BUDGET, BUDGET_V1_8K_PROMPT_CAP, BUDGET_V1_8K_TOTAL_CAP, BudgetV1_8k,
+    CONTEXT_MANIFEST_REASONS, ContextManifestError, ContextManifestItemWrite, ContextManifestWrite,
+    DatabaseContextManifestStore, RECENT_TAIL_BENCHMARK_FLOOR, RetrievalStage,
+    TURN_INTENT_BENCHMARK_COMPARISON, TurnIntentBudgetAllocation, artifact_id_from_raw_ref,
+    budget_for_turn_intent, expired_artifact_placeholder,
 };
 pub use coordination::{
     AgentProfile, AgentProfileRegistry, AgentResult, AgentTier, AgentTrigger, AggregationStrategy,
@@ -378,9 +374,8 @@ pub use skills::{
     UnconfiguredSkillService,
 };
 pub use state_projection::{
-    BubbleUpTarget, COMPACTION_INVARIANT_SQL, CompactionInvariant, DatabaseStateProjectionStore,
-    DelegationProjectionUpsert, PROTECTED_COMPACTION_CATEGORIES, SkillActivationLlmProbe,
-    StateItemUpsert, StateProjectionError, UserAnchorMemoryItem, validate_state_mutation,
+    BubbleUpTarget, DatabaseStateProjectionStore, DelegationProjectionUpsert, StateItemUpsert,
+    StateProjectionError, UserAnchorMemoryItem, validate_state_mutation,
 };
 pub use state_sync::{
     LocalOnlySyncService, MatrixOneSyncService, StateSyncService, SyncDirection, SyncResult,
@@ -389,7 +384,6 @@ pub use state_sync::{
 pub use storage::{
     CleanupResult, RetentionPolicy, cleanup_expired_data, database_user_from_row,
     ensure_core_schema, log_session_audit, resolve_active_skill_versions, session_record_from_row,
-    update_turn_skill_selection_version,
 };
 pub use sync_engine::{
     CloudTransport, DomainAdapter, DomainSyncResult, MergeResult, NoopTransport, PayloadFormat,

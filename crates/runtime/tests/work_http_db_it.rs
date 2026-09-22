@@ -342,7 +342,6 @@ async fn cleanup_owner(pool: &SharedPool, owner_id: &str) {
     for (table, owner_column) in [
         ("session_transcript_projection_heads", "user_id"),
         ("session_transcript_items", "user_id"),
-        ("transcript_pages", "user_id"),
         ("session_context_operation_receipts", "owner_user_id"),
         ("session_context_authority_events", "owner_user_id"),
         ("session_fork_events", "owner_user_id"),
@@ -3894,10 +3893,10 @@ async fn work_transcript_is_bounded_committed_owner_scoped_and_causally_honest()
         sqlx::query(
             "INSERT INTO session_transcript_items
              (session_id, item_seq, user_id, run_id, role, content, payload_json,
-              source_event_id, source_event_idx, content_hash,
+              source_event_id, content_hash,
               canonical_completed_turn, canonical_conversation_seq,
               canonical_root_hash, created_at)
-             VALUES (?, ?, ?, NULL, 'assistant', ?, ?, ?, NULL, ?, ?, ?, ?, NOW(6))",
+             VALUES (?, ?, ?, NULL, 'assistant', ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         )
         .bind(session_id)
         .bind(item_seq)

@@ -287,7 +287,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
     },
     ToolMeta {
         name: "introspect",
-        description: "Query own runtime state: pressure, cache, tool health, alerts",
+        description: "Read runtime state or server Explain snapshots: explain={target:previous} excludes the current root; target=run selects run_id. Returns a bounded window and fixed handle for pagination.",
         triggers: &[
             "introspect",
             "self-check",

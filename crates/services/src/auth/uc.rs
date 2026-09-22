@@ -309,7 +309,7 @@ impl DatabaseAuthService {
         let mut tx = pool.begin().await.map_err(internal_error)?;
         let provider_id = format!("uc:{}", provider.settings.issuer);
         let user = self
-            .resolve_verified_provider_identity(&mut tx, &provider_id, &identity.subject, None)
+            .resolve_verified_provider_identity(&mut tx, &provider_id, &identity.subject)
             .await?;
         tx.commit().await.map_err(internal_error)?;
         Ok(AuthPrincipal {
@@ -371,7 +371,6 @@ mod memory_tests {
             self_hosted_master_access: false,
             issuer: None,
             web_url: None,
-            legacy_issuer: None,
         };
         let auth = || {
             DatabaseAuthService::new(

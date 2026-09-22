@@ -2035,17 +2035,9 @@ async fn load_run_metadata_for_exact_session_tx<T>(
 where
     T: TransactionConnection,
 {
-    match crate::storage::admit_session_scoped_run_write(
-        tx,
-        expected_session_id,
-        user_id,
-        run_id,
-        false,
-    )
-    .await
-    {
-        Ok(true) => {}
-        Ok(false) | Err(sqlx::Error::RowNotFound) => return Ok(None),
+    match crate::storage::admit_session_execution_write(tx, expected_session_id, user_id).await {
+        Ok(()) => {}
+        Err(sqlx::Error::RowNotFound) => return Ok(None),
         Err(source) => {
             return Err(db_error("admit_session_scoped_run_write", run_id, source));
         }
@@ -3849,17 +3841,15 @@ pub(crate) async fn admit_run_action_in_existing_transaction(
         return Err("transactional action admission requires an owner pod id".to_string());
     }
     let expected_owner_generation = database_action_owner_generation(request)?;
-    match crate::storage::admit_session_scoped_run_write(
+    match crate::storage::admit_session_execution_write(
         tx,
         request.expected_session_id,
         request.user_id,
-        request.run_id,
-        false,
     )
     .await
     {
-        Ok(true) => {}
-        Ok(false) | Err(sqlx::Error::RowNotFound) => {
+        Ok(()) => {}
+        Err(sqlx::Error::RowNotFound) => {
             return Ok(TransactionalRunActionAdmission::Missing);
         }
         Err(source) => {
@@ -4789,7 +4779,8 @@ pub trait RunStateStore: Send + Sync {
         kind: DurableRunInteractionKind,
     ) -> Result<Option<DurableRunInteractionProjection>, String>;
 
-    /// Find the newest root run that explicitly requested Explain Analyze.
+    /// Find the newest root run that explicitly requested Explain Analyze,
+    /// excluding the caller's trusted current root when supplied.
     /// Shared stores must answer this from their durable indexed
     /// authority; callers must never infer it from a bounded UI run tree.
     ///
@@ -4797,6 +4788,7 @@ pub trait RunStateStore: Send + Sync {
         &self,
         user_id: &str,
         session_id: &str,
+        excluded_root: Option<&str>,
     ) -> Result<Option<(String, u64)>, String>;
 
     /// Read only the newest typed terminal cancellation origin.
@@ -7263,6 +7255,7 @@ impl RunStateStore for InMemoryRunStateStore {
         &self,
         user_id: &str,
         session_id: &str,
+        excluded_root: Option<&str>,
     ) -> Result<Option<(String, u64)>, String> {
         let runs = self.runs.read().await;
         let mut candidates = runs
@@ -7270,6 +7263,7 @@ impl RunStateStore for InMemoryRunStateStore {
             .filter(|run| {
                 run.user_id == user_id
                     && run.session_id == session_id
+                    && excluded_root != Some(run.run_id.as_str())
                     && run_requested_explain_analyze(run)
             })
             .cloned()
@@ -10104,33 +10098,76 @@ const MAX_TOOL_OUTPUT_BATCH_BYTES: usize = 16 * 1024 * 1024;
 const FALLBACK_PREVIEW_BYTES: usize = 400;
 const BUILTIN_GENERIC_PREVIEW_BYTES: usize = 1200;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolPreviewKind {
+    Recognized,
+    Fallback,
+}
+
 #[derive(Clone, Debug)]
 struct ToolPreviewContract {
     max_preview_bytes: usize,
     normalize_version: String,
-    found: bool,
+    kind: ToolPreviewKind,
 }
 
-fn default_tool_preview_contract(tool_name: &str) -> ToolPreviewContract {
-    if astra_runtime_env::ToolRegistry::builtins()
-        .get(tool_name)
-        .is_some()
-    {
-        // A built-in without a specialized normalizer still has a complete,
-        // code-owned preview contract. The registry is the authority for
-        // built-in identity; absence from the optional DB specialization
-        // table must not become a durable runtime warning.
-        ToolPreviewContract {
-            max_preview_bytes: BUILTIN_GENERIC_PREVIEW_BYTES,
-            normalize_version: "text_v1".to_string(),
-            found: true,
+// Code-owned preview labels do not dispatch normalization algorithms.
+fn tool_preview_contract(tool_name: &str) -> ToolPreviewContract {
+    let (max_preview_bytes, normalize_version) = match tool_name {
+        "bash" => (1200, "shell_v1"),
+        "run_script" => (1200, "python_stdout_v1"),
+        "read_file" => (1000, "text_v1"),
+        "write_file" => (1000, "text_v1"),
+        "str_replace" => (1000, "diff_v1"),
+        "list_dir" => (1200, "text_v1"),
+        "glob" => (1200, "text_v1"),
+        "grep" => (1200, "text_v1"),
+        "symbols" => (1200, "rust_v1"),
+        "web_search" => (1000, "search_v1"),
+        "web_fetch" => (1200, "html_v1"),
+        "tool_search" => (1000, "text_v1"),
+        "session" => (1200, "text_v1"),
+        "task_board" => (1200, "text_v1"),
+        "agent" => (1200, "text_v1"),
+        "agent_fanout" => (1600, "text_v1"),
+        "memory" => (1200, "text_v1"),
+        "mo_query" => (1200, "sql_v1"),
+        "pg_dump" => (1000, "sql_v1"),
+        "fetch_url" => (1000, "html_v1"),
+        "parse_pdf" => (1000, "pdf_v1"),
+        "SKILL.md" => (1200, "skill_md_v1"),
+        "cargo" => (1200, "rust_v1"),
+        "rustc" => (1200, "rust_v1"),
+        "clippy" => (1200, "rust_v1"),
+        "pg_schema_structurize" => (1200, "sql_v1"),
+        "slow_query_analyzer" => (1200, "sql_v1"),
+        "curl" => (1000, "text_v1"),
+        "git" => (1200, "diff_v1"),
+        "docker_logs" => (1200, "text_v1"),
+        "kubectl" => (1200, "text_v1"),
+        "python_stdout" => (1200, "text_v1"),
+        "npm_build" => (1200, "js_v1"),
+        "csv_head" => (1200, "csv_v1"),
+        "json_preview" => (1200, "json_v1"),
+        "markdown_preview" => (1200, "markdown_v1"),
+        _ if astra_runtime_env::ToolRegistry::builtins()
+            .get(tool_name)
+            .is_some() =>
+        {
+            (BUILTIN_GENERIC_PREVIEW_BYTES, "text_v1")
         }
-    } else {
-        ToolPreviewContract {
-            max_preview_bytes: FALLBACK_PREVIEW_BYTES,
-            normalize_version: "raw_v1".to_string(),
-            found: false,
+        _ => {
+            return ToolPreviewContract {
+                max_preview_bytes: FALLBACK_PREVIEW_BYTES,
+                normalize_version: "raw_v1".to_string(),
+                kind: ToolPreviewKind::Fallback,
+            };
         }
+    };
+    ToolPreviewContract {
+        max_preview_bytes,
+        normalize_version: normalize_version.to_string(),
+        kind: ToolPreviewKind::Recognized,
     }
 }
 
@@ -12143,157 +12180,6 @@ impl DatabaseRunStateStore {
             releases_executor_ownership,
         ))
     }
-    async fn load_tool_preview_contracts(
-        &self,
-        items: &[ToolOutputBatchItem],
-    ) -> DbStoreResult<HashMap<String, ToolPreviewContract>> {
-        let tool_names = items
-            .iter()
-            .map(|item| item.tool_name.clone())
-            .collect::<HashSet<_>>();
-        let mut contracts = tool_names
-            .iter()
-            .map(|tool_name| (tool_name.clone(), default_tool_preview_contract(tool_name)))
-            .collect::<HashMap<_, _>>();
-        if tool_names.is_empty() {
-            return Ok(contracts);
-        }
-
-        let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
-            "SELECT tool_name, max_preview_bytes, normalize_version
-             FROM preview_template_registry
-             WHERE status = 'active' AND tool_name IN (",
-        );
-        let mut separated = builder.separated(", ");
-        for tool_name in &tool_names {
-            separated.push_bind(tool_name);
-        }
-        separated.push_unseparated(")");
-        let rows = builder
-            .build()
-            .fetch_all(self.pool.get())
-            .await
-            .map_err(|source| {
-                db_error("load_tool_preview_contracts", "preview_templates", source)
-            })?;
-        for row in rows {
-            let (tool_name, contract) = decode_tool_preview_contract_row(&row)?;
-            contracts.insert(tool_name, contract);
-        }
-        Ok(contracts)
-    }
-
-    async fn record_preview_template_missing_for_tools(
-        &self,
-        session_id: &str,
-        run_id: &str,
-        user_id: &str,
-        contracts: &HashMap<String, ToolPreviewContract>,
-    ) -> DbStoreResult<()> {
-        let missing = contracts
-            .iter()
-            .filter_map(|(tool_name, contract)| (!contract.found).then_some(tool_name.clone()))
-            .collect::<Vec<_>>();
-        if missing.is_empty() {
-            return Ok(());
-        }
-        let missing_events = missing
-            .into_iter()
-            .map(|tool_name| (tool_name, Uuid::new_v4().to_string()))
-            .collect::<Vec<_>>();
-        let last_event_id = missing_events.last().map(|(_, event_id)| event_id.as_str());
-        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
-            .await
-            .map_err(|source| {
-                db_error(
-                    "acquire_record_preview_template_missing_for_tools",
-                    run_id,
-                    source,
-                )
-            })?;
-        let mut tx = connection.begin().await.map_err(|source| {
-            db_error(
-                "begin_record_preview_template_missing_for_tools",
-                run_id,
-                source,
-            )
-        })?;
-        crate::storage::admit_session_event_write(&mut tx, session_id, user_id, true)
-            .await
-            .map_err(|source| {
-                db_error(
-                    "admit_record_preview_template_missing_for_tools",
-                    run_id,
-                    source,
-                )
-            })?;
-        let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
-            "INSERT INTO agent_events
-             (event_id, session_id, user_id, event_type, content, metadata, meta_tool_name,
-              payload_hash, ingestion_write_id, created_at) ",
-        );
-        let ingestion_write_id = Uuid::new_v4().to_string();
-        builder.push_values(missing_events.iter(), |mut row, (tool_name, event_id)| {
-            let metadata = serde_json::json!({
-                "run_id": run_id,
-                "tool_name": tool_name,
-                "fallback_max_preview_bytes": FALLBACK_PREVIEW_BYTES,
-            });
-            let payload_hash = crate::observation_capture::canonical_observation_payload_hash(
-                crate::observation_capture::ObservationPayloadDomain::AgentEvent,
-                &serde_json::json!({
-                    "event_id": event_id,
-                    "session_id": session_id,
-                    "user_id": user_id,
-                    "event_type": "preview_template_missing",
-                    "content": tool_name,
-                    "metadata": metadata,
-                    "meta_tool_name": tool_name,
-                }),
-            );
-            row.push_bind(event_id)
-                .push_bind(session_id)
-                .push_bind(user_id)
-                .push_bind("preview_template_missing")
-                .push_bind(tool_name)
-                .push_bind(metadata.to_string())
-                .push_bind(tool_name)
-                .push_bind(payload_hash)
-                .push_bind(&ingestion_write_id)
-                .push("NOW(6)");
-        });
-        let insert_result = builder.build().execute(&mut *tx).await.map_err(|source| {
-            db_error("record_preview_template_missing_for_tools", run_id, source)
-        })?;
-        let inserted_events = crate::storage::rows_affected_to_i64(
-            insert_result.rows_affected(),
-            "record_preview_template_missing_for_tools",
-        )
-        .map_err(|source| db_error("record_preview_template_missing_for_tools", run_id, source))?;
-        if inserted_events > 0 {
-            crate::storage::add_agent_session_event_count_or_create(
-                &mut tx,
-                session_id,
-                user_id,
-                inserted_events,
-                last_event_id,
-            )
-            .await
-            .map_err(|source| {
-                db_error(
-                    "record_preview_template_missing_event_count_delta",
-                    run_id,
-                    source,
-                )
-            })?;
-        }
-        tx.commit()
-            .await
-            .map_err(|source| db_error("commit_preview_template_missing_events", run_id, source))?;
-        connection.release();
-        Ok(())
-    }
-
     pub async fn acquire_owner_lease(
         &self,
         user_id: &str,
@@ -12340,32 +12226,28 @@ impl DatabaseRunStateStore {
                 bytes: payload_bytes,
             });
         }
-        let preview_contracts = self.load_tool_preview_contracts(items).await?;
-        self.record_preview_template_missing_for_tools(
-            session_id,
-            run_id,
-            user_id,
-            &preview_contracts,
-        )
-        .await?;
         let preview_rows = items
             .iter()
             .zip(payloads.iter())
             .map(|(item, payload)| {
-                let contract = preview_contracts
-                    .get(&item.tool_name)
-                    .cloned()
-                    .unwrap_or_else(|| default_tool_preview_contract(&item.tool_name));
+                let contract = tool_preview_contract(&item.tool_name);
                 build_tool_output_preview_row(session_id, item, payload, &contract)
             })
             .collect::<Vec<_>>();
 
-        let mut tx = self
-            .pool
-            .get()
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| db_error("acquire_tool_output_batch", run_id, source))?;
+        let mut tx = connection
             .begin()
             .await
             .map_err(|source| db_error("begin_tool_output_batch", run_id, source))?;
+
+        // Fence the actual child-row transaction for every tool, including
+        // unknown names. Preview policy has no diagnostic or admission I/O.
+        crate::storage::admit_session_event_write(&mut tx, session_id, user_id, false)
+            .await
+            .map_err(|source| db_error("admit_tool_output_batch", run_id, source))?;
 
         sqlx::query(
             "INSERT INTO session_tool_output_batches
@@ -12424,6 +12306,7 @@ impl DatabaseRunStateStore {
         tx.commit()
             .await
             .map_err(|source| db_error("commit_tool_output_batch", batch_id, source))?;
+        connection.release();
         Ok(())
     }
 
@@ -13499,22 +13382,19 @@ impl DatabaseRunStateStore {
             .begin()
             .await
             .map_err(|source| db_error("insert_run_begin", &record.run_id, source).to_string())?;
-        let (_, execution_admission_facts) =
-            crate::storage::admit_session_scoped_run_write_with_facts(
-                &mut tx,
-                &record.session_id,
-                &record.user_id,
-                &record.run_id,
-                true,
-            )
-            .await
-            .map_err(|source| {
-                if matches!(source, sqlx::Error::RowNotFound) {
-                    "session is not active".to_string()
-                } else {
-                    db_error("insert_run_session_admission", &record.run_id, source).to_string()
-                }
-            })?;
+        let execution_admission_facts = crate::storage::admit_session_execution_write_with_facts(
+            &mut tx,
+            &record.session_id,
+            &record.user_id,
+        )
+        .await
+        .map_err(|source| {
+            if matches!(source, sqlx::Error::RowNotFound) {
+                "session is not active".to_string()
+            } else {
+                db_error("insert_run_session_admission", &record.run_id, source).to_string()
+            }
+        })?;
         let existing_session: Option<String> = sqlx::query_scalar(
             "SELECT session_id FROM agent_runs WHERE user_id = ? AND run_id = ? LIMIT 1 FOR UPDATE",
         )
@@ -15404,10 +15284,11 @@ impl RunStateStore for DatabaseRunStateStore {
         &self,
         user_id: &str,
         session_id: &str,
+        excluded_root: Option<&str>,
     ) -> Result<Option<(String, u64)>, String> {
         let row = sqlx::query(
             "SELECT runs.run_id, runs.run_generation FROM agent_runs runs \
-             WHERE runs.user_id = ? AND runs.session_id = ? AND runs.depth = 0 \
+             WHERE runs.user_id = ? AND runs.session_id = ? AND runs.depth = 0 AND (? IS NULL OR runs.run_id <> ?) \
                AND EXISTS ( \
                    SELECT 1 FROM agent_run_events events \
                    WHERE events.user_id = runs.user_id AND events.run_id = runs.run_id \
@@ -15419,6 +15300,8 @@ impl RunStateStore for DatabaseRunStateStore {
         )
             .bind(user_id)
             .bind(session_id)
+            .bind(excluded_root)
+            .bind(excluded_root)
             .fetch_optional(self.pool.get())
             .await
             .map_err(|source| {
@@ -22958,35 +22841,6 @@ fn run_row_u32(
     })
 }
 
-fn decode_tool_preview_contract_row(
-    row: &impl RunStateDbRow,
-) -> DbStoreResult<(String, ToolPreviewContract)> {
-    let operation = "decode_tool_preview_contract_row";
-    let table = "preview_template_registry";
-    let tool_name = run_row_string(row, operation, table, "tool_name")?;
-    let max_preview_bytes = run_row_at_least_i64(row, operation, table, "max_preview_bytes", 1)?;
-    let max_preview_bytes = usize::try_from(max_preview_bytes).map_err(|_| {
-        invalid_database_value_error(
-            operation,
-            table,
-            "max_preview_bytes",
-            format!(
-                "invalid {table}.max_preview_bytes: {max_preview_bytes}; expected <= {}",
-                usize::MAX
-            ),
-        )
-    })?;
-    let normalize_version = run_row_string(row, operation, table, "normalize_version")?;
-    Ok((
-        tool_name,
-        ToolPreviewContract {
-            max_preview_bytes,
-            normalize_version,
-            found: true,
-        },
-    ))
-}
-
 fn default_owner_pod_id() -> String {
     // `DatabaseRunStateStore::new` is intentionally cheap and is used by the
     // live executor as well as background recovery.  When ASTRA_POD_ID is not
@@ -23032,7 +22886,7 @@ fn build_tool_output_preview_row(
             item.output_id, content_hash
         )
     });
-    let preview_status = if !contract.found {
+    let preview_status = if contract.kind == ToolPreviewKind::Fallback {
         "fallback"
     } else if preview_source.len() > contract.max_preview_bytes {
         "truncated"
@@ -26016,6 +25870,26 @@ mod tests {
         assert_eq!(snapshot.applied.unwrap().selection, selected);
         assert!(
             store
+                .permission_mode_snapshot(&user, &session, "absent-run")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        sqlx::query("UPDATE agent_runs SET depth = 1 WHERE user_id = ? AND run_id = ?")
+            .bind(&user)
+            .bind(&id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .permission_mode_snapshot(&user, &session, &id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
                 .permission_mode_snapshot("other", &session, &id)
                 .await
                 .unwrap()
@@ -26169,11 +26043,19 @@ mod tests {
 
         assert_eq!(
             store
-                .find_latest_explain_analyze_root("u1", "s1")
+                .find_latest_explain_analyze_root("u1", "s1", None)
                 .await
                 .unwrap()
                 .map(|(run_id, _)| run_id),
             Some("explain-target".to_string())
+        );
+
+        assert_eq!(
+            store
+                .find_latest_explain_analyze_root("u1", "s1", Some("explain-target"))
+                .await
+                .unwrap(),
+            None,
         );
 
         let mut newer_paused = durable_run_record("explain-paused");
@@ -26187,11 +26069,19 @@ mod tests {
 
         assert_eq!(
             store
-                .find_latest_explain_analyze_root("u1", "s1")
+                .find_latest_explain_analyze_root("u1", "s1", None)
                 .await
                 .unwrap()
                 .map(|(run_id, _)| run_id),
             Some("explain-paused".to_string())
+        );
+        assert_eq!(
+            store
+                .find_latest_explain_analyze_root("u1", "s1", Some("explain-paused"))
+                .await
+                .unwrap()
+                .map(|(run, _)| run),
+            Some("explain-target".into()),
         );
     }
 
@@ -26839,8 +26729,6 @@ mod tests {
                 "checkpoint_json" => r#"{"version":"checkpoint_v2"}"#,
                 "projection_hash" => "hash-1",
                 "payload_json" => self.payload_json,
-                "tool_name" => "bash",
-                "normalize_version" => "raw_v2",
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
             }
             .to_string())
@@ -26905,7 +26793,6 @@ mod tests {
                 "projection_event_idx" => 4,
                 "total" => 11,
                 "event_idx" => 9,
-                "max_preview_bytes" => 1024,
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
             })
         }
@@ -28216,42 +28103,86 @@ mod tests {
         assert_ne!(base, usage_projection_patch_hash("run-2", 10, 4, 2));
     }
 
+    // Phase 3/6 preview seed contracts now run offline against the policy owner.
     #[test]
-    fn tool_preview_contract_row_decode_preserves_values_and_fails_loudly() {
-        let (tool_name, contract) = decode_tool_preview_contract_row(&FakeRunStateRow::complete())
-            .expect("preview contract decodes");
-        assert_eq!(tool_name, "bash");
-        assert_eq!(contract.max_preview_bytes, 1024);
-        assert_eq!(contract.normalize_version, "raw_v2");
-        assert!(contract.found);
-
-        for column in ["tool_name", "max_preview_bytes", "normalize_version"] {
-            assert_run_db_error_mentions(
-                decode_tool_preview_contract_row(&FakeRunStateRow::fail_on(column)),
-                column,
-            );
+    fn explicit_tool_preview_policy_preserves_all_36_mappings() {
+        let expected = [
+            ("bash", 1200, "shell_v1"),
+            ("run_script", 1200, "python_stdout_v1"),
+            ("read_file", 1000, "text_v1"),
+            ("write_file", 1000, "text_v1"),
+            ("str_replace", 1000, "diff_v1"),
+            ("list_dir", 1200, "text_v1"),
+            ("glob", 1200, "text_v1"),
+            ("grep", 1200, "text_v1"),
+            ("symbols", 1200, "rust_v1"),
+            ("web_search", 1000, "search_v1"),
+            ("web_fetch", 1200, "html_v1"),
+            ("tool_search", 1000, "text_v1"),
+            ("session", 1200, "text_v1"),
+            ("task_board", 1200, "text_v1"),
+            ("agent", 1200, "text_v1"),
+            ("agent_fanout", 1600, "text_v1"),
+            ("memory", 1200, "text_v1"),
+            ("mo_query", 1200, "sql_v1"),
+            ("pg_dump", 1000, "sql_v1"),
+            ("fetch_url", 1000, "html_v1"),
+            ("parse_pdf", 1000, "pdf_v1"),
+            ("SKILL.md", 1200, "skill_md_v1"),
+            ("cargo", 1200, "rust_v1"),
+            ("rustc", 1200, "rust_v1"),
+            ("clippy", 1200, "rust_v1"),
+            ("pg_schema_structurize", 1200, "sql_v1"),
+            ("slow_query_analyzer", 1200, "sql_v1"),
+            ("curl", 1000, "text_v1"),
+            ("git", 1200, "diff_v1"),
+            ("docker_logs", 1200, "text_v1"),
+            ("kubectl", 1200, "text_v1"),
+            ("python_stdout", 1200, "text_v1"),
+            ("npm_build", 1200, "js_v1"),
+            ("csv_head", 1200, "csv_v1"),
+            ("json_preview", 1200, "json_v1"),
+            ("markdown_preview", 1200, "markdown_v1"),
+        ];
+        assert_eq!(expected.len(), 36);
+        for (name, bytes, label) in expected {
+            let contract = tool_preview_contract(name);
+            assert_eq!(contract.max_preview_bytes, bytes, "{name}");
+            assert_eq!(contract.normalize_version, label, "{name}");
+            assert_eq!(contract.kind, ToolPreviewKind::Recognized, "{name}");
         }
-        assert_run_db_error_mentions(
-            decode_tool_preview_contract_row(&FakeRunStateRow::with_i64("max_preview_bytes", 0)),
-            "max_preview_bytes",
-        );
+    }
+
+    #[test]
+    fn generic_builtin_preview_policy_uses_text_1200() {
+        // These built-ins have no explicit preview specialization.
+        for name in ["ask_user", "introspect", "reflect"] {
+            assert!(
+                astra_runtime_env::ToolRegistry::builtins()
+                    .get(name)
+                    .is_some()
+            );
+            let contract = tool_preview_contract(name);
+            assert_eq!(contract.max_preview_bytes, 1200, "{name}");
+            assert_eq!(contract.normalize_version, "text_v1", "{name}");
+            assert_eq!(contract.kind, ToolPreviewKind::Recognized);
+        }
     }
 
     #[test]
     fn builtin_preview_contract_is_generic_truth_not_a_missing_template_warning() {
         for tool in astra_runtime_env::ToolRegistry::builtins().iter() {
-            let contract = default_tool_preview_contract(&tool.name);
+            let contract = tool_preview_contract(&tool.name);
             assert!(
-                contract.found,
+                contract.kind == ToolPreviewKind::Recognized,
                 "built-in {} must own a preview contract",
                 tool.name
             );
             assert!(contract.max_preview_bytes > FALLBACK_PREVIEW_BYTES);
-            assert_eq!(contract.normalize_version, "text_v1");
         }
 
-        let unknown = default_tool_preview_contract("third_party_tool_without_template");
-        assert!(!unknown.found);
+        let unknown = tool_preview_contract("third_party_tool_without_template");
+        assert!(unknown.kind == ToolPreviewKind::Fallback);
         assert_eq!(unknown.max_preview_bytes, FALLBACK_PREVIEW_BYTES);
         assert_eq!(unknown.normalize_version, "raw_v1");
     }
@@ -28260,7 +28191,11 @@ mod tests {
         ToolPreviewContract {
             max_preview_bytes,
             normalize_version: "raw_v1".to_string(),
-            found,
+            kind: if found {
+                ToolPreviewKind::Recognized
+            } else {
+                ToolPreviewKind::Fallback
+            },
         }
     }
 
@@ -28307,6 +28242,71 @@ mod tests {
             DatabaseRunStateStoreError::InvalidToolOutput { ref output_id, .. }
                 if output_id == "forged-output"
         ));
+    }
+
+    #[test]
+    fn tool_output_preview_preserves_utf8_status_hash_and_reference_identity() {
+        for (name, status) in [
+            ("read_file", "truncated"),
+            ("unknown_preview_tool", "fallback"),
+        ] {
+            let contract = tool_preview_contract(name);
+            let text = format!("a{}", "🦀".repeat(400));
+            let item = preview_item(
+                name,
+                json!({"result": text, "parent_output_id": "parent-1"}),
+            );
+            let payload = serde_json::to_string(&item.result).unwrap();
+            let row = build_tool_output_preview_row("session-1", &item, &payload, &contract);
+            assert_eq!(row.payload, payload);
+            assert_eq!(
+                row.preview_text,
+                format!("a{}", "🦀".repeat((contract.max_preview_bytes - 1) / 4))
+            );
+            assert_eq!(row.preview_status, status);
+            assert_eq!(row.normalize_version, contract.normalize_version);
+            assert_eq!(
+                row.content_hash,
+                format!("sha256:{}", sha256_hex(payload.as_bytes()))
+            );
+            assert_eq!(
+                row.artifact_ref,
+                Some(format!(
+                    "tool_output://session-1/output-1@{}",
+                    row.content_hash
+                ))
+            );
+            assert_eq!(row.parent_output_id.as_deref(), Some("parent-1"));
+
+            let mut explicit = item.clone();
+            explicit
+                .result
+                .metadata
+                .insert("artifact_ref".to_string(), json!("artifact://explicit"));
+            let payload = serde_json::to_string(&explicit.result).unwrap();
+            let row = build_tool_output_preview_row("session-1", &explicit, &payload, &contract);
+            assert_eq!(row.artifact_ref.as_deref(), Some("artifact://explicit"));
+            assert_eq!(
+                row.content_hash,
+                format!("sha256:{}", sha256_hex(payload.as_bytes()))
+            );
+        }
+        for (name, status) in [
+            ("read_file", "template"),
+            ("unknown_preview_tool", "fallback"),
+        ] {
+            let item = preview_item(name, json!({"result": "short"}));
+            let payload = serde_json::to_string(&item.result).unwrap();
+            let row = build_tool_output_preview_row(
+                "session-1",
+                &item,
+                &payload,
+                &tool_preview_contract(name),
+            );
+            assert_eq!(row.preview_text, "short");
+            assert_eq!(row.preview_status, status);
+            assert!(row.artifact_ref.is_none());
+        }
     }
 
     #[test]
@@ -31412,6 +31412,38 @@ mod tests {
                 bound_session_id: session_a.clone()
             }
         );
+        assert!(
+            store
+                .permission_mode_snapshot(&user_id, &session_b, &run_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut tx = pool.get().begin().await.unwrap();
+        assert!(
+            load_run_metadata_for_exact_session_tx(&mut tx, &user_id, &session_b, &run_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            admit_run_action_in_existing_transaction(
+                &mut tx,
+                AtomicRunActionAdmissionRequest {
+                    user_id: &user_id,
+                    run_id: &run_id,
+                    expected_session_id: &session_b,
+                    action_id: "wrong-session-action",
+                    expected_control_epoch: -1,
+                    expected_owner_generation: 1,
+                },
+                &store.owner_pod_id,
+            )
+            .await
+            .unwrap(),
+            TransactionalRunActionAdmission::Missing
+        ));
+        tx.rollback().await.unwrap();
         let after: (String, String, i64, String) = sqlx::query_as(
             "SELECT session_id, status, last_event_idx,
                     DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s.%f')

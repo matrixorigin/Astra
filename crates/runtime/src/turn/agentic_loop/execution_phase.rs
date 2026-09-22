@@ -5920,7 +5920,10 @@ fn collapse_batched_observation_fanout(tool_calls: &mut Vec<serde_json::Value>) 
                 (function.get("name").and_then(serde_json::Value::as_str) == Some(tool_name))
                     .then_some((index, observation_call_args(function)))
             })
-            .filter(|(_, args)| tool_name != "introspect" || !args.contains_key("artifact"))
+            .filter(|(_, args)| {
+                tool_name != "introspect"
+                    || (!args.contains_key("artifact") && !args.contains_key("explain"))
+            })
             .collect::<Vec<_>>();
         if candidates.len() < 2 {
             continue;
@@ -8931,11 +8934,17 @@ mod tests {
     fn artifact_paging_is_not_collapsed_with_live_introspection() {
         let mut calls = vec![
             serde_json::json!({"id":"page","function":{"name":"introspect","arguments":"{\"artifact\":\"artifact://session/tool-result/x\",\"offset\":0}"}}),
+            serde_json::json!({"id":"previous","function":{"name":"introspect","arguments":"{\"explain\":{\"target\":\"previous\"}}"}}),
+            serde_json::json!({"id":"run-a","function":{"name":"introspect","arguments":"{\"explain\":{\"target\":\"run\",\"run_id\":\"a\"}}"}}),
+            serde_json::json!({"id":"run-b","function":{"name":"introspect","arguments":"{\"explain\":{\"target\":\"run\",\"run_id\":\"b\"}}"}}),
             serde_json::json!({"id":"live","function":{"name":"introspect","arguments":"{\"facet\":\"overview\"}"}}),
         ];
-
+        let original = calls.clone();
         assert_eq!(collapse_batched_observation_fanout(&mut calls), 0);
-        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls, original,
+            "report selectors and their identities must survive batching"
+        );
     }
 
     #[tokio::test]

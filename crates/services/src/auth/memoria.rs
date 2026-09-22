@@ -1,12 +1,11 @@
 //! Application-scoped Memoria verification and credential lifecycle.
-use super::{
-    AuthHttpError, AuthTokenRecord, DatabaseAuthService, LEGACY_MEMORIA_PROVIDER_ID, sha256_hex,
-};
+use super::{AuthHttpError, AuthTokenRecord, DatabaseAuthService, sha256_hex};
 use crate::FernetTokenEncryptor;
 use astra_core::{MemoriaSettings, SharedPool, error_response, internal_error};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sqlx::Row;
 pub const ACCESS_TTL_SECONDS: u32 = 900;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -58,7 +57,6 @@ pub struct MemoriaProvider {
     pub issuer: String,
     pub provider_id: String,
     pub web_url: Option<String>,
-    legacy_issuer: Option<String>,
     // Never exposed by discovery or Debug. Only the explicit UC product policy
     // may select this credential; it does not change scoped login or fallback.
     deployment_key: Option<String>,
@@ -114,11 +112,6 @@ impl MemoriaProvider {
         Ok(Self {
             deployment_key: settings.master_key.clone().filter(|key| !key.is_empty()),
             provider_id: format!("memoria:{}", sha256_hex(&issuer)),
-            legacy_issuer: settings
-                .legacy_issuer
-                .as_deref()
-                .map(normalize_url)
-                .transpose()?,
             base_url,
             issuer,
             web_url,
@@ -260,10 +253,89 @@ pub struct MemoriaCredentialResolver {
     encryptor: FernetTokenEncryptor,
     uc_provider: Option<super::uc::UcNativeProvider>,
 }
+
+// One statement snapshot; never cached or reused as an operation grant.
+struct MemoriaAuthoritySnapshot {
+    current_token: Option<String>,
+    ciphertext: Option<String>,
+    metadata: Option<String>,
+    local_password: bool,
+    retained_binding: bool,
+    uc_subject_count: i64,
+    uc_subject: Option<String>,
+}
+
 impl MemoriaCredentialResolver {
-    async fn resolve_uc_builtin(
+    async fn load_authority_snapshot(
         &self,
         user: &str,
+    ) -> Result<Option<MemoriaAuthoritySnapshot>, String> {
+        let uc_provider = self
+            .uc_provider
+            .as_ref()
+            .filter(|uc| uc.settings.builtin_memory)
+            .map(|uc| format!("uc:{}", uc.settings.issuer));
+        // Bind each retained set explicitly: MatrixOne does not always push
+        // the outer account predicate through correlated EXISTS joins.
+        let row = sqlx::query(
+                "SELECT current_token.token_id, current_token.encrypted_value,
+                        CAST(current_token.metadata AS CHAR),
+                        CAST(u.password_hash <> '' AS SIGNED),
+                        CAST((EXISTS (SELECT 1 FROM auth_tokens retained
+                              WHERE retained.scope_user_id = u.user_id AND retained.scope_user_id = ?
+                                AND retained.type = 'memoria_connection' AND retained.provider = 'memoria')
+                          OR EXISTS (SELECT 1 FROM auth_external_identities retained
+                              WHERE retained.astra_user_id = u.user_id AND retained.astra_user_id = ?
+                                AND retained.provider_id LIKE 'memoria:%')) AS SIGNED),
+                        CAST(COALESCE(uc.subject_count, 0) AS SIGNED), uc.subject
+                 FROM auth_users u
+                 LEFT JOIN auth_tokens current_token
+                   ON current_token.token_id = ? AND current_token.scope_user_id = u.user_id
+                  AND current_token.type = 'memoria_connection' AND current_token.provider = 'memoria'
+                  AND current_token.is_active = 1
+                 LEFT JOIN (
+                     SELECT astra_user_id, COUNT(*) AS subject_count, MIN(external_subject) AS subject
+                     FROM auth_external_identities WHERE astra_user_id = ? AND provider_id = ?
+                     GROUP BY astra_user_id
+                 ) uc ON uc.astra_user_id = u.user_id
+                 WHERE u.user_id = ? AND u.is_active = 1",
+            )
+            .bind(user).bind(user).bind(self.token_id(user)).bind(user).bind(uc_provider).bind(user)
+            .fetch_optional(self.pool.get()).await
+            .map_err(|_| "Memoria authority lookup failed".to_string())?;
+        row.map(|row| {
+            Ok::<_, sqlx::Error>(MemoriaAuthoritySnapshot {
+                current_token: row.try_get(0)?,
+                ciphertext: row.try_get(1)?,
+                metadata: row.try_get(2)?,
+                local_password: row.try_get::<i64, _>(3)? != 0,
+                retained_binding: row.try_get::<i64, _>(4)? != 0,
+                uc_subject_count: row.try_get(5)?,
+                uc_subject: row.try_get(6)?,
+            })
+        })
+        .transpose()
+        .map_err(|_| "Memoria authority lookup failed".to_string())
+    }
+
+    fn scoped_credential(
+        &self,
+        snapshot: &MemoriaAuthoritySnapshot,
+    ) -> Result<Option<MemoriaCredential>, String> {
+        // Presence is not inferred from nullable ciphertext: a malformed active
+        // binding must error, never silently select deployment authority.
+        snapshot
+            .current_token
+            .as_ref()
+            .map(|_| {
+                self.decode_credential(snapshot.ciphertext.as_deref(), snapshot.metadata.as_deref())
+            })
+            .transpose()
+    }
+
+    async fn resolve_uc_builtin(
+        &self,
+        snapshot: &MemoriaAuthoritySnapshot,
     ) -> Result<Option<MemoriaCredentialResolution<MemoriaCredential>>, String> {
         let Some(uc) = self
             .uc_provider
@@ -275,18 +347,9 @@ impl MemoriaCredentialResolver {
         // Retained Memoria identities and disconnected credentials must never
         // turn into a new deployment grant. Email and untrusted request fields
         // are not identity evidence. Resolve only the configured UC issuer.
-        let subjects: Vec<String> = sqlx::query_scalar(
-            "SELECT e.external_subject FROM auth_external_identities e \
-             JOIN auth_users u ON u.user_id = e.astra_user_id \
-             WHERE e.astra_user_id = ? AND e.provider_id = ? AND u.is_active = 1 \
-             AND NOT EXISTS (SELECT 1 FROM auth_tokens t WHERE t.type = 'memoria_connection' AND t.provider = 'memoria' AND t.scope_user_id = u.user_id) \
-             AND NOT EXISTS (SELECT 1 FROM auth_external_identities m WHERE m.astra_user_id = u.user_id AND m.provider_id LIKE 'memoria:%') LIMIT 2",
-        ).bind(user).bind(format!("uc:{}", uc.settings.issuer))
-            .fetch_all(self.pool.get()).await
-            .map_err(|_| "UC memory identity lookup failed")?;
-        let subject = match subjects.as_slice() {
-            [] => return Ok(None),
-            [subject] if !subject.is_empty() => subject,
+        let subject = match (snapshot.uc_subject_count, snapshot.uc_subject.as_deref()) {
+            (0, _) => return Ok(None),
+            (1, Some(subject)) if !subject.is_empty() => subject,
             _ => return Err("UC memory identity is ambiguous".into()),
         };
         if self.provider.web_url.is_some() {
@@ -354,15 +417,10 @@ impl MemoriaCredentialResolver {
         })
     }
     pub async fn resolve(&self, user: &str) -> Result<Option<MemoriaCredential>, String> {
-        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT encrypted_value, CAST(metadata AS CHAR) FROM auth_tokens WHERE token_id = ? AND type = 'memoria_connection' AND provider = 'memoria' AND scope_user_id = ? AND is_active = 1 AND EXISTS (SELECT 1 FROM auth_users WHERE user_id = auth_tokens.scope_user_id AND is_active = 1)")
-            .bind(self.token_id(user)).bind(user).fetch_optional(self.pool.get()).await
-            .map_err(|_| "Memoria credential lookup failed".to_string())?;
-        let Some((ciphertext, metadata)) = row else {
+        let Some(snapshot) = self.load_authority_snapshot(user).await? else {
             return Ok(None);
         };
-        self.decode_credential(ciphertext.as_deref(), metadata.as_deref())
-            .map(Some)
+        self.scoped_credential(&snapshot)
     }
 
     /// Resolve both the current credential and whether an absent credential
@@ -372,24 +430,19 @@ impl MemoriaCredentialResolver {
         &self,
         user: &str,
     ) -> Result<MemoriaCredentialResolution<MemoriaCredential>, String> {
-        if let Some(credential) = self.resolve(user).await? {
+        let Some(snapshot) = self.load_authority_snapshot(user).await? else {
+            return Ok(MemoriaCredentialResolution::Denied);
+        };
+        if let Some(credential) = self.scoped_credential(&snapshot)? {
             return Ok(MemoriaCredentialResolution::Scoped(credential));
         }
-        if let Some(resolution) = self.resolve_uc_builtin(user).await? {
+        if snapshot.retained_binding {
+            return Ok(MemoriaCredentialResolution::Denied);
+        }
+        if let Some(resolution) = self.resolve_uc_builtin(&snapshot).await? {
             return Ok(resolution);
         }
-        let eligible: Option<String> = sqlx::query_scalar(
-            "SELECT u.user_id FROM auth_users u \
-             WHERE u.user_id = ? AND u.is_active = 1 AND u.password_hash <> '' \
-             AND NOT EXISTS (SELECT 1 FROM auth_tokens t WHERE t.type = 'memoria_connection' AND t.provider = 'memoria' AND t.scope_user_id = u.user_id) \
-             AND NOT EXISTS (SELECT 1 FROM auth_external_identities e WHERE e.astra_user_id = u.user_id AND e.provider_id LIKE 'memoria:%') \
-             LIMIT 1",
-        )
-        .bind(user)
-        .fetch_optional(self.pool.get())
-        .await
-        .map_err(|_| "Memoria runtime fallback eligibility lookup failed".to_string())?;
-        Ok(if eligible.is_some() {
+        Ok(if snapshot.local_password {
             MemoriaCredentialResolution::UnboundLocal
         } else {
             MemoriaCredentialResolution::Denied
@@ -516,7 +569,6 @@ impl DatabaseAuthService {
             self_hosted_master_access: false,
             issuer: None,
             web_url: None,
-            legacy_issuer: None,
         })
         .expect("valid Memoria URL")
     }
@@ -621,29 +673,11 @@ impl DatabaseAuthService {
         key: &str,
     ) -> Result<AuthTokenRecord, AuthHttpError> {
         let mut tx = pool.begin().await.map_err(internal_error)?;
-        let legacy: Option<String> = sqlx::query_scalar(
-            "SELECT astra_user_id FROM auth_external_identities
-             WHERE provider_id = ? AND external_subject = ? LIMIT 1",
-        )
-        .bind(LEGACY_MEMORIA_PROVIDER_ID)
-        .bind(&identity.memoria_user_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(internal_error)?;
-        if legacy.is_some()
-            && resolver.provider.legacy_issuer.as_deref() != Some(&resolver.provider.issuer)
-        {
-            return Err(error_response(
-                StatusCode::CONFLICT,
-                "Legacy Memoria identity requires administrator-configured MEMORIA_LEGACY_ISSUER migration",
-            ));
-        }
         let user = self
             .resolve_verified_provider_identity(
                 &mut tx,
                 &resolver.provider.provider_id,
                 &identity.memoria_user_id,
-                legacy.as_deref(),
             )
             .await?;
         // Reject credentials revoked while waiting on a concurrent link/unlink.
@@ -678,22 +712,6 @@ impl DatabaseAuthService {
         sqlx::query("INSERT INTO auth_tokens (token_id,type,provider,encrypted_value,is_active,scope_user_id,metadata) VALUES (?, 'memoria_connection', 'memoria', ?, 1, ?, ?)")
             .bind(resolver.token_id(&user.user_id)).bind(ciphertext).bind(&user.user_id)
             .bind(serde_json::to_string(&stored_identity).map_err(internal_error)?).execute(&mut *tx).await.map_err(internal_error)?;
-        if legacy.is_some() {
-            sqlx::query(
-                "DELETE FROM auth_external_identities
-                 WHERE provider_id = ? AND astra_user_id = ?",
-            )
-            .bind(LEGACY_MEMORIA_PROVIDER_ID)
-            .bind(&user.user_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(internal_error)?;
-            sqlx::query("UPDATE auth_refresh_tokens SET is_revoked = 1 WHERE user_id = ?")
-                .bind(&user.user_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(internal_error)?;
-        }
         let session = uuid::Uuid::new_v4().to_string();
         let origin = format!("verified:{}", resolver.provider.provider_id);
         let access_token = self
@@ -766,7 +784,6 @@ async fn verify_connection(
         self_hosted_master_access: false,
         issuer: None,
         web_url: None,
-        legacy_issuer: None,
     })
     .unwrap();
     let identity = provider.verify(key).await?;
@@ -953,7 +970,6 @@ mod provider_contract_tests {
             self_hosted_master_access: false,
             issuer: None,
             web_url: web.map(str::to_string),
-            legacy_issuer: None,
         }
     }
     #[test]

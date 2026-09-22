@@ -4,7 +4,7 @@ mod isolated_database;
 use astra_core::JwtSettings;
 use astra_services::{
     DatabaseModelService, FernetTokenEncryptor, ModelService,
-    auth::{AuthRefreshRequestData, AuthService, DatabaseAuthService, LEGACY_MEMORIA_PROVIDER_ID},
+    auth::{AuthRefreshRequestData, AuthService, DatabaseAuthService},
 };
 use axum::{
     Json, Router,
@@ -226,7 +226,6 @@ async fn memoria_issuer_atomicity_concurrent_binding_and_disconnect() {
                 .unwrap_or("").trim_start_matches("Bearer ");
             let owner = match key {
                 "atomic-failure" => format!("{subject}-failure"),
-                "legacy-key" => format!("{subject}-legacy"),
                 _ => subject,
             };
             (if revoked { StatusCode::UNAUTHORIZED } else { StatusCode::OK },
@@ -247,7 +246,6 @@ async fn memoria_issuer_atomicity_concurrent_binding_and_disconnect() {
         self_hosted_master_access: false,
         issuer: None,
         web_url: Some("http://localhost".into()),
-        legacy_issuer: None,
     };
     let jwt = JwtSettings {
         secret_key: "review-704-jwt".into(),
@@ -299,6 +297,22 @@ async fn memoria_issuer_atomicity_concurrent_binding_and_disconnect() {
     let encrypted: String = sqlx::query_scalar("SELECT encrypted_value FROM auth_tokens WHERE type = 'memoria_connection' AND scope_user_id = ?")
         .bind(&user).fetch_one(shared.get()).await.unwrap();
     assert_ne!(encrypted, grant.key);
+    // A present but malformed binding must error, not look like an absent
+    // credential to either public resolver.
+    let metadata: String = sqlx::query_scalar("SELECT CAST(metadata AS CHAR) FROM auth_tokens WHERE type = 'memoria_connection' AND scope_user_id = ?")
+        .bind(&user).fetch_one(shared.get()).await.unwrap();
+    for (ciphertext, metadata) in [
+        (None, metadata.as_str()),
+        (Some("invalid-ciphertext"), metadata.as_str()),
+        (Some(encrypted.as_str()), "{}"),
+    ] {
+        sqlx::query("UPDATE auth_tokens SET encrypted_value = ?, metadata = ? WHERE type = 'memoria_connection' AND scope_user_id = ?")
+            .bind(ciphertext).bind(metadata).bind(&user).execute(shared.get()).await.unwrap();
+        assert!(resolver.resolve(&user).await.is_err());
+        assert!(resolver.resolve_runtime(&user).await.is_err());
+    }
+    sqlx::query("UPDATE auth_tokens SET encrypted_value = ?, metadata = ? WHERE type = 'memoria_connection' AND scope_user_id = ?")
+        .bind(&encrypted).bind(&metadata).bind(&user).execute(shared.get()).await.unwrap();
     let mut headers = HeaderMap::new();
     headers.insert(
         "authorization",
@@ -408,64 +422,6 @@ async fn memoria_issuer_atomicity_concurrent_binding_and_disconnect() {
                 .unwrap();
         assert_eq!(rows, 0, "failed login left rows in {table}");
     }
-
-    // Legacy subjects have no issuer. They are never silently assigned to
-    // whichever instance happens to answer the next login.
-    let legacy_user = format!("legacy-{}", Uuid::new_v4());
-    let legacy_subject = format!("{subject}-legacy");
-    sqlx::query("INSERT INTO auth_users (user_id,username,email,password_hash,is_active) VALUES (?, ?, ?, '', 1)")
-        .bind(&legacy_user).bind(&legacy_user).bind(format!("{legacy_user}@test.invalid"))
-        .execute(shared.get()).await.unwrap();
-    sqlx::query(
-        "INSERT INTO auth_external_identities
-         (provider_id,external_subject,astra_user_id) VALUES (?, ?, ?)",
-    )
-    .bind(LEGACY_MEMORIA_PROVIDER_ID)
-    .bind(&legacy_subject)
-    .bind(&legacy_user)
-    .execute(shared.get())
-    .await
-    .unwrap();
-    assert_eq!(
-        auth.login_memoria("legacy-key").await.err().unwrap().0,
-        StatusCode::CONFLICT
-    );
-    let migrator = auth
-        .clone()
-        .with_memoria_settings(&astra_core::MemoriaSettings {
-            legacy_issuer: Some(base),
-            ..settings.clone()
-        })
-        .unwrap();
-    assert_eq!(
-        migrator
-            .login_memoria("legacy-key")
-            .await
-            .unwrap()
-            .tokens
-            .user_id,
-        legacy_user
-    );
-    assert_eq!(
-        migrator
-            .login_memoria("legacy-key")
-            .await
-            .unwrap()
-            .tokens
-            .user_id,
-        legacy_user
-    );
-    let remaining: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM auth_external_identities
-         WHERE provider_id = ? AND astra_user_id = ?",
-    )
-    .bind(LEGACY_MEMORIA_PROVIDER_ID)
-    .bind(&legacy_user)
-    .fetch_one(shared.get())
-    .await
-    .unwrap();
-    assert_eq!(remaining, 0);
-    migrator.disconnect_memoria(&legacy_user).await.unwrap();
 
     auth.disconnect_memoria(&user).await.unwrap();
     auth.disconnect_memoria(&user).await.unwrap(); // idempotent service operation

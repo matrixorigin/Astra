@@ -1176,7 +1176,7 @@ mod tests {
             "the ephemeral's downstream semantic compactor is the sole lossy history owner"
         );
         let pressured_properties = &outcome.tool_schemas[0]["function"]["parameters"]["properties"];
-        for field in ["artifact", "offset", "max_bytes"] {
+        for field in ["explain", "artifact", "offset", "max_bytes"] {
             assert!(
                 pressured_properties.get(field).is_some(),
                 "aggressive pipeline pressure must retain recovery field `{field}`"

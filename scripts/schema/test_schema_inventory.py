@@ -370,7 +370,6 @@ fn char_literal() { let slash = '/'; }
             "run_display_projections",
             "conversation_log",
             "session_transcript_items",
-            "transcript_pages",
             "session_tool_output_batches",
             "session_tool_outputs",
             "tool_invocation_ledger",
@@ -790,8 +789,6 @@ fn char_literal() { let slash = '/'; }
             "harness_skill_rules",
             "harness_snapshots",
             "llm_provider_admission_pacing",
-            "preview_template_registry",
-            "raw_ref_scheme_registry",
         }
         for table in ctx_eval_harness_preview_tables:
             with self.subTest(table=table):
@@ -866,14 +863,6 @@ fn char_literal() { let slash = '/'; }
             self.tables["eval_user_feedback"]["merge_guidance"],
         )
         self.assertIn(
-            "not preview rendering templates",
-            self.tables["raw_ref_scheme_registry"]["merge_guidance"],
-        )
-        self.assertIn(
-            "raw ref schemes control resolver",
-            self.tables["preview_template_registry"]["merge_guidance"],
-        )
-        self.assertIn(
             "virtual-time concurrency smoothing",
             self.tables["llm_provider_admission_pacing"]["merge_guidance"],
         )
@@ -927,7 +916,7 @@ fn char_literal() { let slash = '/'; }
             encoding="utf-8"
         )
         self.assertNotIn("CREATE TABLE IF NOT EXISTS session_sync_log", storage)
-        self.assertIn("DROP TABLE IF EXISTS session_sync_log", storage)
+        self.assertNotIn("DROP TABLE IF EXISTS session_sync_log", storage)
 
         state_sync = (
             schema_inventory.REPO_ROOT / "crates/services/src/state_sync.rs"
@@ -950,7 +939,7 @@ fn char_literal() { let slash = '/'; }
             "CREATE TABLE IF NOT EXISTS session_deletion_tombstones",
             storage,
         )
-        self.assertIn("DROP TABLE IF EXISTS session_deletion_tombstones", storage)
+        self.assertNotIn("DROP TABLE IF EXISTS session_deletion_tombstones", storage)
         self.assertIn("agent_session_lifecycle_fences", storage)
 
     def test_retired_session_projection_tables_are_absent_from_production_schema(self) -> None:
@@ -985,7 +974,6 @@ fn char_literal() { let slash = '/'; }
             "session_history_chunks",
             "session_artifacts_grants",
             "data_versioning_checkpoints",
-            "preview_template_registry + raw_ref_scheme_registry",
             "harness_skill_drafts + harness_skill_rules",
             "team_execution_history + team_snapshots",
         }
@@ -1011,10 +999,6 @@ fn char_literal() { let slash = '/'; }
 
         self.assertIn("tracing-only", self.p1_5_reviews["session_sync_log"]["user_api_impact"])
         self.assertIn(
-            "legacy issuer",
-            self.p1_5_reviews["auth_memoria_identities"]["user_api_impact"],
-        )
-        self.assertIn(
             "hydration",
             self.p1_5_reviews["session_state_revisions"]["rationale"],
         )
@@ -1029,12 +1013,6 @@ fn char_literal() { let slash = '/'; }
         self.assertIn(
             "rollback/list",
             self.p1_5_reviews["data_versioning_checkpoints"]["user_api_impact"],
-        )
-        self.assertIn(
-            "access checks",
-            self.p1_5_reviews[
-                "preview_template_registry + raw_ref_scheme_registry"
-            ]["user_api_impact"],
         )
         self.assertIn(
             "distinct cardinality",
@@ -1061,16 +1039,8 @@ fn char_literal() { let slash = '/'; }
                 "list_checkpoints",
             ],
             "crates/services/src/storage.rs": [
-                "retire_auth_memoria_identities",
-                "DROP TABLE IF EXISTS auth_memoria_identities",
-                "preview_template_registry",
-                "raw_ref_scheme_registry",
-                "INSERT IGNORE INTO raw_ref_scheme_registry",
-                "INSERT IGNORE INTO preview_template_registry",
-            ],
-            "crates/services/src/auth/memoria.rs": [
-                "LEGACY_MEMORIA_PROVIDER_ID",
-                "auth_external_identities",
+                "validate_core_schema_table_claim",
+                "verify_core_schema_shape",
             ],
             "crates/services/src/harness.rs": [
                 "harness_skill_drafts",

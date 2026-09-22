@@ -281,23 +281,28 @@ async fn observed_deliveries_distinguish_insertion_replay_collision_and_session_
     let session_id = Uuid::new_v4().to_string();
     insert_session_root(&pool, &user_id, &session_id).await;
     let config = IngestionConfig {
-        batch_size: 4,
+        batch_size: 5,
         flush_interval_secs: 1,
         ..Default::default()
     };
     let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    let (sink, mut reports) = IngestionMeasurementSink::bounded(5);
+    let (sink, mut reports) = IngestionMeasurementSink::bounded(6);
     let first = test_event_for_user(&user_id, "same-event", &session_id, "user_query");
     let replay = first.clone();
     let mut collision = first.clone();
     collision.content = Some("conflicting payload".to_string());
+    let mut last_collision = first.clone();
+    last_collision.content = Some("last conflicting payload".to_string());
     let sibling = test_event_for_user(&user_id, "sibling", &session_id, "user_query");
-    for (index, event) in [first, replay, collision, sibling].into_iter().enumerate() {
+    for (index, event) in [first, replay, collision, sibling, last_collision]
+        .into_iter()
+        .enumerate()
+    {
         let (token, _) = sink.try_start(IngestionDeliveryKey(index as u64)).unwrap();
         sender.enqueue_observed(event, token);
     }
     let mut outcomes = std::collections::BTreeMap::new();
-    for _ in 0..4 {
+    for _ in 0..5 {
         let report = tokio::time::timeout(Duration::from_secs(10), reports.recv())
             .await
             .expect("observed commit deadline")
@@ -314,11 +319,15 @@ async fn observed_deliveries_distinguish_insertion_replay_collision_and_session_
         IngestionDeliveryTerminal::Rejected(IngestionRejectionReason::IdentityCollision)
     );
     assert_eq!(outcomes[&3], IngestionDeliveryTerminal::CommittedInserted);
+    assert_eq!(
+        outcomes[&4],
+        IngestionDeliveryTerminal::Rejected(IngestionRejectionReason::IdentityCollision)
+    );
     assert_session_event_count(&pool, &user_id, &session_id, 2).await;
     let receipts: u64 = sqlx::query_scalar(
         "SELECT collision_count FROM observation_identity_collisions WHERE user_id = ? AND identity_kind = 'agent_event' AND identity_id = 'same-event'",
     ).bind(&user_id).fetch_one(&pool).await.expect("receipt committed before terminal report");
-    assert_eq!(receipts, 1);
+    assert_eq!(receipts, 2);
 
     sqlx::query(
         "UPDATE agent_sessions SET status = 'deleting' WHERE user_id = ? AND session_id = ?",
@@ -328,7 +337,7 @@ async fn observed_deliveries_distinguish_insertion_replay_collision_and_session_
     .execute(&pool)
     .await
     .expect("fence deleted session");
-    let (token, _) = sink.try_start(IngestionDeliveryKey(4)).unwrap();
+    let (token, _) = sink.try_start(IngestionDeliveryKey(5)).unwrap();
     sender.enqueue_observed(
         test_event_for_user(&user_id, "rejected", &session_id, "user_query"),
         token,

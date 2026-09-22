@@ -238,7 +238,7 @@ fn typed_subrun_workspace_intent_and_completion_profile_cannot_contradict() {
 
 use crate::server::run::lifecycle::persistence::{
     build_tool_trace_events, extract_session_state_compact, messages_for_csl_persist,
-    redact_trace_value, transcript_page_bounds, transcript_page_seq,
+    redact_trace_value,
 };
 use astra_services::runs::{
     DatabaseRunStateStore, DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord,
@@ -1335,6 +1335,14 @@ async fn exercise_primary_continuation_entry(
                 compact < first_model,
                 "compaction must precede first provider round"
             );
+            assert!(
+                window.events[first_model..]
+                    .iter()
+                    .filter(|event| event.event_type == StepEventType::LlmRoundStarted)
+                    .count()
+                    > 1,
+                "real compaction must be followed by multiple provider calls"
+            );
         }
         let terminal: (String, String, Option<String>) = sqlx::query_as("SELECT executor_run_id, status, outcome FROM work_item_attempts WHERE owner_id = ? AND attempt_id = ?")
             .bind(owner).bind(attempt).fetch_one(pool.get()).await.unwrap();
@@ -1353,6 +1361,29 @@ async fn exercise_primary_continuation_entry(
         .await
         .unwrap();
         assert_eq!(count, 1, "continuation must not duplicate delivered work");
+        // Both the compacted turn and its restored successor keep real Work
+        // authority without manufacturing answer-derived decisions or summaries.
+        for table in ["session_state_items", "session_state_item_events"] {
+            let count: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ? \
+                 AND category IN ('decision', 'summary')"
+            ))
+            .bind(owner)
+            .bind(session)
+            .fetch_one(pool.get())
+            .await
+            .expect("count answer-derived projections");
+            assert_eq!(count, 0, "continuation must not invent {table}");
+        }
+        let audits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ctx_decision_audits WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(owner)
+        .bind(session)
+        .fetch_one(pool.get())
+        .await
+        .expect("count synthetic decision audits");
+        assert_eq!(audits, 0);
         created.push(run.run_id);
     }
     for run in created {
@@ -2651,7 +2682,10 @@ async fn post_loop_memory_never_purges_an_unconfirmed_final_snapshot() {
             _: Option<&str>,
             _: usize,
             _: bool,
-        ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String> {
+        ) -> Result<
+            Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>,
+            astra_memoria::MemoriaOperationError,
+        > {
             Ok(Vec::new())
         }
 
@@ -2764,7 +2798,10 @@ async fn post_loop_memory_disabled_capability_settles_without_health_failure() {
             _: Option<&str>,
             _: usize,
             _: bool,
-        ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String> {
+        ) -> Result<
+            Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>,
+            astra_memoria::MemoriaOperationError,
+        > {
             Ok(Vec::new())
         }
 
@@ -4598,21 +4635,6 @@ fn stream_turn_complete_is_only_for_completed_or_paused_turns() {
     assert!(!should_emit_stream_turn_complete(&RunStatus::Cancelled));
     assert!(!should_emit_stream_turn_complete(&RunStatus::Waiting));
     assert!(!should_emit_stream_turn_complete(&RunStatus::Running));
-}
-
-#[test]
-fn transcript_page_seq_rolls_over_every_fifty_items() {
-    assert_eq!(transcript_page_seq(1), 1);
-    assert_eq!(transcript_page_seq(50), 1);
-    assert_eq!(transcript_page_seq(51), 2);
-    assert_eq!(transcript_page_seq(101), 3);
-}
-
-#[test]
-fn transcript_page_bounds_cover_exact_page_window() {
-    assert_eq!(transcript_page_bounds(1), (1, 50));
-    assert_eq!(transcript_page_bounds(2), (51, 100));
-    assert_eq!(transcript_page_bounds(3), (101, 150));
 }
 
 #[test]
@@ -7435,6 +7457,7 @@ struct FaultInjectedRunStoreCounters {
     load_run_calls: usize,
     status_snapshot_calls: usize,
     interaction_lookup_calls: usize,
+    explain_lookup_calls: usize,
 }
 
 struct FaultInjectedStatusMutation {
@@ -8247,9 +8270,11 @@ impl RunStateStore for FaultInjectedRunStateStore {
         &self,
         user_id: &str,
         session_id: &str,
+        excluded_root: Option<&str>,
     ) -> Result<Option<(String, u64)>, String> {
+        self.counters.lock().unwrap().explain_lookup_calls += 1;
         self.inner
-            .find_latest_explain_analyze_root(user_id, session_id)
+            .find_latest_explain_analyze_root(user_id, session_id, excluded_root)
             .await
     }
 
@@ -23870,6 +23895,54 @@ async fn resume_run_promotes_buffered_completed_pause_to_completed() {
 }
 
 #[tokio::test]
+async fn ordinary_chat_entrypoints_do_not_discover_or_recover_explain() {
+    for streaming in [false, true] {
+        for prior in [None, Some(STATUS_COMPLETED), Some(STATUS_PAUSED)] {
+            let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]));
+            let svc = test_service_with_store(store.clone());
+            let session = format!("lazy-preparation-{}", Uuid::new_v4());
+            if let Some(status) = prior {
+                svc.run_engine
+                    .start_run("prior-explain", "user-1", &session)
+                    .await
+                    .unwrap();
+                svc.run_engine
+                    .append_event(
+                        "user-1",
+                        &session,
+                        "prior-explain",
+                        json!({
+                            "event_type": "run_started", "data": {"explain_analyze_requested": true}
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                svc.run_engine
+                    .persist_status("user-1", &session, "prior-explain", status, None, None)
+                    .await
+                    .unwrap();
+            }
+            let mut request = test_request("ordinary follow-up");
+            request.session_id = Some(session);
+            let (_, counts) =
+                crate::server::explain_analyze_artifact::count_explain_artifact_fetches(async {
+                    if streaming {
+                        ok(svc.stream_chat("user-1".into(), request).await);
+                    } else {
+                        ok(svc.create_run("user-1".into(), request).await);
+                    }
+                })
+                .await;
+            assert_eq!(store.counters.lock().unwrap().explain_lookup_calls, 0);
+            assert_eq!(
+                counts.total, 0,
+                "ordinary preparation must not load or recover Explain"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn explain_publication_failure_is_returned_when_no_outcome_can_be_recorded() {
     let svc = test_service();
     let wire = AgenticRunLifecycleService::publish_explain_artifact(
@@ -23977,6 +24050,29 @@ async fn db_explain_publication_failure_survives_database_outage() {
     crate::server::run::cleanup_run_session_fixture(&cleanup_pool, user, &session).await;
 }
 
+fn explain_test_executor(
+    pool: &SharedPool,
+    svc: &AgenticRunLifecycleService,
+    user: &str,
+    session: &str,
+    root: &str,
+) -> runtime_tool_executor::RuntimeToolExecutor {
+    let mut executor = runtime_tool_executor::RuntimeToolExecutor::new(
+        std::env::temp_dir(),
+        user.into(),
+        session.into(),
+        None,
+        None,
+    )
+    .with_explain_root(svc.run_engine.clone(), root.into())
+    .with_session_artifact_store(
+        astra_services::DatabaseSessionArtifactStore::new(pool.settings().clone())
+            .with_pool(pool.clone()),
+    );
+    executor.set_context_manifest_pool(pool.clone());
+    executor
+}
+
 #[tokio::test]
 #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
 async fn db_explain_publication_is_discoverable_and_readable() {
@@ -24056,16 +24152,16 @@ async fn db_explain_publication_is_discoverable_and_readable() {
             .any(|event| event["type"] == "artifact_publication" && event["handle"] == artifact)
     );
 
-    let context = crate::server::explain_analyze_artifact::context_notice_for_run(
-        Some(&pool),
-        user,
-        &session,
-        &run,
-        generation,
-    )
-    .await
-    .unwrap();
-    assert!(context.contains(&artifact));
+    let executor = explain_test_executor(&pool, &svc, user, &session, "current-root");
+    let context = executor
+        .execute(
+            "introspect",
+            &json!({
+                "explain": {"target": "run", "run_id": run}, "max_bytes": 65536
+            }),
+        )
+        .await;
+    assert!(context.contains(&artifact), "{context}");
     let store = astra_services::DatabaseSessionArtifactStore::new(pool.settings().clone())
         .with_pool(pool.clone());
     let args = json!({"artifact":artifact, "offset":0, "max_bytes":65536});
@@ -24107,40 +24203,18 @@ async fn db_explain_publication_is_discoverable_and_readable() {
     .execute(pool.get())
     .await
     .expect("corrupt the existing Explain snapshot payload");
-    let discovery = crate::server::explain_analyze_artifact::discover_context_notice_for_run(
-        Some(&pool),
-        user,
-        &session,
-        &run,
-        generation,
-    )
-    .await
-    .expect("classify the existing corrupt snapshot");
-    match discovery {
-        crate::server::explain_analyze_artifact::ContextNoticeDiscovery::Notice(notice) => {
-            assert!(notice.contains("unavailable"));
-        }
-        crate::server::explain_analyze_artifact::ContextNoticeDiscovery::Missing => {
-            panic!("an existing corrupt snapshot must never be classified as missing")
-        }
-    }
-    let mut corrupt_profile = serde_json::Map::new();
-    let (_, corrupt_fetches) =
+    let (corrupt, corrupt_fetches) =
         crate::server::explain_analyze_artifact::count_explain_artifact_fetches(
-            svc.append_latest_explain_artifact_context(user, &session, &mut corrupt_profile),
+            executor.execute("introspect", &json!({"explain": {"target": "previous"}})),
         )
         .await;
+    assert!(corrupt.starts_with("Error:"), "{corrupt}");
     assert_eq!(
         corrupt_fetches.total, 1,
-        "an existing corrupt snapshot must not enter recovery"
+        "corrupt snapshots must not enter recovery"
     );
     assert_eq!(corrupt_fetches.discovery, 1);
     assert_eq!(corrupt_fetches.recovery, 0);
-    assert!(
-        serde_json::to_string(&corrupt_profile)
-            .expect("serialize corrupt Explain profile")
-            .contains("unavailable")
-    );
     let unchanged_content: String = sqlx::query_scalar(
         "SELECT content_json FROM session_artifacts
          WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
@@ -24158,7 +24232,7 @@ async fn db_explain_publication_is_discoverable_and_readable() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-async fn db_explain_discovery_reads_an_existing_snapshot_once() {
+async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
     let pool = setup_lifecycle_run_db_it().await;
     let user = "explain-discovery-perf-it";
     let session = format!("explain-discovery-perf-{}", Uuid::new_v4());
@@ -24208,34 +24282,142 @@ async fn db_explain_discovery_reads_an_existing_snapshot_once() {
         .strip_prefix("artifact://session/explain-analyze/")
         .expect("canonical Explain benchmark handle");
 
-    let expected_notice = crate::server::explain_analyze_artifact::context_notice_for_run(
-        Some(&pool),
-        user,
-        &session,
-        &run,
-        generation,
-    )
-    .await
-    .expect("validate Explain snapshot");
-    assert!(expected_notice.contains(&handle));
-    assert!(expected_notice.contains("status=complete"));
-    let mut edge_profile = serde_json::Map::new();
-    let (_, fetches) = crate::server::explain_analyze_artifact::count_explain_artifact_fetches(
-        svc.append_latest_explain_artifact_context(user, &session, &mut edge_profile),
-    )
-    .await;
-    assert_eq!(
-        fetches.total, 1,
-        "existing snapshot discovery must fetch once"
+    let current = format!("current-{}", Uuid::new_v4());
+    svc.run_engine
+        .persist_status(user, &session, &run, STATUS_COMPLETED, None, None)
+        .await
+        .expect("complete prior Explain run before starting the next root");
+    svc.run_engine
+        .start_run(&current, user, &session)
+        .await
+        .unwrap();
+    svc.run_engine
+        .append_event(
+            user,
+            &session,
+            &current,
+            json!({
+                "event_type": "run_started", "data": {"explain_analyze_requested": true}
+            }),
+        )
+        .await
+        .unwrap();
+    let executor = explain_test_executor(&pool, &svc, user, &session, &current);
+    let (first, fetches) =
+        crate::server::explain_analyze_artifact::count_explain_artifact_fetches(executor.execute(
+            "introspect",
+            &json!({"explain": {"target": "previous"}, "max_bytes": 128}),
+        ))
+        .await;
+    assert!(first.contains(&handle), "{first}");
+    assert!(first.contains("Capture status: complete"), "{first}");
+    assert!(
+        !first.contains(&current),
+        "current Explain root must be excluded"
     );
+    assert_eq!(fetches.total, 1);
     assert_eq!(fetches.discovery, 1);
     assert_eq!(fetches.recovery, 0);
-    assert_eq!(
-        edge_profile
-            .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS),
-        Some(&json!([expected_notice])),
-        "one-read discovery must preserve the exact model-facing notice"
-    );
+    let page = executor
+        .execute(
+            "introspect",
+            &json!({
+                "artifact": handle, "offset": 128, "max_bytes": 65536
+            }),
+        )
+        .await;
+    assert!(page.contains(&handle), "{page}");
+    assert!(page.contains("Byte window complete"), "{page}");
+    for (reader, reader_session) in [
+        ("foreign-user", session.as_str()),
+        (user, "foreign-session"),
+    ] {
+        let foreign = explain_test_executor(&pool, &svc, reader, reader_session, &current);
+        for args in [
+            json!({"explain": {"target": "run", "run_id": run}}),
+            json!({"artifact": handle}),
+        ] {
+            let denied = foreign.execute("introspect", &args).await;
+            assert!(denied.starts_with("Error:"), "{denied}");
+        }
+    }
+
+    #[cfg(feature = "e2e-hooks")]
+    {
+        let parent = format!("explain-child-parent-{}", Uuid::new_v4());
+        let child = format!("explain-grandchild-{}", Uuid::new_v4());
+        svc.run_engine
+            .start_run_ext(&parent, user, &session, Some(&current), None, None, None)
+            .await
+            .expect("start delegated parent under the current Explain root");
+        let mut config = test_executable_subrun_config(&child, test_admitted_model_execution());
+        config.user_id = user.into();
+        config.session_id = session.clone();
+        config.parent_run_id = parent.clone();
+        config.max_turns = Some(3);
+        config.initial_turns = None;
+        config.request_constraints =
+            RequestConstraints::new(Some(HashSet::from(["introspect".into()])), None, None, None);
+        config
+            .context
+            .insert("root_run_id".into(), json!("untrusted-prompt-root"));
+        let calls: Vec<_> = [
+            json!({"explain": {"target": "previous"}}),
+            json!({"explain": {"target": "run", "run_id": run}}),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, args)| {
+            json!({
+                "id": format!("explain-{index}"), "type": "function",
+                "function": {"name": "introspect", "arguments": args.to_string()}
+            })
+        })
+        .collect();
+        let delegated = ServerSubRunExecutor::new(
+            pool.settings().clone(),
+            test_encryptor(),
+            Arc::new(TokioMutex::new(HashMap::new())),
+        )
+        .with_run_engine(svc.run_engine.clone())
+        .with_pool(pool.clone())
+        .with_invocation_ledger(
+            svc.invocation_ledger
+                .clone()
+                .expect("database invocation ledger"),
+        )
+        .with_test_llm_rounds(vec![
+            json!({"tool_calls": calls}),
+            json!({"full_text": "Observed both reports."}),
+        ]);
+        let result = tokio::time::timeout(Duration::from_secs(15), delegated.execute(config))
+            .await
+            .expect("bounded delegated Explain execution")
+            .expect("delegated Explain run");
+        assert_eq!(result.status, STATUS_COMPLETED, "{result:?}");
+        let outputs: Vec<(String,)> = sqlx::query_as(
+            "SELECT CAST(metadata AS CHAR) FROM agent_events \
+             WHERE user_id = ? AND session_id = ? AND run_id = ? \
+             AND event_type = 'tool_call_completed' AND meta_tool_name = 'introspect'",
+        )
+        .bind(user)
+        .bind(&session)
+        .bind(&child)
+        .fetch_all(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(
+            outputs.len(),
+            2,
+            "both distinct report requests must execute"
+        );
+        for (output,) in outputs {
+            assert!(output.contains(&handle), "{output}");
+            assert!(!output.contains("requires a server root execution context"));
+        }
+        cleanup_lifecycle_run_fixture(&pool, user, &child).await;
+        cleanup_lifecycle_run_fixture(&pool, user, &parent).await;
+    }
 
     sqlx::query(
         "DELETE FROM session_artifacts
@@ -24275,22 +24457,20 @@ async fn db_explain_discovery_reads_an_existing_snapshot_once() {
         )
         .await
         .expect("append recoverable terminal event");
-    let mut recovered_profile = serde_json::Map::new();
-    let (_, recovery_fetches) =
+    let (recovered, recovery_fetches) =
         crate::server::explain_analyze_artifact::count_explain_artifact_fetches(
-            svc.append_latest_explain_artifact_context(user, &session, &mut recovered_profile),
+            executor.execute("introspect", &json!({"explain": {"target": "previous"}})),
         )
         .await;
-    assert_eq!(
-        recovery_fetches.total, 3,
-        "genuine absence should use two discovery reads plus recovery's guarded existence read"
-    );
+    assert_eq!(recovery_fetches.total, 3);
     assert_eq!(recovery_fetches.discovery, 2);
     assert_eq!(recovery_fetches.recovery, 1);
-    let recovered_profile =
-        serde_json::to_string(&recovered_profile).expect("serialize recovered Explain profile");
-    assert!(recovered_profile.contains("artifact://session/explain-analyze/"));
-    assert!(!recovered_profile.contains("capture is unavailable"));
+    assert!(recovered.contains(&handle), "{recovered}");
+    assert!(
+        recovered.contains("Capture status: complete"),
+        "{recovered}"
+    );
+    cleanup_lifecycle_run_fixture(&pool, user, &current).await;
 
     cleanup_lifecycle_run_fixture(&pool, user, &run).await;
     crate::server::run::cleanup_run_session_fixture(&pool, user, &session).await;
@@ -24343,18 +24523,16 @@ async fn db_pause_resume_promotes_buffered_completed_terminal_explain_publicatio
             .unwrap()
             .is_none()
     );
-    assert!(matches!(
-        crate::server::explain_analyze_artifact::discover_context_notice_for_run(
-            Some(&pool),
-            user_id,
-            &session_id,
-            &run_id,
-            paused.run_generation,
+    let executor = explain_test_executor(&pool, &svc, user_id, &session_id, "current-root");
+    let unavailable = executor
+        .execute(
+            "introspect",
+            &json!({
+                "explain": {"target": "run", "run_id": run_id}
+            }),
         )
-        .await
-        .unwrap(),
-        crate::server::explain_analyze_artifact::ContextNoticeDiscovery::Missing
-    ));
+        .await;
+    assert!(unavailable.starts_with("Error:"), "{unavailable}");
 
     let previous_failure = astra_turn_types::ArtifactPublicationV1 {
         schema_version: 1,
@@ -24398,34 +24576,18 @@ async fn db_pause_resume_promotes_buffered_completed_terminal_explain_publicatio
         .expect("durable run exists");
     assert_eq!(durable.status, STATUS_COMPLETED);
     assert!(durable.waiting_for.is_none());
-    assert!(
-        matches!(crate::server::explain_analyze_artifact::discover_context_notice_for_run(
-            Some(&pool),
-            user_id,
-            &session_id,
-            &run_id,
-            durable.run_generation,
-        )
-        .await
-        .unwrap(), crate::server::explain_analyze_artifact::ContextNoticeDiscovery::Notice(notice)
-            if notice.contains("status=complete")),
-        "resume must publish without executing or waiting for discovery"
-    );
-    let handle =
-        crate::server::explain_analyze_artifact::recover_completed_snapshot(Some(&pool), &durable)
-            .await
-            .unwrap()
-            .expect("resume published the exact completed capture");
-    let notice = crate::server::explain_analyze_artifact::context_notice_for_run(
-        Some(&pool),
-        user_id,
-        &session_id,
-        &run_id,
-        durable.run_generation,
-    )
-    .await
-    .unwrap();
-    assert!(notice.contains(&handle));
+    let handle = result.artifact_publication.as_ref().unwrap()["handle"]
+        .as_str()
+        .expect("resume published the exact completed capture");
+    let (read, fetches) =
+        crate::server::explain_analyze_artifact::count_explain_artifact_fetches(executor.execute(
+            "introspect",
+            &json!({"explain": {"target": "run", "run_id": run_id}}),
+        ))
+        .await;
+    assert!(read.contains(handle), "{read}");
+    assert!(read.contains("Capture status: complete"), "{read}");
+    assert_eq!(fetches.recovery, 0, "resume must already have published");
     let store = astra_services::DatabaseSessionArtifactStore::new(pool.settings().clone())
         .with_pool(pool.clone());
     let read = crate::server::explain_analyze_artifact::resolve_request(

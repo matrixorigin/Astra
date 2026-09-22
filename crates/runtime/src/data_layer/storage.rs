@@ -11,11 +11,10 @@ use astra_core::canonical_names::{
 use astra_core::{matrixone_null_shape_comment, matrixone_statement_with_null_shape};
 use astra_services::observation_capture::{
     DurableCaptureOutcome, ObservationCollisionReceipt, ObservationPayloadDomain,
-    canonical_observation_payload_hash, classify_capture, record_observation_collision,
+    canonical_observation_payload_hash, classify_capture, record_observation_collisions,
 };
 use astra_turn_core::contracts::{
-    TurnAuxiliaryEventRecord, TurnCoreEventRecord, TurnDecisionAuditRecord,
-    TurnSkillSelectionRecord, TurnToolEventRecord,
+    TurnAuxiliaryEventRecord, TurnCoreEventRecord, TurnSkillSelectionRecord, TurnToolEventRecord,
 };
 use astra_turn_core::hook_plans::SnapshotLinkPlan;
 use astra_turn_core::trace_event::TraceEvent;
@@ -208,19 +207,6 @@ pub(crate) async fn classify_agent_event_capture_attempts(
             attempted_payload_hash,
         } = &outcome
         {
-            record_observation_collision(
-                tx,
-                ObservationCollisionReceipt {
-                    user_id: attempt.user_id,
-                    domain: ObservationPayloadDomain::AgentEvent,
-                    identity_id: attempt.event_id,
-                    session_id: attempt.session_id,
-                    stored_payload_hash,
-                    attempted_payload_hash,
-                    source: collision_source,
-                },
-            )
-            .await?;
             tracing::warn!(
                 target: "astra_runtime::agent_event_capture",
                 user_id = %attempt.user_id,
@@ -235,6 +221,26 @@ pub(crate) async fn classify_agent_event_capture_attempts(
         }
         outcomes.push(outcome);
     }
+    let receipts = attempts
+        .iter()
+        .zip(&outcomes)
+        .filter_map(|(attempt, outcome)| match outcome {
+            DurableCaptureOutcome::Collision {
+                stored_payload_hash,
+                attempted_payload_hash,
+            } => Some(ObservationCollisionReceipt {
+                user_id: attempt.user_id,
+                domain: ObservationPayloadDomain::AgentEvent,
+                identity_id: attempt.event_id,
+                session_id: attempt.session_id,
+                stored_payload_hash,
+                attempted_payload_hash,
+                source: collision_source,
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    record_observation_collisions(tx, &receipts).await?;
     Ok(outcomes)
 }
 
@@ -770,28 +776,6 @@ pub(crate) async fn insert_tool_turn_event(
     Ok(inserted)
 }
 
-pub(crate) async fn insert_turn_decision_audit(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    record: &TurnDecisionAuditRecord,
-) -> Result<(), sqlx::Error> {
-    query(
-        "INSERT INTO ctx_decision_audits \
-         (decision_id, user_id, session_id, event_id, decision_type, decision_output, model_used, context_capture_id, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())",
-    )
-    .bind(&record.decision_id)
-    .bind(&record.user_id)
-    .bind(&record.session_id)
-    .bind(&record.event_id)
-    .bind(&record.decision_type)
-    .bind(record.decision_output.to_string())
-    .bind(&record.model_used)
-    .bind(&record.context_capture_id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -805,6 +789,96 @@ mod tests {
     };
     use astra_turn_core::contracts::TurnCoreEventRecord;
     use astra_turn_core::trace_event::TraceEvent;
+
+    #[tokio::test]
+    #[ignore = "requires ASTRA_TEST_DB_IT=1 and MatrixOne"]
+    async fn trace_capture_batch_preserves_mixed_outcomes_and_collision_order() {
+        use super::{DurableCaptureOutcome, insert_trace_events};
+        use sqlx::Row;
+
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let settings = astra_core::MatrixOneSettings::from_env();
+        let catalog =
+            std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+        astra_services::storage::ensure_core_schema(&settings, &catalog)
+            .await
+            .unwrap();
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect(&settings.database_url_with_password())
+            .await
+            .unwrap();
+        let owner = uuid::Uuid::new_v4().to_string();
+        let session = uuid::Uuid::new_v4().to_string();
+        let first = TraceEvent::new("first", &session, &owner, "trace_span", "runtime");
+        let mut tx = pool.begin().await.unwrap();
+        let seeded = insert_trace_events(&mut tx, std::slice::from_ref(&first))
+            .await
+            .unwrap();
+        assert_eq!(seeded.inserted, 1);
+        let sibling = TraceEvent::new("sibling", &session, &owner, "trace_span", "runtime");
+        let mut events = vec![first.clone(), sibling.clone(), sibling];
+        for index in 0..130 {
+            let mut collision = first.clone();
+            collision.content = Some(format!("conflict-{index}"));
+            collision.parent_event_id = Some("rejected-parent".into());
+            events.push(collision);
+        }
+        let outcome = insert_trace_events(&mut tx, &events).await.unwrap();
+        assert_eq!(outcome.inserted, 1);
+        assert_eq!(outcome.last_inserted_event_id.as_deref(), Some("sibling"));
+        assert_eq!(
+            outcome.event_outcomes["sibling"],
+            DurableCaptureOutcome::Inserted
+        );
+        assert!(matches!(
+            outcome.event_outcomes["first"],
+            DurableCaptureOutcome::Collision { .. }
+        ));
+        let receipt = sqlx::query("SELECT collision_count, stored_payload_hash, attempted_payload_hash, source FROM observation_identity_collisions WHERE user_id = ?")
+            .bind(&owner).fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(receipt.get::<u64, _>("collision_count"), 130);
+        assert_eq!(
+            receipt.get::<String, _>("stored_payload_hash"),
+            trace_event_payload_hash(&first).unwrap()
+        );
+        assert_eq!(
+            receipt.get::<String, _>("attempted_payload_hash"),
+            trace_event_payload_hash(events.last().unwrap()).unwrap()
+        );
+        assert_eq!(receipt.get::<String, _>("source"), "runtime_trace_event");
+        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ?")
+            .bind(&owner)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(stored, 2);
+        let edges: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_event_edges WHERE user_id = ?")
+                .bind(&owner)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(edges, 0, "rejected parents must not create causal edges");
+        let replay = insert_trace_events(&mut tx, &events[..3]).await.unwrap();
+        assert_eq!(replay.inserted, 0);
+        assert!(
+            replay
+                .event_outcomes
+                .values()
+                .all(|outcome| *outcome == DurableCaptureOutcome::Replayed)
+        );
+        tx.rollback().await.unwrap();
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM observation_identity_collisions WHERE user_id = ?",
+        )
+        .bind(&owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0);
+        pool.close().await;
+    }
 
     #[test]
     fn core_turn_event_insert_persists_turn_seq() {

@@ -246,10 +246,46 @@ pub fn validate_strict_memories(
     Ok(())
 }
 
+/// Read admission and execution failures, classified at the operation boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemoriaOperationError {
+    Disabled(String),
+    AuthorityUnavailable(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for MemoriaOperationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled(message)
+            | Self::AuthorityUnavailable(message)
+            | Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for MemoriaOperationError {}
+
+impl From<String> for MemoriaOperationError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<&str> for MemoriaOperationError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.to_string())
+    }
+}
+
 /// Provider-neutral Memoria operations used by runtime orchestration.
+/// Reads resolve fresh authority within the actual operation and report disabled
+/// separately from successful empty results. Defaults only delegate; callers do
+/// not need a discarded read admission preflight.
 #[async_trait::async_trait]
 pub trait MemoriaPort: Send + Sync {
-    /// Admission precedes retrieval, inference, reflection and cleanup work.
+    /// Write admission precedes expensive extraction, inference, reflection and
+    /// cleanup work. Final writes still resolve fresh authority after that work.
     /// Explicit transports default to admitted; user-bound transports resolve
     /// current consent without contacting the external memory service.
     async fn admits_operation(&self, _write: bool) -> Result<bool, String> {
@@ -282,7 +318,7 @@ pub trait MemoriaPort: Send + Sync {
         _user_id: &str,
         session_id: &str,
         top_k: usize,
-    ) -> Result<Vec<MemoriaMemory>, String> {
+    ) -> Result<Vec<MemoriaMemory>, MemoriaOperationError> {
         self.retrieve(
             query,
             (!session_id.trim().is_empty()).then_some(session_id),
@@ -296,7 +332,7 @@ pub trait MemoriaPort: Send + Sync {
         query: &str,
         session_id: Option<&str>,
         top_k: usize,
-    ) -> Result<Vec<MemoriaMemory>, String> {
+    ) -> Result<Vec<MemoriaMemory>, MemoriaOperationError> {
         self.retrieve_ext(query, session_id, top_k, false).await
     }
 
@@ -306,7 +342,7 @@ pub trait MemoriaPort: Send + Sync {
         session_id: Option<&str>,
         top_k: usize,
         filter_session: bool,
-    ) -> Result<Vec<MemoriaMemory>, String>;
+    ) -> Result<Vec<MemoriaMemory>, MemoriaOperationError>;
 
     async fn retrieve_scoped_typed(
         &self,
@@ -314,7 +350,7 @@ pub trait MemoriaPort: Send + Sync {
         session_id: &str,
         top_k: usize,
         memory_types: &[&str],
-    ) -> Result<Vec<MemoriaMemory>, String> {
+    ) -> Result<Vec<MemoriaMemory>, MemoriaOperationError> {
         let memories = self
             .retrieve_ext(query, Some(session_id), top_k, true)
             .await?;
@@ -323,7 +359,7 @@ pub trait MemoriaPort: Send + Sync {
                 return Err(format!(
                     "memory_scope_violation: strict recall item {index} ({}) has invalid session_id",
                     memory.memory_id
-                ));
+                ).into());
             }
         }
         if memory_types.is_empty() {

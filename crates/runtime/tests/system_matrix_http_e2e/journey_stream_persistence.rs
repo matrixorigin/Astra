@@ -2193,7 +2193,10 @@ pub async fn run_stream_context_trace_persistence() {
         "session_id": &session_id,
         "model_selection": seeded_model_selection(ctx),
         "context": {
-            "test_llm_rounds": [{ "full_text": "Context trace reply." }]
+            "test_llm_rounds": [{
+                "full_text": "Context trace reply.",
+                "usage": { "prompt_tokens": 100, "completion_tokens": 50 }
+            }]
         }
     });
     let (status, body) = stream_chat_full(app, auth, payload).await;
@@ -2216,7 +2219,7 @@ pub async fn run_stream_context_trace_persistence() {
 
     let recs = sqlx::query(
         "SELECT event_id, event_type, content, causal_chain_id, agent_id, \
-                llm_model_used, token_usage, parent_event_id \
+                llm_model_used, CAST(token_usage AS CHAR) AS token_usage, parent_event_id \
          FROM agent_events WHERE user_id = ? AND session_id = ? ORDER BY created_at ASC",
     )
     .bind(user_id)
@@ -2280,6 +2283,44 @@ pub async fn run_stream_context_trace_persistence() {
         lr_content.contains("Context trace reply."),
         "llm_response content should contain LLM text, got: {lr_content}"
     );
+    let usage: Value = serde_json::from_str(
+        &lr.try_get::<String, _>("token_usage")
+            .expect("canonical usage"),
+    )
+    .expect("usage JSON");
+    assert_eq!(usage["input_tokens"], 100);
+    assert_eq!(usage["output_tokens"], 50);
+
+    let (restore_status, restored) = post_json(
+        app,
+        &format!("/sessions/{session_id}/resume"),
+        Some(auth.as_str()),
+        json!({}),
+    )
+    .await;
+    assert_eq!(restore_status, StatusCode::OK);
+    let restored: astra_services::session_restore::RestoredSession =
+        serde_json::from_value(restored).expect("versioned session restore response");
+    assert!(restored.resume_messages().iter().any(|message| {
+        message["role"] == "assistant"
+            && message["content"].as_str() == Some("Context trace reply.")
+    }));
+    for table in [
+        "session_state_items",
+        "session_state_item_events",
+        "ctx_decision_audits",
+        "skill_selection_events",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
+        ))
+        .bind(user_id)
+        .bind(&session_id)
+        .fetch_one(pool)
+        .await
+        .expect("ordinary answer projection count");
+        assert_eq!(count, 0, "ordinary answer must not create {table}");
+    }
     let lr_chain_id = lr
         .try_get::<Option<String>, _>("causal_chain_id")
         .ok()

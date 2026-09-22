@@ -8,15 +8,30 @@ use astra_services::storage::{ensure_core_schema, load_core_schema_table_contrac
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
-    let (pool, settings) = common::setup_pool_and_settings().await;
+    let mut settings = common::require_db_it_env();
     let bootstrap_catalog =
         std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+    let mut admin_settings = settings.clone();
+    admin_settings.database = bootstrap_catalog.clone();
+    let admin = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_settings.database_url_with_password())
+        .await
+        .expect("connect bootstrap catalog");
+    settings.database = format!("astra_schema_it_{}", uuid::Uuid::new_v4().simple());
+    settings.db_pool_max_connections = 4;
+    settings.db_pool_min_connections = 1;
+    sqlx::query(&format!("CREATE DATABASE `{}`", settings.database))
+        .execute(&admin)
+        .await
+        .expect("create isolated schema database");
     ensure_core_schema(&settings, &bootstrap_catalog)
         .await
-        .expect("second core schema bootstrap");
+        .expect("fresh core schema bootstrap");
+    let pool = astra_core::SharedPool::new(&settings).await.unwrap();
     ensure_core_schema(&settings, &bootstrap_catalog)
         .await
-        .expect("third core schema bootstrap");
+        .expect("repeated core schema bootstrap");
 
     let schema = current_schema(&pool).await;
     let existing =
@@ -71,7 +86,7 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
     );
     assert!(
         !existing.contains("session_deletion_tombstones"),
-        "the redundant deletion tombstone table must be retired during bootstrap"
+        "fresh bootstrap must not create the redundant deletion tombstone table"
     );
     assert!(
         !contracts
@@ -81,7 +96,7 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
     );
     assert!(
         !existing.contains("auth_memoria_identities"),
-        "the migration-only Memoria identity table must be retired during bootstrap"
+        "fresh bootstrap must not create the obsolete Memoria identity table"
     );
     let proposal_columns = column_names(&pool, &schema, "work_proposals").await;
     for expected in [
@@ -215,6 +230,133 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
     .try_get::<i64, _>("count")
     .unwrap();
     assert_eq!(contracts, 1, "repeated bootstrap must remain idempotent");
+
+    // An interrupted fresh bootstrap can leave canonical tables and claims,
+    // no readiness marker, and an expired lease. It must be safe to retry.
+    for sql in [
+        "DELETE FROM astra_schema_contracts WHERE component = 'astra-core'",
+        "DELETE FROM astra_schema_table_contracts WHERE table_name = 'session_weighted_admission_owner_usage'",
+        "DROP TABLE session_weighted_admission_owner_usage",
+        "INSERT INTO astra_schema_bootstrap_leases (component, holder_id, lease_expires_at) VALUES ('astra-core', 'crashed-owner', DATE_SUB(NOW(6), INTERVAL 1 SECOND))",
+    ] {
+        sqlx::query(sql).execute(pool.get()).await.unwrap();
+    }
+    ensure_core_schema(&settings, &bootstrap_catalog)
+        .await
+        .expect("retry interrupted fresh bootstrap through expired lease");
+    let current: String = sqlx::query_scalar(
+        "SELECT contract_version FROM astra_schema_contracts WHERE component = 'astra-core'",
+    )
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        current,
+        astra_services::storage::CORE_SCHEMA_CONTRACT_VERSION
+    );
+
+    sqlx::query("UPDATE astra_schema_contracts SET contract_version = 'unsupported-old-schema' WHERE component = 'astra-core'")
+        .execute(pool.get()).await.unwrap();
+    let error = ensure_core_schema(&settings, &bootstrap_catalog)
+        .await
+        .expect_err("old completion marker must never enter bootstrap")
+        .to_string();
+    assert!(error.contains("recreate the database"), "{error}");
+    let unchanged: String = sqlx::query_scalar(
+        "SELECT contract_version FROM astra_schema_contracts WHERE component = 'astra-core'",
+    )
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(unchanged, "unsupported-old-schema");
+
+    sqlx::query(
+        "UPDATE astra_schema_contracts SET contract_version = ? WHERE component = 'astra-core'",
+    )
+    .bind(&current)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE auth_user_roles DROP INDEX idx_auth_user_roles_role_id")
+        .execute(pool.get())
+        .await
+        .unwrap();
+    for completed in [true, false] {
+        if !completed {
+            sqlx::query("DELETE FROM astra_schema_contracts WHERE component = 'astra-core'")
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+        let error = ensure_core_schema(&settings, &bootstrap_catalog)
+            .await
+            .expect_err("missing key must fail validation without repair")
+            .to_string();
+        assert!(error.contains("idx_auth_user_roles_role_id"), "{error}");
+        assert!(
+            index_columns(
+                &pool,
+                &schema,
+                "auth_user_roles",
+                "idx_auth_user_roles_role_id"
+            )
+            .await
+            .is_empty()
+        );
+    }
+    // Restore only this disposable fixture's index to isolate column drift.
+    sqlx::query("CREATE INDEX idx_auth_user_roles_role_id ON auth_user_roles (role_id)")
+        .execute(pool.get())
+        .await
+        .unwrap();
+    ensure_core_schema(&settings, &bootstrap_catalog)
+        .await
+        .expect("restored fixture is valid");
+    sqlx::query("ALTER TABLE user_llm_models DROP COLUMN thinking_probe_json")
+        .execute(pool.get())
+        .await
+        .unwrap();
+    for completed in [true, false] {
+        if !completed {
+            sqlx::query("DELETE FROM astra_schema_contracts WHERE component = 'astra-core'")
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+        let error = ensure_core_schema(&settings, &bootstrap_catalog)
+            .await
+            .expect_err("missing runtime field must fail without repair")
+            .to_string();
+        assert!(
+            error.contains("user_llm_models.thinking_probe_json"),
+            "{error}"
+        );
+        assert!(
+            !column_names(&pool, &schema, "user_llm_models")
+                .await
+                .iter()
+                .any(|column| column == "thinking_probe_json")
+        );
+    }
+    let markers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM astra_schema_contracts WHERE component = 'astra-core'",
+    )
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(markers, 0, "failed validation must not publish readiness");
+    // MatrixOne does not complete SQLx's graceful MySQL shutdown handshake.
+    // These task-owned pools have no concurrent borrowers; drop their sockets.
+    while pool.get().size() > 0 {
+        drop(pool.get().acquire().await.unwrap().detach());
+    }
+    sqlx::query(&format!("DROP DATABASE `{}`", settings.database))
+        .execute(&admin)
+        .await
+        .expect("drop isolated schema database");
+    while admin.size() > 0 {
+        drop(admin.acquire().await.unwrap().detach());
+    }
 }
 
 #[tokio::test]
@@ -2033,11 +2175,11 @@ async fn phase2_web_hydration_schema_contract() {
             &pool,
             &schema,
             "session_transcript_items",
-            "idx_transcript_owner_run_event"
+            "idx_transcript_owner_run"
         )
         .await,
-        ["user_id", "run_id", "source_event_idx"],
-        "transcript source event lookups must be owner-bound"
+        ["user_id", "run_id"],
+        "transcript run lookups must be owner-bound"
     );
     assert_eq!(
         index_columns(
@@ -2049,35 +2191,6 @@ async fn phase2_web_hydration_schema_contract() {
         .await,
         ["user_id", "session_id", "source_event_id"],
         "transcript source-event idempotency lookups must be owner/session-bound"
-    );
-    let transcript_page_columns = column_names(&pool, &schema, "transcript_pages").await;
-    assert!(
-        transcript_page_columns
-            .iter()
-            .any(|column| column == "user_id"),
-        "transcript_pages must carry physical owner scope"
-    );
-    assert!(
-        column_default(&pool, &schema, "transcript_pages", "user_id")
-            .await
-            .is_none_or(|default| !default.trim_matches('\'').is_empty()),
-        "transcript_pages.user_id must not use an empty-string owner sentinel"
-    );
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "transcript_pages").await,
-        ["user_id", "session_id", "page_seq"],
-        "transcript page identity must be owner/session scoped"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "transcript_pages",
-            "idx_transcript_pages_owner_session_end"
-        )
-        .await,
-        ["user_id", "session_id", "end_item_seq"],
-        "transcript page lookups must use owner/session/end index"
     );
     let ctx_snapshot_columns = column_names(&pool, &schema, "ctx_snapshots").await;
     assert!(
@@ -2576,33 +2689,6 @@ async fn phase3_context_manifest_schema_contract() {
     assert!(
         render_modes.is_ok(),
         "context_manifest_items.render_mode must accept code_block_preserved"
-    );
-
-    let raw_ref_schemes = sqlx::query("SELECT scheme FROM raw_ref_scheme_registry")
-        .fetch_all(pool.get())
-        .await
-        .expect("load raw_ref schemes")
-        .into_iter()
-        .map(|row| row.try_get::<String, _>("scheme").unwrap())
-        .collect::<Vec<_>>();
-    for expected in ["artifact", "s3", "conversation_log"] {
-        assert!(
-            raw_ref_schemes.iter().any(|scheme| scheme == expected),
-            "raw_ref_scheme_registry missing {expected}"
-        );
-    }
-
-    let preview_count = sqlx::query(
-        "SELECT COUNT(*) AS count FROM preview_template_registry WHERE status = 'active'",
-    )
-    .fetch_one(pool.get())
-    .await
-    .expect("preview template count")
-    .try_get::<i64, _>("count")
-    .unwrap();
-    assert!(
-        preview_count >= 18,
-        "preview_template_registry should seed at least 18 baseline templates"
     );
 }
 
@@ -3329,60 +3415,4 @@ async fn phase6_artifact_retention_preview_schema_contract() {
             "session_tool_outputs must not keep legacy ownerless index {removed_index}"
         );
     }
-
-    let preview_templates = column_names(&pool, &schema, "preview_template_registry").await;
-    for expected in [
-        "tool_name",
-        "version",
-        "max_preview_bytes",
-        "normalize_version",
-        "schema_json",
-    ] {
-        assert!(
-            preview_templates.iter().any(|column| column == expected),
-            "preview_template_registry missing {expected}"
-        );
-    }
-    let template_count = sqlx::query(
-        "SELECT COUNT(*) AS count FROM preview_template_registry WHERE status = 'active'",
-    )
-    .fetch_one(pool.get())
-    .await
-    .expect("count preview templates")
-    .try_get::<i64, _>("count")
-    .unwrap_or(0);
-    assert!(
-        template_count >= 18,
-        "expected at least 18 active preview templates, got {template_count}"
-    );
-    let required_templates = sqlx::query(
-        "SELECT tool_name FROM preview_template_registry
-         WHERE tool_name IN ('pg_dump', 'fetch_url', 'parse_pdf', 'SKILL.md', 'cargo', 'rustc',
-          'clippy', 'pg_schema_structurize', 'slow_query_analyzer', 'curl',
-          'git', 'docker_logs', 'kubectl', 'python_stdout', 'npm_build', 'csv_head',
-          'json_preview', 'markdown_preview', 'list_dir', 'glob', 'grep', 'symbols',
-          'task_board', 'agent', 'agent_fanout', 'session', 'web_fetch', 'tool_search',
-          'memory', 'mo_query')
-         AND status = 'active'",
-    )
-    .fetch_all(pool.get())
-    .await
-    .expect("load required preview templates");
-    assert!(
-        required_templates.len() >= 30,
-        "required Phase 6 template set is incomplete"
-    );
-
-    let scheme_rows = sqlx::query(
-        "SELECT scheme FROM raw_ref_scheme_registry
-         WHERE scheme IN ('artifact', 's3', 'conversation_log', 'tool_output', 'chunk', 'state_item')
-           AND is_active = 1",
-    )
-    .fetch_all(pool.get())
-    .await
-    .expect("load raw_ref schemes");
-    assert!(
-        scheme_rows.len() >= 6,
-        "raw_ref_scheme_registry missing Phase 6 schemes"
-    );
 }

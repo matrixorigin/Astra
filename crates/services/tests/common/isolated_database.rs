@@ -24,31 +24,6 @@ fn is_designated_database(database: &str, designated: &str) -> bool {
         )
 }
 
-/// Extra guard for destructive schema rehearsals, not ordinary row fixtures.
-pub fn is_schema_rehearsal_database(database: &str) -> bool {
-    database
-        .strip_prefix("astra_test_probe_")
-        .is_some_and(|suffix| !suffix.is_empty())
-        && is_designated_database(database, database)
-}
-
-// This shared module is also included by the default memoria_auth_db_it target:
-// the guard test runs without external-contract-tests or a database connection.
-#[test]
-fn schema_rehearsal_rejects_broad_or_non_test_targets() {
-    assert!(is_schema_rehearsal_database("astra_test_probe_20260910"));
-    for name in [
-        "production",
-        "review_local",
-        "astra_runtime",
-        "astra_test_probe_",
-        "astra_test_probe_x;DROP",
-        "mysql",
-    ] {
-        assert!(!is_schema_rehearsal_database(name));
-    }
-}
-
 #[test]
 fn isolated_database_contract_accepts_runner_names_and_rejects_implicit_targets() {
     for name in [

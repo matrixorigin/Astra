@@ -128,6 +128,11 @@ On reconnect, the client should rebuild from:
 
 Browser disconnect is not cancellation.
 
+Transcript progress is described by item sequence and committed cursor.
+Physical page counts, page high watermarks, and page lag are not exposed.
+The committed projection may honestly lag canonical context until its evidence
+has been materialized and the contiguous cursor promoted.
+
 ## User-facing diagnostics
 
 A user should be able to answer:

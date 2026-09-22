@@ -28961,6 +28961,7 @@ mod tests {
     #[derive(Default)]
     struct ServerOnlyPromptMemory {
         calls: std::sync::atomic::AtomicUsize,
+        authority_calls: std::sync::atomic::AtomicUsize,
         denied: std::sync::atomic::AtomicBool,
         admission_failed: std::sync::atomic::AtomicBool,
         admission_stalled: std::sync::atomic::AtomicBool,
@@ -28970,7 +28971,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::turn::cloud::memoria_compact::MemoriaPort for ServerOnlyPromptMemory {
-        async fn admits_operation(&self, _write: bool) -> Result<bool, String> {
+        async fn admits_operation(&self, write: bool) -> Result<bool, String> {
+            assert!(write, "read admission belongs to the operation");
             if self.admission_stalled.load(Ordering::SeqCst) {
                 std::future::pending::<()>().await;
             }
@@ -28986,7 +28988,24 @@ mod tests {
             user_id: &str,
             session_id: &str,
             _top_k: usize,
-        ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String> {
+        ) -> Result<
+            Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>,
+            astra_memoria::MemoriaOperationError,
+        > {
+            self.authority_calls.fetch_add(1, Ordering::SeqCst);
+            if self.admission_stalled.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            if self.admission_failed.load(Ordering::SeqCst) {
+                return Err(astra_memoria::MemoriaOperationError::AuthorityUnavailable(
+                    "test authority unavailable".into(),
+                ));
+            }
+            if self.denied.load(Ordering::SeqCst) {
+                return Err(astra_memoria::MemoriaOperationError::Disabled(
+                    "disabled".into(),
+                ));
+            }
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.scopes
                 .lock()
@@ -29012,7 +29031,10 @@ mod tests {
             _session_id: Option<&str>,
             _top_k: usize,
             _filter_session: bool,
-        ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String> {
+        ) -> Result<
+            Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>,
+            astra_memoria::MemoriaOperationError,
+        > {
             panic!("server prompt recall must use retrieve_for_prompt")
         }
 
@@ -29085,7 +29107,10 @@ mod tests {
             _user_id: &str,
             session_id: &str,
             _top_k: usize,
-        ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String> {
+        ) -> Result<
+            Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>,
+            astra_memoria::MemoriaOperationError,
+        > {
             self.prompt_calls.fetch_add(1, Ordering::SeqCst);
             self.wait_for_release().await;
             Ok(vec![crate::turn::cloud::memoria_compact::MemoriaMemory {
@@ -29109,7 +29134,10 @@ mod tests {
             _session_id: Option<&str>,
             _top_k: usize,
             _filter_session: bool,
-        ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String> {
+        ) -> Result<
+            Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>,
+            astra_memoria::MemoriaOperationError,
+        > {
             self.session_calls.fetch_add(1, Ordering::SeqCst);
             self.wait_for_release().await;
             Ok(Vec::new())
@@ -29212,6 +29240,7 @@ mod tests {
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
 
         provider.revision.store(1, Ordering::SeqCst);
+        assert_eq!(provider.authority_calls.load(Ordering::SeqCst), 2);
         provider.denied.store(false, Ordering::SeqCst);
         let reconnected = host.prompt_memory_entries_for_turn(2, "same request").await;
         assert_eq!(reconnected.entries.len(), 1);
@@ -29254,6 +29283,7 @@ mod tests {
                 astra_turn_types::MemoryRetrievalOutcome::Unavailable
             );
             assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.authority_calls.load(Ordering::SeqCst), 2);
         }
     }
 

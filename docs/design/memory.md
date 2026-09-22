@@ -72,6 +72,25 @@ in [MOI native login](../guides/moi-native-login.md#built-in-memory). Automatic
 prompt recall budgets both authorization and retrieval together; one successful
 session-start lane remains usable if the other lane times out.
 
+Optional reads report admission through the existing `MemoriaPort` read
+operation, with one fresh authority resolution per operation and no discarded
+read preflight. `Disabled` is quiet `NotAttempted`; `AuthorityUnavailable` and
+`Failed` are `Unavailable`; successful empty reads are `Complete`. HTTP status
+errors, including 401/403, are failed operations rather than inferred consent
+denials. The shared absolute 750 ms prompt deadline covers authority and HTTP.
+Snapshot reads quietly skip disabled memory; compaction takes its early local
+fallback before summary generation for disabled or unavailable authority, while
+transport failures retain downstream summary behavior. Cleanup maps every read
+error to purge failure. Write admission before expensive work and fresh final
+write checks remain required.
+
+The bounded admitted authority-resolution counts are message recall 2 → 1,
+session-start recall 3 → 2, snapshot loading 2 → 1, and applicable compaction
+2 → 1. Independent session-start lanes deliberately resolve twice even when
+disabled (previously one shared preflight), with zero backend requests. No
+grant/client cache is shared between lanes or operations. These are source-level
+operation counts, not predictions for whole-chat SQL totals.
+
 Automatic prompt recall does not reuse candidates across primary-model request
 preparations solely because the turn number and user message are unchanged.
 Each preparation uses the existing current-authority admission and bounded

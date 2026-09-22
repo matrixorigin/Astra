@@ -1438,7 +1438,6 @@ mod tests {
                 source_event_id: None,
                 created_at: "2026-07-11T00:00:00".into(),
             }],
-            page_refs: vec![],
             next_before_seq: Some(7),
             has_more: true,
         }
@@ -1465,7 +1464,6 @@ mod tests {
                     created_at: "2026-07-11T00:00:00".into(),
                 })
                 .collect(),
-            page_refs: Vec::new(),
             next_before_seq: None,
             has_more: false,
         }
@@ -1741,7 +1739,6 @@ mod tests {
                     source_event_id: Some("assistant-committed-1".into()),
                     created_at: "2026-07-13T00:00:00Z".into(),
                 }],
-                page_refs: Vec::new(),
                 next_before_seq: None,
                 has_more: false,
             },
@@ -2067,7 +2064,6 @@ mod tests {
                         created_at: "2026-07-12T00:00:02".into(),
                     },
                 ],
-                page_refs: Vec::new(),
                 next_before_seq: None,
                 has_more: false,
             },
@@ -2536,7 +2532,6 @@ mod tests {
                         created_at: "2026-07-12T00:00:01".into(),
                     },
                 ],
-                page_refs: Vec::new(),
                 next_before_seq: None,
                 has_more: false,
             },

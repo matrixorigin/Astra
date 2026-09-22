@@ -45,7 +45,7 @@ use measurement::{
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
 use crate::observation_capture::{
     DurableCaptureOutcome, ObservationCollisionReceipt, ObservationPayloadDomain,
-    canonical_observation_payload_hash, classify_capture, record_observation_collision,
+    canonical_observation_payload_hash, classify_capture, record_observation_collisions,
 };
 use astra_core::canonical_names::{
     metadata_duration_ms, metadata_tool_call_id, metadata_tool_name, normalize_optional_name,
@@ -2965,7 +2965,8 @@ impl EventIngestionWorker {
         let mut inserted_events = Vec::new();
         let mut replayed_events = 0_usize;
         let mut collision_events = 0_usize;
-        for (values, outcome) in event_rows.iter().zip(capture_outcomes) {
+        let mut collision_receipts = Vec::new();
+        for (values, outcome) in event_rows.iter().zip(&capture_outcomes) {
             match outcome {
                 DurableCaptureOutcome::Inserted => inserted_events.push(values.event),
                 DurableCaptureOutcome::Replayed => {
@@ -2976,25 +2977,15 @@ impl EventIngestionWorker {
                     attempted_payload_hash,
                 } => {
                     collision_events = collision_events.saturating_add(1);
-                    record_observation_collision(
-                        &mut tx,
-                        ObservationCollisionReceipt {
-                            user_id,
-                            domain: ObservationPayloadDomain::AgentEvent,
-                            identity_id: &values.event.event_id,
-                            session_id,
-                            stored_payload_hash: &stored_payload_hash,
-                            attempted_payload_hash: &attempted_payload_hash,
-                            source: AGENT_EVENT_COLLISION_SOURCE,
-                        },
-                    )
-                    .await
-                    .map_err(|error| {
-                        format!(
-                            "record event identity collision for {user_id}/{}: {error}",
-                            values.event.event_id
-                        )
-                    })?;
+                    collision_receipts.push(ObservationCollisionReceipt {
+                        user_id,
+                        domain: ObservationPayloadDomain::AgentEvent,
+                        identity_id: &values.event.event_id,
+                        session_id,
+                        stored_payload_hash,
+                        attempted_payload_hash,
+                        source: AGENT_EVENT_COLLISION_SOURCE,
+                    });
                     tracing::warn!(
                         target: "astra_services::event_ingestion",
                         user_id = %user_id,
@@ -3008,6 +2999,12 @@ impl EventIngestionWorker {
             }
         }
 
+        record_observation_collisions(&mut tx, &collision_receipts)
+            .await
+            .map_err(|error| {
+                format!("record event identity collisions for {user_id}/{session_id}: {error}")
+            })?;
+
         let inserted_event_count = u64::try_from(inserted_events.len())
             .map_err(|_| "event_ingestion.inserted_events: len exceeds u64::MAX".to_string())?;
         let inserted_event_count = crate::storage::rows_affected_to_i64(
@@ -3016,8 +3013,8 @@ impl EventIngestionWorker {
         )
         .map_err(|error| error.to_string())?;
         if inserted_event_count > 0 {
-            crate::storage::add_agent_session_event_count_after_admission(
-                &mut tx,
+            crate::storage::bump_agent_session_event_count(
+                &mut *tx,
                 session_id,
                 user_id,
                 inserted_event_count,

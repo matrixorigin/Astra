@@ -16,6 +16,12 @@ Client surfaces and deployment owns Web, CLI, TUI, Edge process, API clients, an
 
 All surfaces consume the same backbone state and projections.
 
+Transcript clients consume ordered items, stable source event identities,
+`next_before_seq`, and `has_more`. Root conversation, run, and session scopes
+remain distinct. Responses contain no physical page references or page hashes;
+local fallback selection compares actual conversation coverage. Work views use
+the committed transcript cursor and item commitment fields to assess publication.
+
 ## Deployment responsibilities
 
 Deployment may provide:

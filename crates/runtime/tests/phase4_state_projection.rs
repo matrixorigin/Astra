@@ -2,15 +2,11 @@ mod test_support;
 
 use test_support::require_db_it_env;
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::Arc;
 
 use astra_services::{
-    BubbleUpTarget, COMPACTION_INVARIANT_SQL, DatabasePersonalSkillStore, DatabaseRunStateStore,
-    DatabaseStateProjectionStore, DelegationProjectionUpsert, SkillActivationLlmProbe,
-    StateProjectionError, SubmitUserSkillVersion,
+    BubbleUpTarget, DatabasePersonalSkillStore, DatabaseRunStateStore,
+    DatabaseStateProjectionStore, DelegationProjectionUpsert, SubmitUserSkillVersion,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -177,217 +173,6 @@ async fn index_columns(pool: &astra_core::SharedPool, table: &str, key: &str) ->
     .into_iter()
     .map(|row| row.try_get::<String, _>("COLUMN_NAME").unwrap())
     .collect()
-}
-
-#[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_32_compaction_invariants_return_zero_after_compaction() {
-    let pool = setup_pool().await;
-    let (session_id, user_id, run_id) = ids();
-    insert_session(&pool, &session_id, &user_id).await;
-    insert_run(
-        &pool,
-        &session_id,
-        &user_id,
-        &run_id,
-        None,
-        &run_id,
-        &run_id,
-        0,
-        "completed",
-    )
-    .await;
-    for category in [
-        "plan_state",
-        "decision",
-        "finding",
-        "benchmark",
-        "citation",
-        "todo_state",
-        "error_state",
-        "delegation_state",
-    ] {
-        insert_state_item(
-            &pool,
-            &session_id,
-            &user_id,
-            "session",
-            category,
-            &format!("{category}-key"),
-            "active",
-            1,
-            20,
-        )
-        .await;
-    }
-    let store = DatabaseStateProjectionStore::new(pool.clone());
-    let results = store
-        .compact_session_state(&user_id, &session_id, &run_id, 640)
-        .await
-        .unwrap();
-    assert_eq!(results.len(), COMPACTION_INVARIANT_SQL.len());
-    assert!(results.iter().all(|(_, violations)| *violations == 0));
-    let plan = explain_analyze_text(
-        &pool,
-        &format!(
-            "EXPLAIN ANALYZE SELECT item_id FROM session_state_items FORCE INDEX (idx_state_owner_session_status_category) \
-             WHERE user_id = '{}' AND session_id = '{}' AND category = 'plan_state' AND status = 'active' ORDER BY updated_at DESC LIMIT 5",
-            user_id, session_id
-        ),
-    )
-    .await;
-    assert!(
-        plan.contains("session_state_items"),
-        "query was not analyzed:\n{plan}"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            "session_state_items",
-            "idx_state_owner_session_status_category"
-        )
-        .await,
-        ["user_id", "session_id", "status", "category"],
-        "state lookup index must preserve owner/session/status/category ordering"
-    );
-}
-
-#[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_33_active_structured_state_survives_compaction() {
-    let pool = setup_pool().await;
-    let (session_id, user_id, run_id) = ids();
-    insert_session(&pool, &session_id, &user_id).await;
-    insert_run(
-        &pool,
-        &session_id,
-        &user_id,
-        &run_id,
-        None,
-        &run_id,
-        &run_id,
-        0,
-        "completed",
-    )
-    .await;
-    let categories = [
-        "plan_state",
-        "decision",
-        "finding",
-        "benchmark",
-        "citation",
-        "todo_state",
-        "error_state",
-        "delegation_state",
-    ];
-    for category in categories {
-        insert_state_item(
-            &pool,
-            &session_id,
-            &user_id,
-            "session",
-            category,
-            &format!("active-{category}"),
-            "active",
-            3,
-            24,
-        )
-        .await;
-    }
-    DatabaseStateProjectionStore::new(pool.clone())
-        .compact_session_state(&user_id, &session_id, &run_id, 500)
-        .await
-        .unwrap();
-    let active_count = sqlx::query(
-        "SELECT COUNT(*) AS c FROM session_state_items
-         WHERE session_id = ? AND user_id = ? AND status = 'active'
-           AND category IN ('plan_state','decision','finding','benchmark','citation',
-                            'todo_state','error_state','delegation_state')",
-    )
-    .bind(&session_id)
-    .bind(&user_id)
-    .fetch_one(pool.get())
-    .await
-    .unwrap()
-    .try_get::<i64, _>("c")
-    .unwrap();
-    assert_eq!(active_count, categories.len() as i64);
-}
-
-#[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_34_plan_state_version_does_not_bump_during_compaction() {
-    let pool = setup_pool().await;
-    let (session_id, user_id, run_id) = ids();
-    insert_session(&pool, &session_id, &user_id).await;
-    insert_run(
-        &pool,
-        &session_id,
-        &user_id,
-        &run_id,
-        None,
-        &run_id,
-        &run_id,
-        0,
-        "completed",
-    )
-    .await;
-    insert_state_item(
-        &pool,
-        &session_id,
-        &user_id,
-        "session",
-        "plan_state",
-        "active-plan",
-        "active",
-        7,
-        64,
-    )
-    .await;
-    DatabaseStateProjectionStore::new(pool.clone())
-        .compact_session_state(&user_id, &session_id, &run_id, 480)
-        .await
-        .unwrap();
-    let version = sqlx::query(
-        "SELECT version FROM session_state_items
-         WHERE session_id = ? AND user_id = ? AND category = 'plan_state' AND item_key = 'active-plan'",
-    )
-    .bind(&session_id)
-    .bind(&user_id)
-    .fetch_one(pool.get())
-    .await
-    .unwrap()
-    .try_get::<i64, _>("version")
-    .unwrap();
-    assert_eq!(version, 7);
-}
-
-#[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_35_compaction_rejects_running_or_waiting_runs() {
-    let pool = setup_pool().await;
-    let (session_id, user_id, run_id) = ids();
-    insert_session(&pool, &session_id, &user_id).await;
-    insert_run(
-        &pool,
-        &session_id,
-        &user_id,
-        &run_id,
-        None,
-        &run_id,
-        &run_id,
-        0,
-        "running",
-    )
-    .await;
-    let error = DatabaseStateProjectionStore::new(pool)
-        .compact_session_state(&user_id, &session_id, &run_id, 320)
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        StateProjectionError::ActiveRunCompaction { .. }
-    ));
 }
 
 #[tokio::test]
@@ -637,7 +422,7 @@ async fn l2_39_user_scope_memory_loads_into_anchor_budget() {
 
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_41_personal_skill_activation_pins_frozen_version_id() {
+async fn personal_skill_activation_pins_version_and_records_ui_events() {
     let pool = setup_pool().await;
     let (session_id, user_id, _) = ids();
     insert_session(&pool, &session_id, &user_id).await;
@@ -657,34 +442,9 @@ async fn l2_41_personal_skill_activation_pins_frozen_version_id() {
     .unwrap()
     .try_get::<String, _>("payload_json")
     .unwrap();
-    assert!(payload.contains(&version_id));
-}
-
-#[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_42_skill_activation_is_ui_structured_event_not_llm_turn() {
-    let pool = setup_pool().await;
-    let (session_id, user_id, _) = ids();
-    insert_session(&pool, &session_id, &user_id).await;
-    #[derive(Default)]
-    struct CountingLlmProbe(AtomicUsize);
-    impl SkillActivationLlmProbe for CountingLlmProbe {
-        fn record_llm_call(&self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-    let probe = CountingLlmProbe::default();
-    let version_id = publish_personal_skill_version(&pool, &user_id, "debugger").await;
-    DatabaseStateProjectionStore::new(pool.clone())
-        .activate_personal_skill_from_ui_with_probe(
-            &user_id,
-            &session_id,
-            "debugger",
-            &version_id,
-            Some(&probe),
-        )
-        .await
-        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(payload["version_id"], version_id);
+    assert_eq!(payload["activation_source"], "ui_structured_intent");
     let row = sqlx::query(
         "SELECT
           (SELECT COUNT(*) FROM agent_events
@@ -701,11 +461,6 @@ async fn l2_42_skill_activation_is_ui_structured_event_not_llm_turn() {
     .unwrap();
     assert_eq!(row.try_get::<i64, _>("ui_events").unwrap(), 1);
     assert_eq!(row.try_get::<i64, _>("state_events").unwrap(), 1);
-    assert_eq!(
-        probe.0.load(Ordering::SeqCst),
-        0,
-        "UI structured skill activation must not call an LLM client"
-    );
 }
 
 #[tokio::test]
@@ -863,47 +618,6 @@ async fn delegation_projection_refresh_uses_current_run_status() {
     assert_eq!(
         row.try_get::<String, _>("state_status").unwrap(),
         "completed"
-    );
-}
-
-#[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn compact_session_state_rejects_active_runs_from_same_owner() {
-    let pool = setup_pool().await;
-    let (session_id, user_id, run_id) = ids();
-    let other_user_id = format!("other-{user_id}");
-    let other_run_id = format!("other-{run_id}");
-    let compaction_run_id = format!("compaction-{run_id}");
-    insert_session(&pool, &session_id, &user_id).await;
-    insert_run(
-        &pool,
-        &session_id,
-        &other_user_id,
-        &other_run_id,
-        None,
-        &other_run_id,
-        &other_run_id,
-        0,
-        "running",
-    )
-    .await;
-
-    let store = DatabaseStateProjectionStore::new(pool.clone());
-    // Other-owner active runs must not block compaction.
-    store
-        .compact_session_state(&user_id, &session_id, &compaction_run_id, 400)
-        .await
-        .expect("other-owner active runs must not block owner compaction");
-
-    // Same-owner active run should block compaction.
-    let compaction_run_id2 = format!("compaction2-{run_id}");
-    let err = store
-        .compact_session_state(&other_user_id, &session_id, &compaction_run_id2, 400)
-        .await
-        .expect_err("the other owner still has an active run in that session id");
-    assert!(
-        err.to_string().contains(&session_id),
-        "compaction denial should include the session id for observability: {err}"
     );
 }
 

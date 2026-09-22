@@ -195,13 +195,14 @@ CARGO_INCREMENTAL=0 cargo test --locked -p astra-services \
 This covers create, credential rotation, explicit probe and failed-write
 preservation. Official OpenAI/Anthropic probe and rotation tests seed only their
 fixture rows with loopback endpoints; production official endpoints remain fixed.
-The same fixture also removes the new thinking observation columns in its
-designated disposable database, reruns schema bootstrap twice, and verifies
-that the old model row survives and credential rotation invalidates observations.
-Never designate a database containing non-test data for this fixture.
-Destructive schema rehearsals require an effective database name beginning with
-`astra_test_probe_` and a nonempty suffix, checked before bootstrap or writes.
-This prefix is a guardrail, not permission to reuse a database containing data.
+The fixture uses the current schema and verifies that credential rotation
+invalidates observations. Use only the explicitly designated test database;
+never designate a database containing non-test data.
+`schema_assertions::core_schema_catalog_matches_live_idempotent_bootstrap`
+creates its own disposable database to cover fresh bootstrap, expired lease
+recovery, interrupted-bootstrap retry, repeated validation, old-marker rejection,
+and failure without readiness publication when a required key is missing.
+Bootstrap does not migrate old schemas; recreate an unsupported database.
 `memoria_reauthentication_http` separately covers same-key reconnect, pending
 proof invalidation and an in-flight verification crossing disconnect/reconnect.
 
@@ -251,6 +252,30 @@ capacity probes for many readers, multiple server processes, provider quotas,
 and latency measurements.
 
 ### Sustained ingestion and shared-pool pressure
+
+The collision-receipt and canonical-WAL tests separate database contracts from
+full-scale diagnostics. The normal collision contract still processes 1,024
+distinct conflicting payloads through the bounded batch writer, plus concurrent
+single-receipt checks. The normal WAL contract runs 32 rounds with the same
+retry ownership, stale-parent rollback, linear payload, recovery, and retirement
+assertions. To retain the original 1,024 **independent transactions contending
+on one identity** and 300-round WAL workload, opt in explicitly:
+
+```bash
+# Use a dedicated test database and credentials from your environment/.env.
+ASTRA_TEST_DB_IT=1 ASTRA_TEST_STORAGE_SCALE=1 \
+cargo nextest run -p astra-services \
+  --test observation_capture_db_it --test inference_execution_db_it \
+  --run-ignored all --profile strict-online-ci --test-threads 1 \
+  --success-output immediate \
+  -E 'test(collision_receipts_bound_distinct_hashes_and_isolate_owners) | test(canonical_transition_wal_is_linear_and_recoverable_across_many_rounds)'
+```
+
+The scale mode retains the same 30-second hard deadline and fails on timeout;
+it is not enabled by ordinary integration CI. Keep source, database, machine,
+test profile and workload identical for before/after comparisons. A same-row
+contention result is not a multi-session capacity result; batching does not
+remove contention between independent transactions on the same identity.
 
 For a short batching tradeoff comparison, run the ignored
 `ingestion_batch_tradeoff_db_it` test against a dedicated disposable database.

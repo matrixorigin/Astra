@@ -21,10 +21,6 @@ use std::sync::Arc;
 async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
     let settings = common::require_db_it_env();
     isolated_database::require_isolated_database(&settings.database);
-    assert!(
-        isolated_database::is_schema_rehearsal_database(&settings.database),
-        "schema rehearsal requires an astra_test_probe_* disposable database"
-    );
     assert_eq!(
         std::env::var("ASTRA_ALLOW_INSECURE_DEFAULTS").as_deref(),
         Ok("1")
@@ -161,45 +157,6 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
         )
         .await
         .unwrap();
-    // Simulate the pre-upgrade schema in this explicitly designated disposable
-    // database. Preserve a real old model row across two idempotent bootstraps.
-    let personal_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_llm_models")
-        .fetch_one(pool.get())
-        .await
-        .unwrap();
-    let administrator_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM infra_llm_models")
-        .fetch_one(pool.get())
-        .await
-        .unwrap();
-    assert_eq!(
-        personal_rows, 1,
-        "schema rehearsal requires only this test's model row"
-    );
-    assert_eq!(
-        administrator_rows, 0,
-        "schema rehearsal refuses existing administrator models"
-    );
-    for table in ["infra_llm_models", "user_llm_models"] {
-        sqlx::query(&format!(
-            "ALTER TABLE {table} DROP COLUMN thinking_probe_json"
-        ))
-        .execute(pool.get())
-        .await
-        .unwrap();
-    }
-    sqlx::query("UPDATE astra_schema_contracts SET contract_version = '2026-09-04-v70' WHERE component = 'astra-core'")
-        .execute(pool.get()).await.unwrap();
-    for _ in 0..2 {
-        astra_services::storage::ensure_core_schema(&settings, "mysql")
-            .await
-            .unwrap();
-    }
-    let migrated = service
-        .get_user_model(owner.clone(), created.model_id.clone())
-        .await
-        .unwrap();
-    assert_eq!(migrated.name, created.name);
-    assert!(migrated.thinking_probe.is_none());
     // Fixed official endpoints are not user-overridable. Seed their *test row*
     // with this loopback fixture to exercise the real rotate/probe service paths
     // without adding a production transport bypass or spending a live API key.

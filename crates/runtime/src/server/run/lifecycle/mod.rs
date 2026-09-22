@@ -71,9 +71,7 @@ use astra_services::work::{
     WorkSubjectRef,
 };
 use astra_services::{AdmittedModelExecution, EdgeContext};
-use astra_services::{
-    DatabaseContextManifestStore, DatabaseStateProjectionStore, RetrievalStage, StateItemUpsert,
-};
+use astra_services::{DatabaseContextManifestStore, RetrievalStage};
 use astra_services::{
     WorkspaceCleanupDebtEntry, WorkspaceRecordEntry as StoredWorkspaceRecordEntry,
     WorkspaceRecordStoreError, WorkspaceStateStore,
@@ -132,9 +130,8 @@ use astra_turn_core::agent_live_event::{
     AgentLiveTermination, SharedAgentLiveEventSink,
 };
 use astra_turn_core::contracts::{
-    TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan, TurnDecisionAuditRecord,
-    TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker,
-    TurnSkillSelectionRecord,
+    TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan, TurnHookDbPersistPlan,
+    TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker, TurnSkillSelectionRecord,
 };
 use astra_turn_core::interruption::{InterruptionKind, ResumeAction, ResumeMode};
 use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
@@ -188,9 +185,7 @@ const DURABLE_LIVE_ATTACH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 // facts. Keep an attached observer alive long enough to see the publication,
 // then close with an explicit unavailable outcome instead of waiting forever.
 const DURABLE_LIVE_ATTACH_PUBLICATION_GRACE: Duration = Duration::from_secs(5);
-// Explain artifact discovery is background context. It must never make a
-// normal user turn wait on a slow or unavailable artifact store.
-const EXPLAIN_CONTEXT_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(750);
+// Bound publication latency independently of terminal task completion.
 const EXPLAIN_ARTIFACT_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(2);
 const DURABLE_LIVE_ATTACH_STORAGE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const DURABLE_LIVE_ATTACH_TERMINAL_DELIVERY_TIMEOUT: Duration = Duration::from_secs(1);
@@ -4354,11 +4349,11 @@ async fn persist_runtime_promotion_events(
 pub(crate) use persistence::{
     CanonicalLoopAppend, CanonicalTerminalSettlement, PostLoopPersistContext,
     TranscriptPersistItem, TranscriptPersistPayload,
+    append_session_transcript_items_admitted_in_tx,
     build_run_turn_complete_event_with_interruption, materialize_server_run_transcript_evidence,
     persist_server_loop_canonical_append, persist_server_loop_canonical_terminal_settlement,
-    persist_session_transcript_items, persist_session_transcript_items_inner_in_tx,
-    restore_session_state_compact, restore_step_checkpoint_runtime_state, server_trace_context,
-    trace_context_from_subrun_context,
+    persist_session_transcript_items, restore_session_state_compact,
+    restore_step_checkpoint_runtime_state, server_trace_context, trace_context_from_subrun_context,
 };
 use run_state::*;
 
@@ -11466,122 +11461,6 @@ impl AgenticRunLifecycleService {
         );
     }
 
-    async fn latest_explain_analyze_run(
-        &self,
-        user_id: &str,
-        session_id: &str,
-    ) -> Result<Option<(String, u64)>, String> {
-        self.run_engine
-            .find_latest_explain_analyze_root(user_id, session_id)
-            .await
-    }
-
-    async fn append_latest_explain_artifact_context(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        edge_profile: &mut Map<String, Value>,
-    ) {
-        let run = match self.latest_explain_analyze_run(user_id, session_id).await {
-            Ok(run) => run,
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra_runtime::run_lifecycle",
-                    user_id,
-                    session_id,
-                    %error,
-                    "failed to discover the latest Explain Analyze run"
-                );
-                Self::append_runtime_required_prompt_text(
-                    edge_profile,
-                    crate::server::explain_analyze_artifact::unavailable_context_notice(&format!(
-                        "the server could not discover the latest Explain Analyze run: {error}"
-                    )),
-                );
-                return;
-            }
-        };
-        let Some((run_id, owner_generation)) = run else {
-            return;
-        };
-        let discovery = crate::server::explain_analyze_artifact::discover_context_notice_for_run(
-            self.shared_pool.as_ref(),
-            user_id,
-            session_id,
-            &run_id,
-            owner_generation,
-        )
-        .await;
-        match discovery {
-            Ok(crate::server::explain_analyze_artifact::ContextNoticeDiscovery::Notice(notice)) => {
-                Self::append_runtime_required_prompt_text(edge_profile, notice)
-            }
-            Ok(crate::server::explain_analyze_artifact::ContextNoticeDiscovery::Missing) => {
-                if let Ok(Some(durable)) = self.run_engine.load_run(user_id, &run_id).await
-                    && durable.session_id == session_id
-                    && durable.run_generation == owner_generation
-                {
-                    self.publish_recovered_explain(&durable).await;
-                }
-                match crate::server::explain_analyze_artifact::context_notice_for_run(
-                    self.shared_pool.as_ref(),
-                    user_id,
-                    session_id,
-                    &run_id,
-                    owner_generation,
-                )
-                .await
-                {
-                    Ok(notice) => Self::append_runtime_required_prompt_text(edge_profile, notice),
-                    Err(error) => Self::append_runtime_required_prompt_text(
-                        edge_profile,
-                        crate::server::explain_analyze_artifact::unavailable_context_notice(
-                            &format!(
-                                "the server could not read Explain Analyze run {run_id}: {error}"
-                            ),
-                        ),
-                    ),
-                }
-            }
-            Err(error) => Self::append_runtime_required_prompt_text(
-                edge_profile,
-                crate::server::explain_analyze_artifact::unavailable_context_notice(&format!(
-                    "the server could not read Explain Analyze run {run_id}: {error}"
-                )),
-            ),
-        }
-    }
-
-    async fn append_latest_explain_artifact_context_bounded(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        edge_profile: &mut Map<String, Value>,
-    ) {
-        if tokio::time::timeout(
-            EXPLAIN_CONTEXT_DISCOVERY_TIMEOUT,
-            self.append_latest_explain_artifact_context(user_id, session_id, edge_profile),
-        )
-        .await
-        .is_err()
-        {
-            tracing::warn!(
-                target: "astra_runtime::run_lifecycle",
-                user_id,
-                session_id,
-                timeout_ms = EXPLAIN_CONTEXT_DISCOVERY_TIMEOUT.as_millis() as u64,
-                "timed out discovering the latest Explain Analyze artifact; continuing the user turn"
-            );
-            Self::append_runtime_required_prompt_text(
-                edge_profile,
-                crate::server::explain_analyze_artifact::unavailable_context_notice(&format!(
-                    "artifact discovery timed out after {} ms",
-                    EXPLAIN_CONTEXT_DISCOVERY_TIMEOUT.as_millis()
-                )),
-            );
-        }
-    }
-
     async fn publish_explain_artifact(
         pool: Option<&SharedPool>,
         run_engine: &RunEngine,
@@ -11635,7 +11514,10 @@ impl AgenticRunLifecycleService {
             recorded: true,
             result,
         };
-        Self::record_explain_publication(run_engine, user_id, session_id, outcome).await
+        crate::server::explain_analyze_artifact::record_explain_publication(
+            run_engine, user_id, session_id, outcome,
+        )
+        .await
     }
 
     async fn publish_explain_artifact_bounded(
@@ -11677,107 +11559,22 @@ impl AgenticRunLifecycleService {
                     &turn_id,
                     owner_generation,
                     "publication_timeout",
-                    "The Explain Analyze run completed, but saving its report timed out. The next turn may retry recovery.",
+                    "The Explain Analyze run completed, but saving its report timed out. Explicit Explain introspection may retry recovery.",
                 )
             }
         }
     }
 
-    async fn record_explain_publication(
-        run_engine: &RunEngine,
-        user_id: &str,
-        session_id: &str,
-        mut outcome: astra_turn_types::ArtifactPublicationV1,
-    ) -> Value {
-        let run_id = outcome.run_id.as_str();
-        let owner_generation = outcome.execution_owner_generation;
-        let payload = serde_json::to_value(&outcome).expect("serializable publication outcome");
-        let mut identity = Sha256::new();
-        identity.update(b"astra.artifact-publication.v1\0");
-        identity.update(astra_core::canonical_json_string(&payload).as_bytes());
-        let event = json!({ "event_type":"artifact_publication",
-            "idempotency_key":format!("{:x}", identity.finalize()), "data":payload });
-
-        let recorded = run_engine
-            .append_events_if_current_generation_and_status(
-                user_id,
-                session_id,
-                run_id,
-                owner_generation,
-                &[
-                    STATUS_COMPLETED,
-                    STATUS_FAILED,
-                    STATUS_CANCELLED,
-                    "delegated",
-                ],
-                &[event],
-            )
-            .await;
-        if recorded != Ok(true) {
-            outcome.recorded = false;
-            tracing::warn!(run_id, result = ?recorded,
-                "could not retain Explain artifact publication outcome; notifying live client");
-        }
-        outcome.to_wire()
-    }
-
     async fn publish_recovered_explain(&self, run: &DurableRunRecord) -> Option<Value> {
-        use astra_turn_types::{ArtifactPublicationResult, ArtifactPublicationV1};
-        if run.status != STATUS_COMPLETED
-            || !astra_services::runs::run_requested_explain_analyze(run)
-        {
-            return None;
-        }
-        let turn_id = run
-            .events
-            .iter()
-            .cloned()
-            .map(astra_services::runs::transform_run_event_for_client)
-            .filter_map(|event| astra_turn_types::decode_explain_analyze_wire(&event).ok())
-            .find(|fact| fact.run_id == run.run_id)
-            .map(|fact| fact.turn_id)
-            .unwrap_or_else(|| "unknown".to_string());
-        let result = match crate::server::explain_analyze_artifact::recover_completed_snapshot(
+        let wire = crate::server::explain_analyze_artifact::publish_recovered_explain(
             self.shared_pool.as_ref(),
+            &self.run_engine,
             run,
         )
-        .await
+        .await?;
+        if let Some(live) = self.runs.write().await.get_mut(&run.run_id)
+            && !live.events.contains(&wire)
         {
-            Ok(Some(handle)) => ArtifactPublicationResult::Published { handle },
-            failure => {
-                tracing::warn!(run_id = %run.run_id, result = ?failure, "Explain report recovery unavailable");
-                ArtifactPublicationResult::Unavailable {
-                    reason_code: "recovery_failed".into(),
-                    message: "The server could not recover a readable report for this run.".into(),
-                }
-            }
-        };
-        let outcome = ArtifactPublicationV1 {
-            schema_version: 1,
-            run_id: run.run_id.clone(),
-            turn_id,
-            execution_owner_generation: run.run_generation,
-            artifact_type: "explain_analyze_snapshot".into(),
-            recorded: true,
-            result,
-        };
-        if let Some(existing) = run.events.iter().rev().find_map(|event| {
-            ArtifactPublicationV1::from_wire(&astra_services::runs::transform_run_event_for_client(
-                event.clone(),
-            ))
-            .ok()
-        }) && existing == outcome
-        {
-            return Some(existing.to_wire());
-        }
-        let wire = Self::record_explain_publication(
-            &self.run_engine,
-            &run.user_id,
-            &run.session_id,
-            outcome,
-        )
-        .await;
-        if let Some(live) = self.runs.write().await.get_mut(&run.run_id) {
             live.events.push(wire.clone());
         }
         Some(wire)
@@ -15225,12 +15022,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             request.runtime_system_prompt.as_deref(),
             request.context.as_ref(),
         )?;
-        self.append_latest_explain_artifact_context_bounded(
-            &user_id,
-            &session_id,
-            &mut edge_profile,
-        )
-        .await;
         if let Some(binding) = work_runtime_binding.as_ref() {
             crate::server::work_context::install_canonical_work_context(
                 &mut edge_profile,
@@ -15698,6 +15489,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 memoria_base,
                 None,
             )
+            .with_explain_root(self.run_engine.clone(), run_id.clone())
             .with_runtime_process_authorization(
                 Self::runtime_process_authorization_context(&request)
                     .expect("runtime process authorization was validated before run start"),
@@ -16106,12 +15898,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             request.runtime_system_prompt.as_deref(),
             request.context.as_ref(),
         )?;
-        self.append_latest_explain_artifact_context_bounded(
-            &user_id,
-            &session_id,
-            &mut edge_profile,
-        )
-        .await;
         if let Some(binding) = work_runtime_binding.as_ref() {
             crate::server::work_context::install_canonical_work_context(
                 &mut edge_profile,
@@ -17205,6 +16991,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 memoria_base,
                 None,
             )
+            .with_explain_root(self.run_engine.clone(), run_id.clone())
             .with_runtime_process_authorization(
                 Self::runtime_process_authorization_context(&request).expect(
                     "runtime process authorization was validated before streaming run start",
@@ -22103,6 +21890,12 @@ impl ServerSubRunExecutor {
     }
 }
 
+#[derive(Debug)]
+struct DurableSubrunAdmission {
+    owner_generation: u64,
+    root_run_id: String,
+}
+
 impl ServerSubRunExecutor {
     fn durable_run_engine(&self) -> Option<RunEngine> {
         self.run_engine.clone()
@@ -22112,7 +21905,7 @@ impl ServerSubRunExecutor {
         &self,
         config: &SubRunConfig,
         execution: Option<&astra_services::AdmittedModelExecution>,
-    ) -> Result<Option<crate::server::run::engine::RunExecutionAuthority>, String> {
+    ) -> Result<Option<DurableSubrunAdmission>, String> {
         let Some(run_engine) = self.durable_run_engine() else {
             return Ok(None);
         };
@@ -22121,6 +21914,21 @@ impl ServerSubRunExecutor {
             .load_run(&config.user_id, &config.parent_run_id)
             .await?
             .ok_or_else(|| "durable sub-run parent disappeared before admission".to_string())?;
+        if parent.session_id != config.session_id {
+            return Err("durable sub-run parent belongs to another session".into());
+        }
+        // Reuse the durable parent already read for admission. Nested children
+        // exclude the ancestor root, not their immediate parent, during Explain
+        // discovery. No prompt field or extra preparation query supplies it.
+        let root_run_id = if parent.depth == 0 {
+            parent.run_id.clone()
+        } else {
+            parent
+                .root_run_id
+                .clone()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| "durable sub-run parent has no ancestor root".to_string())?
+        };
         if let Some(existing) = existing {
             if existing.session_id != config.session_id
                 || existing.parent_run_id.as_deref() != Some(config.parent_run_id.as_str())
@@ -22167,8 +21975,9 @@ impl ServerSubRunExecutor {
             if durable_mode != config.interaction_mode {
                 return Err("durable sub-run retry changed its interaction policy".to_string());
             }
-            return Ok(Some(crate::server::run::engine::RunExecutionAuthority {
+            return Ok(Some(DurableSubrunAdmission {
                 owner_generation: expected_generation,
+                root_run_id,
             }));
         }
         if let Some(expected_generation) = config.execution_owner_generation {
@@ -22270,7 +22079,12 @@ impl ServerSubRunExecutor {
                 },
             )
             .await
-            .map(Some)
+            .map(|authority| {
+                Some(DurableSubrunAdmission {
+                    owner_generation: authority.owner_generation,
+                    root_run_id,
+                })
+            })
     }
 
     async fn materialize_durable_subrun_execution(
@@ -23029,9 +22843,14 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let local_execution_lease_lost = Arc::new(AtomicBool::new(false));
 
         let selected_execution = self.select_subrun_execution(&config).await?;
-        let execution_authority = self
+        let durable_admission = self
             .ensure_durable_subrun_started(&config, selected_execution.as_ref())
             .await?;
+        let execution_authority = durable_admission.as_ref().map(|admission| {
+            crate::server::run::engine::RunExecutionAuthority {
+                owner_generation: admission.owner_generation,
+            }
+        });
         let durable_run_engine = self.durable_run_engine();
         config.bind_execution_authority(durable_run_engine.is_some(), execution_authority)?;
         if let (Some(sink), Some(authority)) = (
@@ -23628,6 +23447,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 memoria_base,
                 None,
             );
+            if let (Some(engine), Some(admission)) =
+                (durable_run_engine.as_ref(), durable_admission.as_ref())
+            {
+                executor = executor.with_explain_root(engine.clone(), admission.root_run_id.clone());
+            }
             if let Some(memoria_port) = self
                 .memory_extraction_service
                 .as_ref()

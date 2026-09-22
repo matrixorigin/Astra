@@ -4,27 +4,20 @@ use crate::CancellationSafePoolConnection;
 use crate::db_row::RowExt as ContextManifestDbRow;
 use crate::observation_capture::{
     DurableCaptureOutcome, ObservationCollisionReceipt, ObservationPayloadDomain,
-    canonical_observation_payload_hash, classify_capture, record_observation_collision,
+    canonical_observation_payload_hash, classify_capture, record_observation_collisions,
 };
 use astra_core::{SharedPool, matrixone_null_shape_comment, matrixone_statement_with_null_shape};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sqlx::{Connection, MySql, QueryBuilder};
 use thiserror::Error;
 use uuid::Uuid;
 
 pub const BUDGET_V1_8K_TOTAL_CAP: u32 = 7_300;
 pub const BUDGET_V1_8K_PROMPT_CAP: u32 = 8_000;
-pub const DELEGATION_ZONE_CAP: u32 = 1_500;
-pub const DELEGATION_BLOCKER_ZONE_CAP: u32 = DELEGATION_ZONE_CAP * 2;
-pub const DELEGATION_CHILD_FLOOR: u32 = 200;
-pub const RECENT_TAIL_BLOCKER_FLOOR: u32 = 1_600;
 pub const BENCHMARK_TOOL_PREVIEW_BUDGET: u32 = 2_500;
 pub const RECENT_TAIL_BENCHMARK_FLOOR: u32 = 1_600;
 pub const SYSTEM_TOOL_SCHEMAS_MAX: u32 = 3_400;
 pub const TURN_INTENT_BENCHMARK_COMPARISON: &str = "benchmark_comparison";
-pub const DELEGATION_MAX_RENDERED_CHILDREN: usize =
-    (DELEGATION_ZONE_CAP / DELEGATION_CHILD_FLOOR) as usize;
 pub const SESSION_ARTIFACT_STATUS_EXPIRED: &str = "expired";
 
 /// Keep one manifest write bounded even when a future context assembler emits
@@ -111,67 +104,6 @@ pub const CONTEXT_MANIFEST_REASONS: &[(&str, &str, Option<&str>)] = &[
     ("other", "fallback", None),
 ];
 
-pub const BASELINE_PREVIEW_TEMPLATES: &[(&str, u32, &str)] = &[
-    ("bash", 1200, "shell_v1"),
-    ("run_script", 1200, "python_stdout_v1"),
-    ("read_file", 1000, "text_v1"),
-    ("write_file", 1000, "text_v1"),
-    ("str_replace", 1000, "diff_v1"),
-    ("list_dir", 1200, "text_v1"),
-    ("glob", 1200, "text_v1"),
-    ("grep", 1200, "text_v1"),
-    ("symbols", 1200, "rust_v1"),
-    ("web_search", 1000, "search_v1"),
-    ("web_fetch", 1200, "html_v1"),
-    ("tool_search", 1000, "text_v1"),
-    ("session", 1200, "text_v1"),
-    ("task_board", 1200, "text_v1"),
-    ("agent", 1200, "text_v1"),
-    ("agent_fanout", 1600, "text_v1"),
-    ("memory", 1200, "text_v1"),
-    ("mo_query", 1200, "sql_v1"),
-    ("pg_dump", 1000, "sql_v1"),
-    ("fetch_url", 1000, "html_v1"),
-    ("parse_pdf", 1000, "pdf_v1"),
-    ("SKILL.md", 1200, "skill_md_v1"),
-    ("cargo", 1200, "rust_v1"),
-    ("rustc", 1200, "rust_v1"),
-    ("clippy", 1200, "rust_v1"),
-    ("pg_schema_structurize", 1200, "sql_v1"),
-    ("slow_query_analyzer", 1200, "sql_v1"),
-    ("curl", 1000, "text_v1"),
-    ("git", 1200, "diff_v1"),
-    ("docker_logs", 1200, "text_v1"),
-    ("kubectl", 1200, "text_v1"),
-    ("python_stdout", 1200, "text_v1"),
-    ("npm_build", 1200, "js_v1"),
-    ("csv_head", 1200, "csv_v1"),
-    ("json_preview", 1200, "json_v1"),
-    ("markdown_preview", 1200, "markdown_v1"),
-];
-
-pub fn preview_template_fts_field_weights(normalize_version: &str) -> &'static str {
-    match normalize_version {
-        "sql_v1" => r#"{"statement":2.0,"object_name":1.5,"error":2.0,"preview_text":1.0}"#,
-        "rust_v1" => r#"{"diagnostic":2.0,"crate":1.4,"file":1.3,"preview_text":1.0}"#,
-        "skill_md_v1" => r#"{"name":2.0,"description":1.6,"trigger":1.4,"preview_text":1.0}"#,
-        "json_v1" => r#"{"path":1.8,"key":1.5,"value":1.0,"preview_text":1.0}"#,
-        "csv_v1" => r#"{"header":1.8,"sample":1.2,"preview_text":1.0}"#,
-        "diff_v1" => r#"{"path":1.7,"symbol":1.4,"hunk":1.2,"preview_text":1.0}"#,
-        "html_v1" => r#"{"title":1.8,"heading":1.5,"url":1.2,"preview_text":1.0}"#,
-        "pdf_v1" => r#"{"title":1.8,"section":1.5,"preview_text":1.0}"#,
-        "js_v1" => r#"{"package":1.6,"script":1.4,"error":2.0,"preview_text":1.0}"#,
-        "markdown_v1" => r#"{"heading":1.7,"link":1.2,"preview_text":1.0}"#,
-        "artifact_file_v1" => {
-            r#"{"title":2.0,"filename":1.8,"content_type":1.3,"preview_text":1.0}"#
-        }
-        "shell_v1" => r#"{"command":1.6,"stderr":2.0,"stdout":1.0,"preview_text":1.0}"#,
-        "python_stdout_v1" => r#"{"script":1.5,"stdout":1.0,"stderr":2.0,"preview_text":1.0}"#,
-        "search_v1" => r#"{"query":2.0,"title":1.5,"snippet":1.2,"preview_text":1.0}"#,
-        _ => r#"{"preview_text":1.0,"tool_name":1.2,"error":1.8}"#,
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BudgetV1_8k {
     pub anchor: u32,
@@ -248,141 +180,6 @@ pub fn budget_for_turn_intent(turn_intent: Option<&str>) -> TurnIntentBudgetAllo
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DelegationBudget {
-    pub active_children: usize,
-    pub rendered_children: usize,
-    pub overflow_children: usize,
-    pub per_child_budget: u32,
-    pub rendered_total: u32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DelegationBudgetAllocation {
-    pub child_budget: DelegationBudget,
-    pub requested_delegation_zone_budget: u32,
-    pub delegation_zone_budget: u32,
-    pub recent_tail_budget: u32,
-    pub borrowed_from_recent_tail: u32,
-    pub unfunded_blocker_tokens: u32,
-    pub blocker_active: bool,
-}
-
-pub fn delegation_budget(active_children: usize) -> DelegationBudget {
-    if active_children == 0 {
-        return DelegationBudget {
-            active_children,
-            rendered_children: 0,
-            overflow_children: 0,
-            per_child_budget: 0,
-            rendered_total: 0,
-        };
-    }
-    let rendered_children = active_children.min(DELEGATION_MAX_RENDERED_CHILDREN);
-    let per_child_budget =
-        DELEGATION_CHILD_FLOOR.max(DELEGATION_ZONE_CAP / rendered_children as u32);
-    DelegationBudget {
-        active_children,
-        rendered_children,
-        overflow_children: active_children.saturating_sub(rendered_children),
-        per_child_budget,
-        rendered_total: per_child_budget * rendered_children as u32,
-    }
-}
-
-pub fn delegation_budget_allocation(
-    active_children: usize,
-    blocker_children: usize,
-) -> DelegationBudgetAllocation {
-    let base = BudgetV1_8k::standard();
-    let blocker_active = blocker_children > 0;
-    let requested = if blocker_active {
-        DELEGATION_BLOCKER_ZONE_CAP
-    } else {
-        DELEGATION_ZONE_CAP
-    };
-    let borrowable = base.recent_tail.saturating_sub(RECENT_TAIL_BLOCKER_FLOOR);
-    let needed = requested.saturating_sub(DELEGATION_ZONE_CAP);
-    let borrowed = if blocker_active {
-        borrowable.min(needed)
-    } else {
-        0
-    };
-    let effective_cap = DELEGATION_ZONE_CAP + borrowed;
-    let rendered_children = if active_children == 0 {
-        0
-    } else {
-        active_children.min((effective_cap / DELEGATION_CHILD_FLOOR) as usize)
-    };
-    let child_budget = if rendered_children == 0 {
-        DelegationBudget {
-            active_children,
-            rendered_children: 0,
-            overflow_children: active_children,
-            per_child_budget: 0,
-            rendered_total: 0,
-        }
-    } else {
-        let per_child_budget = DELEGATION_CHILD_FLOOR.max(effective_cap / rendered_children as u32);
-        DelegationBudget {
-            active_children,
-            rendered_children,
-            overflow_children: active_children.saturating_sub(rendered_children),
-            per_child_budget,
-            rendered_total: per_child_budget * rendered_children as u32,
-        }
-    };
-    DelegationBudgetAllocation {
-        child_budget,
-        requested_delegation_zone_budget: requested,
-        delegation_zone_budget: effective_cap,
-        recent_tail_budget: base.recent_tail.saturating_sub(borrowed),
-        borrowed_from_recent_tail: borrowed,
-        unfunded_blocker_tokens: requested.saturating_sub(effective_cap),
-        blocker_active,
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ConfidenceAction {
-    AutoAccept,
-    AskUser,
-    Reject,
-}
-
-pub fn next_action_confidence_action(
-    confidence: f32,
-    ask_user_count_1h: u32,
-    source: &str,
-    provenance_event_id: Option<&str>,
-) -> ConfidenceAction {
-    if source == "small_model" && provenance_event_id.is_none() {
-        return ConfidenceAction::AskUser;
-    }
-    let fatigue_downgrade_allowed = matches!(source, "structured_event" | "rule");
-    let adjusted = if fatigue_downgrade_allowed && ask_user_count_1h >= 3 {
-        confidence - 0.1
-    } else {
-        confidence
-    };
-    if adjusted >= 0.8 {
-        ConfidenceAction::AutoAccept
-    } else if adjusted >= 0.5 {
-        ConfidenceAction::AskUser
-    } else {
-        ConfidenceAction::Reject
-    }
-}
-
-pub fn suggested_next_action_expires_at(kind: &str, now: chrono::DateTime<chrono::Utc>) -> String {
-    let expires = match kind {
-        "approval" => now + chrono::Duration::hours(24),
-        "todo" => now + chrono::Duration::days(7),
-        _ => now + chrono::Duration::hours(1),
-    };
-    expires.to_rfc3339()
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RetrievalStage {
     Structured,
     Fts,
@@ -411,29 +208,6 @@ impl RetrievalStage {
             RetrievalStage::Structured => Some(RetrievalStage::Fts),
             RetrievalStage::Fts => Some(RetrievalStage::Vector),
             RetrievalStage::Vector => None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RenderMode {
-    PlainText,
-    Markdown,
-    CodeBlockPreserved,
-    ToolPreview,
-    Summary,
-    ReferenceOnly,
-}
-
-impl RenderMode {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            RenderMode::PlainText => "plain_text",
-            RenderMode::Markdown => "markdown",
-            RenderMode::CodeBlockPreserved => "code_block_preserved",
-            RenderMode::ToolPreview => "tool_preview",
-            RenderMode::Summary => "summary",
-            RenderMode::ReferenceOnly => "reference_only",
         }
     }
 }
@@ -490,12 +264,8 @@ pub enum ContextManifestError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("cross-session retrieval missing user_id filter")]
-    CrossSessionAuthMissing,
     #[error("session is not active: owner={user_id}, session={session_id}")]
     SessionNotActive { user_id: String, session_id: String },
-    #[error("unsupported raw_ref scheme: {scheme}")]
-    UnsupportedRawRefScheme { scheme: String },
 }
 
 fn context_manifest_session_admission_error(
@@ -537,19 +307,6 @@ fn context_manifest_decode_error(
     }
 }
 
-fn context_manifest_invalid_value_error(
-    operation: &'static str,
-    entity: &str,
-    column: &str,
-    message: impl Into<String>,
-) -> ContextManifestError {
-    let source = sqlx::Error::Decode(Box::new(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        message.into(),
-    )));
-    context_manifest_decode_error(operation, entity, column, source)
-}
-
 fn context_manifest_row_string(
     row: &impl ContextManifestDbRow,
     operation: &'static str,
@@ -568,50 +325,6 @@ fn context_manifest_row_optional_string(
 ) -> Result<Option<String>, ContextManifestError> {
     row.optional_string_column(column)
         .map_err(|source| context_manifest_decode_error(operation, entity, column, source))
-}
-
-fn context_manifest_row_u32_at_least(
-    row: &impl ContextManifestDbRow,
-    operation: &'static str,
-    entity: &str,
-    column: &str,
-    min: i64,
-) -> Result<u32, ContextManifestError> {
-    let value = row
-        .i64_column(column)
-        .map_err(|source| context_manifest_decode_error(operation, entity, column, source))?;
-    if value < min {
-        return Err(context_manifest_invalid_value_error(
-            operation,
-            entity,
-            column,
-            format!("invalid {entity}.{column}: {value}; expected >= {min}"),
-        ));
-    }
-    u32::try_from(value).map_err(|_| {
-        context_manifest_invalid_value_error(
-            operation,
-            entity,
-            column,
-            format!(
-                "invalid {entity}.{column}: {value}; expected <= {}",
-                u32::MAX
-            ),
-        )
-    })
-}
-
-fn decode_preview_template_budget_row(
-    row: &impl ContextManifestDbRow,
-    tool_name: &str,
-) -> Result<u32, ContextManifestError> {
-    context_manifest_row_u32_at_least(
-        row,
-        "preview_template_lookup_decode",
-        tool_name,
-        "max_preview_bytes",
-        1,
-    )
 }
 
 fn decode_session_artifact_manifest_row(
@@ -734,8 +447,8 @@ impl DatabaseContextManifestStore {
                 source: sqlx::Error::Protocol("session event insert affected no rows".into()),
             });
         }
-        crate::storage::add_agent_session_event_count_or_create(
-            tx,
+        crate::storage::bump_agent_session_event_count(
+            &mut **tx,
             event.session_id,
             event.user_id,
             inserted_events,
@@ -903,9 +616,9 @@ impl DatabaseContextManifestStore {
             attempted_payload_hash,
         } = &outcome
         {
-            record_observation_collision(
+            record_observation_collisions(
                 &mut tx,
-                ObservationCollisionReceipt {
+                &[ObservationCollisionReceipt {
                     user_id: &manifest.user_id,
                     domain: ObservationPayloadDomain::ContextManifest,
                     identity_id: &manifest.manifest_id,
@@ -913,7 +626,7 @@ impl DatabaseContextManifestStore {
                     stored_payload_hash,
                     attempted_payload_hash,
                     source: "context_manifest",
-                },
+                }],
             )
             .await
             .map_err(|source| ContextManifestError::Database {
@@ -1017,33 +730,6 @@ impl DatabaseContextManifestStore {
         Ok(DurableCaptureOutcome::Inserted)
     }
 
-    pub async fn validate_raw_ref(&self, raw_ref: &str) -> Result<(), ContextManifestError> {
-        let Some((scheme, _rest)) = raw_ref.split_once("://") else {
-            return Err(ContextManifestError::UnsupportedRawRefScheme {
-                scheme: String::new(),
-            });
-        };
-        let exists = sqlx::query(
-            "SELECT scheme FROM raw_ref_scheme_registry WHERE scheme = ? AND is_active = 1",
-        )
-        .bind(scheme)
-        .fetch_optional(self.pool.get())
-        .await
-        .map_err(|source| ContextManifestError::Database {
-            operation: "raw_ref_scheme_lookup",
-            entity: raw_ref.to_string(),
-            source,
-        })?
-        .is_some();
-        if exists {
-            Ok(())
-        } else {
-            Err(ContextManifestError::UnsupportedRawRefScheme {
-                scheme: scheme.to_string(),
-            })
-        }
-    }
-
     pub async fn record_retrieval_degrade_event(
         &self,
         user_id: &str,
@@ -1074,49 +760,6 @@ impl DatabaseContextManifestStore {
         .await
         .map(|_| ())?;
         Ok(next_stage)
-    }
-
-    pub async fn preview_template_budget_or_fallback(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        run_id: Option<&str>,
-        tool_name: &str,
-    ) -> Result<u32, ContextManifestError> {
-        let row = sqlx::query(
-            "SELECT max_preview_bytes FROM preview_template_registry
-             WHERE tool_name = ? AND status = 'active'
-             ORDER BY updated_at DESC
-             LIMIT 1",
-        )
-        .bind(tool_name)
-        .fetch_optional(self.pool.get())
-        .await
-        .map_err(|source| ContextManifestError::Database {
-            operation: "preview_template_lookup",
-            entity: tool_name.to_string(),
-            source,
-        })?;
-        if let Some(row) = row {
-            return decode_preview_template_budget_row(&row, tool_name);
-        }
-
-        self.insert_session_event_and_bump_count(SessionEventInsert {
-            user_id,
-            session_id,
-            event_type: "preview_template_missing",
-            content: tool_name,
-            metadata: serde_json::json!({
-                "run_id": run_id,
-                "tool_name": tool_name,
-                "fallback_max_preview_bytes": 400,
-            }),
-            operation: "preview_template_missing_event",
-            entity: tool_name,
-        })
-        .await
-        .map(|_| ())?;
-        Ok(400)
     }
 
     pub async fn render_artifact_manifest_item(
@@ -1166,15 +809,6 @@ impl DatabaseContextManifestStore {
 
 fn context_manifest_item_nullable_shape(item: &ContextManifestItemWrite) -> [bool; 2] {
     [item.source_hash.is_some(), item.raw_ref.is_some()]
-}
-
-pub fn content_hash_with_normalize_version(
-    content_hash: &str,
-    normalize_version: Option<&str>,
-) -> String {
-    let version = normalize_version.unwrap_or("raw_v1");
-    let digest = Sha256::digest(format!("{content_hash}|{version}").as_bytes());
-    format!("sha256:{digest:x}")
 }
 
 pub fn expired_artifact_placeholder(artifact_id: &str, summary: Option<&str>) -> String {
@@ -1254,19 +888,71 @@ fn aggregate_artifact_references(
     references
 }
 
-pub fn cross_session_retrieval_requires_user_filter(
-    user_id_filter: Option<&str>,
-) -> Result<(), ContextManifestError> {
-    if user_id_filter.is_some_and(|value| !value.trim().is_empty()) {
-        Ok(())
-    } else {
-        Err(ContextManifestError::CrossSessionAuthMissing)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retrieval_stage_metadata_is_stable() {
+        for (stage, timeout, event, next) in [
+            (
+                RetrievalStage::Structured,
+                50,
+                "retrieval.structured_stale",
+                Some(RetrievalStage::Fts),
+            ),
+            (
+                RetrievalStage::Fts,
+                200,
+                "retrieval.fts_stale",
+                Some(RetrievalStage::Vector),
+            ),
+            (RetrievalStage::Vector, 500, "retrieval.vector_stale", None),
+        ] {
+            assert_eq!(stage.timeout_ms(), timeout);
+            assert_eq!(stage.event_type("stale"), event);
+            assert_eq!(stage.next_stage(), next);
+        }
+    }
+
+    #[test]
+    fn projection_budget_preserves_normal_and_benchmark_caps() {
+        let standard = BudgetV1_8k::standard();
+        assert_eq!(
+            (standard.anchor, standard.plan_todo, standard.recent_tail),
+            (200, 400, 2000)
+        );
+        assert_eq!(
+            (standard.summary, standard.retrieved, standard.tool_previews),
+            (500, 1000, 500)
+        );
+        assert_eq!(standard.system_tool_schemas, 3400);
+        assert_eq!(
+            (standard.reserved_output, standard.safety_buffer),
+            (500, 200)
+        );
+        for intent in [None, Some("normal"), Some("unknown")] {
+            let normal = budget_for_turn_intent(intent);
+            assert_eq!(normal.budget, standard);
+            assert!(!normal.flex_applied);
+            assert_eq!(normal.borrowed_from_recent_tail, 0);
+        }
+        let benchmark = budget_for_turn_intent(Some(TURN_INTENT_BENCHMARK_COMPARISON));
+        assert!(benchmark.flex_applied);
+        assert_eq!(
+            benchmark.budget.tool_previews,
+            BENCHMARK_TOOL_PREVIEW_BUDGET
+        );
+        assert_eq!(benchmark.budget.recent_tail, RECENT_TAIL_BENCHMARK_FLOOR);
+        assert_eq!(
+            benchmark.borrowed_from_recent_tail,
+            standard.recent_tail - benchmark.budget.recent_tail
+        );
+        for budget in [standard, benchmark.budget] {
+            assert_eq!(budget.prompt_cap(), BUDGET_V1_8K_PROMPT_CAP);
+            assert_eq!(budget.input_context_cap(), BUDGET_V1_8K_TOTAL_CAP);
+        }
+    }
 
     #[test]
     fn context_manifest_session_admission_only_reclassifies_row_not_found() {
@@ -1299,7 +985,6 @@ mod tests {
     #[derive(Clone)]
     struct FakeContextManifestRow {
         failed_column: Option<&'static str>,
-        i64_overrides: Vec<(&'static str, i64)>,
         metadata: Option<&'static str>,
     }
 
@@ -1307,7 +992,6 @@ mod tests {
         fn complete() -> Self {
             Self {
                 failed_column: None,
-                i64_overrides: Vec::new(),
                 metadata: Some(r#"{"summary":"metadata summary"}"#),
             }
         }
@@ -1315,13 +999,6 @@ mod tests {
         fn fail_on(column: &'static str) -> Self {
             Self {
                 failed_column: Some(column),
-                ..Self::complete()
-            }
-        }
-
-        fn with_i64(column: &'static str, value: i64) -> Self {
-            Self {
-                i64_overrides: vec![(column, value)],
                 ..Self::complete()
             }
         }
@@ -1357,21 +1034,6 @@ mod tests {
             self.fail_if_needed(column)?;
             Ok(match column {
                 "metadata" => self.metadata.map(ToString::to_string),
-                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
-            })
-        }
-
-        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
-            self.fail_if_needed(column)?;
-            if let Some((_, value)) = self
-                .i64_overrides
-                .iter()
-                .find(|(candidate, _)| *candidate == column)
-            {
-                return Ok(*value);
-            }
-            Ok(match column {
-                "max_preview_bytes" => 1024,
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
             })
         }
@@ -1411,37 +1073,6 @@ mod tests {
             expired_artifact_placeholder("artifact-1", Some("important preserved summary"));
         assert!(rendered.contains("historical, raw no longer available"));
         assert!(rendered.contains("important preserved summary"));
-    }
-
-    #[test]
-    fn preview_template_budget_decode_preserves_values_and_fails_loudly() {
-        assert_eq!(
-            decode_preview_template_budget_row(&FakeContextManifestRow::complete(), "bash")
-                .unwrap(),
-            1024
-        );
-
-        assert_context_manifest_db_error_mentions(
-            decode_preview_template_budget_row(
-                &FakeContextManifestRow::fail_on("max_preview_bytes"),
-                "bash",
-            ),
-            "max_preview_bytes",
-        );
-        assert_context_manifest_db_error_mentions(
-            decode_preview_template_budget_row(
-                &FakeContextManifestRow::with_i64("max_preview_bytes", 0),
-                "bash",
-            ),
-            "max_preview_bytes",
-        );
-        assert_context_manifest_db_error_mentions(
-            decode_preview_template_budget_row(
-                &FakeContextManifestRow::with_i64("max_preview_bytes", i64::from(u32::MAX) + 1),
-                "bash",
-            ),
-            "max_preview_bytes",
-        );
     }
 
     #[test]

@@ -74,29 +74,86 @@ pub struct ObservationCollisionReceipt<'a> {
 
 /// Aggregate conflicts into one row per identity. Expiry is fixed at first
 /// observation so continuous conflicts cannot extend retention indefinitely.
-pub async fn record_observation_collision(
+/// Preserve input order, including identities equivalent under database collation.
+/// Each chunk has at most 128 receipts; all chunks belong to the
+/// caller's transaction, which must be rolled back on error. Empty input does no SQL.
+/// Schema-bounded identifiers and hashes keep valid receipt bytes bounded as well.
+pub async fn record_observation_collisions(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    receipt: ObservationCollisionReceipt<'_>,
+    receipts: &[ObservationCollisionReceipt<'_>],
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    for chunk in receipts.chunks(128) {
+        // Reduction must not hide malformed fields in intermediate receipts.
+        for receipt in chunk {
+            for (value, limit) in [
+                (receipt.user_id, 128),
+                (receipt.identity_id, 128),
+                (receipt.session_id, 128),
+                (receipt.stored_payload_hash, 80),
+                (receipt.attempted_payload_hash, 80),
+                (receipt.source, 64),
+            ] {
+                if value.chars().take(limit + 1).count() > limit {
+                    return Err(sqlx::Error::Protocol(
+                        "collision receipt exceeds schema bounds".into(),
+                    ));
+                }
+            }
+        }
+        // Fresh duplicate keys in a multi-row UPSERT are not safe on MatrixOne.
+        // Let the database group using the target columns' types/collation;
+        // Rust only uses the returned ordinals, never normalizes identities.
+        let groups: Vec<(i64, i64, i64)> = if chunk.len() == 1 {
+            vec![(0, 0, 1)]
+        } else {
+            let mut grouping = sqlx::QueryBuilder::<sqlx::MySql>::new(
+                "SELECT MIN(ord), MAX(ord), COUNT(*) FROM (
+                 SELECT user_id, identity_kind, identity_id, 0 AS ord
+                 FROM observation_identity_collisions WHERE 1 = 0",
+            );
+            for (ordinal, receipt) in chunk.iter().enumerate() {
+                grouping
+                    .push(" UNION ALL SELECT ")
+                    .push_bind(receipt.user_id)
+                    .push(", ")
+                    .push_bind(receipt.domain.identity_kind())
+                    .push(", ")
+                    .push_bind(receipt.identity_id)
+                    .push(", ")
+                    .push(ordinal);
+            }
+            grouping.push(
+                ") AS incoming GROUP BY user_id, identity_kind, identity_id ORDER BY MIN(ord)",
+            );
+            grouping.build_query_as().fetch_all(&mut **tx).await?
+        };
+        let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
         "INSERT INTO observation_identity_collisions
          (user_id, identity_kind, identity_id, session_id, stored_payload_hash,
-          attempted_payload_hash, source, collision_count, first_seen_at, last_seen_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 1, NOW(6), NOW(6), DATE_ADD(NOW(6), INTERVAL 7 DAY))
-         ON DUPLICATE KEY UPDATE
+          attempted_payload_hash, source, collision_count, first_seen_at, last_seen_at, expires_at) ",
+        );
+        query.push_values(&groups, |mut row, &(first, last, count)| {
+            let receipt = &chunk[first as usize];
+            row.push_bind(receipt.user_id)
+                .push_bind(receipt.domain.identity_kind())
+                .push_bind(receipt.identity_id)
+                .push_bind(receipt.session_id)
+                .push_bind(receipt.stored_payload_hash)
+                .push_bind(chunk[last as usize].attempted_payload_hash)
+                .push_bind(receipt.source)
+                .push_bind(count)
+                .push("NOW(6)")
+                .push("NOW(6)")
+                .push("DATE_ADD(NOW(6), INTERVAL 7 DAY)");
+        });
+        query.push(
+            " ON DUPLICATE KEY UPDATE
              attempted_payload_hash = VALUES(attempted_payload_hash),
-             collision_count = collision_count + 1,
+             collision_count = collision_count + VALUES(collision_count),
              last_seen_at = NOW(6)",
-    )
-    .bind(receipt.user_id)
-    .bind(receipt.domain.identity_kind())
-    .bind(receipt.identity_id)
-    .bind(receipt.session_id)
-    .bind(receipt.stored_payload_hash)
-    .bind(receipt.attempted_payload_hash)
-    .bind(receipt.source)
-    .execute(&mut **tx)
-    .await?;
+        );
+        query.build().execute(&mut **tx).await?;
+    }
     Ok(())
 }
 

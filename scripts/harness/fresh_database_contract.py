@@ -49,8 +49,6 @@ BOOT_METADATA_TABLES = frozenset(
         "astra_schema_table_contracts",
         "infra_llm_models",
         "maintenance_sweep_cursors",
-        "preview_template_registry",
-        "raw_ref_scheme_registry",
         # The distributed weighted-admission coordinator owns one durable
         # scope gate. It is created during core-schema bootstrap and is not
         # user/session/work state; its exact scope is validated below.
@@ -382,115 +380,6 @@ def _distributed_admission_scope(repo: Path) -> str:
     return match.group(1)
 
 
-def _canonical_baseline_registry_rows(repo: Path) -> dict[str, list[list[str]]]:
-    """Derive exact startup seeds from the same checked-in Rust constants.
-
-    Timestamps are deliberately excluded.  Every semantic column, including
-    the JSON strings written by startup, is compared byte-for-byte.
-    """
-    storage = (repo / "crates" / "services" / "src" / "storage.rs").read_text(
-        encoding="utf-8"
-    )
-    context = (repo / "crates" / "services" / "src" / "context_manifest.rs").read_text(
-        encoding="utf-8"
-    )
-    raw_block = re.search(
-        r"for \(scheme, resolver, backing, access_check, example\) in \[(.*?)\n\s*\] \{",
-        storage,
-        re.DOTALL,
-    )
-    if raw_block is None:
-        raise ContractError("cannot resolve raw-ref startup seed inventory")
-    raw_rows = [
-        [*values, "1"]
-        for values in re.findall(
-            r'\(\s*"([^"]+)",\s*"([^"]+)",\s*"([^"]+)",\s*"([^"]+)",\s*"([^"]+)"\s*,?\s*\)',
-            raw_block.group(1),
-            re.DOTALL,
-        )
-    ]
-    if len(raw_rows) != 9 or len({row[0] for row in raw_rows}) != len(raw_rows):
-        raise ContractError("raw-ref startup seed inventory is not canonical")
-
-    template_block = re.search(
-        r"pub const BASELINE_PREVIEW_TEMPLATES:.*?= &\[(.*?)\n\];",
-        context,
-        re.DOTALL,
-    )
-    weights_block = re.search(
-        r"pub fn preview_template_fts_field_weights.*?match normalize_version \{(.*?)\n\s*\}\n\}\n\n#\[",
-        context,
-        re.DOTALL,
-    )
-    if template_block is None or weights_block is None:
-        raise ContractError("cannot resolve preview-template startup seed inventory")
-    templates = re.findall(
-        r'\("([^"]+)",\s*([0-9]+),\s*"([^"]+)"\)',
-        template_block.group(1),
-    )
-    weights = dict(
-        re.findall(
-            r'"([^"]+)"\s*=>\s*(?:\{\s*)?r#"([^\n]+)"#',
-            weights_block.group(1),
-        )
-    )
-    default_match = re.search(r'_\s*=>\s*r#"([^\n]+)"#', weights_block.group(1))
-    if not templates or default_match is None:
-        raise ContractError("preview-template startup seed inventory is empty")
-    default_weights = default_match.group(1)
-    preview_rows = [
-        [
-            tool_name,
-            "v1",
-            "active",
-            max_preview_bytes,
-            "tool_output_preview",
-            "[]",
-            weights.get(normalize_version, default_weights),
-            normalize_version,
-            "{}",
-        ]
-        for tool_name, max_preview_bytes, normalize_version in templates
-    ]
-    if len({row[0] for row in preview_rows}) != len(preview_rows):
-        raise ContractError("preview-template startup seed inventory has duplicates")
-    return {
-        "raw_ref_scheme_registry": sorted(raw_rows),
-        "preview_template_registry": sorted(preview_rows),
-    }
-
-
-def _validate_baseline_registry_rows(database: str, repo: Path) -> dict[str, object]:
-    expected = _canonical_baseline_registry_rows(repo)
-    observed = {
-        "raw_ref_scheme_registry": _mysql_rows(
-            "SELECT scheme, resolver_name, backing_store, access_check, "
-            "canonical_example, CAST(is_active AS CHAR) "
-            "FROM raw_ref_scheme_registry ORDER BY scheme",
-            database,
-        ),
-        "preview_template_registry": _mysql_rows(
-            "SELECT tool_name, version, status, CAST(max_preview_bytes AS CHAR), "
-            "default_chunk_type, first_class_columns_json, fts_field_weights_json, "
-            "normalize_version, schema_json "
-            "FROM preview_template_registry ORDER BY tool_name, version",
-            database,
-        ),
-    }
-    result: dict[str, object] = {}
-    for table in sorted(expected):
-        if observed[table] != expected[table]:
-            raise ContractError(
-                f"bootstrap table {table} differs from its exact source-owned baseline"
-            )
-        serialized = json.dumps(
-            observed[table], sort_keys=True, separators=(",", ":")
-        ).encode()
-        result[f"{table}_count"] = len(observed[table])
-        result[f"{table}_sha256"] = hashlib.sha256(serialized).hexdigest()
-    return result
-
-
 def _canonical_runtime_system_baseline(repo: Path) -> dict[str, object]:
     source_paths = (
         "crates/runtime/src/server/sweeper_lease.rs",
@@ -699,7 +588,6 @@ def _validate_boot_metadata(database: str, repo: Path, counts: dict[str, int]) -
         "core_contract_version": version,
         "table_contract_count": len(table_contracts),
         "table_contract_sha256": digest,
-        **_validate_baseline_registry_rows(database, repo),
         **_validate_runtime_system_baseline(database, repo),
     }
 

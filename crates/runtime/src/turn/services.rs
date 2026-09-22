@@ -3,7 +3,7 @@ use crate::data_layer::storage::{
     classify_agent_event_capture_attempts, insert_trace_events, touch_agent_session_activity,
 };
 use crate::server::run::lifecycle::{
-    TranscriptPersistItem, TranscriptPersistPayload, persist_session_transcript_items_inner_in_tx,
+    TranscriptPersistItem, TranscriptPersistPayload, append_session_transcript_items_admitted_in_tx,
 };
 use crate::*;
 use astra_core::canonical_names::metadata_tool_name;
@@ -66,6 +66,8 @@ pub struct DatabaseTurnToolEventWriter {
 #[derive(Clone, Debug)]
 pub struct DatabaseTurnHookDbWriter {
     pool: Option<SharedPool>,
+    #[cfg(feature = "e2e-hooks")]
+    retained_write_hook: Option<Arc<astra_services::decisions::RetainedWriteTestHook>>,
 }
 
 #[derive(Clone, Debug)]
@@ -118,8 +120,21 @@ impl DatabaseTurnToolEventWriter {
 }
 
 impl DatabaseTurnHookDbWriter {
+    #[cfg(feature = "e2e-hooks")]
+    pub fn with_retained_write_test_hook(
+        mut self,
+        hook: Arc<astra_services::decisions::RetainedWriteTestHook>,
+    ) -> Self {
+        self.retained_write_hook = Some(hook);
+        self
+    }
+
     pub fn new(_matrixone: MatrixOneSettings) -> Self {
-        Self { pool: None }
+        Self {
+            pool: None,
+            #[cfg(feature = "e2e-hooks")]
+            retained_write_hook: None,
+        }
     }
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.pool = Some(pool);
@@ -263,8 +278,10 @@ async fn apply_touched_session_deltas_in_tx(
         if *delta <= 0 {
             continue;
         }
-        astra_services::storage::add_agent_session_event_count_or_create(
-            tx,
+        // Admission already created/locked this session in the same transaction.
+        // Updating its count needs neither another fence read nor a root upsert.
+        astra_services::storage::bump_agent_session_event_count(
+            &mut **tx,
             session_id,
             user_id,
             *delta,
@@ -448,7 +465,7 @@ impl TurnCoreEventWriter for DatabaseTurnCoreEventWriter {
         if let Some((user_id, session_id)) = transcript_owner
             && !transcript_items.is_empty()
         {
-            persist_session_transcript_items_inner_in_tx(
+            append_session_transcript_items_admitted_in_tx(
                 &mut tx,
                 &user_id,
                 &session_id,
@@ -611,10 +628,8 @@ impl DatabaseTraceEventWriter {
             // must dominate before any caller projects derived content.
             persist_outcome.merge(session_outcome);
         }
-        // Session summary updates are deliberately deferred until the owning
-        // transaction commits. They use the actual INSERT IGNORE delta, not a
-        // COUNT(*) scan that would lock/scan the shared event table under
-        // concurrent fanout.
+        // The transaction owner applies insertion deltas before committing.
+        // Replayed events never increment the count or require a COUNT(*) scan.
         Ok(persist_outcome)
     }
 }
@@ -622,58 +637,71 @@ impl DatabaseTraceEventWriter {
 #[async_trait]
 impl TurnHookDbWriter for DatabaseTurnHookDbWriter {
     async fn persist(&self, plan: TurnHookDbPersistPlan) -> Result<(), String> {
-        if plan.decision_audit.is_none() && plan.skill_selection.is_none() {
+        let Some(mut skill_selection) = plan.skill_selection else {
             return Ok(());
-        }
+        };
         let pool = self.get_pool()?;
         // Resolve catalog metadata before opening the write transaction. This
         // lookup uses the pool itself; doing it after `begin()` would hold one
         // connection while waiting for a second connection and can deadlock a
         // small pool (and unnecessarily consumes two leases in production).
-        let skill_versions = if let Some(skill_selection) = plan.skill_selection.as_ref() {
-            Some(
-                resolve_active_skill_versions(
-                    &pool,
-                    skill_selection
-                        .selected_skills
-                        .iter()
-                        .map(String::as_str)
-                        .collect(),
-                )
-                .await
-                .map_err(|error| error.to_string())?,
-            )
-        } else {
-            None
-        };
-        let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
-        if let Some(decision_audit) = plan.decision_audit.as_ref() {
-            insert_turn_decision_audit(&mut tx, decision_audit)
-                .await
-                .map_err(|error| error.to_string())?;
+        let skill_versions = resolve_active_skill_versions(
+            &pool,
+            skill_selection
+                .selected_skills
+                .iter()
+                .map(String::as_str)
+                .collect(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        if let Some(first_skill_name) = skill_selection.selected_skills.first()
+            && let Some(skill_version) = skill_versions.get(first_skill_name)
+        {
+            skill_selection.skill_version = Some(skill_version.clone());
         }
-        if let Some(skill_selection) = plan.skill_selection.as_ref() {
-            insert_turn_skill_selection(&mut tx, skill_selection)
-                .await
-                .map_err(|error| error.to_string())?;
-            if let Some(first_skill_name) = skill_selection.selected_skills.first()
-                && let Some(skill_version) = skill_versions
-                    .as_ref()
-                    .and_then(|versions| versions.get(first_skill_name))
+        let mut connection = astra_services::CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|error| error.to_string())?;
+        let result = async {
+            astra_services::storage::admit_session_event_write(
+                &mut tx,
+                &skill_selection.session_id,
+                &skill_selection.user_id,
+                false,
+            )
+            .await?;
+            insert_turn_skill_selection(&mut tx, &skill_selection).await?;
+            #[cfg(feature = "e2e-hooks")]
+            if let Some(hook) = &self.retained_write_hook
+                && hook
+                    .after_insert(&skill_selection.user_id, &skill_selection.session_id)
+                    .await
             {
-                update_turn_skill_selection_version(
-                    &mut tx,
-                    &skill_selection.event_id,
-                    &skill_selection.user_id,
-                    &skill_selection.session_id,
-                    skill_version,
-                )
-                .await
-                .map_err(|error| error.to_string())?;
+                return Err(sqlx::Error::Protocol(
+                    "injected retained write failure".into(),
+                ));
+            }
+            Ok::<(), sqlx::Error>(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                tx.commit().await.map_err(|error| error.to_string())?;
+                connection.release();
+                Ok(())
+            }
+            Err(error) => {
+                if tx.rollback().await.is_ok() {
+                    connection.release();
+                }
+                Err(error.to_string())
             }
         }
-        tx.commit().await.map_err(|error| error.to_string())?;
-        Ok(())
     }
 }
 
@@ -1526,12 +1554,6 @@ mod tests {
             })
             .await
             .expect("seed original response event");
-        sqlx::query("DELETE FROM transcript_pages WHERE user_id = ? AND session_id = ?")
-            .bind(&user_id)
-            .bind(&session_id)
-            .execute(&pool)
-            .await
-            .expect("remove seeded transcript page");
         sqlx::query(
             "DELETE FROM session_transcript_items \
              WHERE user_id = ? AND session_id = ? AND source_event_id = ?",
@@ -1659,7 +1681,6 @@ mod tests {
         assert_eq!(collision_receipts, 1);
 
         for statement in [
-            "DELETE FROM transcript_pages WHERE user_id = ? AND session_id = ?",
             "DELETE FROM session_transcript_items WHERE user_id = ? AND session_id = ?",
             "DELETE FROM agent_event_edges WHERE user_id = ? AND session_id = ?",
             "DELETE FROM agent_events WHERE user_id = ? AND session_id = ?",
@@ -1829,26 +1850,10 @@ mod tests {
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("not configured"));
 
-        // HookDbWriter
+        // An empty hook must succeed without even a configured pool.
         let w = DatabaseTurnHookDbWriter::new(settings.clone());
-        let r = w
-            .persist(TurnHookDbPersistPlan {
-                decision_audit: Some(TurnDecisionAuditRecord {
-                    decision_id: "d1".into(),
-                    user_id: "u".into(),
-                    event_id: "e2".into(),
-                    session_id: "s".into(),
-                    decision_type: "tool_surface".into(),
-                    decision_output: json!({}),
-                    model_used: None,
-                    context_capture_id: None,
-                }),
-                skill_selection: None,
-                reflection_lesson: None,
-                reflection_mark: None,
-            })
-            .await;
-        assert!(r.is_err());
+        let r = w.persist(TurnHookDbPersistPlan::default()).await;
+        assert!(r.is_ok());
 
         // ToolEventWriter
         let w = DatabaseTurnToolEventWriter::new(settings.clone());

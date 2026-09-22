@@ -3,7 +3,7 @@
 //!
 //! Extracted from [`super`] to keep the lifecycle module manageable.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,18 +24,14 @@ use astra_services::runs::{
 };
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
 use astra_services::skills::SkillService;
-use astra_services::state_projection::bounded_state_item_id;
 use astra_services::{CancellationSafePoolConnection, EdgeContext};
-use astra_services::{
-    DatabaseContextManifestStore, DatabaseStateProjectionStore, RetrievalStage, StateItemUpsert,
-};
 use astra_services::{
     WorkspaceCleanupDebtEntry, WorkspaceRecordEntry as StoredWorkspaceRecordEntry,
     WorkspaceRecordStoreError, WorkspaceStateStore,
 };
 use astra_turn_core::contracts::{
-    TurnDecisionAuditRecord, TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest,
-    TurnObserverWorker, TurnSkillSelectionRecord,
+    TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker,
+    TurnSkillSelectionRecord,
 };
 use astra_turn_core::observer::filter_memory_operation_turns;
 use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
@@ -50,19 +46,12 @@ use crate::{
     DatabaseEvaluationService, DatabaseEventService, DatabaseTraceEventWriter,
     EventCreateRequestData, EventService,
 };
-use astra_services::db_row::{RowDecoder, RowExt};
+use astra_services::storage::admit_session_event_write;
 
 use super::{
     build_runtime_event_service, build_runtime_turn_evaluation_event, flush_turn_observability,
     persist_runtime_promotion_events, persist_turn_evaluation_journal,
 };
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct TranscriptPageItemRow {
-    item_seq: i64,
-    role: String,
-    content_hash: String,
-}
 
 const DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY: usize = 4;
 const METRIC_TURN_OBSERVER_DISPATCHES_TOTAL: &str = "astra_turn_observer_dispatches_total";
@@ -197,19 +186,6 @@ fn run_token_usage_json(state: &AgenticLoopState) -> Option<Value> {
     Some(usage)
 }
 
-fn decode_post_compaction_manifest_count(row: &impl RowExt) -> Result<i64, String> {
-    RowDecoder::new(row, "post-compaction context manifest count").non_negative_i64("count")
-}
-
-fn decode_transcript_page_item_row(row: &impl RowExt) -> Result<TranscriptPageItemRow, String> {
-    let dec = RowDecoder::new(row, "transcript page item row");
-    Ok(TranscriptPageItemRow {
-        item_seq: dec.positive_i64("item_seq")?,
-        role: dec.non_empty_string("role")?,
-        content_hash: dec.non_empty_string("content_hash")?,
-    })
-}
-
 /// Bundles all handles needed by post-loop best-effort persistence calls.
 ///
 /// Both `create_run` and `stream_chat` run the same set of side effects after
@@ -322,9 +298,9 @@ impl PostLoopPersistContext {
     ) -> Result<(), String> {
         let mut errors = Vec::new();
         if let Err(error) = core_trace_result {
-            // Hook rows, memory extraction, session-end hooks, promotion
-            // events, and state projections are derived from the canonical
-            // turn. Publishing any of them after the canonical transaction
+            // Hook rows, memory extraction, session-end hooks, and promotion
+            // events are derived from the canonical turn. Publishing any of
+            // them after the canonical transaction
             // failed creates a second, contradictory source of truth. Retain
             // the classified terminal failure and append-only provider/tool
             // evidence, but fail closed before derived state escapes.
@@ -339,9 +315,8 @@ impl PostLoopPersistContext {
             .await;
 
         // The remaining consumers all read the immutable completed loop state
-        // and write independent sinks. Streaming callers complete this phase
-        // before publishing terminal SSE; the writes are awaited together so
-        // their independent database latency remains overlapped.
+        // and write independent sinks. The writes are awaited together;
+        // their completion is not the streaming terminal-delivery boundary.
         let hook_persist = async {
             let Some(writer) = self.hook_db_writer.as_ref() else {
                 return Ok(());
@@ -352,7 +327,6 @@ impl PostLoopPersistContext {
                 &self.session_id,
                 &self.user_message,
                 state,
-                self.model_name.as_deref(),
             )
             .await
         };
@@ -381,21 +355,11 @@ impl PostLoopPersistContext {
             &self.run_id,
             &state.telemetry.promotion_events,
         );
-        let projection_persist = persist_server_loop_projection_state(
-            self.shared_pool.as_ref(),
-            &self.user_id,
-            &self.session_id,
-            &self.run_id,
-            self.agent_id.as_deref(),
-            self.model_name.as_deref(),
-            state,
-        );
-        let (hook_result, observer_result, (), promotion_result, projection_result) = tokio::join!(
+        let (hook_result, observer_result, (), promotion_result) = tokio::join!(
             hook_persist,
             observer_dispatch,
             session_end,
             promotion_persist,
-            projection_persist,
         );
         if let Err(error) = hook_result {
             errors.push(format!("hook events persist failed: {error}"));
@@ -405,9 +369,6 @@ impl PostLoopPersistContext {
         }
         if let Err(error) = promotion_result {
             errors.push(format!("promotion events persist failed: {error}"));
-        }
-        if let Err(error) = projection_result {
-            errors.push(format!("projection state persist failed: {error}"));
         }
 
         // Use loop_success to conditionally log severity
@@ -532,12 +493,10 @@ impl PostLoopPersistContext {
             .begin()
             .await
             .map_err(|error| error.to_string())?;
-        astra_services::storage::admit_session_scoped_run_write(
+        astra_services::storage::admit_session_execution_write(
             &mut tx,
             &self.session_id,
             &self.user_id,
-            &self.run_id,
-            false,
         )
         .await
         .map_err(|error| format!("terminal trace session admission failed: {error}"))?;
@@ -553,7 +512,12 @@ impl PostLoopPersistContext {
         .fetch_optional(&mut *tx)
         .await
         .map_err(|error| error.to_string())?
-        .ok_or_else(|| "authoritative terminal run disappeared before trace repair".to_string())?;
+        .ok_or_else(|| {
+            format!(
+                "terminal trace session admission failed: {}",
+                sqlx::Error::RowNotFound
+            )
+        })?;
         let status = row
             .try_get::<String, _>("status")
             .map_err(|error| error.to_string())?;
@@ -566,8 +530,7 @@ impl PostLoopPersistContext {
             ));
         }
         let (turn_started_at, _) = turn_trace_time_bounds(state);
-        let outcome = persist_server_loop_trace_events_in_tx(
-            &mut tx,
+        let events = build_server_loop_trace_events(
             &self.user_id,
             &self.session_id,
             &self.run_id,
@@ -578,17 +541,17 @@ impl PostLoopPersistContext {
             state,
             self.model_name.as_deref(),
             turn_started_at,
-        )
-        .await?;
-        tx.commit().await.map_err(|error| error.to_string())?;
-        connection.release();
+        );
+        let outcome = DatabaseTraceEventWriter::write_many_in_tx(&mut tx, events)
+            .await
+            .map_err(|error| error.to_string())?;
         if let Some((delta, last_event_id)) = outcome
             .session_event_deltas
             .get(&(self.user_id.clone(), self.session_id.clone()))
             && *delta > 0
         {
             crate::data_layer::storage::bump_agent_session_event_count(
-                pool.get(),
+                &mut *tx,
                 &self.session_id,
                 &self.user_id,
                 *delta,
@@ -597,6 +560,8 @@ impl PostLoopPersistContext {
             .await
             .map_err(|error| format!("bump terminal trace session event count: {error}"))?;
         }
+        tx.commit().await.map_err(|error| error.to_string())?;
+        connection.release();
         Ok(())
     }
 
@@ -1125,7 +1090,6 @@ async fn persist_server_loop_canonical_append_inner(
         append.session_id,
         append.user_id,
         append.run_id,
-        false,
     )
     .await
     .map_err(|error| format!("canonical session admission failed: {error}"))?;
@@ -1185,19 +1149,14 @@ async fn persist_server_loop_canonical_append_inner(
         }
     }
 
-    // Core events (user_query + llm_response) + transcript items.
-    //
-    // `persist_server_loop_core_events_in_tx` now returns `Result`; on Err the
-    // transaction is poisoned (partial writes may be staged) and we MUST
-    // rollback instead of continuing to write detail events into the same tx.
+    // Core and detail facts share one insertion batch and session admission.
     let (execution_started_at, terminal_offset_ms) = turn_trace_time_bounds(state);
     let root_started_at = state
         .canonical_turn_started_at
         .get()
         .copied()
         .unwrap_or(execution_started_at);
-    let mut capture_outcome = match persist_server_loop_core_events_in_tx(
-        &mut tx,
+    let mut events = build_server_loop_core_events(
         append.user_id,
         append.session_id,
         append.run_id,
@@ -1212,16 +1171,27 @@ async fn persist_server_loop_canonical_append_inner(
         root_started_at,
         execution_started_at,
         terminal_offset_ms,
-    )
-    .await
-    {
+    );
+    events.extend(build_server_loop_trace_events(
+        append.user_id,
+        append.session_id,
+        append.run_id,
+        append.parent_run_id,
+        append.agent_id,
+        append.parent_agent_id,
+        append.trace_context.clone(),
+        state,
+        append.model_name,
+        execution_started_at,
+    ));
+    let capture_outcome = match DatabaseTraceEventWriter::write_many_in_tx(&mut tx, events).await {
         Ok(outcome) => outcome,
         Err(error) => {
-            let msg = format!("core events tx failed: {}", error);
+            let msg = format!("canonical events tx failed: {}", error);
             tracing::warn!(
                 session_id = %append.session_id,
                 error = %error,
-                "post-loop: core events tx failed, rolling back MO transaction"
+                "post-loop: canonical events tx failed, rolling back MO transaction"
             );
             // rollback consumes the transaction; cannot use tx after this
             if let Err(rollback_err) = tx.rollback().await {
@@ -1234,41 +1204,6 @@ async fn persist_server_loop_canonical_append_inner(
             return Err(msg);
         }
     };
-
-    // Trace detail events (LLM rounds, tool calls).
-    match persist_server_loop_trace_events_in_tx(
-        &mut tx,
-        append.user_id,
-        append.session_id,
-        append.run_id,
-        append.parent_run_id,
-        append.agent_id,
-        append.parent_agent_id,
-        append.trace_context.clone(),
-        state,
-        append.model_name,
-        execution_started_at,
-    )
-    .await
-    {
-        Ok(outcome) => capture_outcome.merge(outcome),
-        Err(error) => {
-            let msg = format!("detail events tx failed: {}", error);
-            tracing::warn!(
-                session_id = %append.session_id,
-                error = %error,
-                "post-loop: detail events tx failed, rolling back MO transaction"
-            );
-            if let Err(rb_err) = tx.rollback().await {
-                tracing::error!(
-                    session_id = %append.session_id,
-                    error = %rb_err,
-                    "post-loop: rollback failed after detail events tx failure"
-                );
-            }
-            return Err(msg);
-        }
-    }
 
     // Atomic settlement and its authoritative replay verifier require the same
     // complete evidence, including tool/round/user-intent events. Non-terminal
@@ -1288,8 +1223,8 @@ async fn persist_server_loop_canonical_append_inner(
     }
 
     // The transcript gets one ordered durable sequence in this same
-    // transaction. Delegated runs include their terminal assistant here;
-    // roots defer it until the canonical context cursor is committed.
+    // transaction, including recoverable root terminal assistant evidence.
+    // Cursor promotion later certifies the contiguous committed projection.
     if let Err(error) = persist_server_loop_transcript_items_in_tx(
         &mut tx,
         append.user_id,
@@ -1317,6 +1252,24 @@ async fn persist_server_loop_canonical_append_inner(
             );
         }
         return Err(msg);
+    }
+
+    // Admission already holds this session's lock. Commit the insertion delta
+    // with its events so a crash or lost acknowledgement cannot lose the count.
+    if let Some((delta, last_event_id)) = capture_outcome
+        .session_event_deltas
+        .get(&(append.user_id.to_string(), append.session_id.to_string()))
+        && *delta > 0
+    {
+        crate::data_layer::storage::bump_agent_session_event_count(
+            &mut *tx,
+            append.session_id,
+            append.user_id,
+            *delta,
+            last_event_id.as_deref(),
+        )
+        .await
+        .map_err(|error| format!("bump canonical session event count: {error}"))?;
     }
 
     let terminal_commit = if let Some(settlement) = settlement {
@@ -1413,24 +1366,6 @@ async fn persist_server_loop_canonical_append_inner(
             }
         }
     }
-    // Event rows and run state are now durable. Update the derived session
-    // counter outside the long canonical transaction so sibling fanout runs
-    // never wait on `agent_sessions` while holding their own event/run locks.
-    if let Some((delta, last_event_id)) = capture_outcome
-        .session_event_deltas
-        .get(&(append.user_id.to_string(), append.session_id.to_string()))
-        && *delta > 0
-    {
-        crate::data_layer::storage::bump_agent_session_event_count(
-            pool.get(),
-            append.session_id,
-            append.user_id,
-            *delta,
-            last_event_id.as_deref(),
-        )
-        .await
-        .map_err(|error| format!("bump canonical session event count: {error}"))?;
-    }
     if let Some((store, _)) = terminal_commit.as_ref()
         && let Err(error) = store
             .repair_projection_after_atomic_terminal_settlement(
@@ -1464,190 +1399,6 @@ async fn persist_server_loop_canonical_append_inner(
             .unwrap_or_default(),
         terminal_assistant_source_event_id,
     })
-}
-
-async fn persist_server_loop_projection_state(
-    shared_pool: Option<&SharedPool>,
-    user_id: &str,
-    session_id: &str,
-    run_id: &str,
-    agent_id: Option<&str>,
-    model_name: Option<&str>,
-    state: &AgenticLoopState,
-) -> Result<(), String> {
-    let Some(pool) = shared_pool else {
-        return Ok(());
-    };
-    let store = DatabaseStateProjectionStore::new(pool.clone());
-    let final_text = state.final_text.trim();
-    if !final_text.is_empty() {
-        let preview = truncate_for_projection(final_text, 480);
-        let result = store
-            .upsert_state_item(StateItemUpsert {
-                item_id: Some(bounded_state_item_id(
-                    "decision",
-                    &[session_id, run_id, &state.session_turn.to_string()],
-                )),
-                user_id: user_id.to_string(),
-                session_id: session_id.to_string(),
-                scope: "session".to_string(),
-                category: "decision".to_string(),
-                item_key: format!("turn:{}:final_response", state.session_turn),
-                status: "active".to_string(),
-                priority: 50,
-                source: "agentic_loop".to_string(),
-                provenance_event_id: None,
-                run_id: Some(run_id.to_string()),
-                title: Some(format!("Turn {} final decision", state.session_turn)),
-                summary_text: Some(preview.clone()),
-                payload_json: json!({
-                    "run_id": run_id,
-                    "agent_id": agent_id,
-                    "model_name": model_name,
-                    "session_turn": state.session_turn,
-                    "summary": preview,
-                    "source": "server_agentic_loop_final_text",
-                }),
-                token_estimate: astra_turn_core::section_types::estimate_text_tokens(final_text)
-                    .clamp(20, 240),
-                mutation: "insert".to_string(),
-            })
-            .await;
-        if let Err(error) = result {
-            tracing::warn!(
-                target: "astra_runtime::state_projection",
-                session_id = %session_id,
-                run_id = %run_id,
-                error = %error,
-                "failed to persist agentic-loop decision projection"
-            );
-        }
-    }
-
-    let post_compaction_count_row = match sqlx::query(
-        "SELECT COUNT(*) AS count FROM context_manifests \
-         WHERE user_id = ? AND session_id = ? AND run_id = ? AND reason = 'post_compaction'",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .bind(run_id)
-    .fetch_one(pool.get())
-    .await
-    {
-        Ok(row) => row,
-        Err(error) => {
-            let error_msg = format!(
-                "failed to inspect post-compaction context manifest count: {}",
-                error
-            );
-            tracing::warn!(
-                target: "astra_runtime::state_projection",
-                session_id = %session_id,
-                run_id = %run_id,
-                error = %error,
-                "failed to inspect post-compaction context manifest count"
-            );
-            return Err(error_msg);
-        }
-    };
-    let post_compaction_count =
-        match decode_post_compaction_manifest_count(&post_compaction_count_row) {
-            Ok(count) => count,
-            Err(error) => {
-                let error_msg = format!(
-                    "failed to decode post-compaction context manifest count: {}",
-                    error
-                );
-                tracing::warn!(
-                    target: "astra_runtime::state_projection",
-                    session_id = %session_id,
-                    run_id = %run_id,
-                    error = %error,
-                    "failed to decode post-compaction context manifest count"
-                );
-                return Err(error_msg);
-            }
-        };
-    if post_compaction_count > 0 {
-        match store
-            .run_compaction_assertions(user_id, session_id, run_id)
-            .await
-        {
-            Ok(results) if results.iter().all(|(_, violations)| *violations == 0) => {
-                let result = store
-                    .upsert_state_item(StateItemUpsert {
-                        item_id: Some(bounded_state_item_id("summary", &[session_id, run_id])),
-                        user_id: user_id.to_string(),
-                        session_id: session_id.to_string(),
-                        scope: "session".to_string(),
-                        category: "summary".to_string(),
-                        item_key: format!("compaction:{run_id}"),
-                        status: "active".to_string(),
-                        priority: 40,
-                        source: "agentic_loop_compaction".to_string(),
-                        provenance_event_id: None,
-                        run_id: Some(run_id.to_string()),
-                        title: Some("Post-compaction summary".to_string()),
-                        summary_text: Some(
-                            "Compaction completed with invariant checks passing".to_string(),
-                        ),
-                        payload_json: json!({
-                            "reason": "post_compaction",
-                            "invariant_results": results,
-                        }),
-                        token_estimate: 80,
-                        mutation: "insert".to_string(),
-                    })
-                    .await;
-                if let Err(error) = result {
-                    let error_msg = format!(
-                        "failed to persist post-compaction summary projection: {}",
-                        error
-                    );
-                    tracing::warn!(
-                        target: "astra_runtime::state_projection",
-                        session_id = %session_id,
-                        run_id = %run_id,
-                        error = %error,
-                        "failed to persist post-compaction summary projection"
-                    );
-                    return Err(error_msg);
-                }
-            }
-            Ok(results) => {
-                let error_msg = format!("post-compaction invariant check failed: {:?}", results);
-                tracing::warn!(
-                    target: "astra_runtime::state_projection",
-                    session_id = %session_id,
-                    run_id = %run_id,
-                    ?results,
-                    "post-compaction invariant check failed after loop"
-                );
-                return Err(error_msg);
-            }
-            Err(error) => {
-                let error_msg =
-                    format!("failed to run post-compaction invariant checks: {}", error);
-                tracing::warn!(
-                    target: "astra_runtime::state_projection",
-                    session_id = %session_id,
-                    run_id = %run_id,
-                    error = %error,
-                    "failed to run post-compaction invariant checks"
-                );
-                return Err(error_msg);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn truncate_for_projection(text: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    for ch in text.chars().take(max_chars) {
-        out.push(ch);
-    }
-    out
 }
 
 pub(crate) fn extract_session_state_compact(
@@ -2041,59 +1792,6 @@ fn server_loop_user_query_event(
     Some(event)
 }
 
-/// Transactional variant: uses the provided transaction for all writes instead
-/// of creating its own. The caller owns commit/rollback.
-async fn persist_server_loop_core_events_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    user_id: &str,
-    session_id: &str,
-    run_id: &str,
-    parent_run_id: Option<&str>,
-    parent_event_id: Option<&str>,
-    agent_id: Option<&str>,
-    parent_agent_id: Option<&str>,
-    trace_context: Option<TraceContext>,
-    user_message: &str,
-    state: &AgenticLoopState,
-    model_name: Option<&str>,
-    root_started_at: chrono::DateTime<chrono::Utc>,
-    execution_started_at: chrono::DateTime<chrono::Utc>,
-    terminal_offset_ms: u64,
-) -> Result<TraceEventPersistOutcome, String> {
-    let events = build_server_loop_core_events(
-        user_id,
-        session_id,
-        run_id,
-        parent_run_id,
-        parent_event_id,
-        agent_id,
-        parent_agent_id,
-        trace_context,
-        user_message,
-        state,
-        model_name,
-        root_started_at,
-        execution_started_at,
-        terminal_offset_ms,
-    );
-    if events.is_empty() {
-        return Ok(TraceEventPersistOutcome::default());
-    }
-
-    match DatabaseTraceEventWriter::write_many_in_tx(tx, events).await {
-        Ok(deltas) => Ok(deltas),
-        Err(e) => {
-            astra_core::agent_error!(
-                "server-loop",
-                "failed to persist core events (in tx) for session {session_id}: {e}"
-            );
-            // Transaction is poisoned; caller must rollback. Do not keep writing
-            // transcript items into a dirty transaction.
-            Err(e.to_string())
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn build_server_loop_core_events(
     user_id: &str,
@@ -2414,7 +2112,7 @@ async fn persist_server_loop_transcript_items_in_tx(
     .into_iter()
     .filter(|item| capture_outcome.accepts_projection(&item.source_event_id))
     .collect::<Vec<_>>();
-    persist_session_transcript_items_inner_in_tx(tx, user_id, session_id, &items)
+    append_session_transcript_items_admitted_in_tx(tx, user_id, session_id, &items)
         .await
         .map_err(|error| error.to_string())
 }
@@ -2438,9 +2136,12 @@ pub(crate) async fn persist_session_transcript_items(
             return Err(format!("failed to begin transcript transaction: {error}"));
         }
     };
-    if let Err(error) =
-        persist_session_transcript_items_inner_in_tx(&mut tx, user_id, session_id, items).await
-    {
+    let result = async {
+        admit_session_event_write(&mut tx, session_id, user_id, false).await?;
+        append_session_transcript_items_admitted_in_tx(&mut tx, user_id, session_id, items).await
+    }
+    .await;
+    if let Err(error) = result {
         astra_core::agent_error!(
             "server-loop",
             "failed to persist transcript items for session {session_id}: {error}"
@@ -2733,7 +2434,7 @@ async fn update_run_assistant_transcript_reasoning_in_tx(
     .bind(item_seq)
     .execute(&mut **tx)
     .await?;
-    sync_transcript_page_inner(tx, user_id, session_id, transcript_page_seq(item_seq)).await
+    Ok(())
 }
 
 async fn load_durable_run_transcript_projection(
@@ -2823,9 +2524,21 @@ pub(crate) async fn materialize_server_run_transcript_evidence(
         .begin()
         .await
         .map_err(|error| error.to_string())?;
-    if let Err(error) =
-        persist_session_transcript_items_inner_in_tx(&mut tx, user_id, session_id, &evidence_items)
-            .await
+    if let Err(error) = admit_session_event_write(&mut tx, session_id, user_id, false).await {
+        return Err(rollback_materialized_transcript_transaction(
+            tx,
+            "admitting transcript materialization",
+            error,
+        )
+        .await);
+    }
+    if let Err(error) = append_session_transcript_items_admitted_in_tx(
+        &mut tx,
+        user_id,
+        session_id,
+        &evidence_items,
+    )
+    .await
     {
         return Err(rollback_materialized_transcript_transaction(
             tx,
@@ -3318,10 +3031,7 @@ pub(crate) fn build_tool_trace_events(
     events
 }
 
-/// Transactional variant: uses the provided transaction for all writes.
-/// The caller owns commit/rollback.
-async fn persist_server_loop_trace_events_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+fn build_server_loop_trace_events(
     user_id: &str,
     session_id: &str,
     run_id: &str,
@@ -3332,7 +3042,7 @@ async fn persist_server_loop_trace_events_in_tx(
     state: &AgenticLoopState,
     model_name: Option<&str>,
     turn_started_at: chrono::DateTime<chrono::Utc>,
-) -> Result<TraceEventPersistOutcome, String> {
+) -> Vec<TraceEvent> {
     let trace = trace_context
         .unwrap_or_else(|| server_trace_context(user_id, session_id, run_id, state.session_turn));
     // Detail events are persisted as one terminal batch, so `Utc::now()` here
@@ -3358,208 +3068,172 @@ async fn persist_server_loop_trace_events_in_tx(
         parent_agent_id,
         &state.stall.tool_call_records,
     ));
-    if events.is_empty() {
-        return Ok(TraceEventPersistOutcome::default());
-    }
-
-    match DatabaseTraceEventWriter::write_many_in_tx(tx, events).await {
-        Ok(deltas) => Ok(deltas),
-        Err(e) => {
-            astra_core::agent_error!(
-                "server-loop",
-                "failed to persist trace detail events (in tx) for session {session_id}: {e}"
-            );
-            Err(e.to_string())
-        }
-    }
+    events
 }
 
-/// Variant that uses an existing transaction instead of creating its own.
-/// The caller owns commit/rollback.
-pub(crate) async fn persist_session_transcript_items_inner_in_tx(
+// Bounds apply to SQL parameters and their encoded payload, independently.
+// A single indivisible item may exceed the byte target; it is sent alone.
+const TRANSCRIPT_BATCH_BINDS: usize = 512;
+const TRANSCRIPT_BATCH_BYTES: usize = 256 * 1024;
+const TRANSCRIPT_MEMBERSHIP_ROWS: usize = 128;
+const TRANSCRIPT_INSERT_BINDS: usize = 9;
+
+/// Append only after canonical session admission in this same transaction.
+/// The caller owns commit/rollback, including any enclosing event capture.
+/// Identity equality belongs to the database column's collation, not Rust.
+pub(crate) async fn append_session_transcript_items_admitted_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     user_id: &str,
     session_id: &str,
     items: &[TranscriptPersistItem],
 ) -> Result<(), sqlx::Error> {
-    let owned_session = sqlx::query(
-        "SELECT 1 AS owned
-         FROM agent_sessions
-         WHERE session_id = ? AND user_id = ?
-         LIMIT 1
-         FOR UPDATE",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if owned_session.is_none() {
-        return Err(sqlx::Error::RowNotFound);
-    }
-
-    let row = sqlx::query(
-        "SELECT COALESCE(MAX(item_seq), 0) + 1 AS next_seq
-         FROM session_transcript_items
-         WHERE session_id = ? AND user_id = ?",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .fetch_one(&mut **tx)
-    .await?;
-    let mut next_seq = row.try_get::<i64, _>("next_seq")?;
-    let mut dirty_pages = BTreeSet::new();
-
-    for item in items {
-        let existing = sqlx::query(
-            "SELECT 1 AS existing
-             FROM session_transcript_items
-             WHERE session_id = ? AND user_id = ? AND source_event_id = ?
-             LIMIT 1",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .bind(&item.source_event_id)
-        .fetch_optional(&mut **tx)
-        .await?;
-        if existing.is_some() {
-            continue;
+    let mut next_seq = None;
+    let mut offset = 0;
+    while offset < items.len() {
+        let mut end = offset;
+        let mut bytes = user_id.len() + session_id.len();
+        while end < items.len()
+            && end - offset < TRANSCRIPT_MEMBERSHIP_ROWS
+            && end - offset + 2 < TRANSCRIPT_BATCH_BINDS
+        {
+            let item_bytes = items[end].source_event_id.len() + 64;
+            if end > offset && bytes.saturating_add(item_bytes) > TRANSCRIPT_BATCH_BYTES {
+                break;
+            }
+            bytes = bytes.saturating_add(item_bytes);
+            end += 1;
+        }
+        let chunk = &items[offset..end];
+        // The empty column arm supplies source_event_id's database type and
+        // collation, including when the table has no rows. GROUP BY resolves
+        // unseen equivalent IDs inside this chunk; MIN retains first input.
+        // Earlier chunks are inserted before the next read, so the same
+        // database equality also resolves duplicates across chunk boundaries.
+        let mut membership = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "WITH candidates AS (
+                SELECT -1 AS input_ordinal, source_event_id
+                FROM session_transcript_items WHERE 1 = 0",
+        );
+        for (ordinal, item) in chunk.iter().enumerate() {
+            membership.push(" UNION ALL SELECT ");
+            membership.push(ordinal);
+            membership.push(", ");
+            membership.push_bind(&item.source_event_id);
+        }
+        membership.push(
+            ") SELECT MIN(c.input_ordinal) AS input_ordinal
+             FROM candidates c
+             LEFT JOIN session_transcript_items stored
+               ON stored.source_event_id = c.source_event_id
+              AND stored.user_id = ",
+        );
+        membership.push_bind(user_id);
+        membership.push(" AND stored.session_id = ");
+        membership.push_bind(session_id);
+        membership.push(
+            " WHERE stored.item_seq IS NULL
+              GROUP BY c.source_event_id ORDER BY input_ordinal ASC",
+        );
+        let ordinals = membership
+            .build_query_scalar::<i64>()
+            .fetch_all(&mut **tx)
+            .await?;
+        if !ordinals.is_empty() && next_seq.is_none() {
+            next_seq = Some(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COALESCE(MAX(item_seq), 0) + 1
+                     FROM session_transcript_items
+                     WHERE session_id = ? AND user_id = ?",
+                )
+                .bind(session_id)
+                .bind(user_id)
+                .fetch_one(&mut **tx)
+                .await?,
+            );
         }
 
-        let item_seq = next_seq;
-        let payload_json = item
-            .payload
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|error| {
-                sqlx::Error::Protocol(format!(
-                    "serialize transcript payload for {}: {error}",
-                    item.source_event_id
-                ))
+        let mut pending = Vec::new();
+        let mut pending_bytes = 0_usize;
+        for ordinal in ordinals {
+            let item = chunk
+                .get(usize::try_from(ordinal).map_err(|_| {
+                    sqlx::Error::Protocol("negative transcript input ordinal".to_string())
+                })?)
+                .ok_or_else(|| {
+                    sqlx::Error::Protocol("transcript input ordinal out of bounds".to_string())
+                })?;
+            let payload_json = item
+                .payload
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| {
+                    sqlx::Error::Protocol(format!("serialize transcript payload: {error}"))
+                })?;
+            let item_bytes = session_id.len()
+                + user_id.len()
+                + item.run_id.as_ref().map_or(0, String::len)
+                + item.role.len()
+                + item.content.len()
+                + payload_json.as_ref().map_or(0, String::len)
+                + item.source_event_id.len()
+                + 128;
+            pending.push((item, payload_json, item_bytes));
+        }
+        let mut start = 0;
+        while start < pending.len() {
+            let mut stop = start;
+            while stop < pending.len()
+                && (stop - start + 1) * TRANSCRIPT_INSERT_BINDS <= TRANSCRIPT_BATCH_BINDS
+            {
+                let item_bytes = pending[stop].2;
+                if stop > start && pending_bytes.saturating_add(item_bytes) > TRANSCRIPT_BATCH_BYTES
+                {
+                    break;
+                }
+                pending_bytes = pending_bytes.saturating_add(item_bytes);
+                stop += 1;
+            }
+            let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
+                "INSERT INTO session_transcript_items
+                 (session_id, item_seq, user_id, run_id, role, content, payload_json,
+                  source_event_id, content_hash, created_at) ",
+            );
+            // At least one new identity established the sole lazy MAX read.
+            let sequence = next_seq
+                .as_mut()
+                .expect("new transcript sequence allocated");
+            sequence.checked_add((stop - start) as i64).ok_or_else(|| {
+                sqlx::Error::Protocol("transcript sequence exhausted".to_string())
             })?;
-        sqlx::query(
-            "INSERT INTO session_transcript_items
-             (session_id, item_seq, user_id, run_id, role, content, payload_json,
-              source_event_id, source_event_idx, content_hash, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NOW(6))",
-        )
-        .bind(session_id)
-        .bind(item_seq)
-        .bind(user_id)
-        .bind(&item.run_id)
-        .bind(item.role)
-        .bind(&item.content)
-        .bind(&payload_json)
-        .bind(&item.source_event_id)
-        .bind(transcript_content_hash(
-            item.role,
-            &item.content,
-            payload_json.as_deref(),
-        ))
-        .execute(&mut **tx)
-        .await?;
-        dirty_pages.insert(transcript_page_seq(item_seq));
-        next_seq += 1;
+            insert.push_values(&pending[start..stop], |mut row, (item, payload, _)| {
+                row.push_bind(session_id)
+                    .push_bind(*sequence)
+                    .push_bind(user_id)
+                    .push_bind(&item.run_id)
+                    .push_bind(item.role)
+                    .push_bind(&item.content)
+                    .push_bind(payload)
+                    .push_bind(&item.source_event_id)
+                    .push_bind(transcript_content_hash(
+                        item.role,
+                        &item.content,
+                        payload.as_deref(),
+                    ))
+                    .push("NOW(6)");
+                *sequence += 1;
+            });
+            insert.push(astra_core::matrixone_null_shape_comment(
+                pending[start..stop]
+                    .iter()
+                    .flat_map(|(item, payload, _)| [item.run_id.is_some(), payload.is_some()]),
+            ));
+            insert.build().execute(&mut **tx).await?;
+            start = stop;
+            pending_bytes = 0;
+        }
+        offset = end;
     }
-
-    for page_seq in dirty_pages {
-        sync_transcript_page_inner(tx, user_id, session_id, page_seq).await?;
-    }
-
-    Ok(())
-}
-
-const TRANSCRIPT_PAGE_SIZE: i64 = 50;
-
-pub(crate) fn transcript_page_seq(item_seq: i64) -> i64 {
-    ((item_seq.max(1) - 1) / TRANSCRIPT_PAGE_SIZE) + 1
-}
-
-pub(crate) fn transcript_page_bounds(page_seq: i64) -> (i64, i64) {
-    let page_seq = page_seq.max(1);
-    let start = ((page_seq - 1) * TRANSCRIPT_PAGE_SIZE) + 1;
-    let end = start + TRANSCRIPT_PAGE_SIZE - 1;
-    (start, end)
-}
-
-async fn sync_transcript_page_inner(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    user_id: &str,
-    session_id: &str,
-    page_seq: i64,
-) -> Result<(), sqlx::Error> {
-    let (start_item_seq, end_item_seq) = transcript_page_bounds(page_seq);
-    let rows = sqlx::query(
-        "SELECT item_seq, role, content_hash
-         FROM session_transcript_items
-         WHERE session_id = ? AND user_id = ? AND item_seq BETWEEN ? AND ?
-         ORDER BY item_seq ASC",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .bind(start_item_seq)
-    .bind(end_item_seq)
-    .fetch_all(&mut **tx)
-    .await?;
-    if rows.is_empty() {
-        sqlx::query(
-            "DELETE FROM transcript_pages WHERE session_id = ? AND user_id = ? AND page_seq = ?",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .bind(page_seq)
-        .execute(&mut **tx)
-        .await?;
-        return Ok(());
-    }
-
-    let page_items = rows
-        .iter()
-        .map(decode_transcript_page_item_row)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(sqlx::Error::Protocol)?;
-    let Some(first_page_item) = page_items.first() else {
-        return Err(sqlx::Error::Protocol(
-            "non-empty transcript page rows decoded into an empty page item set".to_string(),
-        ));
-    };
-    let Some(last_page_item) = page_items.last() else {
-        return Err(sqlx::Error::Protocol(
-            "non-empty transcript page rows decoded into an empty page item set".to_string(),
-        ));
-    };
-    let first_item_seq = first_page_item.item_seq;
-    let last_item_seq = last_page_item.item_seq;
-    let mut hasher = Sha256::new();
-    for item in &page_items {
-        hasher.update(item.item_seq.to_string().as_bytes());
-        hasher.update([0]);
-        hasher.update(item.role.as_bytes());
-        hasher.update([0]);
-        hasher.update(item.content_hash.as_bytes());
-        hasher.update([0xff]);
-    }
-    let page_hash = format!("{:x}", hasher.finalize());
-    sqlx::query(
-        "INSERT INTO transcript_pages
-         (user_id, session_id, page_seq, start_item_seq, end_item_seq, item_count, page_hash, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
-         ON DUPLICATE KEY UPDATE
-           start_item_seq = VALUES(start_item_seq),
-           end_item_seq = VALUES(end_item_seq),
-           item_count = VALUES(item_count),
-           page_hash = VALUES(page_hash),
-           updated_at = NOW(6)",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .bind(page_seq)
-    .bind(first_item_seq)
-    .bind(last_item_seq)
-    .bind(rows.len() as i64)
-    .bind(page_hash)
-    .execute(&mut **tx)
-    .await?;
     Ok(())
 }
 
@@ -3575,48 +3249,19 @@ fn transcript_content_hash(role: &str, content: &str, payload_json: Option<&str>
     format!("{:x}", hasher.finalize())
 }
 
-/// Persist decision audit + skill selection to hook DB tables after the
-/// server-driven agentic loop completes.  This ensures the decisions API
-/// (`ctx_decision_audits`, `skill_selection_events`) has data for server-loop
-/// sessions, matching what the bridge path persisted via hook side effects.
-#[allow(clippy::too_many_arguments)]
+/// Persist the existing skill-selection telemetry after the server loop.
 async fn persist_server_loop_hook_events(
     hook_db_writer: &dyn TurnHookDbWriter,
     user_id: &str,
     session_id: &str,
     user_message: &str,
     state: &AgenticLoopState,
-    model_name: Option<&str>,
 ) -> Result<(), String> {
     // Use the telemetry accumulator — state.telemetry.all_tools_used tracks every
     // tool name across all rounds.  state.messages does NOT carry assistant
     // tool_call objects in the server loop path.
     let tool_call_names: Vec<String> = state.telemetry.all_tools_used.iter().cloned().collect();
     let selected_skills = state.telemetry.all_selected_skills.clone();
-    let event_id = Uuid::now_v7().to_string();
-
-    let decision_audit = Some(TurnDecisionAuditRecord {
-        decision_id: Uuid::now_v7().to_string(),
-        user_id: user_id.to_string(),
-        session_id: session_id.to_string(),
-        event_id: event_id.clone(),
-        decision_type: if tool_call_names.is_empty() {
-            "response_generation".to_string()
-        } else {
-            "tool_surface".to_string()
-        },
-        decision_output: json!({
-            "text": truncate_for_audit(&state.final_text, 500),
-            "tool_calls": tool_call_names,
-            "model_used": model_name,
-            "total_tool_calls": state.total_tool_calls,
-            "total_prompt_tokens": state.provider_input_tokens(),
-            "total_completion_tokens": state.total_completion,
-        }),
-        model_used: model_name.map(|s| s.to_string()),
-        context_capture_id: None,
-    });
-
     let skill_selection = if let Some(first_skill) = selected_skills.first() {
         Some(TurnSkillSelectionRecord {
             event_id: Uuid::now_v7().to_string(),
@@ -3648,12 +3293,10 @@ async fn persist_server_loop_hook_events(
                 execution_time_ms: None,
             })
     };
-    let plan = TurnHookDbPersistPlan {
-        decision_audit,
-        skill_selection,
-        reflection_mark: None,
-        reflection_lesson: None,
-    };
+    if skill_selection.is_none() {
+        return Ok(());
+    }
+    let plan = TurnHookDbPersistPlan { skill_selection };
 
     hook_db_writer
         .persist(plan)
@@ -3870,6 +3513,30 @@ mod tests {
     static SHARED_BOOTSTRAP: tokio::sync::OnceCell<MatrixOneSettings> =
         tokio::sync::OnceCell::const_new();
 
+    async fn assert_session_event_count(
+        db: &sqlx::MySqlPool,
+        user_id: &str,
+        session_id: &str,
+    ) -> i64 {
+        let (recorded, actual): (i64, i64) = sqlx::query_as(
+            "SELECT sessions.event_count,
+                    (SELECT COUNT(*) FROM agent_events events
+                     WHERE events.user_id = sessions.user_id
+                       AND events.session_id = sessions.session_id)
+             FROM agent_sessions sessions WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_one(db)
+        .await
+        .expect("read session counter and committed events");
+        assert_eq!(
+            recorded, actual,
+            "session counter must match committed events"
+        );
+        recorded
+    }
+
     fn resolved_terminal_fixture() -> astra_services::runs::AtomicRunTerminalSettlementCommit {
         astra_services::runs::AtomicRunTerminalSettlementCommit {
             committed_events: vec![json!({
@@ -4038,11 +3705,750 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_loop_empty_hook_skips_writer_and_selected_skill_is_retained() {
+        let database_writer =
+            crate::turn::services::DatabaseTurnHookDbWriter::new(MatrixOneSettings::default());
+        database_writer
+            .persist(TurnHookDbPersistPlan {
+                skill_selection: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            database_writer
+                .persist(TurnHookDbPersistPlan {
+                    skill_selection: Some(retained_skill_record("user-1", "session-1", "review")),
+                })
+                .await
+                .is_err()
+        );
+        let writer = CaptureHookDbWriter::default();
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.final_text = "Ordinary answer".into();
+        persist_server_loop_hook_events(&writer, "user-1", "session-1", "work", &state)
+            .await
+            .expect("empty hook succeeds");
+        assert!(writer.plans.lock().expect("capture lock").is_empty());
+
+        state.telemetry.all_selected_skills.push("review".into());
+        persist_server_loop_hook_events(&writer, "user-1", "session-1", "work", &state)
+            .await
+            .expect("selected skill persists");
+        let plans = writer.plans.lock().expect("capture lock");
+        assert_eq!(plans.len(), 1);
+        let skill = plans[0].skill_selection.as_ref().expect("selected skill");
+        assert_eq!(skill.skill_name, "review");
+        assert_eq!(skill.selected_skills, vec!["review".to_string()]);
+        assert_eq!(skill.selection_method, "llm_skill_choice");
+        assert_eq!(skill.execution_success, Some(1));
+    }
+
+    fn retained_skill_record(user: &str, session: &str, skill: &str) -> TurnSkillSelectionRecord {
+        TurnSkillSelectionRecord {
+            event_id: Uuid::new_v4().to_string(),
+            user_id: user.into(),
+            session_id: session.into(),
+            agent_id: None,
+            user_query: "retained write".into(),
+            selected_skills: vec![skill.into()],
+            skill_name: skill.into(),
+            skill_version: Some("supplied".into()),
+            selection_method: "llm_skill_choice".into(),
+            execution_success: Some(1),
+            execution_time_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn ordinary_post_loop_needs_no_database_but_selected_skills_still_persist() {
+        let pool = setup_pool().await;
+        let user = format!("post-loop-user-{}", Uuid::new_v4());
+        let session = format!("post-loop-session-{}", Uuid::new_v4());
+        crate::server::run::insert_active_run_session_fixture(&pool, &user, &session).await;
+        let mut persist = test_post_loop_persist_context(&session, None);
+        persist.user_id = user.clone();
+        persist.shared_pool = Some(pool.clone());
+        persist.hook_db_writer = Some(Arc::new(
+            crate::turn::services::DatabaseTurnHookDbWriter::new(pool.settings().clone())
+                .with_pool(pool.clone()),
+        ));
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.final_text = "Ordinary answer".into();
+        state.telemetry.all_selected_skills.push("review".into());
+        persist
+            .run_after_core(&state, true, Ok(()), true)
+            .await
+            .unwrap();
+        let selected: Vec<String> = sqlx::query_scalar(
+            "SELECT skill_name FROM skill_selection_events WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&user)
+        .bind(&session)
+        .fetch_all(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(selected, ["review"]);
+        let skill = format!("retained-{}", Uuid::new_v4());
+        let skill_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO skills_registry (skill_id, skill_name, version, description, skill_definition, is_active, status, source, category, created_by) VALUES (?, ?, '2.0', 'retained test', '{}', 1, 'active', 'user', 'general', ?)")
+            .bind(&skill_id).bind(&skill).bind(&user).execute(pool.get()).await.unwrap();
+        let mut settings = pool.settings().clone();
+        settings.db_pool_max_connections = 1;
+        settings.db_pool_min_connections = 1;
+        let single = astra_core::SharedPool::new(&settings).await.unwrap();
+        let writer = crate::turn::services::DatabaseTurnHookDbWriter::new(settings.clone())
+            .with_pool(single.clone());
+        let other_user = Uuid::new_v4().to_string();
+        let other_session = Uuid::new_v4().to_string();
+        for (owner, sid) in [(&other_user, &session), (&user, &other_session)] {
+            crate::server::run::insert_active_run_session_fixture(&pool, owner, sid).await;
+        }
+        let original = retained_skill_record(&user, &session, &skill);
+        for (selected, expected) in [
+            (vec![skill.clone()], "2.0"),
+            (vec![format!("missing-{skill}"), skill.clone()], "supplied"),
+            (vec![], "supplied"),
+        ] {
+            let record = TurnSkillSelectionRecord {
+                event_id: Uuid::new_v4().to_string(),
+                selected_skills: selected,
+                ..original.clone()
+            };
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                writer.persist(TurnHookDbPersistPlan {
+                    skill_selection: Some(record.clone()),
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let version: String = sqlx::query_scalar(
+                "SELECT skill_version FROM skill_selection_events WHERE event_id = ?",
+            )
+            .bind(&record.event_id)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+            assert_eq!(version, expected);
+            for (owner, sid) in [
+                (&user, &session),
+                (&other_user, &session),
+                (&user, &other_session),
+            ] {
+                let replay = TurnSkillSelectionRecord {
+                    user_id: owner.clone(),
+                    session_id: sid.clone(),
+                    skill_version: Some("overwrite".into()),
+                    selected_skills: vec![],
+                    ..record.clone()
+                };
+                assert!(
+                    writer
+                        .persist(TurnHookDbPersistPlan {
+                            skill_selection: Some(replay)
+                        })
+                        .await
+                        .is_err()
+                );
+                assert_eq!(assert_session_event_count(pool.get(), owner, sid).await, 0);
+            }
+            let stored: (String, String, String) = sqlx::query_as("SELECT user_id, session_id, skill_version FROM skill_selection_events WHERE event_id = ?")
+                .bind(&record.event_id).fetch_one(pool.get()).await.unwrap();
+            assert_eq!(
+                stored,
+                (user.clone(), session.clone(), expected.to_string())
+            );
+        }
+        // The real receipt read shares the only checkout with admission/INSERT.
+        use astra_services::{ContextService, DecisionService, EventService};
+        let event = DatabaseEventService::new(settings.clone())
+            .with_pool(pool.clone())
+            .create_event(
+                user.clone(),
+                EventCreateRequestData {
+                    ingestion_source: astra_services::EventIngestionSource::Client,
+                    event_id: None,
+                    session_id: session.clone(),
+                    event_type: "retained_test".into(),
+                    content: "{}".into(),
+                    agent_id: None,
+                    agent_version: None,
+                    parent_event_id: None,
+                    parent_event_ids: None,
+                    causal_chain_id: None,
+                    metadata: None,
+                },
+            )
+            .await
+            .unwrap();
+        let snapshot = astra_services::DatabaseContextService::new(settings.clone())
+            .with_pool(pool.clone())
+            .create_snapshot(
+                user.clone(),
+                astra_services::SnapshotCreateRequestData {
+                    session_id: session.clone(),
+                    event_id: event.record.event_id.clone(),
+                    context_data: json!({"retained": true}),
+                },
+            )
+            .await
+            .unwrap();
+        let decision_service = astra_services::DatabaseDecisionService::new(settings.clone())
+            .with_pool(single.clone());
+        let request = astra_services::DecisionCreateRequestData {
+            session_id: session.clone(),
+            event_id: event.record.event_id.clone(),
+            context_capture_id: snapshot.context_capture_id,
+            decision_type: "retained_test".into(),
+            decision_output: json!({"ok": true}),
+            model_params: None,
+        };
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            decision_service.record_decision(user.clone(), request.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            assert_session_event_count(pool.get(), &user, &session).await,
+            1
+        );
+        for (owner, sid) in [(&other_user, &session), (&user, &other_session)] {
+            crate::server::run::cleanup_run_session_fixture(&pool, owner, sid).await;
+        }
+        let missing = TurnSkillSelectionRecord {
+            session_id: Uuid::new_v4().to_string(),
+            ..original.clone()
+        };
+        assert!(
+            writer
+                .persist(TurnHookDbPersistPlan {
+                    skill_selection: Some(missing)
+                })
+                .await
+                .is_err()
+        );
+        sqlx::query("UPDATE agent_session_lifecycle_fences SET delete_requested_at = NOW(6) WHERE user_id = ? AND session_id = ?")
+            .bind(&user).bind(&session).execute(pool.get()).await.unwrap();
+        assert!(
+            writer
+                .persist(TurnHookDbPersistPlan {
+                    skill_selection: Some(original.clone())
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            decision_service
+                .record_decision(user.clone(), request.clone())
+                .await
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::NOT_FOUND
+        );
+        use astra_services::SessionService;
+        astra_services::DatabaseSessionService::new(settings.clone())
+            .with_pool(pool.clone())
+            .delete_session(session.clone(), user.clone())
+            .await
+            .unwrap();
+        assert!(
+            writer
+                .persist(TurnHookDbPersistPlan {
+                    skill_selection: Some(original.clone())
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            decision_service
+                .record_decision(user.clone(), request.clone())
+                .await
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::NOT_FOUND
+        );
+        for table in [
+            "agent_sessions",
+            "skill_selection_events",
+            "ctx_decision_audits",
+        ] {
+            let count: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
+            ))
+            .bind(&user)
+            .bind(&session)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+            assert_eq!(count, 0, "{table}");
+        }
+        sqlx::query("DELETE FROM skills_registry WHERE skill_id = ?")
+            .bind(&skill_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        single.close().await;
+        assert_eq!(
+            decision_service
+                .record_decision(user.clone(), request)
+                .await
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "unavailable storage is not a missing session"
+        );
+        writer
+            .persist(TurnHookDbPersistPlan {
+                skill_selection: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            writer
+                .persist(TurnHookDbPersistPlan {
+                    skill_selection: Some(original)
+                })
+                .await
+                .is_err()
+        );
+        sqlx::query("DELETE FROM skill_selection_events WHERE user_id = ? AND session_id = ?")
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        crate::server::run::cleanup_run_session_fixture(&pool, &user, &session).await;
+        pool.close().await;
+
+        // Await the entire post-loop boundary, not just terminal SSE. A closed
+        // pool makes an accidental COUNT/transaction deterministic, not a race
+        // between our assertions and background persistence.
+        state.telemetry.all_selected_skills.clear();
+        persist
+            .run_after_core(&state, true, Ok(()), true)
+            .await
+            .expect("ordinary post-loop must not access the closed database");
+        state.telemetry.all_selected_skills.push("review".into());
+        assert!(
+            persist
+                .run_after_core(&state, true, Ok(()), true)
+                .await
+                .is_err(),
+            "positive control: a real skill write must still require the database"
+        );
+    }
+
+    #[cfg(feature = "e2e-hooks")]
+    async fn wait_for_retained_fence_query(pool: &astra_core::SharedPool, connection_id: u64) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let queries: Vec<String> = sqlx::query_scalar(
+                    "SELECT info FROM information_schema.processlist WHERE db = ? AND conn_id = ? AND info IS NOT NULL",
+                ).bind(&pool.settings().database).bind(connection_id).fetch_all(pool.get()).await.unwrap();
+                if queries.iter().any(|query| query.contains("agent_session_lifecycle_fences")) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("observe the exact connection executing the blocked fence SQL");
+    }
+
+    #[cfg(feature = "e2e-hooks")]
+    async fn write_retained_fixture(
+        pool: astra_core::SharedPool,
+        user: String,
+        request: astra_services::DecisionCreateRequestData,
+        skill: TurnSkillSelectionRecord,
+        decision: bool,
+        hook: Option<Arc<astra_services::decisions::RetainedWriteTestHook>>,
+    ) -> Result<(), String> {
+        if decision {
+            use astra_services::DecisionService;
+            let mut writer = astra_services::DatabaseDecisionService::new(pool.settings().clone())
+                .with_pool(pool);
+            if let Some(hook) = hook {
+                writer = writer.with_retained_write_test_hook(hook);
+            }
+            writer
+                .record_decision(user, request)
+                .await
+                .map(|_| ())
+                .map_err(|error| {
+                    assert!(matches!(
+                        error.0,
+                        axum::http::StatusCode::NOT_FOUND
+                            | axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    ));
+                    error.1.0.detail
+                })
+        } else {
+            let mut writer =
+                crate::turn::services::DatabaseTurnHookDbWriter::new(pool.settings().clone())
+                    .with_pool(pool);
+            if let Some(hook) = hook {
+                writer = writer.with_retained_write_test_hook(hook);
+            }
+            writer
+                .persist(TurnHookDbPersistPlan {
+                    skill_selection: Some(skill),
+                })
+                .await
+        }
+    }
+
+    #[cfg(feature = "e2e-hooks")]
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1 and e2e-hooks"]
+    async fn retained_writers_order_delete_rollback_and_cancellation_on_live_matrixone() {
+        use astra_services::{ContextService, DecisionCreateRequestData, SessionService};
+        use tokio_util::task::AbortOnDropHandle;
+        // Bound setup, contended operations and cleanup together, below nextest's
+        // 15-second limit. Dropping the scenario also aborts its spawned writers.
+        tokio::time::timeout(Duration::from_secs(12), async {
+        let observer = setup_pool().await;
+        let mut settings = observer.settings().clone();
+        settings.db_pool_max_connections = 1;
+        settings.db_pool_min_connections = 1;
+        let worker = astra_core::SharedPool::new(&settings).await.unwrap();
+        let deleter = astra_core::SharedPool::new(&settings).await.unwrap();
+        let skill_name = format!("retained-race-{}", Uuid::new_v4());
+        let skill_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO skills_registry (skill_id, skill_name, version, is_active) VALUES (?, ?, '3.0', 1)")
+            .bind(&skill_id).bind(&skill_name).execute(observer.get()).await.unwrap();
+        for decision in [false, true] {
+            for outcome in [
+                "error",
+                "cancel",
+                "cancel_admission",
+                "writer_first",
+                "delete_first",
+            ] {
+                let user = Uuid::new_v4().to_string();
+                let session = Uuid::new_v4().to_string();
+                crate::server::run::insert_active_run_session_fixture(&observer, &user, &session)
+                    .await;
+                let event = DatabaseEventService::new(settings.clone())
+                    .with_pool(observer.clone())
+                    .create_event(
+                        user.clone(),
+                        EventCreateRequestData {
+                            ingestion_source: astra_services::EventIngestionSource::Client,
+                            event_id: None,
+                            session_id: session.clone(),
+                            event_type: "retained_race".into(),
+                            content: "{}".into(),
+                            agent_id: None,
+                            agent_version: None,
+                            parent_event_id: None,
+                            parent_event_ids: None,
+                            causal_chain_id: None,
+                            metadata: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let snapshot = astra_services::DatabaseContextService::new(settings.clone())
+                    .with_pool(observer.clone())
+                    .create_snapshot(
+                        user.clone(),
+                        astra_services::SnapshotCreateRequestData {
+                            session_id: session.clone(),
+                            event_id: event.record.event_id,
+                            context_data: json!({"race": outcome}),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let request = DecisionCreateRequestData {
+                    session_id: session.clone(),
+                    event_id: snapshot.event_id.clone(),
+                    context_capture_id: snapshot.context_capture_id,
+                    decision_type: "retained_race".into(),
+                    decision_output: json!({"ok": true}),
+                    model_params: None,
+                };
+                let skill = retained_skill_record(&user, &session, &skill_name);
+                if matches!(outcome, "delete_first" | "cancel_admission") {
+                    let connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+                        .fetch_one(worker.get())
+                        .await
+                        .unwrap();
+                    let mut holder = observer.get().begin().await.unwrap();
+                    admit_session_event_write(&mut holder, &session, &user, false)
+                        .await
+                        .unwrap();
+                    let task = AbortOnDropHandle::new(tokio::spawn(write_retained_fixture(
+                        worker.clone(),
+                        user.clone(),
+                        request.clone(),
+                        skill.clone(),
+                        decision,
+                        None,
+                    )));
+                    wait_for_retained_fence_query(&observer, connection_id).await;
+                    // Real writers for A/T and B/S must finish while A/S is fenced.
+                    for (independent_user, independent_session) in [
+                        (user.clone(), Uuid::new_v4().to_string()),
+                        (Uuid::new_v4().to_string(), session.clone()),
+                    ] {
+                        crate::server::run::insert_active_run_session_fixture(
+                            &observer,
+                            &independent_user,
+                            &independent_session,
+                        )
+                        .await;
+                        let event = DatabaseEventService::new(settings.clone())
+                            .with_pool(observer.clone())
+                            .create_event(
+                                independent_user.clone(),
+                                EventCreateRequestData {
+                                    ingestion_source: astra_services::EventIngestionSource::Client,
+                                    event_id: None,
+                                    session_id: independent_session.clone(),
+                                    event_type: "retained_independent".into(),
+                                    content: "{}".into(),
+                                    agent_id: None,
+                                    agent_version: None,
+                                    parent_event_id: None,
+                                    parent_event_ids: None,
+                                    causal_chain_id: None,
+                                    metadata: None,
+                                },
+                            )
+                            .await
+                            .unwrap();
+                        let independent_request = DecisionCreateRequestData {
+                            session_id: independent_session.clone(),
+                            event_id: event.record.event_id,
+                            context_capture_id: String::new(),
+                            ..request.clone()
+                        };
+                        tokio::time::timeout(
+                            Duration::from_secs(10),
+                            write_retained_fixture(
+                                observer.clone(),
+                                independent_user.clone(),
+                                independent_request,
+                                retained_skill_record(
+                                    &independent_user,
+                                    &independent_session,
+                                    &skill_name,
+                                ),
+                                decision,
+                                None,
+                            ),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        assert_eq!(
+                            assert_session_event_count(
+                                observer.get(),
+                                &independent_user,
+                                &independent_session
+                            )
+                            .await,
+                            1
+                        );
+                        // Deleting an unrelated identity must also make progress.
+                        tokio::time::timeout(
+                            Duration::from_secs(10),
+                            astra_services::DatabaseSessionService::new(settings.clone())
+                                .with_pool(observer.clone())
+                                .delete_session(independent_session, independent_user),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    }
+                    if outcome == "cancel_admission" {
+                        // Cancel during the observed MySQL exchange, not merely
+                        // at the post-INSERT test pause.
+                        task.abort();
+                        assert!(task.await.unwrap_err().is_cancelled());
+                        holder.rollback().await.unwrap();
+                    } else {
+                        sqlx::query("UPDATE agent_session_lifecycle_fences SET delete_requested_at = NOW(6) WHERE user_id = ? AND session_id = ?")
+                            .bind(&user).bind(&session).execute(&mut *holder).await.unwrap();
+                        holder.commit().await.unwrap();
+                        assert!(
+                            tokio::time::timeout(Duration::from_secs(10), task)
+                                .await
+                                .unwrap()
+                                .unwrap()
+                                .is_err()
+                        );
+                        assert_eq!(
+                            assert_session_event_count(worker.get(), &user, &session).await,
+                            1
+                        );
+                    }
+                } else {
+                    let hook = Arc::new(astra_services::decisions::RetainedWriteTestHook {
+                        user_id: user.clone(),
+                        session_id: session.clone(),
+                        inserted: Notify::new(),
+                        resume: Notify::new(),
+                        fail: outcome == "error",
+                    });
+                    let task = AbortOnDropHandle::new(tokio::spawn(write_retained_fixture(
+                        worker.clone(),
+                        user.clone(),
+                        request.clone(),
+                        skill.clone(),
+                        decision,
+                        Some(hook.clone()),
+                    )));
+                    tokio::time::timeout(Duration::from_secs(10), hook.inserted.notified())
+                        .await
+                        .unwrap();
+                    if outcome == "writer_first" {
+                        let connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+                            .fetch_one(deleter.get())
+                            .await
+                            .unwrap();
+                        let service = astra_services::DatabaseSessionService::new(settings.clone())
+                            .with_pool(deleter.clone());
+                        let sid = session.clone();
+                        let uid = user.clone();
+                        let deletion = AbortOnDropHandle::new(
+                            tokio::spawn(async move { service.delete_session(sid, uid).await }));
+                        wait_for_retained_fence_query(&observer, connection_id).await;
+                        hook.resume.notify_one();
+                        tokio::time::timeout(Duration::from_secs(10), task)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .unwrap();
+                        tokio::time::timeout(Duration::from_secs(10), deletion)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .unwrap();
+                    } else {
+                        if outcome == "cancel" {
+                            task.abort();
+                            assert!(task.await.unwrap_err().is_cancelled());
+                        } else {
+                            hook.resume.notify_one();
+                            let error = tokio::time::timeout(Duration::from_secs(10), task)
+                                .await
+                                .unwrap()
+                                .unwrap()
+                                .unwrap_err();
+                            assert!(
+                                error.contains(if decision {
+                                    "model_params"
+                                } else {
+                                    "injected retained write failure"
+                                }),
+                                "{error}"
+                            );
+                        }
+                    }
+                }
+                if matches!(outcome, "error" | "cancel" | "cancel_admission") {
+                        // Both cancellation points and receipt failure must leave
+                        // the same single-connection pool reusable and no stray rows.
+                        {
+                            let mut tx = worker.get().begin().await.unwrap();
+                            admit_session_event_write(&mut tx, &session, &user, false)
+                                .await
+                                .unwrap();
+                            tx.rollback().await.unwrap();
+                        }
+                        for table in ["skill_selection_events", "ctx_decision_audits"] {
+                            let count: i64 = sqlx::query_scalar(&format!(
+                                "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
+                            ))
+                            .bind(&user)
+                            .bind(&session)
+                            .fetch_one(worker.get())
+                            .await
+                            .unwrap();
+                            assert_eq!(count, 0, "{decision}/{outcome}/{table}");
+                        }
+                        assert_eq!(
+                            assert_session_event_count(worker.get(), &user, &session).await,
+                            1
+                        );
+                        tokio::time::timeout(
+                            Duration::from_secs(10),
+                            write_retained_fixture(
+                                worker.clone(),
+                                user.clone(),
+                                request.clone(),
+                                skill.clone(),
+                                decision,
+                                None,
+                            ),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        assert_eq!(
+                            assert_session_event_count(worker.get(), &user, &session).await,
+                            1
+                        );
+                }
+                if outcome != "writer_first" {
+                    astra_services::DatabaseSessionService::new(settings.clone())
+                        .with_pool(observer.clone())
+                        .delete_session(session.clone(), user.clone())
+                        .await
+                        .unwrap();
+                }
+                assert!(
+                    write_retained_fixture(
+                        worker.clone(),
+                        user.clone(),
+                        request,
+                        skill,
+                        decision,
+                        None
+                    )
+                    .await
+                    .is_err()
+                );
+                for table in [
+                    "agent_sessions",
+                    "skill_selection_events",
+                    "ctx_decision_audits",
+                ] {
+                    let count: i64 = sqlx::query_scalar(&format!(
+                        "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
+                    ))
+                    .bind(&user)
+                    .bind(&session)
+                    .fetch_one(observer.get())
+                    .await
+                    .unwrap();
+                    assert_eq!(count, 0, "{decision}/{outcome}/{table}");
+                }
+            }
+        }
+        sqlx::query("DELETE FROM skills_registry WHERE skill_id = ?")
+            .bind(&skill_id)
+            .execute(observer.get())
+            .await
+            .unwrap();
+        worker.close().await;
+        deleter.close().await;
+        observer.close().await;
+        }).await.expect("retained-write scenarios, including setup and cleanup, must finish");
+    }
+
+    #[tokio::test]
     async fn canonical_failure_does_not_publish_derived_hook_state() {
         let writer = Arc::new(CaptureHookDbWriter::default());
         let mut persist = test_post_loop_persist_context("canonical-failure-session", None);
         persist.hook_db_writer = Some(writer.clone());
-        let state = crate::turn::agentic_loop::host::make_test_loop_state();
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.telemetry.all_selected_skills.push("review".into());
 
         let error = persist
             .run_after_core(
@@ -5081,202 +5487,6 @@ mod tests {
         assert_eq!(token_usage["total"], 22);
     }
 
-    #[tokio::test]
-    async fn server_loop_hook_audit_prompt_tokens_include_cache_buckets() {
-        let writer = CaptureHookDbWriter::default();
-        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
-        state.final_text = "done".to_string();
-        state.total_prompt = 10;
-        state.total_cache_read = 4;
-        state.total_cache_creation = 3;
-        state.total_completion = 5;
-
-        persist_server_loop_hook_events(
-            &writer,
-            "user-1",
-            "session-1",
-            "work",
-            &state,
-            Some("model-a"),
-        )
-        .await
-        .expect("hook event persistence should succeed");
-
-        let plans = writer.plans.lock().expect("capture lock");
-        assert_eq!(plans.len(), 1);
-        let decision = plans[0].decision_audit.as_ref().expect("decision audit");
-        assert_eq!(decision.decision_output["total_prompt_tokens"], 17);
-        assert_eq!(decision.decision_output["total_completion_tokens"], 5);
-    }
-
-    struct FakeRunLifecyclePersistenceRow {
-        failed_column: Option<&'static str>,
-        count: i64,
-        item_seq: i64,
-        role: &'static str,
-        content_hash: &'static str,
-    }
-
-    impl Default for FakeRunLifecyclePersistenceRow {
-        fn default() -> Self {
-            Self {
-                failed_column: None,
-                count: 2,
-                item_seq: 7,
-                role: "assistant",
-                content_hash: "sha256:page-item",
-            }
-        }
-    }
-
-    impl FakeRunLifecyclePersistenceRow {
-        fn fail_on(column: &'static str) -> Self {
-            Self {
-                failed_column: Some(column),
-                ..Self::default()
-            }
-        }
-
-        fn with_count(count: i64) -> Self {
-            Self {
-                count,
-                ..Self::default()
-            }
-        }
-
-        fn with_item_seq(item_seq: i64) -> Self {
-            Self {
-                item_seq,
-                ..Self::default()
-            }
-        }
-
-        fn with_role(role: &'static str) -> Self {
-            Self {
-                role,
-                ..Self::default()
-            }
-        }
-
-        fn with_content_hash(content_hash: &'static str) -> Self {
-            Self {
-                content_hash,
-                ..Self::default()
-            }
-        }
-    }
-
-    impl RowExt for FakeRunLifecyclePersistenceRow {
-        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
-            if self.failed_column == Some(column) {
-                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
-            }
-            match column {
-                "count" => Ok(self.count),
-                "item_seq" => Ok(self.item_seq),
-                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
-            }
-        }
-
-        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
-            if self.failed_column == Some(column) {
-                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
-            }
-            match column {
-                "role" => Ok(self.role.to_string()),
-                "content_hash" => Ok(self.content_hash.to_string()),
-                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
-            }
-        }
-    }
-
-    #[test]
-    fn post_compaction_manifest_count_decode_preserves_zero_and_fails_loudly() {
-        assert_eq!(
-            decode_post_compaction_manifest_count(&FakeRunLifecyclePersistenceRow::with_count(0))
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            decode_post_compaction_manifest_count(&FakeRunLifecyclePersistenceRow::with_count(2))
-                .unwrap(),
-            2
-        );
-
-        let missing = decode_post_compaction_manifest_count(
-            &FakeRunLifecyclePersistenceRow::fail_on("count"),
-        )
-        .unwrap_err();
-        assert!(
-            missing.contains("post-compaction context manifest count") && missing.contains("count"),
-            "missing count should fail loudly: {missing}"
-        );
-
-        let negative =
-            decode_post_compaction_manifest_count(&FakeRunLifecyclePersistenceRow::with_count(-1))
-                .unwrap_err();
-        assert!(
-            negative.contains("count") && negative.contains("non-negative integer"),
-            "negative count should fail loudly: {negative}"
-        );
-    }
-
-    #[test]
-    fn transcript_page_item_row_decode_preserves_database_values() {
-        let row =
-            decode_transcript_page_item_row(&FakeRunLifecyclePersistenceRow::default()).unwrap();
-
-        assert_eq!(
-            row,
-            TranscriptPageItemRow {
-                item_seq: 7,
-                role: "assistant".to_string(),
-                content_hash: "sha256:page-item".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn transcript_page_item_row_decode_fails_loudly_on_any_selected_column_error() {
-        for column in ["item_seq", "role", "content_hash"] {
-            let error =
-                decode_transcript_page_item_row(&FakeRunLifecyclePersistenceRow::fail_on(column))
-                    .unwrap_err();
-            assert!(
-                error.contains("transcript page item row") && error.contains(column),
-                "decode error should identify selected column `{column}`: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn transcript_page_item_row_decode_rejects_invalid_page_identity() {
-        for item_seq in [0, -1] {
-            let error = decode_transcript_page_item_row(
-                &FakeRunLifecyclePersistenceRow::with_item_seq(item_seq),
-            )
-            .unwrap_err();
-            assert!(
-                error.contains("item_seq") && error.contains("positive integer"),
-                "invalid item_seq should fail loudly: {error}"
-            );
-        }
-
-        for (column, row) in [
-            ("role", FakeRunLifecyclePersistenceRow::with_role("   ")),
-            (
-                "content_hash",
-                FakeRunLifecyclePersistenceRow::with_content_hash(""),
-            ),
-        ] {
-            let error = decode_transcript_page_item_row(&row).unwrap_err();
-            assert!(
-                error.contains(column) && error.contains("non-empty string"),
-                "empty transcript page identity column should fail loudly for `{column}`: {error}"
-            );
-        }
-    }
-
     async fn cleanup_transcript_fixture_for_owner(
         db: &sqlx::Pool<sqlx::MySql>,
         session_id: &str,
@@ -5290,18 +5500,20 @@ mod tests {
         .execute(db)
         .await
         .expect("cleanup transcript fixture projection head");
-        sqlx::query("DELETE FROM transcript_pages WHERE session_id = ? AND user_id = ?")
-            .bind(session_id)
-            .bind(user_id)
-            .execute(db)
-            .await
-            .expect("cleanup transcript fixture transcript_pages");
         sqlx::query("DELETE FROM session_transcript_items WHERE session_id = ? AND user_id = ?")
             .bind(session_id)
             .bind(user_id)
             .execute(db)
             .await
             .expect("cleanup transcript fixture session_transcript_items");
+        sqlx::query(
+            "DELETE FROM agent_session_lifecycle_fences WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .execute(db)
+        .await
+        .expect("cleanup transcript fixture lifecycle fence");
         sqlx::query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
             .bind(session_id)
             .bind(user_id)
@@ -5323,12 +5535,6 @@ mod tests {
         .execute(db)
         .await
         .expect("cleanup core persist projection head");
-        sqlx::query("DELETE FROM transcript_pages WHERE session_id = ? AND user_id = ?")
-            .bind(session_id)
-            .bind(user_id)
-            .execute(db)
-            .await
-            .expect("cleanup core persist transcript_pages");
         sqlx::query("DELETE FROM session_transcript_items WHERE session_id = ? AND user_id = ?")
             .bind(session_id)
             .bind(user_id)
@@ -5353,6 +5559,105 @@ mod tests {
             .execute(db)
             .await
             .expect("cleanup core persist agent_sessions");
+        sqlx::query(
+            "DELETE FROM agent_session_lifecycle_fences WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .execute(db)
+        .await
+        .expect("cleanup core persist lifecycle fence");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn terminal_trace_repair_requires_exact_identity_and_generation_not_live_lease() {
+        let pool = setup_pool().await;
+        let db = pool.get();
+        let user = Uuid::new_v4().to_string();
+        let session = Uuid::new_v4().to_string();
+        let other_session = Uuid::new_v4().to_string();
+        let run = Uuid::new_v4().to_string();
+        for sid in [&session, &other_session] {
+            sqlx::query("INSERT INTO agent_sessions (session_id,user_id,title,status,event_count) VALUES (?,?,'trace-repair','active',0)")
+                .bind(sid).bind(&user).execute(db).await.unwrap();
+        }
+        let store = Arc::new(astra_services::runs::DatabaseRunStateStore::new(
+            pool.clone(),
+        ));
+        let engine = crate::server::run::engine::RunEngine::new(store);
+        let authority = engine.start_run(&run, &user, &session).await.unwrap();
+        sqlx::query("UPDATE agent_runs SET status = 'cancelled', owner_lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE user_id = ? AND run_id = ?")
+            .bind(&user).bind(&run).execute(db).await.unwrap();
+        let mut persist = test_post_loop_persist_context(&session, None);
+        persist.shared_pool = Some(pool.clone());
+        persist.user_id = user.clone();
+        persist.expected_owner_generation = Some(authority.owner_generation);
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state
+            .stall
+            .tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                tool_call_id: Some("repair-tool".into()),
+                name: "read_file".into(),
+                ok: true,
+                ..Default::default()
+            });
+        for (sid, rid) in [(&session, "absent-run"), (&other_session, run.as_str())] {
+            persist.session_id = sid.clone();
+            persist.run_id = rid.to_string();
+            assert_eq!(
+                persist
+                    .persist_trace_after_authoritative_terminal(&state, "cancelled")
+                    .await
+                    .unwrap_err(),
+                format!(
+                    "terminal trace session admission failed: {}",
+                    sqlx::Error::RowNotFound
+                )
+            );
+            assert_eq!(assert_session_event_count(db, &user, sid).await, 0);
+        }
+        persist.session_id = session.clone();
+        persist.run_id = run.clone();
+        persist.expected_owner_generation = Some(authority.owner_generation + 1);
+        assert!(
+            persist
+                .persist_trace_after_authoritative_terminal(&state, "cancelled")
+                .await
+                .unwrap_err()
+                .contains("authority mismatch")
+        );
+        assert_eq!(assert_session_event_count(db, &user, &session).await, 0);
+        persist.expected_owner_generation = Some(authority.owner_generation);
+        persist
+            .persist_trace_after_authoritative_terminal(&state, "cancelled")
+            .await
+            .unwrap();
+        let count = assert_session_event_count(db, &user, &session).await;
+        assert!(count > 0);
+        persist
+            .persist_trace_after_authoritative_terminal(&state, "cancelled")
+            .await
+            .unwrap();
+        assert_eq!(assert_session_event_count(db, &user, &session).await, count);
+        for table in [
+            "agent_run_events",
+            "agent_session_execution_slots",
+            "agent_runs",
+        ] {
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE user_id = ? AND run_id = ?"
+            ))
+            .bind(&user)
+            .bind(&run)
+            .execute(db)
+            .await
+            .unwrap();
+        }
+        for sid in [&session, &other_session] {
+            cleanup_core_persist_fixture_for_owner(db, sid, &user).await;
+        }
     }
 
     #[tokio::test]
@@ -6104,6 +6409,10 @@ mod tests {
         .fetch_one(&db)
         .await
         .expect("load durable run after rollback");
+        assert_eq!(
+            assert_session_event_count(&db, &user_id, &session_id).await,
+            0
+        );
         assert_eq!(canonical_event_count, 0);
         assert_eq!(transcript_count, 0);
         assert_eq!(run_event_count, baseline_run_event_count);
@@ -6393,6 +6702,8 @@ mod tests {
             persist_server_loop_canonical_terminal_settlement(&pool, append(), &state, settlement)
                 .await
                 .expect("commit canonical terminal settlement");
+        let committed_count = assert_session_event_count(&db, &user_id, &session_id).await;
+        assert!(committed_count > 0);
         assert_eq!(commit.terminal_events, terminal_events);
         assert!(commit.terminal_assistant_source_event_id.is_some());
         if let Some(execution_started_at) = execution_started_at {
@@ -6453,12 +6764,20 @@ mod tests {
         .expect("delayed lost-ack resolution retains the original capture")
         .expect("commit must remain authoritative");
         assert_eq!(resolved.committed_events, terminal_events);
+        assert_eq!(
+            assert_session_event_count(&db, &user_id, &session_id).await,
+            committed_count
+        );
 
         tokio::time::sleep(Duration::from_millis(25)).await;
         let replay =
             persist_server_loop_canonical_terminal_settlement(&pool, append(), &state, settlement)
                 .await
                 .expect("delayed terminal replay is idempotent");
+        assert_eq!(
+            assert_session_event_count(&db, &user_id, &session_id).await,
+            committed_count
+        );
         assert_eq!(replay.terminal_events, commit.terminal_events);
         assert_eq!(
             replay.terminal_assistant_source_event_id,
@@ -6560,7 +6879,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-    async fn transcript_persistence_writes_owner_scoped_pages_and_rejects_wrong_owner() {
+    async fn transcript_persistence_batches_items_and_enforces_admission() {
         let pool = setup_pool().await;
         let db = pool.get().clone();
         let session_id = Uuid::new_v4().to_string();
@@ -6570,6 +6889,23 @@ mod tests {
 
         cleanup_transcript_fixture_for_owner(&db, &session_id, &owner_user_id).await;
         cleanup_transcript_fixture_for_owner(&db, &session_id, &other_user_id).await;
+        persist_session_transcript_items(&pool, &owner_user_id, &session_id, &[])
+            .await
+            .expect("empty standalone append needs no root");
+        persist_session_transcript_items(
+            &pool,
+            &owner_user_id,
+            &session_id,
+            &[TranscriptPersistItem {
+                run_id: None,
+                role: "user",
+                content: "missing root".into(),
+                payload: None,
+                source_event_id: "missing-root".into(),
+            }],
+        )
+        .await
+        .expect_err("standalone append cannot lazily create a root");
 
         sqlx::query(
             "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count)
@@ -6592,17 +6928,6 @@ mod tests {
         .execute(&db)
         .await
         .expect("insert foreign dirty transcript item");
-        sqlx::query(
-            "INSERT INTO transcript_pages
-             (user_id, session_id, page_seq, start_item_seq, end_item_seq, item_count, page_hash, created_at, updated_at)
-             VALUES (?, ?, 1, 1, 1, 1, 'foreign-page', NOW(6), NOW(6))",
-        )
-        .bind(&other_user_id)
-        .bind(&session_id)
-        .execute(&db)
-        .await
-        .expect("insert foreign dirty transcript page");
-
         let items = [
             TranscriptPersistItem {
                 run_id: Some(run_id.clone()),
@@ -6629,21 +6954,6 @@ mod tests {
         persist_session_transcript_items(&pool, &owner_user_id, &session_id, &items)
             .await
             .expect("owner transcript persist");
-
-        let page = sqlx::query(
-            "SELECT user_id, start_item_seq, end_item_seq, item_count
-             FROM transcript_pages
-             WHERE user_id = ? AND session_id = ? AND page_seq = 1",
-        )
-        .bind(&owner_user_id)
-        .bind(&session_id)
-        .fetch_one(&db)
-        .await
-        .expect("owner transcript page");
-        assert_eq!(page.try_get::<String, _>("user_id").unwrap(), owner_user_id);
-        assert_eq!(page.try_get::<i64, _>("start_item_seq").unwrap(), 1);
-        assert_eq!(page.try_get::<i64, _>("end_item_seq").unwrap(), 3);
-        assert_eq!(page.try_get::<i64, _>("item_count").unwrap(), 3);
 
         let owner_rows = sqlx::query(
             "SELECT role, content
@@ -6691,29 +7001,12 @@ mod tests {
             "transcript item identity must include owner"
         );
 
-        let same_page_seq_rows = sqlx::query(
-            "SELECT COUNT(*) AS c
-             FROM transcript_pages
-             WHERE session_id = ? AND page_seq = 1",
-        )
-        .bind(&session_id)
-        .fetch_one(&db)
-        .await
-        .expect("count shared page_seq rows")
-        .try_get::<i64, _>("c")
-        .expect("decode shared page_seq count");
-        assert_eq!(
-            same_page_seq_rows, 2,
-            "transcript page identity must include owner"
-        );
-
-        let mut wrong_owner_tx = db.begin().await.expect("begin wrong-owner transcript tx");
-        let wrong_owner = persist_session_transcript_items_inner_in_tx(
-            &mut wrong_owner_tx,
+        let _wrong_owner = persist_session_transcript_items(
+            &pool,
             &other_user_id,
             &session_id,
             &[TranscriptPersistItem {
-                run_id: Some(run_id),
+                run_id: Some(run_id.clone()),
                 role: "assistant",
                 content: "wrong owner".to_string(),
                 payload: None,
@@ -6722,15 +7015,6 @@ mod tests {
         )
         .await
         .expect_err("wrong owner must not persist transcript rows");
-        wrong_owner_tx
-            .rollback()
-            .await
-            .expect("rollback wrong-owner transcript tx");
-        assert!(
-            matches!(&wrong_owner, sqlx::Error::RowNotFound),
-            "wrong owner should fail closed before writing, got {wrong_owner}"
-        );
-
         let wrong_owner_rows = sqlx::query(
             "SELECT COUNT(*) AS c
              FROM session_transcript_items
@@ -6761,6 +7045,257 @@ mod tests {
         .expect("decode wrong owner attempted content count");
         assert_eq!(wrong_owner_attempt_rows, 0);
 
+        // Probe equality using the actual column, so both binary and
+        // case-insensitive databases exercise their own identity contract.
+        let make_item = |id: &str, content: &str| TranscriptPersistItem {
+            run_id: None,
+            role: "user",
+            content: content.to_string(),
+            payload: None,
+            source_event_id: id.to_string(),
+        };
+        persist_session_transcript_items(
+            &pool,
+            &owner_user_id,
+            &session_id,
+            &[make_item("CaseProbe", "probe")],
+        )
+        .await
+        .expect("seed collation probe");
+        let case_equivalent: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_transcript_items
+             WHERE user_id = ? AND session_id = ? AND source_event_id = ?",
+        )
+        .bind(&owner_user_id)
+        .bind(&session_id)
+        .bind("caseprobe")
+        .fetch_one(&db)
+        .await
+        .expect("read column equality");
+
+        let mut mixed = vec![
+            make_item(&items[0].source_event_id, "conflicting replay"),
+            make_item("within-chunk", "first within"),
+            make_item("WITHIN-CHUNK", "case variant"),
+            make_item("within-chunk", "conflicting duplicate"),
+            make_item("across-chunks", "first across"),
+            make_item("equal-text-one", "equal text"),
+            make_item("equal-text-two", "equal text"),
+        ];
+        let filler_count = TRANSCRIPT_MEMBERSHIP_ROWS * 2 + 3;
+        for index in 0..filler_count {
+            mixed.push(make_item(&format!("filler-{index}"), &"x".repeat(6000)));
+        }
+        mixed.push(make_item("ACROSS-CHUNKS", "case variant across"));
+        mixed.push(make_item("across-chunks", "conflicting across"));
+        mixed.push(make_item("last-new", "last"));
+        persist_session_transcript_items(&pool, &owner_user_id, &session_id, &mixed)
+            .await
+            .expect("mixed replay and new identities across bounded chunks");
+        // An exact replay must keep all existing sequences and first content.
+        persist_session_transcript_items(&pool, &owner_user_id, &session_id, &mixed)
+            .await
+            .expect("all replay");
+        let actual = sqlx::query_as::<_, (i64, String, String)>(
+            "SELECT item_seq, source_event_id, content FROM session_transcript_items
+             WHERE user_id = ? AND session_id = ? ORDER BY item_seq",
+        )
+        .bind(&owner_user_id)
+        .bind(&session_id)
+        .fetch_all(&db)
+        .await
+        .expect("read ordered batch");
+        let mut expected = items
+            .iter()
+            .map(|item| (item.source_event_id.clone(), item.content.clone()))
+            .collect::<Vec<_>>();
+        expected.push(("CaseProbe".into(), "probe".into()));
+        expected.push(("within-chunk".into(), "first within".into()));
+        if case_equivalent == 0 {
+            expected.push(("WITHIN-CHUNK".into(), "case variant".into()));
+        }
+        expected.extend([
+            ("across-chunks".into(), "first across".into()),
+            ("equal-text-one".into(), "equal text".into()),
+            ("equal-text-two".into(), "equal text".into()),
+        ]);
+        for index in 0..filler_count {
+            expected.push((format!("filler-{index}"), "x".repeat(6000)));
+        }
+        if case_equivalent == 0 {
+            expected.push(("ACROSS-CHUNKS".into(), "case variant across".into()));
+        }
+        expected.push(("last-new".into(), "last".into()));
+        assert_eq!(actual.len(), expected.len());
+        for (index, ((sequence, id, content), expected)) in actual.iter().zip(&expected).enumerate()
+        {
+            assert_eq!(*sequence, index as i64 + 1);
+            assert_eq!((id, content), (&expected.0, &expected.1));
+        }
+
+        let mut admitted = db.begin().await.expect("hold session admission");
+        admit_session_event_write(&mut admitted, &session_id, &owner_user_id, false)
+            .await
+            .expect("admit first concurrent writer");
+        append_session_transcript_items_admitted_in_tx(
+            &mut admitted,
+            &owner_user_id,
+            &session_id,
+            &[make_item("concurrent-shared", "first writer")],
+        )
+        .await
+        .expect("first writer's uncommitted item");
+        let overlapping = [
+            make_item("concurrent-shared", "second writer conflict"),
+            make_item("concurrent-new", "second writer new"),
+        ];
+        let mut waiting = Box::pin(persist_session_transcript_items(
+            &pool,
+            &owner_user_id,
+            &session_id,
+            &overlapping,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut waiting)
+                .await
+                .is_err(),
+            "same-session admission must wait"
+        );
+        let independent_session = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count)
+             VALUES (?, ?, 'independent transcript', 'active', 0)",
+        )
+        .bind(&independent_session)
+        .bind(&other_user_id)
+        .execute(&db)
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            persist_session_transcript_items(
+                &pool,
+                &other_user_id,
+                &independent_session,
+                &[make_item("concurrent-shared", "independent owner/session")],
+            ),
+        )
+        .await
+        .expect("unrelated session is not serialized")
+        .expect("independent writer succeeds");
+        admitted.commit().await.expect("release first writer");
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("same-session writer resumes")
+            .expect("overlap replays");
+        let concurrent = sqlx::query_as::<_, (i64, String, String)>(
+            "SELECT item_seq, source_event_id, content FROM session_transcript_items
+             WHERE user_id = ? AND session_id = ? AND item_seq > ? ORDER BY item_seq",
+        )
+        .bind(&owner_user_id)
+        .bind(&session_id)
+        .bind(expected.len() as i64)
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            concurrent,
+            vec![
+                (
+                    expected.len() as i64 + 1,
+                    "concurrent-shared".into(),
+                    "first writer".into()
+                ),
+                (
+                    expected.len() as i64 + 2,
+                    "concurrent-new".into(),
+                    "second writer new".into()
+                ),
+            ]
+        );
+        cleanup_transcript_fixture_for_owner(&db, &independent_session, &other_user_id).await;
+
+        // The old unconditional MAX + 1 overflows here even for empty/replay
+        // appends. Neither operation needs allocation or an ownership lookup.
+        sqlx::query(
+            "UPDATE session_transcript_items SET item_seq = ?
+             WHERE user_id = ? AND session_id = ? AND source_event_id = 'last-new'",
+        )
+        .bind(i64::MAX)
+        .bind(&owner_user_id)
+        .bind(&session_id)
+        .execute(&db)
+        .await
+        .expect("seed allocation boundary");
+        persist_session_transcript_items(&pool, &owner_user_id, &session_id, &mixed)
+            .await
+            .expect("all replay must not allocate");
+        let mut empty_tx = db.begin().await.expect("empty transaction");
+        append_session_transcript_items_admitted_in_tx(
+            &mut empty_tx,
+            &owner_user_id,
+            &session_id,
+            &[],
+        )
+        .await
+        .expect("empty append has no SQL");
+        empty_tx.rollback().await.expect("finish empty transaction");
+
+        // Root status and both durable deletion fence states reject even a
+        // replay. Standalone writes must use the canonical admission boundary.
+        sqlx::query(
+            "UPDATE agent_sessions SET status = 'deleting' WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&owner_user_id)
+        .bind(&session_id)
+        .execute(&db)
+        .await
+        .unwrap();
+        persist_session_transcript_items(&pool, &owner_user_id, &session_id, &items)
+            .await
+            .expect_err("deleting root rejects transcript append");
+        sqlx::query(
+            "UPDATE agent_sessions SET status = 'active' WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&owner_user_id)
+        .bind(&session_id)
+        .execute(&db)
+        .await
+        .unwrap();
+        for completed in [false, true] {
+            let sql = if completed {
+                "UPDATE agent_session_lifecycle_fences SET database_deleted_at = NOW(6)
+                 WHERE user_id = ? AND session_id = ?"
+            } else {
+                "UPDATE agent_session_lifecycle_fences SET delete_requested_at = NOW(6)
+                 WHERE user_id = ? AND session_id = ?"
+            };
+            let mut deleting = db.begin().await.expect("begin deletion fence");
+            sqlx::query(sql)
+                .bind(&owner_user_id)
+                .bind(&session_id)
+                .execute(&mut *deleting)
+                .await
+                .expect("set deletion fence");
+            let mut racing = Box::pin(persist_session_transcript_items(
+                &pool,
+                &owner_user_id,
+                &session_id,
+                &items,
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut racing)
+                    .await
+                    .is_err(),
+                "append waits for pending deletion transaction"
+            );
+            deleting.commit().await.expect("publish deletion fence");
+            tokio::time::timeout(Duration::from_secs(5), racing)
+                .await
+                .expect("append observes committed deletion")
+                .expect_err("deletion fence rejects transcript append");
+        }
+
         cleanup_transcript_fixture_for_owner(&db, &session_id, &owner_user_id).await;
         cleanup_transcript_fixture_for_owner(&db, &session_id, &other_user_id).await;
     }
@@ -6787,7 +7322,7 @@ mod tests {
             astra_services::runs::DatabaseRunStateStore::new(pool.clone())
                 .with_owner_pod_id("transcript-commit-owner"),
         );
-        let engine = crate::server::run::engine::RunEngine::new(store);
+        let engine = crate::server::run::engine::RunEngine::new(store.clone());
         let authority = engine
             .start_run(&run_id, &user_id, &session_id)
             .await
@@ -6807,6 +7342,18 @@ mod tests {
         .expect("terminal assistant item")
         .source_event_id;
 
+        let early_items = transcript_items_from_server_loop(
+            &user_id,
+            &session_id,
+            &run_id,
+            None,
+            "inspect identity",
+            &state,
+            false,
+        );
+        persist_session_transcript_items(&pool, &user_id, &session_id, &early_items[..1])
+            .await
+            .expect("early user is visible before terminal capture");
         let committed = persist_server_loop_canonical_append(
             &pool,
             CanonicalLoopAppend {
@@ -6896,6 +7443,128 @@ mod tests {
             );
         }
 
+        let early_user_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_transcript_items
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND role = 'user'",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&run_id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            early_user_count, 1,
+            "terminal replay preserves early user identity"
+        );
+
+        store
+            .append_event(
+                &user_id,
+                &session_id,
+                &run_id,
+                json!({
+                    "event_type": "reasoning_message_content",
+                    "data": {"content": "durable reasoning"}
+                }),
+            )
+            .await
+            .expect("durable reasoning event");
+        materialize_server_run_transcript_evidence(
+            &pool,
+            &user_id,
+            &session_id,
+            &run_id,
+            None,
+            None,
+        )
+        .await
+        .expect("reasoning-only materialization acquires admission");
+        let enriched: String = sqlx::query_scalar(
+            "SELECT payload_json FROM session_transcript_items
+             WHERE user_id = ? AND session_id = ? AND source_event_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&expected)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&enriched).unwrap()["reasoning"],
+            "durable reasoning"
+        );
+        let replay = terminal_assistant_transcript_item(
+            &user_id,
+            &session_id,
+            &run_id,
+            None,
+            "inspect identity",
+            &state,
+        )
+        .unwrap();
+        persist_session_transcript_items(&pool, &user_id, &session_id, &[replay])
+            .await
+            .expect("replay after enrichment");
+        let after_replay: String = sqlx::query_scalar(
+            "SELECT payload_json FROM session_transcript_items
+             WHERE user_id = ? AND session_id = ? AND source_event_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&expected)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(after_replay, enriched);
+        sqlx::query(
+            "UPDATE agent_sessions SET status = 'deleting' WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .execute(&db)
+        .await
+        .unwrap();
+        materialize_server_run_transcript_evidence(
+            &pool,
+            &user_id,
+            &session_id,
+            &run_id,
+            None,
+            None,
+        )
+        .await
+        .expect_err("reasoning-only materialization rejects deleting root");
+        sqlx::query(
+            "UPDATE agent_sessions SET status = 'active' WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .execute(&db)
+        .await
+        .unwrap();
+        for sql in [
+            "UPDATE agent_session_lifecycle_fences SET delete_requested_at = NOW(6) WHERE user_id = ? AND session_id = ?",
+            "UPDATE agent_session_lifecycle_fences SET database_deleted_at = NOW(6) WHERE user_id = ? AND session_id = ?",
+        ] {
+            sqlx::query(sql)
+                .bind(&user_id)
+                .bind(&session_id)
+                .execute(&db)
+                .await
+                .unwrap();
+            materialize_server_run_transcript_evidence(
+                &pool,
+                &user_id,
+                &session_id,
+                &run_id,
+                None,
+                None,
+            )
+            .await
+            .expect_err("reasoning-only materialization rejects durable deletion");
+        }
+
         cleanup_core_persist_fixture_for_owner(&db, &session_id, &user_id).await;
     }
 
@@ -6973,6 +7642,88 @@ mod tests {
         .expect("decode rolled-back transcript count");
         assert_eq!(ghost_transcript, 0);
 
+        // Fail sequence allocation after one complete membership chunk and
+        // several insert chunks, inside the actual canonical capture boundary.
+        let store = Arc::new(
+            DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("transcript-chunk-rollback"),
+        );
+        let engine = crate::server::run::engine::RunEngine::new(store);
+        let authority = engine
+            .start_run(&run_id, &owner_user_id, &session_id)
+            .await
+            .expect("start rollback run");
+        sqlx::query(
+            "INSERT INTO session_transcript_items
+             (user_id, session_id, item_seq, role, content, content_hash)
+             VALUES (?, ?, ?, 'system', 'existing boundary', 'boundary-hash')",
+        )
+        .bind(&owner_user_id)
+        .bind(&session_id)
+        .bind(i64::MAX - TRANSCRIPT_MEMBERSHIP_ROWS as i64 - 1)
+        .execute(&db)
+        .await
+        .expect("seed sequence exhaustion boundary");
+        for index in 0..TRANSCRIPT_MEMBERSHIP_ROWS / 2 {
+            state
+                .stall
+                .tool_call_records
+                .push(astra_services::session_journal::ToolCallRecord {
+                    tool_call_id: Some(format!("rollback-call-{index}")),
+                    name: "read_file".to_string(),
+                    ok: true,
+                    args_full: Some(r#"{"path":"fixture.rs"}"#.to_string()),
+                    result_full: Some("fixture content".to_string()),
+                    ..Default::default()
+                });
+        }
+        let failure = persist_server_loop_canonical_append(
+            &pool,
+            CanonicalLoopAppend {
+                user_id: &owner_user_id,
+                session_id: &session_id,
+                run_id: &run_id,
+                expected_owner_generation: Some(authority.owner_generation),
+                owner_lease_duration: Some(Duration::from_secs(45)),
+                parent_run_id: None,
+                parent_event_id: None,
+                agent_id: Some("root-agent"),
+                parent_agent_id: None,
+                trace_context: None,
+                user_message: "chunk rollback",
+                model_name: Some("test-model"),
+                include_terminal_assistant: true,
+            },
+            &state,
+        )
+        .await
+        .expect_err("later transcript chunk aborts canonical capture");
+        assert!(
+            failure.contains("transcript sequence exhausted"),
+            "{failure}"
+        );
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_transcript_items WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&owner_user_id)
+        .bind(&session_id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 1, "earlier insert chunks roll back together");
+        let captured: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND run_id = ?",
+        )
+        .bind(&owner_user_id)
+        .bind(&session_id)
+        .bind(&run_id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            captured, 0,
+            "canonical event capture rolls back with transcript chunks"
+        );
+
         cleanup_core_persist_fixture_for_owner(&db, &session_id, &wrong_user_id).await;
         cleanup_core_persist_fixture_for_owner(&db, &session_id, &owner_user_id).await;
     }
@@ -7024,17 +7775,16 @@ mod tests {
             config_version_id: None,
         };
         for _ in 0..2 {
-            let mut tx = db.begin().await.expect("begin exact projection retry");
-            commit_run_transcript_projection_in_tx(
-                &mut tx,
+            materialize_server_run_transcript_evidence(
+                &pool,
                 &user_id,
                 &session_id,
                 &run_one,
-                &cursor_one,
+                None,
+                Some(&cursor_one),
             )
             .await
-            .expect("exact projection retry");
-            tx.commit().await.expect("commit exact projection retry");
+            .expect("cursor-only materialization and exact retry");
         }
 
         let run_three = Uuid::new_v4().to_string();
@@ -7097,6 +7847,24 @@ mod tests {
         .try_get::<Option<i64>, _>("canonical_completed_turn")
         .expect("decode gap item");
         assert_eq!(uncommitted, None);
+        sqlx::query(
+            "UPDATE agent_sessions SET status = 'deleting' WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .execute(&db)
+        .await
+        .unwrap();
+        materialize_server_run_transcript_evidence(
+            &pool,
+            &user_id,
+            &session_id,
+            &run_one,
+            None,
+            Some(&cursor_one),
+        )
+        .await
+        .expect_err("cursor-only materialization rejects deleting root");
 
         cleanup_transcript_fixture_for_owner(&db, &session_id, &user_id).await;
     }

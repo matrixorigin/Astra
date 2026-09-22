@@ -532,7 +532,7 @@ mod tests {
             _sid: Option<&str>,
             _k: usize,
             _fs: bool,
-        ) -> Result<Vec<MemoriaMemory>, String> {
+        ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
             Ok(Vec::new())
         }
         async fn store(
@@ -679,7 +679,10 @@ mod tests {
             _session_id: Option<&str>,
             _top_k: usize,
             _filter_session: bool,
-        ) -> Result<Vec<super::super::memoria_compact::MemoriaMemory>, String> {
+        ) -> Result<
+            Vec<super::super::memoria_compact::MemoriaMemory>,
+            astra_memoria::MemoriaOperationError,
+        > {
             self.operations.lock().unwrap().push("retrieve".into());
             Ok(vec![super::super::memoria_compact::MemoriaMemory {
                 memory_id: "working-final".into(),

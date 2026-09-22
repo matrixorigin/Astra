@@ -608,7 +608,6 @@ mod tests {
                 source_event_id: Some("root-item-10".into()),
                 created_at: "2026-07-12T00:00:00Z".into(),
             }],
-            page_refs: Vec::new(),
             next_before_seq: None,
             has_more: false,
         }

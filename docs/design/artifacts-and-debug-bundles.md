@@ -52,6 +52,23 @@ the temporary edges with ordered artifact-to-content references. The first
 workspace package uses one typed artifact containing the snapshot manifest plus
 deduplicated file bytes, rather than one catalog row per file.
 
+## Tool-output previews
+
+Tool-output previews use the synchronous policy in `services/src/runs.rs`:
+36 explicit tool mappings take precedence over the existing built-in tool
+registry's generic 1,200-byte `text_v1` policy. Unknown names use a 400-byte
+`raw_v1` fallback. Normalization versions label persisted previews; they do
+not select a normalization algorithm. UTF-8 truncation, serialized-payload
+hashes, explicit artifact references, and parent-output identity are preserved.
+Fallback persistence does not emit missing-template events or change session
+event counters. The output transaction itself takes the canonical session
+write fence, requires an existing session, and rejects deletion-fenced writes.
+
+Fresh schema contract `2026-09-22-v88` removes the two static SQL registries
+without migration or import of SQL overrides. Raw-reference scheme membership
+is not an authorization authority: concrete artifact readers continue to own
+session ACL and content-integrity checks.
+
 ## Debug bundle rules
 
 Debug bundles are off by default.

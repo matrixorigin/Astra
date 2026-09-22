@@ -2,8 +2,9 @@
 //!
 //! Explain facts are produced by the server run owner.  Clients may render a
 //! local companion, but the model-facing artifact must live beside the server
-//! introspect reader so a handle advertised in the next turn is truthful.
+//! introspect reader for explicit, lazy discovery and fixed-handle pagination.
 
+use super::run::engine::RunEngine;
 use astra_core::SharedPool;
 use astra_services::{
     DatabaseSessionArtifactStore, SessionArtifactJsonRecord, SessionArtifactJsonStore,
@@ -180,6 +181,93 @@ pub(crate) async fn recover_completed_snapshot(
         &events,
     )
     .await
+}
+
+pub(crate) async fn record_explain_publication(
+    run_engine: &RunEngine,
+    user_id: &str,
+    session_id: &str,
+    mut outcome: astra_turn_types::ArtifactPublicationV1,
+) -> Value {
+    let run_id = outcome.run_id.as_str();
+    let owner_generation = outcome.execution_owner_generation;
+    let payload = serde_json::to_value(&outcome).expect("serializable publication outcome");
+    let mut identity = Sha256::new();
+    identity.update(b"astra.artifact-publication.v1\0");
+    identity.update(astra_core::canonical_json_string(&payload).as_bytes());
+    let event = json!({ "event_type":"artifact_publication",
+        "idempotency_key":format!("{:x}", identity.finalize()), "data":payload });
+
+    let recorded = run_engine
+        .append_events_if_current_generation_and_status(
+            user_id,
+            session_id,
+            run_id,
+            owner_generation,
+            &["completed", "failed", "cancelled", "delegated"],
+            &[event],
+        )
+        .await;
+    if recorded != Ok(true) {
+        outcome.recorded = false;
+        tracing::warn!(run_id, result = ?recorded,
+            "could not retain Explain artifact publication outcome; notifying live client");
+    }
+    outcome.to_wire()
+}
+
+pub(crate) async fn publish_recovered_explain(
+    pool: Option<&SharedPool>,
+    run_engine: &RunEngine,
+    run: &astra_services::runs::DurableRunRecord,
+) -> Option<Value> {
+    use astra_turn_types::{ArtifactPublicationResult, ArtifactPublicationV1};
+    if run.status != "completed" || !astra_services::runs::run_requested_explain_analyze(run) {
+        return None;
+    }
+    let turn_id = run
+        .events
+        .iter()
+        .cloned()
+        .map(astra_services::runs::transform_run_event_for_client)
+        .filter_map(|event| astra_turn_types::decode_explain_analyze_wire(&event).ok())
+        .find(|fact| fact.run_id == run.run_id)
+        .map(|fact| fact.turn_id)
+        .unwrap_or_else(|| "unknown".to_string());
+    let result = match crate::server::explain_analyze_artifact::recover_completed_snapshot(
+        pool, run,
+    )
+    .await
+    {
+        Ok(Some(handle)) => ArtifactPublicationResult::Published { handle },
+        failure => {
+            tracing::warn!(run_id = %run.run_id, result = ?failure, "Explain report recovery unavailable");
+            ArtifactPublicationResult::Unavailable {
+                reason_code: "recovery_failed".into(),
+                message: "The server could not recover a readable report for this run.".into(),
+            }
+        }
+    };
+    let outcome = ArtifactPublicationV1 {
+        schema_version: 1,
+        run_id: run.run_id.clone(),
+        turn_id,
+        execution_owner_generation: run.run_generation,
+        artifact_type: "explain_analyze_snapshot".into(),
+        recorded: true,
+        result,
+    };
+    if let Some(existing) = run.events.iter().rev().find_map(|event| {
+        ArtifactPublicationV1::from_wire(&astra_services::runs::transform_run_event_for_client(
+            event.clone(),
+        ))
+        .ok()
+    }) && existing == outcome
+    {
+        return Some(existing.to_wire());
+    }
+    let wire = record_explain_publication(run_engine, &run.user_id, &run.session_id, outcome).await;
+    Some(wire)
 }
 
 pub(crate) fn artifact_handle(artifact_id: &str) -> String {
@@ -733,113 +821,151 @@ fn validate_snapshot_payload_with_bytes<'a>(
     Ok((status, bytes))
 }
 
-pub(crate) fn unavailable_context_notice(reason: &str) -> String {
-    format!(
-        "[Explain Analyze artifact discovery]\nThe latest Explain Analyze capture is unavailable. Reason: {reason}. This is background capability metadata, not a user request. Mention this limitation only when the user asks to analyze this capture. Do not infer missing timing, token, wait, or graph facts from an older artifact or from the renderer."
-    )
+/// Explicit discovery resolves one exact identity. Pagination uses its concrete handle.
+#[derive(serde::Deserialize)]
+#[serde(tag = "target", rename_all = "snake_case", deny_unknown_fields)]
+enum ExplainSelector {
+    Previous {},
+    Run { run_id: String },
 }
 
-pub(crate) enum ContextNoticeDiscovery {
-    Missing,
-    Notice(String),
-}
-
-/// Return the short, model-facing discovery notice for one authoritative
-/// Explain run. The caller resolves the latest requested Explain run from the
-/// durable run ledger; this function never falls back to an older artifact.
-pub(crate) async fn context_notice_for_run(
+pub(crate) async fn resolve_selector(
     pool: Option<&SharedPool>,
+    store: Option<&dyn SessionArtifactJsonStore>,
+    engine: &RunEngine,
     user_id: &str,
     session_id: &str,
-    expected_run_id: &str,
-    expected_owner_generation: u64,
+    current_root: &str,
+    args: &Value,
 ) -> Result<String, String> {
-    Ok(
-        match discover_context_notice_for_run(
-            pool,
-            user_id,
-            session_id,
-            expected_run_id,
-            expected_owner_generation,
-        )
-        .await?
-        {
-            ContextNoticeDiscovery::Missing => unavailable_context_notice(&format!(
-                "no artifact was published for Explain run {expected_run_id}"
-            )),
-            ContextNoticeDiscovery::Notice(notice) => notice,
-        },
-    )
-}
-
-/// Read and validate the exact authoritative Explain snapshot once.
-///
-/// Only physical absence is returned as `Missing`. Corrupt, expired, or
-/// identity-mismatched snapshots become an unavailable notice so callers must
-/// not recover over an existing artifact and hide its integrity failure.
-pub(crate) async fn discover_context_notice_for_run(
-    pool: Option<&SharedPool>,
-    user_id: &str,
-    session_id: &str,
-    expected_run_id: &str,
-    expected_owner_generation: u64,
-) -> Result<ContextNoticeDiscovery, String> {
-    let Some(pool) = pool else {
-        return Ok(ContextNoticeDiscovery::Notice(unavailable_context_notice(
-            "server Explain Analyze artifact storage is not configured",
-        )));
-    };
-    let artifact_id = artifact_id(expected_run_id);
-    let Some(artifact) = load_snapshot_artifact(
-        pool,
-        user_id,
-        session_id,
-        &artifact_id,
-        ArtifactFetchPurpose::Discovery,
-    )
-    .await
-    .map_err(|error| format!("load Explain Analyze artifact for run {expected_run_id}: {error}"))?
-    else {
-        return Ok(ContextNoticeDiscovery::Missing);
-    };
-    if artifact.artifact_kind != ARTIFACT_KIND {
-        return Ok(ContextNoticeDiscovery::Notice(unavailable_context_notice(
-            "the stored artifact kind does not match Explain Analyze",
-        )));
+    if args.get("artifact").is_some() {
+        return Err("explain and artifact are mutually exclusive".into());
     }
-    let status = match validate_snapshot_payload(
-        &artifact,
-        session_id,
-        Some(expected_run_id),
-        Some(expected_owner_generation),
+    let selector: ExplainSelector = serde_json::from_value(
+        args.get("explain")
+            .cloned()
+            .ok_or("explain selector is required")?,
+    )
+    .map_err(|error| format!("invalid Explain selector: {error}"))?;
+    let (offset, max_bytes) = window_arguments(args)?;
+    if offset != 0 {
+        return Err(
+            "Explain discovery starts at offset 0; paginate with the returned artifact handle"
+                .into(),
+        );
+    }
+    if matches!(
+        args.get("source_policy").and_then(Value::as_str),
+        Some("live_only" | "local_only")
     ) {
-        Ok(status) => status,
-        Err(error) => {
-            return Ok(ContextNoticeDiscovery::Notice(unavailable_context_notice(
-                &error,
-            )));
+        return Err("server Explain snapshots require a durable server source".into());
+    }
+    let store = store.ok_or("server Explain Analyze artifact reader is unavailable")?;
+    let (run_id, generation) = match selector {
+        ExplainSelector::Previous {} => engine
+            .find_latest_explain_analyze_root(user_id, session_id, Some(current_root))
+            .await?
+            .ok_or("no previous Explain Analyze root exists in this session")?,
+        ExplainSelector::Run { run_id } => {
+            let run = engine
+                .load_run(user_id, &run_id)
+                .await?
+                .filter(|run| {
+                    run.session_id == session_id
+                        && astra_services::runs::run_requested_explain_analyze(run)
+                })
+                .ok_or("Explain Analyze run was not found in the active session")?;
+            (run.run_id, run.run_generation)
         }
     };
+    let id = artifact_id(&run_id);
+    record_artifact_fetch(ArtifactFetchPurpose::Discovery);
+    let mut artifact = store
+        .load_json_artifact(user_id, session_id, &id)
+        .await
+        .map_err(|error| format!("load Explain Analyze artifact: {error}"))?;
+    // Only physical absence enters recovery. Integrity/status failures are
+    // handled by the same validator as handle reads and never select older runs.
+    if artifact.is_none() {
+        let run = engine
+            .load_run(user_id, &run_id)
+            .await?
+            .filter(|run| run.session_id == session_id && run.run_generation == generation)
+            .ok_or("selected Explain run identity changed or is unavailable")?;
+        publish_recovered_explain(pool, engine, &run).await;
+        record_artifact_fetch(ArtifactFetchPurpose::Discovery);
+        artifact = store
+            .load_json_artifact(user_id, session_id, &id)
+            .await
+            .map_err(|error| format!("load recovered Explain Analyze artifact: {error}"))?;
+    }
+    let artifact = artifact.ok_or("selected Explain Analyze capture is unavailable")?;
+    render_window(
+        &artifact,
+        session_id,
+        Some(&run_id),
+        Some(generation),
+        offset,
+        max_bytes,
+    )
+}
+
+fn window_arguments(args: &Value) -> Result<(usize, usize), String> {
+    let offset = match args.get("offset") {
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or("offset must be a non-negative integer")?,
+        None => 0,
+    };
+    let max_bytes = match args.get("max_bytes") {
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| (1..=MAX_WINDOW_BYTES).contains(value))
+            .ok_or_else(|| format!("max_bytes must be an integer from 1 to {MAX_WINDOW_BYTES}"))?,
+        None => DEFAULT_WINDOW_BYTES,
+    };
+    Ok((offset, max_bytes))
+}
+
+fn render_window(
+    artifact: &StoredSessionArtifact,
+    session_id: &str,
+    expected_run: Option<&str>,
+    expected_generation: Option<u64>,
+    offset: usize,
+    max_bytes: usize,
+) -> Result<String, String> {
+    if artifact.artifact_kind != ARTIFACT_KIND {
+        return Err("artifact handle does not name a server Explain Analyze snapshot".into());
+    }
+    let (status, bytes) = validate_snapshot_payload_with_bytes(
+        artifact,
+        session_id,
+        expected_run,
+        expected_generation,
+    )?;
     if status == "unavailable" {
-        let reason = artifact
-            .content
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or("the server did not publish readable Explain Analyze facts");
-        return Ok(ContextNoticeDiscovery::Notice(unavailable_context_notice(
-            reason,
-        )));
+        return Err("the selected Explain Analyze capture is unavailable".into());
     }
     let handle = artifact_handle(&artifact.artifact_id);
-    let size = artifact
-        .metadata
-        .as_ref()
-        .and_then(|metadata| metadata.get("size_bytes"))
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    Ok(ContextNoticeDiscovery::Notice(format!(
-        "[Explain Analyze artifact discovery]\nExplain Analyze artifact · type={ARTIFACT_TYPE} · content={CONTENT_TYPE} · storage={STORAGE} · status={status} · size={size} bytes\nHandle: {handle}\nIf the user asks about the previous/latest Explain Analyze run, call introspect(artifact=\"{handle}\", offset=0, max_bytes=65536) before drawing conclusions. The handle is server-session scoped and the bounded reader is the model-facing authority; a local TUI/Edge rendered path is only a human presentation copy. If the artifact is partial or the reader reports unavailable, state that limitation and do not infer missing timing or token facts."
-    )))
+    let content = String::from_utf8(bytes)
+        .map_err(|error| format!("Explain Analyze artifact is not valid UTF-8: {error}"))?;
+    let (window, total_bytes, next_offset) = read_window(&content, offset, max_bytes)?;
+    let continuation = if next_offset >= total_bytes {
+        "Byte window complete; capture status is reported separately.".to_string()
+    } else {
+        format!(
+            "Continue with introspect(artifact=\"{handle}\", offset={next_offset}, max_bytes={max_bytes})."
+        )
+    };
+    let run = artifact.content["run_id"].as_str().unwrap_or_default();
+    let turn = artifact.content["turn_id"].as_str().unwrap_or_default();
+    let generation = &artifact.content["execution_owner_generation"];
+    Ok(format!(
+        "<explain-analyze-artifact>\nArtifact handle: {handle}\nRun: {run}\nTurn: {turn}\nGeneration: {generation}\nCapture status: {status}\nBytes: [{offset}..{next_offset}) of {total_bytes}\n\n{window}\n\n{continuation}\n</explain-analyze-artifact>"
+    ))
 }
 
 fn read_window(
@@ -888,51 +1014,20 @@ pub(crate) async fn resolve_request(
             "server Explain Analyze artifact reader is unavailable".to_string()
         ));
     };
-    let offset = match args.get("offset") {
-        Some(value) => value
-            .as_u64()
-            .and_then(|value| usize::try_from(value).ok())
-            .ok_or_else(|| "offset must be a non-negative integer".to_string()),
-        None => Ok(0),
-    };
-    let max_bytes = match args.get("max_bytes") {
-        Some(value) => value
-            .as_u64()
-            .and_then(|value| usize::try_from(value).ok())
-            .filter(|value| (1..=MAX_WINDOW_BYTES).contains(value))
-            .ok_or_else(|| format!("max_bytes must be an integer from 1 to {MAX_WINDOW_BYTES}")),
-        None => Ok(DEFAULT_WINDOW_BYTES),
-    };
-    Some(async move {
-        let offset = offset?;
-        let max_bytes = max_bytes?;
-        let artifact = store
-            .load_json_artifact(user_id, session_id, &artifact_id)
-            .await
-            .map_err(|error| format!("load Explain Analyze artifact: {error}"))?
-            .ok_or_else(|| "Explain Analyze artifact was not found for this session".to_string())?;
-        if artifact.artifact_kind != ARTIFACT_KIND {
-            return Err("artifact handle does not name a server Explain Analyze snapshot".to_string());
+    Some(
+        async move {
+            let (offset, max_bytes) = window_arguments(args)?;
+            let artifact = store
+                .load_json_artifact(user_id, session_id, &artifact_id)
+                .await
+                .map_err(|error| format!("load Explain Analyze artifact: {error}"))?
+                .ok_or_else(|| {
+                    "Explain Analyze artifact was not found for this session".to_string()
+                })?;
+            render_window(&artifact, session_id, None, None, offset, max_bytes)
         }
-        let (status, bytes) = validate_snapshot_payload_with_bytes(&artifact, session_id, None, None)?;
-        if status == "unavailable" {
-            return Err("the latest Explain Analyze capture is unavailable".to_string());
-        }
-        let content = String::from_utf8(bytes)
-            .map_err(|error| format!("Explain Analyze artifact is not valid UTF-8: {error}"))?;
-        let (window, total_bytes, next_offset) = read_window(&content, offset, max_bytes)?;
-        let continuation = if next_offset >= total_bytes {
-            "Complete.".to_string()
-        } else {
-            format!(
-                "Continue with introspect(artifact=\"{handle}\", offset={next_offset}, max_bytes={max_bytes})."
-            )
-        };
-        Ok(format!(
-            "<explain-analyze-artifact>\nArtifact handle: {handle}\nBytes: [{offset}..{next_offset}) of {total_bytes}\n\n{window}\n\n{continuation}\n</explain-analyze-artifact>"
-        ))
-    }
-    .await)
+        .await,
+    )
 }
 
 #[cfg(test)]
@@ -1120,6 +1215,342 @@ mod tests {
             })),
             references: Vec::new(),
         }
+    }
+
+    async fn handler_fixture() -> (
+        crate::server::runtime_tool_executor::RuntimeToolExecutor,
+        Arc<MemoryStore>,
+        RunEngine,
+    ) {
+        let engine = RunEngine::new(Arc::new(astra_services::runs::InMemoryRunStateStore::new()));
+        for run in ["run-1", "current-root"] {
+            engine.start_run(run, "user-a", "session-a").await.unwrap();
+            engine
+                .append_event(
+                    "user-a",
+                    "session-a",
+                    run,
+                    json!({
+                        "event_type": "run_started", "data": {"explain_analyze_requested": true}
+                    }),
+                )
+                .await
+                .unwrap();
+            if run == "run-1" {
+                engine
+                    .persist_status("user-a", "session-a", run, "completed", None, None)
+                    .await
+                    .unwrap();
+            }
+        }
+        let store = Arc::new(MemoryStore::default());
+        let mut artifact = stored(explain_record(
+            &artifact_id("run-1"),
+            "user-a",
+            "session-a",
+            "complete",
+        ));
+        let generation = engine
+            .load_run("user-a", "run-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .run_generation;
+        artifact.content["execution_owner_generation"] = json!(generation);
+        artifact.metadata.as_mut().unwrap()["execution_owner_generation"] = json!(generation);
+        refresh_integrity_metadata(&mut artifact);
+        store.artifacts.lock().unwrap().insert(
+            (
+                "user-a".into(),
+                "session-a".into(),
+                artifact.artifact_id.clone(),
+            ),
+            artifact,
+        );
+        let executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+            std::env::temp_dir(),
+            "user-a".into(),
+            "session-a".into(),
+            None,
+            None,
+        )
+        .with_explain_root(engine.clone(), "current-root".into())
+        .with_test_session_artifact_store(store.clone());
+        (executor, store, engine)
+    }
+
+    #[tokio::test]
+    async fn lazy_handler_discovers_previous_without_prompt_handle_and_paginates() {
+        let (executor, store, engine) = handler_fixture().await;
+        let (first, fetches) = count_explain_artifact_fetches(executor.execute_with_metadata(
+            "introspect",
+            &json!({"explain": {"target": "previous"}, "max_bytes": 128}),
+        ))
+        .await;
+        assert!(!first.is_error, "{first:?}");
+        let handle = artifact_handle(&artifact_id("run-1"));
+        assert!(first.output.contains(&handle), "{first:?}");
+        assert!(first.output.contains("Run: run-1"));
+        assert!(!first.output.contains("current-root"));
+        assert_eq!(fetches.total, 1);
+        // Advance durable selection after page one; the returned handle remains fixed.
+        engine
+            .persist_status(
+                "user-a",
+                "session-a",
+                "current-root",
+                "completed",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        engine
+            .start_run("new-root", "user-a", "session-a")
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                "user-a",
+                "session-a",
+                "new-root",
+                json!({
+                    "event_type": "run_started", "data": {"explain_analyze_requested": true}
+                }),
+            )
+            .await
+            .unwrap();
+        let page = executor
+            .execute_with_metadata(
+                "introspect",
+                &json!({
+                    "artifact": handle, "offset": 128, "max_bytes": 65536
+                }),
+            )
+            .await;
+        assert!(!page.is_error, "{page:?}");
+        assert!(page.output.contains("Run: run-1"));
+        assert!(page.output.contains("Byte window complete"));
+        for (user, session) in [("other-user", "session-a"), ("user-a", "other-session")] {
+            let foreign = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+                std::env::temp_dir(),
+                user.into(),
+                session.into(),
+                None,
+                None,
+            )
+            .with_explain_root(engine.clone(), "current-root".into())
+            .with_test_session_artifact_store(store.clone());
+            for args in [
+                json!({"explain": {"target": "run", "run_id": "run-1"}}),
+                json!({"artifact": handle}),
+            ] {
+                let denied = foreign.execute_with_metadata("introspect", &args).await;
+                assert!(denied.is_error, "{denied:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn lazy_handler_fails_closed_for_newer_unreadable_capture() {
+        for failure in [
+            "missing",
+            "cancelled",
+            "corrupt",
+            "expired",
+            "generation",
+            "unavailable",
+        ] {
+            let (executor, store, engine) = handler_fixture().await;
+            engine
+                .persist_status(
+                    "user-a",
+                    "session-a",
+                    "current-root",
+                    "completed",
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            engine
+                .start_run("new-root", "user-a", "session-a")
+                .await
+                .unwrap();
+            engine
+                .append_event(
+                    "user-a",
+                    "session-a",
+                    "new-root",
+                    json!({
+                        "event_type": "run_started", "data": {"explain_analyze_requested": true}
+                    }),
+                )
+                .await
+                .unwrap();
+            if failure == "cancelled" {
+                let run = engine
+                    .load_run("user-a", "new-root")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                engine
+                    .cancel_if_exact_live_owner(
+                        "user-a",
+                        "session-a",
+                        "new-root",
+                        run.run_generation,
+                        &["running"],
+                        astra_turn_core::orchestration_types::CancellationOrigin::Runtime,
+                        "Explain fixture cancellation",
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    engine
+                        .load_run("user-a", "new-root")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    "cancelled"
+                );
+            } else {
+                engine
+                    .persist_status("user-a", "session-a", "new-root", "paused", None, None)
+                    .await
+                    .unwrap();
+            }
+            if !matches!(failure, "missing" | "cancelled") {
+                let mut artifact = stored(explain_record(
+                    &artifact_id("new-root"),
+                    "user-a",
+                    "session-a",
+                    if failure == "unavailable" {
+                        "unavailable"
+                    } else {
+                        "complete"
+                    },
+                ));
+                artifact.content["run_id"] = json!("new-root");
+                if let Some(events) = artifact.content["events"].as_array_mut() {
+                    for event in events {
+                        event["run_id"] = json!("new-root");
+                    }
+                }
+                let generation = engine
+                    .load_run("user-a", "new-root")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .run_generation;
+                artifact.content["execution_owner_generation"] = json!(generation);
+                artifact.metadata.as_mut().unwrap()["execution_owner_generation"] =
+                    json!(generation);
+                match failure {
+                    "corrupt" => artifact.content = json!({}),
+                    "expired" => artifact.status = Some("expired".into()),
+                    "generation" => {
+                        artifact.content["execution_owner_generation"] = json!(generation + 1);
+                        artifact.metadata.as_mut().unwrap()["execution_owner_generation"] =
+                            json!(generation + 1);
+                    }
+                    _ => {}
+                }
+                refresh_integrity_metadata(&mut artifact);
+                store.artifacts.lock().unwrap().insert(
+                    (
+                        "user-a".into(),
+                        "session-a".into(),
+                        artifact.artifact_id.clone(),
+                    ),
+                    artifact,
+                );
+            }
+            let (result, fetches) =
+                count_explain_artifact_fetches(executor.execute_with_metadata(
+                    "introspect",
+                    &json!({"explain": {"target": "previous"}}),
+                ))
+                .await;
+            assert!(result.is_error, "{failure}: {result:?}");
+            assert!(
+                !result
+                    .output
+                    .contains(&artifact_handle(&artifact_id("run-1")))
+            );
+            assert_eq!(fetches.recovery, 0, "{failure}");
+            assert_eq!(
+                fetches.discovery,
+                if matches!(failure, "missing" | "cancelled") {
+                    2
+                } else {
+                    1
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lazy_handler_rejects_ambiguous_selectors_before_discovery() {
+        let (executor, _, _) = handler_fixture().await;
+        for args in [
+            json!({"explain": {"target": "previous"}, "artifact": "artifact://session/explain-analyze/x"}),
+            json!({"explain": {"target": "run"}}),
+            json!({"explain": {"target": "previous", "run_id": "run-1"}}),
+            json!({"explain": {"target": "previous"}, "offset": 1}),
+            json!({"explain": {"target": "previous"}, "max_bytes": 65537}),
+            json!({"explain": {"target": "previous"}, "source_policy": "local_only"}),
+        ] {
+            let (result, fetches) =
+                count_explain_artifact_fetches(executor.execute_with_metadata("introspect", &args))
+                    .await;
+            assert!(result.is_error, "{result:?}");
+            assert_eq!(fetches.total, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_capture_stays_partial_across_utf8_windows() {
+        let (executor, store, _) = handler_fixture().await;
+        let id = artifact_id("run-1");
+        {
+            let mut artifacts = store.artifacts.lock().unwrap();
+            let artifact = artifacts
+                .get_mut(&("user-a".into(), "session-a".into(), id.clone()))
+                .unwrap();
+            artifact.content["capture_status"] = json!("partial");
+            artifact.content["delivery_degraded"] = json!(true);
+            artifact.content["events"][0]["label"] = json!("观测");
+            artifact.metadata.as_mut().unwrap()["status"] = json!("partial");
+            refresh_integrity_metadata(artifact);
+        }
+        let first = executor
+            .execute(
+                "introspect",
+                &json!({
+                    "explain": {"target": "previous"}, "max_bytes": 128
+                }),
+            )
+            .await;
+        assert!(first.contains("Capture status: partial"), "{first}");
+        let last = executor
+            .execute(
+                "introspect",
+                &json!({
+                    "artifact": artifact_handle(&id), "offset": 128, "max_bytes": 65536
+                }),
+            )
+            .await;
+        assert!(last.contains("Capture status: partial"), "{last}");
+        assert!(last.contains("Byte window complete"), "{last}");
+        assert!(
+            !last.contains("total_tokens"),
+            "unknown usage must not become zero"
+        );
+        assert_eq!(read_window("a观测z", 1, 4).unwrap(), ("观".into(), 8, 4));
+        assert!(read_window("a观测z", 2, 4).is_err());
+        assert!(read_window("观", 0, 2).is_err());
     }
 
     #[tokio::test]

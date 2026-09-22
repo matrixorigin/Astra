@@ -19,10 +19,9 @@ use astra_services::runs::{
 };
 use astra_services::session_workspace::{WorkspaceMetadata, persist_remote_workspace};
 use astra_services::{
-    BubbleUpTarget, COMPACTION_INVARIANT_SQL, ConfidenceAction, ContextManifestItemWrite,
-    ContextManifestWrite, DatabaseContextManifestStore, DatabaseRunStateStore,
-    DatabaseSessionArtifactStore, DatabaseStateProjectionStore, DelegationProjectionUpsert,
-    SessionArtifactJsonRecord, SessionArtifactJsonStore, next_action_confidence_action,
+    BubbleUpTarget, ContextManifestItemWrite, ContextManifestWrite, DatabaseContextManifestStore,
+    DatabaseRunStateStore, DatabaseSessionArtifactStore, DatabaseStateProjectionStore,
+    DelegationProjectionUpsert, SessionArtifactJsonRecord, SessionArtifactJsonStore,
 };
 use astra_thin_client::{
     ASTRA_DEVICE_CHALLENGE_ID_HEADER, ASTRA_DEVICE_FINGERPRINT_HEADER, ASTRA_DEVICE_ID_HEADER,
@@ -1090,322 +1089,6 @@ fn absorb_sse_events(events: Vec<Value>, seen: &mut BTreeSet<i64>, next_index: &
         );
         *next_index += 1;
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn save_manifest_turn(
-    store: &DatabaseContextManifestStore,
-    user_id: &str,
-    session_id: &str,
-    run_id: &str,
-    turn: usize,
-    reason: &str,
-    total_tokens: u32,
-    extra_items: Vec<ContextManifestItemWrite>,
-) {
-    let manifest_id = id("manifest");
-    let mut items = vec![ContextManifestItemWrite {
-        session_id: session_id.to_string(),
-        item_order: 0,
-        zone: "recent_tail".to_string(),
-        source_table: "session_transcript_items".to_string(),
-        source_id: format!("{session_id}:{turn}"),
-        source_hash: None,
-        included: true,
-        token_estimate: total_tokens.min(900),
-        budget_tokens: 2_000,
-        reason: reason.to_string(),
-        render_mode: "plain_text".to_string(),
-        raw_ref: Some(format!("conversation_log://{session_id}/turn/{turn}")),
-    }];
-    for (offset, mut item) in extra_items.into_iter().enumerate() {
-        item.item_order = (offset + 1) as i32;
-        items.push(item);
-    }
-    store
-        .save_manifest(
-            ContextManifestWrite {
-                manifest_id: manifest_id.clone(),
-                user_id: user_id.to_string(),
-                session_id: session_id.to_string(),
-                run_id: Some(run_id.to_string()),
-                turn_id: format!("turn-{turn:02}"),
-                model_provider: "mock".to_string(),
-                model_name: "joint-fixed-llm".to_string(),
-                context_window_tokens: 128_000,
-                max_output_tokens: 2_000,
-                total_estimated_tokens: total_tokens,
-                policy_version: "context_manifest_v1".to_string(),
-                tokenizer_id: Some("estimated_v1".to_string()),
-                budget_template_id: Some("budget_v1_128k".to_string()),
-                turn_intent: Some("development".to_string()),
-                reason: reason.to_string(),
-                manifest_json: json!({
-                    "e2e": "joint",
-                    "turn": turn,
-                    "zones": {
-                        "recent_tail": {"used_tokens": total_tokens.min(900), "budget_tokens": 2000}
-                    }
-                }),
-            },
-            items,
-        )
-        .await
-        .expect("save_manifest_turn must persist manifest and items");
-}
-
-#[tokio::test]
-#[allow(unused_attributes)]
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-#[ignore = "e2e_joint"]
-async fn e2e_joint_1_s01_rust_60_turn_refactor_chain() {
-    let pool = setup_pool().await;
-    let user_id = id("user");
-    let session_id = id("session");
-    let run_id = id("run");
-    insert_session(&pool, &user_id, &session_id).await;
-    insert_run_row(
-        &pool,
-        &user_id,
-        &session_id,
-        &run_id,
-        None,
-        &run_id,
-        &run_id,
-        0,
-        "completed",
-        None,
-        "node",
-    )
-    .await;
-    let plan_item = insert_state_item(
-        &pool,
-        &user_id,
-        &session_id,
-        &run_id,
-        "plan_state",
-        "rust-refactor-plan",
-        7,
-    )
-    .await;
-    for category in [
-        "decision",
-        "finding",
-        "benchmark",
-        "citation",
-        "todo_state",
-        "error_state",
-        "delegation_state",
-    ] {
-        insert_state_item(
-            &pool,
-            &user_id,
-            &session_id,
-            &run_id,
-            category,
-            &format!("{category}-seed"),
-            1,
-        )
-        .await;
-    }
-
-    sqlx::query(
-        "INSERT INTO session_transcript_items
-         (session_id, item_seq, user_id, run_id, role, content, content_hash, created_at)
-         VALUES (?, 17, ?, ?, 'assistant', ?, ?, NOW(6))",
-    )
-    .bind(&session_id)
-    .bind(&user_id)
-    .bind(&run_id)
-    .bind("borrow checker detail from early refactor")
-    .bind(id("hash"))
-    .execute(pool.get())
-    .await
-    .expect("S01 retrieval seed transcript item must be inserted");
-
-    let artifact_id = id("artifact");
-    sqlx::query(
-        "INSERT INTO session_artifacts
-         (artifact_id, session_id, user_id, owner_run_id, root_run_id, artifact_kind, source,
-          content_json, metadata, access_scope, retention_policy, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'cargo', 'tool_output', ?, ?, 'same_root_tree', 'default',
-                 'active', NOW(6), NOW(6))",
-    )
-    .bind(&artifact_id)
-    .bind(&session_id)
-    .bind(&user_id)
-    .bind(&run_id)
-    .bind(&run_id)
-    .bind(json!({"preview_text": "cargo test failed in crate astra-runtime"}).to_string())
-    .bind(
-        json!({"byte_size": 2 * 1024 * 1024, "summary": "cargo test 2MB output preserved"})
-            .to_string(),
-    )
-    .execute(pool.get())
-    .await
-    .expect("S01 large cargo artifact must be inserted");
-
-    let manifest_store = DatabaseContextManifestStore::new(pool.clone());
-    let projection_store = DatabaseStateProjectionStore::new(pool.clone());
-    let compaction_turns = [8_usize, 38, 58];
-    let mut compaction_runs = 0usize;
-    let turn_count = 60usize;
-    for turn in 0..turn_count {
-        if compaction_turns.contains(&turn) {
-            let compaction_run_id = id("compact");
-            insert_run_row(
-                &pool,
-                &user_id,
-                &session_id,
-                &compaction_run_id,
-                Some(&run_id),
-                &run_id,
-                &format!("{run_id}/{compaction_run_id}"),
-                1,
-                "completed",
-                None,
-                "node",
-            )
-            .await;
-            let results = projection_store
-                .compact_session_state(&user_id, &session_id, &compaction_run_id, 640)
-                .await
-                .expect("S01 compaction must run through DatabaseStateProjectionStore");
-            assert!(
-                results.len() == COMPACTION_INVARIANT_SQL.len(),
-                "S01 compaction must execute all invariants; got {} expected {}",
-                results.len(),
-                COMPACTION_INVARIANT_SQL.len()
-            );
-            assert!(
-                results.iter().all(|(_, violations)| *violations == 0),
-                "S01 compaction invariants must all return 0, got {results:?}"
-            );
-            compaction_runs += 1;
-            continue;
-        }
-        let mut extra = Vec::new();
-        let reason = if turn == 17 {
-            extra.push(ContextManifestItemWrite {
-                session_id: session_id.clone(),
-                item_order: 1,
-                zone: "retrieved_facts".to_string(),
-                source_table: "session_transcript_items".to_string(),
-                source_id: format!("{session_id}:17"),
-                source_hash: None,
-                included: true,
-                token_estimate: 220,
-                budget_tokens: 1_000,
-                reason: "history_recall_structured".to_string(),
-                render_mode: "summary".to_string(),
-                raw_ref: Some(format!("transcript://{session_id}/17")),
-            });
-            "history_recall_structured"
-        } else if turn == 44 {
-            extra.push(ContextManifestItemWrite {
-                session_id: session_id.clone(),
-                item_order: 1,
-                zone: "tool_previews".to_string(),
-                source_table: "session_artifacts".to_string(),
-                source_id: artifact_id.clone(),
-                source_hash: None,
-                included: true,
-                token_estimate: 1_200,
-                budget_tokens: 1_200,
-                reason: "large_tool_output_gated".to_string(),
-                render_mode: "tool_preview".to_string(),
-                raw_ref: Some(format!("artifact://{session_id}/{artifact_id}")),
-            });
-            "large_tool_output_gated"
-        } else {
-            "normal_turn"
-        };
-        save_manifest_turn(
-            &manifest_store,
-            &user_id,
-            &session_id,
-            &run_id,
-            turn,
-            reason,
-            1_200,
-            extra,
-        )
-        .await;
-    }
-
-    let row = sqlx::query(
-        "SELECT COUNT(*) AS manifest_count, SUM(total_estimated_tokens) AS actual_tokens
-         FROM context_manifests WHERE session_id = ?",
-    )
-    .bind(&session_id)
-    .fetch_one(pool.get())
-    .await
-    .expect("S01 manifest count query must succeed");
-    let manifest_count = row.try_get::<i64, _>("manifest_count").unwrap_or_default();
-    let actual_tokens = row
-        .try_get::<Option<i64>, _>("actual_tokens")
-        .unwrap_or(Some(0))
-        .unwrap_or(0);
-    assert!(
-        manifest_count == turn_count as i64,
-        "S01 must persist one manifest per turn; got {manifest_count}, expected {turn_count}"
-    );
-    assert!(
-        compaction_runs == compaction_turns.len(),
-        "S01 must trigger expected compactions; got {compaction_runs}, expected {}",
-        compaction_turns.len()
-    );
-    let plan_version = sqlx::query("SELECT version FROM session_state_items WHERE item_id = ?")
-        .bind(&plan_item)
-        .fetch_one(pool.get())
-        .await
-        .expect("S01 plan_state version query must succeed")
-        .try_get::<i64, _>("version")
-        .unwrap_or_default();
-    assert!(
-        plan_version == 7,
-        "S01 compaction must not spuriously bump plan_state version; got {plan_version}"
-    );
-    let naive_tokens = turn_count as i64 * 3_000;
-    let saved_tokens = naive_tokens.saturating_sub(actual_tokens);
-    assert!(
-        saved_tokens * 100 >= naive_tokens * 50,
-        "S01 token savings must be >=50%; naive={naive_tokens}, actual={actual_tokens}"
-    );
-    let artifact_refs = sqlx::query(
-        "SELECT referenced_by_manifest_count FROM session_artifacts
-         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&artifact_id)
-    .fetch_one(pool.get())
-    .await
-    .expect("S01 artifact reference query must succeed")
-    .try_get::<i64, _>("referenced_by_manifest_count")
-    .unwrap_or_default();
-    assert!(
-        artifact_refs >= 1,
-        "S01 large cargo artifact must be referenced by manifest, got {artifact_refs}"
-    );
-    sqlx::query(
-        "UPDATE session_artifacts SET status = 'expired'
-         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&artifact_id)
-    .execute(pool.get())
-    .await
-    .expect("S01 must be able to expire artifact for placeholder rendering");
-    let rendered = manifest_store
-        .render_artifact_manifest_item(&user_id, &session_id, &artifact_id, None)
-        .await
-        .expect("S01 expired artifact renderer must use persisted summary");
-    assert!(
-        rendered.contains("historical, raw no longer available, summary preserved"),
-        "S01 expired artifact renderer must return historical placeholder, got {rendered}"
-    );
 }
 
 #[tokio::test]
@@ -2476,7 +2159,7 @@ async fn e2e_joint_4_s10_five_level_delegation_bubble_up_and_retry_node() {
 #[allow(unused_attributes)]
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
 #[ignore = "e2e_joint"]
-async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
+async fn four_devices_hydrate_revoke_and_receive_lease_expiry_events() {
     let pool = setup_pool().await;
     let matrixone = require_db_it_env();
     let user_id = id("user");
@@ -2538,18 +2221,33 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
         )
         .await
         .expect("S14 second event must make run_event_high_watermark positive");
-    for seq in 1..=4_i64 {
+    let transcript_child = id("transcript-child");
+    insert_run_row(
+        &pool,
+        &user_id,
+        &session_id,
+        &transcript_child,
+        Some(&run_id),
+        &run_id,
+        &format!("{run_id}/{transcript_child}"),
+        1,
+        "completed",
+        None,
+        "node",
+    )
+    .await;
+    for seq in 1..=60_i64 {
         sqlx::query(
             "INSERT INTO session_transcript_items
-             (session_id, item_seq, user_id, run_id, role, content, source_event_idx, content_hash, created_at)
+             (session_id, item_seq, user_id, run_id, role, content, source_event_id, content_hash, created_at)
              VALUES (?, ?, ?, ?, 'assistant', ?, ?, ?, NOW(6))",
         )
         .bind(&session_id)
         .bind(seq)
         .bind(&user_id)
-        .bind(&run_id)
+        .bind(if seq % 10 == 0 { &transcript_child } else { &run_id })
         .bind(format!("transcript item {seq}"))
-        .bind(seq - 1)
+        .bind(format!("transcript-source-{seq}"))
         .bind(id("hash"))
         .execute(pool.get())
         .await
@@ -2707,6 +2405,70 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
                 .is_some_and(|items| items.len() == 2),
             "S14 cold-start transcript pagination must return requested page; transcript={transcript}"
         );
+
+        if device_idx == 0 {
+            for (scope, expected) in [
+                (String::new(), (1..=60_i64).collect::<Vec<_>>()),
+                (
+                    "&scope=root_conversation".to_string(),
+                    (1..=60_i64).filter(|seq| seq % 10 != 0).collect(),
+                ),
+                (
+                    format!("&run_id={run_id}"),
+                    (1..=60_i64).filter(|seq| seq % 10 != 0).collect(),
+                ),
+                (
+                    format!("&run_id={transcript_child}"),
+                    (1..=60_i64).filter(|seq| seq % 10 == 0).collect(),
+                ),
+            ] {
+                let mut before = 61;
+                let mut seen = Vec::new();
+                loop {
+                    let page: Value = client.get(format!(
+                        "http://{addr}/sessions/{session_id}/transcript?limit=17&before_seq={before}{scope}"
+                    )).header("authorization", HTTP_TOKEN).send().await.unwrap()
+                        .error_for_status().expect("public transcript page")
+                        .json().await.unwrap();
+                    let rows = page["items"].as_array().expect("transcript items");
+                    assert_eq!(
+                        page.as_object().unwrap().len(),
+                        4,
+                        "item/cursor response contract"
+                    );
+                    let sequences = rows
+                        .iter()
+                        .map(|item| {
+                            let seq = item["item_seq"].as_i64().unwrap();
+                            assert_eq!(item["source_event_id"], format!("transcript-source-{seq}"));
+                            seq
+                        })
+                        .collect::<Vec<_>>();
+                    assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+                    assert!(sequences.iter().all(|seq| *seq < before));
+                    if scope.is_empty() && before == 61 {
+                        sqlx::query(
+                            "INSERT INTO session_transcript_items
+                             (user_id, session_id, item_seq, run_id, role, content, source_event_id, content_hash)
+                             VALUES (?, ?, 61, ?, 'assistant', 'concurrent append', 'transcript-source-61', 'append-hash')",
+                        ).bind(&user_id).bind(&session_id).bind(&run_id)
+                            .execute(pool.get()).await.expect("append between public pages");
+                    }
+                    seen.extend(sequences);
+                    if !page["has_more"].as_bool().unwrap() {
+                        break;
+                    }
+                    let next = page["next_before_seq"].as_i64().expect("older cursor");
+                    assert!(next < before, "pagination must make progress");
+                    before = next;
+                }
+                seen.sort_unstable();
+                assert_eq!(
+                    seen, expected,
+                    "scoped pagination remains stable during append"
+                );
+            }
+        }
         let replay = get_stream(&client, addr, &run_id, 0).await;
         assert!(
             replay
@@ -2832,38 +2594,6 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
             .expect("S14 revoked_at must decode")
             .is_some(),
         "S14 rejected hydration must not erase revocation evidence"
-    );
-
-    let budget = astra_services::budget_for_turn_intent(Some("benchmark_comparison"));
-    let zone_total = budget.budget.input_context_cap();
-    assert!(
-        zone_total <= 7_300,
-        "S14 budget_v1_8k zones must stay <=7300 tokens, got {zone_total}"
-    );
-    assert!(
-        budget.budget.tool_previews == 2_500 && budget.borrowed_from_recent_tail > 0,
-        "S14 benchmark_comparison must flex tool_previews to 2500 from recent_tail; allocation={budget:?}"
-    );
-    assert!(
-        matches!(
-            next_action_confidence_action(0.9, 0, "structured_event", Some("event-1")),
-            ConfidenceAction::AutoAccept
-        ),
-        "S14 high-confidence structured event must auto-accept"
-    );
-    assert!(
-        matches!(
-            next_action_confidence_action(0.65, 0, "rule", Some("event-2")),
-            ConfidenceAction::AskUser
-        ),
-        "S14 medium-confidence action must ask user"
-    );
-    assert!(
-        matches!(
-            next_action_confidence_action(0.95, 0, "small_model", None),
-            ConfidenceAction::AskUser
-        ),
-        "S14 small-model-only action must require confirmation despite high score"
     );
 
     let mut rx = astra_runtime::server::device_lease_sweeper::subscribe_device_lease_events();

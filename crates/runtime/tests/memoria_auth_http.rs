@@ -1,8 +1,13 @@
 use astra_core::{JwtSettings, MatrixOneSettings, MemoriaSettings, SharedPool};
+use astra_memoria::MemoriaOperationError;
+use astra_runtime::turn::memory_prefetch::{
+    prefetch_memories_with_client, prefetch_session_start_memories_with_client,
+};
 use astra_runtime::{AppState, HealthChecker, MemoriaPort, ServiceInfo, build_app};
 use astra_services::{
     AuthService, DatabaseAuthService, FernetTokenEncryptor, auth::AuthRegisterRequestData,
 };
+use astra_turn_types::MemoryRetrievalOutcome;
 use async_trait::async_trait;
 use axum::{
     Json, Router,
@@ -12,7 +17,7 @@ use axum::{
 };
 use serde_json::{Value, json};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 use tower::ServiceExt;
@@ -21,6 +26,99 @@ use tower::ServiceExt;
 mod isolated_database;
 
 struct Healthy;
+
+#[derive(Clone, Default)]
+struct ReadFixture {
+    requests: Arc<Mutex<Vec<(String, String)>>>,
+    mode: Arc<Mutex<String>>,
+}
+
+impl ReadFixture {
+    fn count(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+
+    async fn respond(
+        &self,
+        headers: axum::http::HeaderMap,
+        query: &str,
+    ) -> (StatusCode, Json<Value>) {
+        self.requests.lock().unwrap().push((
+            headers["authorization"].to_str().unwrap().into(),
+            headers["x-user-id"].to_str().unwrap().into(),
+        ));
+        let mode = self.mode.lock().unwrap().clone();
+        match mode.as_str() {
+            "unauthorized" => (StatusCode::UNAUTHORIZED, Json(json!({}))),
+            "forbidden" => (StatusCode::FORBIDDEN, Json(json!({}))),
+            "failed" => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({}))),
+            "foreign" => (
+                StatusCode::OK,
+                Json(json!({"memories":[{
+                    "memory_id":"foreign", "content":"private foreign memory",
+                    "memory_type":"working", "session_id":"other-session"
+                }]})),
+            ),
+            "partial" if query == "user profile preferences role" => (
+                StatusCode::OK,
+                Json(json!({"memories":[{
+                    "memory_id":"profile", "memory_type":"profile", "retrieval_score":0.9, "content":
+                    astra_prompts::memory_proto::MemoryEntry::new(
+                        astra_prompts::memory_proto::NS_PREF, astra_prompts::memory_proto::ST_ACTIVE,
+                        "Prefers concise answers").encode()
+                }]})),
+            ),
+            "timeout" | "partial" => {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                (StatusCode::OK, Json(json!({"memories":[]})))
+            }
+            _ => (StatusCode::OK, Json(json!({"memories":[]}))),
+        }
+    }
+}
+
+struct NoSummary;
+#[async_trait]
+impl astra_turn_core::cloud_summary::SummaryLlmClient for NoSummary {
+    async fn summarize(
+        &self,
+        _: astra_turn_types::InferencePurpose,
+        _: &[Value],
+    ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, astra_core::ClassifiedError> {
+        panic!("authority denial must precede summary generation")
+    }
+}
+
+async fn assert_no_summary(port: &dyn MemoriaPort) {
+    use astra_runtime::prompts::{CompactConfig, CompactionTier};
+    use astra_runtime::turn::cloud::memoria_compact::{
+        MemoriaCompactConfig, MemoriaCompactParams, compact_with_memoria,
+    };
+    compact_with_memoria(
+        &[json!({"role":"user", "content":"summarize this session"})],
+        Some("session"),
+        &MemoriaCompactConfig {
+            min_tokens_for_retrieval: 1,
+            ..Default::default()
+        },
+        &MemoriaCompactParams {
+            budget_chars: 10000,
+            keep_chars: 2000,
+            tier: CompactionTier::AggressivePrune,
+            keep_recent_turns: 4,
+            current_tokens: 6000,
+            session_facts: None,
+        },
+        Some(port),
+        Some(&CompactConfig {
+            enable_summary: true,
+            summary_min_tier: CompactionTier::AggressivePrune,
+            ..Default::default()
+        }),
+        Some(&NoSummary),
+    )
+    .await;
+}
 #[async_trait]
 impl HealthChecker for Healthy {
     async fn database_healthy(&self) -> bool {
@@ -72,6 +170,9 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
     let owner = format!("http-{}", uuid::Uuid::new_v4());
     let read_calls = calls.clone();
     let store_calls = calls.clone();
+    let reads = ReadFixture::default();
+    let prompt_reads = reads.clone();
+    let typed_reads = reads.clone();
     let app = Router::new()
         .route("/auth/whoami", get(move |headers: axum::http::HeaderMap| {
             let owner = owner.clone();
@@ -104,7 +205,15 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
                 );
                 async { Json(json!({"memory_id":"local-memory"})) }
             }),
-        );
+        )
+        .route("/v1/memories/retrieve", post(move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
+            let reads = prompt_reads.clone();
+            async move { reads.respond(headers, body["query"].as_str().unwrap_or_default()).await }
+        }))
+        .route("/v1/memories", get(move |headers: axum::http::HeaderMap| {
+            let reads = typed_reads.clone();
+            async move { reads.respond(headers, "typed").await }
+        }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
@@ -116,7 +225,6 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
         self_hosted_master_access: false,
         issuer: None,
         web_url: Some("http://localhost".into()),
-        legacy_issuer: None,
     };
     let auth = Arc::new(
         DatabaseAuthService::new(
@@ -133,6 +241,17 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
         .with_memoria_settings(&provider)
         .unwrap(),
     );
+    let unbound = astra_runtime::turn::cloud::memoria_compact::UserScopedMemoriaPort::template(
+        auth.memoria_credentials().unwrap(),
+    );
+    assert!(matches!(
+        unbound
+            .retrieve_scoped_typed("query", "session", 1, &["working"])
+            .await,
+        Err(MemoriaOperationError::AuthorityUnavailable(_))
+    ));
+    assert_no_summary(&unbound).await;
+    assert_eq!(reads.count(), 0, "unbound authority never reaches Memoria");
     let local = auth
         .register(AuthRegisterRequestData {
             username: format!("local-{}", uuid::Uuid::new_v4()),
@@ -148,6 +267,20 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
     )
     .with_self_hosted_fallback(base.clone(), "self-hosted-fallback-key".into());
     assert!(local_port.admits_operation(true).await.unwrap());
+    assert!(
+        local_port
+            .retrieve("local read", None, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        reads.requests.lock().unwrap()[0],
+        (
+            "Memoria-Owner self-hosted-fallback-key".into(),
+            local.user_id.clone()
+        )
+    );
     let local_transport = local_port
         .resolve_tool_transport(true)
         .await
@@ -256,6 +389,108 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
         .unwrap();
     assert!(!scoped_transport.owner_scoped_master);
     assert_ne!(scoped_transport.owner_user_id, login["user_id"]);
+    let user_id = login["user_id"].as_str().unwrap();
+    let before = reads.count();
+    assert!(matches!(
+        retained_scoped_port
+            .retrieve_for_prompt("query", "other-owner", "session", 1)
+            .await,
+        Err(MemoriaOperationError::Failed(_))
+    ));
+    assert_eq!(reads.count(), before, "owner mismatch must precede HTTP");
+    let empty =
+        prefetch_memories_with_client(&retained_scoped_port, "query", user_id, "session", 1).await;
+    assert_eq!(empty.outcome, MemoryRetrievalOutcome::Complete);
+    assert!(empty.entries.is_empty());
+    assert_eq!(reads.count(), before + 1);
+    assert_eq!(
+        reads.requests.lock().unwrap().last().unwrap(),
+        &(
+            "Bearer readonly-key".into(),
+            scoped_transport.owner_user_id.clone()
+        )
+    );
+    let before = reads.count();
+    assert_eq!(
+        prefetch_session_start_memories_with_client(&retained_scoped_port, user_id, "session")
+            .await
+            .outcome,
+        MemoryRetrievalOutcome::Complete
+    );
+    assert_eq!(reads.count(), before + 2);
+    for mode in ["unauthorized", "forbidden", "failed", "timeout"] {
+        *reads.mode.lock().unwrap() = mode.into();
+        let before = reads.count();
+        assert_eq!(
+            prefetch_memories_with_client(&retained_scoped_port, "query", user_id, "session", 1)
+                .await
+                .outcome,
+            MemoryRetrievalOutcome::Unavailable
+        );
+        assert_eq!(reads.count(), before + 1);
+    }
+    *reads.mode.lock().unwrap() = "partial".into();
+    let before = reads.count();
+    let partial =
+        prefetch_session_start_memories_with_client(&retained_scoped_port, user_id, "session")
+            .await;
+    assert_eq!(partial.outcome, MemoryRetrievalOutcome::Partial);
+    assert_eq!(partial.entries.len(), 1);
+    assert_eq!(reads.count(), before + 2);
+    *reads.mode.lock().unwrap() = "foreign".into();
+    let error = retained_scoped_port
+        .retrieve_scoped_typed("query", "session", 1, &["working"])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, MemoriaOperationError::Failed(_)));
+    assert!(!error.to_string().contains("private foreign memory"));
+    *reads.mode.lock().unwrap() = String::new();
+    // Change persisted consent while retaining the port. Neither fallback nor
+    // an earlier successful write admission may override the current binding.
+    let metadata: String = sqlx::query_scalar("SELECT CAST(metadata AS CHAR) FROM auth_tokens WHERE type = 'memoria_connection' AND provider = 'memoria' AND scope_user_id = ?")
+        .bind(user_id).fetch_one(pool.get()).await.unwrap();
+    let mut changed: Value = serde_json::from_str(&metadata).unwrap();
+    changed["memory_access"] = json!("read_write");
+    sqlx::query("UPDATE auth_tokens SET metadata = ? WHERE type = 'memoria_connection' AND provider = 'memoria' AND scope_user_id = ?")
+        .bind(changed.to_string()).bind(user_id).execute(pool.get()).await.unwrap();
+    assert!(
+        retained_scoped_port
+            .retrieve("read-write", None, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(retained_scoped_port.admits_operation(true).await.unwrap());
+    changed["memory_access"] = json!("none");
+    sqlx::query("UPDATE auth_tokens SET metadata = ? WHERE type = 'memoria_connection' AND provider = 'memoria' AND scope_user_id = ?")
+        .bind(changed.to_string()).bind(user_id).execute(pool.get()).await.unwrap();
+    let before = reads.count();
+    let writes_before = calls.load(Ordering::SeqCst);
+    assert!(matches!(
+        retained_scoped_port.retrieve("revoked", None, 1).await,
+        Err(MemoriaOperationError::Disabled(_))
+    ));
+    assert_eq!(
+        prefetch_session_start_memories_with_client(&retained_scoped_port, user_id, "session")
+            .await
+            .outcome,
+        MemoryRetrievalOutcome::NotAttempted
+    );
+    assert_no_summary(&retained_scoped_port).await;
+    let denial = retained_scoped_port
+        .store("revoked after admission", "semantic", None, None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        denial,
+        astra_services::auth::memoria::MemoryAccess::None
+            .denial_message(true)
+            .unwrap()
+    );
+    assert_eq!(reads.count(), before);
+    assert_eq!(calls.load(Ordering::SeqCst), writes_before);
+    sqlx::query("UPDATE auth_tokens SET metadata = ? WHERE type = 'memoria_connection' AND provider = 'memoria' AND scope_user_id = ?")
+        .bind(metadata).bind(user_id).execute(pool.get()).await.unwrap();
     let (status, profile) = request(
         app.clone(),
         "GET",
@@ -322,6 +557,25 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
             .is_none()
     );
     let calls_after_disconnect = calls.load(Ordering::SeqCst);
+    let reads_after_disconnect = reads.count();
+    assert!(matches!(
+        retained_scoped_port.retrieve("query", None, 1).await,
+        Err(MemoriaOperationError::Disabled(_))
+    ));
+    assert_eq!(
+        prefetch_memories_with_client(&retained_scoped_port, "query", user_id, "session", 1)
+            .await
+            .outcome,
+        MemoryRetrievalOutcome::NotAttempted
+    );
+    assert_eq!(
+        prefetch_session_start_memories_with_client(&retained_scoped_port, user_id, "session")
+            .await
+            .outcome,
+        MemoryRetrievalOutcome::NotAttempted
+    );
+    assert_no_summary(&retained_scoped_port).await;
+    assert_eq!(reads.count(), reads_after_disconnect);
     assert!(!retained_scoped_port.admits_operation(false).await.unwrap());
     assert!(
         retained_scoped_port
@@ -343,6 +597,11 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
         .await
         .unwrap();
     assert!(!local_port.admits_operation(true).await.unwrap());
+    assert!(matches!(
+        local_port.retrieve("query", None, 1).await,
+        Err(MemoriaOperationError::Disabled(_))
+    ));
+    assert_eq!(reads.count(), reads_after_disconnect);
     assert!(local_port.resolve_tool_transport(true).await.is_err());
     assert!(
         local_port
@@ -357,6 +616,11 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
         .await
         .unwrap();
     assert!(!local_port.admits_operation(false).await.unwrap());
+    assert!(matches!(
+        local_port.retrieve("query", None, 1).await,
+        Err(MemoriaOperationError::Disabled(_))
+    ));
+    assert_eq!(reads.count(), reads_after_disconnect);
     assert!(local_port.resolve_tool_transport(false).await.is_err());
     assert!(
         local_port
@@ -365,5 +629,20 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
             .is_err()
     );
     assert_eq!(calls.load(Ordering::SeqCst), calls_after_disconnect);
+    // Closing this isolated fixture's pool creates a real authority lookup
+    // failure without changing schema or allowing the configured fallback.
+    pool.get().close().await;
+    assert!(matches!(
+        retained_scoped_port.retrieve("query", None, 1).await,
+        Err(MemoriaOperationError::AuthorityUnavailable(_))
+    ));
+    assert_eq!(
+        prefetch_memories_with_client(&retained_scoped_port, "query", user_id, "session", 1)
+            .await
+            .outcome,
+        MemoryRetrievalOutcome::Unavailable
+    );
+    assert_no_summary(&retained_scoped_port).await;
+    assert_eq!(reads.count(), reads_after_disconnect);
     server.abort();
 }

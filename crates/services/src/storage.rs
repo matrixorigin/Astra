@@ -21,21 +21,6 @@ const EDGE_PENDING_DISPATCH_IDENTITY_COLUMNS: &[&str] = &[
     "turn_chain_id",
     "request_id",
 ];
-const EDGE_PENDING_DISPATCH_LEGACY_COLUMNS: &[&str] = &[
-    "user_id",
-    "edge_agent_id",
-    "request_id",
-    "payload_json",
-    "result_json",
-    "status",
-    "pod_id",
-    "dispatched_at",
-    "completed_at",
-    "created_at",
-];
-const EDGE_PENDING_DISPATCH_LEGACY_PRIMARY_KEY: &[&str] = &["user_id", "request_id"];
-const EDGE_PENDING_DISPATCH_LEGACY_ARCHIVE_TABLE: &str =
-    "edge_pending_dispatch_legacy_owner_request_v1";
 const TOOL_INVOCATION_LEDGER_REQUIRED_COLUMNS: &[&str] = &["identity_key"];
 const TOOL_INVOCATION_LEDGER_REQUIRED_VARCHAR_WIDTHS: &[(&str, u64)] = &[("identity_key", 71)];
 
@@ -122,7 +107,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-22-v87";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-22-v89";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -292,48 +277,7 @@ const INSERT_CORE_SCHEMA_TABLE_CLAIM_WITHOUT_TAKEOVER_SQL: &str =
      (table_name, component, owner, contract_version, ddl_sha256)
      VALUES (?, ?, ?, ?, ?)";
 
-const UPDATE_OWNED_CORE_SCHEMA_TABLE_CLAIM_SQL: &str = "UPDATE astra_schema_table_contracts
-     SET owner = ?, contract_version = ?, ddl_sha256 = ?, updated_at = NOW(6)
-     WHERE table_name = ? AND component = ?";
-
-/// Validate ownership and identify declarations retired by the new contract.
-///
-/// A contract-version upgrade is an ownership-aware reconciliation, not an
-/// unqualified delete/reinsert cycle. The old path mapped every duplicate-key
-/// error to "another owner" without reading the persisted owner first. An
-/// explicit read plus per-key upsert distinguishes legitimate same-component
-/// upgrades from real cross-component conflicts and remains safe under retry.
-fn stale_core_schema_table_claims(
-    existing: &[PersistedCoreSchemaTableClaim],
-    declarations: &[CoreSchemaTableSpec],
-) -> Result<Vec<String>, sqlx::Error> {
-    let desired_names = declarations
-        .iter()
-        .map(|declaration| declaration.name.as_str())
-        .collect::<BTreeSet<_>>();
-
-    for claim in existing {
-        if desired_names.contains(claim.name.as_str())
-            && claim.component != CORE_SCHEMA_CONTRACT_COMPONENT
-        {
-            return Err(sqlx::Error::Protocol(format!(
-                "schema table {} is already claimed by lifecycle component {} (owner={})",
-                claim.name, claim.component, claim.owner
-            )));
-        }
-    }
-
-    Ok(existing
-        .iter()
-        .filter(|claim| {
-            claim.component == CORE_SCHEMA_CONTRACT_COMPONENT
-                && !desired_names.contains(claim.name.as_str())
-        })
-        .map(|claim| claim.name.clone())
-        .collect())
-}
-
-fn validate_reconciled_core_schema_table_claim(
+fn validate_core_schema_table_claim(
     claim: &PersistedCoreSchemaTableClaim,
     declaration: &CoreSchemaTableSpec,
 ) -> Result<(), sqlx::Error> {
@@ -348,7 +292,7 @@ fn validate_reconciled_core_schema_table_claim(
         || claim.ddl_sha256 != declaration.ddl_sha256
     {
         return Err(sqlx::Error::Protocol(format!(
-            "schema table {} lifecycle contract did not converge after owner-scoped reconciliation",
+            "schema table {} lifecycle contract differs from the current schema; recreate the database",
             declaration.name
         )));
     }
@@ -502,7 +446,6 @@ pub(crate) fn rows_affected_to_i64(rows: u64, context: &str) -> Result<i64, sqlx
 
 const AGENT_EVENTS_OWNER_SESSION_TURN_INDEX_DECL: &str =
     "INDEX idx_agent_events_owner_session_turn (user_id, session_id, turn_seq)";
-const AGENT_EVENTS_OWNER_SESSION_TURN_INDEX_ALTER_SQL: &str = "ALTER TABLE agent_events ADD INDEX idx_agent_events_owner_session_turn (user_id, session_id, turn_seq)";
 
 fn agent_events_create_sql() -> String {
     format!(
@@ -730,7 +673,9 @@ async fn core_schema_contract_is_current(pool: &sqlx::Pool<MySql>) -> Result<boo
     match persisted {
         None => Ok(false),
         Some(version) if version == CORE_SCHEMA_CONTRACT_VERSION => Ok(true),
-        Some(_) => Ok(false),
+        Some(version) => Err(sqlx::Error::Protocol(format!(
+            "unsupported core schema contract {version}; expected {CORE_SCHEMA_CONTRACT_VERSION}; recreate the database with the current schema"
+        ))),
     }
 }
 
@@ -851,7 +796,19 @@ async fn publish_core_schema_table_contracts(
         })
     })
     .collect::<Result<Vec<_>, sqlx::Error>>()?;
-    let stale_claims = stale_core_schema_table_claims(&existing, declarations)?;
+    for claim in &existing {
+        if let Some(declaration) = declarations
+            .iter()
+            .find(|declaration| declaration.name == claim.name)
+        {
+            validate_core_schema_table_claim(claim, declaration)?;
+        } else if claim.component == CORE_SCHEMA_CONTRACT_COMPONENT {
+            return Err(sqlx::Error::Protocol(format!(
+                "unsupported core schema table claim {}; recreate the database",
+                claim.name
+            )));
+        }
+    }
 
     for declaration in declarations {
         // Insert without taking over an existing identity. A concurrent foreign
@@ -876,22 +833,6 @@ async fn publish_core_schema_table_contracts(
                 ))
             })?;
 
-        // Only the owning lifecycle component may mutate an existing claim.
-        query(UPDATE_OWNED_CORE_SCHEMA_TABLE_CLAIM_SQL)
-            .bind(&declaration.owner)
-            .bind(CORE_SCHEMA_CONTRACT_VERSION)
-            .bind(&declaration.ddl_sha256)
-            .bind(&declaration.name)
-            .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|error| {
-                sqlx::Error::Protocol(format!(
-                    "failed to update schema table {} lifecycle contract: {error}",
-                    declaration.name
-                ))
-            })?;
-
         let row = query(
             "SELECT table_name, component, owner, contract_version, ddl_sha256
              FROM astra_schema_table_contracts
@@ -900,24 +841,14 @@ async fn publish_core_schema_table_contracts(
         .bind(&declaration.name)
         .fetch_one(&mut *transaction)
         .await?;
-        let reconciled = PersistedCoreSchemaTableClaim {
+        let persisted = PersistedCoreSchemaTableClaim {
             name: row.try_get("table_name")?,
             component: row.try_get("component")?,
             owner: row.try_get("owner")?,
             contract_version: row.try_get("contract_version")?,
             ddl_sha256: row.try_get("ddl_sha256")?,
         };
-        validate_reconciled_core_schema_table_claim(&reconciled, declaration)?;
-    }
-    for table_name in stale_claims {
-        query(
-            "DELETE FROM astra_schema_table_contracts
-             WHERE table_name = ? AND component = ?",
-        )
-        .bind(table_name)
-        .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
-        .execute(&mut *transaction)
-        .await?;
+        validate_core_schema_table_claim(&persisted, declaration)?;
     }
     transaction.commit().await
 }
@@ -1261,36 +1192,19 @@ where
     })
 }
 
-/// Admit the session and execution slot before locking an exact run.
-/// `allow_missing_run` is reserved for run creation.
+/// Admit a session/slot and require an exact run when the caller has no
+/// authoritative run lookup of its own. Callers that read the run should use
+/// session/execution admission followed by that locking read, not both.
 pub async fn admit_session_scoped_run_write<T>(
     tx: &mut T,
     session_id: &str,
     user_id: &str,
     run_id: &str,
-    allow_missing_run: bool,
-) -> Result<bool, sqlx::Error>
+) -> Result<(), sqlx::Error>
 where
     T: TransactionConnection,
 {
-    admit_session_scoped_run_write_with_facts(tx, session_id, user_id, run_id, allow_missing_run)
-        .await
-        .map(|(run_exists, _)| run_exists)
-}
-
-/// Admit a session-scoped run and return the already-locked execution facts
-/// for callers that immediately mutate the same run/slot.
-pub(crate) async fn admit_session_scoped_run_write_with_facts<T>(
-    tx: &mut T,
-    session_id: &str,
-    user_id: &str,
-    run_id: &str,
-    allow_missing_run: bool,
-) -> Result<(bool, SessionExecutionAdmissionFacts), sqlx::Error>
-where
-    T: TransactionConnection,
-{
-    let facts = admit_session_execution_write_with_facts(tx, session_id, user_id).await?;
+    admit_session_execution_write(tx, session_id, user_id).await?;
     let run_exists: Option<i32> = query_scalar(
         "SELECT 1 FROM agent_runs
          WHERE user_id = ? AND session_id = ? AND run_id = ? LIMIT 1 FOR UPDATE",
@@ -1300,10 +1214,10 @@ where
     .bind(run_id)
     .fetch_optional(&mut **tx)
     .await?;
-    if run_exists.is_none() && !allow_missing_run {
+    if run_exists.is_none() {
         return Err(sqlx::Error::RowNotFound);
     }
-    Ok((run_exists.is_some(), facts))
+    Ok(())
 }
 
 pub async fn agent_event_exists_for_user_session<'e, E>(
@@ -1524,7 +1438,7 @@ pub async fn lock_agent_session_write_fence_state<T>(
 where
     T: TransactionConnection,
 {
-    // Session creation/backfill establishes the fence before normal child
+    // Session creation establishes the fence before normal child
     // writes. Fast-path the common case so every manifest/event write does not
     // pay an INSERT IGNORE round trip. If this transaction inserted the fence,
     // the inserted row is already write-locked until commit and its nullable
@@ -1577,45 +1491,6 @@ where
         .bind(last_event_id)
         .execute(&mut **tx)
         .await?;
-    if result.rows_affected() == 0 {
-        return Err(sqlx::Error::RowNotFound);
-    }
-    Ok(())
-}
-
-/// Update an already-admitted session without reacquiring its lifecycle fence.
-///
-/// This is intentionally `pub(crate)`: callers must have completed
-/// [`admit_session_event_write`] in the same transaction. Keeping that fact in
-/// the function name prevents the optimized path from becoming a general
-/// session mutation API that could bypass deletion admission.
-pub(crate) async fn add_agent_session_event_count_after_admission(
-    tx: &mut Transaction<'_, MySql>,
-    session_id: &str,
-    user_id: &str,
-    delta: i64,
-    last_event_id: Option<&str>,
-) -> Result<(), sqlx::Error> {
-    if delta <= 0 {
-        return Err(sqlx::Error::Protocol(
-            "add_agent_session_event_count_after_admission requires a positive delta".into(),
-        ));
-    }
-
-    let result = query(
-        "UPDATE agent_sessions
-         SET event_count = event_count + ?,
-             last_event_id = COALESCE(?, last_event_id),
-             updated_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at),
-             last_active_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at)
-         WHERE session_id = ? AND user_id = ? AND status <> 'deleting'",
-    )
-    .bind(delta)
-    .bind(last_event_id)
-    .bind(session_id)
-    .bind(user_id)
-    .execute(&mut **tx)
-    .await?;
     if result.rows_affected() == 0 {
         return Err(sqlx::Error::RowNotFound);
     }
@@ -1932,173 +1807,22 @@ fn validate_schema_identifier(raw: &str, kind: &str) -> Result<(), sqlx::Error> 
     })
 }
 
-const USER_IDENTITY_COLUMN_NAMES: [&str; 6] = [
-    "user_id",
-    "owner_user_id",
-    "scope_user_id",
-    "created_by",
-    "updated_by",
-    "username",
-];
-
-fn identity_column_widening_ddl(
-    table: &str,
-    column: &str,
-    is_nullable: bool,
-) -> Result<String, sqlx::Error> {
-    validate_schema_identifier(table, "matrixone table")?;
-    validate_schema_identifier(column, "matrixone column")?;
-    let nullability = if is_nullable { "NULL" } else { "NOT NULL" };
-    Ok(format!(
-        "ALTER TABLE {} MODIFY COLUMN {} VARCHAR({USER_ID_MAX_LEN}) {nullability}",
-        crate::snapshot_sql::quote_mysql_identifier(table),
-        crate::snapshot_sql::quote_mysql_identifier(column),
-    ))
-}
-
-/// Widens legacy identity columns to the repository-wide principal contract.
-///
-/// This is an explicit, idempotent schema migration. It never truncates data,
-/// changes nullability, or rewrites UUID identifier columns.
-async fn migrate_user_identity_column_widths(
-    pool: &sqlx::Pool<MySql>,
-    database: &str,
-) -> Result<(), sqlx::Error> {
-    validate_schema_identifier(database, "matrixone database")?;
-    let rows = query(
-        "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, \
-                IS_NULLABLE, COLUMN_DEFAULT \
-         FROM information_schema.COLUMNS \
-         WHERE TABLE_SCHEMA = ? \
-           AND COLUMN_NAME IN \
-               ('user_id', 'owner_user_id', 'scope_user_id', 'created_by', 'updated_by', 'username') \
-         ORDER BY TABLE_NAME, COLUMN_NAME",
-    )
-    .bind(database)
-    .fetch_all(pool)
-    .await?;
-
-    for row in rows {
-        let table: String = row.try_get("TABLE_NAME")?;
-        let column: String = row.try_get("COLUMN_NAME")?;
-        let data_type: String = row.try_get("DATA_TYPE")?;
-        let width: Option<i64> = row.try_get("CHARACTER_MAXIMUM_LENGTH")?;
-        let is_nullable: String = row.try_get("IS_NULLABLE")?;
-        let default_value: Option<String> = row.try_get("COLUMN_DEFAULT")?;
-
-        if !USER_IDENTITY_COLUMN_NAMES.contains(&column.as_str()) {
-            return Err(sqlx::Error::Protocol(format!(
-                "identity column migration selected unexpected column {table}.{column}"
-            )));
-        }
-        if !data_type.eq_ignore_ascii_case("varchar") {
-            return Err(sqlx::Error::Protocol(format!(
-                "identity column {table}.{column} must be VARCHAR, found {data_type}"
-            )));
-        }
-        let width = width.ok_or_else(|| {
-            sqlx::Error::Protocol(format!(
-                "identity column {table}.{column} has no bounded VARCHAR width"
-            ))
-        })?;
-        if width < 0 {
-            return Err(sqlx::Error::Protocol(format!(
-                "identity column {table}.{column} has invalid width {width}"
-            )));
-        }
-        if width >= USER_ID_MAX_LEN as i64 {
-            continue;
-        }
-        if default_value.is_some() {
-            return Err(sqlx::Error::Protocol(format!(
-                "identity column {table}.{column} has a default value that must be preserved by an explicit migration"
-            )));
-        }
-        let is_nullable = match is_nullable.as_str() {
-            "YES" => true,
-            "NO" => false,
-            value => {
-                return Err(sqlx::Error::Protocol(format!(
-                    "identity column {table}.{column} has invalid IS_NULLABLE value {value}"
-                )));
-            }
-        };
-        let ddl = identity_column_widening_ddl(&table, &column, is_nullable)?;
-        query(&ddl).execute(pool).await?;
-        tracing::info!(
-            table,
-            column,
-            previous_width = width,
-            new_width = USER_ID_MAX_LEN,
-            "widened legacy user identity column"
-        );
-    }
-
-    Ok(())
-}
-
-async fn add_column_if_missing(
-    pool: &sqlx::Pool<MySql>,
-    database: &str,
-    table: &str,
-    column: &str,
-    ddl: &str,
-) -> Result<(), sqlx::Error> {
-    validate_schema_identifier(database, "matrixone database")?;
-    validate_schema_identifier(table, "matrixone table")?;
-    validate_schema_identifier(column, "matrixone column")?;
-
-    let exists = query(
-        "SELECT 1 FROM information_schema.COLUMNS \
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ? LIMIT 1",
-    )
-    .bind(database)
-    .bind(table)
-    .bind(column)
-    .fetch_optional(pool)
-    .await?
-    .is_some();
-    if exists {
-        return Ok(());
-    }
-
-    query(ddl).execute(pool).await?;
-    Ok(())
-}
-
-const EDGE_PENDING_DISPATCH_RESULT_JSON_LONGTEXT_ALTER_SQL: &str =
-    "ALTER TABLE edge_pending_dispatch MODIFY COLUMN result_json LONGTEXT NULL";
-
-fn edge_pending_dispatch_result_json_upgrade_ddl(
+fn validate_edge_pending_dispatch_result_storage(
     data_type: &str,
     nullable: bool,
-) -> Result<Option<&'static str>, sqlx::Error> {
-    if !nullable {
-        return Err(sqlx::Error::Protocol(
-            "edge_pending_dispatch.result_json must remain nullable".to_string(),
-        ));
-    }
-    // MatrixOne reports a declared LONGTEXT column as DATA_TYPE=TEXT. Both
-    // catalog spellings identify the same lossless text storage contract;
-    // the declaration and upgrade DDL retain LONGTEXT capacity.
-    if data_type.eq_ignore_ascii_case("longtext") || data_type.eq_ignore_ascii_case("text") {
-        return Ok(None);
-    }
-    if data_type.eq_ignore_ascii_case("json") {
-        return Ok(Some(EDGE_PENDING_DISPATCH_RESULT_JSON_LONGTEXT_ALTER_SQL));
+) -> Result<(), sqlx::Error> {
+    // MatrixOne reports declared LONGTEXT as TEXT.
+    if nullable
+        && (data_type.eq_ignore_ascii_case("longtext") || data_type.eq_ignore_ascii_case("text"))
+    {
+        return Ok(());
     }
     Err(sqlx::Error::Protocol(format!(
-        "edge_pending_dispatch.result_json has unsupported type {data_type}; expected JSON or lossless text storage"
+        "edge_pending_dispatch.result_json requires nullable lossless text storage, found {data_type} (nullable={nullable}); recreate the database"
     )))
 }
 
-/// Preserve the exact result bytes used by the Edge dispatch integrity hash.
-///
-/// MatrixOne's JSON storage normalizes numeric lexemes on read, so values such
-/// as `86400` and `86400.0` need not retain their accepted wire spelling and
-/// can no longer match its hash. Existing JSON rows are converted in place
-/// without rewriting their integrity hashes: their original lexemes are
-/// already unrecoverable, while all subsequent rows retain their exact text.
+/// Validate lossless storage for the bytes hashed by the Edge dispatch protocol.
 async fn ensure_edge_pending_dispatch_result_json_lossless(
     pool: &sqlx::Pool<MySql>,
     database: &str,
@@ -2127,39 +1851,7 @@ async fn ensure_edge_pending_dispatch_result_json_lossless(
             )));
         }
     };
-    if let Some(ddl) = edge_pending_dispatch_result_json_upgrade_ddl(&data_type, nullable)? {
-        query(ddl).execute(pool).await?;
-    }
-    Ok(())
-}
-
-async fn add_index_if_missing(
-    pool: &sqlx::Pool<MySql>,
-    database: &str,
-    table: &str,
-    index: &str,
-    ddl: &str,
-) -> Result<(), sqlx::Error> {
-    validate_schema_identifier(database, "matrixone database")?;
-    validate_schema_identifier(table, "matrixone table")?;
-    validate_schema_identifier(index, "matrixone index")?;
-
-    let exists = query(
-        "SELECT 1 FROM information_schema.STATISTICS \
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = ? LIMIT 1",
-    )
-    .bind(database)
-    .bind(table)
-    .bind(index)
-    .fetch_optional(pool)
-    .await?
-    .is_some();
-    if exists {
-        return Ok(());
-    }
-
-    query(ddl).execute(pool).await?;
-    Ok(())
+    validate_edge_pending_dispatch_result_storage(&data_type, nullable)
 }
 
 async fn existing_table_columns(
@@ -2247,122 +1939,6 @@ async fn table_exists(
     .fetch_optional(pool)
     .await
     .map(|row| row.is_some())
-}
-
-/// Migrate the pre-issuer Memoria mapping into the canonical external
-/// identity table and retire its one-purpose source table.
-///
-/// The old table has no issuer namespace, so its rows are deliberately
-/// represented by the reserved `memoria:legacy` provider id. Runtime login
-/// still requires an explicit legacy issuer before it can replace that row
-/// with the current issuer-derived identity. A conflicting pre-existing row
-/// fails the bootstrap rather than silently relinking an account.
-async fn retire_auth_memoria_identities(
-    pool: &sqlx::Pool<MySql>,
-    database: &str,
-) -> Result<(), sqlx::Error> {
-    if !table_exists(pool, database, "auth_memoria_identities").await? {
-        return Ok(());
-    }
-
-    let conflict = query(
-        "SELECT 1
-         FROM auth_memoria_identities legacy
-         JOIN auth_external_identities canonical
-           ON canonical.provider_id = ?
-          AND canonical.external_subject = legacy.memoria_user_id
-         WHERE canonical.astra_user_id <> legacy.astra_user_id
-         LIMIT 1",
-    )
-    .bind(crate::auth::LEGACY_MEMORIA_PROVIDER_ID)
-    .fetch_optional(pool)
-    .await?;
-    if conflict.is_some() {
-        return Err(sqlx::Error::Protocol(
-            "legacy Memoria identity conflicts with canonical provider mapping".into(),
-        ));
-    }
-
-    query(
-        "INSERT INTO auth_external_identities
-             (provider_id, external_subject, astra_user_id, created_at, updated_at)
-         SELECT ?, memoria_user_id, astra_user_id, created_at, created_at
-         FROM auth_memoria_identities
-         ON DUPLICATE KEY UPDATE
-             astra_user_id = VALUES(astra_user_id),
-             created_at = LEAST(created_at, VALUES(created_at)),
-             updated_at = GREATEST(updated_at, VALUES(updated_at))",
-    )
-    .bind(crate::auth::LEGACY_MEMORIA_PROVIDER_ID)
-    .execute(pool)
-    .await?;
-    query("DROP TABLE IF EXISTS auth_memoria_identities")
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-/// Fold the legacy deletion tombstone projection into the lifecycle fence.
-///
-/// Both tables represented the same fact: a session identity must never be
-/// recreated after deletion. The lifecycle fence is already the lock held by
-/// every session-bound writer, so keeping a second permanent table only added
-/// a write and an extra read to the admission path. This migration is
-/// deliberately one-way: old rows are preserved in the fence, pending rows
-/// remain eligible for the existing delete-intent reconciler, and the
-/// redundant table is then removed.
-///
-/// This is a coordinated clean-contract cutover. A pre-v85 process that still
-/// queries or writes the retired table must not run against the v85 schema.
-async fn retire_session_deletion_tombstones(
-    pool: &sqlx::Pool<MySql>,
-    database: &str,
-) -> Result<(), sqlx::Error> {
-    if !table_exists(pool, database, "session_deletion_tombstones").await? {
-        return Ok(());
-    }
-
-    // Keep the pending and completed cases as separate INSERT...SELECT
-    // statements. MatrixOne's conditional expression inference can coerce a
-    // DATETIME(6) branch to second precision; a deletion timestamp is part of
-    // the recovery evidence, so do not route it through CASE/IF.
-    query(
-        "INSERT INTO agent_session_lifecycle_fences
-         (session_id, user_id, delete_requested_at, database_deleted_at, created_at, updated_at)
-         SELECT tombstones.session_id, tombstones.user_id, tombstones.deleted_at, NULL,
-                tombstones.deleted_at, tombstones.deleted_at
-         FROM session_deletion_tombstones tombstones
-         JOIN agent_sessions sessions
-           ON sessions.user_id = tombstones.user_id
-          AND sessions.session_id = tombstones.session_id
-         ON DUPLICATE KEY UPDATE
-           delete_requested_at = COALESCE(delete_requested_at, VALUES(delete_requested_at)),
-           database_deleted_at = COALESCE(database_deleted_at, VALUES(database_deleted_at)),
-           updated_at = GREATEST(updated_at, VALUES(updated_at))",
-    )
-    .execute(pool)
-    .await?;
-    query(
-        "INSERT INTO agent_session_lifecycle_fences
-         (session_id, user_id, delete_requested_at, database_deleted_at, created_at, updated_at)
-         SELECT tombstones.session_id, tombstones.user_id, tombstones.deleted_at,
-                tombstones.deleted_at, tombstones.deleted_at, tombstones.deleted_at
-         FROM session_deletion_tombstones tombstones
-         LEFT JOIN agent_sessions sessions
-           ON sessions.user_id = tombstones.user_id
-          AND sessions.session_id = tombstones.session_id
-         WHERE sessions.session_id IS NULL
-         ON DUPLICATE KEY UPDATE
-           delete_requested_at = COALESCE(delete_requested_at, VALUES(delete_requested_at)),
-           database_deleted_at = COALESCE(database_deleted_at, VALUES(database_deleted_at)),
-           updated_at = GREATEST(updated_at, VALUES(updated_at))",
-    )
-    .execute(pool)
-    .await?;
-    query("DROP TABLE IF EXISTS session_deletion_tombstones")
-        .execute(pool)
-        .await?;
-    Ok(())
 }
 
 /// The current admission protocol stores materialized usage beside the
@@ -2888,73 +2464,9 @@ async fn fail_if_obsolete_shape(
     }
 
     Err(sqlx::Error::Protocol(format!(
-        "obsolete core schema table {table} requires manual migration before startup: {}",
+        "obsolete core schema table {table} is unsupported; recreate the database before startup: {}",
         reasons.join(", ")
     )))
-}
-
-fn is_legacy_edge_pending_dispatch_shape(
-    columns: &BTreeSet<String>,
-    primary_key: &[String],
-) -> bool {
-    EDGE_PENDING_DISPATCH_LEGACY_COLUMNS
-        .iter()
-        .all(|column| columns.contains(*column))
-        && EDGE_PENDING_DISPATCH_IDENTITY_COLUMNS
-            .iter()
-            .skip(1)
-            .take(3)
-            .all(|column| !columns.contains(*column))
-        && primary_key
-            .iter()
-            .map(String::as_str)
-            .eq(EDGE_PENDING_DISPATCH_LEGACY_PRIMARY_KEY.iter().copied())
-}
-
-async fn migrate_legacy_edge_pending_dispatch_if_needed(
-    pool: &sqlx::Pool<MySql>,
-    database: &str,
-) -> Result<(), sqlx::Error> {
-    let columns = existing_table_columns(pool, database, "edge_pending_dispatch").await?;
-    if columns.is_empty() {
-        return Ok(());
-    }
-    let primary_key =
-        existing_index_columns(pool, database, "edge_pending_dispatch", "PRIMARY").await?;
-    if !is_legacy_edge_pending_dispatch_shape(&columns, &primary_key) {
-        return Ok(());
-    }
-    if table_exists(pool, database, EDGE_PENDING_DISPATCH_LEGACY_ARCHIVE_TABLE).await? {
-        return Err(sqlx::Error::Protocol(format!(
-            "legacy edge_pending_dispatch migration archive {EDGE_PENDING_DISPATCH_LEGACY_ARCHIVE_TABLE} already exists; inspect the previous migration before startup"
-        )));
-    }
-
-    let active_row = query(
-        "SELECT 1 AS active_row FROM edge_pending_dispatch \
-         WHERE status IN ('pending', 'dispatched') LIMIT 1",
-    )
-    .fetch_optional(pool)
-    .await?;
-    if active_row.is_some() {
-        return Err(sqlx::Error::Protocol(
-            "legacy edge_pending_dispatch contains active rows without session/run/turn identity; drain them with the pre-turn-scoped Astra release before upgrade"
-                .to_string(),
-        ));
-    }
-    query(&format!(
-        "RENAME TABLE {} TO {}",
-        crate::snapshot_sql::quote_mysql_identifier("edge_pending_dispatch"),
-        crate::snapshot_sql::quote_mysql_identifier(EDGE_PENDING_DISPATCH_LEGACY_ARCHIVE_TABLE),
-    ))
-    .execute(pool)
-    .await?;
-    tracing::info!(
-        legacy_table = "edge_pending_dispatch",
-        archive_table = EDGE_PENDING_DISPATCH_LEGACY_ARCHIVE_TABLE,
-        "archived terminal legacy edge dispatch rows before turn-scoped schema creation"
-    );
-    Ok(())
 }
 
 async fn fail_if_required_columns_missing_or_nullable(
@@ -3370,7 +2882,7 @@ async fn verify_inference_invocation_schema_contract(
         return Ok(());
     }
     Err(sqlx::Error::Protocol(format!(
-        "obsolete core schema table {table} requires manual migration before startup: {}",
+        "obsolete core schema table {table} is unsupported; recreate the database before startup: {}",
         reasons.join(", ")
     )))
 }
@@ -3455,7 +2967,7 @@ async fn verify_inference_provider_attempt_schema_contract(
         return Ok(());
     }
     Err(sqlx::Error::Protocol(format!(
-        "obsolete core schema table {table} requires manual migration before startup: {}",
+        "obsolete core schema table {table} is unsupported; recreate the database before startup: {}",
         reasons.join(", ")
     )))
 }
@@ -3538,7 +3050,7 @@ async fn verify_inference_canonical_transition_head_schema_contract(
         return Ok(());
     }
     Err(sqlx::Error::Protocol(format!(
-        "obsolete core schema table {table} requires manual migration before startup: {}",
+        "obsolete core schema table {table} is unsupported; recreate the database before startup: {}",
         reasons.join(", ")
     )))
 }
@@ -3631,7 +3143,7 @@ async fn verify_inference_canonical_transition_wal_schema_contract(
         return Ok(());
     }
     Err(sqlx::Error::Protocol(format!(
-        "obsolete core schema table {table} requires manual migration before startup: {}",
+        "obsolete core schema table {table} is unsupported; recreate the database before startup: {}",
         reasons.join(", ")
     )))
 }
@@ -3708,7 +3220,7 @@ async fn fail_if_required_column_nullability_mismatches(
         return Ok(());
     }
     Err(sqlx::Error::Protocol(format!(
-        "obsolete core schema table {table} requires manual migration before startup: {}",
+        "obsolete core schema table {table} is unsupported; recreate the database before startup: {}",
         reasons.join(", ")
     )))
 }
@@ -3769,7 +3281,7 @@ async fn fail_if_varchar_columns_shorter_than(
     }
 
     Err(sqlx::Error::Protocol(format!(
-        "obsolete core schema table {table} requires manual migration before startup: {}",
+        "obsolete core schema table {table} is unsupported; recreate the database before startup: {}",
         reasons.join(", ")
     )))
 }
@@ -3799,37 +3311,21 @@ async fn existing_index_columns(
         .collect::<Result<Vec<_>, _>>()
 }
 
-async fn drop_index_if_present(
-    pool: &sqlx::Pool<MySql>,
-    database: &str,
-    table: &str,
-    index: &str,
-) -> Result<(), sqlx::Error> {
-    let columns = existing_index_columns(pool, database, table, index).await?;
-    if columns.is_empty() {
-        return Ok(());
-    }
-    let ddl = format!(
-        "ALTER TABLE {} DROP INDEX {}",
-        crate::snapshot_sql::quote_mysql_identifier(table),
-        crate::snapshot_sql::quote_mysql_identifier(index)
-    );
-    query(&ddl).execute(pool).await?;
-    Ok(())
-}
-
-async fn ensure_index_shape(
-    pool: &sqlx::Pool<MySql>,
-    database: &str,
+fn ensure_index_shape(
+    indexes: &BTreeMap<(String, String), Vec<String>>,
     table: &str,
     index: &str,
     expected_columns: &[&str],
-    ddl: &str,
 ) -> Result<(), sqlx::Error> {
     for column in expected_columns {
         validate_schema_identifier(column, "matrixone column")?;
     }
-    let existing = existing_index_columns(pool, database, table, index).await?;
+    validate_schema_identifier(table, "matrixone table")?;
+    validate_schema_identifier(index, "matrixone index")?;
+    let existing = indexes
+        .get(&(table.to_string(), index.to_string()))
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     if existing
         .iter()
         .map(String::as_str)
@@ -3837,44 +3333,11 @@ async fn ensure_index_shape(
     {
         return Ok(());
     }
-    if !existing.is_empty() {
-        return Err(sqlx::Error::Protocol(format!(
-            "index shape mismatch for {table}.{index}: existing ({}) != expected ({})",
-            existing.join(", "),
-            expected_columns.join(", ")
-        )));
-    }
-    query(ddl).execute(pool).await?;
-    Ok(())
-}
-
-async fn ensure_primary_key_shape(
-    pool: &sqlx::Pool<MySql>,
-    database: &str,
-    table: &str,
-    expected_columns: &[&str],
-    ddl: &str,
-) -> Result<(), sqlx::Error> {
-    for column in expected_columns {
-        validate_schema_identifier(column, "matrixone column")?;
-    }
-    let existing = existing_index_columns(pool, database, table, "PRIMARY").await?;
-    if existing
-        .iter()
-        .map(String::as_str)
-        .eq(expected_columns.iter().copied())
-    {
-        return Ok(());
-    }
-    if !existing.is_empty() {
-        return Err(sqlx::Error::Protocol(format!(
-            "primary key shape mismatch for {table}: existing ({}) != expected ({})",
-            existing.join(", "),
-            expected_columns.join(", ")
-        )));
-    }
-    query(ddl).execute(pool).await?;
-    Ok(())
+    Err(sqlx::Error::Protocol(format!(
+        "index shape mismatch for {table}.{index}: existing ({}) != expected ({}); recreate the database",
+        existing.join(", "),
+        expected_columns.join(", ")
+    )))
 }
 
 pub async fn ensure_core_schema(
@@ -3947,232 +3410,15 @@ pub async fn ensure_core_schema(
     }
 }
 
-async fn backfill_conversation_manifest_segments(
-    pool: &sqlx::Pool<MySql>,
-) -> Result<(), sqlx::Error> {
-    const BACKFILL_BATCH: i64 = 128;
-    loop {
-        let rows = query(
-            "SELECT isolation_domain, owner_user_id, session_id, branch_id,
-                    manifest_root, CAST(manifest_json AS CHAR) AS manifest_json
-               FROM conversation_manifest_nodes node
-              WHERE NOT EXISTS (
-                        SELECT 1 FROM conversation_manifest_segments segment
-                         WHERE segment.isolation_domain = node.isolation_domain
-                           AND segment.owner_user_id = node.owner_user_id
-                           AND segment.session_id = node.session_id
-                           AND segment.branch_id = node.branch_id
-                           AND segment.manifest_root = node.manifest_root
-                    )
-              ORDER BY node.created_at ASC, node.manifest_root ASC
-              LIMIT ?",
-        )
-        .bind(BACKFILL_BATCH)
-        .fetch_all(pool)
-        .await?;
-        if rows.is_empty() {
-            return Ok(());
-        }
-
-        for row in rows {
-            let isolation_domain: String = row.try_get("isolation_domain")?;
-            let owner_user_id: String = row.try_get("owner_user_id")?;
-            let session_id: String = row.try_get("session_id")?;
-            let branch_id: String = row.try_get("branch_id")?;
-            let manifest_root: String = row.try_get("manifest_root")?;
-            let manifest_json: String = row.try_get("manifest_json")?;
-            let manifest: astra_turn_types::ContextManifestNodeV1 =
-                serde_json::from_str(&manifest_json).map_err(|source| {
-                    sqlx::Error::Protocol(format!(
-                        "decode manifest segment backfill row {manifest_root}: {source}"
-                    ))
-                })?;
-            manifest.validate().map_err(|source| {
-                sqlx::Error::Protocol(format!(
-                    "validate manifest segment backfill row {manifest_root}: {source}"
-                ))
-            })?;
-            if manifest.key.isolation_domain != isolation_domain
-                || manifest.key.owner_user_id != owner_user_id
-                || manifest.key.session_id != session_id
-                || manifest.key.branch_id != branch_id
-                || manifest.manifest_root != manifest_root
-            {
-                return Err(sqlx::Error::Protocol(format!(
-                    "manifest segment backfill identity mismatch for {manifest_root}"
-                )));
-            }
-
-            // One manifest's reference index is installed atomically. If
-            // bootstrap is interrupted, the next leased run sees either all
-            // positions or none and can safely retry.
-            let mut tx = pool.begin().await?;
-            let mut builder = QueryBuilder::<MySql>::new(
-                "INSERT IGNORE INTO conversation_manifest_segments
-                 (isolation_domain, owner_user_id, session_id, branch_id,
-                  manifest_root, segment_position, segment_hash) ",
-            );
-            builder.push_values(
-                manifest.appended_segments.iter().enumerate(),
-                |mut values, (position, segment)| {
-                    values
-                        .push_bind(&isolation_domain)
-                        .push_bind(&owner_user_id)
-                        .push_bind(&session_id)
-                        .push_bind(&branch_id)
-                        .push_bind(&manifest_root)
-                        .push_bind(i64::try_from(position).unwrap_or(i64::MAX))
-                        .push_bind(&segment.segment_hash);
-                },
-            );
-            builder.build().execute(&mut *tx).await?;
-            tx.commit().await?;
-        }
-    }
-}
-
-/// Move pre-`run_checkpoints` snapshots into canonical checkpoint history.
-///
-/// The run row is locked while its snapshot is read and inserted. That lock is
-/// the same serialization point used by checkpoint writes, so a concurrent
-/// writer cannot commit a newer snapshot before this historical row is given
-/// its source timestamp.
-async fn backfill_legacy_checkpoints(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
-    const BATCH_SIZE: i64 = 128;
-    let mut last_key: Option<(String, String)> = None;
-
-    loop {
-        let mut select = QueryBuilder::<MySql>::new(
-            "SELECT user_id, run_id
-             FROM agent_runs
-             WHERE checkpoint_version IS NOT NULL
-               AND checkpoint_json IS NOT NULL
-               AND NOT EXISTS (
-                   SELECT 1 FROM run_checkpoints AS canonical
-                   WHERE canonical.user_id = agent_runs.user_id
-                     AND canonical.run_id = agent_runs.run_id
-               )",
-        );
-        if let Some((last_user_id, last_run_id)) = &last_key {
-            select
-                .push(" AND (user_id > ")
-                .push_bind(last_user_id)
-                .push(" OR (user_id = ")
-                .push_bind(last_user_id)
-                .push(" AND run_id > ")
-                .push_bind(last_run_id)
-                .push("))");
-        }
-        select
-            .push(" ORDER BY user_id, run_id LIMIT ")
-            .push_bind(BATCH_SIZE);
-        let rows = select.build().fetch_all(pool).await?;
-        if rows.is_empty() {
-            return Ok(());
-        }
-
-        for key_row in &rows {
-            let user_id: String = key_row.try_get("user_id")?;
-            let run_id: String = key_row.try_get("run_id")?;
-            let mut tx = pool.begin().await?;
-            let Some(row) = query(
-                "SELECT session_id, last_event_idx, checkpoint_json, updated_at
-                 FROM agent_runs
-                 WHERE user_id = ? AND run_id = ?
-                   AND checkpoint_version IS NOT NULL
-                   AND checkpoint_json IS NOT NULL
-                 FOR UPDATE",
-            )
-            .bind(&user_id)
-            .bind(&run_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            else {
-                tx.rollback().await?;
-                continue;
-            };
-            // The paging query is only an optimization. Recheck after locking
-            // the run because a canonical writer may have committed since the
-            // page was read.
-            let has_canonical_history: Option<i64> = query_scalar(
-                "SELECT 1 FROM run_checkpoints
-                 WHERE user_id = ? AND run_id = ? LIMIT 1",
-            )
-            .bind(&user_id)
-            .bind(&run_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if has_canonical_history.is_some() {
-                tx.commit().await?;
-                continue;
-            }
-            let session_id: String = row.try_get("session_id")?;
-            let node_seq: i64 = row.try_get("last_event_idx")?;
-            let checkpoint_json: String = row.try_get("checkpoint_json")?;
-            let created_at: chrono::NaiveDateTime = row.try_get("updated_at")?;
-            let (checkpoint_kind, checkpoint_version, idempotency_key) =
-                match crate::runs::checkpoint_metadata(&run_id, &checkpoint_json) {
-                    Ok(metadata) => metadata,
-                    Err(error) => {
-                        tracing::warn!(
-                            target: "astra_services::storage",
-                            run_id = %run_id,
-                            error = %error,
-                            "skipping malformed legacy checkpoint during schema migration"
-                        );
-                        tx.commit().await?;
-                        continue;
-                    }
-                };
-            query(
-                "INSERT INTO run_checkpoints
-                 (checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
-                  checkpoint_version, idempotency_key, checkpoint_json, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(format!("ckpt-legacy-{}", Uuid::now_v7()))
-            .bind(run_id)
-            .bind(user_id)
-            .bind(session_id)
-            .bind(node_seq.max(0))
-            .bind(checkpoint_kind)
-            .bind(checkpoint_version)
-            .bind(idempotency_key)
-            .bind(checkpoint_json)
-            .bind(created_at)
-            .execute(&mut *tx)
-            .await?;
-            tx.commit().await?;
-        }
-
-        let last_row = rows.last().expect("non-empty legacy checkpoint batch");
-        last_key = Some((last_row.try_get("user_id")?, last_row.try_get("run_id")?));
-    }
-}
-
 async fn ensure_core_schema_while_leased(
     settings: &MatrixOneSettings,
     pool: sqlx::Pool<MySql>,
     holder_id: &str,
 ) -> Result<(), sqlx::Error> {
-    reject_obsolete_weighted_admission_schema(&pool, &settings.database).await?;
     if core_schema_contract_is_current(&pool).await? {
         verify_core_schema_catalog(&pool, &settings.database).await?;
-        verify_inference_invocation_schema_contract(&pool, &settings.database).await?;
-        verify_inference_provider_attempt_schema_contract(&pool, &settings.database).await?;
-        verify_inference_canonical_transition_head_schema_contract(&pool, &settings.database)
-            .await?;
-        return verify_inference_canonical_transition_wal_schema_contract(
-            &pool,
-            &settings.database,
-        )
-        .await;
+        return verify_core_schema_shape(&pool, &settings.database).await;
     }
-
-    // Existing deployments may still have UUID-sized identity columns. Widen
-    // them before table-specific shape checks run so every persistence path
-    // observes the same principal contract during startup.
-    migrate_user_identity_column_widths(&pool, &settings.database).await?;
 
     // The executor observes the exact CREATE TABLE statements that bootstrap
     // executes. This makes DDL the declaration and the ownership catalog its
@@ -4232,39 +3478,7 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    fail_if_obsolete_shape(
-        &pool,
-        &settings.database,
-        "auth_user_roles",
-        &["user_id", "role_id"],
-        &["id"],
-        &["uq_auth_user_roles_user_role"],
-    )
-    .await?;
-    drop_index_if_present(
-        &pool,
-        &settings.database,
-        "auth_user_roles",
-        "idx_auth_user_roles_user_id",
-    )
-    .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "auth_user_roles",
-        &["user_id", "role_id"],
-        "ALTER TABLE auth_user_roles ADD PRIMARY KEY (user_id, role_id)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "auth_user_roles",
-        "idx_auth_user_roles_role_id",
-        &["role_id"],
-        "ALTER TABLE auth_user_roles ADD INDEX idx_auth_user_roles_role_id (role_id)",
-    )
-    .await?;
+
     core_schema_create!(
         pool,
         "auth_refresh_tokens",
@@ -4307,23 +3521,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "auth_refresh_tokens",
-        "session_id",
-        "ALTER TABLE auth_refresh_tokens ADD COLUMN session_id VARCHAR(64) NULL",
-    )
-    .await?;
-    add_index_if_missing(
-        &pool,
-        &settings.database,
-        "auth_refresh_tokens",
-        "idx_auth_refresh_tokens_session",
-        "ALTER TABLE auth_refresh_tokens ADD INDEX idx_auth_refresh_tokens_session (session_id)",
-    )
-    .await?;
-
     core_schema_create!(
         pool,
         "auth_tokens",
@@ -4364,8 +3561,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-
-    retire_auth_memoria_identities(&pool.pool, &settings.database).await?;
 
     core_schema_create!(pool, "auth_provider_request_replay",
         "CREATE TABLE IF NOT EXISTS auth_provider_request_replay (
@@ -4439,52 +3634,7 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "agent_sessions",
-        "delete_requested_at",
-        "ALTER TABLE agent_sessions ADD COLUMN delete_requested_at DATETIME(6) NULL",
-    )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "agent_sessions",
-        "provider_creation_hash",
-        "ALTER TABLE agent_sessions ADD COLUMN provider_creation_hash CHAR(64) NULL",
-    )
-    .await?;
-    let legacy_delete_intents_backfilled = query(
-        "UPDATE agent_sessions
-         SET delete_requested_at = COALESCE(ended_at, updated_at, created_at)
-         WHERE status = 'deleting' AND delete_requested_at IS NULL",
-    )
-    .execute(&pool)
-    .await?
-    .rows_affected();
-    if legacy_delete_intents_backfilled > 0 {
-        tracing::info!(
-            legacy_delete_intents_backfilled,
-            "backfilled immutable timestamps for legacy session delete intents"
-        );
-    }
-    drop_index_if_present(
-        &pool,
-        &settings.database,
-        "agent_sessions",
-        "idx_agent_sessions_status_updated_owner",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "agent_sessions",
-        "idx_agent_sessions_delete_requested_owner",
-        &["delete_requested_at", "user_id", "session_id"],
-        "ALTER TABLE agent_sessions ADD INDEX idx_agent_sessions_delete_requested_owner (delete_requested_at, user_id, session_id)",
-    )
-    .await?;
+
     core_schema_create!(
         pool,
         "agent_session_lifecycle_fences",
@@ -4502,59 +3652,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "agent_session_lifecycle_fences",
-        &["user_id", "session_id"],
-        "ALTER TABLE agent_session_lifecycle_fences ADD PRIMARY KEY (user_id, session_id)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "agent_session_lifecycle_fences",
-        "idx_agent_session_fences_pending_delete",
-        &[
-            "database_deleted_at",
-            "delete_requested_at",
-            "user_id",
-            "session_id",
-        ],
-        "ALTER TABLE agent_session_lifecycle_fences ADD INDEX idx_agent_session_fences_pending_delete (database_deleted_at, delete_requested_at, user_id, session_id)",
-    )
-    .await?;
-    let lifecycle_fences_backfilled = query(
-        "INSERT IGNORE INTO agent_session_lifecycle_fences
-         (session_id, user_id, delete_requested_at, created_at, updated_at)
-         SELECT session_id, user_id, delete_requested_at, created_at, updated_at
-         FROM agent_sessions",
-    )
-    .execute(&pool)
-    .await?
-    .rows_affected();
-    if lifecycle_fences_backfilled > 0 {
-        tracing::info!(
-            lifecycle_fences_backfilled,
-            "backfilled durable lifecycle fences for existing sessions"
-        );
-    }
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "agent_sessions",
-        &["user_id", "session_id"],
-        "ALTER TABLE agent_sessions ADD PRIMARY KEY (user_id, session_id)",
-    )
-    .await?;
-    fail_if_varchar_columns_shorter_than(
-        &pool,
-        &settings.database,
-        "agent_sessions",
-        &[("last_event_id", AGENT_EVENT_ID_LEN as u64)],
-    )
-    .await?;
-    retire_session_deletion_tombstones(&pool.pool, &settings.database).await?;
 
     // Work is the canonical product root. Bootstrap creates the current
     // schema; an older shape is rejected below instead of being rewritten.
@@ -4565,126 +3662,12 @@ async fn ensure_core_schema_while_leased(
             .declare(work_schema.owner, table_name, ddl);
         query(ddl).execute(&work_schema).await?;
     }
-    verify_work_canonical_schema(&pool, &settings.database).await?;
 
     let agent_events_sql = agent_events_create_sql();
     pool.authority
         .declare("storage", "agent_events", &agent_events_sql);
     query(&agent_events_sql).execute(&pool).await?;
-    fail_if_required_columns_missing_or_nullable(
-        &pool,
-        &settings.database,
-        "agent_events",
-        &["payload_hash", "ingestion_write_id", "server_received_at"],
-    )
-    .await?;
-    fail_if_obsolete_shape(
-        &pool,
-        &settings.database,
-        "agent_events",
-        &[
-            "user_id",
-            "event_id",
-            "payload_hash",
-            "ingestion_write_id",
-            "server_received_at",
-        ],
-        &[],
-        &[],
-    )
-    .await?;
-    fail_if_varchar_columns_shorter_than(
-        &pool,
-        &settings.database,
-        "agent_events",
-        &[
-            ("event_id", AGENT_EVENT_ID_LEN as u64),
-            ("parent_event_id", AGENT_EVENT_ID_LEN as u64),
-            ("causal_chain_id", AGENT_EVENT_ID_LEN as u64),
-            ("payload_hash", 80),
-            ("ingestion_write_id", 64),
-        ],
-    )
-    .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "agent_events",
-        &["user_id", "event_id"],
-        "ALTER TABLE agent_events ADD PRIMARY KEY (user_id, event_id)",
-    )
-    .await?;
-    for removed_index in [
-        "idx_agent_events_session_created",
-        "idx_agent_events_session_type_created",
-        "idx_agent_events_session_model_created",
-        "idx_agent_events_session_parent",
-        "idx_agent_events_causal_chain_id",
-    ] {
-        drop_index_if_present(&pool, &settings.database, "agent_events", removed_index).await?;
-    }
-    for (index, expected_columns, ddl) in [
-        (
-            "idx_agent_events_owner_session_created",
-            &["user_id", "session_id", "created_at"][..],
-            "ALTER TABLE agent_events ADD INDEX idx_agent_events_owner_session_created (user_id, session_id, created_at)",
-        ),
-        (
-            "idx_agent_events_owner_session_type_created",
-            &["user_id", "session_id", "event_type", "created_at"][..],
-            "ALTER TABLE agent_events ADD INDEX idx_agent_events_owner_session_type_created (user_id, session_id, event_type, created_at)",
-        ),
-        (
-            "idx_agent_events_owner_session_model_created",
-            &["user_id", "session_id", "llm_model_used", "created_at"][..],
-            "ALTER TABLE agent_events ADD INDEX idx_agent_events_owner_session_model_created (user_id, session_id, llm_model_used, created_at DESC)",
-        ),
-        (
-            "idx_agent_events_owner_session_parent",
-            &["user_id", "session_id", "parent_event_id"][..],
-            "ALTER TABLE agent_events ADD INDEX idx_agent_events_owner_session_parent (user_id, session_id, parent_event_id)",
-        ),
-        (
-            "idx_agent_events_owner_causal_chain_created",
-            &["user_id", "causal_chain_id", "created_at", "event_id"][..],
-            "ALTER TABLE agent_events ADD INDEX idx_agent_events_owner_causal_chain_created (user_id, causal_chain_id, created_at, event_id)",
-        ),
-        (
-            "idx_agent_events_trace",
-            &["user_id", "session_id", "turn_id", "created_at"][..],
-            "ALTER TABLE agent_events ADD INDEX idx_agent_events_trace (user_id, session_id, turn_id, created_at)",
-        ),
-        (
-            "idx_agent_events_run",
-            &["user_id", "session_id", "run_id", "created_at"][..],
-            "ALTER TABLE agent_events ADD INDEX idx_agent_events_run (user_id, session_id, run_id, created_at)",
-        ),
-        (
-            "idx_agent_events_parent_run",
-            &["user_id", "session_id", "parent_run_id", "created_at"][..],
-            "ALTER TABLE agent_events ADD INDEX idx_agent_events_parent_run (user_id, session_id, parent_run_id, created_at)",
-        ),
-        (
-            "idx_agent_events_tool_call",
-            &["user_id", "session_id", "tool_call_id"][..],
-            "ALTER TABLE agent_events ADD INDEX idx_agent_events_tool_call (user_id, session_id, tool_call_id)",
-        ),
-        (
-            "idx_agent_events_owner_session_turn",
-            &["user_id", "session_id", "turn_seq"][..],
-            AGENT_EVENTS_OWNER_SESSION_TURN_INDEX_ALTER_SQL,
-        ),
-    ] {
-        ensure_index_shape(
-            &pool,
-            &settings.database,
-            "agent_events",
-            index,
-            expected_columns,
-            ddl,
-        )
-        .await?;
-    }
+
     let workspace_schema = pool.owned_by("workspace_records");
     for (table_name, ddl) in [
         (
@@ -4701,20 +3684,11 @@ async fn ensure_core_schema_while_leased(
             .declare(workspace_schema.owner, table_name, ddl);
         query(ddl).execute(&workspace_schema).await?;
     }
-    crate::workspace_records::verify_workspace_record_tables(&workspace_schema).await?;
 
     // ── Durable web-agent run state (Phase 1 / G15 + G19) ────────────────
     core_schema_create!(pool, "agent_runs", AGENT_RUNS_CREATE_SQL)
         .execute(&pool)
         .await?;
-    verify_agent_runs_canonical_schema(&pool, &settings.database).await?;
-    fail_if_varchar_columns_shorter_than(
-        &pool,
-        &settings.database,
-        "agent_runs",
-        &[("trigger_event_id", AGENT_EVENT_ID_LEN as u64)],
-    )
-    .await?;
 
     core_schema_create!(
         pool,
@@ -4731,32 +3705,6 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
-    .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "agent_session_execution_slots",
-        &["user_id", "session_id"],
-        "ALTER TABLE agent_session_execution_slots ADD PRIMARY KEY (user_id, session_id)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "agent_session_execution_slots",
-        "idx_session_execution_slots_run",
-        &["user_id", "run_id"],
-        "ALTER TABLE agent_session_execution_slots ADD INDEX idx_session_execution_slots_run (user_id, run_id)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "agent_session_execution_slots",
-        "idx_session_execution_slots_updated",
-        &["updated_at"],
-        "ALTER TABLE agent_session_execution_slots ADD INDEX idx_session_execution_slots_updated (updated_at)",
-    )
     .await?;
 
     core_schema_create!(
@@ -4794,14 +3742,6 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "session_context_heads",
-        "fork_base_json",
-        "ALTER TABLE session_context_heads ADD COLUMN fork_base_json LONGTEXT NULL",
-    )
     .await?;
 
     core_schema_create!(
@@ -5003,79 +3943,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    for (column, ddl) in [
-        (
-            "total_canonical_bytes",
-            "ALTER TABLE conversation_manifest_nodes ADD COLUMN total_canonical_bytes BIGINT NOT NULL DEFAULT 0",
-        ),
-        (
-            "total_message_count",
-            "ALTER TABLE conversation_manifest_nodes ADD COLUMN total_message_count BIGINT NOT NULL DEFAULT 0",
-        ),
-        (
-            "reachable",
-            "ALTER TABLE conversation_manifest_nodes ADD COLUMN reachable TINYINT NOT NULL DEFAULT 0",
-        ),
-        (
-            "compaction_generation",
-            "ALTER TABLE conversation_manifest_nodes ADD COLUMN compaction_generation BIGINT NOT NULL DEFAULT 0",
-        ),
-    ] {
-        add_column_if_missing(
-            &pool,
-            &settings.database,
-            "conversation_manifest_nodes",
-            column,
-            ddl,
-        )
-        .await?;
-    }
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "conversation_manifest_nodes",
-        "idx_context_manifest_reachable_sequence",
-        &[
-            "isolation_domain",
-            "owner_user_id",
-            "session_id",
-            "branch_id",
-            "reachable",
-            "conversation_seq",
-        ],
-        "ALTER TABLE conversation_manifest_nodes ADD INDEX idx_context_manifest_reachable_sequence (isolation_domain, owner_user_id, session_id, branch_id, reachable, conversation_seq)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "conversation_manifest_nodes",
-        "idx_context_manifest_generation_sequence",
-        &[
-            "isolation_domain",
-            "owner_user_id",
-            "session_id",
-            "branch_id",
-            "compaction_generation",
-            "reachable",
-            "conversation_seq",
-        ],
-        "ALTER TABLE conversation_manifest_nodes ADD INDEX idx_context_manifest_generation_sequence (isolation_domain, owner_user_id, session_id, branch_id, compaction_generation, reachable, conversation_seq)",
-    )
-    .await?;
-    query(
-        "UPDATE conversation_manifest_nodes n
-         INNER JOIN session_context_heads h
-           ON h.isolation_domain = n.isolation_domain
-          AND h.owner_user_id = n.owner_user_id
-          AND h.session_id = n.session_id
-          AND h.branch_id = n.branch_id
-          AND h.latest_manifest_root = n.manifest_root
-         SET n.reachable = 1
-         WHERE n.reachable = 0",
-    )
-    .execute(&pool)
-    .await?;
 
     core_schema_create!(
         pool,
@@ -5104,7 +3971,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    backfill_conversation_manifest_segments(&pool).await?;
 
     core_schema_create!(
         pool,
@@ -5300,10 +4166,7 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    // Create the owner usage table before the gate row. If startup is
-    // interrupted before the gate DDL, the next run sees no gate and retries
-    // bootstrap; it cannot publish a gate that will fail the v82 preflight
-    // because its owner table is missing.
+    // Both admission tables must validate before readiness is published.
     core_schema_create!(
         pool,
         "session_weighted_admission_gates",
@@ -5326,14 +4189,6 @@ async fn ensure_core_schema_while_leased(
         .bind(crate::weighted_admission::DISTRIBUTED_ADMISSION_SCOPE)
         .execute(&pool)
         .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "session_weighted_admission_gates",
-        "capacity_hash",
-        "ALTER TABLE session_weighted_admission_gates ADD COLUMN capacity_hash CHAR(64) NULL",
-    )
-    .await?;
 
     core_schema_create!(
         pool,
@@ -5396,82 +4251,7 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "agent_run_events",
-        "subject_run_id",
-        "ALTER TABLE agent_run_events ADD COLUMN subject_run_id VARCHAR(64) NULL",
-    )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "agent_run_events",
-        "interaction_request_id",
-        "ALTER TABLE agent_run_events ADD COLUMN interaction_request_id VARCHAR(128) NULL",
-    )
-    .await?;
-    for (index, expected_columns, ddl) in [
-        (
-            "uq_run_event_idx",
-            &["user_id", "run_id", "event_idx"][..],
-            "ALTER TABLE agent_run_events ADD UNIQUE KEY uq_run_event_idx (user_id, run_id, event_idx)",
-        ),
-        (
-            "uq_run_event_idempotency",
-            &["user_id", "run_id", "idempotency_key"][..],
-            "ALTER TABLE agent_run_events ADD UNIQUE KEY uq_run_event_idempotency (user_id, run_id, idempotency_key)",
-        ),
-        (
-            "idx_agent_run_events_control_type_idx",
-            &["user_id", "run_id", "event_type", "event_idx"][..],
-            "ALTER TABLE agent_run_events ADD INDEX idx_agent_run_events_control_type_idx (user_id, run_id, event_type, event_idx)",
-        ),
-        (
-            "idx_agent_run_events_owner_session_run_idx",
-            &["user_id", "session_id", "run_id", "event_idx"][..],
-            "ALTER TABLE agent_run_events ADD INDEX idx_agent_run_events_owner_session_run_idx (user_id, session_id, run_id, event_idx)",
-        ),
-        (
-            "idx_agent_run_events_owner_session_subject",
-            &[
-                "user_id",
-                "session_id",
-                "event_type",
-                "subject_run_id",
-                "event_idx",
-            ][..],
-            "ALTER TABLE agent_run_events ADD INDEX idx_agent_run_events_owner_session_subject (user_id, session_id, event_type, subject_run_id, event_idx)",
-        ),
-        (
-            "idx_agent_run_events_interaction",
-            &[
-                "user_id",
-                "run_id",
-                "interaction_request_id",
-                "event_type",
-                "event_idx",
-            ][..],
-            "ALTER TABLE agent_run_events ADD INDEX idx_agent_run_events_interaction (user_id, run_id, interaction_request_id, event_type, event_idx)",
-        ),
-    ] {
-        ensure_index_shape(
-            &pool,
-            &settings.database,
-            "agent_run_events",
-            index,
-            expected_columns,
-            ddl,
-        )
-        .await?;
-    }
-    for removed_index in [
-        "idx_agent_run_events_run_created",
-        "idx_agent_run_events_session_created",
-    ] {
-        drop_index_if_present(&pool, &settings.database, "agent_run_events", removed_index).await?;
-    }
+
     core_schema_create!(pool, "run_checkpoints",
         "CREATE TABLE IF NOT EXISTS run_checkpoints (
             checkpoint_id VARCHAR(64) NOT NULL,
@@ -5492,42 +4272,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "run_checkpoints",
-        &["user_id", "checkpoint_id"],
-        "ALTER TABLE run_checkpoints ADD PRIMARY KEY (user_id, checkpoint_id)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "run_checkpoints",
-        "uniq_run_checkpoint_idem",
-        &["user_id", "run_id", "checkpoint_kind", "idempotency_key"],
-        "ALTER TABLE run_checkpoints ADD UNIQUE KEY uniq_run_checkpoint_idem (user_id, run_id, checkpoint_kind, idempotency_key)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "run_checkpoints",
-        "idx_run_checkpoints_user_run_created",
-        &["user_id", "run_id", "created_at"],
-        "ALTER TABLE run_checkpoints ADD INDEX idx_run_checkpoints_user_run_created (user_id, run_id, created_at)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "run_checkpoints",
-        "idx_run_checkpoints_session_kind_created",
-        &["user_id", "session_id", "checkpoint_kind", "created_at"],
-        "ALTER TABLE run_checkpoints ADD INDEX idx_run_checkpoints_session_kind_created (user_id, session_id, checkpoint_kind, created_at)",
-    )
-    .await?;
-    backfill_legacy_checkpoints(&pool).await?;
 
     core_schema_create!(pool, "run_display_projections",
         "CREATE TABLE IF NOT EXISTS run_display_projections (
@@ -5554,30 +4298,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "run_display_projections",
-        &["user_id", "run_id"],
-        "ALTER TABLE run_display_projections ADD PRIMARY KEY (user_id, run_id)",
-    )
-    .await?;
-    drop_index_if_present(
-        &pool,
-        &settings.database,
-        "run_display_projections",
-        "idx_run_display_projections_session_updated",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "run_display_projections",
-        "idx_run_display_projections_owner_session_updated",
-        &["user_id", "session_id", "updated_at"],
-        "ALTER TABLE run_display_projections ADD INDEX idx_run_display_projections_owner_session_updated (user_id, session_id, updated_at)",
-    )
-    .await?;
 
     core_schema_create!(pool, "session_tool_output_batches",
         "CREATE TABLE IF NOT EXISTS session_tool_output_batches (
@@ -5598,50 +4318,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    for removed_index in [
-        "idx_tool_output_batches_session",
-        "idx_tool_output_batches_run_status",
-        "idx_tool_output_batches_run_created",
-        "idx_tool_output_batches_session_created",
-    ] {
-        drop_index_if_present(
-            &pool,
-            &settings.database,
-            "session_tool_output_batches",
-            removed_index,
-        )
-        .await?;
-    }
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "session_tool_output_batches",
-        &["user_id", "session_id", "batch_id"],
-        "ALTER TABLE session_tool_output_batches ADD PRIMARY KEY (user_id, session_id, batch_id)",
-    )
-    .await?;
-    for (index, expected_columns, ddl) in [
-        (
-            "idx_tool_output_batches_user_run_created",
-            &["user_id", "run_id", "created_at", "batch_id"][..],
-            "ALTER TABLE session_tool_output_batches ADD INDEX idx_tool_output_batches_user_run_created (user_id, run_id, created_at, batch_id)",
-        ),
-        (
-            "idx_tool_output_batches_user_session_created",
-            &["user_id", "session_id", "created_at", "batch_id"][..],
-            "ALTER TABLE session_tool_output_batches ADD INDEX idx_tool_output_batches_user_session_created (user_id, session_id, created_at, batch_id)",
-        ),
-    ] {
-        ensure_index_shape(
-            &pool,
-            &settings.database,
-            "session_tool_output_batches",
-            index,
-            expected_columns,
-            ddl,
-        )
-        .await?;
-    }
 
     core_schema_create!(pool, "session_tool_outputs",
         "CREATE TABLE IF NOT EXISTS session_tool_outputs (
@@ -5672,71 +4348,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    for removed_index in [
-        "idx_tool_outputs_tool_created",
-        "idx_tool_outputs_session_tool_score",
-        "idx_tool_outputs_status_created",
-        "idx_tool_outputs_batch",
-        "idx_tool_outputs_run_created",
-        "idx_tool_outputs_session_created",
-    ] {
-        drop_index_if_present(
-            &pool,
-            &settings.database,
-            "session_tool_outputs",
-            removed_index,
-        )
-        .await?;
-    }
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "session_tool_outputs",
-        &["user_id", "session_id", "output_id"],
-        "ALTER TABLE session_tool_outputs ADD PRIMARY KEY (user_id, session_id, output_id)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "session_tool_outputs",
-        "uq_tool_outputs_batch_idx",
-        &["user_id", "session_id", "batch_id", "output_idx"],
-        "ALTER TABLE session_tool_outputs ADD UNIQUE KEY uq_tool_outputs_batch_idx (user_id, session_id, batch_id, output_idx)",
-    )
-    .await?;
-    for (index, expected_columns, ddl) in [
-        (
-            "idx_tool_outputs_user_run_created",
-            &["user_id", "run_id", "created_at", "output_id"][..],
-            "ALTER TABLE session_tool_outputs ADD INDEX idx_tool_outputs_user_run_created (user_id, run_id, created_at, output_id)",
-        ),
-        (
-            "idx_tool_outputs_user_session_created",
-            &["user_id", "session_id", "created_at", "output_id"][..],
-            "ALTER TABLE session_tool_outputs ADD INDEX idx_tool_outputs_user_session_created (user_id, session_id, created_at, output_id)",
-        ),
-        (
-            "idx_tool_outputs_parent",
-            &["user_id", "parent_output_id"][..],
-            "ALTER TABLE session_tool_outputs ADD INDEX idx_tool_outputs_parent (user_id, parent_output_id)",
-        ),
-        (
-            "idx_tool_outputs_artifact_ref",
-            &["user_id", "artifact_ref"][..],
-            "ALTER TABLE session_tool_outputs ADD INDEX idx_tool_outputs_artifact_ref (user_id, artifact_ref)",
-        ),
-    ] {
-        ensure_index_shape(
-            &pool,
-            &settings.database,
-            "session_tool_outputs",
-            index,
-            expected_columns,
-            ddl,
-        )
-        .await?;
-    }
 
     // `tool_exactly_once_results` is retired and is not a runtime authority.
     // Startup deliberately leaves any historical table untouched: removing
@@ -5774,38 +4385,7 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    fail_if_required_columns_missing_or_nullable(
-        &pool,
-        &settings.database,
-        "tool_invocation_ledger",
-        TOOL_INVOCATION_LEDGER_REQUIRED_COLUMNS,
-    )
-    .await?;
-    fail_if_varchar_columns_shorter_than(
-        &pool,
-        &settings.database,
-        "tool_invocation_ledger",
-        TOOL_INVOCATION_LEDGER_REQUIRED_VARCHAR_WIDTHS,
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "tool_invocation_ledger",
-        "idx_tool_invocation_run_compaction",
-        &["user_id", "session_id", "run_id", "state", "identity_key"],
-        "ALTER TABLE tool_invocation_ledger ADD INDEX idx_tool_invocation_run_compaction (user_id, session_id, run_id, state, identity_key)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "tool_invocation_ledger",
-        "idx_tool_invocation_session_state",
-        &["user_id", "session_id", "state", "identity_key"],
-        "ALTER TABLE tool_invocation_ledger ADD INDEX idx_tool_invocation_session_state (user_id, session_id, state, identity_key)",
-    )
-    .await?;
+
     core_schema_create!(
         pool,
         "tool_invocation_archive_chunks",
@@ -5828,69 +4408,6 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
-    .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "tool_invocation_archive_chunks",
-        &["user_id", "session_id", "run_id", "chunk_index"],
-        "ALTER TABLE tool_invocation_archive_chunks ADD PRIMARY KEY (user_id, session_id, run_id, chunk_index)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "tool_invocation_archive_chunks",
-        "idx_tool_invocation_archive_lookup",
-        &[
-            "user_id",
-            "session_id",
-            "run_id",
-            "first_identity_key",
-            "last_identity_key",
-        ],
-        "ALTER TABLE tool_invocation_archive_chunks ADD INDEX idx_tool_invocation_archive_lookup (user_id, session_id, run_id, first_identity_key, last_identity_key)",
-    )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "tool_invocation_ledger",
-        "decision_json",
-        "ALTER TABLE tool_invocation_ledger ADD COLUMN decision_json JSON NULL",
-    )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "tool_invocation_ledger",
-        "dispatch_owner",
-        "ALTER TABLE tool_invocation_ledger ADD COLUMN dispatch_owner VARCHAR(64) NULL",
-    )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "tool_invocation_ledger",
-        "dispatch_lease_expires_at",
-        "ALTER TABLE tool_invocation_ledger ADD COLUMN dispatch_lease_expires_at DATETIME(6) NULL",
-    )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "tool_invocation_ledger",
-        "outcome_json",
-        "ALTER TABLE tool_invocation_ledger ADD COLUMN outcome_json JSON NULL",
-    )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "tool_invocation_ledger",
-        "completion_source_json",
-        "ALTER TABLE tool_invocation_ledger ADD COLUMN completion_source_json JSON NULL",
-    )
     .await?;
 
     core_schema_create!(
@@ -5944,14 +4461,13 @@ async fn ensure_core_schema_while_leased(
             content LONGTEXT NOT NULL,
             payload_json LONGTEXT NULL,
             source_event_id VARCHAR(128) NULL,
-            source_event_idx BIGINT NULL,
             content_hash VARCHAR(128) NOT NULL,
             canonical_completed_turn BIGINT NULL,
             canonical_conversation_seq BIGINT NULL,
             canonical_root_hash VARCHAR(64) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, session_id, item_seq),
-            INDEX idx_transcript_owner_run_event (user_id, run_id, source_event_idx),
+            INDEX idx_transcript_owner_run (user_id, run_id),
             INDEX idx_transcript_owner_session_source_event (user_id, session_id, source_event_id),
             INDEX idx_transcript_owner_session_commit_item
                 (user_id, session_id, canonical_completed_turn, item_seq)
@@ -5959,69 +4475,7 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "session_transcript_items",
-        &["user_id", "session_id", "item_seq"],
-        "ALTER TABLE session_transcript_items ADD PRIMARY KEY (user_id, session_id, item_seq)",
-    )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "session_transcript_items",
-        "payload_json",
-        "ALTER TABLE session_transcript_items ADD COLUMN payload_json LONGTEXT NULL",
-    )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "session_transcript_items",
-        "canonical_completed_turn",
-        "ALTER TABLE session_transcript_items ADD COLUMN canonical_completed_turn BIGINT NULL",
-    )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "session_transcript_items",
-        "canonical_conversation_seq",
-        "ALTER TABLE session_transcript_items ADD COLUMN canonical_conversation_seq BIGINT NULL",
-    )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "session_transcript_items",
-        "canonical_root_hash",
-        "ALTER TABLE session_transcript_items ADD COLUMN canonical_root_hash VARCHAR(64) NULL",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "session_transcript_items",
-        "idx_transcript_owner_run_event",
-        &["user_id", "run_id", "source_event_idx"],
-        "ALTER TABLE session_transcript_items ADD INDEX idx_transcript_owner_run_event (user_id, run_id, source_event_idx)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "session_transcript_items",
-        "idx_transcript_owner_session_commit_item",
-        &[
-            "user_id",
-            "session_id",
-            "canonical_completed_turn",
-            "item_seq",
-        ],
-        "ALTER TABLE session_transcript_items ADD INDEX idx_transcript_owner_session_commit_item (user_id, session_id, canonical_completed_turn, item_seq)",
-    )
-    .await?;
+
     core_schema_create!(
         pool,
         "session_transcript_projection_heads",
@@ -6041,65 +4495,7 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "session_transcript_items",
-        "idx_transcript_owner_session_source_event",
-        &["user_id", "session_id", "source_event_id"],
-        "ALTER TABLE session_transcript_items ADD INDEX idx_transcript_owner_session_source_event (user_id, session_id, source_event_id)",
-    )
-    .await?;
-    core_schema_create!(
-        pool,
-        "transcript_pages",
-        "CREATE TABLE IF NOT EXISTS transcript_pages (
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            page_seq BIGINT NOT NULL,
-            start_item_seq BIGINT NOT NULL,
-            end_item_seq BIGINT NOT NULL,
-            item_count INT NOT NULL,
-            page_hash VARCHAR(128) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, page_seq),
-            INDEX idx_transcript_pages_owner_session_end (user_id, session_id, end_item_seq),
-            INDEX idx_transcript_pages_owner_session_updated (user_id, session_id, updated_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "transcript_pages",
-        &["user_id", "session_id", "page_seq"],
-        "ALTER TABLE transcript_pages ADD PRIMARY KEY (user_id, session_id, page_seq)",
-    )
-    .await?;
-    for (index, expected_columns, ddl) in [
-        (
-            "idx_transcript_pages_owner_session_end",
-            &["user_id", "session_id", "end_item_seq"][..],
-            "ALTER TABLE transcript_pages ADD INDEX idx_transcript_pages_owner_session_end (user_id, session_id, end_item_seq)",
-        ),
-        (
-            "idx_transcript_pages_owner_session_updated",
-            &["user_id", "session_id", "updated_at"][..],
-            "ALTER TABLE transcript_pages ADD INDEX idx_transcript_pages_owner_session_updated (user_id, session_id, updated_at)",
-        ),
-    ] {
-        ensure_index_shape(
-            &pool,
-            &settings.database,
-            "transcript_pages",
-            index,
-            expected_columns,
-            ddl,
-        )
-        .await?;
-    }
+
     core_schema_create!(pool, "prompt_request_records",
         "CREATE TABLE IF NOT EXISTS prompt_request_records (
             request_id VARCHAR(64) NOT NULL,
@@ -6130,112 +4526,7 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "prompt_request_records",
-        "created_at_unix_ms",
-        "ALTER TABLE prompt_request_records ADD COLUMN created_at_unix_ms BIGINT NULL",
-    )
-    .await?;
-    query(
-        "UPDATE prompt_request_records
-         SET created_at_unix_ms = UNIX_TIMESTAMP(created_at) * 1000
-         WHERE created_at_unix_ms IS NULL",
-    )
-    .execute(&pool)
-    .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "prompt_request_records",
-        &["user_id", "request_id"],
-        "ALTER TABLE prompt_request_records ADD PRIMARY KEY (user_id, request_id)",
-    )
-    .await?;
-    for removed_index in [
-        "idx_prompt_requests_session_created",
-        "idx_prompt_requests_run_created",
-    ] {
-        drop_index_if_present(
-            &pool,
-            &settings.database,
-            "prompt_request_records",
-            removed_index,
-        )
-        .await?;
-    }
-    for (index, expected_columns, ddl) in [
-        (
-            "idx_prompt_requests_owner_session_created",
-            &[
-                "user_id",
-                "session_id",
-                "created_at",
-                "turn",
-                "round",
-                "attempt",
-            ][..],
-            "ALTER TABLE prompt_request_records ADD INDEX idx_prompt_requests_owner_session_created (user_id, session_id, created_at, turn, round, attempt)",
-        ),
-        (
-            "idx_prompt_requests_owner_run_created",
-            &[
-                "user_id",
-                "run_id",
-                "created_at",
-                "turn",
-                "round",
-                "attempt",
-            ][..],
-            "ALTER TABLE prompt_request_records ADD INDEX idx_prompt_requests_owner_run_created (user_id, run_id, created_at, turn, round, attempt)",
-        ),
-        (
-            "idx_prompt_requests_owner_previous",
-            &["user_id", "session_id", "previous_request_id"][..],
-            "ALTER TABLE prompt_request_records ADD INDEX idx_prompt_requests_owner_previous (user_id, session_id, previous_request_id)",
-        ),
-        (
-            "idx_prompt_requests_retention_ms",
-            &["created_at_unix_ms", "user_id", "request_id", "session_id"][..],
-            "ALTER TABLE prompt_request_records ADD INDEX idx_prompt_requests_retention_ms (created_at_unix_ms, user_id, request_id, session_id)",
-        ),
-    ] {
-        ensure_index_shape(
-            &pool,
-            &settings.database,
-            "prompt_request_records",
-            index,
-            expected_columns,
-            ddl,
-        )
-        .await?;
-    }
-    fail_if_obsolete_shape(
-        &pool,
-        &settings.database,
-        "prompt_deltas",
-        &[
-            "user_id",
-            "session_id",
-            "request_id",
-            "delta_seq",
-            "logical_key",
-            "chunk_kind",
-            "position",
-            "op",
-            "chunk_id",
-            "chunk_hash",
-            "previous_chunk_hash",
-            "created_at",
-        ],
-        &["delta_id", "payload_json"],
-        &[
-            "uq_prompt_delta_request_seq",
-            "idx_prompt_deltas_request_position",
-        ],
-    )
-    .await?;
+
     core_schema_create!(pool, "prompt_deltas",
         "CREATE TABLE IF NOT EXISTS prompt_deltas (
             user_id VARCHAR(128) NOT NULL,
@@ -6261,30 +4552,7 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    for (column, ddl) in [
-        (
-            "reuse_count",
-            "ALTER TABLE prompt_deltas ADD COLUMN reuse_count INT NULL",
-        ),
-        (
-            "chunk_tokens",
-            "ALTER TABLE prompt_deltas ADD COLUMN chunk_tokens BIGINT NULL",
-        ),
-        (
-            "chunk_bytes",
-            "ALTER TABLE prompt_deltas ADD COLUMN chunk_bytes BIGINT NULL",
-        ),
-        (
-            "previous_chunk_tokens",
-            "ALTER TABLE prompt_deltas ADD COLUMN previous_chunk_tokens BIGINT NULL",
-        ),
-        (
-            "previous_chunk_bytes",
-            "ALTER TABLE prompt_deltas ADD COLUMN previous_chunk_bytes BIGINT NULL",
-        ),
-    ] {
-        add_column_if_missing(&pool, &settings.database, "prompt_deltas", column, ddl).await?;
-    }
+
     core_schema_create!(
         pool,
         "session_device_leases",
@@ -6313,34 +4581,7 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    fail_if_obsolete_shape(
-        &pool,
-        &settings.database,
-        "session_device_leases",
-        &[
-            "lease_id",
-            "user_id",
-            "session_id",
-            "device_id",
-            "device_fingerprint",
-            "device_key_hash",
-            "trust_level",
-            "status",
-            "last_monotonic_id",
-            "expires_at",
-        ],
-        &[],
-        &[],
-    )
-    .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "session_device_leases",
-        &["user_id", "lease_id"],
-        "ALTER TABLE session_device_leases ADD PRIMARY KEY (user_id, lease_id)",
-    )
-    .await?;
+
     core_schema_create!(
         pool,
         "session_device_challenges",
@@ -6384,22 +4625,6 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
-    .await?;
-    drop_index_if_present(
-        &pool,
-        &settings.database,
-        "session_device_lease_events",
-        "idx_lease_events_session_device",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "session_device_lease_events",
-        "idx_lease_events_owner_session_device",
-        &["user_id", "session_id", "device_id", "created_at"],
-        "ALTER TABLE session_device_lease_events ADD INDEX idx_lease_events_owner_session_device (user_id, session_id, device_id, created_at)",
-    )
     .await?;
 
     // ── Sweeper leader election (prevents duplicate background work in
@@ -6476,79 +4701,7 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    fail_if_obsolete_shape(
-        &pool,
-        &settings.database,
-        "context_manifests",
-        &[
-            "user_id",
-            "manifest_id",
-            "payload_hash",
-            "ingestion_write_id",
-        ],
-        &[],
-        &[],
-    )
-    .await?;
-    fail_if_required_columns_missing_or_nullable(
-        &pool,
-        &settings.database,
-        "context_manifests",
-        &["payload_hash", "ingestion_write_id"],
-    )
-    .await?;
-    fail_if_varchar_columns_shorter_than(
-        &pool,
-        &settings.database,
-        "context_manifests",
-        &[("payload_hash", 80), ("ingestion_write_id", 64)],
-    )
-    .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "context_manifests",
-        &["user_id", "manifest_id"],
-        "ALTER TABLE context_manifests ADD PRIMARY KEY (user_id, manifest_id)",
-    )
-    .await?;
-    for removed_index in ["idx_ctx_manifest_session_turn", "idx_ctx_manifest_run"] {
-        drop_index_if_present(
-            &pool,
-            &settings.database,
-            "context_manifests",
-            removed_index,
-        )
-        .await?;
-    }
-    for (index, expected_columns, ddl) in [
-        (
-            "idx_ctx_manifest_owner_session_created",
-            &["user_id", "session_id", "created_at", "manifest_id"][..],
-            "ALTER TABLE context_manifests ADD INDEX idx_ctx_manifest_owner_session_created (user_id, session_id, created_at, manifest_id)",
-        ),
-        (
-            "idx_ctx_manifest_owner_session_run_created",
-            &[
-                "user_id",
-                "session_id",
-                "run_id",
-                "created_at",
-                "manifest_id",
-            ][..],
-            "ALTER TABLE context_manifests ADD INDEX idx_ctx_manifest_owner_session_run_created (user_id, session_id, run_id, created_at, manifest_id)",
-        ),
-    ] {
-        ensure_index_shape(
-            &pool,
-            &settings.database,
-            "context_manifests",
-            index,
-            expected_columns,
-            ddl,
-        )
-        .await?;
-    }
+
     core_schema_create!(
         pool,
         "context_manifest_items",
@@ -6576,57 +4729,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    fail_if_obsolete_shape(
-        &pool,
-        &settings.database,
-        "context_manifest_items",
-        &["user_id", "manifest_id", "item_order"],
-        &["id"],
-        &["uq_manifest_item_order"],
-    )
-    .await?;
-    drop_index_if_present(
-        &pool,
-        &settings.database,
-        "context_manifest_items",
-        "idx_manifest_items_session_zone",
-    )
-    .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "context_manifest_items",
-        &["user_id", "manifest_id", "item_order"],
-        "ALTER TABLE context_manifest_items ADD PRIMARY KEY (user_id, manifest_id, item_order)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "context_manifest_items",
-        "idx_manifest_items_manifest_zone",
-        &["user_id", "manifest_id", "zone", "included"],
-        "ALTER TABLE context_manifest_items ADD INDEX idx_manifest_items_manifest_zone (user_id, manifest_id, zone, included)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "context_manifest_items",
-        "idx_manifest_items_source",
-        &["user_id", "source_table", "source_id"],
-        "ALTER TABLE context_manifest_items ADD INDEX idx_manifest_items_source (user_id, source_table, source_id)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "context_manifest_items",
-        "idx_manifest_items_raw_ref",
-        &["user_id", "raw_ref"],
-        "ALTER TABLE context_manifest_items ADD INDEX idx_manifest_items_raw_ref (user_id, raw_ref)",
-    )
-    .await?;
 
     core_schema_create!(
         pool,
@@ -6651,231 +4753,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    fail_if_obsolete_shape(
-        &pool,
-        &settings.database,
-        "observation_identity_collisions",
-        &[
-            "user_id",
-            "identity_kind",
-            "identity_id",
-            "session_id",
-            "stored_payload_hash",
-            "attempted_payload_hash",
-            "source",
-            "collision_count",
-            "first_seen_at",
-            "last_seen_at",
-            "expires_at",
-        ],
-        &[],
-        &[],
-    )
-    .await?;
-    fail_if_required_columns_missing_or_nullable(
-        &pool,
-        &settings.database,
-        "observation_identity_collisions",
-        &[
-            "stored_payload_hash",
-            "attempted_payload_hash",
-            "collision_count",
-            "first_seen_at",
-            "last_seen_at",
-            "expires_at",
-            "source",
-        ],
-    )
-    .await?;
-    fail_if_varchar_columns_shorter_than(
-        &pool,
-        &settings.database,
-        "observation_identity_collisions",
-        &[("stored_payload_hash", 80), ("attempted_payload_hash", 80)],
-    )
-    .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "observation_identity_collisions",
-        &["user_id", "identity_kind", "identity_id"],
-        "ALTER TABLE observation_identity_collisions ADD PRIMARY KEY (user_id, identity_kind, identity_id)",
-    )
-    .await?;
-    for (index, expected_columns, ddl) in [
-        (
-            "idx_observation_collisions_owner_seen",
-            &["user_id", "last_seen_at"][..],
-            "ALTER TABLE observation_identity_collisions ADD INDEX idx_observation_collisions_owner_seen (user_id, last_seen_at)",
-        ),
-        (
-            "idx_observation_collisions_owner_session_seen",
-            &["user_id", "session_id", "last_seen_at"][..],
-            "ALTER TABLE observation_identity_collisions ADD INDEX idx_observation_collisions_owner_session_seen (user_id, session_id, last_seen_at)",
-        ),
-        (
-            "idx_observation_collisions_expiry",
-            &["expires_at", "user_id", "identity_kind", "identity_id"][..],
-            "ALTER TABLE observation_identity_collisions ADD INDEX idx_observation_collisions_expiry (expires_at, user_id, identity_kind, identity_id)",
-        ),
-    ] {
-        ensure_index_shape(
-            &pool,
-            &settings.database,
-            "observation_identity_collisions",
-            index,
-            expected_columns,
-            ddl,
-        )
-        .await?;
-    }
-
-    core_schema_create!(
-        pool,
-        "preview_template_registry",
-        "CREATE TABLE IF NOT EXISTS preview_template_registry (
-            tool_name VARCHAR(128) NOT NULL,
-            version VARCHAR(64) NOT NULL,
-            status VARCHAR(32) NOT NULL DEFAULT 'active',
-            max_preview_bytes INT NOT NULL DEFAULT 400,
-            default_chunk_type VARCHAR(64) NOT NULL DEFAULT 'tool_output_preview',
-            first_class_columns_json LONGTEXT NOT NULL,
-            fts_field_weights_json LONGTEXT NOT NULL,
-            normalize_version VARCHAR(32) NOT NULL DEFAULT 'v1',
-            schema_json LONGTEXT NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (tool_name, version),
-            INDEX idx_preview_templates_status (tool_name, status, updated_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "raw_ref_scheme_registry",
-        "CREATE TABLE IF NOT EXISTS raw_ref_scheme_registry (
-            scheme VARCHAR(64) PRIMARY KEY,
-            resolver_name VARCHAR(128) NOT NULL,
-            backing_store VARCHAR(64) NOT NULL,
-            access_check VARCHAR(64) NOT NULL,
-            canonical_example VARCHAR(255) NOT NULL,
-            is_active SMALLINT NOT NULL DEFAULT 1,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    for (scheme, resolver, backing, access_check, example) in [
-        (
-            "artifact",
-            "artifact_resolver",
-            "matrixone",
-            "session_artifact_acl",
-            "artifact://session/artifact_id@sha256:...",
-        ),
-        (
-            "s3",
-            "s3_resolver",
-            "object_store",
-            "presigned_url_acl",
-            "s3://bucket/key@sha256:...",
-        ),
-        (
-            "conversation_log",
-            "conversation_log_resolver",
-            "matrixone",
-            "session_owner",
-            "conversation_log://session/item_seq@sha256:...",
-        ),
-        (
-            "object_store",
-            "object_store_resolver",
-            "object_store",
-            "object_acl",
-            "object_store://namespace/key@sha256:...",
-        ),
-        (
-            "cold_storage",
-            "cold_storage_resolver",
-            "cold_storage",
-            "archive_acl",
-            "cold_storage://archive/key@sha256:...",
-        ),
-        (
-            "blob",
-            "blob_resolver",
-            "matrixone",
-            "blob_acl",
-            "blob://table/blob_id@sha256:...",
-        ),
-        (
-            "tool_output",
-            "tool_output_resolver",
-            "matrixone",
-            "session_owner",
-            "tool_output://session/output_id@sha256:...",
-        ),
-        (
-            "chunk",
-            "history_chunk_resolver",
-            "matrixone",
-            "session_or_user_scope",
-            "chunk://session/chunk_id@sha256:...",
-        ),
-        (
-            "state_item",
-            "state_item_resolver",
-            "matrixone",
-            "session_or_user_scope",
-            "state_item://session/item_id@sha256:...",
-        ),
-    ] {
-        query(
-            "INSERT IGNORE INTO raw_ref_scheme_registry
-             (scheme, resolver_name, backing_store, access_check, canonical_example, is_active, created_at)
-             VALUES (?, ?, ?, ?, ?, 1, NOW(6))",
-        )
-        .bind(scheme)
-        .bind(resolver)
-        .bind(backing)
-        .bind(access_check)
-        .bind(example)
-        .execute(&pool)
-        .await?;
-    }
-
-    for (tool_name, max_preview_bytes, normalize_version) in
-        crate::context_manifest::BASELINE_PREVIEW_TEMPLATES
-    {
-        let fts_field_weights =
-            crate::context_manifest::preview_template_fts_field_weights(normalize_version);
-        query(
-            "INSERT IGNORE INTO preview_template_registry
-             (tool_name, version, status, max_preview_bytes, default_chunk_type,
-              first_class_columns_json, fts_field_weights_json, normalize_version, schema_json,
-              created_at, updated_at)
-             VALUES (?, 'v1', 'active', ?, 'tool_output_preview', '[]', ?, ?, '{}', NOW(6), NOW(6))",
-        )
-        .bind(tool_name)
-        .bind(i64::from(*max_preview_bytes))
-        .bind(fts_field_weights)
-        .bind(normalize_version)
-        .execute(&pool)
-        .await?;
-
-        query(
-            "UPDATE preview_template_registry
-             SET fts_field_weights_json = ?, updated_at = NOW(6)
-             WHERE tool_name = ? AND version = 'v1' AND fts_field_weights_json = '{}'",
-        )
-        .bind(fts_field_weights)
-        .bind(tool_name)
-        .execute(&pool)
-        .await?;
-    }
 
     // ── State projection v1 (Phase 4 / G2+G4+G5+G6+G14+G16+G20) ────────
     core_schema_create!(pool, "session_state_items",
@@ -6917,42 +4794,7 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    for removed_index in ["idx_state_session_category", "idx_state_origin_session"] {
-        drop_index_if_present(
-            &pool,
-            &settings.database,
-            "session_state_items",
-            removed_index,
-        )
-        .await?;
-    }
-    for (index, expected_columns, ddl) in [
-        (
-            "idx_state_owner_session_status_category",
-            &["user_id", "session_id", "status", "category"][..],
-            "ALTER TABLE session_state_items ADD INDEX idx_state_owner_session_status_category (user_id, session_id, status, category)",
-        ),
-        (
-            "idx_state_user_scope_category",
-            &["user_id", "scope", "category", "status", "priority"][..],
-            "ALTER TABLE session_state_items ADD INDEX idx_state_user_scope_category (user_id, scope, category, status, priority)",
-        ),
-        (
-            "idx_state_owner_origin_session",
-            &["user_id", "origin_session_id", "category", "status"][..],
-            "ALTER TABLE session_state_items ADD INDEX idx_state_owner_origin_session (user_id, origin_session_id, category, status)",
-        ),
-    ] {
-        ensure_index_shape(
-            &pool,
-            &settings.database,
-            "session_state_items",
-            index,
-            expected_columns,
-            ddl,
-        )
-        .await?;
-    }
+
     core_schema_create!(pool, "session_state_item_events",
         "CREATE TABLE IF NOT EXISTS session_state_item_events (
             event_id VARCHAR(64) NOT NULL,
@@ -6979,57 +4821,6 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
-    .await?;
-    fail_if_obsolete_shape(
-        &pool,
-        &settings.database,
-        "session_state_item_events",
-        &["user_id", "event_id"],
-        &["id"],
-        &[],
-    )
-    .await?;
-    drop_index_if_present(
-        &pool,
-        &settings.database,
-        "session_state_item_events",
-        "idx_state_events_session_created",
-    )
-    .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "session_state_item_events",
-        &["user_id", "event_id"],
-        "ALTER TABLE session_state_item_events ADD PRIMARY KEY (user_id, event_id)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "session_state_item_events",
-        "idx_state_events_item_created",
-        &["item_id", "created_at", "event_id"],
-        "ALTER TABLE session_state_item_events ADD INDEX idx_state_events_item_created (item_id, created_at, event_id)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "session_state_item_events",
-        "idx_state_events_owner_session_created",
-        &["user_id", "session_id", "created_at", "event_id"],
-        "ALTER TABLE session_state_item_events ADD INDEX idx_state_events_owner_session_created (user_id, session_id, created_at, event_id)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "session_state_item_events",
-        "idx_state_events_category_created",
-        &["category", "created_at", "event_id"],
-        "ALTER TABLE session_state_item_events ADD INDEX idx_state_events_category_created (category, created_at, event_id)",
-    )
     .await?;
 
     core_schema_create!(pool, "session_delegations",
@@ -7064,77 +4855,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    for removed_index in [
-        "idx_delegations_root_depth",
-        "idx_delegations_parent",
-        "idx_delegations_session_status",
-    ] {
-        drop_index_if_present(
-            &pool,
-            &settings.database,
-            "session_delegations",
-            removed_index,
-        )
-        .await?;
-    }
-    for (index, expected_columns, ddl) in [
-        (
-            "idx_delegations_owner_root_depth",
-            &["user_id", "root_run_id", "depth", "created_at"][..],
-            "ALTER TABLE session_delegations ADD INDEX idx_delegations_owner_root_depth (user_id, root_run_id, depth, created_at)",
-        ),
-        (
-            "idx_delegations_owner_parent_status_updated",
-            &["user_id", "parent_run_id", "status", "updated_at"][..],
-            "ALTER TABLE session_delegations ADD INDEX idx_delegations_owner_parent_status_updated (user_id, parent_run_id, status, updated_at)",
-        ),
-        (
-            "idx_delegations_owner_session_status",
-            &["user_id", "session_id", "status", "updated_at"][..],
-            "ALTER TABLE session_delegations ADD INDEX idx_delegations_owner_session_status (user_id, session_id, status, updated_at)",
-        ),
-    ] {
-        ensure_index_shape(
-            &pool,
-            &settings.database,
-            "session_delegations",
-            index,
-            expected_columns,
-            ddl,
-        )
-        .await?;
-    }
-
-    query("DROP TABLE IF EXISTS session_artifact_grants")
-        .execute(&pool)
-        .await?;
-
-    fail_if_obsolete_shape(
-        &pool,
-        &settings.database,
-        "agent_event_edges",
-        &[
-            "user_id",
-            "session_id",
-            "child_event_id",
-            "parent_event_id",
-            "relation_kind",
-            "parent_order",
-        ],
-        &[],
-        &[
-            "idx_agent_event_edges_child",
-            "idx_agent_event_edges_parent",
-        ],
-    )
-    .await?;
-    fail_if_required_columns_missing_or_nullable(
-        &pool,
-        &settings.database,
-        "agent_event_edges",
-        &["user_id", "session_id"],
-    )
-    .await?;
 
     core_schema_create!(
         pool,
@@ -7154,16 +4874,6 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
-    .await?;
-    fail_if_varchar_columns_shorter_than(
-        &pool,
-        &settings.database,
-        "agent_event_edges",
-        &[
-            ("child_event_id", AGENT_EVENT_ID_LEN as u64),
-            ("parent_event_id", AGENT_EVENT_ID_LEN as u64),
-        ],
-    )
     .await?;
 
     // Harness diagnostic snapshots — separated from agent_events to avoid
@@ -7187,46 +4897,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    for removed_index in [
-        "idx_harness_session",
-        "idx_harness_session_turn",
-        "idx_harness_chain",
-    ] {
-        drop_index_if_present(
-            &pool,
-            &settings.database,
-            "harness_snapshots",
-            removed_index,
-        )
-        .await?;
-    }
-    for (index, expected_columns, ddl) in [
-        (
-            "idx_harness_owner_session_created",
-            &["user_id", "session_id", "created_at"][..],
-            "ALTER TABLE harness_snapshots ADD INDEX idx_harness_owner_session_created (user_id, session_id, created_at)",
-        ),
-        (
-            "idx_harness_owner_session_turn",
-            &["user_id", "session_id", "turn_number"][..],
-            "ALTER TABLE harness_snapshots ADD INDEX idx_harness_owner_session_turn (user_id, session_id, turn_number)",
-        ),
-        (
-            "idx_harness_owner_chain",
-            &["user_id", "causal_chain_id"][..],
-            "ALTER TABLE harness_snapshots ADD INDEX idx_harness_owner_chain (user_id, causal_chain_id)",
-        ),
-    ] {
-        ensure_index_shape(
-            &pool,
-            &settings.database,
-            "harness_snapshots",
-            index,
-            expected_columns,
-            ddl,
-        )
-        .await?;
-    }
 
     // Product harness workflow state. This is separate from the diagnostic
     // `harness_snapshots` table above: these rows are the durable product model
@@ -7255,22 +4925,6 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
-    .await?;
-    drop_index_if_present(
-        &pool,
-        &settings.database,
-        "harness_runs",
-        "idx_harness_runs_session",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "harness_runs",
-        "idx_harness_runs_owner_session_updated",
-        &["user_id", "session_id", "updated_at"],
-        "ALTER TABLE harness_runs ADD INDEX idx_harness_runs_owner_session_updated (user_id, session_id, updated_at)",
-    )
     .await?;
 
     core_schema_create!(
@@ -7402,41 +5056,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    fail_if_varchar_columns_shorter_than(
-        &pool,
-        &settings.database,
-        "ctx_snapshots",
-        &[("event_id", AGENT_EVENT_ID_LEN as u64)],
-    )
-    .await?;
-    for removed_index in [
-        "idx_ctx_snapshots_session_created",
-        "idx_ctx_snapshots_event_id",
-    ] {
-        drop_index_if_present(&pool, &settings.database, "ctx_snapshots", removed_index).await?;
-    }
-    for (index, expected_columns, ddl) in [
-        (
-            "idx_ctx_snapshots_owner_session_created",
-            &["user_id", "session_id", "created_at"][..],
-            "ALTER TABLE ctx_snapshots ADD INDEX idx_ctx_snapshots_owner_session_created (user_id, session_id, created_at)",
-        ),
-        (
-            "idx_ctx_snapshots_owner_event_id",
-            &["user_id", "event_id"][..],
-            "ALTER TABLE ctx_snapshots ADD INDEX idx_ctx_snapshots_owner_event_id (user_id, event_id)",
-        ),
-    ] {
-        ensure_index_shape(
-            &pool,
-            &settings.database,
-            "ctx_snapshots",
-            index,
-            expected_columns,
-            ddl,
-        )
-        .await?;
-    }
 
     core_schema_create!(pool, "ctx_decision_audits",
         "CREATE TABLE IF NOT EXISTS ctx_decision_audits (
@@ -7457,61 +5076,7 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    fail_if_varchar_columns_shorter_than(
-        &pool,
-        &settings.database,
-        "ctx_decision_audits",
-        &[("event_id", AGENT_EVENT_ID_LEN as u64)],
-    )
-    .await?;
-    for removed_index in [
-        "idx_ctx_decisions_session_type_created",
-        "idx_ctx_decisions_event_id",
-        "idx_ctx_decisions_context_capture_id",
-    ] {
-        drop_index_if_present(
-            &pool,
-            &settings.database,
-            "ctx_decision_audits",
-            removed_index,
-        )
-        .await?;
-    }
-    for (index, expected_columns, ddl) in [
-        (
-            "idx_ctx_decisions_owner_session_type_created",
-            &["user_id", "session_id", "decision_type", "created_at"][..],
-            "ALTER TABLE ctx_decision_audits ADD INDEX idx_ctx_decisions_owner_session_type_created (user_id, session_id, decision_type, created_at)",
-        ),
-        (
-            "idx_ctx_decisions_owner_event_id",
-            &["user_id", "event_id"][..],
-            "ALTER TABLE ctx_decision_audits ADD INDEX idx_ctx_decisions_owner_event_id (user_id, event_id)",
-        ),
-        (
-            "idx_ctx_decisions_owner_context_capture_id",
-            &["user_id", "context_capture_id"][..],
-            "ALTER TABLE ctx_decision_audits ADD INDEX idx_ctx_decisions_owner_context_capture_id (user_id, context_capture_id)",
-        ),
-    ] {
-        ensure_index_shape(
-            &pool,
-            &settings.database,
-            "ctx_decision_audits",
-            index,
-            expected_columns,
-            ddl,
-        )
-        .await?;
-    }
 
-    fail_if_required_columns_missing_or_nullable(
-        &pool,
-        &settings.database,
-        "skill_selection_events",
-        &["user_id"],
-    )
-    .await?;
     core_schema_create!(
         pool,
         "skill_selection_events",
@@ -7535,22 +5100,6 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
-    .await?;
-    drop_index_if_present(
-        &pool,
-        &settings.database,
-        "skill_selection_events",
-        "idx_skill_selection_session_created",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "skill_selection_events",
-        "idx_skill_selection_owner_session_created",
-        &["user_id", "session_id", "created_at"],
-        "ALTER TABLE skill_selection_events ADD INDEX idx_skill_selection_owner_session_created (user_id, session_id, created_at)",
-    )
     .await?;
 
     core_schema_create!(
@@ -7612,18 +5161,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-
-    // Additive observations; old models stay usable. Never probe in migrations.
-    for table in ["infra_llm_models", "user_llm_models"] {
-        add_column_if_missing(
-            &pool,
-            &settings.database,
-            table,
-            "thinking_probe_json",
-            &format!("ALTER TABLE {table} ADD COLUMN thinking_probe_json JSON NULL"),
-        )
-        .await?;
-    }
 
     // Canonical inference execution ledger. Admission writes the immutable route
     // and logical invocation together; each physical attempt is then committed
@@ -7727,35 +5264,6 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "inference_invocations",
-        "idx_inference_invocations_logical_cursor",
-        &[
-            "user_id",
-            "scope_kind",
-            "session_id",
-            "run_id",
-            "harness_run_id",
-            "turn_index",
-            "round_index",
-            "operation_id",
-            "purpose",
-            "logical_attempt",
-        ],
-        "ALTER TABLE inference_invocations ADD INDEX idx_inference_invocations_logical_cursor (user_id, scope_kind, session_id, run_id, harness_run_id, turn_index, round_index, operation_id, purpose, logical_attempt)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "inference_invocations",
-        "idx_inference_invocations_owner_lease",
-        &["owner_lease_expires_at", "user_id", "invocation_id"],
-        "ALTER TABLE inference_invocations ADD INDEX idx_inference_invocations_owner_lease (owner_lease_expires_at, user_id, invocation_id)",
-    )
     .await?;
 
     core_schema_create!(pool, "inference_provider_attempts",
@@ -7920,14 +5428,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "inference_provider_attempts",
-        "context_expired_at",
-        "ALTER TABLE inference_provider_attempts ADD COLUMN context_expired_at DATETIME(6) NULL",
-    )
-    .await?;
 
     core_schema_create!(
         pool,
@@ -7974,24 +5474,6 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "model_request_context_events",
-        "idx_model_request_context_created_event",
-        &["created_at", "event_id"],
-        "ALTER TABLE model_request_context_events ADD INDEX idx_model_request_context_created_event (created_at, event_id)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "model_request_context_events",
-        "idx_model_request_context_owner_harness_created",
-        &["user_id", "harness_run_id", "created_at", "event_id"],
-        "ALTER TABLE model_request_context_events ADD INDEX idx_model_request_context_owner_harness_created (user_id, harness_run_id, created_at, event_id)",
-    )
     .await?;
 
     // Terminal request metrics are accumulated transactionally with their
@@ -8078,165 +5560,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    for (column, ddl) in [
-        (
-            "session_id",
-            "ALTER TABLE inference_invocation_settlement_debts ADD COLUMN session_id VARCHAR(64) NULL",
-        ),
-        (
-            "harness_run_id",
-            "ALTER TABLE inference_invocation_settlement_debts ADD COLUMN harness_run_id VARCHAR(128) NULL",
-        ),
-        (
-            "provider_attempt_id",
-            "ALTER TABLE inference_invocation_settlement_debts ADD COLUMN provider_attempt_id VARCHAR(64) NULL",
-        ),
-        (
-            "usage_status",
-            "ALTER TABLE inference_invocation_settlement_debts ADD COLUMN usage_status VARCHAR(32) NOT NULL DEFAULT 'unavailable'",
-        ),
-        (
-            "provider_delivery_state",
-            "ALTER TABLE inference_invocation_settlement_debts ADD COLUMN provider_delivery_state VARCHAR(32) NOT NULL DEFAULT 'unknown'",
-        ),
-        (
-            "reconciliation_status",
-            "ALTER TABLE inference_invocation_settlement_debts ADD COLUMN reconciliation_status VARCHAR(16) NOT NULL DEFAULT 'pending'",
-        ),
-        (
-            "quarantine_reason",
-            "ALTER TABLE inference_invocation_settlement_debts ADD COLUMN quarantine_reason VARCHAR(255) NULL",
-        ),
-        (
-            "next_retry_at",
-            "ALTER TABLE inference_invocation_settlement_debts ADD COLUMN next_retry_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)",
-        ),
-    ] {
-        add_column_if_missing(
-            &pool,
-            &settings.database,
-            "inference_invocation_settlement_debts",
-            column,
-            ddl,
-        )
-        .await?;
-    }
-    for (index, columns, ddl) in [
-        (
-            "idx_inference_settlement_owner_session_created",
-            &["user_id", "session_id", "created_at", "invocation_id"][..],
-            "ALTER TABLE inference_invocation_settlement_debts ADD INDEX idx_inference_settlement_owner_session_created (user_id, session_id, created_at, invocation_id)",
-        ),
-        (
-            "idx_inference_settlement_owner_harness_created",
-            &["user_id", "harness_run_id", "created_at", "invocation_id"][..],
-            "ALTER TABLE inference_invocation_settlement_debts ADD INDEX idx_inference_settlement_owner_harness_created (user_id, harness_run_id, created_at, invocation_id)",
-        ),
-        (
-            "idx_inference_settlement_recovery_ready",
-            &[
-                "reconciliation_status",
-                "next_retry_at",
-                "user_id",
-                "invocation_id",
-            ],
-            "ALTER TABLE inference_invocation_settlement_debts ADD INDEX idx_inference_settlement_recovery_ready (reconciliation_status, next_retry_at, user_id, invocation_id)",
-        ),
-    ] {
-        ensure_index_shape(
-            &pool,
-            &settings.database,
-            "inference_invocation_settlement_debts",
-            index,
-            columns,
-            ddl,
-        )
-        .await?;
-    }
-
-    // Lifecycle writes are exact owner+identity transitions. MatrixOne can
-    // omit eligible rows when it plans those transitions through a secondary
-    // index led by mutable status, so remove the old scan indexes from both
-    // fresh and existing deployments before any reconciliation reads them.
-    for (table, index) in [
-        (
-            "inference_invocations",
-            "idx_inference_invocations_status_created",
-        ),
-        (
-            "inference_provider_attempts",
-            "idx_inference_attempts_status_started",
-        ),
-    ] {
-        drop_index_if_present(&pool, &settings.database, table, index).await?;
-    }
-    fail_if_required_columns_missing_or_nullable(
-        &pool,
-        &settings.database,
-        "inference_routes",
-        &["scope_kind"],
-    )
-    .await?;
-    fail_if_required_columns_missing_or_nullable(
-        &pool,
-        &settings.database,
-        "inference_invocation_settlement_debts",
-        &[
-            "usage_status",
-            "provider_delivery_state",
-            "reconciliation_status",
-            "next_retry_at",
-        ],
-    )
-    .await?;
-    fail_if_required_columns_missing_or_nullable(
-        &pool,
-        &settings.database,
-        "inference_invocations",
-        &["scope_kind", "operation_id"],
-    )
-    .await?;
-    verify_inference_invocation_schema_contract(&pool, &settings.database).await?;
-    verify_inference_provider_attempt_schema_contract(&pool, &settings.database).await?;
-    verify_inference_canonical_transition_head_schema_contract(&pool, &settings.database).await?;
-    verify_inference_canonical_transition_wal_schema_contract(&pool, &settings.database).await?;
-    for (table, nullable_columns) in [
-        (
-            "inference_routes",
-            &["session_id", "run_id", "harness_run_id"][..],
-        ),
-        (
-            "inference_invocations",
-            &[
-                "session_id",
-                "run_id",
-                "harness_run_id",
-                "turn_index",
-                "round_index",
-            ][..],
-        ),
-        (
-            "inference_provider_attempts",
-            &["session_id", "run_id", "harness_run_id"][..],
-        ),
-        (
-            "inference_invocation_settlement_debts",
-            &[
-                "session_id",
-                "harness_run_id",
-                "provider_attempt_id",
-                "quarantine_reason",
-            ][..],
-        ),
-    ] {
-        fail_if_required_columns_missing_or_not_nullable(
-            &pool,
-            &settings.database,
-            table,
-            nullable_columns,
-        )
-        .await?;
-    }
 
     // Server-wide admin config KV store. Holds settings that the admin explicitly manages
     // via `astra admin config set/get/unset` (first key: `reasoning_offering_id`).
@@ -8268,10 +5591,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-
-    query("DROP TABLE IF EXISTS session_sync_log")
-        .execute(&pool)
-        .await?;
 
     // Skills registry — master catalog for database-backed skills.
     //
@@ -8318,15 +5637,7 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "skills_registry",
-        "idx_skill_active_name_ver",
-        &["is_active", "skill_name", "version"],
-        "ALTER TABLE skills_registry ADD INDEX idx_skill_active_name_ver (is_active, skill_name, version)",
-    )
-    .await?;
+
     core_schema_create!(
         pool,
         "skill_metrics",
@@ -8386,80 +5697,7 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "edge_agent_registry",
-        &["user_id", "registry_id"],
-        "ALTER TABLE edge_agent_registry ADD PRIMARY KEY (user_id, registry_id)",
-    )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "edge_agent_registry",
-        "workspace_id",
-        "ALTER TABLE edge_agent_registry ADD COLUMN workspace_id VARCHAR(512) NULL",
-    )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "edge_agent_registry",
-        "materialization_id",
-        "ALTER TABLE edge_agent_registry ADD COLUMN materialization_id VARCHAR(128) NULL",
-    )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "edge_agent_registry",
-        "registration_state",
-        "ALTER TABLE edge_agent_registry ADD COLUMN registration_state TINYINT NOT NULL DEFAULT 1",
-    )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "edge_agent_registry",
-        "registration_previous_edge_id",
-        "ALTER TABLE edge_agent_registry ADD COLUMN registration_previous_edge_id VARCHAR(128) NULL",
-    )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "edge_agent_registry",
-        "registration_claim_id",
-        "ALTER TABLE edge_agent_registry ADD COLUMN registration_claim_id VARCHAR(64) NULL",
-    )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "edge_agent_registry",
-        "registration_claim_expires_at",
-        "ALTER TABLE edge_agent_registry ADD COLUMN registration_claim_expires_at DATETIME(6) NULL",
-    )
-    .await?;
-    add_index_if_missing(
-        &pool,
-        &settings.database,
-        "edge_agent_registry",
-        "idx_edge_registry_agent_workspace",
-        "ALTER TABLE edge_agent_registry ADD INDEX idx_edge_registry_agent_workspace (edge_agent_id, workspace_id)",
-    )
-    .await?;
-    add_index_if_missing(
-        &pool,
-        &settings.database,
-        "edge_agent_registry",
-        "idx_edge_registry_user_workspace_agent",
-        "ALTER TABLE edge_agent_registry ADD INDEX idx_edge_registry_user_workspace_agent (user_id, workspace_id, edge_agent_id)",
-    )
-    .await?;
 
-    migrate_legacy_edge_pending_dispatch_if_needed(&pool, &settings.database).await?;
     core_schema_create!(pool, "edge_pending_dispatch",
         "CREATE TABLE IF NOT EXISTS edge_pending_dispatch (
             user_id VARCHAR(128) NOT NULL,
@@ -8481,49 +5719,6 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
-    .await?;
-    ensure_edge_pending_dispatch_result_json_lossless(&pool, &settings.database).await?;
-    fail_if_obsolete_shape(
-        &pool,
-        &settings.database,
-        "edge_pending_dispatch",
-        EDGE_PENDING_DISPATCH_IDENTITY_COLUMNS,
-        &["dispatch_id"],
-        &["uq_edge_dispatch_owner_request"],
-    )
-    .await?;
-    drop_index_if_present(
-        &pool,
-        &settings.database,
-        "edge_pending_dispatch",
-        "uq_edge_dispatch_request_id",
-    )
-    .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "edge_pending_dispatch",
-        EDGE_PENDING_DISPATCH_IDENTITY_COLUMNS,
-        "ALTER TABLE edge_pending_dispatch ADD PRIMARY KEY (user_id, session_id, run_id, turn_chain_id, request_id)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "edge_pending_dispatch",
-        "idx_edge_dispatch_user_status",
-        &[
-            "user_id",
-            "edge_agent_id",
-            "status",
-            "created_at",
-            "session_id",
-            "run_id",
-            "turn_chain_id",
-            "request_id",
-        ],
-        "ALTER TABLE edge_pending_dispatch ADD INDEX idx_edge_dispatch_user_status (user_id, edge_agent_id, status, created_at, session_id, run_id, turn_chain_id, request_id)",
-    )
     .await?;
 
     core_schema_create!(
@@ -8549,16 +5744,7 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    fail_if_required_column_nullability_mismatches(
-        &pool,
-        &settings.database,
-        "agent_bindings",
-        &[
-            ("owner_user_id", ColumnNullability::NotNull),
-            ("principal_scope_id", ColumnNullability::NotNull),
-        ],
-    )
-    .await?;
+
     let owner_column_rows = query(
         "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH \
          FROM information_schema.COLUMNS \
@@ -8606,33 +5792,6 @@ async fn ensure_core_schema_while_leased(
             "obsolete unscoped agent_bindings index {index_name} requires explicit schema replacement before startup"
         )));
     }
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "agent_bindings",
-        "uq_agent_bindings_owner_scope_name",
-        &["owner_user_id", "principal_scope_id", "binding_name"],
-        "ALTER TABLE agent_bindings ADD UNIQUE INDEX uq_agent_bindings_owner_scope_name (owner_user_id, principal_scope_id, binding_name)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "agent_bindings",
-        "uq_agent_bindings_owner_scope_idempotency",
-        &["owner_user_id", "principal_scope_id", "idempotency_key"],
-        "ALTER TABLE agent_bindings ADD UNIQUE INDEX uq_agent_bindings_owner_scope_idempotency (owner_user_id, principal_scope_id, idempotency_key)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "agent_bindings",
-        "idx_agent_bindings_owner_scope_status_created",
-        &["owner_user_id", "principal_scope_id", "status", "created_at"],
-        "ALTER TABLE agent_bindings ADD INDEX idx_agent_bindings_owner_scope_status_created (owner_user_id, principal_scope_id, status, created_at)",
-    )
-    .await?;
 
     core_schema_create!(
         pool,
@@ -8653,34 +5812,6 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
-    .await?;
-    fail_if_varchar_columns_shorter_than(&pool, &settings.database, "mcp_servers", &[("id", 64)])
-        .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "mcp_servers",
-        &["owner_user_id", "id"],
-        "ALTER TABLE mcp_servers ADD PRIMARY KEY (owner_user_id, id)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "mcp_servers",
-        "uq_mcp_servers_owner_name",
-        &["owner_user_id", "name"],
-        "ALTER TABLE mcp_servers ADD UNIQUE INDEX uq_mcp_servers_owner_name (owner_user_id, name)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "mcp_servers",
-        "idx_mcp_servers_owner_active",
-        &["owner_user_id", "is_active", "updated_at"],
-        "ALTER TABLE mcp_servers ADD INDEX idx_mcp_servers_owner_active (owner_user_id, is_active, updated_at)",
-    )
     .await?;
 
     core_schema_create!(
@@ -8704,55 +5835,7 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    fail_if_varchar_columns_shorter_than(
-        &pool,
-        &settings.database,
-        "mcp_bindings",
-        &[("id", 64), ("mcp_id", 64)],
-    )
-    .await?;
-    drop_index_if_present(
-        &pool,
-        &settings.database,
-        "mcp_bindings",
-        "idx_mcp_bindings_mcp_id",
-    )
-    .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "mcp_bindings",
-        &["owner_user_id", "id"],
-        "ALTER TABLE mcp_bindings ADD PRIMARY KEY (owner_user_id, id)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "mcp_bindings",
-        "uq_mcp_bindings_owner_mcp_key",
-        &["owner_user_id", "mcp_id", "key_hash"],
-        "ALTER TABLE mcp_bindings ADD UNIQUE INDEX uq_mcp_bindings_owner_mcp_key (owner_user_id, mcp_id, key_hash)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "mcp_bindings",
-        "idx_mcp_bindings_owner_active",
-        &["owner_user_id", "is_active", "updated_at"],
-        "ALTER TABLE mcp_bindings ADD INDEX idx_mcp_bindings_owner_active (owner_user_id, is_active, updated_at)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "mcp_bindings",
-        "idx_mcp_bindings_owner_mcp",
-        &["owner_user_id", "mcp_id"],
-        "ALTER TABLE mcp_bindings ADD INDEX idx_mcp_bindings_owner_mcp (owner_user_id, mcp_id)",
-    )
-    .await?;
+
     core_schema_create!(
         pool,
         "mcp_tools",
@@ -8772,55 +5855,6 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
-    .await?;
-    fail_if_obsolete_shape(
-        &pool,
-        &settings.database,
-        "mcp_tools",
-        &["owner_user_id", "binding_id", "tool_name"],
-        &["id"],
-        &["uq_mcp_tools_binding_tool", "uq_mcp_tools_binding_public"],
-    )
-    .await?;
-    fail_if_varchar_columns_shorter_than(
-        &pool,
-        &settings.database,
-        "mcp_tools",
-        &[("binding_id", 64)],
-    )
-    .await?;
-    drop_index_if_present(
-        &pool,
-        &settings.database,
-        "mcp_tools",
-        "idx_mcp_tools_binding",
-    )
-    .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "mcp_tools",
-        &["owner_user_id", "binding_id", "tool_name"],
-        "ALTER TABLE mcp_tools ADD PRIMARY KEY (owner_user_id, binding_id, tool_name)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "mcp_tools",
-        "uq_mcp_tools_owner_binding_public",
-        &["owner_user_id", "binding_id", "public_name"],
-        "ALTER TABLE mcp_tools ADD UNIQUE INDEX uq_mcp_tools_owner_binding_public (owner_user_id, binding_id, public_name)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "mcp_tools",
-        "idx_mcp_tools_owner_binding",
-        &["owner_user_id", "binding_id"],
-        "ALTER TABLE mcp_tools ADD INDEX idx_mcp_tools_owner_binding (owner_user_id, binding_id)",
-    )
     .await?;
 
     // ── Plans: cloud-authoritative plan state (user-owned, session-linked) ──
@@ -8851,24 +5885,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    drop_index_if_present(&pool, &settings.database, "plans", "idx_plans_session").await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "plans",
-        &["user_id", "plan_id"],
-        "ALTER TABLE plans ADD PRIMARY KEY (user_id, plan_id)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "plans",
-        "idx_plans_owner_session_updated",
-        &["user_id", "session_id", "updated_at"],
-        "ALTER TABLE plans ADD INDEX idx_plans_owner_session_updated (user_id, session_id, updated_at DESC)",
-    )
-    .await?;
 
     // ── Plan step runs: append-only attempt chain for every subtask ──
     core_schema_create!(
@@ -8893,31 +5909,6 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
-    .await?;
-    drop_index_if_present(
-        &pool,
-        &settings.database,
-        "plan_step_runs",
-        "idx_step_runs_session",
-    )
-    .await?;
-    // Upgrade: old schema used single-column PK (run_id). Rebuild to composite.
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "plan_step_runs",
-        &["user_id", "run_id"],
-        "ALTER TABLE plan_step_runs ADD PRIMARY KEY (user_id, run_id)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "plan_step_runs",
-        "idx_step_runs_plan_started",
-        &["user_id", "plan_id", "started_at"],
-        "ALTER TABLE plan_step_runs ADD INDEX idx_step_runs_plan_started (user_id, plan_id, started_at DESC)",
-    )
     .await?;
 
     core_schema_create!(
@@ -8945,50 +5936,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    for removed_index in ["idx_ckpt_session_number", "idx_ckpt_session_turn"] {
-        drop_index_if_present(
-            &pool,
-            &settings.database,
-            "session_checkpoints",
-            removed_index,
-        )
-        .await?;
-    }
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "session_checkpoints",
-        &["user_id", "session_id", "checkpoint_id"],
-        "ALTER TABLE session_checkpoints ADD PRIMARY KEY (user_id, session_id, checkpoint_id)",
-    )
-    .await?;
-    for (index, expected_columns, ddl) in [
-        (
-            "uq_session_checkpoints_owner_number",
-            &["user_id", "session_id", "number"][..],
-            "ALTER TABLE session_checkpoints ADD UNIQUE KEY uq_session_checkpoints_owner_number (user_id, session_id, number)",
-        ),
-        (
-            "idx_ckpt_owner_session_turn",
-            &["user_id", "session_id", "turn"][..],
-            "ALTER TABLE session_checkpoints ADD INDEX idx_ckpt_owner_session_turn (user_id, session_id, turn)",
-        ),
-        (
-            "idx_ckpt_user_created",
-            &["user_id", "created_at"][..],
-            "ALTER TABLE session_checkpoints ADD INDEX idx_ckpt_user_created (user_id, created_at)",
-        ),
-    ] {
-        ensure_index_shape(
-            &pool,
-            &settings.database,
-            "session_checkpoints",
-            index,
-            expected_columns,
-            ddl,
-        )
-        .await?;
-    }
 
     core_schema_create!(pool, "session_artifacts",
         "CREATE TABLE IF NOT EXISTS session_artifacts (
@@ -9034,81 +5981,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "session_artifacts",
-        &["user_id", "session_id", "artifact_id"],
-        "ALTER TABLE session_artifacts ADD PRIMARY KEY (user_id, session_id, artifact_id)",
-    )
-    .await?;
-    for (index, expected_columns, ddl) in [
-        (
-            "idx_session_artifacts_owner_kind_order",
-            &[
-                "user_id",
-                "session_id",
-                "artifact_kind",
-                "created_at",
-                "artifact_id",
-            ][..],
-            "ALTER TABLE session_artifacts ADD INDEX idx_session_artifacts_owner_kind_order (user_id, session_id, artifact_kind, created_at, artifact_id)",
-        ),
-        (
-            "idx_session_artifacts_owner_session_order",
-            &["user_id", "session_id", "created_at", "artifact_id"][..],
-            "ALTER TABLE session_artifacts ADD INDEX idx_session_artifacts_owner_session_order (user_id, session_id, created_at, artifact_id)",
-        ),
-        (
-            "idx_session_artifacts_owner_source_order",
-            &[
-                "user_id",
-                "session_id",
-                "source",
-                "created_at",
-                "artifact_id",
-            ][..],
-            "ALTER TABLE session_artifacts ADD INDEX idx_session_artifacts_owner_source_order (user_id, session_id, source, created_at, artifact_id)",
-        ),
-        (
-            "idx_artifacts_root_scope",
-            &[
-                "user_id",
-                "root_run_id",
-                "access_scope",
-                "status",
-                "updated_at",
-                "artifact_id",
-            ][..],
-            "ALTER TABLE session_artifacts ADD INDEX idx_artifacts_root_scope (user_id, root_run_id, access_scope, status, updated_at, artifact_id)",
-        ),
-    ] {
-        ensure_index_shape(
-            &pool,
-            &settings.database,
-            "session_artifacts",
-            index,
-            expected_columns,
-            ddl,
-        )
-        .await?;
-    }
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "session_artifacts",
-        "idx_artifacts_retention",
-        &[
-            "status",
-            "retention_until",
-            "retention_policy",
-            "user_id",
-            "session_id",
-            "artifact_id",
-        ],
-        "ALTER TABLE session_artifacts ADD INDEX idx_artifacts_retention (status, retention_until, retention_policy, user_id, session_id, artifact_id)",
-    )
-    .await?;
 
     core_schema_create!(
         pool,
@@ -9129,35 +6001,6 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
-    .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "session_artifact_references",
-        &[
-            "user_id",
-            "session_id",
-            "artifact_id",
-            "reference_kind",
-            "reference_id",
-        ],
-        "ALTER TABLE session_artifact_references ADD PRIMARY KEY (user_id, session_id, artifact_id, reference_kind, reference_id)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "session_artifact_references",
-        "idx_artifact_references_owner_reference",
-        &[
-            "user_id",
-            "session_id",
-            "reference_kind",
-            "reference_id",
-            "artifact_id",
-        ],
-        "ALTER TABLE session_artifact_references ADD INDEX idx_artifact_references_owner_reference (user_id, session_id, reference_kind, reference_id, artifact_id)",
-    )
     .await?;
 
     // Byte payloads are content-addressed and owner-scoped.  The catalog and
@@ -9180,23 +6023,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "session_artifact_content_chunks",
-        &["user_id", "content_digest"],
-        "ALTER TABLE session_artifact_content_chunks ADD PRIMARY KEY (user_id, content_digest)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "session_artifact_content_chunks",
-        "idx_artifact_content_chunks_updated",
-        &["user_id", "updated_at", "content_digest"],
-        "ALTER TABLE session_artifact_content_chunks ADD INDEX idx_artifact_content_chunks_updated (user_id, updated_at, content_digest)",
-    )
-    .await?;
 
     core_schema_create!(
         pool,
@@ -9215,29 +6041,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "session_artifact_content_refs",
-        &["user_id", "session_id", "artifact_id", "chunk_index"],
-        "ALTER TABLE session_artifact_content_refs ADD PRIMARY KEY (user_id, session_id, artifact_id, chunk_index)",
-    )
-    .await?;
-    for (index, expected_columns, ddl) in [(
-        "idx_artifact_content_refs_digest",
-        &["user_id", "content_digest"][..],
-        "ALTER TABLE session_artifact_content_refs ADD INDEX idx_artifact_content_refs_digest (user_id, content_digest)",
-    )] {
-        ensure_index_shape(
-            &pool,
-            &settings.database,
-            "session_artifact_content_refs",
-            index,
-            expected_columns,
-            ddl,
-        )
-        .await?;
-    }
 
     core_schema_create!(
         pool,
@@ -9255,23 +6058,6 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
-    .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "session_artifact_content_upload_leases",
-        &["user_id", "session_id", "artifact_id"],
-        "ALTER TABLE session_artifact_content_upload_leases ADD PRIMARY KEY (user_id, session_id, artifact_id)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "session_artifact_content_upload_leases",
-        "idx_artifact_content_upload_leases_expiry",
-        &["user_id", "expires_at", "session_id", "artifact_id"],
-        "ALTER TABLE session_artifact_content_upload_leases ADD INDEX idx_artifact_content_upload_leases_expiry (user_id, expires_at, session_id, artifact_id)",
-    )
     .await?;
 
     core_schema_create!(
@@ -9294,70 +6080,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "session_artifact_content_reservations",
-        &["user_id", "session_id", "artifact_id", "content_digest"],
-        "ALTER TABLE session_artifact_content_reservations ADD PRIMARY KEY (user_id, session_id, artifact_id, content_digest)",
-    )
-    .await?;
-    for (index, expected_columns, ddl) in [
-        (
-            "idx_artifact_content_reservations_expiry",
-            &["user_id", "expires_at", "content_digest"][..],
-            "ALTER TABLE session_artifact_content_reservations ADD INDEX idx_artifact_content_reservations_expiry (user_id, expires_at, content_digest)",
-        ),
-        (
-            "idx_artifact_content_reservations_digest",
-            &["user_id", "content_digest", "expires_at"][..],
-            "ALTER TABLE session_artifact_content_reservations ADD INDEX idx_artifact_content_reservations_digest (user_id, content_digest, expires_at)",
-        ),
-    ] {
-        ensure_index_shape(
-            &pool,
-            &settings.database,
-            "session_artifact_content_reservations",
-            index,
-            expected_columns,
-            ddl,
-        )
-        .await?;
-    }
-
-    for (table, column, ddl) in [
-        (
-            "agent_sessions",
-            "project_id",
-            "ALTER TABLE agent_sessions ADD COLUMN project_id VARCHAR(128) NULL",
-        ),
-        (
-            "agent_sessions",
-            "project_retention_policy",
-            "ALTER TABLE agent_sessions ADD COLUMN project_retention_policy VARCHAR(32) NOT NULL DEFAULT 'session'",
-        ),
-    ] {
-        if let Err(e) = add_column_if_missing(&pool, &settings.database, table, column, ddl).await {
-            tracing::warn!("core schema additive column skipped: {table}.{column}: {e}");
-        }
-    }
-
-    for (table, index, ddl) in [
-        (
-            "agent_sessions",
-            "idx_sessions_project",
-            "ALTER TABLE agent_sessions ADD INDEX idx_sessions_project (user_id, project_id, updated_at)",
-        ),
-        (
-            "agent_events",
-            "idx_agent_events_owner_session_turn",
-            AGENT_EVENTS_OWNER_SESSION_TURN_INDEX_ALTER_SQL,
-        ),
-    ] {
-        if let Err(e) = add_index_if_missing(&pool, &settings.database, table, index, ddl).await {
-            tracing::debug!("phase4 additive index migration skipped: {table}.{index}: {e}");
-        }
-    }
 
     // ─── Skill management tables ─────────────────────────────────────────────────
 
@@ -9406,31 +6128,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    fail_if_obsolete_shape(
-        &pool,
-        &settings.database,
-        "user_skill_evaluations",
-        &[
-            "evaluation_id",
-            "owner_user_id",
-            "source_id",
-            "version_id",
-            "run_id",
-            "hits",
-            "suspects",
-            "false_positives",
-            "payload_json",
-            "created_at",
-        ],
-        &[],
-        &[
-            "idx_user_skill_eval_source_created",
-            "idx_user_skill_eval_version_created",
-            "idx_user_skill_eval_run",
-        ],
-    )
-    .await?;
-
     core_schema_create!(
         pool,
         "user_skill_evaluations",
@@ -9451,29 +6148,6 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
-    .await?;
-
-    fail_if_obsolete_shape(
-        &pool,
-        &settings.database,
-        "skill_installations",
-        &[
-            "installation_id",
-            "user_id",
-            "skill_name",
-            "skill_version",
-            "status",
-            "installed_at",
-            "updated_at",
-        ],
-        &[
-            "scope",
-            "session_id",
-            "workspace_id",
-            "auto_activate_on_topic_match",
-        ],
-        &["idx_si_scope_target", "idx_si_auto_activate"],
-    )
     .await?;
 
     core_schema_create!(pool, "skill_installations",
@@ -9693,48 +6367,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    fail_if_varchar_columns_shorter_than(
-        &pool,
-        &settings.database,
-        "eval_calibration_assessments",
-        &[("user_id", USER_ID_MAX_LEN as u64)],
-    )
-    .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "eval_calibration_assessments",
-        &["user_id", "calibration_id"],
-        "ALTER TABLE eval_calibration_assessments ADD PRIMARY KEY (user_id, calibration_id)",
-    )
-    .await?;
-
-    for (index, ddl) in [
-        (
-            "idx_eval_calibration_user_created",
-            "ALTER TABLE eval_calibration_assessments ADD INDEX idx_eval_calibration_user_created (user_id, created_at)",
-        ),
-        (
-            "idx_eval_calibration_user_agent_created",
-            "ALTER TABLE eval_calibration_assessments ADD INDEX idx_eval_calibration_user_agent_created (user_id, agent_id, created_at)",
-        ),
-        (
-            "idx_eval_calibration_session",
-            "ALTER TABLE eval_calibration_assessments ADD INDEX idx_eval_calibration_session (user_id, session_id, created_at)",
-        ),
-    ] {
-        if let Err(e) = add_index_if_missing(
-            &pool,
-            &settings.database,
-            "eval_calibration_assessments",
-            index,
-            ddl,
-        )
-        .await
-        {
-            tracing::debug!("eval calibration additive index migration skipped: {index}: {e}");
-        }
-    }
 
     core_schema_create!(pool, "eval_training_datasets",
         "CREATE TABLE IF NOT EXISTS eval_training_datasets (
@@ -9774,22 +6406,6 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
-    .await?;
-    drop_index_if_present(
-        &pool,
-        &settings.database,
-        "eval_user_feedback",
-        "idx_euf_session",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "eval_user_feedback",
-        "idx_euf_owner_session_created",
-        &["user_id", "session_id", "created_at"],
-        "ALTER TABLE eval_user_feedback ADD INDEX idx_euf_owner_session_created (user_id, session_id, created_at)",
-    )
     .await?;
 
     // ─── Team definitions ───────────────────────────────────────────────────────
@@ -9897,10 +6513,1488 @@ async fn ensure_core_schema_while_leased(
         .execute(&config_version_schema)
         .await?;
 
+    verify_core_schema_shape(&pool, &settings.database).await?;
     let declarations = pool.authority.declarations()?;
     publish_core_schema_table_contracts(&pool, &declarations).await?;
     verify_core_schema_catalog(&pool, &settings.database).await?;
     mark_core_schema_contract_current(&pool, holder_id).await?;
+    Ok(())
+}
+
+async fn verify_core_schema_shape(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    reject_obsolete_weighted_admission_schema(pool, database).await?;
+    validate_schema_identifier(database, "matrixone database")?;
+    // CREATE IF NOT EXISTS does not validate existing tables. Reject missing
+    // runtime fields without restoring the historical ALTER/repair path.
+    let columns = query(
+        "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ?",
+    )
+    .bind(database)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| {
+        Ok((
+            row.try_get::<String, _>("TABLE_NAME")?,
+            row.try_get::<String, _>("COLUMN_NAME")?,
+        ))
+    })
+    .collect::<Result<BTreeSet<_>, sqlx::Error>>()?;
+    for (table, required) in [
+        ("auth_refresh_tokens", &["session_id"][..]),
+        (
+            "agent_sessions",
+            &[
+                "delete_requested_at",
+                "provider_creation_hash",
+                "project_id",
+                "project_retention_policy",
+            ][..],
+        ),
+        ("session_context_heads", &["fork_base_json"][..]),
+        (
+            "conversation_manifest_nodes",
+            &[
+                "total_canonical_bytes",
+                "total_message_count",
+                "reachable",
+                "compaction_generation",
+            ][..],
+        ),
+        ("session_weighted_admission_gates", &["capacity_hash"][..]),
+        (
+            "agent_run_events",
+            &["subject_run_id", "interaction_request_id"][..],
+        ),
+        (
+            "tool_invocation_ledger",
+            &[
+                "decision_json",
+                "dispatch_owner",
+                "dispatch_lease_expires_at",
+                "outcome_json",
+                "completion_source_json",
+            ][..],
+        ),
+        (
+            "session_transcript_items",
+            &[
+                "payload_json",
+                "canonical_completed_turn",
+                "canonical_conversation_seq",
+                "canonical_root_hash",
+            ][..],
+        ),
+        ("prompt_request_records", &["created_at_unix_ms"][..]),
+        (
+            "prompt_deltas",
+            &[
+                "reuse_count",
+                "chunk_tokens",
+                "chunk_bytes",
+                "previous_chunk_tokens",
+                "previous_chunk_bytes",
+            ][..],
+        ),
+        ("inference_provider_attempts", &["context_expired_at"][..]),
+        (
+            "inference_invocation_settlement_debts",
+            &[
+                "session_id",
+                "harness_run_id",
+                "provider_attempt_id",
+                "usage_status",
+                "provider_delivery_state",
+                "reconciliation_status",
+                "quarantine_reason",
+                "next_retry_at",
+            ][..],
+        ),
+        (
+            "edge_agent_registry",
+            &[
+                "workspace_id",
+                "materialization_id",
+                "registration_state",
+                "registration_previous_edge_id",
+                "registration_claim_id",
+                "registration_claim_expires_at",
+            ][..],
+        ),
+        ("infra_llm_models", &["thinking_probe_json"][..]),
+        ("user_llm_models", &["thinking_probe_json"][..]),
+    ] {
+        for column in required {
+            if !columns.contains(&(table.to_owned(), (*column).to_owned())) {
+                return Err(sqlx::Error::Protocol(format!(
+                    "core schema is incomplete: missing {table}.{column}; recreate the database with the current schema"
+                )));
+            }
+        }
+    }
+    let mut indexes: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for row in query(
+        "SELECT TABLE_NAME, INDEX_NAME, COLUMN_NAME FROM information_schema.STATISTICS
+         WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX",
+    )
+    .bind(database)
+    .fetch_all(pool)
+    .await?
+    {
+        indexes
+            .entry((row.try_get("TABLE_NAME")?, row.try_get("INDEX_NAME")?))
+            .or_default()
+            .push(row.try_get("COLUMN_NAME")?);
+    }
+
+    fail_if_obsolete_shape(
+        pool,
+        database,
+        "auth_user_roles",
+        &["user_id", "role_id"],
+        &["id"],
+        &["uq_auth_user_roles_user_role"],
+    )
+    .await?;
+    ensure_index_shape(
+        &indexes,
+        "auth_user_roles",
+        "PRIMARY",
+        &["user_id", "role_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "auth_user_roles",
+        "idx_auth_user_roles_role_id",
+        &["role_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "agent_sessions",
+        "idx_agent_sessions_delete_requested_owner",
+        &["delete_requested_at", "user_id", "session_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "agent_session_lifecycle_fences",
+        "PRIMARY",
+        &["user_id", "session_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "agent_session_lifecycle_fences",
+        "idx_agent_session_fences_pending_delete",
+        &[
+            "database_deleted_at",
+            "delete_requested_at",
+            "user_id",
+            "session_id",
+        ],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "agent_sessions",
+        "PRIMARY",
+        &["user_id", "session_id"],
+    )?;
+    fail_if_varchar_columns_shorter_than(
+        pool,
+        database,
+        "agent_sessions",
+        &[("last_event_id", AGENT_EVENT_ID_LEN as u64)],
+    )
+    .await?;
+    verify_work_canonical_schema(pool, database).await?;
+    fail_if_required_columns_missing_or_nullable(
+        pool,
+        database,
+        "agent_events",
+        &["payload_hash", "ingestion_write_id", "server_received_at"],
+    )
+    .await?;
+    fail_if_obsolete_shape(
+        pool,
+        database,
+        "agent_events",
+        &[
+            "user_id",
+            "event_id",
+            "payload_hash",
+            "ingestion_write_id",
+            "server_received_at",
+        ],
+        &[],
+        &[],
+    )
+    .await?;
+    fail_if_varchar_columns_shorter_than(
+        pool,
+        database,
+        "agent_events",
+        &[
+            ("event_id", AGENT_EVENT_ID_LEN as u64),
+            ("parent_event_id", AGENT_EVENT_ID_LEN as u64),
+            ("causal_chain_id", AGENT_EVENT_ID_LEN as u64),
+            ("payload_hash", 80),
+            ("ingestion_write_id", 64),
+        ],
+    )
+    .await?;
+    ensure_index_shape(
+        &indexes,
+        "agent_events",
+        "PRIMARY",
+        &["user_id", "event_id"],
+    )?;
+    for (index, expected_columns) in [
+        (
+            "idx_agent_events_owner_session_created",
+            &["user_id", "session_id", "created_at"][..],
+        ),
+        (
+            "idx_agent_events_owner_session_type_created",
+            &["user_id", "session_id", "event_type", "created_at"][..],
+        ),
+        (
+            "idx_agent_events_owner_session_model_created",
+            &["user_id", "session_id", "llm_model_used", "created_at"][..],
+        ),
+        (
+            "idx_agent_events_owner_session_parent",
+            &["user_id", "session_id", "parent_event_id"][..],
+        ),
+        (
+            "idx_agent_events_owner_causal_chain_created",
+            &["user_id", "causal_chain_id", "created_at", "event_id"][..],
+        ),
+        (
+            "idx_agent_events_trace",
+            &["user_id", "session_id", "turn_id", "created_at"][..],
+        ),
+        (
+            "idx_agent_events_run",
+            &["user_id", "session_id", "run_id", "created_at"][..],
+        ),
+        (
+            "idx_agent_events_parent_run",
+            &["user_id", "session_id", "parent_run_id", "created_at"][..],
+        ),
+        (
+            "idx_agent_events_tool_call",
+            &["user_id", "session_id", "tool_call_id"][..],
+        ),
+        (
+            "idx_agent_events_owner_session_turn",
+            &["user_id", "session_id", "turn_seq"][..],
+        ),
+    ] {
+        ensure_index_shape(&indexes, "agent_events", index, expected_columns)?;
+    }
+    crate::workspace_records::verify_workspace_record_tables(pool).await?;
+    verify_agent_runs_canonical_schema(pool, database).await?;
+    fail_if_varchar_columns_shorter_than(
+        pool,
+        database,
+        "agent_runs",
+        &[("trigger_event_id", AGENT_EVENT_ID_LEN as u64)],
+    )
+    .await?;
+    ensure_index_shape(
+        &indexes,
+        "agent_session_execution_slots",
+        "PRIMARY",
+        &["user_id", "session_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "agent_session_execution_slots",
+        "idx_session_execution_slots_run",
+        &["user_id", "run_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "agent_session_execution_slots",
+        "idx_session_execution_slots_updated",
+        &["updated_at"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "conversation_manifest_nodes",
+        "idx_context_manifest_reachable_sequence",
+        &[
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id",
+            "reachable",
+            "conversation_seq",
+        ],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "conversation_manifest_nodes",
+        "idx_context_manifest_generation_sequence",
+        &[
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id",
+            "compaction_generation",
+            "reachable",
+            "conversation_seq",
+        ],
+    )?;
+    for (index, expected_columns) in [
+        ("uq_run_event_idx", &["user_id", "run_id", "event_idx"][..]),
+        (
+            "uq_run_event_idempotency",
+            &["user_id", "run_id", "idempotency_key"][..],
+        ),
+        (
+            "idx_agent_run_events_control_type_idx",
+            &["user_id", "run_id", "event_type", "event_idx"][..],
+        ),
+        (
+            "idx_agent_run_events_owner_session_run_idx",
+            &["user_id", "session_id", "run_id", "event_idx"][..],
+        ),
+        (
+            "idx_agent_run_events_owner_session_subject",
+            &[
+                "user_id",
+                "session_id",
+                "event_type",
+                "subject_run_id",
+                "event_idx",
+            ][..],
+        ),
+        (
+            "idx_agent_run_events_interaction",
+            &[
+                "user_id",
+                "run_id",
+                "interaction_request_id",
+                "event_type",
+                "event_idx",
+            ][..],
+        ),
+    ] {
+        ensure_index_shape(&indexes, "agent_run_events", index, expected_columns)?;
+    }
+    ensure_index_shape(
+        &indexes,
+        "run_checkpoints",
+        "PRIMARY",
+        &["user_id", "checkpoint_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "run_checkpoints",
+        "uniq_run_checkpoint_idem",
+        &["user_id", "run_id", "checkpoint_kind", "idempotency_key"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "run_checkpoints",
+        "idx_run_checkpoints_user_run_created",
+        &["user_id", "run_id", "created_at"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "run_checkpoints",
+        "idx_run_checkpoints_session_kind_created",
+        &["user_id", "session_id", "checkpoint_kind", "created_at"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "run_display_projections",
+        "PRIMARY",
+        &["user_id", "run_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "run_display_projections",
+        "idx_run_display_projections_owner_session_updated",
+        &["user_id", "session_id", "updated_at"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "session_tool_output_batches",
+        "PRIMARY",
+        &["user_id", "session_id", "batch_id"],
+    )?;
+    for (index, expected_columns) in [
+        (
+            "idx_tool_output_batches_user_run_created",
+            &["user_id", "run_id", "created_at", "batch_id"][..],
+        ),
+        (
+            "idx_tool_output_batches_user_session_created",
+            &["user_id", "session_id", "created_at", "batch_id"][..],
+        ),
+    ] {
+        ensure_index_shape(
+            &indexes,
+            "session_tool_output_batches",
+            index,
+            expected_columns,
+        )?;
+    }
+    ensure_index_shape(
+        &indexes,
+        "session_tool_outputs",
+        "PRIMARY",
+        &["user_id", "session_id", "output_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "session_tool_outputs",
+        "uq_tool_outputs_batch_idx",
+        &["user_id", "session_id", "batch_id", "output_idx"],
+    )?;
+    for (index, expected_columns) in [
+        (
+            "idx_tool_outputs_user_run_created",
+            &["user_id", "run_id", "created_at", "output_id"][..],
+        ),
+        (
+            "idx_tool_outputs_user_session_created",
+            &["user_id", "session_id", "created_at", "output_id"][..],
+        ),
+        (
+            "idx_tool_outputs_parent",
+            &["user_id", "parent_output_id"][..],
+        ),
+        (
+            "idx_tool_outputs_artifact_ref",
+            &["user_id", "artifact_ref"][..],
+        ),
+    ] {
+        ensure_index_shape(&indexes, "session_tool_outputs", index, expected_columns)?;
+    }
+    fail_if_required_columns_missing_or_nullable(
+        pool,
+        database,
+        "tool_invocation_ledger",
+        TOOL_INVOCATION_LEDGER_REQUIRED_COLUMNS,
+    )
+    .await?;
+    fail_if_varchar_columns_shorter_than(
+        pool,
+        database,
+        "tool_invocation_ledger",
+        TOOL_INVOCATION_LEDGER_REQUIRED_VARCHAR_WIDTHS,
+    )
+    .await?;
+    ensure_index_shape(
+        &indexes,
+        "tool_invocation_ledger",
+        "idx_tool_invocation_run_compaction",
+        &["user_id", "session_id", "run_id", "state", "identity_key"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "tool_invocation_ledger",
+        "idx_tool_invocation_session_state",
+        &["user_id", "session_id", "state", "identity_key"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "tool_invocation_archive_chunks",
+        "PRIMARY",
+        &["user_id", "session_id", "run_id", "chunk_index"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "tool_invocation_archive_chunks",
+        "idx_tool_invocation_archive_lookup",
+        &[
+            "user_id",
+            "session_id",
+            "run_id",
+            "first_identity_key",
+            "last_identity_key",
+        ],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "session_transcript_items",
+        "PRIMARY",
+        &["user_id", "session_id", "item_seq"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "session_transcript_items",
+        "idx_transcript_owner_run",
+        &["user_id", "run_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "session_transcript_items",
+        "idx_transcript_owner_session_commit_item",
+        &[
+            "user_id",
+            "session_id",
+            "canonical_completed_turn",
+            "item_seq",
+        ],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "session_transcript_items",
+        "idx_transcript_owner_session_source_event",
+        &["user_id", "session_id", "source_event_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "prompt_request_records",
+        "PRIMARY",
+        &["user_id", "request_id"],
+    )?;
+    for (index, expected_columns) in [
+        (
+            "idx_prompt_requests_owner_session_created",
+            &[
+                "user_id",
+                "session_id",
+                "created_at",
+                "turn",
+                "round",
+                "attempt",
+            ][..],
+        ),
+        (
+            "idx_prompt_requests_owner_run_created",
+            &[
+                "user_id",
+                "run_id",
+                "created_at",
+                "turn",
+                "round",
+                "attempt",
+            ][..],
+        ),
+        (
+            "idx_prompt_requests_owner_previous",
+            &["user_id", "session_id", "previous_request_id"][..],
+        ),
+        (
+            "idx_prompt_requests_retention_ms",
+            &["created_at_unix_ms", "user_id", "request_id", "session_id"][..],
+        ),
+    ] {
+        ensure_index_shape(&indexes, "prompt_request_records", index, expected_columns)?;
+    }
+    fail_if_obsolete_shape(
+        pool,
+        database,
+        "prompt_deltas",
+        &[
+            "user_id",
+            "session_id",
+            "request_id",
+            "delta_seq",
+            "logical_key",
+            "chunk_kind",
+            "position",
+            "op",
+            "chunk_id",
+            "chunk_hash",
+            "previous_chunk_hash",
+            "created_at",
+        ],
+        &["delta_id", "payload_json"],
+        &[
+            "uq_prompt_delta_request_seq",
+            "idx_prompt_deltas_request_position",
+        ],
+    )
+    .await?;
+    fail_if_obsolete_shape(
+        pool,
+        database,
+        "session_device_leases",
+        &[
+            "lease_id",
+            "user_id",
+            "session_id",
+            "device_id",
+            "device_fingerprint",
+            "device_key_hash",
+            "trust_level",
+            "status",
+            "last_monotonic_id",
+            "expires_at",
+        ],
+        &[],
+        &[],
+    )
+    .await?;
+    ensure_index_shape(
+        &indexes,
+        "session_device_leases",
+        "PRIMARY",
+        &["user_id", "lease_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "session_device_lease_events",
+        "idx_lease_events_owner_session_device",
+        &["user_id", "session_id", "device_id", "created_at"],
+    )?;
+    fail_if_obsolete_shape(
+        pool,
+        database,
+        "context_manifests",
+        &[
+            "user_id",
+            "manifest_id",
+            "payload_hash",
+            "ingestion_write_id",
+        ],
+        &[],
+        &[],
+    )
+    .await?;
+    fail_if_required_columns_missing_or_nullable(
+        pool,
+        database,
+        "context_manifests",
+        &["payload_hash", "ingestion_write_id"],
+    )
+    .await?;
+    fail_if_varchar_columns_shorter_than(
+        pool,
+        database,
+        "context_manifests",
+        &[("payload_hash", 80), ("ingestion_write_id", 64)],
+    )
+    .await?;
+    ensure_index_shape(
+        &indexes,
+        "context_manifests",
+        "PRIMARY",
+        &["user_id", "manifest_id"],
+    )?;
+    for (index, expected_columns) in [
+        (
+            "idx_ctx_manifest_owner_session_created",
+            &["user_id", "session_id", "created_at", "manifest_id"][..],
+        ),
+        (
+            "idx_ctx_manifest_owner_session_run_created",
+            &[
+                "user_id",
+                "session_id",
+                "run_id",
+                "created_at",
+                "manifest_id",
+            ][..],
+        ),
+    ] {
+        ensure_index_shape(&indexes, "context_manifests", index, expected_columns)?;
+    }
+    fail_if_obsolete_shape(
+        pool,
+        database,
+        "context_manifest_items",
+        &["user_id", "manifest_id", "item_order"],
+        &["id"],
+        &["uq_manifest_item_order"],
+    )
+    .await?;
+    ensure_index_shape(
+        &indexes,
+        "context_manifest_items",
+        "PRIMARY",
+        &["user_id", "manifest_id", "item_order"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "context_manifest_items",
+        "idx_manifest_items_manifest_zone",
+        &["user_id", "manifest_id", "zone", "included"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "context_manifest_items",
+        "idx_manifest_items_source",
+        &["user_id", "source_table", "source_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "context_manifest_items",
+        "idx_manifest_items_raw_ref",
+        &["user_id", "raw_ref"],
+    )?;
+    fail_if_obsolete_shape(
+        pool,
+        database,
+        "observation_identity_collisions",
+        &[
+            "user_id",
+            "identity_kind",
+            "identity_id",
+            "session_id",
+            "stored_payload_hash",
+            "attempted_payload_hash",
+            "source",
+            "collision_count",
+            "first_seen_at",
+            "last_seen_at",
+            "expires_at",
+        ],
+        &[],
+        &[],
+    )
+    .await?;
+    fail_if_required_columns_missing_or_nullable(
+        pool,
+        database,
+        "observation_identity_collisions",
+        &[
+            "stored_payload_hash",
+            "attempted_payload_hash",
+            "collision_count",
+            "first_seen_at",
+            "last_seen_at",
+            "expires_at",
+            "source",
+        ],
+    )
+    .await?;
+    fail_if_varchar_columns_shorter_than(
+        pool,
+        database,
+        "observation_identity_collisions",
+        &[("stored_payload_hash", 80), ("attempted_payload_hash", 80)],
+    )
+    .await?;
+    ensure_index_shape(
+        &indexes,
+        "observation_identity_collisions",
+        "PRIMARY",
+        &["user_id", "identity_kind", "identity_id"],
+    )?;
+    for (index, expected_columns) in [
+        (
+            "idx_observation_collisions_owner_seen",
+            &["user_id", "last_seen_at"][..],
+        ),
+        (
+            "idx_observation_collisions_owner_session_seen",
+            &["user_id", "session_id", "last_seen_at"][..],
+        ),
+        (
+            "idx_observation_collisions_expiry",
+            &["expires_at", "user_id", "identity_kind", "identity_id"][..],
+        ),
+    ] {
+        ensure_index_shape(
+            &indexes,
+            "observation_identity_collisions",
+            index,
+            expected_columns,
+        )?;
+    }
+    for (index, expected_columns) in [
+        (
+            "idx_state_owner_session_status_category",
+            &["user_id", "session_id", "status", "category"][..],
+        ),
+        (
+            "idx_state_user_scope_category",
+            &["user_id", "scope", "category", "status", "priority"][..],
+        ),
+        (
+            "idx_state_owner_origin_session",
+            &["user_id", "origin_session_id", "category", "status"][..],
+        ),
+    ] {
+        ensure_index_shape(&indexes, "session_state_items", index, expected_columns)?;
+    }
+    fail_if_obsolete_shape(
+        pool,
+        database,
+        "session_state_item_events",
+        &["user_id", "event_id"],
+        &["id"],
+        &[],
+    )
+    .await?;
+    ensure_index_shape(
+        &indexes,
+        "session_state_item_events",
+        "PRIMARY",
+        &["user_id", "event_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "session_state_item_events",
+        "idx_state_events_item_created",
+        &["item_id", "created_at", "event_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "session_state_item_events",
+        "idx_state_events_owner_session_created",
+        &["user_id", "session_id", "created_at", "event_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "session_state_item_events",
+        "idx_state_events_category_created",
+        &["category", "created_at", "event_id"],
+    )?;
+    for (index, expected_columns) in [
+        (
+            "idx_delegations_owner_root_depth",
+            &["user_id", "root_run_id", "depth", "created_at"][..],
+        ),
+        (
+            "idx_delegations_owner_parent_status_updated",
+            &["user_id", "parent_run_id", "status", "updated_at"][..],
+        ),
+        (
+            "idx_delegations_owner_session_status",
+            &["user_id", "session_id", "status", "updated_at"][..],
+        ),
+    ] {
+        ensure_index_shape(&indexes, "session_delegations", index, expected_columns)?;
+    }
+    fail_if_obsolete_shape(
+        pool,
+        database,
+        "agent_event_edges",
+        &[
+            "user_id",
+            "session_id",
+            "child_event_id",
+            "parent_event_id",
+            "relation_kind",
+            "parent_order",
+        ],
+        &[],
+        &[
+            "idx_agent_event_edges_child",
+            "idx_agent_event_edges_parent",
+        ],
+    )
+    .await?;
+    fail_if_required_columns_missing_or_nullable(
+        pool,
+        database,
+        "agent_event_edges",
+        &["user_id", "session_id"],
+    )
+    .await?;
+    fail_if_varchar_columns_shorter_than(
+        pool,
+        database,
+        "agent_event_edges",
+        &[
+            ("child_event_id", AGENT_EVENT_ID_LEN as u64),
+            ("parent_event_id", AGENT_EVENT_ID_LEN as u64),
+        ],
+    )
+    .await?;
+    for (index, expected_columns) in [
+        (
+            "idx_harness_owner_session_created",
+            &["user_id", "session_id", "created_at"][..],
+        ),
+        (
+            "idx_harness_owner_session_turn",
+            &["user_id", "session_id", "turn_number"][..],
+        ),
+        (
+            "idx_harness_owner_chain",
+            &["user_id", "causal_chain_id"][..],
+        ),
+    ] {
+        ensure_index_shape(&indexes, "harness_snapshots", index, expected_columns)?;
+    }
+    ensure_index_shape(
+        &indexes,
+        "harness_runs",
+        "idx_harness_runs_owner_session_updated",
+        &["user_id", "session_id", "updated_at"],
+    )?;
+    fail_if_varchar_columns_shorter_than(
+        pool,
+        database,
+        "ctx_snapshots",
+        &[("event_id", AGENT_EVENT_ID_LEN as u64)],
+    )
+    .await?;
+    for (index, expected_columns) in [
+        (
+            "idx_ctx_snapshots_owner_session_created",
+            &["user_id", "session_id", "created_at"][..],
+        ),
+        (
+            "idx_ctx_snapshots_owner_event_id",
+            &["user_id", "event_id"][..],
+        ),
+    ] {
+        ensure_index_shape(&indexes, "ctx_snapshots", index, expected_columns)?;
+    }
+    fail_if_varchar_columns_shorter_than(
+        pool,
+        database,
+        "ctx_decision_audits",
+        &[("event_id", AGENT_EVENT_ID_LEN as u64)],
+    )
+    .await?;
+    for (index, expected_columns) in [
+        (
+            "idx_ctx_decisions_owner_session_type_created",
+            &["user_id", "session_id", "decision_type", "created_at"][..],
+        ),
+        (
+            "idx_ctx_decisions_owner_event_id",
+            &["user_id", "event_id"][..],
+        ),
+        (
+            "idx_ctx_decisions_owner_context_capture_id",
+            &["user_id", "context_capture_id"][..],
+        ),
+    ] {
+        ensure_index_shape(&indexes, "ctx_decision_audits", index, expected_columns)?;
+    }
+    fail_if_required_columns_missing_or_nullable(
+        pool,
+        database,
+        "skill_selection_events",
+        &["user_id"],
+    )
+    .await?;
+    ensure_index_shape(
+        &indexes,
+        "skill_selection_events",
+        "idx_skill_selection_owner_session_created",
+        &["user_id", "session_id", "created_at"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "inference_invocations",
+        "idx_inference_invocations_logical_cursor",
+        &[
+            "user_id",
+            "scope_kind",
+            "session_id",
+            "run_id",
+            "harness_run_id",
+            "turn_index",
+            "round_index",
+            "operation_id",
+            "purpose",
+            "logical_attempt",
+        ],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "inference_invocations",
+        "idx_inference_invocations_owner_lease",
+        &["owner_lease_expires_at", "user_id", "invocation_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "model_request_context_events",
+        "idx_model_request_context_created_event",
+        &["created_at", "event_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "model_request_context_events",
+        "idx_model_request_context_owner_harness_created",
+        &["user_id", "harness_run_id", "created_at", "event_id"],
+    )?;
+    for (index, columns) in [
+        (
+            "idx_inference_settlement_owner_session_created",
+            &["user_id", "session_id", "created_at", "invocation_id"][..],
+        ),
+        (
+            "idx_inference_settlement_owner_harness_created",
+            &["user_id", "harness_run_id", "created_at", "invocation_id"][..],
+        ),
+        (
+            "idx_inference_settlement_recovery_ready",
+            &[
+                "reconciliation_status",
+                "next_retry_at",
+                "user_id",
+                "invocation_id",
+            ],
+        ),
+    ] {
+        ensure_index_shape(
+            &indexes,
+            "inference_invocation_settlement_debts",
+            index,
+            columns,
+        )?;
+    }
+    fail_if_required_columns_missing_or_nullable(
+        pool,
+        database,
+        "inference_routes",
+        &["scope_kind"],
+    )
+    .await?;
+    fail_if_required_columns_missing_or_nullable(
+        pool,
+        database,
+        "inference_invocation_settlement_debts",
+        &[
+            "usage_status",
+            "provider_delivery_state",
+            "reconciliation_status",
+            "next_retry_at",
+        ],
+    )
+    .await?;
+    fail_if_required_columns_missing_or_nullable(
+        pool,
+        database,
+        "inference_invocations",
+        &["scope_kind", "operation_id"],
+    )
+    .await?;
+    verify_inference_invocation_schema_contract(pool, database).await?;
+    verify_inference_provider_attempt_schema_contract(pool, database).await?;
+    verify_inference_canonical_transition_head_schema_contract(pool, database).await?;
+    verify_inference_canonical_transition_wal_schema_contract(pool, database).await?;
+    for (table, nullable_columns) in [
+        (
+            "inference_routes",
+            &["session_id", "run_id", "harness_run_id"][..],
+        ),
+        (
+            "inference_invocations",
+            &[
+                "session_id",
+                "run_id",
+                "harness_run_id",
+                "turn_index",
+                "round_index",
+            ][..],
+        ),
+        (
+            "inference_provider_attempts",
+            &["session_id", "run_id", "harness_run_id"][..],
+        ),
+        (
+            "inference_invocation_settlement_debts",
+            &[
+                "session_id",
+                "harness_run_id",
+                "provider_attempt_id",
+                "quarantine_reason",
+            ][..],
+        ),
+    ] {
+        fail_if_required_columns_missing_or_not_nullable(pool, database, table, nullable_columns)
+            .await?;
+    }
+    ensure_index_shape(
+        &indexes,
+        "skills_registry",
+        "idx_skill_active_name_ver",
+        &["is_active", "skill_name", "version"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "edge_agent_registry",
+        "PRIMARY",
+        &["user_id", "registry_id"],
+    )?;
+    ensure_edge_pending_dispatch_result_json_lossless(pool, database).await?;
+    fail_if_obsolete_shape(
+        pool,
+        database,
+        "edge_pending_dispatch",
+        EDGE_PENDING_DISPATCH_IDENTITY_COLUMNS,
+        &["dispatch_id"],
+        &["uq_edge_dispatch_owner_request"],
+    )
+    .await?;
+    ensure_index_shape(
+        &indexes,
+        "edge_pending_dispatch",
+        "PRIMARY",
+        EDGE_PENDING_DISPATCH_IDENTITY_COLUMNS,
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "edge_pending_dispatch",
+        "idx_edge_dispatch_user_status",
+        &[
+            "user_id",
+            "edge_agent_id",
+            "status",
+            "created_at",
+            "session_id",
+            "run_id",
+            "turn_chain_id",
+            "request_id",
+        ],
+    )?;
+    fail_if_required_column_nullability_mismatches(
+        pool,
+        database,
+        "agent_bindings",
+        &[
+            ("owner_user_id", ColumnNullability::NotNull),
+            ("principal_scope_id", ColumnNullability::NotNull),
+        ],
+    )
+    .await?;
+    ensure_index_shape(
+        &indexes,
+        "agent_bindings",
+        "uq_agent_bindings_owner_scope_name",
+        &["owner_user_id", "principal_scope_id", "binding_name"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "agent_bindings",
+        "uq_agent_bindings_owner_scope_idempotency",
+        &["owner_user_id", "principal_scope_id", "idempotency_key"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "agent_bindings",
+        "idx_agent_bindings_owner_scope_status_created",
+        &[
+            "owner_user_id",
+            "principal_scope_id",
+            "status",
+            "created_at",
+        ],
+    )?;
+    fail_if_varchar_columns_shorter_than(pool, database, "mcp_servers", &[("id", 64)]).await?;
+    ensure_index_shape(&indexes, "mcp_servers", "PRIMARY", &["owner_user_id", "id"])?;
+    ensure_index_shape(
+        &indexes,
+        "mcp_servers",
+        "uq_mcp_servers_owner_name",
+        &["owner_user_id", "name"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "mcp_servers",
+        "idx_mcp_servers_owner_active",
+        &["owner_user_id", "is_active", "updated_at"],
+    )?;
+    fail_if_varchar_columns_shorter_than(
+        pool,
+        database,
+        "mcp_bindings",
+        &[("id", 64), ("mcp_id", 64)],
+    )
+    .await?;
+    ensure_index_shape(
+        &indexes,
+        "mcp_bindings",
+        "PRIMARY",
+        &["owner_user_id", "id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "mcp_bindings",
+        "uq_mcp_bindings_owner_mcp_key",
+        &["owner_user_id", "mcp_id", "key_hash"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "mcp_bindings",
+        "idx_mcp_bindings_owner_active",
+        &["owner_user_id", "is_active", "updated_at"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "mcp_bindings",
+        "idx_mcp_bindings_owner_mcp",
+        &["owner_user_id", "mcp_id"],
+    )?;
+    fail_if_obsolete_shape(
+        pool,
+        database,
+        "mcp_tools",
+        &["owner_user_id", "binding_id", "tool_name"],
+        &["id"],
+        &["uq_mcp_tools_binding_tool", "uq_mcp_tools_binding_public"],
+    )
+    .await?;
+    fail_if_varchar_columns_shorter_than(pool, database, "mcp_tools", &[("binding_id", 64)])
+        .await?;
+    ensure_index_shape(
+        &indexes,
+        "mcp_tools",
+        "PRIMARY",
+        &["owner_user_id", "binding_id", "tool_name"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "mcp_tools",
+        "uq_mcp_tools_owner_binding_public",
+        &["owner_user_id", "binding_id", "public_name"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "mcp_tools",
+        "idx_mcp_tools_owner_binding",
+        &["owner_user_id", "binding_id"],
+    )?;
+    ensure_index_shape(&indexes, "plans", "PRIMARY", &["user_id", "plan_id"])?;
+    ensure_index_shape(
+        &indexes,
+        "plans",
+        "idx_plans_owner_session_updated",
+        &["user_id", "session_id", "updated_at"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "plan_step_runs",
+        "PRIMARY",
+        &["user_id", "run_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "plan_step_runs",
+        "idx_step_runs_plan_started",
+        &["user_id", "plan_id", "started_at"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "session_checkpoints",
+        "PRIMARY",
+        &["user_id", "session_id", "checkpoint_id"],
+    )?;
+    for (index, expected_columns) in [
+        (
+            "uq_session_checkpoints_owner_number",
+            &["user_id", "session_id", "number"][..],
+        ),
+        (
+            "idx_ckpt_owner_session_turn",
+            &["user_id", "session_id", "turn"][..],
+        ),
+        ("idx_ckpt_user_created", &["user_id", "created_at"][..]),
+    ] {
+        ensure_index_shape(&indexes, "session_checkpoints", index, expected_columns)?;
+    }
+    ensure_index_shape(
+        &indexes,
+        "session_artifacts",
+        "PRIMARY",
+        &["user_id", "session_id", "artifact_id"],
+    )?;
+    for (index, expected_columns) in [
+        (
+            "idx_session_artifacts_owner_kind_order",
+            &[
+                "user_id",
+                "session_id",
+                "artifact_kind",
+                "created_at",
+                "artifact_id",
+            ][..],
+        ),
+        (
+            "idx_session_artifacts_owner_session_order",
+            &["user_id", "session_id", "created_at", "artifact_id"][..],
+        ),
+        (
+            "idx_session_artifacts_owner_source_order",
+            &[
+                "user_id",
+                "session_id",
+                "source",
+                "created_at",
+                "artifact_id",
+            ][..],
+        ),
+        (
+            "idx_artifacts_root_scope",
+            &[
+                "user_id",
+                "root_run_id",
+                "access_scope",
+                "status",
+                "updated_at",
+                "artifact_id",
+            ][..],
+        ),
+    ] {
+        ensure_index_shape(&indexes, "session_artifacts", index, expected_columns)?;
+    }
+    ensure_index_shape(
+        &indexes,
+        "session_artifacts",
+        "idx_artifacts_retention",
+        &[
+            "status",
+            "retention_until",
+            "retention_policy",
+            "user_id",
+            "session_id",
+            "artifact_id",
+        ],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "session_artifact_references",
+        "PRIMARY",
+        &[
+            "user_id",
+            "session_id",
+            "artifact_id",
+            "reference_kind",
+            "reference_id",
+        ],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "session_artifact_references",
+        "idx_artifact_references_owner_reference",
+        &[
+            "user_id",
+            "session_id",
+            "reference_kind",
+            "reference_id",
+            "artifact_id",
+        ],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "session_artifact_content_chunks",
+        "PRIMARY",
+        &["user_id", "content_digest"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "session_artifact_content_chunks",
+        "idx_artifact_content_chunks_updated",
+        &["user_id", "updated_at", "content_digest"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "session_artifact_content_refs",
+        "PRIMARY",
+        &["user_id", "session_id", "artifact_id", "chunk_index"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "session_artifact_content_refs",
+        "idx_artifact_content_refs_digest",
+        &["user_id", "content_digest"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "session_artifact_content_upload_leases",
+        "PRIMARY",
+        &["user_id", "session_id", "artifact_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "session_artifact_content_upload_leases",
+        "idx_artifact_content_upload_leases_expiry",
+        &["user_id", "expires_at", "session_id", "artifact_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "session_artifact_content_reservations",
+        "PRIMARY",
+        &["user_id", "session_id", "artifact_id", "content_digest"],
+    )?;
+    for (index, expected_columns) in [
+        (
+            "idx_artifact_content_reservations_expiry",
+            &["user_id", "expires_at", "content_digest"][..],
+        ),
+        (
+            "idx_artifact_content_reservations_digest",
+            &["user_id", "content_digest", "expires_at"][..],
+        ),
+    ] {
+        ensure_index_shape(
+            &indexes,
+            "session_artifact_content_reservations",
+            index,
+            expected_columns,
+        )?;
+    }
+    fail_if_obsolete_shape(
+        pool,
+        database,
+        "user_skill_evaluations",
+        &[
+            "evaluation_id",
+            "owner_user_id",
+            "source_id",
+            "version_id",
+            "run_id",
+            "hits",
+            "suspects",
+            "false_positives",
+            "payload_json",
+            "created_at",
+        ],
+        &[],
+        &[
+            "idx_user_skill_eval_source_created",
+            "idx_user_skill_eval_version_created",
+            "idx_user_skill_eval_run",
+        ],
+    )
+    .await?;
+    fail_if_obsolete_shape(
+        pool,
+        database,
+        "skill_installations",
+        &[
+            "installation_id",
+            "user_id",
+            "skill_name",
+            "skill_version",
+            "status",
+            "installed_at",
+            "updated_at",
+        ],
+        &[
+            "scope",
+            "session_id",
+            "workspace_id",
+            "auto_activate_on_topic_match",
+        ],
+        &["idx_si_scope_target", "idx_si_auto_activate"],
+    )
+    .await?;
+    fail_if_varchar_columns_shorter_than(
+        pool,
+        database,
+        "eval_calibration_assessments",
+        &[("user_id", USER_ID_MAX_LEN as u64)],
+    )
+    .await?;
+    ensure_index_shape(
+        &indexes,
+        "eval_calibration_assessments",
+        "PRIMARY",
+        &["user_id", "calibration_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "eval_user_feedback",
+        "idx_euf_owner_session_created",
+        &["user_id", "session_id", "created_at"],
+    )?;
     Ok(())
 }
 
@@ -10034,30 +8128,6 @@ pub async fn log_session_audit(
             "failed to write auth audit log"
         );
     }
-}
-
-pub async fn update_turn_skill_selection_version(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    event_id: &str,
-    user_id: &str,
-    session_id: &str,
-    skill_version: &str,
-) -> Result<(), sqlx::Error> {
-    let result = query(
-        "UPDATE skill_selection_events
-         SET skill_version = ?
-         WHERE event_id = ? AND user_id = ? AND session_id = ?",
-    )
-    .bind(skill_version)
-    .bind(event_id)
-    .bind(user_id)
-    .bind(session_id)
-    .execute(&mut **tx)
-    .await?;
-    if result.rows_affected() == 0 {
-        return Err(sqlx::Error::RowNotFound);
-    }
-    Ok(())
 }
 
 pub async fn resolve_active_skill_versions(
@@ -10388,38 +8458,14 @@ mod tests {
     }
 
     #[test]
-    fn identity_column_widening_preserves_nullability() {
-        assert_eq!(
-            identity_column_widening_ddl("eval_quality_assessments", "user_id", true)
-                .expect("nullable identity migration DDL"),
-            "ALTER TABLE `eval_quality_assessments` MODIFY COLUMN `user_id` VARCHAR(128) NULL"
-        );
-        assert_eq!(
-            identity_column_widening_ddl("auth_users", "username", false)
-                .expect("required identity migration DDL"),
-            "ALTER TABLE `auth_users` MODIFY COLUMN `username` VARCHAR(128) NOT NULL"
-        );
-    }
-
-    #[test]
-    fn edge_dispatch_result_storage_upgrades_only_legacy_json_shape() {
-        assert_eq!(
-            edge_pending_dispatch_result_json_upgrade_ddl("json", true)
-                .expect("legacy JSON column is upgradeable"),
-            Some(EDGE_PENDING_DISPATCH_RESULT_JSON_LONGTEXT_ALTER_SQL)
-        );
-        assert_eq!(
-            edge_pending_dispatch_result_json_upgrade_ddl("longtext", true)
-                .expect("canonical LONGTEXT column is already current"),
-            None
-        );
-        assert_eq!(
-            edge_pending_dispatch_result_json_upgrade_ddl("text", true)
-                .expect("MatrixOne reports LONGTEXT as TEXT"),
-            None
-        );
-        assert!(edge_pending_dispatch_result_json_upgrade_ddl("mediumtext", true).is_err());
-        assert!(edge_pending_dispatch_result_json_upgrade_ddl("json", false).is_err());
+    fn edge_dispatch_result_storage_requires_nullable_lossless_text() {
+        for data_type in ["longtext", "text", "TEXT"] {
+            assert!(validate_edge_pending_dispatch_result_storage(data_type, true).is_ok());
+            assert!(validate_edge_pending_dispatch_result_storage(data_type, false).is_err());
+        }
+        for data_type in ["json", "mediumtext"] {
+            assert!(validate_edge_pending_dispatch_result_storage(data_type, true).is_err());
+        }
     }
 
     struct FakeDatabaseUserRow {
@@ -11277,67 +9323,11 @@ mod tests {
     }
 
     #[test]
-    fn core_schema_contract_upgrade_reconciles_same_component_in_place() {
-        let existing = vec![persisted_claim(
-            "admin_config",
-            CORE_SCHEMA_CONTRACT_COMPONENT,
-            "storage",
-            "2026-07-20-v6",
-        )];
-        let declarations = vec![desired_table("admin_config", "storage")];
-
-        let stale = stale_core_schema_table_claims(&existing, &declarations).unwrap();
-
-        assert!(
-            stale.is_empty(),
-            "an older contract for the same component must be updated in place"
-        );
-    }
-
-    #[test]
-    fn core_schema_contract_upgrade_removes_only_retired_same_component_claims() {
-        let existing = vec![
-            persisted_claim(
-                "kept_table",
-                CORE_SCHEMA_CONTRACT_COMPONENT,
-                "storage",
-                "old",
-            ),
-            persisted_claim(
-                "retired_table",
-                CORE_SCHEMA_CONTRACT_COMPONENT,
-                "storage",
-                "old",
-            ),
-            persisted_claim("foreign_table", "extension", "plugin", "v1"),
-        ];
-        let declarations = vec![desired_table("kept_table", "storage")];
-
-        let stale = stale_core_schema_table_claims(&existing, &declarations).unwrap();
-
-        assert_eq!(stale, vec!["retired_table"]);
-    }
-
-    #[test]
-    fn core_schema_contract_upgrade_rejects_foreign_component_claim() {
-        let existing = vec![persisted_claim("shared_table", "extension", "plugin", "v1")];
-        let declarations = vec![desired_table("shared_table", "storage")];
-
-        let error = stale_core_schema_table_claims(&existing, &declarations)
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("shared_table"), "{error}");
-        assert!(error.contains("extension"), "{error}");
-        assert!(error.contains("plugin"), "{error}");
-    }
-
-    #[test]
     fn core_schema_contract_write_never_takes_over_a_concurrent_foreign_claim() {
         let declaration = desired_table("shared_table", "storage");
         let raced_claim = persisted_claim("shared_table", "extension", "plugin", "v1");
 
-        let error = validate_reconciled_core_schema_table_claim(&raced_claim, &declaration)
+        let error = validate_core_schema_table_claim(&raced_claim, &declaration)
             .expect_err("a foreign claim that appears after the pre-read must still fail")
             .to_string();
 
@@ -11353,14 +9343,10 @@ mod tests {
                 .contains("ON DUPLICATE KEY UPDATE"),
             "a duplicate claim must never be implemented by updating its identity"
         );
-        assert!(
-            UPDATE_OWNED_CORE_SCHEMA_TABLE_CLAIM_SQL.contains("AND component = ?"),
-            "contract updates must be scoped to the existing owning component"
-        );
     }
 
     #[test]
-    fn core_schema_contract_write_validates_the_exact_converged_claim() {
+    fn core_schema_contract_retry_requires_the_exact_current_claim() {
         let declaration = desired_table("shared_table", "storage");
         let converged = PersistedCoreSchemaTableClaim {
             name: declaration.name.clone(),
@@ -11370,7 +9356,7 @@ mod tests {
             ddl_sha256: declaration.ddl_sha256.clone(),
         };
 
-        validate_reconciled_core_schema_table_claim(&converged, &declaration)
+        validate_core_schema_table_claim(&converged, &declaration)
             .expect("the exact owner-scoped contract should validate");
 
         for divergent in [
@@ -11388,8 +9374,8 @@ mod tests {
             },
         ] {
             assert!(
-                validate_reconciled_core_schema_table_claim(&divergent, &declaration).is_err(),
-                "reconciliation must fail loudly unless every claimed contract field converged"
+                validate_core_schema_table_claim(&divergent, &declaration).is_err(),
+                "retry must reject claims that differ from the current contract"
             );
         }
     }

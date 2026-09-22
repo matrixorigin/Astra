@@ -54,9 +54,22 @@ Refresh validates the current Memoria credential online. Compare-and-revoke of t
 - Deactivated/deleted Astra accounts cannot resolve their scoped credential. Bounded maintenance removes their stored ciphertext. Existing external mappings do not automatically recreate a deleted local account.
 - Account-wide Work/history erasure remains governed by the account retention contract; sign-out, disconnect and temporary verification outages never erase it.
 
-## Legacy migration
+## Current-schema identity policy
 
-The old `auth_memoria_identities` table is a read-only migration source. Its missing issuer cannot safely be guessed. Administrators must set `MEMORIA_LEGACY_ISSUER` to the known original issuer, matching the configured issuer. A fresh verified login then moves that mapping to the canonical table, preserves the Astra user ID and its models/Work, replaces the credential, and revokes old sessions in one transaction. Without that assertion, login fails with 409 and legacy refresh sessions fail closed. Do not set this option when pointing an old Astra database at a different Memoria instance.
+Fresh schema bootstrap creates `auth_external_identities`. It does not import
+`auth_memoria_identities` or migrate an older database; unsupported schema
+versions require database recreation.
+
+Login resolves only the current verified issuer and subject. There is no
+issuerless identity adoption or relink migration. Retained Memoria identities
+and inactive credentials still deny deployment fallback; an absent current
+credential is not permission to change identity authority.
+
+Each resolution reads account state, scoped credentials, retained bindings and
+configured UC identity from one database statement snapshot. This snapshot is
+not cached: each memory operation rechecks current authority, and UC memory
+still verifies account status upstream. Inapplicable compaction performs no
+credential lookup.
 
 ## Fresh reauthentication
 
@@ -243,7 +256,7 @@ password and manual-key login remain unchanged.
 
 ## Verification
 
-Focused coverage lives in `memoria_auth_db_it`, `memoria_auth_http`, CLI auth-flow tests and runtime consent-admission tests. It includes issuer separation, concurrent login/relink, post-write failure rollback, legacy migration, disconnect, inactive-account retention, source-configuration mismatch, read-only extraction and login discovery. Actual Windows browser launch and live OAuth callbacks require platform/deployment testing in addition to deterministic contracts.
+Focused coverage lives in `memoria_auth_db_it`, `memoria_auth_http`, CLI auth-flow tests and runtime consent-admission tests. It includes issuer separation, concurrent login/relink, post-write failure rollback, disconnect, inactive-account retention, source-configuration mismatch, read-only extraction and login discovery. Actual Windows browser launch and live OAuth callbacks require platform/deployment testing in addition to deterministic contracts.
 
 `memoria_live_contract_it` additionally runs against a real Memoria API implementing scoped-key API version 1. It creates disposable identity-only, read-only and read-write keys, verifies stable Astra account mapping, and revokes each key through Memoria before checking refresh rejection. Run only against an isolated Memoria test service and an explicitly designated test database:
 

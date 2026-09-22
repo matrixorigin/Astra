@@ -426,7 +426,10 @@ impl astra_runtime::turn::cloud::memoria_compact::MemoriaPort for CliSessionMemo
         session_id: Option<&str>,
         top_k: usize,
         filter_session: bool,
-    ) -> Result<Vec<astra_runtime::turn::cloud::memoria_compact::MemoriaMemory>, String> {
+    ) -> Result<
+        Vec<astra_runtime::turn::cloud::memoria_compact::MemoriaMemory>,
+        astra_runtime::turn::cloud::memoria_compact::MemoriaOperationError,
+    > {
         let token = self.fresh_token().await?;
         let mut body = serde_json::json!({
             "query": query,
@@ -450,7 +453,7 @@ impl astra_runtime::turn::cloud::memoria_compact::MemoriaPort for CliSessionMemo
             .await
             .map_err(|error| format!("memory retrieve parse failed: {error}"))?;
         if !status.is_success() {
-            return Err(format!("memory retrieve HTTP {status}"));
+            return Err(format!("memory retrieve HTTP {status}").into());
         }
         let memories = Self::parse_memories(&payload);
         if filter_session {
@@ -1579,7 +1582,10 @@ mod tests {
             .retrieve_ext("session memory", Some("session-1"), 5, true)
             .await
             .expect_err("foreign session result must fail closed");
-        assert!(error.starts_with("memory_scope_violation:"), "{error}");
+        assert!(
+            error.to_string().starts_with("memory_scope_violation:"),
+            "{error}"
+        );
         assert!(port.working_ids.lock().unwrap().is_empty());
     }
 

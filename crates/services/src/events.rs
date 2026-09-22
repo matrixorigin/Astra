@@ -696,9 +696,9 @@ impl EventService for DatabaseEventService {
                     connection.release();
                     return Ok(EventCreateOutcome::replayed(existing));
                 }
-                crate::observation_capture::record_observation_collision(
+                crate::observation_capture::record_observation_collisions(
                     &mut tx,
-                    crate::observation_capture::ObservationCollisionReceipt {
+                    &[crate::observation_capture::ObservationCollisionReceipt {
                         user_id: &user_id,
                         domain: crate::observation_capture::ObservationPayloadDomain::AgentEvent,
                         identity_id: existing_id,
@@ -706,7 +706,7 @@ impl EventService for DatabaseEventService {
                         stored_payload_hash: &stored_hash,
                         attempted_payload_hash: &payload_hash,
                         source: "event_service",
-                    },
+                    }],
                 )
                 .await
                 .map_err(internal_error)?;
@@ -809,9 +809,9 @@ impl EventService for DatabaseEventService {
                         connection.release();
                         return Ok(EventCreateOutcome::replayed(existing));
                     }
-                    crate::observation_capture::record_observation_collision(
+                    crate::observation_capture::record_observation_collisions(
                         &mut tx,
-                        crate::observation_capture::ObservationCollisionReceipt {
+                        &[crate::observation_capture::ObservationCollisionReceipt {
                             user_id: &user_id,
                             domain:
                                 crate::observation_capture::ObservationPayloadDomain::AgentEvent,
@@ -820,7 +820,7 @@ impl EventService for DatabaseEventService {
                             stored_payload_hash: &stored_hash,
                             attempted_payload_hash: &payload_hash,
                             source: "event_service",
-                        },
+                        }],
                     )
                     .await
                     .map_err(internal_error)?;

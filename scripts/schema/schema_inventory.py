@@ -554,22 +554,12 @@ TABLE_METADATA: dict[str, TableMetadata] = {
     "session_transcript_items": TableMetadata(
         semantic_owner="runtime run lifecycle persistence",
         state_class="durable user-visible transcript stream",
-        primary_query="transcript hydration by user_id, session_id, item_seq and run/event lookup",
-        retention_policy="retain with user-visible session history; do not delete before transcript pages/history are reconciled",
-        rebuildability="partially rebuildable for new writes, but item sequence and page identity are product state",
+        primary_query="item-sequence pagination by user_id/session_id; owner/run and owner/session/source_event_id lookup",
+        retention_policy="retain with user-visible session history and owner-scoped session deletion",
+        rebuildability="accepted event replay can repair missing material; original item sequences and timestamps cannot be reconstructed arbitrarily",
         merge_guidance="do not merge with conversation_log; transcript is display state, not model context",
         migration_owner="astra_services::storage / runtime session persistence",
         product_owner="web/session transcript UI",
-    ),
-    "transcript_pages": TableMetadata(
-        semantic_owner="runtime run lifecycle persistence",
-        state_class="derived transcript projection",
-        primary_query="transcript pagination by user_id, session_id, page_seq or end item sequence",
-        retention_policy="can be cleared and rebuilt from session_transcript_items with a repair path",
-        rebuildability="rebuildable from session_transcript_items",
-        merge_guidance="candidate for repair tooling, not deletion; merge only if pagination cost is proven low",
-        migration_owner="astra_services::storage / runtime session persistence",
-        product_owner="web/session transcript pagination",
     ),
     "session_artifacts": TableMetadata(
         semantic_owner="astra_services::session_artifact_store / artifact_retention_sweeper",
@@ -885,11 +875,11 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         semantic_owner="astra_services::state_projection",
         state_class="durable state projection audit event",
         primary_query="state item audit by item_id/created_at/event_id and owner session audit by user_id/session_id/created_at/event_id",
-        retention_policy="retain with session_state_items while compaction invariants, projection debugging, and user/session audit need mutation history",
+        retention_policy="retain with session_state_items while projection debugging and user/session audit need mutation history",
         rebuildability="not fully rebuildable after source mutation context is gone",
         merge_guidance="keep separate from session_state_items; the item table is current projection state, while this table records mutation history",
         migration_owner="astra_services::storage / state_projection",
-        product_owner="session state projection, compaction invariants, active skill/delegation audit",
+        product_owner="session state projection, active skill/delegation audit",
     ),
     "session_delegations": TableMetadata(
         semantic_owner="astra_services::state_projection / runtime delegation engine",
@@ -1200,26 +1190,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="keep separate from agent_events until feedback readers stop querying rating/comment directly; feedback is evaluation input rather than timeline-only audit",
         migration_owner="astra_services::storage / evaluation",
         product_owner="user feedback, quality loops, evaluation training inputs",
-    ),
-    "preview_template_registry": TableMetadata(
-        semantic_owner="astra_services::tool_output_preview",
-        state_class="durable preview template registry fact",
-        primary_query="preview template lookup by tool_name/version and active template list by tool_name/status/updated_at",
-        retention_policy="retain active and compatible template versions while tool output previews can be rendered or re-normalized; deactivate old versions instead of deleting while artifacts may reference them",
-        rebuildability="rebuildable only from checked-in template definitions if they exactly match deployed first_class_columns_json, field weights, and schema_json",
-        merge_guidance="keep separate from raw_ref_scheme_registry; preview templates control rendering/normalization while raw ref schemes control resolver and access semantics",
-        migration_owner="astra_services::storage / tool_output_preview",
-        product_owner="tool output preview rendering, search normalization, artifact UX",
-    ),
-    "raw_ref_scheme_registry": TableMetadata(
-        semantic_owner="astra_services::raw_ref_resolver",
-        state_class="durable raw reference scheme registry fact",
-        primary_query="raw reference scheme lookup by scheme and active resolver metadata",
-        retention_policy="retain active resolver definitions while raw refs in manifests, previews, citations, or artifacts can be dereferenced; disable schemes before deleting resolver metadata",
-        rebuildability="rebuildable only from resolver bootstrap definitions if access_check, backing_store, and canonical examples remain identical",
-        merge_guidance="keep separate from preview_template_registry; scheme rows define dereference and access-check authority, not preview rendering templates",
-        migration_owner="astra_services::storage / raw_ref_resolver",
-        product_owner="raw reference resolution, artifact/context access checks, manifest dereferencing",
     ),
     "llm_provider_admission_pacing": TableMetadata(
         semantic_owner="astra_runtime::llm_provider_admission",
@@ -1836,7 +1806,7 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         state_class="durable transcript projection sequence head",
         primary_query="transcript projection head by user_id/session_id, completed_turn, journal_event_seq, conversation_seq, and canonical_root_hash",
         retention_policy="retain the current projection checkpoint while transcript replay and compaction need it; replace during projection repair and remove with session cleanup",
-        rebuildability="rebuildable from transcript items and canonical journal/manifests when sequence and root evidence remain available",
+        rebuildability="advance only through contiguous canonical cursor promotion with complete materialized evidence; MAX(item_seq) cannot certify commitment",
         merge_guidance="keep separate from session_context_heads, transcript items, manifests, and events; this is transcript projection state keyed by projection sequence, not canonical history",
         migration_owner="astra_services::storage / context",
         product_owner="transcript materialization, compaction, and projection recovery",
@@ -1919,7 +1889,7 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
             "sync status no longer depends on session_sync_log"
         ),
         migration_backfill=(
-            "no backfill; schema setup drops the legacy table and live MatrixOne tests assert it is absent"
+            "no backfill; fresh schema excludes the retired table and live MatrixOne tests assert it is absent"
         ),
         rollback=(
             "rollback would require explicitly reintroducing the DDL and persistence path; "
@@ -2039,8 +2009,7 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
             "anti-resurrection and recovery authority"
         ),
         migration_backfill=(
-            "legacy rows are copied into agent_session_lifecycle_fences before the redundant table "
-            "is dropped during the v85 schema bootstrap"
+            "none; bootstrap supports the current fresh schema without legacy data migration"
         ),
         rollback=(
             "rollback would require explicitly restoring the legacy table and its readers; "
@@ -2048,7 +2017,6 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         ),
         test_evidence=[
             "crates/services/tests/schema_assertions.rs::core_schema_catalog_matches_live_idempotent_bootstrap",
-            "crates/services/tests/edge_dispatch_schema_migration_db_it.rs::deletion_tombstone_schema_upgrade_migrates_rows_and_drops_redundant_table",
         ],
         rationale=(
             "the tombstone duplicated the lifecycle fence's irreversible delete fact and added "
@@ -2059,29 +2027,27 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         candidate="auth_memoria_identities",
         decision="removed",
         current_read_paths=[
-            "none in steady-state auth; v86 bootstrap reads the legacy source only during migration",
+            "none; identity lookup uses auth_external_identities",
         ],
         current_write_paths=[
-            "v86 bootstrap backfills auth_external_identities with the reserved memoria:legacy provider id and drops the source table",
+            "none; current issuer-scoped identities are written to auth_external_identities",
         ],
         user_api_impact=(
-            "legacy Memoria accounts remain reconnectable only with an explicit legacy issuer; "
+            "login accepts only current issuer-scoped identities, without legacy relinking; "
             "current issuer-scoped identity and disconnect behavior remain in auth_external_identities"
         ),
         migration_backfill=(
-            "copy memoria_user_id/astra_user_id into auth_external_identities, fail closed on a "
-            "conflicting canonical mapping, then drop the migration-only source table"
+            "none; bootstrap supports the current fresh schema without legacy data migration"
         ),
         rollback=(
-            "rollback requires restoring the source rows from the reserved memoria:legacy mappings; "
-            "the canonical rows retain the complete legacy identity pair"
+            "rollback requires explicitly restoring the retired importer and its source data; "
+            "fresh bootstrap does not preserve or convert legacy source rows"
         ),
         test_evidence=[
-            "crates/services/tests/edge_dispatch_schema_migration_db_it.rs::legacy_memoria_identity_schema_upgrade_migrates_rows_and_drops_source_table",
             "crates/services/tests/memoria_auth_db_it.rs::memoria_issuer_atomicity_concurrent_binding_and_disconnect",
         ],
         rationale=(
-            "the table is a read-only migration source with no independent authority; keeping it "
+            "the obsolete source table has no current schema or runtime owner; restoring it "
             "forces runtime auth and model eligibility to maintain a second identity lookup"
         ),
     ),
@@ -2111,38 +2077,6 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         ],
         rationale=(
             "small table size is not evidence of redundancy; it is the durable root for rollback/list identity"
-        ),
-    ),
-    ConsolidationReview(
-        candidate="preview_template_registry + raw_ref_scheme_registry",
-        decision="keep_separate",
-        current_read_paths=[
-            "crates/services/src/runs.rs::preview_template_registry",
-            "crates/services/src/context_manifest.rs::raw_ref_scheme_registry",
-        ],
-        current_write_paths=[
-            "crates/services/src/storage.rs::seed raw_ref_scheme_registry",
-            "crates/services/src/storage.rs::seed preview_template_registry",
-        ],
-        user_api_impact=(
-            "preview templates affect artifact/tool-output rendering; raw-ref schemes affect dereference "
-            "authority and access checks"
-        ),
-        migration_backfill=(
-            "no merge; a unified table would need a typed registry model and separate indexes for resolver "
-            "authority versus rendering templates"
-        ),
-        rollback=(
-            "keep current bootstrap seeds as rollback source; merged rows would need lossless split back "
-            "into scheme metadata and template metadata"
-        ),
-        test_evidence=[
-            "crates/services/tests/schema_assertions.rs::preview_template_registry",
-            "crates/services/tests/schema_assertions.rs::raw_ref_scheme_registry",
-            "crates/runtime/tests/phase6_artifact_preview.rs",
-        ],
-        rationale=(
-            "same bootstrap area does not imply same lifecycle; resolver/access semantics differ from rendering"
         ),
     ),
     ConsolidationReview(

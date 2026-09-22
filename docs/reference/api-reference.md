@@ -172,6 +172,19 @@ provided together; `offset` pagination is not supported.
 
 ### GET /sessions/{session_id}
 
+### GET /sessions/{session_id}/transcript
+
+Owner-scoped item pagination accepts `limit`, `before_seq`, and either
+`scope=root_conversation` or `run_id`. Combining those filters is rejected;
+omitting both selects the session audit stream. Items retain ascending
+`item_seq` order and stable `source_event_id` values. The response contains
+`session_id`, `items`, `next_before_seq`, and `has_more`. Use the returned
+sequence with the same scope for older items. Artifact hydration is included.
+Physical page references/hashes are no longer part of this response.
+
+Work transcript responses retain their committed cursor and per-item commitment
+fields; a newer canonical context head does not certify transcript publication.
+
 ### PUT /sessions/{session_id}
 
 ### POST /sessions/{session_id}/close

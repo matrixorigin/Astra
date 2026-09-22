@@ -1826,7 +1826,6 @@ async fn cleanup_session_delete_fixture_for_owner(
     for table in [
         "ctx_decision_audits",
         "ctx_snapshots",
-        "transcript_pages",
         "session_artifacts",
         "eval_calibration_assessments",
         "conversation_log",
@@ -6775,12 +6774,9 @@ async fn session_owned_services_isolate_same_session_id_across_owners_on_live_ma
             },
         )
         .await;
-    assert_eq!(
-        decision_result
-            .expect_err("non-owner cannot record decision")
-            .0,
-        axum::http::StatusCode::NOT_FOUND
-    );
+    let error = decision_result.expect_err("non-owner cannot record decision");
+    assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
+    assert_eq!(error.1.0.detail, format!("Session {session_id} not found"));
 
     let replay_service = DatabaseReplayService::new(settings).with_pool(shared);
     let replay_result = replay_service
@@ -7149,6 +7145,146 @@ async fn context_and_decision_writes_require_owner_bound_references_on_live_matr
         "rejected decision references must not write stray owner rows"
     );
     assert_eq!(decision.context_capture_id, snapshot.context_capture_id);
+
+    let request = DecisionCreateRequestData {
+        session_id: session_id.clone(),
+        event_id: owner_event_id.clone(),
+        context_capture_id: snapshot.context_capture_id.clone(),
+        decision_type: "retained_reference_contract".into(),
+        decision_output: serde_json::json!({"allowed": true}),
+        model_params: None,
+    };
+    for (candidate, expected) in [
+        (
+            DecisionCreateRequestData {
+                event_id: other_event_id.clone(),
+                context_capture_id: other_context_id.clone(),
+                ..request.clone()
+            },
+            format!("Event {other_event_id} not found"),
+        ),
+        (
+            DecisionCreateRequestData {
+                session_id: Uuid::new_v4().to_string(),
+                ..request.clone()
+            },
+            String::from("Session "),
+        ),
+    ] {
+        let error = decision_service
+            .record_decision(owner_user_id.clone(), candidate)
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
+        assert!(error.1.0.detail.starts_with(&expected));
+    }
+    for blank in ["", " \t "] {
+        let receipt = decision_service
+            .record_decision(
+                owner_user_id.clone(),
+                DecisionCreateRequestData {
+                    context_capture_id: blank.into(),
+                    ..request.clone()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.context_capture_id, blank);
+        assert_eq!(receipt.model_params, serde_json::json!({}));
+        assert_eq!(receipt.decision_output, request.decision_output);
+        let stored_timestamp: String = sqlx::query_scalar(
+            "SELECT DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') FROM ctx_decision_audits WHERE decision_id = ? AND user_id = ?",
+        ).bind(&receipt.decision_id).bind(&owner_user_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(receipt.created_at, stored_timestamp);
+    }
+    let other_session_id = Uuid::new_v4().to_string();
+    let other_session_snapshot = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO agent_sessions (session_id, user_id, status) VALUES (?, ?, 'active')")
+        .bind(&other_session_id)
+        .bind(&owner_user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO ctx_snapshots (context_capture_id, user_id, session_id, event_id, context_data) VALUES (?, ?, ?, ?, '{}')")
+        .bind(&other_session_snapshot).bind(&owner_user_id).bind(&other_session_id).bind(&owner_event_id).execute(&pool).await.unwrap();
+    for (candidate, expected) in [
+        (
+            DecisionCreateRequestData {
+                session_id: other_session_id.clone(),
+                ..request.clone()
+            },
+            format!("Event {owner_event_id} not found"),
+        ),
+        (
+            DecisionCreateRequestData {
+                context_capture_id: other_session_snapshot.clone(),
+                ..request.clone()
+            },
+            format!("Snapshot {other_session_snapshot} not found"),
+        ),
+        (
+            DecisionCreateRequestData {
+                context_capture_id: format!(" {} ", request.context_capture_id),
+                ..request.clone()
+            },
+            format!("Snapshot  {}  not found", request.context_capture_id),
+        ),
+    ] {
+        let error = decision_service
+            .record_decision(owner_user_id.clone(), candidate)
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(error.1.0.detail, expected);
+    }
+    cleanup_agent_sessions_and_events_for_owner(
+        &pool,
+        &owner_user_id,
+        &[other_session_id],
+        &[],
+        &[],
+    )
+    .await;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT event_count FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&owner_user_id)
+    .bind(&session_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        count, 2,
+        "retained decisions never change the session counter"
+    );
+    // Valid event and snapshot remain intact: this rejects the old unfenced path.
+    sqlx::query("UPDATE agent_session_lifecycle_fences SET delete_requested_at = NOW(6) WHERE user_id = ? AND session_id = ?")
+        .bind(&owner_user_id).bind(&session_id).execute(&pool).await.unwrap();
+    let error = decision_service
+        .record_decision(owner_user_id.clone(), request.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
+    assert_eq!(error.1.0.detail, format!("Session {session_id} not found"));
+    DatabaseSessionService::new(settings.clone())
+        .with_pool(shared.clone())
+        .delete_session(session_id.clone(), owner_user_id.clone())
+        .await
+        .unwrap();
+    let error = decision_service
+        .record_decision(owner_user_id.clone(), request)
+        .await
+        .unwrap_err();
+    assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ctx_decision_audits WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&owner_user_id)
+    .bind(&session_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(remaining, 0);
 
     cleanup_agent_sessions_and_events_for_owner(
         &pool,
@@ -7764,24 +7900,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         .expect("insert conversation log");
     }
 
-    for (user_id, page_seq, page_hash) in [
-        (&owner_user_id, 1_i64, "page-owner"),
-        (&other_user_id, 7_i64, "page-foreign"),
-    ] {
-        sqlx::query(
-            "INSERT INTO transcript_pages \
-             (user_id, session_id, page_seq, start_item_seq, end_item_seq, item_count, page_hash) \
-             VALUES (?, ?, ?, 1, 2, 2, ?)",
-        )
-        .bind(user_id)
-        .bind(&session_id)
-        .bind(page_seq)
-        .bind(page_hash)
-        .execute(&pool)
-        .await
-        .expect("insert transcript page");
-    }
-
     for (user_id, calibration_id, marker) in [
         (&owner_user_id, &owner_calibration_id, "owner"),
         (&other_user_id, &foreign_calibration_id, "foreign"),
@@ -8039,11 +8157,30 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         .expect("insert config version provenance");
     }
 
+    let decision_service = DatabaseDecisionService::new(settings.clone()).with_pool(shared.clone());
+    let retained_request = DecisionCreateRequestData {
+        session_id: session_id.clone(),
+        event_id: owner_event_id.clone(),
+        context_capture_id: owner_context_capture_id.clone(),
+        decision_type: "retained_delete_fixture".into(),
+        decision_output: serde_json::json!({"owner": true}),
+        model_params: None,
+    };
+    decision_service
+        .record_decision(owner_user_id.clone(), retained_request.clone())
+        .await
+        .unwrap();
     let session_service = DatabaseSessionService::new(settings).with_pool(shared);
     session_service
         .delete_session(session_id.clone(), owner_user_id.clone())
         .await
         .expect("owner-scoped delete must ignore unrelated foreign rows");
+    let error = decision_service
+        .record_decision(owner_user_id.clone(), retained_request)
+        .await
+        .unwrap_err();
+    assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
+    assert_eq!(error.1.0.detail, format!("Session {session_id} not found"));
 
     let delete_audit = load_session_delete_audit_details(&pool, &owner_user_id, &session_id).await;
     assert_eq!(
@@ -8100,7 +8237,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         ),
         ("conversation_log", "conversation_log"),
         ("session_artifacts", "session_artifacts"),
-        ("transcript_pages", "transcript_pages"),
         (
             "eval_calibration_assessments",
             "eval_calibration_assessments",
@@ -8362,16 +8498,6 @@ async fn session_delete_removes_owner_scoped_database_rows_and_local_files_on_li
     .await
     .expect("insert owner session");
     sqlx::query(
-        "INSERT INTO transcript_pages \
-         (user_id, session_id, page_seq, start_item_seq, end_item_seq, item_count, page_hash) \
-         VALUES (?, ?, 1, 1, 2, 2, 'page-owner')",
-    )
-    .bind(&owner_user_id)
-    .bind(&session_id)
-    .execute(&pool)
-    .await
-    .expect("insert owner transcript page");
-    sqlx::query(
         "INSERT INTO conversation_log \
          (user_id, session_id, seq, turn, entry_type, payload) \
          VALUES (?, ?, 1, 1, 0, '{\"type\":\"snapshot\",\"seq\":1,\"turn\":1,\"messages\":[],\"session_state\":{}}')",
@@ -8430,7 +8556,6 @@ async fn session_delete_removes_owner_scoped_database_rows_and_local_files_on_li
 
     for label in [
         "agent_sessions",
-        "transcript_pages",
         "ctx_snapshots",
         "ctx_decision_audits",
         "conversation_log",
@@ -8517,105 +8642,6 @@ async fn session_delete_rejects_non_owner_without_removing_local_files_on_live_m
     );
 
     cleanup_session_delete_fixture_for_owner(&pool, &owner_user_id, &session_id).await;
-}
-
-#[tokio::test]
-#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn skill_selection_version_update_is_owner_session_scoped_on_live_matrixone() {
-    let (shared, _settings) = setup_pool_and_settings().await;
-    let pool = shared.get().clone();
-
-    let event_id = Uuid::new_v4().to_string();
-    let owner_user_id = Uuid::new_v4().to_string();
-    let other_user_id = Uuid::new_v4().to_string();
-    let session_id = Uuid::new_v4().to_string();
-    let other_session_id = Uuid::new_v4().to_string();
-
-    let _ = sqlx::query("DELETE FROM skill_selection_events WHERE event_id = ?")
-        .bind(&event_id)
-        .execute(&pool)
-        .await;
-
-    sqlx::query(
-        "INSERT INTO skill_selection_events \
-         (event_id, session_id, user_id, skill_name, selected_skills, created_at) \
-         VALUES (?, ?, ?, 'owner-skill', CAST('[\"owner-skill\"]' AS JSON), NOW(6))",
-    )
-    .bind(&event_id)
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .execute(&pool)
-    .await
-    .expect("insert owner skill selection event");
-
-    let mut wrong_owner_tx = pool.begin().await.expect("begin wrong owner tx");
-    let wrong_owner = astra_services::update_turn_skill_selection_version(
-        &mut wrong_owner_tx,
-        &event_id,
-        &other_user_id,
-        &session_id,
-        "foreign-owner-version",
-    )
-    .await;
-    assert!(
-        matches!(wrong_owner, Err(sqlx::Error::RowNotFound)),
-        "wrong owner must not update skill selection version: {wrong_owner:?}"
-    );
-    wrong_owner_tx
-        .rollback()
-        .await
-        .expect("rollback wrong owner tx");
-
-    let mut wrong_session_tx = pool.begin().await.expect("begin wrong session tx");
-    let wrong_session = astra_services::update_turn_skill_selection_version(
-        &mut wrong_session_tx,
-        &event_id,
-        &owner_user_id,
-        &other_session_id,
-        "foreign-session-version",
-    )
-    .await;
-    assert!(
-        matches!(wrong_session, Err(sqlx::Error::RowNotFound)),
-        "wrong session must not update skill selection version: {wrong_session:?}"
-    );
-    wrong_session_tx
-        .rollback()
-        .await
-        .expect("rollback wrong session tx");
-
-    let mut owner_tx = pool.begin().await.expect("begin owner tx");
-    astra_services::update_turn_skill_selection_version(
-        &mut owner_tx,
-        &event_id,
-        &owner_user_id,
-        &session_id,
-        "owner-version",
-    )
-    .await
-    .expect("owner-scoped version update");
-    owner_tx.commit().await.expect("commit owner update");
-
-    let row = sqlx::query(
-        "SELECT skill_version FROM skill_selection_events \
-         WHERE event_id = ? AND user_id = ? AND session_id = ?",
-    )
-    .bind(&event_id)
-    .bind(&owner_user_id)
-    .bind(&session_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load owner skill selection event");
-    assert_eq!(
-        row.try_get::<String, _>("skill_version")
-            .expect("decode skill_version"),
-        "owner-version"
-    );
-
-    let _ = sqlx::query("DELETE FROM skill_selection_events WHERE event_id = ?")
-        .bind(&event_id)
-        .execute(&pool)
-        .await;
 }
 
 #[tokio::test]
@@ -9012,17 +9038,6 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
         .await
         .expect("record retrieval degrade event");
     assert_eq!(next_stage, Some(RetrievalStage::Fts));
-    let missing_tool_name = format!("missing-tool-{}", Uuid::new_v4());
-    let fallback_budget = context_manifest_store
-        .preview_template_budget_or_fallback(
-            &user_id,
-            &context_session,
-            Some("run-context-it"),
-            &missing_tool_name,
-        )
-        .await
-        .expect("record preview template missing event");
-    assert_eq!(fallback_budget, 400);
     let context_count =
         sqlx::query("SELECT event_count FROM agent_sessions WHERE session_id = ? AND user_id = ?")
             .bind(&context_session)
@@ -9033,7 +9048,7 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
             .try_get::<i64, _>("event_count")
             .expect("decode context manifest event_count");
     assert_eq!(
-        context_count, 3,
+        context_count, 2,
         "context manifest diagnostics should add one event_count delta per persisted event"
     );
     let context_event_ids =
@@ -9046,7 +9061,7 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
             .into_iter()
             .map(|row| row.try_get::<String, _>("event_id").expect("event_id"))
             .collect::<Vec<_>>();
-    assert_eq!(context_event_ids.len(), 3);
+    assert_eq!(context_event_ids.len(), 2);
 
     let state_projection_store = DatabaseStateProjectionStore::new(shared.clone());
     let active_skill_name = format!("active-skill-{}", Uuid::new_v4());
@@ -9065,12 +9080,11 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
         .await
         .expect("publish personal skill version fixture");
     state_projection_store
-        .activate_personal_skill_from_ui_with_probe(
+        .activate_personal_skill_from_ui(
             &user_id,
             &state_session,
             &active_skill_name,
             &active_skill_version.version_id,
-            None,
         )
         .await
         .expect("activate personal skill");
