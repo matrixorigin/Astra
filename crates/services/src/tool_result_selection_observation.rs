@@ -246,11 +246,6 @@ impl ToolResultJudgmentExplanation {
     }
 
     fn render_detail(&self) -> String {
-        let trigger = match &self.outcome {
-            astra_turn_types::ToolResultSelectionOutcomeV1::NotDispatched { .. }
-            | astra_turn_types::ToolResultSelectionOutcomeV1::Baseline { .. } => None,
-            _ => Some("why it ran is not recorded"),
-        };
         let mut detail = format!(
             "turn {} round {} · source {} bytes, scanned {} bytes, {} candidate chunks · source {} · goal {}",
             self.correlation.turn,
@@ -269,10 +264,6 @@ impl ToolResultJudgmentExplanation {
                 "incomplete"
             },
         );
-        if let Some(trigger) = trigger {
-            detail.push_str(" · ");
-            detail.push_str(trigger);
-        }
         detail.push_str(&format!(
             " · {} · {}",
             self.outcome_label(),
@@ -458,6 +449,10 @@ impl ToolResultJudgmentView {
             line.push_str(&format!(". {note}"));
         }
         if !self.explanations.is_empty() {
+            // A selection observation is emitted only after an eligible
+            // tool-result candidate entered this optional path. Reuse that
+            // existing fact instead of adding a persisted trigger field.
+            line.push_str(". Selection trigger: eligible tool-result candidate");
             let details = self
                 .explanations
                 .iter()
@@ -1440,6 +1435,7 @@ mod tests {
         );
         let skipped_detail = skipped_view.render();
         assert!(skipped_detail.contains("not dispatched · no offering"));
+        assert!(skipped_detail.contains("Selection trigger: eligible tool-result candidate"));
         assert!(!skipped_detail.contains("why it ran is not recorded"));
 
         let mut baseline = observation(
@@ -1456,6 +1452,7 @@ mod tests {
         )
         .render();
         assert!(baseline_detail.contains("kept baseline · incomplete evidence"));
+        assert!(baseline_detail.contains("Selection trigger: eligible tool-result candidate"));
         assert!(!baseline_detail.contains("why it ran is not recorded"));
     }
 
@@ -1556,6 +1553,13 @@ mod tests {
             rendered.matches("Later task effect not recorded").count(),
             1
         );
+        assert_eq!(
+            rendered
+                .matches("Selection trigger: eligible tool-result candidate")
+                .count(),
+            1
+        );
+        assert!(!rendered.contains("why it ran is not recorded"));
 
         let mut invocation_mismatch = selected_observation.clone();
         if let astra_turn_types::ToolResultSelectionOutcomeV1::Decided { execution, .. } =
