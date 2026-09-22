@@ -126,7 +126,7 @@ pub fn build_introspect_report(
     let semantic_judgments = super::semantic_judgment_view(snapshot, request);
     if let Some(semantics) = &semantic_judgments {
         warnings.push(format!(
-            "semantic judgment trace coverage={:?}; capture incomplete; model adoption unknown",
+            "semantic judgment history coverage={:?}; whether it guided the run is not recorded",
             semantics.coverage
         ));
     }
@@ -217,8 +217,8 @@ pub fn build_introspect_report(
             evidence_refs: vec![RUNTIME_SNAPSHOT_REF.into()],
         });
         evidence[0].summary.push_str(match semantics.scope {
-            astra_services::semantic_judgment_observation::SemanticJudgmentScope::LocalJournalAtRead => "\nsource=owner_local_journal.trace_span; bounded historical capture; model adoption unknown.",
-            _ => "\nsource=agent_events.trace_span; owner/session-scoped captured semantic facts at read time; trace capture incomplete; model adoption unknown.",
+            astra_services::semantic_judgment_observation::SemanticJudgmentScope::LocalJournalAtRead => "\nsource=owner_local_journal.trace_span; bounded historical capture; whether it guided the run is not recorded.",
+            _ => "\nsource=agent_events.trace_span; owner/session-scoped captured semantic facts at read time; history may be incomplete; whether it guided the run is not recorded.",
         });
     }
     if let Some(usage) = &judgment_usage {
