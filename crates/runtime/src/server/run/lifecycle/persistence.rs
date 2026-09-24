@@ -39,9 +39,9 @@ use astra_turn_types::SessionCursorV1;
 
 use crate::MatrixOneSettings;
 use crate::data_layer::storage::trace_event_payload_hash;
+use crate::server::run::engine::{RunOwnerLeaseTerminalAuthority, RunOwnerLeaseTerminalOperation};
 use crate::turn::agentic_loop::host::AgenticLoopState;
 use crate::turn::services::TraceEventPersistOutcome;
-use crate::turn::token_usage::TokenUsage;
 use crate::{
     DatabaseEvaluationService, DatabaseEventService, DatabaseTraceEventWriter,
     EventCreateRequestData, EventService,
@@ -54,6 +54,7 @@ use super::{
 };
 
 const DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY: usize = 4;
+const TERMINAL_PROJECTION_REPAIR_MAX_WAIT: Duration = Duration::from_secs(5);
 const METRIC_TURN_OBSERVER_DISPATCHES_TOTAL: &str = "astra_turn_observer_dispatches_total";
 const METRIC_TURN_OBSERVER_RUNS_TOTAL: &str = "astra_turn_observer_runs_total";
 static TURN_OBSERVER_ASYNC_IN_FLIGHT: std::sync::atomic::AtomicUsize =
@@ -132,56 +133,15 @@ fn record_turn_observer_run_metrics(
     );
 }
 
-fn lifecycle_token_usage_json(
-    input_tokens: u64,
-    cached_input_tokens: u64,
-    cache_creation_tokens: u64,
-    output_tokens: u64,
-) -> Option<serde_json::Value> {
-    let usage = TokenUsage {
-        input_tokens,
-        cached_input_tokens,
-        cache_creation_tokens,
-        output_tokens,
-    };
-    if usage.is_empty() {
-        return None;
-    }
-
-    let billable_input = usage.normalized_prompt_cache_usage().total_input_tokens();
-    let total_tokens = usage.total_tokens();
-    let cache_hit_ratio = if billable_input == 0 {
-        0.0
-    } else {
-        cached_input_tokens as f64 / billable_input as f64
-    };
-    let mut usage_json = usage.to_json_map();
-    usage_json.insert("prompt".into(), Value::from(billable_input));
-    usage_json.insert("completion".into(), Value::from(output_tokens));
-    usage_json.insert("cache_read".into(), Value::from(cached_input_tokens));
-    usage_json.insert("cache_write".into(), Value::from(cache_creation_tokens));
-    usage_json.insert("raw_prompt_tokens".into(), Value::from(billable_input));
-    usage_json.insert("uncached_input_tokens".into(), Value::from(input_tokens));
-    usage_json.insert("effective_input_tokens".into(), Value::from(input_tokens));
-    usage_json.insert(
-        "prompt_cache_hit_ratio".into(),
-        Value::from(cache_hit_ratio),
-    );
-    usage_json.insert("total".into(), Value::from(total_tokens));
-    Some(Value::Object(usage_json))
-}
-
 /// Run totals include auxiliary judgments and may span multiple providers.
 /// A single cache hit ratio here would misrepresent the primary model.
 fn run_token_usage_json(state: &AgenticLoopState) -> Option<Value> {
-    let mut usage = lifecycle_token_usage_json(
-        state.total_prompt,
-        state.total_cache_read,
-        state.total_cache_creation,
-        state.total_completion,
-    )?;
+    let mut usage = state.qualified_usage?.to_json();
     let object = usage.as_object_mut().expect("usage is an object");
-    object.remove("prompt_cache_hit_ratio");
+    if object.is_empty() {
+        // Same canonical unknown witness retained by the storage writer.
+        object.insert("total_tokens".into(), Value::Null);
+    }
     object.insert("scope".into(), json!("runtime_accounted_usage"));
     Some(usage)
 }
@@ -202,6 +162,7 @@ pub(crate) struct PostLoopPersistContext {
     pub(crate) run_id: String,
     pub(crate) expected_owner_generation: Option<u64>,
     pub(crate) owner_lease_duration: Option<Duration>,
+    pub(crate) terminal_authority: Option<RunOwnerLeaseTerminalAuthority>,
     pub(crate) agent_id: Option<String>,
     pub(crate) model_name: Option<String>,
     pub(crate) user_message: String,
@@ -582,6 +543,10 @@ impl PostLoopPersistContext {
         let Some(pool) = self.shared_pool.as_ref() else {
             return Ok(None);
         };
+        let terminal_operation = match self.terminal_authority.as_ref() {
+            Some(authority) => Some(authority.begin().await?),
+            None => None,
+        };
         match persist_server_loop_canonical_terminal_settlement(
             pool,
             self.atomic_terminal_canonical_append(expected_owner_generation),
@@ -597,6 +562,7 @@ impl PostLoopPersistContext {
                 completion_tokens: state.total_completion,
                 tool_calls: state.total_tool_calls,
             },
+            terminal_operation,
         )
         .await
         {
@@ -695,6 +661,35 @@ pub(crate) struct CanonicalTerminalSettlement<'a> {
 pub(crate) struct CanonicalTerminalSettlementCommit {
     pub(crate) terminal_events: Vec<Value>,
     pub(crate) terminal_assistant_source_event_id: Option<String>,
+}
+
+async fn finish_terminal_with_projection<F>(
+    commit: CanonicalTerminalSettlementCommit,
+    projection: F,
+    user_id: &str,
+    run_id: &str,
+    timeout: Duration,
+) -> CanonicalTerminalSettlementCommit
+where
+    F: std::future::Future<Output = Result<(), String>>,
+{
+    match tokio::time::timeout(timeout, projection).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(
+            target: "astra_runtime::run_lifecycle",
+            user_id,
+            run_id,
+            error = %error,
+            "canonical terminal committed but display projection repair failed"
+        ),
+        Err(_) => tracing::warn!(
+            target: "astra_runtime::run_lifecycle",
+            user_id,
+            run_id,
+            "canonical terminal committed but display projection repair timed out"
+        ),
+    }
+    commit
 }
 
 fn atomic_terminal_request<'a>(
@@ -976,28 +971,14 @@ fn classify_authoritative_terminal_resolution(
     }
 }
 
-async fn finish_authoritatively_resolved_terminal(
-    store: &DatabaseRunStateStore,
+fn finish_authoritatively_resolved_terminal(
     terminal: astra_services::runs::AtomicRunTerminalSettlementCommit,
     append: &CanonicalLoopAppend<'_>,
     state: &AgenticLoopState,
-    log_message: &'static str,
+    terminal_operation: Option<RunOwnerLeaseTerminalOperation<'_>>,
 ) -> CanonicalTerminalSettlementCommit {
-    if let Err(error) = store
-        .repair_projection_after_atomic_terminal_settlement(
-            append.user_id,
-            append.session_id,
-            append.run_id,
-        )
-        .await
-    {
-        tracing::warn!(
-            target: "astra_runtime::run_lifecycle",
-            user_id = append.user_id,
-            run_id = append.run_id,
-            error = %error,
-            "{log_message}"
-        );
+    if let Some(operation) = terminal_operation {
+        operation.retire();
     }
     CanonicalTerminalSettlementCommit {
         terminal_events: terminal.committed_events,
@@ -1026,7 +1007,7 @@ pub(crate) async fn persist_server_loop_canonical_append(
     append: CanonicalLoopAppend<'_>,
     state: &AgenticLoopState,
 ) -> Result<Option<String>, String> {
-    persist_server_loop_canonical_append_inner(pool, append, state, None)
+    persist_server_loop_canonical_append_inner(pool, append, state, None, None)
         .await
         .map(|commit| commit.terminal_assistant_source_event_id)
 }
@@ -1039,8 +1020,33 @@ pub(crate) async fn persist_server_loop_canonical_terminal_settlement(
     append: CanonicalLoopAppend<'_>,
     state: &AgenticLoopState,
     settlement: CanonicalTerminalSettlement<'_>,
+    terminal_operation: Option<RunOwnerLeaseTerminalOperation<'_>>,
 ) -> Result<CanonicalTerminalSettlementCommit, String> {
-    persist_server_loop_canonical_append_inner(pool, append, state, Some(settlement)).await
+    let user_id = append.user_id;
+    let session_id = append.session_id;
+    let run_id = append.run_id;
+    // Once an exact-generation terminal transaction may have reached COMMIT,
+    // dropping its future at the lease deadline would bypass the existing
+    // lost-acknowledgement resolution and report a committed run as failed.
+    // The terminal authority bounds lock acquisition; the transaction's
+    // durable generation fence owns settlement and its uncertainty handling.
+    let commit = persist_server_loop_canonical_append_inner(
+        pool,
+        append,
+        state,
+        Some(settlement),
+        terminal_operation,
+    )
+    .await?;
+    let store = DatabaseRunStateStore::new(pool.clone());
+    Ok(finish_terminal_with_projection(
+        commit,
+        store.repair_projection_after_atomic_terminal_settlement(user_id, session_id, run_id),
+        user_id,
+        run_id,
+        TERMINAL_PROJECTION_REPAIR_MAX_WAIT,
+    )
+    .await)
 }
 
 async fn persist_server_loop_canonical_append_inner(
@@ -1048,6 +1054,7 @@ async fn persist_server_loop_canonical_append_inner(
     append: CanonicalLoopAppend<'_>,
     state: &AgenticLoopState,
     settlement: Option<CanonicalTerminalSettlement<'_>>,
+    mut terminal_operation: Option<RunOwnerLeaseTerminalOperation<'_>>,
 ) -> Result<CanonicalTerminalSettlementCommit, String> {
     if let Some(settlement) = settlement {
         if append.expected_owner_generation != Some(settlement.expected_owner_generation) {
@@ -1129,19 +1136,17 @@ async fn persist_server_loop_canonical_append_inner(
             let _ = tx.rollback().await;
             drop(connection);
             if let Some(settlement) = settlement
-                && let Some((store, terminal)) = resolve_existing_atomic_terminal_settlement(
+                && let Some((_store, terminal)) = resolve_existing_atomic_terminal_settlement(
                     pool, &append, state, settlement, None,
                 )
                 .await?
             {
                 return Ok(finish_authoritatively_resolved_terminal(
-                    &store,
                     terminal,
                     &append,
                     state,
-                    "replayed canonical terminal is authoritative but display projection repair failed",
-                )
-                .await);
+                    terminal_operation.take(),
+                ));
             }
             return Err(format!(
                 "canonical append lost durable execution authority at generation {expected_owner_generation}"
@@ -1290,14 +1295,12 @@ async fn persist_server_loop_canonical_append_inner(
                 )
                 .await?
                 {
-                    Some((store, terminal)) => Ok(finish_authoritatively_resolved_terminal(
-                        &store,
+                    Some((_store, terminal)) => Ok(finish_authoritatively_resolved_terminal(
                         terminal,
                         &append,
                         state,
-                        "concurrent exact terminal is authoritative but display projection repair failed",
-                    )
-                    .await),
+                        terminal_operation.take(),
+                    )),
                     None => Err(format!(
                         "canonical terminal settlement lost durable execution authority at generation {}",
                         settlement.expected_owner_generation
@@ -1366,22 +1369,10 @@ async fn persist_server_loop_canonical_append_inner(
             }
         }
     }
-    if let Some((store, _)) = terminal_commit.as_ref()
-        && let Err(error) = store
-            .repair_projection_after_atomic_terminal_settlement(
-                append.user_id,
-                append.session_id,
-                append.run_id,
-            )
-            .await
+    if terminal_commit.is_some()
+        && let Some(operation) = terminal_operation.take()
     {
-        tracing::warn!(
-            target: "astra_runtime::run_lifecycle",
-            user_id = append.user_id,
-            run_id = append.run_id,
-            error = %error,
-            "canonical terminal settlement committed but display projection repair failed"
-        );
+        operation.retire();
     }
     let terminal_assistant_source_event_id = terminal_assistant_transcript_item(
         append.user_id,
@@ -2899,12 +2890,7 @@ fn build_llm_round_trace_events(
 fn llm_round_token_usage_json(
     round: &crate::turn::agentic_loop::host::RecentRoundSummary,
 ) -> Option<serde_json::Value> {
-    lifecycle_token_usage_json(
-        round.prompt_tokens,
-        round.cache_read_tokens,
-        round.cache_creation_tokens,
-        round.completion_tokens,
-    )
+    round.qualified_usage.map(|usage| usage.to_json())
 }
 
 fn tool_trace_call_id(
@@ -3513,6 +3499,49 @@ mod tests {
     static SHARED_BOOTSTRAP: tokio::sync::OnceCell<MatrixOneSettings> =
         tokio::sync::OnceCell::const_new();
 
+    #[tokio::test(start_paused = true)]
+    async fn confirmed_terminal_receipt_survives_stalled_projection() {
+        let receipt = CanonicalTerminalSettlementCommit {
+            terminal_events: vec![json!({"event_type": "run_finished"})],
+            terminal_assistant_source_event_id: Some("answer-1".into()),
+        };
+        let task = tokio::spawn(finish_terminal_with_projection(
+            receipt,
+            std::future::pending::<Result<(), String>>(),
+            "user-1",
+            "run-1",
+            Duration::from_secs(5),
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let result = task.await.expect("bounded projection");
+        assert_eq!(
+            result.terminal_assistant_source_event_id.as_deref(),
+            Some("answer-1")
+        );
+        assert_eq!(result.terminal_events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn confirmed_terminal_receipt_survives_projection_error() {
+        let receipt = CanonicalTerminalSettlementCommit {
+            terminal_events: vec![],
+            terminal_assistant_source_event_id: Some("answer-2".into()),
+        };
+        let result = finish_terminal_with_projection(
+            receipt,
+            async { Err("projection unavailable".into()) },
+            "user-1",
+            "run-2",
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            result.terminal_assistant_source_event_id.as_deref(),
+            Some("answer-2")
+        );
+    }
+
     async fn assert_session_event_count(
         db: &sqlx::MySqlPool,
         user_id: &str,
@@ -3669,6 +3698,7 @@ mod tests {
             run_id: "run-1".to_string(),
             expected_owner_generation: None,
             owner_lease_duration: None,
+            terminal_authority: None,
             agent_id: Some("agent-1".to_string()),
             model_name: Some("model-1".to_string()),
             user_message: "work".to_string(),
@@ -4856,30 +4886,37 @@ mod tests {
 
     #[test]
     fn lifecycle_token_usage_json_uses_canonical_prompt_cache_shape() {
-        let usage = lifecycle_token_usage_json(10, 4, 3, 5).expect("non-empty usage");
+        let mut state = observer_test_state();
+        state.qualified_usage = Some(
+            astra_turn_types::CanonicalTokenUsage::new(Some(10), Some(4), Some(3), Some(5))
+                .unwrap(),
+        );
+        let usage = run_token_usage_json(&state).expect("non-empty usage");
 
         assert_eq!(usage["input_tokens"], 10);
         assert_eq!(usage["cached_input_tokens"], 4);
         assert_eq!(usage["cache_creation_tokens"], 3);
         assert_eq!(usage["output_tokens"], 5);
         assert_eq!(usage["total_tokens"], 22);
-        assert_eq!(usage["prompt"], 17);
-        assert_eq!(usage["completion"], 5);
-        assert_eq!(usage["cache_read"], 4);
-        assert_eq!(usage["cache_write"], 3);
-        assert_eq!(usage["raw_prompt_tokens"], 17);
-        assert_eq!(usage["uncached_input_tokens"], 10);
-        assert_eq!(usage["effective_input_tokens"], 10);
-        assert_eq!(
-            usage["prompt_cache_hit_ratio"],
-            serde_json::json!(4.0 / 17.0)
-        );
-        assert_eq!(usage["total"], 22);
+        assert_eq!(usage.as_object().unwrap().len(), 6);
         assert!(
             usage.get("cache_read_tokens").is_none(),
             "persisted runtime events must use canonical prompt-cache field names"
         );
-        assert!(lifecycle_token_usage_json(0, 0, 0, 0).is_none());
+        state.qualified_usage = None;
+        assert!(run_token_usage_json(&state).is_none());
+        for qualified in [
+            astra_turn_types::CanonicalTokenUsage::new(None, None, None, None).unwrap(),
+            astra_turn_types::CanonicalTokenUsage::new(Some(0), Some(0), Some(0), Some(0)).unwrap(),
+            astra_turn_types::CanonicalTokenUsage::new(Some(10), None, None, Some(5)).unwrap(),
+        ] {
+            state.qualified_usage = Some(qualified);
+            let wire = run_token_usage_json(&state).unwrap();
+            assert_eq!(
+                astra_turn_types::CanonicalTokenUsage::from_json(&wire).unwrap(),
+                qualified
+            );
+        }
     }
 
     #[test]
@@ -4889,13 +4926,20 @@ mod tests {
         state.total_prompt = 1_100;
         state.total_cache_read = 900;
         state.total_completion = 3;
+        state.qualified_usage = Some(
+            astra_turn_types::CanonicalTokenUsage::new(Some(1100), None, None, Some(3)).unwrap(),
+        );
         let usage = run_token_usage_json(&state).unwrap();
         assert_eq!(usage["scope"], "runtime_accounted_usage");
-        assert_eq!(usage["prompt"], 2_000);
-        assert_eq!(usage["total"], 2_003);
+        assert_eq!(usage["input_tokens"], 1_100);
+        assert!(usage.get("cached_input_tokens").is_none());
+        assert!(usage.get("total_tokens").is_none());
         assert!(usage.get("prompt_cache_hit_ratio").is_none());
-        let primary = lifecycle_token_usage_json(100, 900, 0, 0).unwrap();
-        assert_eq!(primary["prompt_cache_hit_ratio"], json!(0.9));
+        let primary =
+            astra_turn_types::CanonicalTokenUsage::new(Some(100), Some(900), Some(0), Some(0))
+                .unwrap()
+                .to_json();
+        assert!(primary.get("prompt_cache_hit_ratio").is_none());
     }
 
     #[test]
@@ -5447,6 +5491,10 @@ mod tests {
             Some("root-agent"),
             Some("fallback-model"),
             &[crate::turn::agentic_loop::host::RecentRoundSummary {
+                qualified_usage: Some(
+                    astra_turn_types::CanonicalTokenUsage::new(Some(10), Some(4), Some(3), Some(5))
+                        .unwrap(),
+                ),
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 turn: 1,
                 round: 2,
@@ -5480,11 +5528,7 @@ mod tests {
         assert_eq!(token_usage["cache_creation_tokens"], 3);
         assert_eq!(token_usage["output_tokens"], 5);
         assert_eq!(token_usage["total_tokens"], 22);
-        assert_eq!(token_usage["prompt"], 17);
-        assert_eq!(token_usage["completion"], 5);
-        assert_eq!(token_usage["cache_read"], 4);
-        assert_eq!(token_usage["cache_write"], 3);
-        assert_eq!(token_usage["total"], 22);
+        assert_eq!(token_usage.as_object().unwrap().len(), 5);
     }
 
     async fn cleanup_transcript_fixture_for_owner(
@@ -5694,6 +5738,7 @@ mod tests {
         state.session_turn = 7;
         state.final_text = "assistant final".to_string();
         state.push_recent_round(crate::turn::agentic_loop::host::RecentRoundSummary {
+            qualified_usage: None,
             purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             turn: 7,
             round: 1,
@@ -5746,6 +5791,7 @@ mod tests {
             run_id: run_id.clone(),
             expected_owner_generation: Some(authority.owner_generation),
             owner_lease_duration: Some(Duration::from_secs(45)),
+            terminal_authority: None,
             agent_id: None,
             model_name: Some("test-model".to_string()),
             user_message: "initial one".to_string(),
@@ -5967,6 +6013,7 @@ mod tests {
             run_id: run_id.clone(),
             expected_owner_generation: Some(authority.owner_generation),
             owner_lease_duration: Some(Duration::from_secs(45)),
+            terminal_authority: None,
             agent_id: Some("root-agent".to_string()),
             model_name: Some("test-model".to_string()),
             user_message: "same user request".to_string(),
@@ -6208,6 +6255,7 @@ mod tests {
                 completion_tokens: 7,
                 tool_calls: 3,
             },
+            None,
         )
         .await
         .expect_err("stale generation must fail before writing any settlement evidence");
@@ -6364,6 +6412,7 @@ mod tests {
                 completion_tokens: 13,
                 tool_calls: 5,
             },
+            None,
         )
         .await
         .expect_err("terminal precondition conflict must roll back canonical writes");
@@ -6504,6 +6553,7 @@ mod tests {
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.final_text = "atomically committed answer".into();
         state.push_recent_round(crate::turn::agentic_loop::host::RecentRoundSummary {
+            qualified_usage: None,
             purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             turn: 1,
             round: 1,
@@ -6548,6 +6598,7 @@ mod tests {
             run_id: run_id.clone(),
             expected_owner_generation: Some(authority.owner_generation),
             owner_lease_duration: Some(Duration::from_secs(45)),
+            terminal_authority: None,
             agent_id: Some("root-agent".to_string()),
             model_name: Some("test-model".to_string()),
             user_message: "produce an answer".to_string(),
@@ -6650,6 +6701,7 @@ mod tests {
                     append(),
                     &state,
                     settlement,
+                    None,
                 )
                 .await
                 .expect_err("any conflicting canonical evidence must abort terminal settlement");
@@ -6698,10 +6750,15 @@ mod tests {
             .await
             .unwrap();
         }
-        let commit =
-            persist_server_loop_canonical_terminal_settlement(&pool, append(), &state, settlement)
-                .await
-                .expect("commit canonical terminal settlement");
+        let commit = persist_server_loop_canonical_terminal_settlement(
+            &pool,
+            append(),
+            &state,
+            settlement,
+            None,
+        )
+        .await
+        .expect("commit canonical terminal settlement");
         let committed_count = assert_session_event_count(&db, &user_id, &session_id).await;
         assert!(committed_count > 0);
         assert_eq!(commit.terminal_events, terminal_events);
@@ -6770,10 +6827,15 @@ mod tests {
         );
 
         tokio::time::sleep(Duration::from_millis(25)).await;
-        let replay =
-            persist_server_loop_canonical_terminal_settlement(&pool, append(), &state, settlement)
-                .await
-                .expect("delayed terminal replay is idempotent");
+        let replay = persist_server_loop_canonical_terminal_settlement(
+            &pool,
+            append(),
+            &state,
+            settlement,
+            None,
+        )
+        .await
+        .expect("delayed terminal replay is idempotent");
         assert_eq!(
             assert_session_event_count(&db, &user_id, &session_id).await,
             committed_count

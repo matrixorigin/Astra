@@ -1762,7 +1762,7 @@ impl ReflectService for DatabaseReflectService {
                 }
             },
             async {
-                if !crate::semantic_judgment_observation::semantic_judgment_facet_enabled(
+                if !crate::tool_result_selection_observation::historical_tool_result_judgment_facet_enabled(
                     request.facet,
                 ) {
                     return None;
@@ -4031,6 +4031,10 @@ mod tests {
         assert_eq!(json_value["facet"], json_value["view"]["facet"]);
         assert_eq!(json_value["depth"], json_value["view"]["depth"]);
         assert_eq!(json_value["horizon"], json_value["view"]["horizon"]);
+        assert!(
+            json_value.get("tool_result_judgments").is_none(),
+            "an unrequested historical source must be omitted, not reported as zero"
+        );
         assert_eq!(
             json_value["data_coverage"],
             json_value["view"]["data_coverage"]

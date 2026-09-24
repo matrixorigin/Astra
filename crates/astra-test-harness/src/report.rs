@@ -122,6 +122,10 @@ pub struct CaseRunReport {
     /// Failure classification — populated only when `status` is not `Passed`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub failure_class: Option<crate::classify::FailureClass>,
+    /// Cleanup is a separate harness outcome. A product failure is never
+    /// overwritten by teardown/capture errors, but the case stays failed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cleanup_errors: Vec<String>,
     /// True when status is `Passed` but some Soft/Quality criteria failed.
     /// Frontend shows these as yellow warnings, not green passes.
     #[serde(default)]
@@ -283,6 +287,221 @@ pub(crate) fn format_render_error(reason: &str) -> String {
     format!("{{\n  \"error\": \"SuiteReport JSON render failed: {escaped}\"\n}}")
 }
 
+fn auxiliary_judgment_lines(run: &CaseRunReport) -> Vec<String> {
+    let execution_count = run.attempts.len() + run.steps.len();
+    if execution_count == 0 {
+        return auxiliary_lines_for_outcome("", &run.outcome);
+    }
+
+    let mut lines = Vec::new();
+    for attempt in &run.attempts {
+        let label = (execution_count > 1).then(|| format!("attempt[{}]", attempt.attempt_index));
+        lines.extend(auxiliary_lines_for_outcome(
+            label.as_deref().unwrap_or(""),
+            &attempt.outcome,
+        ));
+    }
+    for step in &run.steps {
+        let label = (execution_count > 1).then(|| format!("step[{}]", step.step_index));
+        lines.extend(auxiliary_lines_for_outcome(
+            label.as_deref().unwrap_or(""),
+            &step.outcome,
+        ));
+    }
+    lines
+}
+
+fn auxiliary_lines_for_outcome(label: &str, outcome: &RunOutcome) -> Vec<String> {
+    let heading = if label.is_empty() {
+        "    auxiliary".to_owned()
+    } else {
+        format!("    auxiliary {label}")
+    };
+    let Some(capture) = outcome.explain_capture.as_ref() else {
+        return vec![format!("{heading}: evidence not captured\n")];
+    };
+    let Some(graph) = capture.canonical_graph() else {
+        return vec![format!(
+            "{heading}: evidence unavailable (capture incomplete)\n"
+        )];
+    };
+
+    let details = graph.auxiliary_details();
+    let usage = graph.auxiliary_usage_snapshot();
+    let calls = details
+        .iter()
+        .enumerate()
+        .flat_map(|(scope, (_, details))| details.calls.iter().map(move |call| (scope, call)))
+        .collect::<Vec<_>>();
+    let call_timing_truncated = details.iter().any(|(_, details)| details.truncated);
+    let terminal_turns = graph
+        .nodes()
+        .iter()
+        .filter(|node| {
+            node.kind == astra_turn_types::ExplainAnalyzeNodeKindV1::Turn && node.terminal_observed
+        })
+        .collect::<Vec<_>>();
+    let call_timing_scope_complete = !terminal_turns.is_empty()
+        && terminal_turns
+            .iter()
+            .all(|node| node.auxiliary_details.is_some());
+    let scope_coverage = graph.execution_scope_coverage();
+    let scope_coverage_complete = !scope_coverage.is_empty()
+        && scope_coverage
+            .iter()
+            .all(|scope| scope.terminal_turn_observed && scope.auxiliary_snapshot_observed)
+        && !graph.auxiliary_usage_unavailable();
+    let usage_snapshot_complete = scope_coverage_complete
+        && !graph.auxiliary_usage_truncated()
+        && !graph.auxiliary_capture_conflicted()
+        && graph.auxiliary_usage_conflict_count() == 0;
+    let mut lines = Vec::new();
+    for (scope, (_, detail)) in details.iter().enumerate() {
+        let scope_label = if details.len() > 1 {
+            format!(" scope[{scope}]")
+        } else {
+            String::new()
+        };
+        if let Some(admission) = detail.admission.as_ref() {
+            let status = match admission.status {
+                astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::Accepted => "accepted",
+                astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::Rejected => "rejected",
+                astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::Unavailable => {
+                    "unavailable"
+                }
+                astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::NotDispatched => {
+                    "not_dispatched"
+                }
+            };
+            use astra_turn_types::ExplainAnalyzeAdmissionSettlementReasonV1 as Reason;
+            let reason = match admission.reason {
+                Reason::Accepted => "accepted",
+                Reason::ClassifierUncertain => "classifier_uncertain",
+                Reason::ClassifierConflicting => "classifier_conflicting",
+                Reason::InvalidClassifierResponse => "invalid_classifier_response",
+                Reason::ProviderRejected => "provider_rejected",
+                Reason::PlanningRejected => "planning_rejected",
+                Reason::ReconciliationRejected => "reconciliation_rejected",
+                Reason::Unavailable { .. } => "unavailable",
+                Reason::NotDispatched { .. } => "not_dispatched",
+            };
+            lines.push(format!(
+                "{heading}{scope_label}: judgment admission={status} · {reason}\n"
+            ));
+        } else if detail
+            .calls
+            .iter()
+            .any(|call| call.operation_id == "request_judgment")
+        {
+            lines.push(format!(
+                "{heading}{scope_label}: judgment admission=not captured\n"
+            ));
+        }
+    }
+    if calls.is_empty() {
+        if usage.available && usage.attempts.is_empty() && usage_snapshot_complete {
+            lines.push(format!(
+                "{heading}: provider attempts=0 (complete usage snapshot)\n"
+            ));
+        } else if usage.available && !usage.attempts.is_empty() {
+            lines.push(format!(
+                "{heading}: captured provider attempts={} · call timing unavailable\n",
+                usage.attempts.len()
+            ));
+        } else {
+            lines.push(format!("{heading}: provider attempt count unavailable\n"));
+        }
+    } else {
+        for (scope, call) in &calls {
+            let scope_label = if details.len() > 1 {
+                format!(" scope[{scope}]")
+            } else {
+                String::new()
+            };
+            lines.push(format!(
+                "{heading}{scope_label} call: {} {} · {}ms\n",
+                call.operation_id,
+                format!("{:?}", call.outcome).to_ascii_lowercase(),
+                call.duration_ms
+            ));
+        }
+    }
+
+    if !scope_coverage_complete {
+        let scope_reason = if graph.auxiliary_usage_unavailable() {
+            "scope coverage incomplete (some scopes unavailable)"
+        } else {
+            "scope coverage incomplete"
+        };
+        lines.push(format!("{heading} usage: {scope_reason}\n"));
+    }
+    if call_timing_truncated {
+        lines.push(format!(
+            "{heading}: call timing capture incomplete (truncated)\n"
+        ));
+    } else if !call_timing_scope_complete && !calls.is_empty() {
+        lines.push(format!(
+            "{heading}: call timing scope coverage incomplete\n"
+        ));
+    }
+    if usage.truncated {
+        lines.push(format!(
+            "{heading} usage: captured attempts are incomplete (truncated)\n"
+        ));
+    }
+    if graph.auxiliary_capture_conflicted() || graph.auxiliary_usage_conflict_count() > 0 {
+        lines.push(format!("{heading} usage: conflicting records\n"));
+        return lines;
+    }
+    if !usage.available {
+        let reason = if graph.auxiliary_usage_unavailable() {
+            "one or more scopes unavailable"
+        } else {
+            "capture unavailable"
+        };
+        lines.push(format!("{heading} usage: {reason}\n"));
+        return lines;
+    }
+
+    for attempt in usage.attempts {
+        let status = match attempt.usage_status {
+            astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact => "exact",
+            astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderPartial => "partial",
+            astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::Unavailable => "unavailable",
+        };
+        let bucket = |value: Option<u64>| {
+            value.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+        };
+        let (fresh, cache_read, cache_write, output) = attempt.usage.as_ref().map_or(
+            (
+                "unknown".to_owned(),
+                "unknown".to_owned(),
+                "unknown".to_owned(),
+                "unknown".to_owned(),
+            ),
+            |usage| {
+                (
+                    bucket(usage.fresh_input_tokens),
+                    bucket(usage.cache_read_tokens),
+                    bucket(usage.cache_creation_tokens),
+                    bucket(usage.output_tokens),
+                )
+            },
+        );
+        lines.push(format!(
+            "{heading} usage: {} · {} · {} · fresh-in={} cache-read={} cache-write={} out={}\n",
+            attempt.model_name,
+            attempt.operation_id,
+            status,
+            fresh,
+            cache_read,
+            cache_write,
+            output,
+        ));
+    }
+    lines
+}
+
 fn render_text(report: &SuiteReport, verbose: bool) -> String {
     let mut s = String::new();
     s.push_str("=== astra-test suite report ===\n");
@@ -311,22 +530,30 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
     };
     let wall_secs = wall_ms / 1000;
 
-    let total_billable_input = astra_turn_types::NormalizedPromptCacheUsage::new(
-        total_prompt,
-        total_cache_read,
-        total_cache_create,
-    )
-    .total_input_tokens();
-    let cache_ratio_pct = if total_cache_read > 0 {
-        format!(
-            " cache-read={:.0}%",
-            total_cache_read as f64 / total_billable_input as f64 * 100.0
-        )
-    } else {
-        String::new()
+    let primary_cache = report
+        .runs
+        .iter()
+        .try_fold((0_u128, 0_u128), |(read, input), run| {
+            let usage = run
+                .outcome
+                .explain_capture
+                .as_ref()?
+                .primary_prompt_cache_usage()?;
+            Some((
+                read + u128::from(usage.cache_read_tokens),
+                input + u128::from(usage.checked_total_input_tokens()?),
+            ))
+        });
+    let cache_ratio_pct = match primary_cache {
+        Some((read, input)) if input > 0 => format!(
+            "primary prompt-cache read={:.1}%",
+            read as f64 / input as f64 * 100.0
+        ),
+        Some(_) => "primary prompt-cache read=n/a".to_owned(),
+        None => "primary prompt-cache read=unknown (input coverage incomplete)".to_owned(),
     };
     s.push_str(&format!(
-        "total={} passed={} failed={} cancelled={} unavailable={} | tokens: {} fresh-in/{}out{} | wall: {}m{}s (sum: {}m{}s)\n\n",
+        "total={} passed={} failed={} cancelled={} unavailable={} | terminal-reported tokens: {} fresh-in/{}out cache-read={} cache-write={} (not full model cost) | {} | wall: {}m{}s (sum: {}m{}s)\n\n",
         report.total(),
         report.passed(),
         report.failed(),
@@ -334,6 +561,8 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         report.unavailable(),
         total_prompt,
         total_completion,
+        total_cache_read,
+        total_cache_create,
         cache_ratio_pct,
         wall_secs / 60,
         wall_secs % 60,
@@ -361,6 +590,9 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
             run.outcome.duration_ms,
             run.outcome.turn_rounds,
         ));
+        for line in auxiliary_judgment_lines(run) {
+            s.push_str(&line);
+        }
         if run.attempts.len() > 1 {
             s.push_str(&format!(
                 "    warning: {} terminal attempts recorded; totals include every attempt\n",
@@ -373,6 +605,9 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
                 class,
                 crate::classify::suggested_action(class)
             ));
+        }
+        for error in &run.cleanup_errors {
+            s.push_str(&format!("    cleanup: {error}\n"));
         }
         for c in &run.criteria {
             let m = match (run.status, c.passed, c.severity) {
@@ -433,33 +668,37 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
                 cap.skipped_lines,
                 cap.tools_invoked()
             ));
-            let health = crate::pipeline_analysis::analyze_pipeline_health(cap);
-            if health.turns_with_feedback > 0 {
-                if let Some(stable_prefix_coverage) = health.stable_prefix_cache_coverage {
-                    s.push_str(&format!(
-                        "    pipeline: turns={} cache-read-share={:.0}% stable-prefix={:.0}% compactions={}\n",
-                        health.turns_with_feedback,
-                        health.avg_cache_hit_ratio * 100.0,
-                        stable_prefix_coverage * 100.0,
-                        health.compaction_count,
-                    ));
-                } else {
-                    s.push_str(&format!(
-                        "    pipeline: turns={} cache-read-share={:.0}% compactions={}\n",
-                        health.turns_with_feedback,
-                        health.avg_cache_hit_ratio * 100.0,
-                        health.compaction_count,
-                    ));
-                }
-                if health.cascade_detected {
-                    s.push_str("    pipeline: ⚠ compaction cascade detected\n");
-                }
-                for alert in &health.alerts {
-                    s.push_str(&format!(
-                        "    pipeline: T{} [{}] {}\n",
-                        alert.turn, alert.severity, alert.rule
-                    ));
-                }
+            let executions: Vec<_> = match (run.attempts.is_empty(), run.steps.is_empty()) {
+                (true, true) => vec![&run.outcome],
+                // An aggregate with steps cannot stand in for a missing root.
+                (true, false) => Vec::new(),
+                (false, _) => run
+                    .attempts
+                    .iter()
+                    .map(|attempt| &attempt.outcome)
+                    .chain(run.steps.iter().map(|step| &step.outcome))
+                    .collect(),
+            };
+            let health = crate::pipeline_analysis::analyze_pipeline_health(cap, &executions);
+            let prefix = health
+                .stable_prefix_cache_coverage
+                .map(|coverage| format!(" stable-prefix={:.0}%", coverage * 100.0))
+                .unwrap_or_default();
+            s.push_str(&format!(
+                "    pipeline: feedback={} mean-primary-request-cache-read={}{} compactions={}\n",
+                health.feedback_observations,
+                health.cache_read_share_label(),
+                prefix,
+                health.compaction_count,
+            ));
+            if health.cascade_detected {
+                s.push_str("    pipeline: ⚠ compaction cascade detected\n");
+            }
+            for alert in &health.alerts {
+                s.push_str(&format!(
+                    "    pipeline: T{} [{}] {}\n",
+                    alert.turn, alert.severity, alert.rule
+                ));
             }
             health.execution
         });
@@ -894,6 +1133,19 @@ mod tests {
     use super::*;
     use crate::criteria::Criterion;
 
+    fn terminal_turn_mut(
+        capture: &mut crate::explain_capture::ExplainCapture,
+    ) -> &mut astra_turn_types::ExplainAnalyzeEventV1 {
+        capture
+            .events
+            .iter_mut()
+            .find(|event| {
+                event.kind == astra_turn_types::ExplainAnalyzeNodeKindV1::Turn
+                    && event.transition == astra_turn_types::ExplainAnalyzeTransitionV1::Finished
+            })
+            .unwrap()
+    }
+
     fn mk_outcome() -> RunOutcome {
         RunOutcome {
             model: "m".into(),
@@ -915,6 +1167,8 @@ mod tests {
             ttft_ms: 0,
             final_state: None,
             interruption_kind: None,
+            error_kind: None,
+            explain_capture: None,
             tool_result_class_counts: std::collections::BTreeMap::new(),
         }
     }
@@ -949,6 +1203,7 @@ mod tests {
                 digest: None,
                 digest_error: None,
                 failure_class: None,
+                cleanup_errors: Vec::new(),
                 has_warnings: false,
             }],
             ..Default::default()
@@ -963,6 +1218,61 @@ mod tests {
         assert!(out.contains("total=1"));
         assert!(out.contains("passed=1"));
         assert!(out.contains("failed=0"));
+    }
+
+    #[test]
+    fn pipeline_cache_display_preserves_unknown_zero_and_physical_execution_coverage() {
+        let mut report = mk_report_passed();
+        report.runs[0].session = Some(SessionCapture {
+            session_id: "cache-session".into(),
+            journal_path: "capture.jsonl".into(),
+            events: vec![],
+            skipped_lines: 0,
+            dropped_lines: 0,
+            integrity_errors: 0,
+        });
+        let known = crate::exec::test_support::cache_request_outcome("r", "t", &[(100, 900, 0)]);
+        report.runs[0].outcome = known.clone();
+        assert!(
+            render(&report, Format::Text, false).contains("mean-primary-request-cache-read=90.0%")
+        );
+        report.runs[0].outcome =
+            crate::exec::test_support::cache_request_outcome("r", "t", &[(0, 0, 0)]);
+        assert!(
+            render(&report, Format::Text, false)
+                .contains("mean-primary-request-cache-read=n/a (zero input)")
+        );
+        // An already-present unknown attempt cannot borrow the aggregate's usage.
+        report.runs[0].outcome = known.clone();
+        report.runs[0].attempts = vec![AttemptRecord {
+            attempt_index: 0,
+            outcome: mk_outcome(),
+        }];
+        assert!(
+            render(&report, Format::Text, false)
+                .contains("mean-primary-request-cache-read=unknown")
+        );
+        report.runs[0].attempts[0].outcome = known;
+        report.runs[0].steps.push(StepResult {
+            step_index: 0,
+            prompt: "continue".into(),
+            duration_ms: 0,
+            criteria: vec![],
+            passed: true,
+            outcome: crate::exec::test_support::cache_request_outcome(
+                "next",
+                "t2",
+                &[(900, 100, 0)],
+            ),
+        });
+        assert!(
+            render(&report, Format::Text, false).contains("mean-primary-request-cache-read=50.0%")
+        );
+        report.runs[0].attempts.clear();
+        assert!(
+            render(&report, Format::Text, false)
+                .contains("mean-primary-request-cache-read=unknown")
+        );
     }
 
     #[test]
@@ -1333,6 +1643,7 @@ mod tests {
             digest: None,
             digest_error: None,
             failure_class: None,
+            cleanup_errors: Vec::new(),
             has_warnings: false,
         });
         assert_eq!(r.total(), 2);
@@ -1448,6 +1759,7 @@ mod tests {
                 criteria: vec![],
                 steps: vec![],
                 failure_class: None,
+                cleanup_errors: Vec::new(),
                 has_warnings: false,
                 attempts: Vec::new(),
                 session: None,
@@ -1461,15 +1773,15 @@ mod tests {
         };
         let out = render_text(&r, false);
         assert!(
-            out.contains("tokens: 0 fresh-in/0out"),
+            out.contains("terminal-reported tokens: 0 fresh-in/0out cache-read=0 cache-write=0 (not full model cost)"),
             "missing token summary: {out}"
         );
         assert!(out.contains("wall: 0m5s"), "missing wall time: {out}");
     }
 
     #[test]
-    fn render_text_uses_total_input_for_cache_read_share() {
-        let r = SuiteReport {
+    fn render_text_keeps_terminal_cache_counts_without_claiming_primary_share() {
+        let mut r = SuiteReport {
             runs: vec![CaseRunReport {
                 case_name: "cache".into(),
                 model: "m".into(),
@@ -1489,6 +1801,7 @@ mod tests {
                 criteria: vec![],
                 steps: vec![],
                 failure_class: None,
+                cleanup_errors: Vec::new(),
                 has_warnings: false,
                 attempts: Vec::new(),
                 session: None,
@@ -1503,19 +1816,316 @@ mod tests {
 
         let out = render_text(&r, false);
         assert!(
-            out.contains("tokens: 200 fresh-in/50out cache-read=80%"),
-            "cache share must use fresh+read+creation denominator: {out}"
+            out.contains(
+                "terminal-reported tokens: 200 fresh-in/50out cache-read=800 cache-write=0 (not full model cost)"
+            ),
+            "reported cache counts must remain visible: {out}"
         );
+        assert!(out.contains("primary prompt-cache read=unknown"));
+        let mut capture = crate::explain_capture::ExplainCapture::default();
+        for (node, kind) in [("turn", "turn"), ("request", "provider_attempt")] {
+            let mut start = serde_json::json!({
+                "schema_version":1,"event_id":format!("{node}-start"),"run_id":"r",
+                "turn_id":"t","node_id":node,"producer_id":"p","clock_domain_id":"c",
+                "kind":kind,"label":node,"transition":"started","elapsed_ms":0
+            });
+            if node == "request" {
+                start["round_index"] = serde_json::json!(0);
+                start["attempt_index"] = serde_json::json!(0);
+            }
+            let mut finish = start.clone();
+            finish["event_id"] = serde_json::json!(format!("{node}-finish"));
+            finish["transition"] = serde_json::json!("finished");
+            finish["outcome"] = serde_json::json!("completed");
+            finish["start_elapsed_ms"] = serde_json::json!(0);
+            finish["duration_ms"] = serde_json::json!(0);
+            if node == "request" {
+                finish["usage"] = serde_json::json!({"basis":"provider_exact",
+                    "fresh_input_tokens":100,"cache_read_tokens":900,"cache_creation_tokens":0});
+            } else {
+                finish["auxiliary_usage"] = serde_json::json!({"available":true,"attempts":[{
+                    "attempt_id":"aux","usage_status":"provider_exact","provider":"typesafe",
+                    "offering_id":"o","model_name":"jev","purpose":"introspection","operation_id":"request_judgment",
+                    "usage":{"basis":"provider_exact","fresh_input_tokens":999999,"output_tokens":100}
+                }]});
+                finish["auxiliary_details"] = serde_json::json!({"calls":[{
+                    "call_id":"request_judgment:initial:0","operation_id":"request_judgment",
+                    "stage":"initial","start_elapsed_ms":0,"duration_ms":0,"outcome":"succeeded"
+                }]});
+            }
+            for fact in [start, finish] {
+                let fact: astra_turn_types::ExplainAnalyzeEventV1 =
+                    serde_json::from_value(fact).unwrap();
+                assert!(fact.is_valid());
+                capture.events.push(fact);
+            }
+        }
+        capture.bind(Some("r"));
+        r.runs[0].outcome.explain_capture = Some(capture);
+        let rendered = render_text(&r, false);
+        assert!(rendered.contains("primary prompt-cache read=90.0%"));
+        assert!(rendered.contains("auxiliary call: request_judgment succeeded · 0ms"));
+        assert!(rendered.contains(
+            "auxiliary usage: jev · request_judgment · exact · fresh-in=999999 cache-read=unknown cache-write=unknown out=100"
+        ));
+
+        let mut failed_auxiliary = r.clone();
+        let capture = failed_auxiliary.runs[0]
+            .outcome
+            .explain_capture
+            .as_mut()
+            .unwrap();
+        let terminal = terminal_turn_mut(capture);
+        terminal.auxiliary_usage = Some(Box::new(
+            serde_json::from_value(serde_json::json!({"available":true,"attempts":[{
+                "attempt_id":"aux","usage_status":"unavailable","provider":"typesafe",
+                "offering_id":"o","model_name":"jev-1.13.0","purpose":"introspection",
+                "operation_id":"request_judgment"
+            }]}))
+            .unwrap(),
+        ));
+        terminal.auxiliary_details.as_mut().unwrap().calls[0].outcome =
+            astra_turn_types::ExplainAnalyzeOutcomeV1::Failed;
+        let rendered = render_text(&failed_auxiliary, false);
+        assert!(rendered.contains("auxiliary call: request_judgment failed · 0ms"));
+        assert!(rendered.contains(
+            "auxiliary usage: jev-1.13.0 · request_judgment · unavailable · fresh-in=unknown cache-read=unknown cache-write=unknown out=unknown"
+        ));
+
+        let mut no_auxiliary = r.clone();
+        let capture = no_auxiliary.runs[0]
+            .outcome
+            .explain_capture
+            .as_mut()
+            .unwrap();
+        let terminal = terminal_turn_mut(capture);
+        terminal.auxiliary_usage = Some(Box::new(
+            serde_json::from_value(serde_json::json!({"available":true,"attempts":[]})).unwrap(),
+        ));
+        terminal.auxiliary_details = Some(Box::new(
+            serde_json::from_value(serde_json::json!({"calls":[],"truncated":true})).unwrap(),
+        ));
+        let rendered = render_text(&no_auxiliary, false);
+        assert!(rendered.contains("auxiliary: provider attempts=0 (complete usage snapshot)"));
+        assert!(rendered.contains("call timing capture incomplete (truncated)"));
+        assert!(!rendered.contains("call timing=none"));
+
+        let mut admission_does_not_hide_attempt = r.clone();
+        let capture = admission_does_not_hide_attempt.runs[0]
+            .outcome
+            .explain_capture
+            .as_mut()
+            .unwrap();
+        let terminal = terminal_turn_mut(capture);
+        let details = terminal.auxiliary_details.as_mut().unwrap();
+        details.admission = Some(
+            serde_json::from_value(serde_json::json!({
+                "status":"rejected","reason":{"kind":"classifier_uncertain"}
+            }))
+            .unwrap(),
+        );
+        let rendered = render_text(&admission_does_not_hide_attempt, false);
+        assert!(rendered.contains("auxiliary: judgment admission=rejected · classifier_uncertain"));
+        assert!(rendered.contains("auxiliary call: request_judgment succeeded · 0ms"));
+        terminal_turn_mut(
+            admission_does_not_hide_attempt.runs[0]
+                .outcome
+                .explain_capture
+                .as_mut()
+                .unwrap(),
+        )
+        .auxiliary_details
+        .as_mut()
+        .unwrap()
+        .calls
+        .clear();
+        let rendered = render_text(&admission_does_not_hide_attempt, false);
+        assert!(rendered.contains("auxiliary: judgment admission=rejected · classifier_uncertain"));
+        assert!(rendered.contains("captured provider attempts=1 · call timing unavailable"));
+        assert!(!rendered.contains("no provider call"));
+
+        let mut unavailable_admission = r.clone();
+        terminal_turn_mut(
+            unavailable_admission.runs[0]
+                .outcome
+                .explain_capture
+                .as_mut()
+                .unwrap(),
+        )
+        .auxiliary_details
+        .as_mut()
+        .unwrap()
+        .admission = Some(
+            serde_json::from_value(serde_json::json!({
+                "status":"unavailable","reason":{"kind":"unavailable","reason":"execution_error"}
+            }))
+            .unwrap(),
+        );
+        let rendered = render_text(&unavailable_admission, false);
+        assert!(rendered.contains("auxiliary: judgment admission=unavailable · unavailable"));
+        assert!(rendered.contains("auxiliary call: request_judgment succeeded · 0ms"));
+
+        let mut multiple_scopes = r.clone();
+        let capture = multiple_scopes.runs[0]
+            .outcome
+            .explain_capture
+            .as_mut()
+            .unwrap();
+        let first = terminal_turn_mut(capture);
+        first.auxiliary_details.as_mut().unwrap().admission = Some(
+            serde_json::from_value(serde_json::json!({
+                "status":"rejected","reason":{"kind":"classifier_uncertain"}
+            }))
+            .unwrap(),
+        );
+        let mut second = first.clone();
+        second.event_id = "turn-2-finish".into();
+        second.turn_id = "t2".into();
+        second.node_id = "turn-2".into();
+        second.clock_domain_id = "c2".into();
+        let second_details = second.auxiliary_details.as_mut().unwrap();
+        second_details.admission = Some(
+            serde_json::from_value(serde_json::json!({
+                "status":"accepted","reason":{"kind":"accepted"},
+                "decision":{"result":"decided","classification":{
+                    "work_required":false,"activation_deferred":false,"domain":null,
+                    "mutation":"read_only","scope":"unknown",
+                    "parallel_subruns":false,"capabilities":[]
+                }}
+            }))
+            .unwrap(),
+        );
+        second_details.calls[0].duration_ms = 12;
+        second.elapsed_ms = 12;
+        second.duration_ms = Some(12);
+        let mut second_start = capture
+            .events
+            .iter()
+            .find(|event| {
+                event.kind == astra_turn_types::ExplainAnalyzeNodeKindV1::Turn
+                    && event.transition == astra_turn_types::ExplainAnalyzeTransitionV1::Started
+            })
+            .unwrap()
+            .clone();
+        second_start.event_id = "turn-2-start".into();
+        second_start.turn_id = "t2".into();
+        second_start.node_id = "turn-2".into();
+        second_start.clock_domain_id = "c2".into();
+        capture.events.push(second_start);
+        assert!(second.is_valid());
+        capture.events.push(second);
+        let rendered = render_text(&multiple_scopes, false);
+        assert!(
+            rendered
+                .contains("auxiliary scope[0]: judgment admission=rejected · classifier_uncertain"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("auxiliary scope[0] call: request_judgment succeeded · 0ms"));
+        assert!(rendered.contains("auxiliary scope[1]: judgment admission=accepted · accepted"));
+        assert!(rendered.contains("auxiliary scope[1] call: request_judgment succeeded · 12ms"));
+
+        let missing_admission = render_text(&r, false);
+        assert!(missing_admission.contains("auxiliary: judgment admission=not captured"));
+
+        let mut truncated_timing = r.clone();
+        let capture = truncated_timing.runs[0]
+            .outcome
+            .explain_capture
+            .as_mut()
+            .unwrap();
+        terminal_turn_mut(capture)
+            .auxiliary_details
+            .as_mut()
+            .unwrap()
+            .truncated = true;
+        assert!(
+            render_text(&truncated_timing, false)
+                .contains("call timing capture incomplete (truncated)")
+        );
+
+        let mut partial_scope = r.clone();
+        let capture = partial_scope.runs[0]
+            .outcome
+            .explain_capture
+            .as_mut()
+            .unwrap();
+        let mut unavailable_scope = terminal_turn_mut(capture).clone();
+        unavailable_scope.event_id = "turn-2-finish".into();
+        unavailable_scope.turn_id = "turn-2".into();
+        unavailable_scope.node_id = "turn-2".into();
+        unavailable_scope.clock_domain_id = "clock-2".into();
+        unavailable_scope.auxiliary_usage = Some(Box::new(
+            serde_json::from_value(serde_json::json!({"available":false,"attempts":[]})).unwrap(),
+        ));
+        unavailable_scope.auxiliary_details = None;
+        capture.events.push(unavailable_scope);
+        let rendered = render_text(&partial_scope, false);
+        assert!(rendered.contains("scope coverage incomplete (some scopes unavailable)"));
+
+        let mut conflicted_turn = r.clone();
+        let capture = conflicted_turn.runs[0]
+            .outcome
+            .explain_capture
+            .as_mut()
+            .unwrap();
+        let mut conflicting = terminal_turn_mut(capture).clone();
+        conflicting.event_id = "turn-conflict".into();
+        conflicting.auxiliary_usage = Some(Box::new(
+            serde_json::from_value(serde_json::json!({"available":false,"attempts":[]})).unwrap(),
+        ));
+        capture.events.push(conflicting);
+        let rendered = render_text(&conflicted_turn, false);
+        assert!(rendered.contains("auxiliary usage: conflicting records"));
+        assert!(!rendered.contains("auxiliary usage: capture unavailable"));
+        let complete = r.clone();
+        let mut missing_run = complete.runs[0].clone();
+        missing_run.outcome.explain_capture = None;
+        let mut partial_suite = complete.clone();
+        partial_suite.runs.push(missing_run);
+        assert!(render_text(&partial_suite, false).contains("primary prompt-cache read=unknown"));
+        for gate in 0..3 {
+            let mut degraded = complete.clone();
+            let capture = degraded.runs[0].outcome.explain_capture.as_mut().unwrap();
+            match gate {
+                0 => capture.identity_verified = false,
+                1 => capture.gap_unrecovered = true,
+                _ => capture.diagnostics.push("delivery_degraded".into()),
+            }
+            assert!(render_text(&degraded, false).contains("primary prompt-cache read=unknown"));
+        }
+        r.runs[0]
+            .outcome
+            .explain_capture
+            .as_mut()
+            .unwrap()
+            .snapshot_pending = true;
+        assert!(render_text(&r, false).contains("primary prompt-cache read=unknown"));
+        let capture = r.runs[0].outcome.explain_capture.as_mut().unwrap();
+        capture.snapshot_pending = false;
+        let usage = capture
+            .events
+            .iter_mut()
+            .find_map(|event| event.usage.as_mut())
+            .unwrap();
+        usage.fresh_input_tokens = Some(0);
+        usage.cache_read_tokens = Some(0);
+        assert!(render_text(&r, false).contains("primary prompt-cache read=n/a"));
+        let usage = r.runs[0]
+            .outcome
+            .explain_capture
+            .as_mut()
+            .unwrap()
+            .events
+            .iter_mut()
+            .find_map(|event| event.usage.as_mut())
+            .unwrap();
+        usage.fresh_input_tokens = Some(u64::MAX);
+        usage.cache_read_tokens = Some(1);
+        assert!(render_text(&r, false).contains("primary prompt-cache read=unknown"));
     }
 
-    /// Regression: the denominator must include `cache_creation_tokens`,
-    /// otherwise a turn that wrote 200 cache tokens on top of 200 reads
-    /// would appear to have read=50% when it actually read 200/(200+200+200)
-    /// = 33% of total billable input. Anthropic and Bedrock reports both
-    /// surface non-zero `cache_creation_tokens` on the first cached call,
-    /// so this case is real.
     #[test]
-    fn render_text_cache_read_share_includes_cache_creation_in_denominator() {
+    fn render_text_preserves_reported_cache_creation_without_input_coverage() {
         let r = SuiteReport {
             runs: vec![CaseRunReport {
                 case_name: "cache".into(),
@@ -1536,6 +2146,7 @@ mod tests {
                 criteria: vec![],
                 steps: vec![],
                 failure_class: None,
+                cleanup_errors: Vec::new(),
                 has_warnings: false,
                 attempts: Vec::new(),
                 session: None,
@@ -1549,17 +2160,15 @@ mod tests {
         };
 
         let out = render_text(&r, false);
-        // 200 / (100 + 200 + 200) = 0.40 → 40%. If the denominator drops
-        // `cache_creation_tokens`, the share would render as 200/(100+200)
-        // = 67% — the assertion catches that regression.
         assert!(
-            out.contains("cache-read=40%"),
-            "cache_creation_tokens must contribute to the denominator: {out}"
+            out.contains("cache-read=200 cache-write=200")
+                && out.contains("primary prompt-cache read=unknown"),
+            "mixed terminal counters cannot certify primary cache share: {out}"
         );
     }
 
     #[test]
-    fn render_text_omits_cache_read_share_when_no_cache_read_occurred() {
+    fn render_text_does_not_certify_zero_cache_from_terminal_counters() {
         let r = SuiteReport {
             runs: vec![CaseRunReport {
                 case_name: "cache-create-only".into(),
@@ -1580,6 +2189,7 @@ mod tests {
                 criteria: vec![],
                 steps: vec![],
                 failure_class: None,
+                cleanup_errors: Vec::new(),
                 has_warnings: false,
                 attempts: Vec::new(),
                 session: None,
@@ -1594,8 +2204,9 @@ mod tests {
 
         let out = render_text(&r, false);
         assert!(
-            !out.contains("cache-read="),
-            "cache-read share should stay hidden until some cached input was actually read: {out}"
+            out.contains("cache-read=0 cache-write=200")
+                && out.contains("primary prompt-cache read=unknown"),
+            "retain reported counts without inventing primary coverage: {out}"
         );
     }
 
@@ -1617,6 +2228,7 @@ mod tests {
             criteria: vec![],
             steps: vec![],
             failure_class: None,
+            cleanup_errors: Vec::new(),
             has_warnings: false,
             attempts: Vec::new(),
             session: None,
@@ -1653,6 +2265,7 @@ mod tests {
             criteria: vec![],
             steps: vec![],
             failure_class: None,
+            cleanup_errors: Vec::new(),
             has_warnings: false,
             attempts: Vec::new(),
             session: None,
@@ -1694,6 +2307,7 @@ mod tests {
             criteria: vec![],
             steps: vec![],
             failure_class: None,
+            cleanup_errors: Vec::new(),
             has_warnings: false,
             attempts: Vec::new(),
             session: None,
@@ -1773,6 +2387,7 @@ mod tests {
             criteria: vec![],
             steps: vec![],
             failure_class: None,
+            cleanup_errors: Vec::new(),
             has_warnings: false,
             attempts: Vec::new(),
             session: None,

@@ -709,6 +709,9 @@ pub(crate) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
         astra_thin_client::ThinClientError::InvalidInput(value) => {
             format!("Invalid request: {value}")
         }
+        astra_thin_client::ThinClientError::AdmissionDeadlineExpired => {
+            "Execution deadline expired before Server admission".to_string()
+        }
     }
 }
 

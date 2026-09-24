@@ -709,6 +709,9 @@ impl<'a> SuiteRunner<'a> {
                         args
                     },
                     timeout_seconds: step.timeout_seconds.unwrap_or(case.timeout_seconds),
+                    cli_wall_time_seconds: case.cli_wall_time_seconds.filter(|deadline| {
+                        *deadline < step.timeout_seconds.unwrap_or(case.timeout_seconds)
+                    }),
                     capability: None,
                     required_cache_scope: None,
                     difficulty: None,
@@ -810,6 +813,9 @@ impl<'a> SuiteRunner<'a> {
                 });
 
                 // Merge step outcome into main outcome.
+                // Evidence remains on attempts/steps. The aggregate is not a
+                // physical execution scope and must not inherit one capture.
+                outcome.explain_capture = None;
                 outcome.completion_tokens += step_outcome.completion_tokens;
                 outcome.prompt_tokens += step_outcome.prompt_tokens;
                 outcome.cached_input_tokens += step_outcome.cached_input_tokens;
@@ -892,6 +898,7 @@ impl<'a> SuiteRunner<'a> {
                 outcome.duration_ms = outcome
                     .duration_ms
                     .saturating_add(first_attempt.duration_ms);
+                outcome.explain_capture = None;
                 if !first_attempt.stderr.is_empty() {
                     outcome.stderr = format!(
                         "[attempt 0 stderr]\n{}\n[attempt 1 stderr]\n{}",
@@ -1089,7 +1096,17 @@ impl<'a> SuiteRunner<'a> {
             attach_durable_judger_evidence(&mut judger_outcome, session);
         }
 
-        let mut det = evaluate_deterministic_with_session(&criteria, &outcome, session.as_ref());
+        let primary_executions = attempts
+            .iter()
+            .map(|attempt| &attempt.outcome)
+            .chain(step_results.iter().map(|step| &step.outcome))
+            .collect::<Vec<_>>();
+        let mut det = crate::criteria::evaluate_with_primary_executions(
+            &criteria,
+            &outcome,
+            session.as_ref(),
+            &primary_executions,
+        );
 
         // Always run the judger (unless --no-judger) — the quality
         // score is useful for diagnostics even when Hard criteria fail.
@@ -1211,11 +1228,8 @@ impl<'a> SuiteRunner<'a> {
         // in the report, but make the harness failure explicit rather than
         // presenting a green result with an easily missed warning.
         let passed = product_passed && cleanup_errors.is_empty();
-        let failure_class = if cleanup_errors.is_empty() {
-            product_failure_class
-        } else {
-            Some(FailureClass::HarnessCleanupFailed)
-        };
+        let failure_class = product_failure_class
+            .or_else(|| (!cleanup_errors.is_empty()).then_some(FailureClass::HarnessCleanupFailed));
 
         // Progress: emit per-case result to stderr so long runs show
         // streaming progress even when stdout is buffered.
@@ -1261,6 +1275,7 @@ impl<'a> SuiteRunner<'a> {
             digest,
             digest_error,
             failure_class,
+            cleanup_errors,
             has_warnings: passed && (!all_passed || retry_attempted),
         }
     }
@@ -1447,6 +1462,7 @@ impl<'a> SuiteRunner<'a> {
             digest: None,
             digest_error: None,
             failure_class: Some(crate::classify::FailureClass::InfraVerificationUnavailable),
+            cleanup_errors: Vec::new(),
             has_warnings: false,
         }
     }
@@ -1493,6 +1509,7 @@ impl<'a> SuiteRunner<'a> {
             digest: None,
             digest_error: None,
             failure_class: Some(FailureClass::InfraVerificationUnavailable),
+            cleanup_errors: Vec::new(),
             has_warnings: false,
         }
     }
@@ -1549,6 +1566,7 @@ impl<'a> SuiteRunner<'a> {
             digest: None,
             digest_error: None,
             failure_class: Some(crate::classify::FailureClass::InfraVerificationUnavailable),
+            cleanup_errors: Vec::new(),
             has_warnings: false,
         })
     }
@@ -1599,6 +1617,7 @@ mod tests {
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 60,
+            cli_wall_time_seconds: None,
             capability: None,
             required_cache_scope: None,
             difficulty: None,
@@ -1979,6 +1998,8 @@ mod tests {
             ttft_ms: 0,
             final_state: None,
             interruption_kind: None,
+            error_kind: None,
+            explain_capture: None,
             tool_result_class_counts: std::collections::BTreeMap::new(),
         }
     }
@@ -3230,6 +3251,7 @@ mod tests {
             report.runs[0].failure_class,
             Some(FailureClass::HarnessCleanupFailed)
         );
+        assert_eq!(report.runs[0].cleanup_errors.len(), 1);
         assert!(
             report.runs[0]
                 .outcome
@@ -3237,6 +3259,38 @@ mod tests {
                 .contains("teardown_cmd failed for case=c1"),
             "the persisted artifact must retain the cleanup failure reason"
         );
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_does_not_replace_the_product_failure() {
+        let exec = FakeExecutor::new();
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+        let mut case = case_with("product-and-cleanup-fail", vec![]);
+        case.setup_cmd = Some("false".into());
+        case.teardown_cmd = Some("false".into());
+
+        let report = runner.run_all(&[case]).await;
+        assert!(!report.runs[0].is_passed());
+        assert_eq!(
+            report.runs[0].failure_class,
+            Some(FailureClass::PlatformSetupFailed)
+        );
+        assert_eq!(report.runs[0].cleanup_errors.len(), 1);
     }
 
     #[tokio::test]
@@ -3738,6 +3792,104 @@ mod tests {
                 .stderr
                 .contains("did not return the server-issued UUID session_id")
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_cache_criteria_use_step_evidence_and_preserve_unknown_retry_cost() {
+        for mode in ["complete", "missing", "overlap", "retry"] {
+            let criterion = Criterion::PromptCacheTokens {
+                min_read: 30,
+                min_creation: 3,
+                max_creation: Some(3),
+            };
+            let mut root = outcome_ok("m", "root", &[]).with_final_state("completed");
+            let mut step = outcome_ok("m", "step", &[]).with_final_state("completed");
+            root.run_id = Some("root".into());
+            step.run_id = Some("step".into());
+            root.explain_capture =
+                crate::exec::test_support::cache_outcome("root", 10, 1).explain_capture;
+            step.explain_capture =
+                crate::exec::test_support::cache_outcome("step", 20, 2).explain_capture;
+            for event in &mut step.explain_capture.as_mut().unwrap().events {
+                event.turn_id = "next-turn".into();
+            }
+            // Mixed terminal counters must never stand in for primary evidence.
+            root.cached_input_tokens = 999_999;
+            match mode {
+                "missing" => root.explain_capture = None,
+                "overlap" => step = root.clone(),
+                "retry" => {
+                    root = RunOutcome::new("m")
+                        .with_exit_code(1)
+                        .with_final_state("interrupted")
+                        .with_interruption_kind("rate_limit")
+                        .with_stderr("HTTP 429: Too many requests");
+                    step.explain_capture =
+                        crate::exec::test_support::cache_outcome("step", 30, 3).explain_capture;
+                }
+                _ => {}
+            }
+            let exec = SequenceExecutor {
+                outcomes: std::sync::Mutex::new(vec![root, step]),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let judger = FixedJudger { score: 1.0 };
+            let loader = NoopSessionLoader;
+            let runner = SuiteRunner {
+                executor: &exec,
+                judger: &judger,
+                session_loader: &loader,
+                digest_collector: None,
+                runner_cfg: RunnerConfig::new(PathBuf::from("astra"))
+                    .with_fallback_models(vec!["m".into()]),
+                no_judger: true,
+                session_mode: SessionCaptureMode::Never,
+                suite_cfg: SuiteConfig {
+                    retry_on_429: mode == "retry",
+                    ..SuiteConfig::default()
+                },
+                dashboard_tx: None,
+                run_id: String::new(),
+                cancel_flag: None,
+            };
+            let nested_ratio = Criterion::AllOf {
+                criteria: vec![Criterion::AnyOf {
+                    criteria: vec![Criterion::ProviderPromptCacheReadRatio {
+                        min: 0.1,
+                        warmup_turns: 0,
+                        warmup_rounds: 1,
+                    }],
+                }],
+            };
+            let mut case = case_with("cache-evidence", vec![criterion, nested_ratio]);
+            case.required_cache_scope = Some(PromptCacheReuseScope::ConversationTurns);
+            if mode != "retry" {
+                case.steps.push(crate::case::CaseStep {
+                    prompt: "continue".into(),
+                    criteria: vec![],
+                    timeout_seconds: None,
+                });
+            }
+            let report = runner.run_all(&[case]).await;
+            assert_eq!(exec.calls.load(Ordering::Relaxed), 2, "{mode}");
+            let result = &report.runs[0].criteria[0];
+            assert_eq!(result.passed, mode == "complete", "{mode}: {result:?}");
+            let nested = &report.runs[0].criteria[1];
+            assert_eq!(nested.passed, mode == "complete", "{mode}: {nested:?}");
+            let scope = report.runs[0]
+                .criteria
+                .iter()
+                .find(|result| matches!(result.criterion, Criterion::PromptCacheReuseScope { .. }))
+                .expect("injected reuse-scope gate");
+            assert_eq!(scope.passed, mode == "complete", "{mode}: {scope:?}");
+            if mode != "complete" {
+                assert!(
+                    result.detail.contains("evidence unavailable"),
+                    "{mode}: {result:?}"
+                );
+            }
+            assert!(report.runs[0].outcome.explain_capture.is_none());
+        }
     }
 
     #[tokio::test]

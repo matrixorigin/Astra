@@ -765,7 +765,6 @@ impl ToolPolicyConfig {
         let base = EffectiveToolPolicy {
             max_identical_tool_calls: self.effective_max_identical_calls(),
             max_tools_per_turn: self.effective_max_tools_per_turn(),
-            repeated_cache_hit_suppression: 3,
             max_consecutive_empty_name: 3,
             parallel_batching_force_streak: self.effective_parallel_batching_force_streak(),
         };
@@ -802,7 +801,6 @@ impl ToolPolicyConfig {
                     model_match: "opus".to_string(),
                     max_identical_tool_calls: 4,
                     max_tools_per_turn: 128,
-                    repeated_cache_hit_suppression: 4,
                     max_consecutive_empty_name: 3,
                     parallel_batching_force_streak: 0,
                 },
@@ -810,7 +808,6 @@ impl ToolPolicyConfig {
                     model_match: "sonnet-4".to_string(),
                     max_identical_tool_calls: 4,
                     max_tools_per_turn: 100,
-                    repeated_cache_hit_suppression: 4,
                     max_consecutive_empty_name: 3,
                     parallel_batching_force_streak: 0,
                 },
@@ -818,7 +815,6 @@ impl ToolPolicyConfig {
                     model_match: "haiku".to_string(),
                     max_identical_tool_calls: 2,
                     max_tools_per_turn: 48,
-                    repeated_cache_hit_suppression: 2,
                     max_consecutive_empty_name: 2,
                     parallel_batching_force_streak: 0,
                 },
@@ -826,7 +822,6 @@ impl ToolPolicyConfig {
                     model_match: "gpt-5".to_string(),
                     max_identical_tool_calls: 4,
                     max_tools_per_turn: 128,
-                    repeated_cache_hit_suppression: 4,
                     max_consecutive_empty_name: 3,
                     parallel_batching_force_streak: 0,
                 },
@@ -1088,13 +1083,6 @@ pub struct ModelPolicyProfile {
     #[serde(default)]
     pub max_tools_per_turn: u32,
 
-    /// After this many consecutive cache-hit suppressions on identical args,
-    /// the pipeline switches to hard-refusal instead of a soft hint.
-    /// 0 = inherit. Replaces the former hardcoded
-    /// `REPEATED_CACHE_HIT_SUPPRESSION_THRESHOLD` (was 2).
-    #[serde(default)]
-    pub repeated_cache_hit_suppression: u32,
-
     /// Abort a headless round after this many consecutive empty-name tool
     /// calls from the model. 0 = inherit. Replaces the former hardcoded
     /// `MAX_CONSECUTIVE_EMPTY_NAME` (was 3).
@@ -1115,9 +1103,6 @@ pub struct ModelPolicyProfile {
 pub struct EffectiveToolPolicy {
     pub max_identical_tool_calls: u32,
     pub max_tools_per_turn: u32,
-    /// How many times the same cached (tool, args) may be suppressed with a
-    /// soft hint before switching to hard-refusal.
-    pub repeated_cache_hit_suppression: u32,
     /// Abort headless round after this many consecutive empty-name calls.
     pub max_consecutive_empty_name: u32,
     /// Mid-loop guard threshold for escalating single-tool streaks into a
@@ -1159,7 +1144,6 @@ impl ToolSelectionConfig {
             // Defaults raised from 2 → 3 alongside `max_identical_tool_calls`
             // on 2026-04-27; same rationale (read-after-edit verification is
             // legitimate, not a loop).
-            repeated_cache_hit_suppression: 3,
             max_consecutive_empty_name: 3,
             parallel_batching_force_streak: self.effective_parallel_batching_force_streak(),
         };
@@ -1203,7 +1187,6 @@ impl ToolSelectionConfig {
                     model_match: "opus".to_string(),
                     max_identical_tool_calls: 4,
                     max_tools_per_turn: 20,
-                    repeated_cache_hit_suppression: 4,
                     max_consecutive_empty_name: 3,
                     parallel_batching_force_streak: 0,
                 },
@@ -1212,7 +1195,6 @@ impl ToolSelectionConfig {
                     model_match: "sonnet-4".to_string(),
                     max_identical_tool_calls: 4,
                     max_tools_per_turn: 18,
-                    repeated_cache_hit_suppression: 4,
                     max_consecutive_empty_name: 3,
                     parallel_batching_force_streak: 0,
                 },
@@ -1221,7 +1203,6 @@ impl ToolSelectionConfig {
                     model_match: "haiku".to_string(),
                     max_identical_tool_calls: 2,
                     max_tools_per_turn: 12,
-                    repeated_cache_hit_suppression: 2,
                     max_consecutive_empty_name: 2,
                     parallel_batching_force_streak: 0,
                 },
@@ -1230,7 +1211,6 @@ impl ToolSelectionConfig {
                     model_match: "gpt-5".to_string(),
                     max_identical_tool_calls: 4,
                     max_tools_per_turn: 20,
-                    repeated_cache_hit_suppression: 4,
                     max_consecutive_empty_name: 3,
                     parallel_batching_force_streak: 0,
                 },
@@ -1425,8 +1405,6 @@ impl ToolSelectionConfig {
 /// - `max_identical_tool_calls` floor 2 — a value of 1 would make every
 ///   second tool call a dedup hit. Matches the haiku built-in's lower bound.
 /// - `max_tools_per_turn` floor 5 — prevents pathological starvation.
-/// - `repeated_cache_hit_suppression` floor 1 — 0 would effectively disable
-///   the guard.
 /// - `max_consecutive_empty_name` floor 1 — 0 would abort on the very first
 ///   empty-name call.
 /// - `parallel_batching_force_streak` floor 5
@@ -1444,11 +1422,6 @@ fn apply_profile(base: EffectiveToolPolicy, profile: &ModelPolicyProfile) -> Eff
             profile.max_tools_per_turn.max(5)
         } else {
             base.max_tools_per_turn
-        },
-        repeated_cache_hit_suppression: if profile.repeated_cache_hit_suppression > 0 {
-            profile.repeated_cache_hit_suppression.max(1)
-        } else {
-            base.repeated_cache_hit_suppression
         },
         max_consecutive_empty_name: if profile.max_consecutive_empty_name > 0 {
             profile.max_consecutive_empty_name.max(1)
@@ -3826,7 +3799,6 @@ mod tests {
             model_match: "gpt-5".to_string(),
             max_identical_tool_calls: 6,
             max_tools_per_turn: 25,
-            repeated_cache_hit_suppression: 0,
             max_consecutive_empty_name: 0,
             parallel_batching_force_streak: 0,
         });
@@ -3949,26 +3921,10 @@ mod tests {
     }
 
     #[test]
-    fn effective_policy_exposes_cache_hit_suppression_and_empty_name_limits() {
-        // Global default: suppression threshold = 3, empty-name cap = 3.
-        // These replaced the hardcoded `REPEATED_CACHE_HIT_SUPPRESSION_THRESHOLD`
-        // and `MAX_CONSECUTIVE_EMPTY_NAME` constants in the runtime pipeline.
+    fn effective_policy_exposes_empty_name_limit() {
         let cfg = ToolSelectionConfig::default();
         let policy = cfg.resolve_for_model(None);
-        assert_eq!(policy.repeated_cache_hit_suppression, 3);
         assert_eq!(policy.max_consecutive_empty_name, 3);
-    }
-
-    #[test]
-    fn opus_profile_loosens_cache_hit_suppression() {
-        // Stronger models repeat reads more deliberately — give them more rope
-        // before suppression kicks in. Haiku stays tight.
-        let cfg = ToolSelectionConfig::default();
-        let opus = cfg.resolve_for_model(Some("claude-opus-4-7"));
-        assert_eq!(opus.repeated_cache_hit_suppression, 4);
-
-        let haiku = cfg.resolve_for_model(Some("claude-haiku-4-5"));
-        assert_eq!(haiku.repeated_cache_hit_suppression, 2);
     }
 
     #[test]
@@ -3978,13 +3934,11 @@ mod tests {
             model_match: "custom".to_string(),
             max_identical_tool_calls: 0,
             max_tools_per_turn: 0,
-            repeated_cache_hit_suppression: 5,
             max_consecutive_empty_name: 4,
             parallel_batching_force_streak: 0,
         });
         let policy = cfg.resolve_for_model(Some("custom-model"));
-        // These two override…
-        assert_eq!(policy.repeated_cache_hit_suppression, 5);
+        // The empty-name limit overrides independently…
         assert_eq!(policy.max_consecutive_empty_name, 4);
         // …while the zero-valued fields inherit the global default.
         assert_eq!(policy.max_identical_tool_calls, 3);

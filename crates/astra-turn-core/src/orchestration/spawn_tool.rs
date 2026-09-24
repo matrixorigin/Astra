@@ -74,9 +74,10 @@ pub struct SpawnAgentInput {
     /// Name for agent-to-agent messaging.
     pub name: Option<String>,
 
-    /// Max turns before auto-stopping.
+    /// Suggested initial execution slice. The model may size the first
+    /// checkpoint, but cannot impose a hard limit on the child.
     #[serde(default)]
-    pub max_turns: Option<u32>,
+    pub initial_turns: Option<u32>,
 
     /// Max output tokens for the child's first API call. When a
     /// `ForkPrefix` is inherited with thinking enabled, the
@@ -102,15 +103,15 @@ pub struct SpawnAgentInput {
     pub inherit_prefix: Option<InheritPrefixSpec>,
 
     /// Optional task-complexity hint used to scale the default
-    /// turn budget when `max_turns` is not explicitly set. Accepted
+    /// turn budget when `initial_turns` is not set. Accepted
     /// values: `"light"` (≈10 turns, simple one-shot queries),
     /// `"normal"` (agent-type default, the status quo), `"deep"`
     /// (2× agent-type default, for reviewing diffs across many
     /// files, multi-step refactors, or anything that would
     /// routinely exhaust the default budget).
     ///
-    /// `max_turns` is the numeric ceiling; when `complexity` is also set,
-    /// the smaller ceiling wins. This prevents an internally inconsistent
+    /// `initial_turns` sizes the first checkpoint; when `complexity` is also set,
+    /// the smaller first slice wins. This prevents an internally inconsistent
     /// `normal + 2×default` request from silently becoming a deep run.
     ///
     /// APPENDED at the end of the struct: earlier fields are
@@ -244,7 +245,7 @@ impl Default for SpawnAgentInput {
             agent_type: default_agent_type(),
             run_in_background: false,
             name: None,
-            max_turns: None,
+            initial_turns: None,
             max_output_tokens: None,
             isolated: false,
             allowed_tools: None,
@@ -262,14 +263,12 @@ impl Default for SpawnAgentInput {
 }
 
 /// Resolve the effective initial execution slice given an explicit
-/// `max_turns`, an optional `complexity` hint, and the agent-type default.
+/// `initial_turns`, an optional `complexity` hint, and the agent-type default.
 ///
-/// This pure calculation does not decide whether the result is a hard limit.
-/// The spawning runtime retains the numeric input's provenance separately:
-/// only an explicit `max_turns` becomes a hard boundary, while persona and
-/// complexity values remain renewable convergence checkpoints. Rules:
+/// All inputs here are model-authored scheduling hints. The result is a
+/// renewable convergence checkpoint, never a hard execution boundary. Rules:
 ///
-///  * an explicit `max_turns=Some(n)` is authoritative when it is the only
+///  * an `initial_turns=Some(n)` hint sets the first slice when it is the only
 ///    constraint (with a minimum of 1);
 ///  * `complexity=Some("light")` → at most 10 turns;
 ///  * `complexity=Some("normal")` / None → default;
@@ -283,7 +282,7 @@ impl Default for SpawnAgentInput {
 /// unknown input. Callers: the spawner right after reading the
 /// agent_def.
 pub fn resolve_turn_budget(
-    explicit_max_turns: Option<u32>,
+    suggested_initial_turns: Option<u32>,
     complexity: Option<&str>,
     default_max_turns: u32,
 ) -> u32 {
@@ -305,7 +304,7 @@ pub fn resolve_turn_budget(
             default_max_turns
         }
     };
-    match (explicit_max_turns, complexity) {
+    match (suggested_initial_turns, complexity) {
         (Some(n), Some(_)) => n.max(1).min(complexity_budget),
         (Some(n), None) => n.max(1),
         (None, _) => complexity_budget,
@@ -317,7 +316,7 @@ mod budget_resolve_tests {
     use super::resolve_turn_budget;
 
     #[test]
-    fn explicit_max_turns_is_authoritative_when_it_is_the_only_constraint() {
+    fn initial_turns_sizes_the_first_slice_when_it_is_the_only_hint() {
         assert_eq!(resolve_turn_budget(Some(40), None, 20), 40);
         assert_eq!(resolve_turn_budget(Some(7), None, 20), 7);
         assert_eq!(resolve_turn_budget(Some(0), None, 20), 1);
@@ -879,11 +878,11 @@ mod strict_type_tests {
     }
 
     #[test]
-    fn max_turns_rejects_string_integer() {
+    fn initial_turns_rejects_string_integer() {
         let err = serde_json::from_str::<SpawnAgentInput>(
-            r#"{"description":"test","prompt":"p","max_turns":"10"}"#,
+            r#"{"description":"test","prompt":"p","initial_turns":"10"}"#,
         )
-        .expect_err("string max_turns must not deserialize");
+        .expect_err("string initial_turns must not deserialize");
         assert!(err.to_string().contains("expected u32"), "{err}");
     }
 
@@ -897,21 +896,30 @@ mod strict_type_tests {
     }
 
     #[test]
-    fn max_turns_rejects_empty_string() {
+    fn initial_turns_rejects_empty_string() {
         let err = serde_json::from_str::<SpawnAgentInput>(
-            r#"{"description":"test","prompt":"p","max_turns":""}"#,
+            r#"{"description":"test","prompt":"p","initial_turns":""}"#,
         )
         .expect_err("empty string must not silently coerce");
         assert!(err.to_string().contains("expected u32"), "{err}");
     }
 
     #[test]
-    fn max_turns_rejects_float_string() {
+    fn initial_turns_rejects_float_string() {
         let err = serde_json::from_str::<SpawnAgentInput>(
-            r#"{"description":"test","prompt":"p","max_turns":"10.5"}"#,
+            r#"{"description":"test","prompt":"p","initial_turns":"10.5"}"#,
         )
         .expect_err("float string must not deserialize as u32");
         assert!(err.to_string().contains("expected u32"), "{err}");
+    }
+
+    #[test]
+    fn old_model_hard_limit_field_is_rejected() {
+        let err = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"test","prompt":"p","max_turns":2}"#,
+        )
+        .expect_err("a model-authored hard limit is not an execution authority");
+        assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
     #[test]

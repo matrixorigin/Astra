@@ -228,8 +228,9 @@ pub struct ChatTurnSseAccum {
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
     pub has_usage: bool,
-    /// `true` when the visible usage is an aggregate rather than one physical
-    /// provider exchange (for example a server-owned run or a bounded retry).
+    /// Complete-per-lane evidence, distinct from observed numeric subtotals.
+    pub qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
+    /// `true` only for run totals, never a logical-request retry increment.
     pub usage_is_run_total: bool,
     /// Usage for the most recent physical model request. This is distinct
     /// from aggregate logical-response usage: the latter is useful for
@@ -302,6 +303,34 @@ pub struct StreamAppliedUserIntent {
     pub delivery: astra_turn_types::UserIntentDelivery,
     pub event_index: usize,
     pub content: String,
+}
+
+impl ChatTurnSseAccum {
+    /// Run snapshots need the existing summary/identity deduplication boundary.
+    /// Missing coverage must not turn a snapshot into a qualified increment.
+    pub fn accounted_usage(&self) -> Option<astra_turn_types::CanonicalTokenUsage> {
+        let unbound_snapshot = self.usage_is_run_total
+            && (self.server_execution_summary.is_none()
+                || self.run_id.as_deref().is_none_or(|id| id.trim().is_empty()));
+        let missing_report = self.qualified_usage.is_none()
+            && self
+                .server_execution_summary
+                .as_ref()
+                .is_some_and(|summary| {
+                    summary.llm_rounds > 0
+                        || summary
+                            .token_usage_coverage
+                            .is_some_and(|coverage| coverage.attempts > 0)
+                });
+        if unbound_snapshot || missing_report {
+            Some(
+                astra_turn_types::CanonicalTokenUsage::new(None, None, None, None)
+                    .expect("unknown usage is valid"),
+            )
+        } else {
+            self.qualified_usage
+        }
+    }
 }
 
 /// Typed terminal state carried by a durable `run_finished` SSE event.
@@ -1198,20 +1227,36 @@ fn apply_one_event(
             // `astra_runtime::turn::token_usage::TokenUsage`). Fields may be
             // either flat on the event or nested under `"usage"`; flat wins.
             let nested = event.get("usage");
+            let raw_usage = Value::Object(
+                [
+                    "input_tokens",
+                    "cached_input_tokens",
+                    "cache_creation_tokens",
+                    "output_tokens",
+                    "total_tokens",
+                ]
+                .into_iter()
+                .filter_map(|key| {
+                    event
+                        .get(key)
+                        .or_else(|| nested.and_then(|u| u.get(key)))
+                        .map(|value| (key.to_owned(), value.clone()))
+                })
+                .collect(),
+            );
+            let validated = astra_turn_types::CanonicalTokenUsage::from_json(&raw_usage)
+                .unwrap_or_else(|_| {
+                    astra_turn_types::CanonicalTokenUsage::new(None, None, None, None)
+                        .expect("unknown usage is valid")
+                });
             let read_u64 = |field: &str| -> Option<u64> {
                 event
                     .get(field)
-                    .and_then(|v| v.as_u64())
-                    .or_else(|| nested.and_then(|u| u.get(field)).and_then(|v| v.as_u64()))
+                    .or_else(|| nested.and_then(|u| u.get(field)))
+                    .and_then(Value::as_u64)
             };
             let input = read_u64("input_tokens");
             let output = read_u64("output_tokens");
-            if input.is_none() && output.is_none() {
-                if accum.error_message.is_none() {
-                    accum.error_message = Some("Error: invalid usage payload".to_string());
-                }
-                return;
-            }
             // Local accum exposes the legacy field names; map them through.
             // (prompt_tokens stores FRESH input — cache read/creation are
             // counted separately below so the sum is the billable total.)
@@ -1219,16 +1264,40 @@ fn apply_one_event(
             accum.completion_tokens = output.unwrap_or(0);
             accum.cache_read_tokens = read_u64("cached_input_tokens").unwrap_or(0);
             accum.cache_creation_tokens = read_u64("cache_creation_tokens").unwrap_or(0);
-            accum.has_usage = true;
+            // Receipt of an accounting event is not evidence of token counts.
+            // Empty/null payloads occur when an attempt stops before usage.
+            accum.has_usage = input.is_some()
+                || output.is_some()
+                || read_u64("cached_input_tokens").is_some()
+                || read_u64("cache_creation_tokens").is_some();
             // A durable server run terminates with its aggregate usage.  Do
             // not let that aggregate impersonate one provider request in the
             // context rail or cache-rate indicator.
-            accum.usage_is_run_total = event
+            let usage_scope = event
                 .get("usage_scope")
                 .or_else(|| nested.and_then(|usage| usage.get("usage_scope")))
-                .and_then(Value::as_str)
-                == Some("run_total");
-            if accum.usage_is_run_total {
+                .and_then(Value::as_str);
+            accum.qualified_usage =
+                if matches!(usage_scope, Some("run_total" | "logical_request_total")) {
+                    event
+                        .get("qualified_usage")
+                        .or_else(|| nested.and_then(|usage| usage.get("qualified_usage")))
+                        .filter(|usage| !usage.is_null())
+                        .map(|usage| {
+                            astra_turn_types::CanonicalTokenUsage::from_json(usage).unwrap_or_else(
+                                |_| {
+                                    astra_turn_types::CanonicalTokenUsage::new(
+                                        None, None, None, None,
+                                    )
+                                    .expect("unknown usage is valid")
+                                },
+                            )
+                        })
+                } else {
+                    Some(validated)
+                };
+            accum.usage_is_run_total = usage_scope == Some("run_total");
+            if matches!(usage_scope, Some("run_total" | "logical_request_total")) {
                 // `/chat/stream` carries the final physical exchange inside
                 // its terminal accounting event.  The run endpoint expands
                 // the same value into a separate `context_usage` event, but
@@ -1238,23 +1307,25 @@ fn apply_one_event(
                     .get("last_request_usage")
                     .or_else(|| nested.and_then(|usage| usage.get("last_request_usage")));
                 let physical = last_request.and_then(|usage| {
-                    Some(astra_turn_types::RequestTokenUsage {
-                        fresh_input_tokens: usage.get("prompt_tokens")?.as_u64()?,
-                        cache_read_tokens: usage.get("cache_read_tokens")?.as_u64()?,
-                        cache_creation_tokens: usage.get("cache_creation_tokens")?.as_u64()?,
-                        output_tokens: usage.get("completion_tokens")?.as_u64()?,
-                    })
+                    astra_turn_types::RequestTokenUsage::try_new(
+                        usage.get("prompt_tokens")?.as_u64()?,
+                        usage.get("cache_read_tokens")?.as_u64()?,
+                        usage.get("cache_creation_tokens")?.as_u64()?,
+                        usage.get("completion_tokens")?.as_u64()?,
+                    )
+                    .ok()
                 });
-                if let Some(physical) = physical {
-                    accum.current_request_usage = Some(physical);
-                }
+                accum.current_request_usage = physical;
             } else {
-                accum.current_request_usage = Some(astra_turn_types::RequestTokenUsage {
-                    fresh_input_tokens: accum.prompt_tokens,
-                    cache_read_tokens: accum.cache_read_tokens,
-                    cache_creation_tokens: accum.cache_creation_tokens,
-                    output_tokens: accum.completion_tokens,
-                });
+                accum.current_request_usage = (|| {
+                    astra_turn_types::RequestTokenUsage::try_new(
+                        validated.input_tokens()?,
+                        validated.cached_input_tokens()?,
+                        validated.cache_creation_tokens()?,
+                        validated.output_tokens()?,
+                    )
+                    .ok()
+                })();
             }
         }
         "context_usage" => {
@@ -1273,19 +1344,18 @@ fn apply_one_event(
                     Some(cache_read_tokens),
                     Some(cache_creation_tokens),
                     Some(output_tokens),
-                ) => Some(astra_turn_types::RequestTokenUsage {
+                ) => astra_turn_types::RequestTokenUsage::try_new(
                     fresh_input_tokens,
                     cache_read_tokens,
                     cache_creation_tokens,
                     output_tokens,
-                }),
+                )
+                .ok(),
                 _ => None,
             };
-            // A malformed optional observation must never erase a previously
-            // observed physical request.
-            if let Some(usage) = usage {
-                accum.current_request_usage = Some(usage);
-            }
+            // An incomplete latest observation must not inherit measured
+            // context/cache evidence from a previous physical request.
+            accum.current_request_usage = usage;
         }
         "error" => {
             // Indexed errors are durable historical events. An error without
@@ -3304,14 +3374,90 @@ mod tests {
     }
 
     #[test]
-    fn invalid_usage_payload_sets_error() {
+    fn run_snapshot_requires_identity_and_summary_for_qualified_accounting() {
+        let known = astra_turn_types::CanonicalTokenUsage::new(Some(10), Some(0), Some(0), Some(2))
+            .unwrap();
+        let mut accum = ChatTurnSseAccum {
+            qualified_usage: Some(known),
+            ..Default::default()
+        };
+        assert_eq!(accum.accounted_usage(), Some(known));
+        accum.usage_is_run_total = true;
+        assert_eq!(accum.accounted_usage().unwrap().input_tokens(), None);
+        accum.run_id = Some("run".into());
+        assert_eq!(accum.accounted_usage().unwrap().input_tokens(), None);
+        accum.server_execution_summary = Some(ServerLoopExecutionSummary {
+            llm_rounds: 1,
+            ..Default::default()
+        });
+        assert_eq!(accum.accounted_usage(), Some(known));
+        accum.qualified_usage = None;
+        assert_eq!(accum.accounted_usage().unwrap().input_tokens(), None);
+        let summary = accum.server_execution_summary.as_mut().unwrap();
+        summary.llm_rounds = 0;
+        summary.token_usage_coverage = Some(TokenUsageCoverage {
+            attempts: 1,
+            provider_reported: 0,
+            unavailable: 1,
+        });
+        assert_eq!(accum.accounted_usage().unwrap().input_tokens(), None);
+    }
+
+    #[test]
+    fn contradictory_usage_cannot_qualify_physical_context() {
+        for payload in [
+            r#"{"type":"usage","input_tokens":-1,"usage":{"input_tokens":10},"cached_input_tokens":0,"cache_creation_tokens":0,"output_tokens":2}"#,
+            r#"{"type":"usage","input_tokens":null,"usage":{"input_tokens":10},"cached_input_tokens":0,"cache_creation_tokens":0,"output_tokens":2}"#,
+            r#"{"type":"usage","input_tokens":10,"cached_input_tokens":0,"cache_creation_tokens":0,"output_tokens":2,"total_tokens":999}"#,
+        ] {
+            let mut accum = ChatTurnSseAccum::default();
+            dispatch_chat_turn_sse_event_block(
+                "data: {\"type\":\"usage\",\"input_tokens\":10,\"cached_input_tokens\":0,\"cache_creation_tokens\":0,\"output_tokens\":2}\n\n",
+                &mut accum,
+                &mut vec![],
+            );
+            assert!(accum.current_request_usage.is_some());
+            dispatch_chat_turn_sse_event_block(
+                &format!("data: {payload}\n\n"),
+                &mut accum,
+                &mut vec![],
+            );
+            assert!(accum.current_request_usage.is_none(), "{payload}");
+            assert_eq!(
+                accum.qualified_usage.unwrap().input_tokens(),
+                None,
+                "{payload}"
+            );
+            assert!(accum.error_message.is_none(), "{payload}");
+        }
+    }
+
+    #[test]
+    fn missing_usage_is_unknown_not_a_model_error() {
         let mut a = ChatTurnSseAccum::default();
-        dispatch_chat_turn_sse_event_block("data: {\"type\":\"usage\"}\n\n", &mut a, &mut vec![]);
-        assert_eq!(
-            a.error_message.as_deref(),
-            Some("Error: invalid usage payload")
+        dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"usage\",\"input_tokens\":100,\"cached_input_tokens\":900,\"cache_creation_tokens\":0,\"output_tokens\":20}\n\n",
+            &mut a,
+            &mut vec![],
         );
+        assert!(a.current_request_usage.is_some());
+        dispatch_chat_turn_sse_event_block("data: {\"type\":\"usage\"}\n\n", &mut a, &mut vec![]);
+        assert!(a.error_message.is_none());
+        assert!(a.qualified_usage.is_some());
+        assert_eq!(a.qualified_usage.unwrap().input_tokens(), None);
         assert!(!a.has_usage);
+        assert!(a.current_request_usage.is_none());
+        assert_eq!(a.prompt_tokens, 0);
+        dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"usage\",\"cached_input_tokens\":900}\n\n",
+            &mut a,
+            &mut vec![],
+        );
+        assert!(a.has_usage);
+        assert_eq!(a.qualified_usage.unwrap().cached_input_tokens(), Some(900));
+        assert_eq!(a.qualified_usage.unwrap().input_tokens(), None);
+        assert!(a.current_request_usage.is_none());
+        assert!(a.error_message.is_none());
     }
 
     #[test]
@@ -3382,7 +3528,54 @@ mod tests {
     }
 
     #[test]
-    fn malformed_context_usage_preserves_prior_physical_request() {
+    fn partial_usage_keeps_observed_counts_without_inventing_physical_usage() {
+        let mut accum = ChatTurnSseAccum::default();
+        for body in [
+            ",\"input_tokens\":100,\"cached_input_tokens\":900,\"cache_creation_tokens\":0,\"output_tokens\":7",
+            ",\"input_tokens\":1200,\"output_tokens\":7",
+        ] {
+            dispatch_chat_turn_sse_event_block(&sse("usage", body), &mut accum, &mut vec![]);
+        }
+        assert!(accum.has_usage);
+        assert_eq!(accum.prompt_tokens, 1200);
+        assert_eq!(accum.completion_tokens, 7);
+        assert_eq!(accum.current_request_usage, None);
+    }
+
+    #[test]
+    fn physical_usage_rejects_out_of_range_lanes_and_combined_overflow() {
+        for event_type in ["usage", "context_usage"] {
+            for (input, output) in [(i64::MAX as u64 + 1, 0), (i64::MAX as u64, 1)] {
+                let mut accum = ChatTurnSseAccum {
+                    current_request_usage: Some(astra_turn_types::RequestTokenUsage::default()),
+                    ..Default::default()
+                };
+                let body = format!(
+                    ",\"input_tokens\":{input},\"cached_input_tokens\":0,\"cache_creation_tokens\":0,\"output_tokens\":{output}"
+                );
+                dispatch_chat_turn_sse_event_block(
+                    &sse(event_type, &body),
+                    &mut accum,
+                    &mut vec![],
+                );
+                assert_eq!(accum.current_request_usage, None, "{event_type}: {body}");
+            }
+        }
+        for input in [i64::MAX as u64, i64::MAX as u64 + 1] {
+            let mut accum = ChatTurnSseAccum {
+                current_request_usage: Some(astra_turn_types::RequestTokenUsage::default()),
+                ..Default::default()
+            };
+            let body = format!(
+                ",\"usage_scope\":\"run_total\",\"input_tokens\":1,\"output_tokens\":1,\"last_request_usage\":{{\"prompt_tokens\":{input},\"cache_read_tokens\":1,\"cache_creation_tokens\":0,\"completion_tokens\":0}}"
+            );
+            dispatch_chat_turn_sse_event_block(&sse("usage", &body), &mut accum, &mut vec![]);
+            assert_eq!(accum.current_request_usage, None);
+        }
+    }
+
+    #[test]
+    fn incomplete_context_usage_clears_prior_physical_request() {
         let mut accum = ChatTurnSseAccum {
             current_request_usage: Some(astra_turn_types::RequestTokenUsage {
                 fresh_input_tokens: 100,
@@ -3397,15 +3590,7 @@ mod tests {
             &mut accum,
             &mut vec![],
         );
-        assert_eq!(
-            accum.current_request_usage,
-            Some(astra_turn_types::RequestTokenUsage {
-                fresh_input_tokens: 100,
-                cache_read_tokens: 900,
-                cache_creation_tokens: 0,
-                output_tokens: 10,
-            })
-        );
+        assert_eq!(accum.current_request_usage, None);
     }
 
     #[test]
@@ -3491,7 +3676,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_without_prompt_or_completion_is_error_and_ignores_cache() {
+    fn usage_without_prompt_or_completion_preserves_known_cache() {
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(
             &sse(
@@ -3501,11 +3686,13 @@ mod tests {
             &mut a,
             &mut vec![],
         );
-        // Early return: no prompt/completion → error, cache tokens not parsed
-        assert!(!a.has_usage);
-        assert_eq!(a.cache_read_tokens, 0);
-        assert_eq!(a.cache_creation_tokens, 0);
-        assert!(a.error_message.is_some());
+        assert!(a.has_usage);
+        assert_eq!(a.cache_read_tokens, 500);
+        assert_eq!(a.cache_creation_tokens, 100);
+        assert_eq!(a.qualified_usage.unwrap().cached_input_tokens(), Some(500));
+        assert_eq!(a.qualified_usage.unwrap().input_tokens(), None);
+        assert!(a.current_request_usage.is_none());
+        assert!(a.error_message.is_none());
     }
 
     #[test]
@@ -3631,33 +3818,6 @@ mod tests {
             &mut pending,
         );
         assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn usage_negative_tokens_treated_as_missing() {
-        let mut a = ChatTurnSseAccum::default();
-        // as_u64() returns None for negative values
-        dispatch_chat_turn_sse_event_block(
-            &sse("usage", ",\"input_tokens\":-1,\"output_tokens\":-5"),
-            &mut a,
-            &mut vec![],
-        );
-        // Negative i64 fails as_u64() → both None → error
-        assert!(a.error_message.is_some());
-        assert!(!a.has_usage);
-    }
-
-    #[test]
-    fn usage_float_tokens_treated_as_zero() {
-        let mut a = ChatTurnSseAccum::default();
-        dispatch_chat_turn_sse_event_block(
-            &sse("usage", ",\"input_tokens\":1.5,\"output_tokens\":2.7"),
-            &mut a,
-            &mut vec![],
-        );
-        // as_u64() returns None for floats → falls through to unwrap_or(0)
-        // But at least one must be present as integer for has_usage
-        assert!(a.error_message.is_some());
     }
 
     #[test]
@@ -3976,14 +4136,14 @@ mod tests {
             &mut a,
             &mut vec![],
         );
-        // Negative values fail as_u64() → both None → error branch
+        // Invalid accounting cannot manufacture tokens or fail model content.
         assert!(!a.has_usage);
-        assert!(a.error_message.is_some());
-        assert!(a.error_message.as_ref().unwrap().contains("invalid usage"));
+        assert!(a.error_message.is_none());
+        assert_eq!(a.qualified_usage.unwrap().input_tokens(), None);
     }
 
     #[test]
-    fn usage_float_tokens_treated_as_error() {
+    fn usage_float_tokens_are_not_counts() {
         let mut a = ChatTurnSseAccum::default();
         // Float values cannot be parsed as i64 by serde, so as_i64() returns None.
         dispatch_chat_turn_sse_event_block(
@@ -3991,9 +4151,9 @@ mod tests {
             &mut a,
             &mut vec![],
         );
-        // The parser falls through to the "neither prompt nor completion" branch
-        // and sets an error, OR it just stores 0. Either way, no panic.
-        assert!(a.has_usage || a.error_message.is_some());
+        assert!(!a.has_usage);
+        assert!(a.error_message.is_none());
+        assert_eq!(a.current_request_usage, None);
     }
 
     #[test]

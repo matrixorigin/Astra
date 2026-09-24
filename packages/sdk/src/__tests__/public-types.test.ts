@@ -4,6 +4,8 @@ import type {
   AgentInterruptedEvent,
   RunErrorEvent,
   RunInterruptedEvent,
+  SessionRequestUsageSummary,
+  SessionCostSummary,
   ToolCallEvent,
   WorkspaceState,
 } from '../index';
@@ -13,6 +15,22 @@ import type {
 } from '../react';
 
 describe('public SDK types', () => {
+  test('audit usage keeps unknown, zero, and known counts distinct', () => {
+    const usage: SessionRequestUsageSummary = {
+      scope: 'session_all_runs',
+      request_count: 2,
+      fresh_input_tokens: null,
+      cache_read_tokens: null,
+      cache_creation_tokens: 0,
+      output_tokens: 27,
+    };
+    const cost: SessionCostSummary = {
+      priced_turn_count: 0,
+      unpriced_turn_count: 2,
+    };
+    expect(JSON.parse(JSON.stringify(usage))).toEqual(usage);
+    expect(cost.estimated_cost_usd).toBeUndefined();
+  });
   test('export execution-boundary run, tool, agent, and workspace state types', () => {
     const workspace: WorkspaceBinding = {
       kind: 'edge_workspace',

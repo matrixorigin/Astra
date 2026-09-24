@@ -1302,6 +1302,12 @@ pub struct ToolCallRecord {
     /// journal boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_mutation_receipt: Option<serde_json::Value>,
+    /// Trusted executor's narrower fact that a direct typed writer committed
+    /// inside its bound workspace while full attribution was unavailable.
+    /// Not a current-state, stable-mutation, or observation receipt. Only live
+    /// completion may consume it; restoration retains it for audit alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_writer_applied_bound: Option<bool>,
     /// Executor-owned observation that explicitly declared state outside the
     /// bound workspace changed during this invocation. This is separate from
     /// workspace evidence so neither scope can satisfy the other's contract.
@@ -6229,6 +6235,38 @@ impl JournalEvent {
         self
     }
 
+    /// Replace observed subtotals with qualified accounting evidence.
+    /// An empty sample needs a presence witness; known lanes are not mirrored.
+    pub fn with_qualified_usage(
+        mut self,
+        usage: Option<astra_turn_types::CanonicalTokenUsage>,
+    ) -> Self {
+        self.tokens_in = usage.and_then(|usage| usage.input_tokens());
+        self.tokens_out = usage.and_then(|usage| usage.output_tokens());
+        self.cache_read_tokens = usage.and_then(|usage| usage.cached_input_tokens());
+        self.cache_creation_tokens = usage.and_then(|usage| usage.cache_creation_tokens());
+        if let Some(metadata) = self
+            .metadata
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            metadata.remove("qualified_usage");
+        }
+        if usage.is_some()
+            && self.tokens_in.is_none()
+            && self.tokens_out.is_none()
+            && self.cache_read_tokens.is_none()
+            && self.cache_creation_tokens.is_none()
+        {
+            let metadata = self.metadata.get_or_insert_with(|| serde_json::json!({}));
+            if !metadata.is_object() {
+                *metadata = serde_json::json!({ "previous_metadata": metadata.clone() });
+            }
+            metadata["qualified_usage"] = serde_json::json!({});
+        }
+        self
+    }
+
     /// Attach the terminal run id to a journal event for attempt provenance.
     pub fn with_run_id(mut self, run_id: Option<&str>) -> Self {
         let Some(run_id) = run_id.filter(|value| !value.is_empty()) else {
@@ -9489,6 +9527,54 @@ mod tests {
     }
 
     #[test]
+    fn qualified_usage_replaces_observations_and_stale_witness() {
+        use astra_turn_types::CanonicalTokenUsage;
+        let unknown = CanonicalTokenUsage::new(None, None, None, None).unwrap();
+        for usage in [
+            None,
+            Some(unknown),
+            Some(CanonicalTokenUsage::new(Some(12), None, None, Some(2)).unwrap()),
+            Some(CanonicalTokenUsage::new(Some(0), Some(0), Some(0), Some(0)).unwrap()),
+        ] {
+            let mut event = JournalEvent::turn(Some("s"), 1, None, "in", "out", 0, 999, 888, 1)
+                .with_cache_tokens(777, 666)
+                .with_run_id(Some("run"));
+            event.metadata.as_mut().unwrap()["partial"] = serde_json::json!(true);
+            let event = event
+                .with_qualified_usage(Some(unknown))
+                .with_qualified_usage(usage);
+            let restored: JournalEvent =
+                serde_json::from_value(serde_json::to_value(event).unwrap()).unwrap();
+            let metadata = restored.metadata.as_ref().unwrap();
+            assert_eq!(metadata["run_id"], "run");
+            assert_eq!(metadata["partial"], true);
+            assert_eq!(
+                metadata.get("qualified_usage").is_some(),
+                usage == Some(unknown)
+            );
+            let ingestion =
+                crate::event_ingestion::IngestionEvent::from_journal_event(&restored, "user")
+                    .unwrap();
+            assert_eq!(ingestion.token_usage, usage.map(|usage| usage.to_json()));
+        }
+    }
+
+    #[test]
+    fn qualified_usage_preserves_non_object_metadata() {
+        let mut event = JournalEvent::turn(None, 1, None, "in", "out", 0, 0, 0, 1);
+        event.metadata = Some(serde_json::json!("diagnostic"));
+        let event = event.with_qualified_usage(Some(
+            astra_turn_types::CanonicalTokenUsage::new(None, None, None, None).unwrap(),
+        ));
+        assert_eq!(
+            event.metadata.unwrap(),
+            serde_json::json!({
+                "previous_metadata": "diagnostic", "qualified_usage": {}
+            })
+        );
+    }
+
+    #[test]
     fn turn_event_with_tool_calls_round_trip() {
         let evt = JournalEvent::turn(
             Some("s1"),
@@ -11423,8 +11509,8 @@ mod tests {
                 !ToolCallRecord {
                     name: "read_file".to_string(),
                     ok: true,
-                    error: Some("cached_cross_turn".into()),
-                    result_preview: Some("[cached_cross_turn: reused 200 bytes]".into()),
+                    error: Some("cached_same_invocation".into()),
+                    result_preview: Some("[cached_same_invocation: replayed 200 bytes]".into()),
                     ..Default::default()
                 }
                 .is_noop_or_cached_result(),

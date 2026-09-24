@@ -15,4 +15,6 @@ pub(crate) enum ExitCode {
     Partial = 5,
     /// Task result was requested before the task had finished (6)
     Unfinished = 6,
+    /// Session cancellation was accepted but execution is still settling (7).
+    CancellationPending = 7,
 }

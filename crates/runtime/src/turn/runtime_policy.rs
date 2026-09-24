@@ -782,11 +782,11 @@ fn evaluate_policy_boundary(
     let boundary_has_decisive_transition = authoritative_boundary_records
         .iter()
         .any(|record| record_is_decisive_transition(record));
-    let watch_will_be_ignored = state
+    let inspection_watch_will_converge = state
         .search_converged_followup_inspections
         .is_some_and(|followups| boundary_is_inspection_only && followups >= 1);
-    let general_entry_limit =
-        RuntimePolicyFeedbackSet::MAX_ENTRIES.saturating_sub(usize::from(watch_will_be_ignored));
+    let general_entry_limit = RuntimePolicyFeedbackSet::MAX_ENTRIES
+        .saturating_sub(usize::from(inspection_watch_will_converge));
     let prior_entries = match &state.latest {
         RuntimePolicyFeedbackSet::Evaluated {
             subject: prior_subject,
@@ -938,14 +938,14 @@ fn evaluate_policy_boundary(
             || entry.stage == RuntimePolicyStage::Converge
             || signal_reobserved(entry.signal)
     };
-    let low_yield_slot_is_needed = watch_will_be_ignored
+    let low_yield_slot_is_needed = inspection_watch_will_converge
         || (completed_rounds as usize >= thresholds.llm_round_churn
             && (sequential_single_call_streak >= thresholds.llm_round_churn
                 || entries
                     .iter()
                     .any(|entry| entry_corroborates_low_yield(entry))));
     let search_entry_limit = general_entry_limit.saturating_sub(usize::from(
-        low_yield_slot_is_needed && !watch_will_be_ignored,
+        low_yield_slot_is_needed && !inspection_watch_will_converge,
     ));
     let search_stage = (search_fanout >= thresholds.search_fanout).then(|| {
         stage(
@@ -953,11 +953,11 @@ fn evaluate_policy_boundary(
             saturating_u32(search_fanout),
         )
     });
-    let mut search_converge_was_projected = false;
+    let mut search_converge_was_emitted = false;
     if let Some(search_stage) = search_stage
         && entries.len() < search_entry_limit
     {
-        search_converge_was_projected = search_stage == RuntimePolicyStage::Converge;
+        search_converge_was_emitted = search_stage == RuntimePolicyStage::Converge;
         entries.push(RuntimePolicyFeedbackEntry {
             signal: RuntimePolicySignal::SearchFanout,
             stage: search_stage,
@@ -966,15 +966,15 @@ fn evaluate_policy_boundary(
             recommendation: RuntimePolicyRecommendation::NarrowEvidenceSearch,
         });
     }
-    // A Converge advisory is useful only if the next request can change the
-    // model's behavior. Permit one exact follow-up inspection, then surface a
-    // stronger decision/synthesis recommendation when a second authoritative
-    // boundary remains exclusively observational. This is still advisory:
-    // it changes no budget, tool admission, or terminal authority.
+    // Consecutive inspection-only boundaries after a Converge search signal
+    // strengthen the evidence for low-yield search. This is an observation,
+    // not proof that the model received or ignored the earlier advisory:
+    // cache capability may omit optional feedback from the provider wire.
+    // The signal changes no budget, tool admission, or terminal authority.
     //
     // Any typed action boundary resets the watch. It can re-arm only when a
-    // later boundary both contributes new search evidence and actually
-    // projects a Converge entry to the model. Introspect/reflect observe runtime
+    // later boundary both contributes new search evidence and emits a
+    // Converge entry. Introspect/reflect observe runtime
     // state and deliberately do not masquerade as task progress.
     if boundary_has_decisive_transition || lifecycle_transition {
         state.search_converged_followup_inspections = None;
@@ -982,10 +982,10 @@ fn evaluate_policy_boundary(
         if boundary_is_inspection_only {
             *followups = followups.saturating_add(1);
         }
-    } else if search_converge_was_projected && new_successful_searches > 0 {
+    } else if search_converge_was_emitted && new_successful_searches > 0 {
         state.search_converged_followup_inspections = Some(0);
     }
-    let ignored_search_advisory = state
+    let persistent_search_only_inspections = state
         .search_converged_followup_inspections
         .is_some_and(|followups| followups >= 2);
     // Long tasks are healthy. Round count becomes actionable only when a
@@ -1038,16 +1038,20 @@ fn evaluate_policy_boundary(
     let low_yield_corroborator_present = entries
         .iter()
         .any(|entry| entry_corroborates_low_yield(entry));
-    if (completed_rounds as usize >= thresholds.llm_round_churn || ignored_search_advisory)
+    if (completed_rounds as usize >= thresholds.llm_round_churn
+        || persistent_search_only_inspections)
         && (cadence_observed
             || low_yield_corroborator_present
             || sticky_convergence
-            || ignored_search_advisory)
+            || persistent_search_only_inspections)
         && entries.len() < RuntimePolicyFeedbackSet::MAX_ENTRIES
     {
         entries.push(RuntimePolicyFeedbackEntry {
             signal: RuntimePolicySignal::RoundActivity,
-            stage: if sticky_convergence || cadence_is_corroborated || ignored_search_advisory {
+            stage: if sticky_convergence
+                || cadence_is_corroborated
+                || persistent_search_only_inspections
+            {
                 RuntimePolicyStage::Converge
             } else {
                 RuntimePolicyStage::Observe
@@ -1354,7 +1358,7 @@ fn recommendation_text(
             "Exploration remains in one family. State the unresolved hypothesis and test it directly instead of repeating the family by default."
         }
         (RuntimePolicyRecommendation::TestExactHypothesis, RuntimePolicyStage::Converge) => {
-            "The same exploration family persisted after prior feedback. Stop repeating it; use the evidence already present to decide the hypothesis, or run one materially different decisive check."
+            "The same exploration family persists across observed boundaries. Use the evidence already present to decide the hypothesis, or run one materially different decisive check."
         }
         (RuntimePolicyRecommendation::ReviewReadCoverage, _) => {
             "Recorded reads cover overlapping ranges. This does not establish unchanged content or current context coverage. Check whether another read serves an unmet requirement; reuse prior results only when available and sufficient."
@@ -1369,13 +1373,13 @@ fn recommendation_text(
             "Several tool requests were rejected before execution. Re-read the visible schema and repair the exact arguments or authority boundary before issuing another request."
         }
         (RuntimePolicyRecommendation::RepairToolRequest, RuntimePolicyStage::Converge) => {
-            "Rejected requests persisted after prior feedback. Stop guessing at the call shape; inspect the live trace/schema and make one contract-valid request."
+            "Rejected requests persist across observed boundaries. Stop guessing at the call shape; inspect the live trace/schema and make one contract-valid request."
         }
         (RuntimePolicyRecommendation::NarrowEvidenceSearch, RuntimePolicyStage::Observe) => {
             "Search fan-out reached the advisory threshold. Summarize what is already known, name the remaining evidence gap, and run one narrow query for that gap. This is guidance, not evidence that the task should stop."
         }
         (RuntimePolicyRecommendation::NarrowEvidenceSearch, RuntimePolicyStage::Converge) => {
-            "Search fan-out persisted after prior feedback. Stop broad discovery; decide from collected evidence or inspect one exact unresolved location."
+            "Search fan-out persists across observed boundaries. Stop broad discovery; decide from collected evidence or inspect one exact unresolved location."
         }
         (RuntimePolicyRecommendation::ChangeValidationStrategy, RuntimePolicyStage::Observe) => {
             "The same validation family failed repeatedly without an intervening change. Diagnose the environment or prerequisite once before choosing a materially different validation path."
@@ -1383,7 +1387,10 @@ fn recommendation_text(
         (RuntimePolicyRecommendation::ChangeValidationStrategy, RuntimePolicyStage::Converge) => {
             "Validation retry churn persisted. Do not rerun equivalent checks; use authoritative CI/artifacts or fix the prerequisite, and state the resulting confidence boundary."
         }
-        (RuntimePolicyRecommendation::ReviewTaskProgress, _) => {
+        (RuntimePolicyRecommendation::ReviewTaskProgress, RuntimePolicyStage::Converge) => {
+            "The observed low-yield trajectory persists across tool boundaries. Before another broad inspection, compare the evidence already collected with the user's deliverables, name one material uncertainty, then choose one decisive check or synthesize with explicit limits. Continue necessary authorized work when that evidence is still missing."
+        }
+        (RuntimePolicyRecommendation::ReviewTaskProgress, RuntimePolicyStage::Observe) => {
             "Recorded activity crossed the review threshold. Round count alone does not measure progress. Compare observed results with the user's requirements; continue needed work or report the result and unresolved gaps."
         }
     }
@@ -2678,7 +2685,7 @@ mod tests {
     }
 
     #[test]
-    fn ignored_search_convergence_gets_one_precise_inspection_before_decision_guidance() {
+    fn persistent_search_gets_one_precise_inspection_before_decision_guidance() {
         let mut state = RuntimePolicyEvaluationState::default();
         let subject = RuntimePolicySubject::Run;
         let threshold = astra_turn_core::evaluation::SEARCH_FANOUT_THRESHOLD as u32;
@@ -2724,17 +2731,17 @@ mod tests {
             r#"{"path":"src/another_gap.rs"}"#,
             threshold + 3,
         ));
-        let ignored = evaluate_tool_boundary(&mut state, subject, &records, threshold + 3)
+        let persistent = evaluate_tool_boundary(&mut state, subject, &records, threshold + 3)
             .unwrap()
             .expect("continued inspection after the allowance changes guidance");
         assert!(
-            feedback_has_persistent_round_activity(&ignored),
+            feedback_has_persistent_round_activity(&persistent),
             "a second inspection-only boundary should produce decision guidance"
         );
     }
 
     #[test]
-    fn decisive_action_clears_ignored_search_transition_without_rearming_from_history() {
+    fn decisive_action_clears_search_inspection_watch_without_rearming_from_history() {
         let mut state = RuntimePolicyEvaluationState::default();
         let subject = RuntimePolicySubject::Run;
         let threshold = astra_turn_core::evaluation::SEARCH_FANOUT_THRESHOLD as u32;
@@ -2786,7 +2793,7 @@ mod tests {
                     .expect("post-action inspection is evaluated");
             assert!(
                 !feedback_has_persistent_round_activity(&feedback),
-                "historical fan-out must not immediately re-arm ignored-advisory state"
+                "historical fan-out must not immediately re-arm inspection watch"
             );
         }
     }
@@ -2830,14 +2837,14 @@ mod tests {
             r#"{"path":"src/still-inspecting.rs"}"#,
             threshold + 3,
         ));
-        let ignored = evaluate_tool_boundary(&mut state, subject, &records, threshold + 3)
+        let persistent = evaluate_tool_boundary(&mut state, subject, &records, threshold + 3)
             .unwrap()
             .expect("continued inspection is evaluated");
-        assert!(feedback_has_persistent_round_activity(&ignored));
+        assert!(feedback_has_persistent_round_activity(&persistent));
     }
 
     #[test]
-    fn batched_early_fanout_can_surface_ignored_guidance_before_round_churn_gate() {
+    fn batched_early_fanout_can_surface_persistent_search_before_round_churn_gate() {
         let mut state = RuntimePolicyEvaluationState::default();
         let subject = RuntimePolicySubject::Run;
         let threshold = astra_turn_core::evaluation::SEARCH_FANOUT_THRESHOLD as u32;
@@ -2866,10 +2873,10 @@ mod tests {
             "one directory inspection remains allowed"
         );
         records.push(executed("read_file", r#"{"path":"src/followup.rs"}"#, 4));
-        let ignored = evaluate_tool_boundary(&mut state, subject, &records, 4)
+        let persistent = evaluate_tool_boundary(&mut state, subject, &records, 4)
             .unwrap()
             .expect("second observation advances guidance");
-        assert!(feedback_has_persistent_round_activity(&ignored));
+        assert!(feedback_has_persistent_round_activity(&persistent));
     }
 
     #[test]
@@ -2924,10 +2931,10 @@ mod tests {
             r#"{"path":"src/still-observing.rs"}"#,
             threshold + 4,
         ));
-        let ignored = evaluate_tool_boundary(&mut state, subject, &records, threshold + 4)
+        let persistent = evaluate_tool_boundary(&mut state, subject, &records, threshold + 4)
             .unwrap()
             .expect("next authoritative inspection consumes the active watch");
-        assert!(feedback_has_persistent_round_activity(&ignored));
+        assert!(feedback_has_persistent_round_activity(&persistent));
     }
 
     #[test]
@@ -3058,7 +3065,7 @@ mod tests {
             let feedback =
                 evaluate_tool_boundary(&mut state, RuntimePolicySubject::Run, &[record], 1)
                     .unwrap()
-                    .expect("second inspection advances ignored-advisory guidance");
+                    .expect("second inspection advances persistent-search guidance");
             assert!(feedback_has_persistent_round_activity(&feedback));
             assert_eq!(state.search_converged_followup_inspections, Some(2));
         }
@@ -3089,7 +3096,7 @@ mod tests {
     }
 
     #[test]
-    fn unprojected_search_convergence_cannot_arm_ignored_advisory_watch() {
+    fn unemitted_search_convergence_cannot_arm_inspection_watch() {
         let thresholds = astra_turn_core::evaluation::EvaluationThresholds {
             redundant_overlapping_reads: 1,
             search_fanout: 1,
@@ -3168,13 +3175,13 @@ mod tests {
             let current = feedback.as_ref().unwrap_or_else(|| state.latest());
             assert!(
                 !feedback_has_persistent_round_activity(current),
-                "an advisory the model never received cannot be classified as ignored"
+                "an unemitted search signal cannot arm the inspection watch"
             );
         }
     }
 
     #[test]
-    fn delivered_search_watch_survives_later_projection_eviction() {
+    fn emitted_search_watch_survives_later_projection_eviction() {
         let thresholds = astra_turn_core::evaluation::EvaluationThresholds {
             redundant_overlapping_reads: 1,
             search_fanout: 1,
@@ -3250,12 +3257,12 @@ mod tests {
             r#"{"path":"src/second-followup.rs"}"#,
             4,
         ));
-        let ignored = evaluate_tool_boundary_with_thresholds(
+        let persistent = evaluate_tool_boundary_with_thresholds(
             &mut state, subject, &records, 4, thresholds, None,
         )
         .unwrap()
-        .expect("ignored guidance reserves a projection slot");
-        assert!(feedback_has_persistent_round_activity(&ignored));
+        .expect("persistent inspection evidence reserves a projection slot");
+        assert!(feedback_has_persistent_round_activity(&persistent));
     }
 
     #[test]
@@ -3697,12 +3704,13 @@ mod tests {
             assert_eq!(activity["signal"], "round_activity");
             assert_eq!(activity["recommendation"], "review_task_progress");
             assert_eq!(activity["evidence_count"], 12);
-            assert!(
-                activity["instruction"]
-                    .as_str()
-                    .unwrap()
-                    .contains("Round count alone does not measure progress")
-            );
+            let instruction = activity["instruction"].as_str().unwrap();
+            assert!(match stage {
+                RuntimePolicyStage::Observe =>
+                    instruction.contains("Round count alone does not measure progress"),
+                RuntimePolicyStage::Converge =>
+                    instruction.contains("observed low-yield trajectory persists"),
+            });
             let overlap = &payload["entries"][1];
             assert_eq!(overlap["signal"], "read_coverage_overlap");
             assert_eq!(overlap["recommendation"], "review_read_coverage");

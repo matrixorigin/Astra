@@ -295,6 +295,8 @@ mod tests {
             total_observation_tool_calls: 0,
             tool_ledger_receipt: Default::default(),
             has_any_usage: false,
+            qualified_usage: None,
+            last_request_usage: None,
             max_turns: 3,
             remaining_turns: 3,
             charged_iterations: 0,
@@ -317,7 +319,6 @@ mod tests {
                 .tool_policy
                 .effective_max_identical_calls(),
             max_tools_per_turn: 15,
-            repeated_cache_hit_suppression: 3,
             max_consecutive_empty_name: 3,
             stall: Default::default(),
             telemetry: Default::default(),

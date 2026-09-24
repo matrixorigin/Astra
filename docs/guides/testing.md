@@ -40,17 +40,22 @@ target triple, and profile. Test processes do not run nested Cargo builds.
 Live `astra-test` quality judging invokes `astra session judge --model MODEL
 --message JUDGMENT_REQUEST_JSON`. This is one tool-free `VerificationJudge`
 completion through the existing authenticated Offering and durable inference
-owners. The input is the shared `JudgmentRequest` schema; ordinary LLMs return
-fixed true/uncertain IDs and Jev returns native probabilities. The CLI returns
-normalized answers and their provenance. The harness requires one confident
-rubric category (fully yes, substantially yes, partial, or no), then maps it to
-1.0, 0.7, 0.4, or 0.0. Probabilities are never scores; uncertain, conflicting,
-and malformed judgments fail without format repair. Rubric wire IDs are
-descriptive strings (`rubric_fully_yes`, `rubric_substantially_yes`,
-`rubric_partial`, `rubric_no`), not numeric indices. Sparse chat answers contain
-only `true` and `uncertain`; false answers are omitted. Numeric IDs and an extra
-`false` field remain invalid, not coerced. Criterion thresholds and
-quorum aggregation remain unchanged. Each judgment and quorum vote creates its own
+owners. The input is the shared versioned `JudgmentRequest` schema. Ordinary
+LLMs return an `answers` map containing one explicitly typed discrete answer
+per exact question ID; Noul answers are yes/no/unknown, Choice answers name an
+option or use an explicit `null` for unknown, and Score answers name a level or
+use an explicit `null`. Omitting the Choice/Score field is malformed, not an
+implicit abstention.
+TypeSafe returns provider-native judgment values. The CLI returns normalized
+answers and execution-owned provenance; answer shape or model-name text cannot
+select the decoder. The harness requires one determined rubric category (fully
+yes, substantially yes, partial, or no), then maps it to 1.0, 0.7, 0.4, or 0.0.
+Judgment values are never scores; unknown, conflicting, and malformed rubric
+judgments fail without format repair. Rubric wire IDs are descriptive strings
+(`rubric_fully_yes`, `rubric_substantially_yes`, `rubric_partial`,
+`rubric_no`), not numeric indices. Missing, extra, duplicate, and wrongly typed
+answers remain invalid, not coerced. Criterion thresholds and quorum
+aggregation remain unchanged. Each judgment and quorum vote creates its own
 session; its real usage is separate from the measured agent session. The CLI
 closes the evaluation session after a completed response or client-error rejection.
 Uncertain gateway and transport failures retain the session identity for diagnosis without
@@ -80,8 +85,17 @@ CLI invocation. `astra session cancel` waits up to 10 seconds for the Server's
 `execution_settled: true` proof; a `cancelled` display status without that proof
 is not sufficient. Pending cancellation, missing proof, a different Session
 identity, or a timeout fails cleanup instead of claiming that the checkout is
-free. Deletion after capture is harness-owned history cleanup, not a requirement
+free. The CLI returns exit code `7` only for a typed, still-pending cancellation
+of the requested Session; the harness retries that result within one bounded
+cleanup window and never retries unrelated failures. Deletion after capture is
+harness-owned history cleanup, not a requirement
 for starting a new conversation in an idle checkout.
+An interactive Ctrl-C stops new case admission, kills the active CLI process
+group, and uses that same exact-Session cancellation path before returning a
+non-passing interrupted result. The case watchdog also covers stdout/stderr
+and machine-event drain after the CLI process exits; a descendant holding a
+pipe open cannot turn an incomplete capture into a passing result or leave the
+harness waiting without a bound.
 
 Live agent cases require exit 0 by default. A negative test can explicitly
 expect a nonzero terminal code using `exit_code`, together with the expected

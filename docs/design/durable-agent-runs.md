@@ -210,12 +210,28 @@ snapshot. The old reservation is identity evidence, not renewed authority.
 
 Original execution facts also retain the original TurnGuard. Its owning module
 validates both checkpoint serialization and restoration; recovery does not import
-it as fresh-session health or reset correction outcomes, warning watermarks,
-adaptive thresholds, or the workspace observation epoch. Retained stall keys
+it as fresh-session health or reset warning watermarks or the workspace
+observation epoch. Retained stall keys
 contain tool names and opaque digests, not complete arguments. Restoring the epoch
 preserves observation grouping only: it never authorizes reuse of process-local
 cached results. Malformed or contradictory facts reject execution restoration
 rather than being clamped into a healthy-looking state.
+
+TurnGuard observations do not establish that feedback was delivered or followed.
+Correction outcomes and correction-derived adaptive thresholds are not retained;
+the configured task profile and baseline stall window own signature detection.
+The strict continuation decoder rejects older TurnGuard payloads containing
+`pending_correction`, `corrections`, or `adaptive_thresholds`. Such checkpoints
+cannot resume exact execution across this schema change; they are not silently
+migrated into fresh state. Canonical runtime-policy feedback and pending context
+retain their existing owners and delivery semantics.
+
+The former command-prefix validation retry cap is also removed. Repetition and
+workspace epochs cannot prove that a validation run will yield no new evidence;
+the guard no longer persists `validation_attempts_since_workspace_mutation` or
+vetoes an otherwise authorized recheck. Strict restoration rejects checkpoints
+with that retired field. Existing permissions, execution budgets, and runtime
+policy advisories remain the owners of action control and feedback.
 
 Skill execution facts preserve the instructions already delivered, re-entry and
 auto-route attempt history, pinned/discovered skills, effort and effective sandbox
@@ -281,6 +297,11 @@ observation uses constant-size evidence, not a serialized tool-history scan.
 Weak mutation receipts may preserve negative invalidation, never artifact delivery
 or positive mutation-completion authority. An independent subsequent observation
 can discharge observation debt without upgrading the writer's authority.
+Explicit Bash `mode=verify` is admitted only after its prepared invocation owner
+can provide authoritative descendant settlement. A weak process-group fallback
+rejects it before starting the command; an ordinary Bash test may still run,
+but its output alone is not an explicit unchanged-workspace receipt. Typed file
+observation does not replace a required script or test result.
 
 The handoff also records exact primary Work custody using the existing Work
 binding and item-attempt identifiers. Its explicit variants distinguish no

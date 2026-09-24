@@ -503,7 +503,8 @@ impl Deref for PreparedChatTurnPayload {
 /// contract. Conversation history, model rounds, tool results, and canonical
 /// turn identity deliberately do not cross this boundary: the Server restores
 /// and advances those authorities itself.
-pub(crate) fn server_loop_admission_payload(
+#[cfg(test)]
+fn server_loop_admission_payload(
     prepared: &Value,
     message: &str,
     explain: bool,
@@ -511,7 +512,7 @@ pub(crate) fn server_loop_admission_payload(
     server_loop_admission_payload_with_execution_time_budget(prepared, message, explain, None)
 }
 
-fn server_loop_admission_payload_with_execution_time_budget(
+pub(crate) fn server_loop_admission_payload_with_execution_time_budget(
     prepared: &Value,
     message: &str,
     explain: bool,
@@ -1646,10 +1647,48 @@ async fn chat_turn_post_payload_after_prepare(
         None => None,
     };
     let http_mark = Instant::now();
-    let resp = api
-        .post_developer_loop_retry_429(token, &server_payload, CHAT_TURN_POST_MAX_RETRIES, quiet)
-        .await
-        .map_err(|e| e.to_string())?;
+    let admission = api.post_developer_loop_retry_429_with_payload(
+        token,
+        CHAT_TURN_POST_MAX_RETRIES,
+        quiet,
+        || {
+            let mut payload = server_payload.clone();
+            if let Some(clock) = execution_time_budget_clock {
+                let remaining_seconds = clock.remaining().remaining_seconds;
+                if tokio::time::Instant::now() >= clock.admission_deadline()
+                    || remaining_seconds == 0
+                {
+                    return Err(astra_thin_client::ThinClientError::AdmissionDeadlineExpired);
+                }
+                payload["execution_time_budget"]["remaining_seconds"] =
+                    serde_json::Value::from(remaining_seconds);
+            }
+            Ok(payload)
+        },
+    );
+    let resp = if let Some(clock) = execution_time_budget_clock {
+        tokio::time::timeout_at(clock.admission_deadline(), admission)
+            .await
+            .map_err(|_| {
+                astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::BudgetExhausted,
+                    "execution time budget expired during Server admission",
+                )
+                .to_string()
+            })?
+    } else {
+        admission.await
+    }
+    .map_err(|e| match e {
+        astra_thin_client::ThinClientError::AdmissionDeadlineExpired => {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::BudgetExhausted,
+                "execution time budget expired before Server admission",
+            )
+            .to_string()
+        }
+        other => other.to_string(),
+    })?;
     if ui.timing {
         eprintln!(
             "{}",

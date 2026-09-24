@@ -996,6 +996,9 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
                     request.depth,
                 ),
                 async {
+                    if !astra_services::tool_result_selection_observation::historical_tool_result_judgment_facet_enabled(request.facet) {
+                        return astra_services::tool_result_selection_observation::ToolResultJudgmentView::default();
+                    }
                     if matches!(
                         request.source_policy,
                         astra_core::SourcePolicy::LiveOnly | astra_core::SourcePolicy::LocalOnly
@@ -1052,7 +1055,9 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
             }
             snapshot.judgment_usage = Some(usage);
             snapshot.semantic_judgments = Some(semantics);
-            snapshot.tool_result_judgments = Some(tool_result_judgments);
+            if astra_services::tool_result_selection_observation::historical_tool_result_judgment_facet_enabled(request.facet) {
+                snapshot.tool_result_judgments = Some(tool_result_judgments);
+            }
         }
         let run_id = args
             .get("_run_id")
@@ -1768,6 +1773,36 @@ mod tests {
             assert_eq!(report["semantic_judgments"]["coverage"], expected);
             assert!(report["semantic_judgments"]["counts"].is_null());
             assert!(report["semantic_judgments"].get("model_adoption").is_none());
+            assert!(
+                report.get("tool_result_judgments").is_none(),
+                "overview must omit unrequested historical selector evidence"
+            );
+
+            let trace = IntrospectToolHandler
+                .execute(
+                    &executor,
+                    &serde_json::json!({
+                        "format":"json", "facet":"trace", "source_policy":policy,
+                    }),
+                    None,
+                )
+                .await;
+            assert!(!trace.is_error);
+            let trace_report: Value = serde_json::from_str(&trace.output).unwrap();
+            assert_eq!(trace_report["judgment_usage"]["coverage"], expected);
+            assert_eq!(trace_report["semantic_judgments"]["coverage"], expected);
+            assert_eq!(
+                trace_report["tool_result_judgments"]["evaluation_coverage"],
+                if policy == "auto" {
+                    "source_unavailable"
+                } else {
+                    "source_excluded"
+                }
+            );
+            assert_eq!(
+                trace_report["tool_result_judgments"]["application_coverage"],
+                trace_report["tool_result_judgments"]["evaluation_coverage"]
+            );
         }
     }
 

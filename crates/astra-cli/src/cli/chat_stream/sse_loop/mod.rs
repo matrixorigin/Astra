@@ -9,7 +9,7 @@ mod agentic_sse_loop;
 mod server_admission_host;
 
 pub(crate) use agentic_loop_turn::{
-    server_loop_admission_payload, turn_policy_from_payload_edge_tools,
+    server_loop_admission_payload_with_execution_time_budget, turn_policy_from_payload_edge_tools,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -442,6 +442,7 @@ pub(crate) async fn stream_chat_sse(
                 client_tool_delivery_tx: None,
                 trace_context: None,
                 execution_metadata: None,
+                execution_deadline: None,
                 workspace_mutation:
                     astra_runtime::orchestration::WorkspaceMutationAuthority::default(),
                 transcript_location:
@@ -870,6 +871,8 @@ pub(crate) async fn stream_chat_sse(
         last_finish_reason: None,
         total_observation_tool_calls: 0,
         has_any_usage: false,
+        qualified_usage: None,
+        last_request_usage: None,
         max_turns,
         remaining_turns: max_turns,
         charged_iterations: 0,
@@ -892,7 +895,6 @@ pub(crate) async fn stream_chat_sse(
         call_counts: HashMap::new(),
         max_identical_tool_calls: resolved_tool_policy.max_identical_tool_calls,
         max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
-        repeated_cache_hit_suppression: resolved_tool_policy.repeated_cache_hit_suppression,
         max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
         stall: {
             let mut stall = StallTrackingState::default();
@@ -909,7 +911,7 @@ pub(crate) async fn stream_chat_sse(
             first_ttft_ms: None,
             all_tools_used: HashSet::new(),
             authoritative_llm_rounds: None,
-            server_summary_run_ids: HashSet::new(),
+            server_summary_run_usage: Default::default(),
             server_summary_llm_rounds: 0,
             server_summary_tool_calls: 0,
             server_summary_observation_tool_calls: 0,
@@ -1229,6 +1231,7 @@ pub(crate) async fn stream_chat_sse(
                 completion_tokens: state.total_completion,
                 cache_read_tokens: state.total_cache_read,
                 cache_creation_tokens: state.total_cache_creation,
+                qualified_usage: state.qualified_usage,
                 usage_attribution,
                 tool_calls_count,
                 llm_rounds: Some(state.llm_rounds_completed),
@@ -1353,6 +1356,7 @@ pub(crate) async fn stream_chat_sse(
         completion_tokens: state.total_completion,
         cache_read_tokens: state.total_cache_read,
         cache_creation_tokens: state.total_cache_creation,
+        qualified_usage: state.qualified_usage,
         usage_attribution,
         tool_calls_count: state.total_tool_calls,
         tool_ledger_aggregate,

@@ -245,37 +245,17 @@ fn non_negative_i32_to_u32(value: i32, context: &str, column: &str) -> Result<u3
         .map_err(|_| format!("{context}: column `{column}` expected u32 range, got {value}"))
 }
 
-fn token_usage_i64_or_zero(value: &Value, field: &str, context: &str) -> Result<i64, String> {
-    match value.get(field) {
-        None | Some(Value::Null) => Ok(0),
-        Some(raw) => {
-            let count = raw.as_i64().ok_or_else(|| {
-                format!("{context}: token_usage field `{field}` must be an integer, got {raw}")
-            })?;
-            if count < 0 {
-                return Err(format!(
-                    "{context}: token_usage field `{field}` must be non-negative, got {count}"
-                ));
-            }
-            Ok(count)
-        }
-    }
-}
-
 fn cache_token_counts_from_token_usage_json(
     raw: &str,
     context: &str,
-) -> Result<(i64, i64), String> {
+) -> Result<(Option<i64>, Option<i64>), String> {
     let value: Value = serde_json::from_str(raw)
         .map_err(|error| format!("{context}: token_usage JSON decode failed: {error}"))?;
-    if !value.is_object() {
-        return Err(format!(
-            "{context}: token_usage must be an object, got {value}"
-        ));
-    }
+    let usage = astra_turn_types::CanonicalTokenUsage::from_json(&value)
+        .map_err(|error| format!("{context}: {error}"))?;
     Ok((
-        token_usage_i64_or_zero(&value, "cached_input_tokens", context)?,
-        token_usage_i64_or_zero(&value, "cache_creation_tokens", context)?,
+        usage.cached_input_tokens().map(|value| value as i64),
+        usage.cache_creation_tokens().map(|value| value as i64),
     ))
 }
 
@@ -300,22 +280,26 @@ fn apply_restore_cache_token_usage(
             return false;
         }
     };
-    let Some(next_cache_read_total) = cache_read_total.checked_add(cache_read) else {
+    // These are observed subtotals, not complete request measurements. A missing
+    // lane leaves its subtotal unchanged; it does not establish measured zero.
+    let Some(next_cache_read_total) = cache_read_total.checked_add(cache_read.unwrap_or(0)) else {
         tracing::warn!(
             target: "astra_services::session_restore",
             event_id = event_id,
             current_total = *cache_read_total,
-            delta = cache_read,
+            delta = ?cache_read,
             "cache read token total overflow while restoring session; skipping event token counters"
         );
         return false;
     };
-    let Some(next_cache_creation_total) = cache_creation_total.checked_add(cache_creation) else {
+    let Some(next_cache_creation_total) =
+        cache_creation_total.checked_add(cache_creation.unwrap_or(0))
+    else {
         tracing::warn!(
             target: "astra_services::session_restore",
             event_id = event_id,
             current_total = *cache_creation_total,
-            delta = cache_creation,
+            delta = ?cache_creation,
             "cache creation token total overflow while restoring session; skipping event token counters"
         );
         return false;
@@ -339,10 +323,10 @@ pub struct RestoredSession {
     pub total_tokens_in: u64,
     /// Total output tokens consumed so far.
     pub total_tokens_out: u64,
-    /// Total prompt-cache read tokens consumed so far.
+    /// Observed prompt-cache read subtotal; not proof of complete usage.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub total_cache_read_tokens: u64,
-    /// Total prompt-cache creation tokens consumed so far.
+    /// Observed prompt-cache creation subtotal; not proof of complete usage.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub total_cache_creation_tokens: u64,
     /// Recently used tools (for context carry-forward).
@@ -3165,11 +3149,11 @@ mod tests {
         .to_string();
         assert_eq!(
             cache_token_counts_from_token_usage_json(&raw, "test").expect("cache split"),
-            (4, 3)
+            (Some(4), Some(3))
         );
         assert_eq!(
-            cache_token_counts_from_token_usage_json("{}", "test").expect("missing fields default"),
-            (0, 0)
+            cache_token_counts_from_token_usage_json("{}", "test").expect("unknown sample"),
+            (None, None)
         );
         let error = cache_token_counts_from_token_usage_json(
             r#"{"cached_input_tokens":-1,"cache_creation_tokens":0}"#,
@@ -3177,6 +3161,44 @@ mod tests {
         )
         .expect_err("negative cache counts must fail");
         assert!(error.contains("non-negative"));
+    }
+
+    #[test]
+    fn restore_cache_subtotals_keep_known_lanes_and_reject_contradictions() {
+        assert_eq!(
+            cache_token_counts_from_token_usage_json(r#"{"cached_input_tokens":0}"#, "test")
+                .unwrap(),
+            (Some(0), None)
+        );
+        let mut read = 4;
+        let mut creation = 3;
+        for raw in [
+            r#"{"output_tokens":7}"#,
+            "{}",
+            r#"{"cached_input_tokens":null}"#,
+        ] {
+            assert!(apply_restore_cache_token_usage(
+                raw,
+                "partial",
+                &mut read,
+                &mut creation
+            ));
+            assert_eq!((read, creation), (4, 3));
+        }
+        assert!(apply_restore_cache_token_usage(
+            r#"{"cache_creation_tokens":2}"#,
+            "known",
+            &mut read,
+            &mut creation
+        ));
+        assert_eq!((read, creation), (4, 5));
+        assert!(!apply_restore_cache_token_usage(
+            r#"{"input_tokens":10,"cached_input_tokens":2,"cache_creation_tokens":0,"output_tokens":3,"total_tokens":14}"#,
+            "contradictory",
+            &mut read,
+            &mut creation,
+        ));
+        assert_eq!((read, creation), (4, 5));
     }
 
     #[test]

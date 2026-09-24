@@ -72,6 +72,8 @@ impl UsageLaneAccumulator {
 pub(crate) struct UsageAttribution {
     pub(crate) primary: Option<AttributedTokenUsage>,
     pub(crate) primary_complete: bool,
+    /// Input-only eligibility, derived from canonical facts; never persisted.
+    pub(crate) primary_input_complete: bool,
     pub(crate) primary_attempts: u32,
     pub(crate) primary_model: Option<String>,
     /// Explain delivery or settlement was degraded. This is independent of
@@ -181,10 +183,17 @@ impl UsageAttribution {
                     && !model.eq_ignore_ascii_case("default")
             });
 
+        let primary_input_complete =
+            !explain_analyze_degraded && graph.primary_prompt_cache_usage().is_some();
         Self {
             primary: primary_accumulator.finish(),
-            primary_complete: primary_attempts > 0
-                && primary_accumulator_complete(&graph, &scope_coverage, explain_analyze_degraded),
+            primary_input_complete,
+            primary_complete: primary_input_complete
+                && provider_attempt_nodes.iter().all(|node| {
+                    node.usage
+                        .as_ref()
+                        .is_some_and(|usage| usage.output_tokens.is_some())
+                }),
             primary_attempts,
             primary_model,
             capture_degraded: explain_analyze_degraded,
@@ -304,37 +313,6 @@ impl UsageAttribution {
     }
 }
 
-fn primary_accumulator_complete(
-    graph: &astra_turn_types::ExplainAnalyzeGraphV1,
-    scope_coverage: &[astra_turn_types::ExplainAnalyzeScopeCoverageV1],
-    explain_analyze_degraded: bool,
-) -> bool {
-    !scope_coverage.is_empty()
-        && scope_coverage
-            .iter()
-            .all(|scope| scope.terminal_turn_observed && !scope.turn_conflicted)
-        && !explain_analyze_degraded
-        && graph.diagnostics().is_empty()
-        && graph
-            .nodes()
-            .iter()
-            .filter(|node| node.kind == astra_turn_types::ExplainAnalyzeNodeKindV1::ProviderAttempt)
-            .all(|node| {
-                node.start_observed
-                    && node.terminal_observed
-                    && !node.conflicted
-                    && node.usage.as_ref().is_some_and(|usage| {
-                        usage.is_valid()
-                            && usage.basis
-                                == astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderExact
-                            && usage.fresh_input_tokens.is_some()
-                            && usage.cache_read_tokens.is_some()
-                            && usage.cache_creation_tokens.is_some()
-                            && usage.output_tokens.is_some()
-                    })
-            })
-}
-
 fn provider_attempt_model_name(label: &str) -> Option<&str> {
     label
         .strip_prefix("Model request ·")
@@ -423,6 +401,7 @@ impl OutputTransportFailure {
 /// Enables enriched error logging, failure learning, and post-mortem analysis.
 #[derive(Debug, Default)]
 pub(crate) struct PartialTurnData {
+    pub qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
     pub tool_call_records: Vec<astra_services::session_journal::ToolCallRecord>,
     pub tools_used: Vec<String>,
     pub stall_events: Vec<(String, u32)>,
@@ -468,7 +447,8 @@ pub(crate) struct PartialTurnData {
     /// a user-facing suffix and cannot represent tools or reasoning.
     pub run_transcript_messages: Vec<serde_json::Value>,
     /// The local client can no longer settle or observe an admitted durable
-    /// run, so that exact owner must receive an explicit cancellation request.
+    /// run. The outer lifecycle decides whether exact-owner cancellation is
+    /// appropriate; a clean internal stream detach preserves server recovery.
     pub remote_cancel_required: bool,
     /// An edge callback acknowledgement failed and this client detached.
     /// The sentence in `TurnFailure::error` states that fact only. The outer
@@ -544,6 +524,46 @@ pub(crate) struct TurnFailure {
     pub partial: PartialTurnData,
 }
 
+impl TurnFailure {
+    /// Observation of an internal transport failure is not a user request to
+    /// cancel the durable run. This only classifies the failure; callers must
+    /// still enforce their own identity/lease boundary before releasing it.
+    pub(crate) fn is_clean_internal_stream_detach(&self) -> bool {
+        self.partial.remote_cancel_required
+            && !self.partial.callback_client_detached
+            && self.partial.output_transport_failure.is_none()
+            && self.partial.interruption.as_ref().is_some_and(|record| {
+                matches!(
+                    record.get("kind").and_then(serde_json::Value::as_str),
+                    Some("stream_transport" | "stream_idle" | "executor_dropped")
+                )
+            })
+    }
+}
+
+#[cfg(test)]
+mod internal_detach_tests {
+    use super::{PartialTurnData, TurnFailure};
+
+    #[test]
+    fn only_clean_internal_detach_preserves_run_control() {
+        let mut failure = TurnFailure {
+            error: "stream closed".into(),
+            partial: PartialTurnData {
+                remote_cancel_required: true,
+                interruption: Some(serde_json::json!({"kind": "stream_transport"})),
+                ..Default::default()
+            },
+        };
+        assert!(failure.is_clean_internal_stream_detach());
+        failure.partial.callback_client_detached = true;
+        assert!(!failure.is_clean_internal_stream_detach());
+        failure.partial.callback_client_detached = false;
+        failure.partial.interruption = Some(serde_json::json!({"kind": "cancelled"}));
+        assert!(!failure.is_clean_internal_stream_detach());
+    }
+}
+
 /// Promote a typed, resumable runtime interruption into the same terminal
 /// shape used by the normal stream path.
 ///
@@ -586,6 +606,7 @@ pub(crate) fn stream_result_from_resumable_turn_failure(
         completion_tokens: failure.partial.completion_tokens,
         cache_read_tokens: failure.partial.cache_read_tokens,
         cache_creation_tokens: failure.partial.cache_creation_tokens,
+        qualified_usage: failure.partial.qualified_usage,
         usage_attribution: failure.partial.usage_attribution.clone(),
         tool_calls_count: failure.partial.tool_calls_count,
         llm_rounds: failure.partial.llm_rounds,
@@ -679,6 +700,7 @@ pub(crate) fn root_run_transcript_events(
 /// Result of a streaming chat turn, including token counts and tool usage data.
 #[derive(Debug)]
 pub(crate) struct StreamResult {
+    pub(crate) qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
     pub(crate) session_id: Option<String>,
     pub(crate) run_id: Option<String>,
     /// Durable local persistence failure recorded after the runtime finished
@@ -690,8 +712,7 @@ pub(crate) struct StreamResult {
     pub(crate) cache_read_tokens: u64,
     pub(crate) cache_creation_tokens: u64,
     /// Explicit attribution for user-visible summaries. The four legacy
-    /// counters above intentionally remain overall run totals for settlement
-    /// and billing compatibility.
+    /// counters above remain observed run subtotals, not complete billing evidence.
     pub(crate) usage_attribution: UsageAttribution,
     pub(crate) tool_calls_count: u32,
     /// Canonical fixed-size closure of every local and remote tool attempt in
@@ -1054,6 +1075,50 @@ mod user_input_tests {
 #[cfg(test)]
 mod usage_attribution_tests {
     use super::UsageAttribution;
+
+    #[test]
+    fn primary_input_coverage_is_independent_of_output() {
+        let mut events = vec![
+            started_primary("primary"),
+            finished_primary(
+                "primary",
+                Some(astra_turn_types::ExplainAnalyzeTokenUsageV1 {
+                    basis: astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderExact,
+                    fresh_input_tokens: Some(100),
+                    cache_read_tokens: Some(900),
+                    cache_creation_tokens: Some(0),
+                    output_tokens: None,
+                }),
+            ),
+            auxiliary_event(true, vec![]),
+        ];
+        let usage = UsageAttribution::from_explain_analyze_events(&events, None, false);
+        assert!(usage.primary_input_complete);
+        assert!(!usage.primary_complete);
+        let projection = crate::cli::turn::turn_reporting::project_primary_usage(&usage, false);
+        assert_eq!(
+            crate::cli::turn::turn_reporting::format_primary_usage_summary(
+                projection.fresh_input_tokens,
+                projection.output_tokens,
+                projection.cache_read_tokens,
+                projection.cache_creation_tokens,
+                projection.observed,
+                projection.complete,
+                projection.input_complete,
+            )
+            .as_deref(),
+            Some("≥1.0k tokens · 90% cached")
+        );
+        assert!(
+            !UsageAttribution::from_explain_analyze_events(&events, None, true)
+                .primary_input_complete
+        );
+        events[1].usage.as_mut().unwrap().cache_creation_tokens = None;
+        assert!(
+            !UsageAttribution::from_explain_analyze_events(&events, None, false)
+                .primary_input_complete
+        );
+    }
 
     fn finished_primary(
         node_id: &str,
@@ -1523,6 +1588,7 @@ impl Default for StreamResult {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             usage_attribution: UsageAttribution::default(),
+            qualified_usage: None,
             tool_calls_count: 0,
             tool_ledger_aggregate: Default::default(),
             visible_tools: vec![],

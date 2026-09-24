@@ -141,10 +141,15 @@ impl CaseExecutor for AstraCliExecutor {
             "--model".into(),
             shell_escape(model.to_string()),
             "--json".into(),
+            "--explain=on".into(),
             "--stream-events".into(),
             "\"$(mktemp -d)/events.jsonl\"".into(),
             "-y".into(),
         ]);
+        if let Some(cli_wall_time_seconds) = case.cli_wall_time_seconds {
+            parts.push("--max-wall-time-seconds".into());
+            parts.push(shell_escape(cli_wall_time_seconds.to_string()));
+        }
         for extra in &case.extra_cli_args {
             parts.push(shell_escape(extra.clone()));
         }
@@ -208,7 +213,10 @@ fn merge_step_event_stats(out: &mut RunOutcome, stats: crate::session_capture::S
 // Keep human diagnostics bounded independently of turn duration while
 // continuing to drain stderr so the tested CLI cannot block on a full pipe.
 const MAX_CAPTURED_STDERR_BYTES: usize = 256 * 1024;
-const MAX_STREAM_EVENT_LINE_BYTES: usize = 64 * 1024;
+// A canonical snapshot is one JSONL envelope, not one line per fact. Allow
+// envelope headroom beyond the archive budget, still bounded before parsing.
+// Archive overflow is diagnostic loss, not invalid lifecycle binding.
+const MAX_STREAM_EVENT_LINE_BYTES: usize = 2 * crate::explain_capture::MAX_BYTES;
 const STDERR_TRUNCATION_NOTICE: &[u8] =
     b"\n[astra-test] stderr capture truncated; further live events omitted\n";
 
@@ -266,6 +274,7 @@ struct MachineEventObservation {
     run_id: Option<String>,
     event_count: u64,
     invalid: Option<String>,
+    explain: crate::explain_capture::ExplainCapture,
 }
 
 impl MachineEventObservation {
@@ -285,6 +294,7 @@ impl MachineEventObservation {
             return;
         };
         self.event_count = self.event_count.saturating_add(1);
+        self.explain.observe(&value);
         let observed = match event_type {
             "session_bound" => session_id_from_stream_event(line).map(|id| (true, id)),
             "run_bound" => run_id_from_stream_event(line).map(|id| (false, id)),
@@ -399,8 +409,8 @@ async fn observe_machine_event_file(
 }
 
 #[cfg(unix)]
-async fn kill_process_group_and_reap(child: &mut tokio::process::Child) {
-    if let Some(pid) = child.id()
+async fn kill_process_group_and_reap(child: &mut tokio::process::Child, group_id: Option<u32>) {
+    if let Some(pid) = group_id
         && pid <= i32::MAX as u32
     {
         let _ = nix::sys::signal::killpg(
@@ -412,14 +422,24 @@ async fn kill_process_group_and_reap(child: &mut tokio::process::Child) {
     let _ = child.wait().await;
 }
 
+async fn wait_for_user_cancel(flag: Option<&Arc<std::sync::atomic::AtomicBool>>) {
+    let Some(flag) = flag else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 #[cfg(not(unix))]
-async fn kill_process_group_and_reap(child: &mut tokio::process::Child) {
+async fn kill_process_group_and_reap(child: &mut tokio::process::Child, _group_id: Option<u32>) {
     let _ = child.kill().await;
     let _ = child.wait().await;
 }
 
 async fn join_output_reader(
-    reader: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    reader: &mut tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
 ) -> Result<Vec<u8>, String> {
     reader
         .await
@@ -428,7 +448,7 @@ async fn join_output_reader(
 }
 
 async fn join_stderr_reader(
-    reader: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    reader: &mut tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
 ) -> Result<Vec<u8>, String> {
     reader
         .await
@@ -438,7 +458,7 @@ async fn join_stderr_reader(
 
 async fn finish_machine_event_observer(
     done: tokio_util::sync::CancellationToken,
-    reader: tokio::task::JoinHandle<std::io::Result<()>>,
+    reader: &mut tokio::task::JoinHandle<std::io::Result<()>>,
     observation: &Arc<Mutex<MachineEventObservation>>,
 ) -> Result<(Option<String>, Option<String>), String> {
     done.cancel();
@@ -453,6 +473,80 @@ async fn finish_machine_event_observer(
         return Err(error.clone());
     }
     Ok((observation.session_id.clone(), observation.run_id.clone()))
+}
+
+type CollectedCaseStreams = (Result<Vec<u8>, String>, Result<Vec<u8>, String>);
+
+async fn collect_case_streams(
+    stdout_reader: &mut tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    stderr_reader: &mut tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    stdout_result: &mut Option<Result<Vec<u8>, String>>,
+    stderr_result: &mut Option<Result<Vec<u8>, String>>,
+    deadline: tokio::time::Instant,
+) -> Result<CollectedCaseStreams, &'static str> {
+    while stdout_result.is_none() || stderr_result.is_none() {
+        tokio::select! {
+            result = join_output_reader(stdout_reader), if stdout_result.is_none() => *stdout_result = Some(result),
+            result = join_stderr_reader(stderr_reader), if stderr_result.is_none() => *stderr_result = Some(result),
+            _ = tokio::time::sleep_until(deadline) => {
+                stdout_reader.abort();
+                stderr_reader.abort();
+                return Err("timeout while draining subprocess evidence");
+            }
+        }
+    }
+    Ok((
+        stdout_result.take().expect("stdout reader completed"),
+        stderr_result.take().expect("stderr reader completed"),
+    ))
+}
+
+async fn finish_machine_event_observer_bounded(
+    done: tokio_util::sync::CancellationToken,
+    reader: &mut tokio::task::JoinHandle<std::io::Result<()>>,
+    observation: &Arc<Mutex<MachineEventObservation>>,
+    deadline: tokio::time::Instant,
+) -> Result<(Option<String>, Option<String>), String> {
+    match tokio::time::timeout_at(
+        deadline,
+        finish_machine_event_observer(done, reader, observation),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            reader.abort();
+            Err("machine event drain timed out".into())
+        }
+    }
+}
+
+fn observed_machine_identity(
+    observation: &Arc<Mutex<MachineEventObservation>>,
+) -> (Option<String>, Option<String>) {
+    observation.lock().ok().map_or((None, None), |observed| {
+        if observed.invalid.is_some() {
+            (None, None)
+        } else {
+            (observed.session_id.clone(), observed.run_id.clone())
+        }
+    })
+}
+
+async fn finish_failed_evidence_outcome(
+    cfg: &RunnerConfig,
+    observation: &Arc<Mutex<MachineEventObservation>>,
+    mut outcome: RunOutcome,
+) -> RunOutcome {
+    // Capture integrity and cleanup authority are separate. A failed final
+    // read cannot certify the run, but an earlier unambiguous server-issued
+    // session identity still needs to be cancelled before returning.
+    let (session_id, _) = observed_machine_identity(observation);
+    outcome
+        .stderr
+        .push_str(&cleanup_observed_session(cfg, session_id.as_deref()).await);
+    retain_machine_capture(&mut outcome, observation);
+    outcome
 }
 
 async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> RunOutcome {
@@ -505,10 +599,15 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
     cmd.arg("--model")
         .arg(model)
         .arg("--json")
+        .arg("--explain=on")
         // Exact lifecycle evidence used only for safe timeout convergence.
         .arg("--stream-events")
         .arg(&stream_event_path)
         .arg("-y");
+    if let Some(cli_wall_time_seconds) = case.cli_wall_time_seconds {
+        cmd.arg("--max-wall-time-seconds")
+            .arg(cli_wall_time_seconds.to_string());
+    }
     if let Some(ref wd) = cfg.working_dir {
         cmd.current_dir(wd);
     }
@@ -534,6 +633,21 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
         cmd.process_group(0);
     }
 
+    if cfg
+        .cancel_flag
+        .as_ref()
+        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+    {
+        return RunOutcome {
+            model: model.into(),
+            exit_code: 130,
+            text: "cancelled before CLI subprocess admission".into(),
+            final_state: Some("interrupted".into()),
+            interruption_kind: Some("cancelled".into()),
+            duration_ms: start.elapsed().as_millis() as u64,
+            ..Default::default()
+        };
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -546,6 +660,8 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
                 run_id: None,
                 final_state: None,
                 interruption_kind: None,
+                error_kind: None,
+                explain_capture: None,
                 tool_result_class_counts: std::collections::BTreeMap::new(),
                 tool_calls_count: 0,
                 tools_used: vec![],
@@ -562,16 +678,17 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
         }
     };
 
+    let child_group_id = child.id();
     let stdout = child.stdout.take().expect("piped stdout is present");
     let stderr = child.stderr.take().expect("piped stderr is present");
     let machine_observation = Arc::new(Mutex::new(MachineEventObservation::default()));
     let machine_observer_done = tokio_util::sync::CancellationToken::new();
-    let machine_event_reader = tokio::spawn(observe_machine_event_file(
+    let mut machine_event_reader = tokio::spawn(observe_machine_event_file(
         stream_event_path,
         Arc::clone(&machine_observation),
         machine_observer_done.clone(),
     ));
-    let stdout_reader = tokio::spawn(async move {
+    let mut stdout_reader = tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
 
         let mut stdout = stdout;
@@ -579,21 +696,49 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
         stdout.read_to_end(&mut bytes).await?;
         Ok::<_, std::io::Error>(bytes)
     });
-    let stderr_reader = tokio::spawn(collect_stderr(stderr));
+    let mut stderr_reader = tokio::spawn(collect_stderr(stderr));
+    // A cancellation can interrupt the wait after either reader completes.
+    // Keep that result outside the wait future so no JoinHandle is polled twice.
+    let mut stdout_result = None;
+    let mut stderr_result = None;
 
     let timeout = Duration::from_secs(case.timeout_seconds);
-    // Drain both pipes and observe the dedicated machine-event file
-    // concurrently. The file carries the server-issued binding before final
-    // JSON exists, so a timeout can cancel the exact run without treating
-    // human stderr diagnostics as protocol data.
-    match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) => {
-            let stdout = join_output_reader(stdout_reader).await;
-            let stderr = join_stderr_reader(stderr_reader).await;
-            let machine = finish_machine_event_observer(
-                machine_observer_done,
-                machine_event_reader,
+    let deadline = tokio::time::Instant::from_std(start + timeout);
+    // Keep the child unreaped until both pipes close. If a descendant holds a
+    // pipe open, the unreaped child still owns its process-group ID when the
+    // deadline fires; a cached integer after wait/reap would not be safe to
+    // signal on a busy multi-session host.
+    let (stream_result, cancelled_during_drain) = tokio::select! {
+        biased;
+        streams = collect_case_streams(&mut stdout_reader, &mut stderr_reader, &mut stdout_result, &mut stderr_result, deadline) => (Some(streams), false),
+        _ = wait_for_user_cancel(cfg.cancel_flag.as_ref()) => (None, true),
+    };
+    let mut drained_streams = None;
+    let mut drain_error = None;
+    let (wait_result, user_cancelled) = match stream_result {
+        Some(Ok(streams)) => {
+            drained_streams = Some(streams);
+            tokio::select! {
+                biased;
+                status = child.wait() => (Some(status), false),
+                _ = wait_for_user_cancel(cfg.cancel_flag.as_ref()) => (None, true),
+                _ = tokio::time::sleep_until(deadline) => (None, false),
+            }
+        }
+        Some(Err(error)) => {
+            drain_error = Some(error);
+            (None, false)
+        }
+        None => (None, cancelled_during_drain),
+    };
+    let mut outcome = match wait_result {
+        Some(Ok(status)) => {
+            let (stdout, stderr) = drained_streams.expect("pipes closed before child was reaped");
+            let machine = finish_machine_event_observer_bounded(
+                machine_observer_done.clone(),
+                &mut machine_event_reader,
                 &machine_observation,
+                deadline,
             )
             .await;
             let (stdout, stderr, (observed_session_id, _observed_run_id)) = match (
@@ -616,10 +761,10 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
                         String::from_utf8_lossy(&stderr)
                     );
                     out.duration_ms = start.elapsed().as_millis() as u64;
-                    return out;
+                    return finish_failed_evidence_outcome(cfg, &machine_observation, out).await;
                 }
                 (stdout_error, stderr_error, machine_error) => {
-                    return RunOutcome {
+                    let out = RunOutcome {
                         model: model.into(),
                         exit_code: -1,
                         text: format!(
@@ -628,6 +773,7 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
                         duration_ms: start.elapsed().as_millis() as u64,
                         ..Default::default()
                     };
+                    return finish_failed_evidence_outcome(cfg, &machine_observation, out).await;
                 }
             };
             let stdout = String::from_utf8_lossy(&stdout).into_owned();
@@ -662,17 +808,33 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
             }
             out
         }
-        Ok(Err(error)) => {
-            kill_process_group_and_reap(&mut child).await;
-            let _stdout = join_output_reader(stdout_reader).await.unwrap_or_default();
-            let stderr = join_stderr_reader(stderr_reader).await.unwrap_or_default();
-            let machine = finish_machine_event_observer(
-                machine_observer_done,
-                machine_event_reader,
+        Some(Err(error)) => {
+            kill_process_group_and_reap(&mut child, child_group_id).await;
+            let stderr = if let Some((_stdout, stderr)) = drained_streams {
+                stderr.unwrap_or_default()
+            } else {
+                collect_case_streams(
+                    &mut stdout_reader,
+                    &mut stderr_reader,
+                    &mut stdout_result,
+                    &mut stderr_result,
+                    tokio::time::Instant::now() + Duration::from_secs(2),
+                )
+                .await
+                .ok()
+                .and_then(|(_stdout, stderr)| stderr.ok())
+                .unwrap_or_default()
+            };
+            let machine = finish_machine_event_observer_bounded(
+                machine_observer_done.clone(),
+                &mut machine_event_reader,
                 &machine_observation,
+                tokio::time::Instant::now() + Duration::from_secs(2),
             )
             .await;
-            let (session_id, _) = machine.clone().unwrap_or_default();
+            let (session_id, _) = machine
+                .clone()
+                .unwrap_or_else(|_| observed_machine_identity(&machine_observation));
             let cleanup = cleanup_observed_session(cfg, session_id.as_deref()).await;
             RunOutcome {
                 model: model.into(),
@@ -690,29 +852,52 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
                 ..Default::default()
             }
         }
-        Err(_timed_out) => {
-            kill_process_group_and_reap(&mut child).await;
-            let _stdout = join_output_reader(stdout_reader).await.unwrap_or_default();
-            let stderr = join_stderr_reader(stderr_reader).await.unwrap_or_default();
-            let machine = finish_machine_event_observer(
-                machine_observer_done,
-                machine_event_reader,
+        None => {
+            kill_process_group_and_reap(&mut child, child_group_id).await;
+            let stderr = if let Some((_stdout, stderr)) = drained_streams {
+                stderr.unwrap_or_default()
+            } else {
+                collect_case_streams(
+                    &mut stdout_reader,
+                    &mut stderr_reader,
+                    &mut stdout_result,
+                    &mut stderr_result,
+                    tokio::time::Instant::now() + Duration::from_secs(2),
+                )
+                .await
+                .ok()
+                .and_then(|(_stdout, stderr)| stderr.ok())
+                .unwrap_or_default()
+            };
+            let machine = finish_machine_event_observer_bounded(
+                machine_observer_done.clone(),
+                &mut machine_event_reader,
                 &machine_observation,
+                tokio::time::Instant::now() + Duration::from_secs(2),
             )
             .await;
-            let (session_id, observed_run_id) = machine.clone().unwrap_or_default();
+            let (session_id, observed_run_id) = machine
+                .clone()
+                .unwrap_or_else(|_| observed_machine_identity(&machine_observation));
             let cleanup = cleanup_observed_session(cfg, session_id.as_deref()).await;
             let stderr = String::from_utf8_lossy(&stderr).into_owned();
             let mut out = RunOutcome {
                 model: model.into(),
-                // POSIX `timeout` utility exits 124 — follow the convention.
-                // Cancellation only converges resources; it never turns the
-                // timed-out product run into a passing harness result.
-                exit_code: 124,
+                // Both paths remain non-successful after resource convergence.
+                exit_code: if user_cancelled { 130 } else { 124 },
                 text: format!(
-                    "timeout after {}s (case timeout_seconds={}){cleanup}{}",
-                    timeout.as_secs(),
-                    case.timeout_seconds,
+                    "{}{cleanup}{}",
+                    if user_cancelled {
+                        "cancelled by user".to_string()
+                    } else if let Some(error) = drain_error {
+                        error.to_string()
+                    } else {
+                        format!(
+                            "timeout after {}s (case timeout_seconds={})",
+                            timeout.as_secs(),
+                            case.timeout_seconds
+                        )
+                    },
                     machine
                         .err()
                         .map(|error| format!("; invalid machine events: {error}"))
@@ -725,11 +910,18 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
                 // work so invocation scoping keeps this run's durable events.
                 run_id: observed_run_id,
                 final_state: Some("interrupted".into()),
-                interruption_kind: Some("timeout".into()),
+                interruption_kind: Some(
+                    if user_cancelled {
+                        "cancelled"
+                    } else {
+                        "timeout"
+                    }
+                    .into(),
+                ),
                 duration_ms: start.elapsed().as_millis() as u64,
                 ..Default::default()
             };
-            // A timeout does not erase typed progress that was durably
+            // An interruption does not erase typed progress that was durably
             // emitted before cancellation. Merge the same owner-scoped
             // step-event counters used by the normal exit path so the
             // classifier can distinguish "provider never started" from a
@@ -747,7 +939,36 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
             }
             out
         }
+    };
+    retain_machine_capture(&mut outcome, &machine_observation);
+    outcome
+}
+
+fn retain_machine_capture(
+    outcome: &mut RunOutcome,
+    observation: &Arc<Mutex<MachineEventObservation>>,
+) {
+    let mut capture = crate::explain_capture::ExplainCapture::default();
+    if let Ok(observed) = observation.lock() {
+        capture = observed.explain.clone();
+        if observed.invalid.is_some() {
+            capture.diagnose("invalid_machine_stream");
+        }
+        let binding_matches = outcome.session_id.is_some()
+            && outcome.session_id == observed.session_id
+            && outcome.run_id == observed.run_id;
+        capture.bind(if binding_matches {
+            outcome.run_id.as_deref()
+        } else {
+            None
+        });
+    } else {
+        capture.diagnose("capture_reader_unavailable");
     }
+    if outcome.exit_code != 0 || outcome.final_state.as_deref() != Some("completed") {
+        capture.diagnose("execution_incomplete");
+    }
+    outcome.explain_capture = Some(capture);
 }
 
 async fn cleanup_observed_session(cfg: &RunnerConfig, session_id: Option<&str>) -> String {
@@ -917,6 +1138,70 @@ impl CaseExecutor for ExternalCmdExecutor {
 pub(crate) mod test_support {
     //! Fake executor/judger helpers shared by suite + integration tests.
 
+    pub(crate) fn cache_outcome(run: &str, read: u64, creation: u64) -> crate::runner::RunOutcome {
+        cache_request_outcome(run, "t", &[(100, read, creation)])
+    }
+
+    pub(crate) fn cache_request_outcome(
+        run: &str,
+        turn: &str,
+        usages: &[(u64, u64, u64)],
+    ) -> crate::runner::RunOutcome {
+        let mut out = crate::runner::RunOutcome::new("m");
+        out.run_id = Some(run.into());
+        out.session_id = Some("cache-session".into());
+        let mut capture = crate::explain_capture::ExplainCapture::default();
+        let mut nodes = vec![("turn".to_owned(), "turn", None, None)];
+        for (index, usage) in usages.iter().enumerate() {
+            nodes.push((
+                format!("model-{index}"),
+                "model_round",
+                Some(index as u32),
+                None,
+            ));
+            nodes.push((
+                format!("request-{index}"),
+                "provider_attempt",
+                Some(index as u32),
+                Some(*usage),
+            ));
+        }
+        for (node, kind, round, usage) in nodes {
+            let mut start = serde_json::json!({"schema_version":1,
+                "event_id":format!("{node}-start"),"run_id":run,"turn_id":turn,
+                "node_id":node,"producer_id":"p","clock_domain_id":"c",
+                "kind":kind,"label":node,"transition":"started","elapsed_ms":0});
+            if let Some(round) = round {
+                start["round_index"] = serde_json::json!(round);
+                start["attempt_index"] = serde_json::json!(0);
+                start["parent_node_id"] = serde_json::json!(if kind == "model_round" {
+                    "turn".to_owned()
+                } else {
+                    format!("model-{round}")
+                });
+            }
+            let mut finish = start.clone();
+            finish["event_id"] = serde_json::json!(format!("{node}-finish"));
+            finish["transition"] = serde_json::json!("finished");
+            finish["outcome"] = serde_json::json!("completed");
+            finish["start_elapsed_ms"] = serde_json::json!(0);
+            finish["duration_ms"] = serde_json::json!(0);
+            if let Some((fresh, read, creation)) = usage {
+                finish["usage"] = serde_json::json!({"basis":"provider_exact",
+                    "fresh_input_tokens":fresh,"cache_read_tokens":read,"cache_creation_tokens":creation});
+            }
+            for fact in [start, finish] {
+                let fact: astra_turn_types::ExplainAnalyzeEventV1 =
+                    serde_json::from_value(fact).unwrap();
+                assert!(fact.is_valid());
+                capture.events.push(fact);
+            }
+        }
+        capture.bind(Some(run));
+        out.explain_capture = Some(capture);
+        out
+    }
+
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -977,6 +1262,8 @@ pub(crate) mod test_support {
                     ttft_ms: 0,
                     final_state: None,
                     interruption_kind: None,
+                    error_kind: None,
+                    explain_capture: None,
                     tool_result_class_counts: std::collections::BTreeMap::new(),
                 })
         }
@@ -1033,13 +1320,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn incomplete_execution_retains_explain_facts_without_certifying_identity() {
+        let mut observed = MachineEventObservation::default();
+        observed.observe_line(r#"{"type":"explain_analyze","schema_version":1,"event_id":"e","run_id":"foreign","turn_id":"t","node_id":"n","producer_id":"p","clock_domain_id":"c","kind":"admission","label":"Admission","transition":"started","elapsed_ms":0}"#);
+        observed.observe_line("corrupt trailing evidence");
+        let mut outcome = RunOutcome {
+            exit_code: 124,
+            ..Default::default()
+        };
+        retain_machine_capture(&mut outcome, &Arc::new(Mutex::new(observed)));
+        let capture = outcome.explain_capture.unwrap();
+        assert_eq!(capture.events.len(), 1);
+        assert!(!capture.identity_verified);
+        assert!(
+            capture
+                .diagnostics
+                .contains(&"invalid_machine_stream".into())
+        );
+        assert!(capture.diagnostics.contains(&"execution_incomplete".into()));
+    }
+
+    #[tokio::test]
+    async fn failed_evidence_cleanup_uses_verified_session_but_not_conflicting_identity() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shim = tmp.path().join("fake-astra");
+        crate::test_support::write_executable_shim(
+            &shim,
+            concat!(
+                "#!/bin/sh\n",
+                "if [ \"$1\" = session ] && [ \"$2\" = cancel ] && [ \"$3\" = 550e8400-e29b-41d4-a716-446655440000 ]; then\n",
+                "  printf '%s\\n' '{\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"status\":\"cancelled\",\"execution_settled\":true}'\n",
+                "  exit 0\n",
+                "fi\n",
+                "exit 88\n",
+            ),
+        )
+        .expect("write shim");
+        let cfg = RunnerConfig::new(shim);
+        let observation = Arc::new(Mutex::new(MachineEventObservation::default()));
+        observation.lock().unwrap().observe_line(
+            r#"{"type":"session_bound","session_id":"550e8400-e29b-41d4-a716-446655440000"}"#,
+        );
+
+        let failed_capture = || RunOutcome {
+            exit_code: -1,
+            text: "subprocess evidence collection failed".into(),
+            ..Default::default()
+        };
+        let recovered = finish_failed_evidence_outcome(&cfg, &observation, failed_capture()).await;
+        assert!(recovered.stderr.contains("observed session cancelled"));
+        assert!(
+            recovered.session_id.is_none(),
+            "failed capture cannot certify a run"
+        );
+
+        observation.lock().unwrap().observe_line(
+            r#"{"type":"session_bound","session_id":"550e8400-e29b-41d4-a716-446655440001"}"#,
+        );
+        let conflicting =
+            finish_failed_evidence_outcome(&cfg, &observation, failed_capture()).await;
+        assert!(
+            conflicting
+                .stderr
+                .contains("no server-issued session identity observed")
+        );
+        assert!(!conflicting.stderr.contains("observed session cancelled"));
+    }
+
     #[tokio::test]
     async fn machine_event_file_observer_reads_dedicated_jsonl_before_shutdown() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
         let observation = Arc::new(Mutex::new(MachineEventObservation::default()));
         let done = tokio_util::sync::CancellationToken::new();
-        let reader = tokio::spawn(observe_machine_event_file(
+        let mut reader = tokio::spawn(observe_machine_event_file(
             path.clone(),
             Arc::clone(&observation),
             done.clone(),
@@ -1054,7 +1412,7 @@ mod tests {
         .await
         .unwrap();
 
-        let (session_id, run_id) = finish_machine_event_observer(done, reader, &observation)
+        let (session_id, run_id) = finish_machine_event_observer(done, &mut reader, &observation)
             .await
             .unwrap();
 
@@ -1066,6 +1424,42 @@ mod tests {
             run_id.as_deref(),
             Some("8a0dcb50-38a7-4402-bef3-2c1aee9a4e85")
         );
+    }
+
+    #[tokio::test]
+    async fn machine_file_observer_accepts_snapshot_larger_than_old_line_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let events: Vec<_> = (0..400)
+            .map(|id| {
+                serde_json::json!({
+                    "schema_version":1,"event_id":format!("e{id}"),"run_id":"r",
+                    "turn_id":"t","node_id":format!("n{id}"),"producer_id":"p",
+                    "clock_domain_id":"c","kind":"admission","label":"Admission",
+                    "transition":"started","elapsed_ms":0
+                })
+            })
+            .collect();
+        let line = serde_json::json!({"type":"explain_analyze_snapshot",
+            "events":events,"delivery_degraded":false})
+        .to_string()
+            + "\n";
+        assert!(line.len() > 64 * 1024);
+        tokio::fs::write(&path, line).await.unwrap();
+        let observation = Arc::new(Mutex::new(MachineEventObservation::default()));
+        let done = tokio_util::sync::CancellationToken::new();
+        let mut reader = tokio::spawn(observe_machine_event_file(
+            path,
+            observation.clone(),
+            done.clone(),
+        ));
+        finish_machine_event_observer(done, &mut reader, &observation)
+            .await
+            .unwrap();
+        let observed = observation.lock().unwrap();
+        assert!(observed.invalid.is_none());
+        assert_eq!(observed.explain.events.len(), 400);
+        assert!(observed.explain.diagnostics.is_empty());
     }
 
     #[test]
@@ -1154,7 +1548,8 @@ mod tests {
             criteria: vec![],
             debug_log: false,
             extra_cli_args: vec!["--verbose".into()],
-            timeout_seconds: 60,
+            timeout_seconds: 180,
+            cli_wall_time_seconds: Some(180),
             capability: None,
             required_cache_scope: None,
             difficulty: None,
@@ -1176,6 +1571,14 @@ mod tests {
         assert!(repro.contains("--model"));
         assert!(repro.contains("qwen-flash"));
         assert!(repro.contains("--verbose"));
+        assert!(repro.contains("--max-wall-time-seconds '180'"));
+        let default_case = simple_case();
+        assert!(
+            !exec
+                .reproducer(&default_case, "qwen-flash")
+                .contains("--max-wall-time-seconds"),
+            "the harness must not silently shorten other cases' execution budgets"
+        );
         // POSIX single-quote escape: `'say '\''hello'\'''` preserves
         // the original bytes without relying on double-quote semantics
         // (which would still expand $ and backticks). A prompt with
@@ -1212,6 +1615,8 @@ mod tests {
         .expect("write shim");
 
         let mut case = simple_case();
+        case.timeout_seconds = 180;
+        case.cli_wall_time_seconds = Some(180);
         case.cli_env.insert(
             "HARNESS_ARGS_PATH".into(),
             args_path.to_string_lossy().into_owned(),
@@ -1229,6 +1634,14 @@ mod tests {
             "root turn must not fabricate a resumable id: {root_args:?}"
         );
         assert!(root_args.lines().any(|arg| arg == "--no-resume"));
+        assert!(
+            root_args
+                .lines()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|pair| pair == ["--max-wall-time-seconds", "180"]),
+            "CLI watchdog must receive the same outer wall budget: {root_args:?}"
+        );
 
         case.extra_cli_args = vec![
             "--session-id".into(),
@@ -1398,6 +1811,8 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
                 "done\n",
                 "printf '%s\\n' '{\"type\":\"session_bound\",\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\"}' > \"$events\"\n",
                 "printf '%s\\n' '{\"type\":\"run_bound\",\"run_id\":\"550e8400-e29b-41d4-a716-446655440001\"}' >> \"$events\"\n",
+                r#"printf '%s\n' '{"type":"explain_analyze","schema_version":1,"event_id":"e","run_id":"550e8400-e29b-41d4-a716-446655440001","turn_id":"t","node_id":"n","producer_id":"p","clock_domain_id":"c","kind":"admission","label":"Admission","transition":"started","elapsed_ms":0}' >> "$events""#,
+                "\n",
                 "sleep 10\n",
             ),
         )
@@ -1415,6 +1830,7 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 5,
+            cli_wall_time_seconds: None,
             capability: None,
             required_cache_scope: None,
             difficulty: None,
@@ -1429,6 +1845,15 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
         let start = std::time::Instant::now();
         let outcome = exec.execute(&case, "ignored").await;
         let elapsed = start.elapsed();
+
+        let capture = outcome
+            .explain_capture
+            .as_ref()
+            .expect("timeout retains capture");
+        assert_eq!(capture.events.len(), 1);
+        assert!(capture.identity_verified);
+        assert!(capture.snapshot_pending);
+        assert!(capture.diagnostics.contains(&"execution_incomplete".into()));
 
         // `kill_on_drop` + explicit timeout capped the elapsed wall
         // time near the 5s budget. 2s slack for CI scheduling noise.
@@ -1471,6 +1896,222 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn user_cancel_kills_active_cli_and_settles_observed_session() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        use crate::test_support::write_executable_shim;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shim = tmp.path().join("fake-astra");
+        let ready = tmp.path().join("ready");
+        write_executable_shim(
+            &shim,
+            concat!(
+                "#!/bin/sh\n",
+                "if [ \"$1\" = session ] && [ \"$2\" = cancel ] && [ \"$3\" = 550e8400-e29b-41d4-a716-446655440000 ]; then\n",
+                "  printf '%s\\n' '{\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"status\":\"cancelled\",\"execution_settled\":true}'\n",
+                "  exit 0\n",
+                "fi\n",
+                "events=; next_is_events=0\n",
+                "for arg in \"$@\"; do\n",
+                "  if [ \"$next_is_events\" = 1 ]; then events=$arg; next_is_events=0;\n",
+                "  elif [ \"$arg\" = --stream-events ]; then next_is_events=1; fi\n",
+                "done\n",
+                "printf '%s\\n' '{\"type\":\"session_bound\",\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\"}' > \"$events\"\n",
+                "printf '%s\\n' '{\"type\":\"run_bound\",\"run_id\":\"550e8400-e29b-41d4-a716-446655440001\"}' >> \"$events\"\n",
+                "touch \"$HARNESS_READY_PATH\"\n",
+                "sleep 10\n",
+            ),
+        )
+        .expect("write shim");
+
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut cfg = RunnerConfig::new(shim);
+        cfg.cancel_flag = Some(flag.clone());
+        let exec = AstraCliExecutor::new(cfg);
+        let mut case = simple_case();
+        case.timeout_seconds = 15;
+        case.cli_env.insert(
+            "HARNESS_READY_PATH".into(),
+            ready.to_string_lossy().into_owned(),
+        );
+        let start = std::time::Instant::now();
+        let running = tokio::spawn(async move { exec.execute(&case, "ignored").await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("CLI shim must publish the session binding before cancellation");
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let outcome = running.await.expect("executor task");
+        assert!(start.elapsed().as_secs() < 7, "cancel did not reap the CLI");
+        assert_eq!(outcome.exit_code, 130);
+        assert_eq!(outcome.interruption_kind.as_deref(), Some("cancelled"));
+        assert_eq!(outcome.final_state.as_deref(), Some("interrupted"));
+        assert_eq!(
+            outcome.session_id.as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
+        assert_eq!(
+            outcome.run_id.as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440001")
+        );
+        assert!(outcome.text.contains("observed session cancelled"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn exited_cli_with_open_descendant_pipe_settles_timeout_and_cancel() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        use crate::test_support::write_executable_shim;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shim = tmp.path().join("fake-astra");
+        write_executable_shim(
+            &shim,
+            concat!(
+                "#!/bin/sh\n",
+                "if [ \"$1\" = session ] && [ \"$2\" = cancel ]; then\n",
+                "  printf '%s\\n' '{\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"status\":\"cancelled\",\"execution_settled\":true}'\n",
+                "  exit 0\n",
+                "fi\n",
+                "events=; next_is_events=0\n",
+                "for arg in \"$@\"; do\n",
+                "  if [ \"$next_is_events\" = 1 ]; then events=$arg; next_is_events=0;\n",
+                "  elif [ \"$arg\" = --stream-events ]; then next_is_events=1; fi\n",
+                "done\n",
+                "printf '%s\\n' '{\"type\":\"session_bound\",\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\"}' > \"$events\"\n",
+                "sleep 5 &\n",
+                "if [ -n \"$HARNESS_READY_PATH\" ]; then touch \"$HARNESS_READY_PATH\"; fi\n",
+                "exit 0\n",
+            ),
+        )
+        .expect("write shim");
+        let exec = AstraCliExecutor::new(RunnerConfig::new(shim.clone()));
+        let mut case = simple_case();
+        case.timeout_seconds = 2;
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            exec.execute(&case, "ignored"),
+        )
+        .await
+        .expect("case watchdog must cover stdout/stderr drain after CLI exit");
+        assert_eq!(outcome.exit_code, 124);
+        assert_eq!(outcome.interruption_kind.as_deref(), Some("timeout"));
+        assert!(
+            outcome
+                .text
+                .contains("timeout while draining subprocess evidence")
+        );
+        assert!(outcome.text.contains("observed session cancelled"));
+
+        let ready = tmp.path().join("drain-ready");
+        case.timeout_seconds = 10;
+        case.cli_env.insert(
+            "HARNESS_READY_PATH".into(),
+            ready.to_string_lossy().into_owned(),
+        );
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut cfg = RunnerConfig::new(shim);
+        cfg.cancel_flag = Some(flag.clone());
+        let exec = AstraCliExecutor::new(cfg);
+        let running = tokio::spawn(async move { exec.execute(&case, "ignored").await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("CLI shim must enter the open-pipe drain window");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let cancelled = tokio::time::timeout(std::time::Duration::from_secs(4), running)
+            .await
+            .expect("cancel must interrupt pipe drain promptly")
+            .expect("executor task");
+        assert_eq!(cancelled.exit_code, 130);
+        assert_eq!(cancelled.interruption_kind.as_deref(), Some("cancelled"));
+        assert!(cancelled.text.contains("observed session cancelled"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn one_open_pipe_does_not_repoll_completed_reader_on_timeout_or_cancel() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        use crate::test_support::write_executable_shim;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for (pipe, child_command) in [
+            ("stdout", "sleep 5 2>/dev/null &"),
+            ("stderr", "sleep 5 >/dev/null &"),
+        ] {
+            let shim = tmp.path().join(format!("fake-astra-{pipe}"));
+            let script = format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = session ] && [ \"$2\" = cancel ]; then\n\
+                   printf '%s\\n' '{{\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"status\":\"cancelled\",\"execution_settled\":true}}'\n\
+                   exit 0\n\
+                 fi\n\
+                 events=; next_is_events=0\n\
+                 for arg in \"$@\"; do\n\
+                   if [ \"$next_is_events\" = 1 ]; then events=$arg; next_is_events=0;\n\
+                   elif [ \"$arg\" = --stream-events ]; then next_is_events=1; fi\n\
+                 done\n\
+                 printf '%s\\n' '{{\"type\":\"session_bound\",\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\"}}' > \"$events\"\n\
+                 {child_command}\n\
+                 if [ -n \"$HARNESS_READY_PATH\" ]; then touch \"$HARNESS_READY_PATH\"; fi\n\
+                 exit 0\n"
+            );
+            write_executable_shim(&shim, &script).expect("write shim");
+
+            let mut case = simple_case();
+            case.timeout_seconds = 2;
+            let timed_out = tokio::time::timeout(
+                std::time::Duration::from_secs(4),
+                AstraCliExecutor::new(RunnerConfig::new(shim.clone())).execute(&case, "ignored"),
+            )
+            .await
+            .expect("case deadline must settle open pipe");
+            assert_eq!(timed_out.exit_code, 124, "{pipe}: {}", timed_out.text);
+            assert!(timed_out.text.contains("observed session cancelled"));
+
+            let ready = tmp.path().join(format!("ready-{pipe}"));
+            case.timeout_seconds = 10;
+            case.cli_env.insert(
+                "HARNESS_READY_PATH".into(),
+                ready.to_string_lossy().into_owned(),
+            );
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut cfg = RunnerConfig::new(shim);
+            cfg.cancel_flag = Some(flag.clone());
+            let running =
+                tokio::spawn(
+                    async move { AstraCliExecutor::new(cfg).execute(&case, "ignored").await },
+                );
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !ready.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("shim must enter pipe drain");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            let cancelled = tokio::time::timeout(std::time::Duration::from_secs(4), running)
+                .await
+                .expect("cancel must settle open pipe")
+                .expect("executor task");
+            assert_eq!(cancelled.exit_code, 130, "{pipe}: {}", cancelled.text);
+            assert!(cancelled.text.contains("observed session cancelled"));
+        }
+    }
+
+    #[tokio::test]
     async fn fake_executor_records_calls_and_returns_seeded_outcome() {
         let fe = test_support::FakeExecutor::new();
         let mut seed = RunOutcome {
@@ -1493,6 +2134,8 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             ttft_ms: 0,
             final_state: None,
             interruption_kind: None,
+            error_kind: None,
+            explain_capture: None,
             tool_result_class_counts: std::collections::BTreeMap::new(),
         };
         seed.exit_code = 0;
@@ -1508,6 +2151,7 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 60,
+            cli_wall_time_seconds: None,
             capability: None,
             required_cache_scope: None,
             difficulty: None,
@@ -1542,6 +2186,7 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 60,
+            cli_wall_time_seconds: None,
             capability: None,
             required_cache_scope: None,
             difficulty: None,

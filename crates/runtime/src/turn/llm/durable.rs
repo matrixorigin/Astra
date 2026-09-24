@@ -55,10 +55,6 @@ impl DurableInferenceRunAuthority {
         }
     }
 
-    pub(crate) fn admission_authority(&self) -> astra_services::InferenceRunAdmissionAuthority {
-        self.durable.clone()
-    }
-
     fn local_fence_error(&self, stage: &'static str) -> Option<astra_core::ClassifiedError> {
         if self
             .execution_lease_lost
@@ -118,6 +114,7 @@ impl DurableInferenceRunAuthority {
 pub(crate) struct DurableInferenceCallOutcome {
     logical_attempt: u32,
     invocation_id: Option<String>,
+    pub(crate) qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
     result: Result<LlmCallResult, astra_core::ClassifiedError>,
 }
 
@@ -2297,20 +2294,18 @@ impl InferenceLedgerPersistence for TestInferenceLedgerPersistence {
         plan: &astra_services::InferenceInvocationPlan,
     ) -> astra_services::ServiceResult<()> {
         let mut state = self.lock();
-        if state
-            .invocations
-            .insert(
-                plan.invocation_id().to_string(),
-                TestInvocationState::default(),
-            )
-            .is_some()
-        {
-            return Err(astra_services::ServiceError::conflict(format!(
-                "test inference invocation {} was admitted twice",
-                plan.invocation_id()
-            )));
+        match state.invocations.entry(plan.invocation_id().to_string()) {
+            std::collections::btree_map::Entry::Occupied(_) => {
+                Err(astra_services::ServiceError::conflict(format!(
+                    "test inference invocation {} was admitted twice",
+                    plan.invocation_id()
+                )))
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(TestInvocationState::default());
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     async fn settle_uncertain_admission(
@@ -2485,26 +2480,24 @@ impl InferenceLedgerPersistence for TestInferenceLedgerPersistence {
                 attempt.attempt_id()
             )));
         }
-        if state
-            .attempts
-            .insert(
-                attempt.attempt_id().to_string(),
-                TestProviderAttemptState {
+        match state.attempts.entry(attempt.attempt_id().to_string()) {
+            std::collections::btree_map::Entry::Occupied(_) => {
+                Err(astra_services::ServiceError::conflict(format!(
+                    "test provider attempt {} was admitted twice",
+                    attempt.attempt_id()
+                )))
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(TestProviderAttemptState {
                     invocation_id: attempt.invocation_id().to_string(),
                     canonical_transition_hash: attempt
                         .canonical_transition_hash()
                         .map(str::to_string),
                     terminal: None,
-                },
-            )
-            .is_some()
-        {
-            return Err(astra_services::ServiceError::conflict(format!(
-                "test provider attempt {} was admitted twice",
-                attempt.attempt_id()
-            )));
+                });
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     async fn finish_provider_attempt(
@@ -3150,20 +3143,6 @@ impl DurableInferenceLedger {
         .await
     }
 
-    pub(crate) async fn execute_nonstream_with_execution_round(
-        &self,
-        client: &reqwest::Client,
-        scope: astra_turn_types::InferenceInvocationScope,
-        call: LlmCall<'_>,
-        timeout: std::time::Duration,
-        execution_round: u32,
-    ) -> DurableInferenceCallOutcome {
-        let mut request_context = astra_services::ModelRequestContextSeed::server_default();
-        request_context.execution_round = Some(execution_round);
-        self.execute_nonstream_with_request_context(client, scope, call, timeout, request_context)
-            .await
-    }
-
     async fn execute_nonstream_with_request_context(
         &self,
         client: &reqwest::Client,
@@ -3188,16 +3167,18 @@ impl DurableInferenceLedger {
                 return DurableInferenceCallOutcome {
                     logical_attempt: failure.logical_attempt,
                     invocation_id: None,
+                    qualified_usage: None,
                     result: Err(failure.error),
                 };
             }
         };
         let logical_attempt = invocation.logical_attempt();
         let invocation_id = invocation.invocation_id().to_string();
+        let invocation = Arc::new(invocation);
         let result = async {
             let owner_lease = invocation.owner_lease.clone();
             let attempt_observer = invocation.attempt_observer_arc();
-            let settlement = NonstreamInvocationSupervisor::start(Arc::new(invocation));
+            let settlement = NonstreamInvocationSupervisor::start(invocation.clone());
             let provider = crate::turn::llm::client::call_llm_nonstream_with_attempt_observer(
                 client,
                 call,
@@ -3264,6 +3245,7 @@ impl DurableInferenceLedger {
         DurableInferenceCallOutcome {
             logical_attempt,
             invocation_id: Some(invocation_id),
+            qualified_usage: invocation.qualified_usage().await,
             result,
         }
     }
@@ -3285,18 +3267,6 @@ impl DurableInferenceLedger {
             astra_services::ModelRequestContextSeed::server_default(),
         )
         .await
-    }
-
-    pub(crate) async fn execute_stream_no_tool_choice_with_execution_round(
-        &self,
-        scope: astra_turn_types::InferenceInvocationScope,
-        call: LlmCall<'_>,
-        execution_round: u32,
-    ) -> DurableInferenceCallOutcome {
-        let mut request_context = astra_services::ModelRequestContextSeed::server_default();
-        request_context.execution_round = Some(execution_round);
-        self.execute_stream_no_tool_choice_with_request_context(scope, call, request_context)
-            .await
     }
 
     async fn execute_stream_no_tool_choice_with_request_context(
@@ -3321,16 +3291,18 @@ impl DurableInferenceLedger {
                 return DurableInferenceCallOutcome {
                     logical_attempt: failure.logical_attempt,
                     invocation_id: None,
+                    qualified_usage: None,
                     result: Err(failure.error),
                 };
             }
         };
         let logical_attempt = invocation.logical_attempt();
         let invocation_id = invocation.invocation_id().to_string();
+        let invocation = Arc::new(invocation);
         let result = async {
             let owner_cancel = invocation.owner_lease.cancel.clone();
             let attempt_observer = invocation.attempt_observer_arc();
-            let settlement = NonstreamInvocationSupervisor::start(Arc::new(invocation));
+            let settlement = NonstreamInvocationSupervisor::start(invocation.clone());
             let cancel_flag = self
                 .run_authority
                 .as_ref()
@@ -3388,6 +3360,7 @@ impl DurableInferenceLedger {
         DurableInferenceCallOutcome {
             logical_attempt,
             invocation_id: Some(invocation_id),
+            qualified_usage: invocation.qualified_usage().await,
             result,
         }
     }
@@ -3615,6 +3588,8 @@ pub(crate) struct DurableProviderAttemptFact {
     /// another merely prepared request look sent.
     pub dispatch_started: bool,
     pub terminal: Option<astra_services::InferenceInvocationTerminal>,
+    /// None means not dispatched; an empty sample means dispatched, unknown.
+    pub qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
 }
 
 impl DurableInferenceInvocation {
@@ -3675,58 +3650,6 @@ impl DurableInferenceInvocation {
         Ok(())
     }
 
-    /// Bind source-verified optional context projections before provider
-    /// assembly. Retries reuse the same immutable decisions and reconstructed
-    /// bodies while each physical attempt receives its own exact wire receipt.
-    pub(crate) fn bind_tool_result_projections(
-        &self,
-        projections: Vec<crate::turn::llm::client::PreparedToolResultProjection>,
-    ) -> Result<(), astra_core::ClassifiedError> {
-        if self.observer.next_attempt.load(Ordering::Acquire) != 0 {
-            return Err(contract_error(
-                "tool-result projection binding",
-                "provider attempt admission already started",
-            ));
-        }
-        let mut freeze_keys = BTreeSet::new();
-        for projection in &projections {
-            projection.decision.validate().map_err(|error| {
-                contract_error(
-                    "tool-result projection binding",
-                    format!("invalid decision: {error}"),
-                )
-            })?;
-            if !freeze_keys.insert(projection.decision.freeze_key_sha256.as_str()) {
-                return Err(contract_error(
-                    "tool-result projection binding",
-                    "duplicate projection freeze key",
-                ));
-            }
-        }
-        let mut bound = self
-            .observer
-            .tool_result_projections
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !bound.is_empty()
-            && bound
-                .iter()
-                .map(|value| &value.decision)
-                .collect::<Vec<_>>()
-                != projections
-                    .iter()
-                    .map(|value| &value.decision)
-                    .collect::<Vec<_>>()
-        {
-            return Err(contract_error(
-                "tool-result projection binding",
-                "a different projection set is already bound",
-            ));
-        }
-        *bound = projections;
-        Ok(())
-    }
-
     pub(crate) async fn provider_attempt_facts(&self) -> Vec<DurableProviderAttemptFact> {
         let dispatched_attempts = self
             .observer
@@ -3739,6 +3662,27 @@ impl DurableInferenceInvocation {
             .lock()
             .await
             .attempt_facts(&dispatched_attempts)
+    }
+
+    /// Snapshot only in-memory attempt evidence after provider execution has
+    /// stopped. Detached settlement need not finish to preserve unknown usage.
+    async fn qualified_usage(&self) -> Option<astra_turn_types::CanonicalTokenUsage> {
+        self.provider_attempt_facts()
+            .await
+            .into_iter()
+            .filter_map(|fact| fact.qualified_usage)
+            .fold(
+                None,
+                |total: Option<astra_turn_types::CanonicalTokenUsage>, usage| {
+                    Some(match total {
+                        None => usage,
+                        Some(total) => total.checked_add(usage).unwrap_or_else(|_| {
+                            astra_turn_types::CanonicalTokenUsage::new(None, None, None, None)
+                                .expect("unknown usage is valid")
+                        }),
+                    })
+                },
+            )
     }
 
     /// Transition id acknowledged by the same durable transaction that
@@ -4046,12 +3990,11 @@ struct DurableProviderAttemptObserver {
     invocation: astra_services::InferenceInvocationPlan,
     request_context: astra_services::ModelRequestContextSeed,
     canonical_transitions: std::sync::Mutex<Vec<astra_turn_types::ProviderCanonicalTransitionV2>>,
-    tool_result_projections:
-        std::sync::Mutex<Vec<crate::turn::llm::client::PreparedToolResultProjection>>,
     admitted_canonical_transition_id: std::sync::Mutex<Option<String>>,
     next_attempt: AtomicU32,
     dispatch_started: AtomicBool,
-    dispatched_attempts: std::sync::Mutex<BTreeSet<u32>>,
+    dispatched_attempts:
+        std::sync::Mutex<BTreeMap<u32, Option<crate::turn::token_usage::TokenUsagePresence>>>,
     state: Arc<tokio::sync::Mutex<ProviderAttemptState>>,
     operations: ProviderOperationGate,
     owner_lease: Arc<InferenceOwnerLease>,
@@ -4071,14 +4014,50 @@ struct ProviderAttemptState {
 impl ProviderAttemptState {
     fn attempt_facts(
         &self,
-        dispatched_attempts: &BTreeSet<u32>,
+        dispatched_attempts: &BTreeMap<u32, Option<crate::turn::token_usage::TokenUsagePresence>>,
     ) -> Vec<DurableProviderAttemptFact> {
         self.requests
             .iter()
             .map(|(attempt, request)| DurableProviderAttemptFact {
                 request: request.clone(),
-                dispatch_started: dispatched_attempts.contains(attempt),
+                dispatch_started: dispatched_attempts.contains_key(attempt),
                 terminal: self.terminals.get(attempt).cloned(),
+                qualified_usage: dispatched_attempts.get(attempt).map(|presence| {
+                    let unknown =
+                        astra_turn_types::CanonicalTokenUsage::new(None, None, None, None)
+                            .expect("unknown usage is valid");
+                    let committed = self.terminals.get(attempt);
+                    let pending = self.pending_terminals.get(attempt);
+                    if let (Some(committed), Some(pending)) = (committed, pending)
+                        && (committed.usage != pending.usage
+                            || committed.usage_status != pending.usage_status
+                            || committed.status != pending.status)
+                    {
+                        tracing::warn!(
+                            attempt,
+                            "conflicting pending and committed usage; capture unavailable"
+                        );
+                        return unknown;
+                    }
+                    let (Some(terminal), Some(presence)) = (committed.or(pending), presence) else {
+                        return unknown;
+                    };
+                    if terminal.usage_status == astra_services::InferenceUsageStatus::Unavailable {
+                        return unknown;
+                    }
+                    let usage = &terminal.usage;
+                    astra_turn_types::CanonicalTokenUsage::new(
+                        (presence.fresh_input_tokens && !presence.input_invalid)
+                            .then_some(usage.input.fresh_input_tokens),
+                        (presence.cache_read_tokens && !presence.input_invalid)
+                            .then_some(usage.input.cache_read_tokens),
+                        (presence.cache_creation_tokens && !presence.input_invalid)
+                            .then_some(usage.input.cache_creation_tokens),
+                        (presence.output_tokens && !presence.output_invalid)
+                            .then_some(usage.output_tokens),
+                    )
+                    .unwrap_or(unknown)
+                }),
             })
             .collect()
     }
@@ -4243,11 +4222,10 @@ impl DurableProviderAttemptObserver {
             invocation,
             request_context,
             canonical_transitions: std::sync::Mutex::new(Vec::new()),
-            tool_result_projections: std::sync::Mutex::new(Vec::new()),
             admitted_canonical_transition_id: std::sync::Mutex::new(None),
             next_attempt: AtomicU32::new(0),
             dispatch_started: AtomicBool::new(false),
-            dispatched_attempts: std::sync::Mutex::new(BTreeSet::new()),
+            dispatched_attempts: std::sync::Mutex::new(BTreeMap::new()),
             state: Arc::new(tokio::sync::Mutex::new(ProviderAttemptState::default())),
             operations: ProviderOperationGate::default(),
             owner_lease,
@@ -4413,15 +4391,6 @@ impl Drop for DurableProviderAttemptObserver {
 
 #[async_trait]
 impl ProviderAttemptObserver for DurableProviderAttemptObserver {
-    fn prepared_tool_result_projections(
-        &self,
-    ) -> Vec<crate::turn::llm::client::PreparedToolResultProjection> {
-        self.tool_result_projections
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-
     async fn begin_attempt(
         &self,
         wire: &ProviderWireRequestIdentity,
@@ -4465,9 +4434,7 @@ impl ProviderAttemptObserver for DurableProviderAttemptObserver {
             self.request_context.clone(),
         )
         .with_canonical_transitions(&canonical_transitions)
-        .map_err(|error| service_error("provider canonical transition", error))?
-        .with_tool_result_projections(wire.tool_result_projections.clone())
-        .map_err(|error| service_error("provider tool-result projections", error))?;
+        .map_err(|error| service_error("provider canonical transition", error))?;
         let request = DurableProviderRequestIdentity {
             request_id: attempt.request_id().to_string(),
             request_hash: wire.provider_wire_hash.clone(),
@@ -4579,11 +4546,31 @@ impl ProviderAttemptObserver for DurableProviderAttemptObserver {
         Ok(())
     }
 
+    fn note_usage_presence(
+        &self,
+        attempt_index: u32,
+        presence: crate::turn::token_usage::TokenUsagePresence,
+    ) {
+        let mut dispatched = self
+            .dispatched_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(current) = dispatched.get_mut(&attempt_index) {
+            *current = Some(presence);
+        } else {
+            tracing::warn!(
+                attempt_index,
+                "usage observed before dispatch; capture ignored"
+            );
+        }
+    }
+
     fn note_dispatch_started(&self, attempt_index: u32) {
         self.dispatched_attempts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(attempt_index);
+            .entry(attempt_index)
+            .or_insert(None);
         self.dispatch_started.store(true, Ordering::Release);
     }
 }
@@ -6016,6 +6003,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_test_admissions_preserve_existing_terminals() {
+        let persistence = TestInferenceLedgerPersistence::default();
+        let plan = test_invocation_plan();
+        let attempt = test_provider_attempt(&plan, 0);
+        let terminal = astra_services::InferenceInvocationTerminal::succeeded(
+            astra_services::InferenceUsage::default(),
+            Some("original-provider-response".to_string()),
+        );
+        persistence.admit_invocation(&plan).await.unwrap();
+        persistence.begin_provider_attempt(&attempt).await.unwrap();
+        persistence
+            .finish_provider_attempt(&attempt, &terminal)
+            .await
+            .unwrap();
+
+        // Keep the logical invocation open so duplicate attempt admission
+        // reaches the occupied entry rather than the settlement guard.
+        assert!(persistence.begin_provider_attempt(&attempt).await.is_err());
+        assert_eq!(
+            persistence.lock().attempts[attempt.attempt_id()].terminal,
+            Some(terminal.clone())
+        );
+        persistence
+            .finish_invocation(&plan, &terminal)
+            .await
+            .unwrap();
+        assert!(persistence.admit_invocation(&plan).await.is_err());
+        assert_eq!(
+            persistence.lock().invocations[plan.invocation_id()].terminal,
+            Some(terminal)
+        );
+        persistence.assert_quiescent();
+    }
+
+    #[tokio::test]
     async fn owner_heartbeat_loss_cancels_local_provider_authority() {
         let persistence = Arc::new(TestInferenceLedgerPersistence::default());
         let plan = test_invocation_plan();
@@ -6163,7 +6185,6 @@ mod tests {
                 ..Default::default()
             },
             fingerprints: Default::default(),
-            tool_result_projections: Vec::new(),
         };
         let attempt = observer
             .begin_attempt(&wire)
@@ -7775,7 +7796,6 @@ mod tests {
                 ..Default::default()
             },
             fingerprints: Default::default(),
-            tool_result_projections: Vec::new(),
         };
         let mut admission = Box::pin(observer.begin_attempt(&wire));
         tokio::select! {
@@ -7837,7 +7857,6 @@ mod tests {
                 ..Default::default()
             },
             fingerprints: Default::default(),
-            tool_result_projections: Vec::new(),
         };
 
         let admitting_observer = observer.clone();
@@ -7929,7 +7948,6 @@ mod tests {
                 ..Default::default()
             },
             fingerprints: Default::default(),
-            tool_result_projections: Vec::new(),
         };
         let attempt = observer
             .begin_attempt(&wire)
@@ -7986,7 +8004,6 @@ mod tests {
                 ..Default::default()
             },
             fingerprints: Default::default(),
-            tool_result_projections: Vec::new(),
         };
         let mut admission = Box::pin(observer.begin_attempt(&wire));
         tokio::select! {
@@ -8077,7 +8094,6 @@ mod tests {
                 ..Default::default()
             },
             fingerprints: Default::default(),
-            tool_result_projections: Vec::new(),
         }
     }
 
@@ -8637,7 +8653,7 @@ mod tests {
             },
         );
 
-        let facts = state.attempt_facts(&BTreeSet::from([1]));
+        let facts = state.attempt_facts(&BTreeMap::from([(1, None)]));
         assert_eq!(
             facts
                 .iter()
@@ -8655,5 +8671,67 @@ mod tests {
         assert!(facts[1].terminal.is_none());
         assert!(!facts[0].dispatch_started);
         assert!(facts[1].dispatch_started);
+        assert_eq!(facts[0].qualified_usage, None);
+        assert_eq!(
+            facts[1].qualified_usage.unwrap().to_json(),
+            serde_json::json!({})
+        );
+        let presence = crate::turn::token_usage::TokenUsagePresence {
+            fresh_input_tokens: true,
+            output_tokens: true,
+            ..Default::default()
+        };
+        let dispatched = BTreeMap::from([(1, Some(presence))]);
+        let terminal = astra_services::InferenceInvocationTerminal {
+            status: astra_services::InferenceTerminalStatus::Succeeded,
+            usage: astra_services::InferenceUsage {
+                input: astra_turn_types::NormalizedPromptCacheUsage::new(10, 0, 0),
+                output_tokens: 0,
+            },
+            usage_status: astra_services::InferenceUsageStatus::ProviderPartial,
+            provider_response_id: None,
+            error_kind: None,
+            error_message: None,
+        };
+        state.pending_terminals.insert(1, terminal.clone());
+        let pending = state.attempt_facts(&dispatched);
+        assert!(
+            pending[1].terminal.is_none(),
+            "uncommitted terminal must stay uncommitted"
+        );
+        assert_eq!(
+            pending[1].qualified_usage.unwrap().to_json(),
+            serde_json::json!({"input_tokens":10,"output_tokens":0})
+        );
+        state.terminals.insert(1, terminal.clone());
+        assert_eq!(
+            state.attempt_facts(&dispatched)[1].qualified_usage,
+            pending[1].qualified_usage
+        );
+        state
+            .pending_terminals
+            .get_mut(&1)
+            .unwrap()
+            .usage
+            .output_tokens = 1;
+        assert_eq!(
+            state.attempt_facts(&dispatched)[1]
+                .qualified_usage
+                .unwrap()
+                .to_json(),
+            serde_json::json!({})
+        );
+        state.pending_terminals.remove(&1);
+        let revoked = BTreeMap::from([(
+            1,
+            Some(crate::turn::token_usage::TokenUsagePresence::default()),
+        )]);
+        assert_eq!(
+            state.attempt_facts(&revoked)[1]
+                .qualified_usage
+                .unwrap()
+                .to_json(),
+            serde_json::json!({})
+        );
     }
 }

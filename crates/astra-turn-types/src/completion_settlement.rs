@@ -155,6 +155,7 @@ pub struct ForegroundFanoutPagination {
     pub group_id: String,
     pub target_count: u64,
     pub pending_slots: BTreeMap<u64, u64>,
+    pub had_recoverable_issues: bool,
 }
 
 /// A narrow action that can finish an already-established obligation at the
@@ -220,6 +221,7 @@ pub struct CompletionActionWindow {
 #[serde(deny_unknown_fields)]
 pub enum BudgetWrapupOrigin {
     RoundSlice,
+    ExecutionDeadline,
     TokenRail,
 }
 
@@ -277,6 +279,7 @@ mod tests {
                 group_id: "group".into(),
                 target_count: 2,
                 pending_slots: BTreeMap::from([(0, 40), (1, 80)]),
+                had_recoverable_issues: false,
             }),
             text_only: true,
             work_settlement_only: true,

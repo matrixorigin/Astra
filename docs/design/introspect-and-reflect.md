@@ -117,15 +117,24 @@ Their zero-length intervals mark observation instants, not inference latency;
 measured provider duration and usage retain their existing owners. Labels are
 derived from the typed facts and are never parsed back into semantic state.
 
-Large tool-result selection has a separate shared read projection for
-introspection and reflection. Evaluation traces answer what was evaluated and
-recommended; immutable projection receipts answer what the provider wire
-actually contained. A recommendation without a receipt has unconfirmed
-application. A receipt without a trace is still valid application evidence but
-does not recover the missing evaluation rationale. A `Started` trace without a
-terminal trace is reported as missing terminal evidence, not inferred to be a
-cancellation or interruption. Evaluation capture and application capture have
-independent bounded-coverage states, and conflicting identities are quarantined
+Historical tool-result selection observations retain a separate shared read
+projection for explicit `facet=trace` introspection and reflection; routine
+overview, recent, and session views omit this historical source without querying
+it. Omission is not evidence that no historical judgments exist. The agent loop no longer evaluates
+or applies new tool-result selection decisions: the optional semantic rerank did
+not demonstrate a reliable reduction of the final provider context, while even
+the no-auxiliary route scanned candidates and read frozen decisions. Trace
+decoding remains for historical audit; the unused recommendation builder and
+trace producer are removed rather than kept as a dormant execution path.
+Historical evaluation traces describe recommendations, and immutable receipts
+describe
+what an earlier provider wire contained; neither is evidence of a new runtime
+selection. A recommendation without a receipt has unconfirmed application. A
+receipt without a trace is valid historical application evidence but does not
+recover the missing evaluation rationale. A `Started` trace without a terminal
+trace is reported as missing terminal evidence, not inferred to be a
+cancellation or interruption. Evaluation and application capture have
+independent bounded-coverage states; conflicting identities are quarantined
 without discarding unrelated facts. Default text is a compact outcome summary;
 hashes, ranges and internal identities remain diagnostic details.
 

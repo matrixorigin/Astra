@@ -4692,6 +4692,7 @@ fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunC
         model: None,
         initial_turns: 3,
         hard_turn_limit: None,
+        execution_deadline: None,
         allowed_tools: allowed_tools.into_iter().map(String::from).collect(),
         read_only,
         workspace_mutation: if read_only {
@@ -15465,6 +15466,7 @@ fn build_runtime_turn_evaluation_event_uses_loop_state_signals() {
     round_prompts.push((33, 15_922));
     for (round, prompt_tokens) in round_prompts {
         state.push_recent_round(crate::turn::agentic_loop::host::RecentRoundSummary {
+            qualified_usage: None,
             purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             turn: 2,
             round,
@@ -15699,13 +15701,16 @@ fn finalize_run_events_separates_run_accounting_from_latest_request_context() {
     state.total_cache_read = 1_706_112;
     state.total_cache_creation = 0;
     state.total_completion = 34_000;
+    state.last_request_usage =
+        Some(astra_turn_types::RequestTokenUsage::try_new(17_250, 85_248, 0, 901).unwrap());
     state.push_recent_round(crate::turn::agentic_loop::host::RecentRoundSummary {
+        qualified_usage: None,
         purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
         turn: 1,
         round: 0,
         provider: "test".into(),
         model: "test-model".into(),
-        prompt_tokens: 17_250,
+        prompt_tokens: 34_500,
         cache_read_tokens: 85_248,
         cache_creation_tokens: 0,
         completion_tokens: 901,
@@ -15922,7 +15927,10 @@ async fn paused_terminal_repair_persists_accounting_without_reintroducing_resume
     state.total_cache_creation = 303;
     state.total_completion = 404;
     state.total_tool_calls = 5;
+    state.last_request_usage =
+        Some(astra_turn_types::RequestTokenUsage::try_new(11, 22, 33, 44).unwrap());
     state.push_recent_round(crate::turn::agentic_loop::host::RecentRoundSummary {
+        qualified_usage: None,
         purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
         turn: 1,
         round: 2,
@@ -22236,10 +22244,6 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
             attempt_leased: false,
         });
     facts.original.turn_guard.record_workspace_mutation();
-    facts
-        .original
-        .turn_guard
-        .record_validation_attempt("cargo test");
     facts.original.turn_guard.nudge_count = 3;
     crate::turn::runtime_policy::evaluate_tool_boundary(
         &mut facts.original.runtime_policy_evaluation,
@@ -22343,12 +22347,6 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     assert_eq!(state.volatile_pending[0].round_index, 18);
     assert!(!state.volatile_pending[0].attempt_leased);
     assert_eq!(state.turn_guard.workspace_epoch(), 1);
-    assert_eq!(
-        state
-            .turn_guard
-            .validation_attempts_since_workspace_mutation("cargo test"),
-        1
-    );
     assert_eq!(state.turn_guard.nudge_count, 3);
     assert_eq!(state.stall.active_policy_feedback, expected_policy);
     assert_eq!(

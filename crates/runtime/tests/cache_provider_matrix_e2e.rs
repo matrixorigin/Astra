@@ -29,8 +29,8 @@
 //!      conversational data. Marker-isolated providers keep runtime context
 //!      after the explicit message cache boundary; OpenAI-compatible
 //!      providers place it before a current user tail or after a complete
-//!      trailing assistant/tool group; strict-history providers suppress
-//!      optional runtime context.
+//!      trailing assistant/tool group; `RequiredOnly` suppresses optional
+//!      runtime context regardless of cache protocol.
 //!   3. **No runtime-cc-marker on trailing system msgs**: the cache
 //!      breakpoint MUST land on the last non-system message before runtime
 //!      context; the runtime system message must not carry cache_control.
@@ -160,7 +160,7 @@ struct ProviderCase {
     cache_capability: Option<CacheCapability>,
 }
 
-/// The five provider shapes we need to keep honest.
+/// The provider/cache-capability shapes we need to keep honest.
 ///
 /// Keep this list in sync with `cache_placement::VolatilePlacement` — any
 /// newly added provider classification should get a row here before
@@ -227,6 +227,18 @@ const PROVIDER_MATRIX: &[ProviderCase] = &[
             protocol: CacheProtocol::StrictHistoryMatch,
             volatile_placement: VolatilePlacement::CurrentUserOnly,
             volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(CacheReuseScope::ConversationTurns),
+        }),
+    },
+    ProviderCase {
+        label: "strict-history-all-volatile",
+        provider: "openai",
+        model: "strict-history-all-fixture",
+        is_marker_isolated: false,
+        cache_capability: Some(CacheCapability {
+            protocol: CacheProtocol::StrictHistoryMatch,
+            volatile_placement: VolatilePlacement::CurrentUserOnly,
+            volatile_delivery: VolatileDeliveryPolicy::All,
             reuse_scope: Some(CacheReuseScope::ConversationTurns),
         }),
     },
@@ -755,13 +767,12 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
                 label = case.label,
             );
         }
-        // Primary system + tools remain the same even when runtime context and
-        // conversation tail grow.
+        // This hash covers the leading system block, not accumulated tool
+        // history. Per-message comparisons below own the latter contract.
         assert_eq!(
             r1.cacheable_prefix_sha256,
             r2.cacheable_prefix_sha256,
-            "[{label}] cacheable prefix bytes must be stable across \
-             tool-loop rounds",
+            "[{label}] leading system bytes must be stable across tool-loop rounds",
             label = case.label,
         );
 
@@ -785,6 +796,37 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
                 r3.message_sha256[..r2_runtime],
                 "[{label}] round 3 must retain the accumulated round-2 prefix before its runtime tail",
                 label = case.label,
+            );
+        }
+        if matches!(
+            cache_capability_for(case),
+            CacheCapability {
+                protocol: CacheProtocol::StrictHistoryMatch,
+                volatile_placement: VolatilePlacement::CurrentUserOnly,
+                volatile_delivery: VolatileDeliveryPolicy::All,
+                ..
+            }
+        ) {
+            let runtime = r1
+                .messages
+                .iter()
+                .position(|message| flatten_content(message).contains("runtime advisory round 1"))
+                .expect("all-delivery capability must emit the runtime advisory");
+            let first_difference = r1
+                .message_sha256
+                .iter()
+                .zip(&r2.message_sha256)
+                .position(|(left, right)| left != right)
+                .expect("updated advisory must change the assembled messages");
+            assert_eq!(
+                first_difference, runtime,
+                "changing the advisory must not be misreported as preserving accumulated history"
+            );
+            assert!(
+                r1.messages[runtime + 1..]
+                    .iter()
+                    .any(|message| message.get("role").and_then(Value::as_str) == Some("tool")),
+                "the changed advisory precedes the current tool history"
             );
         }
     }
@@ -1235,7 +1277,7 @@ async fn matrix_volatile_lane_keeps_history_clean() {
 //
 // Runtime data enters through the typed volatile lane. Prior history and the
 // current user message remain exact conversation bytes; optional evidence is
-// either carried by a system message or suppressed for strict-history models.
+// either carried by a system message or suppressed by RequiredOnly delivery.
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]

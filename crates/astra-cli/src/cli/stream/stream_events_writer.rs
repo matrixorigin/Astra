@@ -141,10 +141,10 @@ fn event_to_json(event: &StreamEvent) -> String {
         }
         StreamEvent::RequestTokenUsage(usage) => serde_json::json!({
             "type": "request_token_usage",
-            "fresh_input_tokens": usage.fresh_input_tokens,
-            "cache_read_tokens": usage.cache_read_tokens,
-            "cache_creation_tokens": usage.cache_creation_tokens,
-            "output_tokens": usage.output_tokens,
+            "fresh_input_tokens": usage.map(|usage| usage.fresh_input_tokens),
+            "cache_read_tokens": usage.map(|usage| usage.cache_read_tokens),
+            "cache_creation_tokens": usage.map(|usage| usage.cache_creation_tokens),
+            "output_tokens": usage.map(|usage| usage.output_tokens),
         }),
         StreamEvent::RuntimeFeedback(frame) => serde_json::json!({
             "type": "runtime_feedback",
@@ -506,25 +506,40 @@ mod tests {
         assert_eq!(estimated["used_tokens"], 12_000);
         assert_eq!(estimated["source"], "estimated");
 
-        let measured = event_to_json(&StreamEvent::ContextWindowMeasured(18_000));
+        let measured = event_to_json(&StreamEvent::ContextWindowMeasured(Some(18_000)));
         let measured: serde_json::Value = serde_json::from_str(&measured).unwrap();
         assert_eq!(measured["type"], "context_window_measured");
         assert_eq!(measured["used_tokens"], 18_000);
 
-        let lanes = event_to_json(&StreamEvent::RequestTokenUsage(
+        let lanes = event_to_json(&StreamEvent::RequestTokenUsage(Some(
             astra_turn_types::RequestTokenUsage {
                 fresh_input_tokens: 200,
                 cache_read_tokens: 800,
                 cache_creation_tokens: 100,
                 output_tokens: 50,
             },
-        ));
+        )));
         let lanes: serde_json::Value = serde_json::from_str(&lanes).unwrap();
         assert_eq!(lanes["type"], "request_token_usage");
         assert_eq!(lanes["fresh_input_tokens"], 200);
         assert_eq!(lanes["cache_read_tokens"], 800);
         assert_eq!(lanes["cache_creation_tokens"], 100);
         assert_eq!(lanes["output_tokens"], 50);
+
+        let cleared: serde_json::Value =
+            serde_json::from_str(&event_to_json(&StreamEvent::RequestTokenUsage(None))).unwrap();
+        for lane in [
+            "fresh_input_tokens",
+            "cache_read_tokens",
+            "cache_creation_tokens",
+            "output_tokens",
+        ] {
+            assert_eq!(cleared.get(lane), Some(&serde_json::Value::Null));
+        }
+        let cleared: serde_json::Value =
+            serde_json::from_str(&event_to_json(&StreamEvent::ContextWindowMeasured(None)))
+                .unwrap();
+        assert_eq!(cleared.get("used_tokens"), Some(&serde_json::Value::Null));
     }
 
     #[test]

@@ -343,19 +343,25 @@ fn inference_ledger_http_error(
 
 fn completion_usage(
     raw: &serde_json::Map<String, serde_json::Value>,
-    presence: crate::turn::token_usage::TokenUsagePresence,
+    mut presence: crate::turn::token_usage::TokenUsagePresence,
 ) -> Option<CompletionUsage> {
+    presence.merge(Default::default());
     // This compact wire DTO cannot express unknown lanes. Keep partial usage
     // in the physical-attempt ledger rather than turning missing fields into 0.
-    if !presence.fresh_input_tokens || !presence.output_tokens {
+    if !presence.fresh_input_tokens
+        || !presence.cache_read_tokens
+        || !presence.cache_creation_tokens
+        || !presence.output_tokens
+    {
         return None;
     }
-    let usage = crate::turn::token_usage::TokenUsage::from_partial_json_map(raw);
-    let prompt_tokens = usage.normalized_prompt_cache_usage().total_input_tokens();
+    let usage =
+        astra_turn_types::CanonicalTokenUsage::from_json(&serde_json::Value::Object(raw.clone()))
+            .ok()?;
     Some(CompletionUsage {
-        prompt_tokens,
-        completion_tokens: usage.output_tokens,
-        total_tokens: usage.total_tokens(),
+        prompt_tokens: u64::try_from(usage.input_column()?).ok()?,
+        completion_tokens: usage.output_tokens()?,
+        total_tokens: usage.total_tokens()?,
     })
 }
 
@@ -556,7 +562,7 @@ mod tests {
         operation: CompletionOperation,
     ) -> CompletionRequest {
         let judgment = astra_turn_types::JudgmentRequest {
-            schema_version: 1,
+            schema_version: astra_turn_types::JUDGMENT_SCHEMA_VERSION,
             state: json!({"evidence":"bounded"}),
             questions: [(
                 "evidence".to_string(),
@@ -1292,7 +1298,7 @@ mod tests {
             .with_shared_pool(shared_pool.clone());
         for (index, mode) in ["exact", "partial", "missing"].into_iter().enumerate() {
             let judgment = JudgmentRequest {
-                schema_version: 1,
+                schema_version: astra_turn_types::JUDGMENT_SCHEMA_VERSION,
                 state: json!({"usage":mode}),
                 questions: [(
                     "evidence".into(),
@@ -1319,7 +1325,10 @@ mod tests {
             let answer: JudgmentResponse =
                 serde_json::from_str(&response.choices[0].message.content).unwrap();
             assert_eq!(answer.model, "mock-jev-returned-model");
-            assert_eq!(answer.answers["evidence"].probability(), 0.9);
+            assert_eq!(
+                answer.answers["evidence"].native_noul_probability(),
+                Some(0.9)
+            );
             if mode == "exact" {
                 let usage = response.usage.unwrap();
                 assert_eq!(usage.prompt_tokens, 100);
@@ -1463,24 +1472,34 @@ mod tests {
         let complete = TokenUsagePresence {
             fresh_input_tokens: true,
             output_tokens: true,
+            cache_read_tokens: true,
+            cache_creation_tokens: true,
             ..Default::default()
         };
         let result = completion_usage(canonical.as_object().unwrap(), complete).unwrap();
         assert_eq!(result.prompt_tokens, 100);
         assert_eq!(result.completion_tokens, 4);
         assert_eq!(result.total_tokens, 104);
-        // Canonical buckets are zero-filled; metadata remains authoritative.
+        // A numeric zero without presence is not evidence of a measured zero.
         assert!(
             completion_usage(
                 canonical.as_object().unwrap(),
                 TokenUsagePresence {
                     fresh_input_tokens: true,
+                    output_tokens: true,
                     ..Default::default()
                 }
             )
             .is_none()
         );
         assert!(completion_usage(canonical.as_object().unwrap(), Default::default()).is_none());
+        for invalid in [
+            json!({"input_tokens":100,"output_tokens":4}),
+            json!({"input_tokens":100,"cached_input_tokens":0,"cache_creation_tokens":0,"output_tokens":4,"total_tokens":999}),
+            json!({"input_tokens":-1,"cached_input_tokens":0,"cache_creation_tokens":0,"output_tokens":4}),
+        ] {
+            assert!(completion_usage(invalid.as_object().unwrap(), complete).is_none());
+        }
         let zero = json!({"input_tokens":0,"cached_input_tokens":0,"cache_creation_tokens":0,"output_tokens":0});
         assert_eq!(
             completion_usage(zero.as_object().unwrap(), complete)

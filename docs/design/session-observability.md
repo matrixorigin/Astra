@@ -127,6 +127,12 @@ On reconnect, the client should rebuild from:
 - artifact manifest.
 
 Browser disconnect is not cancellation.
+An internal CLI stream failure does not cancel the Server run. The local
+session execution lease covers local tool execution and canonical partial
+commit; after those finish, it is released with the request. A still-active
+remote run remains protected by Server session-slot admission. An unconfirmed
+local execution or failed owner cleanup is not treated as a clean stream
+failure and retains its local exclusion until its own authority settles.
 
 Transcript progress is described by item sequence and committed cursor.
 Physical page counts, page high watermarks, and page lag are not exposed.

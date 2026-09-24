@@ -7067,6 +7067,7 @@ impl AgenticRunLifecycleService {
             client_tool_delivery_tx: work_surface_event_tx.clone(),
             trace_context: Some(server_trace_context(user_id, session_id, run_id, turn_seq)),
             execution_metadata,
+            execution_deadline: request.admitted_execution_deadline,
             workspace_mutation: crate::orchestration::WorkspaceMutationAuthority::default(),
             transcript_location: AgentTranscriptLocation::DurableServer,
         });
@@ -8038,6 +8039,13 @@ impl AgenticRunLifecycleService {
             // This is the sum of every physical model request in the run,
             // not a context-window measurement.
             "usage_scope": "run_total",
+            "qualified_usage": loop_state.qualified_usage,
+            "last_request_usage": loop_state.last_request_usage.map(|physical| json!({
+                "prompt_tokens": physical.fresh_input_tokens,
+                "cache_read_tokens": physical.cache_read_tokens,
+                "cache_creation_tokens": physical.cache_creation_tokens,
+                "completion_tokens": physical.output_tokens,
+            })),
         });
         usage["tool_outcomes"] = serde_json::to_value(
             astra_services::session_journal::ToolOutcomeSummary::from_records(
@@ -8045,14 +8053,6 @@ impl AgenticRunLifecycleService {
             ),
         )
         .unwrap_or(Value::Null);
-        if let Some(round) = loop_state.recent_rounds.last() {
-            usage["last_request_usage"] = json!({
-                "prompt_tokens": round.prompt_tokens,
-                "cache_read_tokens": round.cache_read_tokens,
-                "cache_creation_tokens": round.cache_creation_tokens,
-                "completion_tokens": round.completion_tokens,
-            });
-        }
         usage
     }
 
@@ -12363,6 +12363,8 @@ impl AgenticRunLifecycleService {
                 total_tool_calls: 0,
                 total_observation_tool_calls: 0,
                 has_any_usage: false,
+                qualified_usage: None,
+                last_request_usage: None,
                 agentic_turn_budget,
                 budget_is_explicit,
                 budget_policy: None,
@@ -12456,6 +12458,8 @@ impl AgenticRunLifecycleService {
             total_observation_tool_calls: facts.original.total_observation_tool_calls,
             tool_ledger_receipt: facts.tool_ledger_receipt,
             has_any_usage: facts.original.has_any_usage,
+            qualified_usage: facts.original.qualified_usage,
+            last_request_usage: facts.original.last_request_usage,
             last_finish_reason: facts.original.last_finish_reason,
             max_turns: facts.max_turns,
             remaining_turns: facts.remaining_turns,
@@ -12482,7 +12486,6 @@ impl AgenticRunLifecycleService {
             // unaffected and stay uniform across models.
             max_identical_tool_calls: resolved_tool_policy.max_identical_tool_calls,
             max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
-            repeated_cache_hit_suppression: resolved_tool_policy.repeated_cache_hit_suppression,
             max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
             stall: crate::turn::agentic_loop::host::StallTrackingState {
                 active_policy_feedback: facts.original.runtime_policy_evaluation.latest().clone(),
@@ -14050,6 +14053,9 @@ impl AgenticRunLifecycleService {
             run_id: run_id.clone(),
             expected_owner_generation: Some(execution_owner_generation),
             owner_lease_duration: self.run_engine.owner_lease_duration(),
+            terminal_authority: owner_lease_heartbeat
+                .as_ref()
+                .map(|heartbeat| heartbeat.terminal_authority()),
             agent_id: request.agent_id.clone(),
             model_name: request.model.clone(),
             user_message: request.message.clone(),
@@ -17293,6 +17299,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             run_id: run_id.clone(),
             expected_owner_generation: Some(execution_owner_generation),
             owner_lease_duration: self.run_engine.owner_lease_duration(),
+            terminal_authority: owner_lease_heartbeat
+                .as_ref()
+                .map(|heartbeat| heartbeat.terminal_authority()),
             agent_id: request.agent_id.clone(),
             model_name: request.model.clone(),
             user_message: request.message.clone(),
@@ -21563,13 +21572,15 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             harness_sink: context.harness_sink.clone(),
         };
 
-        let executor = self.build_subrun_executor(
-            child_permissions,
-            dynamic_agent_spawner,
-            config.client_tool_delivery_tx.clone(),
-            context.admitted_model_execution.as_ref(),
-            child_runtime_context.edge_tools.clone(),
-        );
+        let executor = self
+            .build_subrun_executor(
+                child_permissions,
+                dynamic_agent_spawner,
+                config.client_tool_delivery_tx.clone(),
+                context.admitted_model_execution.as_ref(),
+                child_runtime_context.edge_tools.clone(),
+            )
+            .with_admitted_execution_deadline(config.execution_deadline);
         #[cfg(feature = "e2e-hooks")]
         let executor = if !context.test_child_llm_rounds.is_empty() {
             executor.with_test_llm_rounds(context.test_child_llm_rounds.clone())
@@ -21701,6 +21712,7 @@ pub struct ServerSubRunExecutor {
     /// Short-lived material inherited from an already admitted live parent.
     /// Recovery executors leave this empty and re-materialize by durable ID.
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
+    admitted_execution_deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
@@ -21765,6 +21777,7 @@ impl ServerSubRunExecutor {
             invocation_ledger: None,
             shared_pool: None,
             admitted_model_execution: None,
+            admitted_execution_deadline: None,
             edge_callback_ledger,
             edge_connection_pool: None,
             edge_dispatch_service: None,
@@ -21807,6 +21820,14 @@ impl ServerSubRunExecutor {
         execution: Option<astra_services::AdmittedModelExecution>,
     ) -> Self {
         self.admitted_model_execution = execution;
+        self
+    }
+
+    pub fn with_admitted_execution_deadline(
+        mut self,
+        deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
+    ) -> Self {
+        self.admitted_execution_deadline = deadline;
         self
     }
 
@@ -22330,6 +22351,7 @@ impl ServerSubRunExecutor {
             owner_lease_duration: self
                 .durable_run_engine()
                 .and_then(|engine| engine.owner_lease_duration()),
+            terminal_authority: None,
             agent_id: Some(agent_id.to_string()),
             model_name: child_model_name.map(ToString::to_string),
             user_message: task.to_string(),
@@ -23098,6 +23120,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         .with_model(child_model_name.clone())
         .with_model_service(self.model_service.clone())
         .with_admitted_model_execution(admitted_model_execution)
+        .with_admitted_execution_deadline(self.admitted_execution_deadline)
         .with_inference_owner_pod_id(
             self.run_engine
                 .as_ref()
@@ -23277,6 +23300,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             total_observation_tool_calls: 0,
             tool_ledger_receipt: Default::default(),
             has_any_usage: false,
+            qualified_usage: None,
+            last_request_usage: None,
             last_finish_reason: None,
             max_turns,
             remaining_turns: max_turns,
@@ -23303,7 +23328,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
             call_counts: HashMap::new(),
             max_identical_tool_calls: resolved_tool_policy.max_identical_tool_calls,
             max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
-            repeated_cache_hit_suppression: resolved_tool_policy.repeated_cache_hit_suppression,
             max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
             stall: Default::default(),
             telemetry: Default::default(),
@@ -23457,7 +23481,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 config.session_id.clone(),
                 memoria_base,
                 None,
-            );
+            )
+            .with_admitted_execution_deadline(self.admitted_execution_deadline);
             if let (Some(engine), Some(admission)) =
                 (durable_run_engine.as_ref(), durable_admission.as_ref())
             {
@@ -23602,6 +23627,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                         &config.run_id,
                     ),
                     execution_metadata: config.execution_metadata.clone(),
+                    execution_deadline: self.admitted_execution_deadline,
                     workspace_mutation,
                     transcript_location: AgentTranscriptLocation::DurableServer,
                 });
@@ -23813,18 +23839,28 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 model_name: child_model_name.as_deref(),
                 include_terminal_assistant: true,
             };
+            let terminal_authority = owner_lease_heartbeat
+                .as_ref()
+                .map(|heartbeat| heartbeat.terminal_authority());
             let persisted = match terminal_settlement {
-                Some(settlement) => persist_server_loop_canonical_terminal_settlement(
-                    canonical_pool,
-                    append,
-                    &loop_state,
-                    settlement,
-                )
-                .await
-                .map(|commit| {
-                    durable_terminal_committed = true;
-                    commit.terminal_assistant_source_event_id
-                }),
+                Some(settlement) => {
+                    let terminal_operation = match terminal_authority.as_ref() {
+                        Some(authority) => Some(authority.begin().await?),
+                        None => None,
+                    };
+                    persist_server_loop_canonical_terminal_settlement(
+                        canonical_pool,
+                        append,
+                        &loop_state,
+                        settlement,
+                        terminal_operation,
+                    )
+                    .await
+                    .map(|commit| {
+                        durable_terminal_committed = true;
+                        commit.terminal_assistant_source_event_id
+                    })
+                }
                 None => persist_server_loop_canonical_append(canonical_pool, append, &loop_state)
                     .await,
             };

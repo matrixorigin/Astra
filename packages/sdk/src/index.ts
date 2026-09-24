@@ -164,6 +164,8 @@ export type {
   SessionActivity,
   SessionActivityCursor,
   SessionAuditSummary,
+  SessionRequestUsageSummary,
+  SessionCostSummary,
   SessionUpdateBody,
   SessionActivityEntryResponse,
   SessionActivityResponse,

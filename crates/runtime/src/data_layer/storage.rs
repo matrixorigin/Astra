@@ -244,110 +244,58 @@ pub(crate) async fn classify_agent_event_capture_attempts(
     Ok(outcomes)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CanonicalTokenUsageColumns {
-    input_tokens: i64,
-    cached_input_tokens: i64,
-    cache_creation_tokens: i64,
-    token_input: i64,
-    token_output: i64,
-    token_total: i64,
-}
-
-fn token_usage_protocol_error(message: impl Into<String>) -> sqlx::Error {
-    sqlx::Error::Protocol(message.into())
-}
-
-fn canonical_token_count(value: &Value, field: &str) -> Result<i64, sqlx::Error> {
-    let raw = value.get(field).ok_or_else(|| {
-        token_usage_protocol_error(format!("token_usage missing canonical field `{field}`"))
-    })?;
-    let Some(raw) = raw.as_i64() else {
-        return Err(token_usage_protocol_error(format!(
-            "token_usage field `{field}` must be a non-negative integer, got {raw}"
-        )));
-    };
-    if raw < 0 {
-        return Err(token_usage_protocol_error(format!(
-            "token_usage field `{field}` must be non-negative, got {raw}"
-        )));
-    }
-    Ok(raw)
-}
-
 fn canonical_token_usage_columns(
     token_usage: Option<&Value>,
-) -> Result<Option<CanonicalTokenUsageColumns>, sqlx::Error> {
-    let Some(value) = token_usage else {
-        return Ok(None);
-    };
-    if !value.is_object() {
-        return Err(token_usage_protocol_error(format!(
-            "token_usage must be a canonical JSON object, got {value}"
-        )));
-    }
-    let input = canonical_token_count(value, "input_tokens")?;
-    let cached = canonical_token_count(value, "cached_input_tokens")?;
-    let creation = canonical_token_count(value, "cache_creation_tokens")?;
-    let output = canonical_token_count(value, "output_tokens")?;
-    let total = canonical_token_count(value, "total_tokens")?;
-    let normalized_input = astra_turn_types::NormalizedPromptCacheUsage::new(
-        input as u64,
-        cached as u64,
-        creation as u64,
-    );
-    let token_input = normalized_input
-        .checked_total_input_tokens()
-        .and_then(|value| i64::try_from(value).ok())
-        .ok_or_else(|| token_usage_protocol_error("token_usage input column overflow"))?;
-    let expected_total = normalized_input
-        .checked_total_tokens_with_output(output as u64)
-        .and_then(|value| i64::try_from(value).ok())
-        .ok_or_else(|| token_usage_protocol_error("token_usage total column overflow"))?;
-    if total != expected_total {
-        return Err(token_usage_protocol_error(format!(
-            "token_usage total_tokens mismatch: expected {expected_total}, got {total}"
-        )));
-    }
-    Ok(Some(CanonicalTokenUsageColumns {
-        input_tokens: input,
-        cached_input_tokens: cached,
-        cache_creation_tokens: creation,
-        token_input,
-        token_output: output,
-        token_total: total,
-    }))
+) -> Result<Option<astra_turn_types::CanonicalTokenUsage>, sqlx::Error> {
+    token_usage
+        .map(astra_turn_types::CanonicalTokenUsage::from_json)
+        .transpose()
+        .map_err(sqlx::Error::Protocol)
 }
 
 fn persisted_token_usage_json(
-    token_usage: Option<&Value>,
-    usage: Option<CanonicalTokenUsageColumns>,
+    source: Option<&Value>,
+    usage: Option<astra_turn_types::CanonicalTokenUsage>,
 ) -> Option<String> {
-    let token_usage = token_usage?;
     let usage = usage?;
-    let mut token_usage = token_usage.clone();
-    if let Value::Object(ref mut obj) = token_usage {
-        obj.insert("input_tokens".into(), Value::from(usage.input_tokens));
-        obj.insert(
-            "cached_input_tokens".into(),
-            Value::from(usage.cached_input_tokens),
-        );
-        obj.insert(
-            "cache_creation_tokens".into(),
-            Value::from(usage.cache_creation_tokens),
-        );
-        obj.insert("output_tokens".into(), Value::from(usage.token_output));
-        obj.insert("total_tokens".into(), Value::from(usage.token_total));
-        obj.insert("prompt".into(), Value::from(usage.token_input));
-        obj.insert("completion".into(), Value::from(usage.token_output));
-        obj.insert("cache_read".into(), Value::from(usage.cached_input_tokens));
-        obj.insert(
-            "cache_write".into(),
-            Value::from(usage.cache_creation_tokens),
-        );
-        obj.insert("total".into(), Value::from(usage.token_total));
+    let mut object = source?.as_object()?.clone();
+    // Keep existing accounting scope/metadata, but never stale numeric aliases
+    // or a ratio derived from a now-partial input partition.
+    for key in [
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_creation_tokens",
+        "output_tokens",
+        "total_tokens",
+        "prompt",
+        "completion",
+        "cache_read",
+        "cache_write",
+        "total",
+        "raw_prompt_tokens",
+        "uncached_input_tokens",
+        "effective_input_tokens",
+        "prompt_cache_hit_ratio",
+    ] {
+        object.remove(key);
     }
-    Some(token_usage.to_string())
+    object.extend(usage.to_json().as_object()?.clone());
+    // Metadata alone is not a canonical usage object. Keep an explicit unknown
+    // field so an observed unavailable sample survives a validated replay.
+    if !object.is_empty()
+        && [
+            "input_tokens",
+            "cached_input_tokens",
+            "cache_creation_tokens",
+            "output_tokens",
+            "total_tokens",
+        ]
+        .iter()
+        .all(|key| !object.contains_key(*key))
+    {
+        object.insert("total_tokens".into(), Value::Null);
+    }
+    Some(Value::Object(object).to_string())
 }
 
 fn hash_agent_event_payload(payload: serde_json::Value) -> String {
@@ -446,9 +394,9 @@ fn core_turn_event_insert_values(
         turn_seq: event.turn_seq,
         token_usage_json: persisted_token_usage_json(event.token_usage.as_ref(), usage),
         llm_params_json: event.llm_params.as_ref().map(serde_json::Value::to_string),
-        token_input: usage.map(|usage| usage.token_input),
-        token_output: usage.map(|usage| usage.token_output),
-        token_total: usage.map(|usage| usage.token_total),
+        token_input: usage.and_then(|usage| usage.input_column()),
+        token_output: usage.and_then(|usage| usage.output_column()),
+        token_total: usage.and_then(|usage| usage.total_column()),
     })
 }
 
@@ -457,9 +405,9 @@ fn trace_event_insert_values(event: &TraceEvent) -> Result<TraceEventInsertValue
     Ok(TraceEventInsertValues {
         payload_hash: trace_event_payload_hash(event)?,
         token_usage_json: persisted_token_usage_json(event.token_usage.as_ref(), usage),
-        token_input: usage.map(|usage| usage.token_input),
-        token_output: usage.map(|usage| usage.token_output),
-        token_total: usage.map(|usage| usage.token_total),
+        token_input: usage.and_then(|usage| usage.input_column()),
+        token_output: usage.and_then(|usage| usage.output_column()),
+        token_total: usage.and_then(|usage| usage.total_column()),
         metadata_json: event.metadata.to_string(),
         created_at: mysql_datetime(event.created_at),
     })
@@ -948,6 +896,67 @@ mod tests {
     }
 
     #[test]
+    fn token_usage_writers_preserve_partial_and_unavailable_samples() {
+        for raw in [
+            serde_json::json!({}),
+            serde_json::json!({"output_tokens":7}),
+            serde_json::json!({"input_tokens":null,"output_tokens":7,"total_tokens":null}),
+        ] {
+            let event = core_event_with_token_usage(Some(raw.clone()));
+            let core = core_turn_event_insert_values(&event).unwrap();
+            let mut trace = TraceEvent::new(
+                "partial",
+                "session-1",
+                "user-1",
+                "llm_round_completed",
+                "llm_round",
+            );
+            trace.token_usage = Some(raw.clone());
+            let trace = trace_event_insert_values(&trace).unwrap();
+            assert_eq!(core.token_usage_json, trace.token_usage_json);
+            assert_eq!(core.token_input, None);
+            assert_eq!(trace.token_input, None);
+            assert_eq!(core.token_total, None);
+            assert_eq!(trace.token_total, None);
+            assert_eq!(
+                core.token_output,
+                raw.get("output_tokens").and_then(serde_json::Value::as_i64)
+            );
+            assert_eq!(trace.token_output, core.token_output);
+            let stored: serde_json::Value =
+                serde_json::from_str(core.token_usage_json.as_deref().unwrap()).unwrap();
+            assert_eq!(stored.get("output_tokens"), raw.get("output_tokens"));
+            assert!(stored.get("input_tokens").is_none());
+            assert!(stored.get("total_tokens").is_none());
+        }
+    }
+
+    #[test]
+    fn unavailable_usage_with_metadata_round_trips_without_stale_counters() {
+        let raw = serde_json::json!({
+            "input_tokens":null, "scope":"runtime_accounted_usage", "source":"provider",
+            "prompt":99, "cache_read":98, "total":100, "prompt_cache_hit_ratio":0.98,
+        });
+        let event = core_event_with_token_usage(Some(raw));
+        let values = core_turn_event_insert_values(&event).unwrap();
+        assert_eq!(
+            (values.token_input, values.token_output, values.token_total),
+            (None, None, None)
+        );
+        let persisted: serde_json::Value =
+            serde_json::from_str(values.token_usage_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            persisted,
+            serde_json::json!({"scope":"runtime_accounted_usage","source":"provider","total_tokens":null})
+        );
+        let usage = astra_turn_types::CanonicalTokenUsage::from_json(&persisted).unwrap();
+        assert_eq!(usage.to_json(), serde_json::json!({}));
+        let replay = core_event_with_token_usage(Some(persisted));
+        let replay = core_turn_event_insert_values(&replay).unwrap();
+        assert_eq!(values.token_usage_json, replay.token_usage_json);
+    }
+
+    #[test]
     fn core_turn_event_insert_values_preserve_turn_seq_and_token_columns() {
         let event = core_event_with_token_usage(Some(canonical_token_usage()));
 
@@ -965,11 +974,26 @@ mod tests {
         );
         let persisted: serde_json::Value =
             serde_json::from_str(values.token_usage_json.as_deref().unwrap()).unwrap();
-        assert_eq!(persisted["prompt"], 17);
-        assert_eq!(persisted["completion"], 5);
-        assert_eq!(persisted["cache_read"], 4);
-        assert_eq!(persisted["cache_write"], 3);
-        assert_eq!(persisted["total"], 22);
+        assert!(
+            persisted.get("prompt").is_none(),
+            "canonical serialization omits redundant aliases"
+        );
+        assert!(
+            persisted.get("completion").is_none(),
+            "canonical serialization omits redundant aliases"
+        );
+        assert!(
+            persisted.get("cache_read").is_none(),
+            "canonical serialization omits redundant aliases"
+        );
+        assert!(
+            persisted.get("cache_write").is_none(),
+            "canonical serialization omits redundant aliases"
+        );
+        assert!(
+            persisted.get("total").is_none(),
+            "canonical serialization omits redundant aliases"
+        );
         assert_eq!(
             values.llm_params_json.as_deref(),
             Some("{\"temperature\":0.2}")
@@ -1000,11 +1024,26 @@ mod tests {
         );
         let persisted: serde_json::Value =
             serde_json::from_str(values.token_usage_json.as_deref().unwrap()).unwrap();
-        assert_eq!(persisted["prompt"], 17);
-        assert_eq!(persisted["completion"], 5);
-        assert_eq!(persisted["cache_read"], 4);
-        assert_eq!(persisted["cache_write"], 3);
-        assert_eq!(persisted["total"], 22);
+        assert!(
+            persisted.get("prompt").is_none(),
+            "canonical serialization omits redundant aliases"
+        );
+        assert!(
+            persisted.get("completion").is_none(),
+            "canonical serialization omits redundant aliases"
+        );
+        assert!(
+            persisted.get("cache_read").is_none(),
+            "canonical serialization omits redundant aliases"
+        );
+        assert!(
+            persisted.get("cache_write").is_none(),
+            "canonical serialization omits redundant aliases"
+        );
+        assert!(
+            persisted.get("total").is_none(),
+            "canonical serialization omits redundant aliases"
+        );
     }
 
     #[test]

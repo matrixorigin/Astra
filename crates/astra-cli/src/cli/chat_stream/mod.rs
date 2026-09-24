@@ -25,6 +25,6 @@ pub(crate) use params::{
     SharedStreamEventSink, StreamEvent, StreamEventRx, StreamEventSink, StreamEventTx,
     ToolProgressSink, enqueue_interactive_request, stream_event_channel,
 };
-pub(crate) use sse_loop::server_loop_admission_payload;
+pub(crate) use sse_loop::server_loop_admission_payload_with_execution_time_budget;
 pub(crate) use sse_loop::stream_chat_sse;
 pub(crate) use sse_loop::turn_policy_from_payload_edge_tools;

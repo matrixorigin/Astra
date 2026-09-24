@@ -4448,6 +4448,28 @@ impl RuntimeToolExecutor {
                 None
             }
         };
+        let direct_writer_applied = coordination_integrity_valid
+            && !nested_run_script_callback
+            && result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("workspace_mutation_applied"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+        if !receipt_authority_valid
+            && astra_tools::workspace_observation::typed_workspace_tool_applied_bound(
+                name,
+                args,
+                &self.workspace_root,
+                result.is_error,
+                direct_writer_applied,
+            )
+        {
+            result.metadata.get_or_insert_with(Default::default).insert(
+                astra_tools::workspace_observation::WRITER_APPLIED_BOUND_FIELD.to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
         // Built-in server handlers are a separate owner path from the shared
         // DefaultToolExecutor.  Stamp the same typed workspace facts here so
         // Edge/server/local execution cannot drift in completion semantics.
@@ -4457,14 +4479,7 @@ impl RuntimeToolExecutor {
                 args,
                 &self.workspace_root,
                 result.is_error,
-                receipt_authority_valid
-                    && !nested_run_script_callback
-                    && result
-                        .metadata
-                        .as_ref()
-                        .and_then(|fields| fields.get("workspace_mutation_applied"))
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true),
+                receipt_authority_valid && direct_writer_applied,
             )
         {
             result
@@ -8866,6 +8881,7 @@ esac
             client_tool_delivery_tx: None,
             trace_context: None,
             execution_metadata: None,
+            execution_deadline: None,
             workspace_mutation: crate::orchestration::WorkspaceMutationAuthority::default(),
             transcript_location: crate::orchestration::AgentTranscriptLocation::DurableServer,
         }

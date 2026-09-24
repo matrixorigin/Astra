@@ -137,6 +137,17 @@ requests supplied usage, retain known lanes, and leave unreported lanes unknown.
 Context assembly and request budget estimates remain separate from provider
 usage and identify their estimation scope.
 
+Primary prompt-cache read share is an input-only measurement. Its eligibility
+does not depend on output-token coverage or untimed stages. The canonical graph
+projects exact, complete input buckets from physical provider attempts only;
+stage totals and auxiliary snapshots never enter that denominator. Consumers
+also require verified identity and complete transport capture. Missing input
+lanes, conflicting facts, unfinished execution scopes, and arithmetic overflow
+cannot establish a full-run percentage. Zero input makes the ratio inapplicable.
+The current projection requires all three disjoint input buckets; it does not
+infer an absent cache-write bucket from the model name. Supporting an inclusive
+provider input total requires explicit validated evidence, not a renderer guess.
+
 The quality fixture includes at least: a long provider wait followed by a fast
 answer, a retried request with per-attempt token usage, parallel tools whose
 summed work exceeds their wall envelope, an approval wait, and a trace with

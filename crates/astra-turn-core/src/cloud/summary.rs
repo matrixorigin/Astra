@@ -154,6 +154,9 @@ pub struct SummaryResponse {
     /// Provider-reported usage for this inference. Auxiliary inference is part
     /// of the durable turn budget and must not disappear at this abstraction.
     pub usage: Map<String, Value>,
+    /// Aggregate evidence for all dispatched attempts, distinct from the
+    /// final response's physical usage. Missing evidence is not measured zero.
+    pub qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
     /// Actual durable execution that produced this response. Absence means
     /// the adapter cannot prove an admitted invocation and must never be
     /// replaced with a requested attempt or generated correlation ID.
@@ -422,6 +425,7 @@ pub mod test_support {
         pub fn success(text: &str) -> Self {
             Self {
                 responses: vec![Ok(SummaryResponse {
+                    qualified_usage: None,
                     judgment_provenance: None,
                     model_used: "fixture-model".into(),
                     text: text.to_string(),
@@ -440,6 +444,7 @@ pub mod test_support {
             Self {
                 responses: vec![
                     Ok(SummaryResponse {
+                        qualified_usage: None,
                         judgment_provenance: None,
                         model_used: "fixture-model".into(),
                         text: String::new(),
@@ -449,6 +454,7 @@ pub mod test_support {
                         execution: None,
                     }),
                     Ok(SummaryResponse {
+                        qualified_usage: None,
                         judgment_provenance: None,
                         model_used: "fixture-model".into(),
                         text: success_text.to_string(),
@@ -467,6 +473,7 @@ pub mod test_support {
         pub fn always_ptl() -> Self {
             Self {
                 responses: vec![Ok(SummaryResponse {
+                    qualified_usage: None,
                     judgment_provenance: None,
                     model_used: "fixture-model".into(),
                     text: String::new(),

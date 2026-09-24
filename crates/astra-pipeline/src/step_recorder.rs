@@ -741,7 +741,7 @@ impl StepRecorder {
 
     /// Record a cache hit with an explicit trace reason.
     ///
-    /// Use a scoped reason (for example `cached_cross_turn`) when the cache
+    /// Use a scoped reason (for example `cached_same_invocation`) when the cache
     /// source matters for loop diagnostics and trace replay.
     pub fn record_cache_hit_with_reason(
         &mut self,
@@ -2752,7 +2752,7 @@ mod tests {
                 cached_at: 42,
                 context_signature: None,
             },
-            "cached_cross_turn",
+            "cached_same_invocation",
         );
         rec.end_turn(false);
 
@@ -2812,7 +2812,7 @@ mod tests {
                 let payload = event.payload.as_ref().unwrap();
                 assert_eq!(
                     payload.get("reason").and_then(serde_json::Value::as_str),
-                    Some("cached_cross_turn")
+                    Some("cached_same_invocation")
                 );
                 assert_eq!(
                     payload.get("cached").and_then(serde_json::Value::as_bool),

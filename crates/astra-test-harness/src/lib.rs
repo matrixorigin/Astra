@@ -47,6 +47,7 @@ pub mod dashboard;
 pub mod digest;
 pub mod eval;
 pub mod exec;
+pub mod explain_capture;
 pub mod judger;
 pub mod model_profiles;
 pub mod pipeline_analysis;

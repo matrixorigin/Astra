@@ -498,7 +498,6 @@ pub(crate) fn format_policy_output(
             "trust_mode": trust_mode,
             "max_identical_tool_calls": policy.max_identical_tool_calls,
             "max_tools_per_turn": policy.max_tools_per_turn,
-            "repeated_cache_hit_suppression": policy.repeated_cache_hit_suppression,
             "max_consecutive_empty_name": policy.max_consecutive_empty_name,
             "parallel_batching_force_streak": policy.parallel_batching_force_streak,
             // Always present as an array (possibly empty) so json consumers
@@ -514,12 +513,10 @@ pub(crate) fn format_policy_output(
              \n  trust_mode                     = {trust_mode}\
              \n  max_identical_tool_calls       = {}\
              \n  max_tools_per_turn             = {}\
-             \n  repeated_cache_hit_suppression = {}\
              \n  max_consecutive_empty_name     = {}\
              \n  parallel_batching_force_streak = {}\n",
             policy.max_identical_tool_calls,
             policy.max_tools_per_turn,
-            policy.repeated_cache_hit_suppression,
             policy.max_consecutive_empty_name,
             policy.parallel_batching_force_streak,
         );

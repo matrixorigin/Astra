@@ -1704,159 +1704,42 @@ fn ingestion_event_has_parent_edges(event: &IngestionEvent) -> bool {
             .any(|id| !id.trim().is_empty())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CanonicalTokenUsage {
-    input_tokens: u64,
-    cached_input_tokens: u64,
-    cache_creation_tokens: u64,
-    output_tokens: u64,
-    total_tokens: u64,
-}
-
-impl CanonicalTokenUsage {
-    fn from_journal_event(
-        event: &crate::session_journal::JournalEvent,
-    ) -> Result<Option<Self>, String> {
-        let cached_input_tokens = event.cache_read_tokens.unwrap_or(0);
-        let cache_creation_tokens = event.cache_creation_tokens.unwrap_or(0);
-        let has_any_token_field = event.tokens_in.is_some()
-            || event.tokens_out.is_some()
-            || cached_input_tokens > 0
-            || cache_creation_tokens > 0;
-        if !has_any_token_field {
-            return Ok(None);
-        }
-
-        let input_tokens = event
-            .tokens_in
-            .ok_or_else(|| "token_usage canonicalization: missing tokens_in".to_string())?;
-        let output_tokens = event
-            .tokens_out
-            .ok_or_else(|| "token_usage canonicalization: missing tokens_out".to_string())?;
-        let normalized_input = astra_turn_types::NormalizedPromptCacheUsage::new(
-            input_tokens,
-            cached_input_tokens,
-            cache_creation_tokens,
-        );
-        let billable_input = normalized_input
-            .checked_total_input_tokens()
-            .ok_or_else(|| "token_usage canonicalization: input token overflow".to_string())?;
-        let total_tokens = billable_input
-            .checked_add(output_tokens)
-            .ok_or_else(|| "token_usage canonicalization: total token overflow".to_string())?;
-        Ok(Some(Self {
-            input_tokens,
-            cached_input_tokens,
-            cache_creation_tokens,
-            output_tokens,
-            total_tokens,
-        }))
-    }
-
-    fn from_json(value: &Value) -> Result<Option<Self>, String> {
-        let Some(obj) = value.as_object() else {
-            return Err(format!(
-                "token_usage must be a canonical JSON object, got {value}"
-            ));
-        };
-        let read_required = |key: &str| -> Result<u64, String> {
-            let value = obj
-                .get(key)
-                .ok_or_else(|| format!("token_usage missing canonical field `{key}`"))?;
-            if let Some(value) = value.as_u64() {
-                return Ok(value);
-            }
-            if let Some(value) = value.as_i64() {
-                return u64::try_from(value).map_err(|_| {
-                    format!("token_usage field `{key}` must be non-negative, got {value}")
-                });
-            }
-            Err(format!(
-                "token_usage field `{key}` must be an integer, got {value}"
-            ))
-        };
-        let usage = Self {
-            input_tokens: read_required("input_tokens")?,
-            cached_input_tokens: read_required("cached_input_tokens")?,
-            cache_creation_tokens: read_required("cache_creation_tokens")?,
-            output_tokens: read_required("output_tokens")?,
-            total_tokens: read_required("total_tokens")?,
-        };
-        let expected_total = astra_turn_types::NormalizedPromptCacheUsage::new(
-            usage.input_tokens,
-            usage.cached_input_tokens,
-            usage.cache_creation_tokens,
-        )
-        .checked_total_tokens_with_output(usage.output_tokens)
-        .ok_or_else(|| "token_usage total overflow".to_string())?;
-        if usage.total_tokens != expected_total {
-            return Err(format!(
-                "token_usage total_tokens mismatch: expected {expected_total}, got {}",
-                usage.total_tokens
-            ));
-        }
-        Ok(Some(usage))
-    }
-
-    fn to_json(self) -> Value {
-        let billable_input = astra_turn_types::NormalizedPromptCacheUsage::new(
-            self.input_tokens,
-            self.cached_input_tokens,
-            self.cache_creation_tokens,
-        )
-        .total_input_tokens();
-        serde_json::json!({
-            "input_tokens": self.input_tokens,
-            "cached_input_tokens": self.cached_input_tokens,
-            "cache_creation_tokens": self.cache_creation_tokens,
-            "output_tokens": self.output_tokens,
-            "total_tokens": self.total_tokens,
-            "prompt": billable_input,
-            "completion": self.output_tokens,
-            "cache_read": self.cached_input_tokens,
-            "cache_write": self.cache_creation_tokens,
-            "total": self.total_tokens,
-        })
-    }
-
-    fn input_column(self) -> Result<i64, String> {
-        let billable_input = astra_turn_types::NormalizedPromptCacheUsage::new(
-            self.input_tokens,
-            self.cached_input_tokens,
-            self.cache_creation_tokens,
-        )
-        .checked_total_input_tokens()
-        .ok_or_else(|| "token_usage input column overflow".to_string())?;
-        i64::try_from(billable_input)
-            .map_err(|_| format!("token_usage input column exceeds i64::MAX: {billable_input}"))
-    }
-
-    fn output_column(self) -> Result<i64, String> {
-        i64::try_from(self.output_tokens).map_err(|_| {
-            format!(
-                "token_usage output column exceeds i64::MAX: {}",
-                self.output_tokens
-            )
-        })
-    }
-
-    fn total_column(self) -> Result<i64, String> {
-        i64::try_from(self.total_tokens).map_err(|_| {
-            format!(
-                "token_usage total column exceeds i64::MAX: {}",
-                self.total_tokens
-            )
-        })
-    }
-}
+use astra_turn_types::CanonicalTokenUsage;
 
 fn canonical_token_usage_json_from_journal_event(
     event: &crate::session_journal::JournalEvent,
 ) -> Option<Value> {
-    CanonicalTokenUsage::from_journal_event(event)
-        .ok()
-        .flatten()
-        .map(CanonicalTokenUsage::to_json)
+    let no_counts = [
+        event.tokens_in,
+        event.tokens_out,
+        event.cache_read_tokens,
+        event.cache_creation_tokens,
+    ]
+    .iter()
+    .all(Option::is_none);
+    if let Some(witness) = event
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("qualified_usage"))
+    {
+        if !no_counts || !witness.as_object().is_some_and(serde_json::Map::is_empty) {
+            tracing::warn!("invalid or conflicting journal usage witness; capture unavailable");
+        }
+        // This field is only an unknown-sample witness, never another numeric
+        // source. Invalid or contradictory witnesses quarantine all lanes.
+        return Some(serde_json::json!({}));
+    }
+    if no_counts {
+        return None;
+    }
+    CanonicalTokenUsage::new(
+        event.tokens_in,
+        event.cache_read_tokens,
+        event.cache_creation_tokens,
+        event.tokens_out,
+    )
+    .ok()
+    .map(CanonicalTokenUsage::to_json)
 }
 
 #[derive(Debug)]
@@ -1899,7 +1782,7 @@ impl<'a> IngestionEventInsertValues<'a> {
         );
         let usage = match event.token_usage.as_ref() {
             Some(value) => match CanonicalTokenUsage::from_json(value) {
-                Ok(usage) => usage,
+                Ok(usage) => Some(usage),
                 Err(error) => {
                     tracing::warn!(
                         target: "astra_services::event_ingestion",
@@ -1915,21 +1798,7 @@ impl<'a> IngestionEventInsertValues<'a> {
             },
             None => None,
         };
-        let token_fields = match canonical_token_usage_db_fields_or_null(usage) {
-            Ok(fields) => fields,
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra_services::event_ingestion",
-                    user_id = %event.user_id,
-                    session_id = %event.session_id,
-                    event_id = %event.event_id,
-                    event_type = %event.event_type,
-                    error = %error,
-                    "canonical token_usage exceeds database token columns; storing event without token counters"
-                );
-                TokenUsageDbFields::default()
-            }
-        };
+        let token_fields = canonical_token_usage_db_fields_or_null(usage);
         let metadata = event.metadata.as_ref();
         let tool_call_id = metadata_tool_call_id(metadata);
         let meta_tool_name = metadata_tool_name(metadata).or_else(|| {
@@ -1977,19 +1846,19 @@ impl<'a> IngestionEventInsertValues<'a> {
 
 fn canonical_token_usage_db_fields_or_null(
     usage: Option<CanonicalTokenUsage>,
-) -> Result<TokenUsageDbFields, String> {
+) -> TokenUsageDbFields {
     let Some(usage) = usage else {
-        return Ok(TokenUsageDbFields::default());
+        return TokenUsageDbFields::default();
     };
-    let input = usage.input_column()?;
-    let output = usage.output_column()?;
-    let total = usage.total_column()?;
-    Ok(TokenUsageDbFields {
+    let input = usage.input_column();
+    let output = usage.output_column();
+    let total = usage.total_column();
+    TokenUsageDbFields {
         token_usage_json: Some(usage.to_json().to_string()),
-        token_input: Some(input),
-        token_output: Some(output),
-        token_total: Some(total),
-    })
+        token_input: input,
+        token_output: output,
+        token_total: total,
+    }
 }
 
 fn add_inserted_rows(total: &mut i64, rows_affected: u64, context: &str) -> Result<(), String> {
@@ -4248,10 +4117,10 @@ mod tests {
 
         let usage = ingestion.token_usage.as_ref().unwrap();
         assert_eq!(usage["input_tokens"], 500);
-        assert_eq!(usage["cached_input_tokens"], 0);
-        assert_eq!(usage["cache_creation_tokens"], 0);
+        assert!(usage.get("cached_input_tokens").is_none());
+        assert!(usage.get("cache_creation_tokens").is_none());
         assert_eq!(usage["output_tokens"], 200);
-        assert_eq!(usage["total_tokens"], 700);
+        assert!(usage.get("total_tokens").is_none());
     }
 
     #[test]
@@ -4907,6 +4776,22 @@ mod tests {
     }
 
     #[test]
+    fn journal_unknown_witness_does_not_authorize_numeric_counters() {
+        for witness in [
+            serde_json::json!({}),
+            serde_json::json!({"input_tokens":10}),
+            serde_json::json!(null),
+        ] {
+            let mut event = make_turn_event();
+            event.tokens_in = Some(10);
+            event.tokens_out = Some(2);
+            event.metadata = Some(serde_json::json!({"qualified_usage": witness}));
+            let ingestion = IngestionEvent::from_journal_event(&event, "u1").unwrap();
+            assert_eq!(ingestion.token_usage, Some(serde_json::json!({})));
+        }
+    }
+
+    #[test]
     fn token_usage_uses_disjoint_canonical_shape_and_derived_columns() {
         let mut event = make_turn_event();
         event.tokens_in = Some(300);
@@ -4923,16 +4808,70 @@ mod tests {
         assert_eq!(usage["cache_creation_tokens"], 10);
         assert_eq!(usage["output_tokens"], 150);
         assert_eq!(usage["total_tokens"], 480);
-        assert_eq!(usage["prompt"], 330);
-        assert_eq!(usage["completion"], 150);
-        assert_eq!(usage["cache_read"], 20);
-        assert_eq!(usage["cache_write"], 10);
-        assert_eq!(usage["total"], 480);
+        assert!(
+            usage.get("prompt").is_none(),
+            "canonical serialization omits redundant aliases"
+        );
+        assert!(
+            usage.get("completion").is_none(),
+            "canonical serialization omits redundant aliases"
+        );
+        assert!(
+            usage.get("cache_read").is_none(),
+            "canonical serialization omits redundant aliases"
+        );
+        assert!(
+            usage.get("cache_write").is_none(),
+            "canonical serialization omits redundant aliases"
+        );
+        assert!(
+            usage.get("total").is_none(),
+            "canonical serialization omits redundant aliases"
+        );
 
         let values = IngestionEventInsertValues::from_event(&ingestion).expect("canonical usage");
         assert_eq!(values.token_input, Some(330));
         assert_eq!(values.token_output, Some(150));
         assert_eq!(values.token_total, Some(480));
+    }
+
+    #[test]
+    fn token_usage_ingestion_preserves_partial_and_unavailable_samples() {
+        for raw in [
+            serde_json::json!({}),
+            serde_json::json!({"output_tokens":7}),
+            serde_json::json!({"input_tokens":null,"output_tokens":7,"total_tokens":null}),
+        ] {
+            let mut event = test_event("partial", "session", "llm_response");
+            event.token_usage = Some(raw.clone());
+            let values = IngestionEventInsertValues::from_event(&event).unwrap();
+            assert_eq!(values.token_input, None);
+            assert_eq!(values.token_total, None);
+            assert_eq!(
+                values.token_output,
+                raw.get("output_tokens").and_then(Value::as_i64)
+            );
+            let stored: Value =
+                serde_json::from_str(values.token_usage_json.as_deref().unwrap()).unwrap();
+            assert_eq!(stored.get("output_tokens"), raw.get("output_tokens"));
+            assert!(stored.get("input_tokens").is_none());
+            assert!(stored.get("total_tokens").is_none());
+        }
+        let mut journal = make_turn_event();
+        journal.tokens_in = None;
+        journal.tokens_out = Some(7);
+        journal.cache_read_tokens = None;
+        journal.cache_creation_tokens = None;
+        let event = IngestionEvent::from_journal_event(&journal, "user").unwrap();
+        assert_eq!(
+            event.token_usage,
+            Some(serde_json::json!({"output_tokens":7}))
+        );
+        let values = IngestionEventInsertValues::from_event(&event).unwrap();
+        assert_eq!(
+            (values.token_input, values.token_output, values.token_total),
+            (None, Some(7), None)
+        );
     }
 
     #[test]
@@ -4993,7 +4932,10 @@ mod tests {
         assert_eq!(usage["cached_input_tokens"], 1_000);
         assert_eq!(usage["cache_creation_tokens"], 50);
         assert_eq!(usage["output_tokens"], 5);
-        assert_eq!(usage["prompt"], 1_060);
+        assert!(
+            usage.get("prompt").is_none(),
+            "canonical serialization omits redundant aliases"
+        );
         assert_eq!(usage["total_tokens"], 1_065);
 
         let values = IngestionEventInsertValues::from_event(&ingestion).expect("canonical usage");
@@ -5017,15 +4959,21 @@ mod tests {
     }
 
     #[test]
-    fn token_usage_degrades_to_absent_on_partial_or_overflowing_journal_tokens() {
+    fn token_usage_preserves_partial_but_rejects_overflowing_journal_tokens() {
         let mut partial = make_turn_event();
         partial.tokens_out = None;
         let ingestion = IngestionEvent::from_journal_event(&partial, "u1")
             .expect("partial token data must not drop the event");
-        assert!(
-            ingestion.token_usage.is_none(),
-            "partial token data should only drop token_usage"
+        let usage = ingestion
+            .token_usage
+            .as_ref()
+            .expect("known input survives missing output");
+        assert_eq!(
+            usage.get("input_tokens").and_then(Value::as_u64),
+            partial.tokens_in
         );
+        assert!(usage.get("output_tokens").is_none());
+        assert!(usage.get("total_tokens").is_none());
 
         let mut overflowing = make_turn_event();
         overflowing.tokens_in = Some(u64::MAX);

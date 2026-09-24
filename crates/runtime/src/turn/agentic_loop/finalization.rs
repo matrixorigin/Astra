@@ -834,6 +834,28 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
     // internal details, re-rendering that envelope on an append-only stream
     // duplicates the provider response.
     if let Some(interruption) = state.interruption.as_ref() {
+        if interruption.kind == astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete
+            && state
+                .hooks
+                .completion_settlement
+                .completion_action_window
+                .as_ref()
+                .is_some_and(|window| {
+                    !window.consumed
+                        || !window.matched
+                        || !matches!(
+                            super::execution_phase::pending_completion_action(state),
+                            Ok(None)
+                        )
+                })
+        {
+            // A matched action can still fail to satisfy its obligation.
+            // Conversely, a satisfied window may remain until the next text
+            // boundary, so its presence alone is not an incomplete result.
+            state.final_text = interruption_terminal_message(interruption);
+            state.final_text_streamed = false;
+            return;
+        }
         // Prefer the latest provider response, then the bounded settlement
         // candidate. A current runtime-owned Work settlement sentence is not
         // provider output and must not be promoted to partial assistant text.
@@ -1266,8 +1288,16 @@ mod tests {
     }
 
     #[test]
-    fn interruption_prefers_latest_provider_text_over_older_mixed_candidate() {
+    fn execution_incomplete_does_not_promote_provider_success_claim() {
         let mut state = make_state();
+        state.hooks.completion_settlement.completion_action_window =
+            Some(super::super::host::CompletionActionWindow {
+                action: super::super::host::CompletionAction::PostMutationObservation,
+                attempts_remaining: 1,
+                mismatch_corrections_remaining: 0,
+                consumed: false,
+                matched: false,
+            });
         state.hooks.completion_settlement.deferred_candidate_text =
             Some("older mixed response".to_string());
         state.hooks.completion_settlement.latest_provider_text =
@@ -1288,8 +1318,79 @@ mod tests {
 
         ensure_terminal_text(&mut state);
 
-        assert!(state.final_text.contains("latest truthful handoff"));
-        assert!(!state.final_text.contains("older mixed response"));
+        assert_eq!(
+            state.final_text,
+            state.interruption.as_ref().unwrap().user_message
+        );
+        assert!(!state.final_text.contains("latest truthful handoff"));
+        assert!(!state.final_text_streamed);
+    }
+
+    #[test]
+    fn failed_matched_completion_action_does_not_promote_provider_success_claim() {
+        let mut state = make_state();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                true,
+                false,
+                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+            );
+        state
+            .stall
+            .tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "write_file".to_string(),
+                ok: true,
+                ..Default::default()
+            });
+        state.hooks.completion_settlement.completion_action_window =
+            Some(super::super::host::CompletionActionWindow {
+                action: super::super::host::CompletionAction::PostMutationObservation,
+                attempts_remaining: 0,
+                mismatch_corrections_remaining: 0,
+                consumed: true,
+                matched: true,
+            });
+        state.hooks.completion_settlement.latest_provider_text =
+            Some("Fixed and verified.".to_string());
+        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+            astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete,
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+            astra_turn_core::interruption::InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 2,
+                turns_completed: 3,
+                remaining_turns: 0,
+                error_detail: Some("completion action ran but remains unverified".into()),
+                stall_signal: None,
+                resume_restricted_tools: vec![],
+            },
+        ));
+        assert!(matches!(
+            super::super::execution_phase::pending_completion_action(&state),
+            Ok(Some(_))
+        ));
+
+        ensure_terminal_text(&mut state);
+
+        assert_eq!(
+            state.final_text,
+            state.interruption.as_ref().unwrap().user_message
+        );
+        assert!(!state.final_text_streamed);
+
+        // The same matched window can outlive a settled obligation.
+        state.stall.tool_call_records.clear();
+        state.task_profile = make_state().task_profile;
+        state.hooks.completion_settlement.latest_provider_text =
+            Some("The edit was made; the final summary is partial.".to_string());
+        let pending = super::super::execution_phase::pending_completion_action(&state);
+        assert!(matches!(pending, Ok(None)), "{pending:?}");
+        ensure_terminal_text(&mut state);
+        assert_eq!(
+            state.final_text,
+            "The edit was made; the final summary is partial."
+        );
     }
 
     #[test]
@@ -1955,7 +2056,11 @@ mod tests {
             state.interruption.as_ref().map(|record| record.kind),
             Some(astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete)
         );
-        assert_eq!(state.final_text, answer);
+        assert_eq!(
+            state.final_text,
+            state.interruption.as_ref().unwrap().user_message
+        );
+        assert_ne!(state.final_text, answer);
         assert_eq!(
             state
                 .interruption
@@ -1963,7 +2068,7 @@ mod tests {
                 .and_then(|interruption| interruption.error_detail.as_deref()),
             Some("typed completion action was not satisfied")
         );
-        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages.len(), 2);
         assert_eq!(
             state.messages[0],
             serde_json::json!({
@@ -1971,6 +2076,10 @@ mod tests {
                 "content": "No workspace mutation was needed based on the evidence."
             }),
             "the provider response must remain intact as historical evidence"
+        );
+        assert_eq!(
+            state.messages[1],
+            serde_json::json!({"role": "assistant", "content": state.final_text})
         );
     }
 

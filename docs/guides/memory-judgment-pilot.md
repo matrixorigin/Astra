@@ -148,19 +148,20 @@ its original selector chain and excludes TypeSafe. No new execution endpoint is
 added. The existing authenticated completion proxy and durable inference ledger
 own provider execution, request hashes, deadlines, attempt settlement, and usage.
 
-Requests carry a strict versioned structured judgment: shared JSON evidence and
-keyed Noul questions. Memory code constructs the relevance/dismissal questions;
-the TypeSafe adapter only encodes the provider protocol. It preserves every
-probability and actual model identity in a typed response, with usage in the
-existing completion envelope. Memory code applies separate relevance/dismissal
-policies. Ordinary LLMs return fixed question IDs in `true` and `uncertain`
-lists. Memory, request classification, skill selection, and the comparison command share the
-message formatter and strict response normalization in `astra-turn-types`.
-Question IDs are JSON strings, including numeric-looking keys such as `"0"`;
-the shared chat instructions make this explicit rather than accepting numeric
-IDs through coercion. Dismissal questions also state their positive and negative
-criteria explicitly: invalidating a lesson is different from postponing an
-action, changing tasks, or making a current-task exception.
+Requests carry the version-2 structured judgment contract: shared JSON evidence
+and keyed questions. Memory code constructs its Noul relevance/dismissal
+questions; the TypeSafe adapter only encodes the provider protocol and preserves
+native probabilities and model identity, with usage in the existing completion
+envelope. Ordinary LLMs return an explicit typed `answers` map. Their discrete
+yes/no/unknown decisions never become probabilities; memory relevance retains
+unknown candidates after clear matches, while dismissal excludes unknowns.
+Memory, request classification, skill selection, and the comparison command
+share the formatter and strict response normalization in `astra-turn-types`.
+Question IDs are exact JSON strings, including numeric-looking keys such as
+`"0"`; duplicate keys, missing/extra IDs, and wrong answer types are rejected.
+Dismissal questions also state their positive and negative criteria explicitly:
+invalidating a lesson is different from postponing an action, changing tasks, or
+making a current-task exception.
 Memory evidence is keyed by the exact question IDs; questions reference those
 keys instead of requiring the model to count positions in an unlabelled array.
 This preserves identity when a batch contains multi-digit IDs.
@@ -174,12 +175,17 @@ Typed completion-proxy operations accept that canonical two-role message
 envelope and derive the minimum output budget from the question IDs before
 provider admission. The caller's `max_tokens` and the selected Offering's
 catalog cap must both fit the complete answer; free-form memory extraction is
-the only completion operation outside this typed contract.
+the only completion operation outside this typed contract. The judgment cap is
+derived from the largest serialized answer shape and is only an admission and
+generation limit; it is not a tokenizer measurement, reported usage, or billed
+token count. Actual usage remains sourced from provider-reported usage.
 Unknown or repeated IDs are invalid, not silently discarded. Native provider
 probabilities remain probabilities; discrete LLM decisions are never displayed
 as calibrated confidence. Uncertain memory decisions do not select or dismiss
 candidates. Business owners retain their thresholds and fallback behavior.
-Choice and Score can be added when a concrete caller needs them.
+The shared version-2 primitive also supports native and discrete Choice/Score
+answers for other callers; the memory selector deliberately asks only Noul
+questions and does not interpret Choice/Score distributions.
 
 One Jev Offering contains the connection and encrypted key. Future operations
 reuse that Offering, rather than creating scenario-specific Jev credentials.

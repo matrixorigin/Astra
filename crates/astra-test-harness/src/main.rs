@@ -349,6 +349,20 @@ fn initialize_execution_environment() -> Result<()> {
     Ok(())
 }
 
+async fn wait_for_suite_interrupt() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
+}
+
 async fn run() -> Result<()> {
     let args = Args::parse();
     if args.skip_preflight && std::env::var_os("ASTRA_EXPECTED_BUILD_GIT_SHA").is_some() {
@@ -540,6 +554,8 @@ async fn run() -> Result<()> {
     let mut runner_cfg = RunnerConfig::new(astra_bin.clone())
         .with_fallback_models(fallback_models.clone())
         .with_required_memoria_subsystem_health();
+    let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    runner_cfg.cancel_flag = Some(cancel_flag.clone());
     runner_cfg.working_dir = args.working_dir.clone();
     runner_cfg.profile = runner_profile.clone();
     runner_cfg.artifact_owner_scopes = runner_identity.artifact_owner_scopes.clone();
@@ -646,10 +662,23 @@ async fn run() -> Result<()> {
         suite_cfg,
         dashboard_tx: None,
         run_id: String::from("cli"),
-        cancel_flag: None,
+        cancel_flag: Some(cancel_flag.clone()),
     };
 
+    // Register only for the suite: preflight retains its normal signal
+    // behavior, while an active case gets time to kill its process group and
+    // settle the exact observed Session before this process exits.
+    let interrupt_task = tokio::spawn(async move {
+        if wait_for_suite_interrupt().await.is_ok() {
+            eprintln!(
+                "[astra-test] interrupt received; cancelling active case and settling its session"
+            );
+            cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    tokio::task::yield_now().await;
     let suite = runner.run_all(&cases).await;
+    interrupt_task.abort();
 
     // Persist artifacts if requested.
     if let Some(ref dir) = args.artifacts_dir {

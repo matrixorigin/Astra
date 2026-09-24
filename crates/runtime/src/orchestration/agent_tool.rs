@@ -71,11 +71,18 @@ const FANOUT_RESULT_MAX_BYTES: usize = 65_536;
 /// call budget, but it must eventually settle even when one child transport
 /// never reaches a terminal boundary. Expiry system-cancels only unfinished
 /// slots and returns the canonical aggregate, including completed partials.
-// One provider call has a 300s hard budget. Give its typed BudgetExhausted
-// projection and child finalizer a short settlement window before the group
-// owner force-cancels the slot; otherwise equal deadlines race and discard a
-// child partial that was already becoming terminal.
+// Keep an unbounded foreground fanout from waiting forever. When a parent has
+// an explicit execution deadline, its derived child deadline is authoritative
+// instead; the fixed fallback must not truncate a long, budgeted child run.
 const FANOUT_FOREGROUND_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(305);
+// The child runtime needs a small bounded interval after its work deadline to
+// publish the terminal receipt that the parent is waiting for.
+const FANOUT_TERMINAL_DELIVERY_GRACE: Duration = Duration::from_secs(5);
+/// Keep the parent's final-answer window after a foreground child settles.
+/// Optional parent verification can use time left if the child finishes early;
+/// it must not shorten every child's deadline pre-emptively.
+const FOREGROUND_CHILD_PARENT_FINAL_RESERVE: Duration =
+    astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET;
 static NEXT_FANOUT_GROUP_ID: AtomicU64 = AtomicU64::new(1);
 /// Static prose for the `Unknown` outcome. Must NOT interpolate the
 /// caller-supplied agent_id — that value already appears in the
@@ -445,6 +452,9 @@ pub struct AgentToolContext {
     pub trace_context: Option<TraceContext>,
     /// UI/runtime execution binding metadata inherited by child agents.
     pub execution_metadata: Option<Value>,
+    /// Absolute parent execution authority. Foreground children receive a
+    /// strictly earlier deadline so the parent can settle their results.
+    pub execution_deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
     /// Root-owned workspace-effect intent inherited by every spawned child.
     pub workspace_mutation: WorkspaceMutationAuthority,
     /// Where the canonical transcript for dynamic child runs is persisted.
@@ -882,7 +892,7 @@ struct AgentFanoutStartSlot {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
-    max_turns: Option<u32>,
+    initial_turns: Option<u32>,
     #[serde(default)]
     max_output_tokens: Option<u32>,
     #[serde(default)]
@@ -905,7 +915,7 @@ struct AgentFanoutDefaults {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
-    max_turns: Option<u32>,
+    initial_turns: Option<u32>,
     #[serde(default)]
     max_output_tokens: Option<u32>,
     #[serde(default)]
@@ -965,7 +975,7 @@ const FANOUT_START_FIELDS: &[&str] = &[
 const FANOUT_DEFAULTS_FIELDS: &[&str] = &[
     "agent_type",
     "model",
-    "max_turns",
+    "initial_turns",
     "max_output_tokens",
     "complexity",
     "isolated",
@@ -977,7 +987,7 @@ const FANOUT_SLOT_FIELDS: &[&str] = &[
     "prompt",
     "agent_type",
     "model",
-    "max_turns",
+    "initial_turns",
     "max_output_tokens",
     "complexity",
     "isolated",
@@ -1319,6 +1329,10 @@ async fn handle_agent_fanout_start_action_with_deadline(
         })
         .to_string();
     }
+    let child_execution_deadline = match derive_foreground_child_deadline(ctx.execution_deadline) {
+        Ok(deadline) => deadline,
+        Err(()) => return execution_deadline_too_short_outcome(),
+    };
     let slots = std::mem::take(&mut input.slots);
     let tool_call_id = input._tool_call_id.clone();
     if let Err(error) = ctx
@@ -1351,7 +1365,12 @@ async fn handle_agent_fanout_start_action_with_deadline(
                 tool_call_id.as_deref(),
             );
             Box::pin(async move {
-                let rendered = handle_agent_spawn_action(&spawn_args, Some(ctx)).await;
+                let rendered = handle_agent_spawn_action_with_deadline(
+                    &spawn_args,
+                    Some(ctx),
+                    SpawnDeadline::Explicit(child_execution_deadline),
+                )
+                .await;
                 let rendered_value = parsed_agent_output_or_bounded_error(rendered);
                 json!({
                     "slot_index": slot_index,
@@ -1369,28 +1388,29 @@ async fn handle_agent_fanout_start_action_with_deadline(
             })
         })
         .collect();
-    let mut agents: Vec<Value> =
-        match tokio::time::timeout(settlement_timeout, join_all(futs)).await {
-            Ok(agents) => agents,
-            Err(_) => {
-                let reason = format!(
-                    "foreground fanout settlement deadline elapsed after {}ms",
-                    settlement_timeout.as_millis()
-                );
-                let _ = ctx
-                    .spawner
-                    .cancel_fanout_group_for_deadline(&group_id, &reason)
-                    .await;
-                return render_agent_fanout_results(
-                    ctx,
-                    &group_id,
-                    tool_call_id,
-                    FanoutResultReadOptions::default(),
-                    false,
-                )
+    let settlement_deadline =
+        fanout_settlement_deadline(child_execution_deadline, settlement_timeout);
+    let mut agents: Vec<Value> = match tokio::time::timeout_at(settlement_deadline, join_all(futs))
+        .await
+    {
+        Ok(agents) => agents,
+        Err(_) => {
+            let reason = "foreground fanout settlement deadline elapsed before terminal delivery"
+                .to_string();
+            let _ = ctx
+                .spawner
+                .cancel_fanout_group_for_deadline(&group_id, &reason)
                 .await;
-            }
-        };
+            return render_agent_fanout_results(
+                ctx,
+                &group_id,
+                tool_call_id,
+                FanoutResultReadOptions::default(),
+                false,
+            )
+            .await;
+        }
+    };
     // Restore slot-index order.
     agents.sort_by_key(|v| v.get("slot_index").and_then(Value::as_u64).unwrap_or(0));
     // `Launched` is possible only after the user explicitly promotes the
@@ -1855,7 +1875,7 @@ async fn render_agent_fanout_results(
         obj.insert(
             "instruction".into(),
             json!(format!(
-                "Do NOT retry, respawn, or spawn additional agents to replace failed/interrupted/cancelled slots. The fanout group has a fixed target_count and adding agents corrupts accounting. Exactly {}/{} slots produced complete deliverables; {} incomplete slots retained usable partial evidence. Disclose the completion ratio, attribute partial claims to their originating slots, and synthesize the retained evidence now while marking unverified scope. Do not discard a partial solely because its run was interrupted. Ask the user how to proceed only when no usable partial evidence remains.",
+                "Do NOT retry, respawn, or spawn additional agents to replace failed/interrupted/cancelled slots. The fanout group has a fixed target_count and adding agents corrupts accounting. Exactly {}/{} slots produced complete deliverables; {} incomplete slots retained usable partial evidence. Attribute partial claims to their originating slots and do not discard a partial solely because its run was interrupted. Continue any unfulfilled part of the original task in this parent run with available tools while budget remains. If the final-answer window has begun, synthesize the retained evidence and clearly report what remains unverified; ask the user only when blocked by genuinely missing authority or required input.",
                 complete_deliverables, summary.target_count, usable_partial_count
             )),
         );
@@ -2140,7 +2160,9 @@ fn fanout_slot_spawn_args(
     });
     let object = value.as_object_mut().expect("object");
     let defaults = input.defaults.as_ref();
-    let effective_max_turns = fanout_effective_max_turns(&slot, defaults);
+    let initial_turns = slot
+        .initial_turns
+        .or_else(|| defaults.and_then(|defaults| defaults.initial_turns));
     insert_optional_string(
         object,
         "agent_type",
@@ -2154,7 +2176,7 @@ fn fanout_slot_spawn_args(
         slot.model
             .or_else(|| defaults.and_then(|d| d.model.clone())),
     );
-    insert_optional_u32(object, "max_turns", effective_max_turns);
+    insert_optional_u32(object, "initial_turns", initial_turns);
     insert_optional_u32(
         object,
         "max_output_tokens",
@@ -2186,18 +2208,6 @@ fn fanout_slot_spawn_args(
         );
     }
     value
-}
-
-fn fanout_effective_max_turns(
-    slot: &AgentFanoutStartSlot,
-    defaults: Option<&AgentFanoutDefaults>,
-) -> Option<u32> {
-    // A numeric max_turns is caller-owned authority and therefore a hard
-    // boundary. Do not serialize a persona/complexity default here: spawn
-    // uses the presence of this field to distinguish a hard ceiling from a
-    // renewable initial scheduling slice.
-    slot.max_turns
-        .or_else(|| defaults.and_then(|defaults| defaults.max_turns))
 }
 
 fn insert_optional_string(
@@ -2330,6 +2340,62 @@ fn fanout_slot_status_label(status: AgentFanoutSlotStatus) -> &'static str {
 
 /// Handle `agent(action='spawn')`.
 pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolContext>) -> String {
+    handle_agent_spawn_action_with_deadline(args, ctx, SpawnDeadline::Derive).await
+}
+
+#[derive(Clone, Copy)]
+enum SpawnDeadline {
+    Derive,
+    Explicit(Option<astra_services::runs::ExecutionDeadlineAuthority>),
+}
+
+fn derive_foreground_child_deadline(
+    parent: Option<astra_services::runs::ExecutionDeadlineAuthority>,
+) -> Result<Option<astra_services::runs::ExecutionDeadlineAuthority>, ()> {
+    let Some(parent) = parent else {
+        return Ok(None);
+    };
+    let child = parent
+        .with_parent_reserve(FOREGROUND_CHILD_PARENT_FINAL_RESERVE + FANOUT_TERMINAL_DELIVERY_GRACE)
+        .ok_or(())?;
+    (child.remaining()
+        >= astra_turn_core::chat_turn_heuristics::MIN_FOREGROUND_CHILD_EXECUTION_BUDGET)
+        .then_some(Some(child))
+        .ok_or(())
+}
+
+fn fanout_settlement_deadline(
+    child_deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
+    settlement_timeout: Duration,
+) -> tokio::time::Instant {
+    let requested = tokio::time::Instant::now() + settlement_timeout;
+    child_deadline
+        .map(|deadline| {
+            tokio::time::Instant::from_std(deadline.monotonic_deadline())
+                .checked_add(FANOUT_TERMINAL_DELIVERY_GRACE)
+                .unwrap_or_else(|| tokio::time::Instant::from_std(deadline.monotonic_deadline()))
+        })
+        .unwrap_or(requested)
+}
+
+fn execution_deadline_too_short_outcome() -> String {
+    json!({
+        "status": "completed",
+        "outcome": "delegation_skipped",
+        "reason_code": "insufficient_time_to_delegate",
+        "retryable": false,
+        "executed": false,
+        "result": "No child run was accepted. Delegation is optional; continue the original task in this parent run with available tools and evidence. Do not retry delegation. Clearly identify any requested checks that remain unverified.",
+        "instruction": "No child run was accepted. Delegation is optional; continue the original task in this parent run with available tools and evidence. Do not retry delegation or ask the user to resume solely because delegation was skipped. Clearly identify any requested checks that remain unverified.",
+    })
+    .to_string()
+}
+
+async fn handle_agent_spawn_action_with_deadline(
+    args: &Value,
+    ctx: Option<&AgentToolContext>,
+    deadline_policy: SpawnDeadline,
+) -> String {
     let input: SpawnAgentInput = match normalize_agent_spawn_args(args)
         .and_then(|patched_args| serde_json::from_value(patched_args).map_err(|e| e.to_string()))
     {
@@ -2361,6 +2427,19 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
     if let Err(e) = input.validate_fanout_metadata() {
         return render_agent_tool_error(None, &format!("Invalid input: {e}"));
     }
+
+    let execution_deadline = if input.run_in_background {
+        None
+    } else {
+        let derived = match deadline_policy {
+            SpawnDeadline::Derive => derive_foreground_child_deadline(ctx.execution_deadline),
+            SpawnDeadline::Explicit(deadline) => Ok(deadline),
+        };
+        match derived {
+            Ok(deadline) => deadline,
+            Err(()) => return execution_deadline_too_short_outcome(),
+        }
+    };
 
     let mut inherited_permissions = ctx.inherited_permissions.clone();
     inherited_permissions.is_background = input.run_in_background;
@@ -2419,13 +2498,16 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
     tokio::task::yield_now().await;
     let spawner = Arc::clone(&ctx.spawner);
     let spawn = AbortOnDropJoinHandle::new(tokio::spawn(async move {
-        spawner.spawn(input, &spawn_ctx).await
+        spawner
+            .spawn_with_execution_deadline(input, &spawn_ctx, execution_deadline)
+            .await
     }));
     match spawn.await {
         Ok(Ok(output)) => render_spawn_agent_output(output, ctx.transcript_location),
         Ok(Err(SpawnError::ExecutorUnavailable)) => {
             render_agent_runtime_binding_error("agent", "spawn")
         }
+        Ok(Err(SpawnError::ExecutionDeadlineElapsed)) => execution_deadline_too_short_outcome(),
         Ok(Err(e)) => render_agent_tool_error(None, &e.to_string()),
         Err(e) => render_agent_tool_error(None, &format!("agent spawn task failed: {e}")),
     }
@@ -3028,6 +3110,8 @@ mod tests {
     struct CapturingModelExecutor {
         captured_model: Mutex<Option<String>>,
         captured_execution_metadata: Mutex<Option<Value>>,
+        captured_execution_deadline:
+            Mutex<Option<astra_services::runs::ExecutionDeadlineAuthority>>,
         captured_max_turns: Mutex<Option<u32>>,
         captured_hard_turn_limit: Mutex<Option<Option<u32>>>,
         spawn_count: Mutex<usize>,
@@ -3038,6 +3122,7 @@ mod tests {
             Self {
                 captured_model: Mutex::new(None),
                 captured_execution_metadata: Mutex::new(None),
+                captured_execution_deadline: Mutex::new(None),
                 captured_max_turns: Mutex::new(None),
                 captured_hard_turn_limit: Mutex::new(None),
                 spawn_count: Mutex::new(0),
@@ -3050,6 +3135,12 @@ mod tests {
 
         fn take_captured_execution_metadata(&self) -> Option<Value> {
             self.captured_execution_metadata.lock().unwrap().take()
+        }
+
+        fn take_captured_execution_deadline(
+            &self,
+        ) -> Option<astra_services::runs::ExecutionDeadlineAuthority> {
+            self.captured_execution_deadline.lock().unwrap().take()
         }
 
         fn take_captured_max_turns(&self) -> Option<u32> {
@@ -3071,6 +3162,7 @@ mod tests {
             *self.spawn_count.lock().unwrap() += 1;
             *self.captured_model.lock().unwrap() = config.model.clone();
             *self.captured_execution_metadata.lock().unwrap() = config.execution_metadata.clone();
+            *self.captured_execution_deadline.lock().unwrap() = config.execution_deadline;
             *self.captured_max_turns.lock().unwrap() = Some(config.initial_turns);
             *self.captured_hard_turn_limit.lock().unwrap() = Some(config.hard_turn_limit);
             Ok(SpawnRunResult {
@@ -3478,6 +3570,7 @@ mod tests {
             client_tool_delivery_tx: None,
             trace_context: None,
             execution_metadata: None,
+            execution_deadline: None,
             workspace_mutation: WorkspaceMutationAuthority::default(),
             transcript_location: AgentTranscriptLocation::LocalJournal,
         }
@@ -3534,6 +3627,166 @@ mod tests {
         assert_eq!(
             executor.take_captured_model().as_deref(),
             Some("MiniMax-M2.7")
+        );
+    }
+
+    #[tokio::test]
+    async fn foreground_spawn_inherits_a_strictly_earlier_absolute_deadline() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let mut ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let parent_deadline = astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+            astra_services::runs::ExecutionTimeBudget {
+                remaining_seconds: 210,
+            },
+            1_000,
+        )
+        .expect("valid request deadline");
+        ctx.execution_deadline = Some(parent_deadline);
+
+        let result = handle_agent_spawn_action(
+            &json!({
+                "description": "Bounded review",
+                "prompt": "Return a concise finding.",
+                "agent_type": "general-purpose"
+            }),
+            Some(&ctx),
+        )
+        .await;
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&result).unwrap()["status"],
+            "completed"
+        );
+        let child_deadline = executor
+            .take_captured_execution_deadline()
+            .expect("foreground child must inherit a deadline");
+        assert_eq!(
+            parent_deadline.deadline_unix_ms - child_deadline.deadline_unix_ms,
+            35_000,
+            "delivery grace precedes the parent's final convergence window"
+        );
+        assert!(child_deadline.monotonic_deadline() < parent_deadline.monotonic_deadline());
+        let grandchild_deadline = derive_foreground_child_deadline(Some(child_deadline))
+            .expect("remaining time supports another bounded delegation");
+        let grandchild_deadline = grandchild_deadline.expect("nested child has useful work time");
+        assert_eq!(
+            parent_deadline.deadline_unix_ms - grandchild_deadline.deadline_unix_ms,
+            70_000,
+            "nested delegation narrows the same absolute deadline instead of reanchoring it"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreground_spawn_skips_when_child_cannot_get_a_work_and_settlement_window() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let mut ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        ctx.execution_deadline = Some(
+            astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+                astra_services::runs::ExecutionTimeBudget {
+                    remaining_seconds: 89,
+                },
+                1_000,
+            )
+            .expect("valid request deadline"),
+        );
+
+        let result = handle_agent_spawn_action(
+            &json!({
+                "description": "Too-late review",
+                "prompt": "Return a concise finding.",
+                "agent_type": "general-purpose"
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let result: Value = serde_json::from_str(&result).expect("structured skip outcome");
+
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["outcome"], "delegation_skipped");
+        assert_eq!(result["reason_code"], "insufficient_time_to_delegate");
+        assert_eq!(result["executed"], false);
+        let instruction = result["instruction"].as_str().unwrap();
+        assert!(instruction.contains("continue the original task in this parent run"));
+        assert!(instruction.contains("Do not retry delegation"));
+        assert_eq!(executor.spawn_count(), 0);
+    }
+
+    #[test]
+    fn foreground_child_requires_one_work_window_and_its_final_window() {
+        let parent = astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+            astra_services::runs::ExecutionTimeBudget {
+                remaining_seconds: 96,
+            },
+            1_000,
+        )
+        .expect("valid request deadline");
+        let child = derive_foreground_child_deadline(Some(parent))
+            .expect("96 seconds leaves at least 60 for child work and settlement")
+            .expect("finite parent produces finite child deadline");
+        assert!(child.remaining() >= Duration::from_secs(60));
+
+        let too_short = astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+            astra_services::runs::ExecutionTimeBudget {
+                remaining_seconds: 95,
+            },
+            1_000,
+        )
+        .expect("valid request deadline");
+        assert!(derive_foreground_child_deadline(Some(too_short)).is_err());
+    }
+
+    #[test]
+    fn fanout_wait_allows_terminal_delivery_after_the_child_deadline() {
+        let parent = astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+            astra_services::runs::ExecutionTimeBudget {
+                remaining_seconds: 120,
+            },
+            1_000,
+        )
+        .expect("valid request deadline");
+        let child = derive_foreground_child_deadline(Some(parent))
+            .expect("parent has room for child and parent settlement")
+            .expect("finite parent produces finite child deadline");
+
+        assert_eq!(
+            fanout_settlement_deadline(Some(child), Duration::from_secs(305)),
+            tokio::time::Instant::from_std(child.monotonic_deadline())
+                + FANOUT_TERMINAL_DELIVERY_GRACE,
+            "the child gets a bounded opportunity to publish its terminal result"
+        );
+        assert!(
+            parent.monotonic_deadline().duration_since(
+                fanout_settlement_deadline(Some(child), Duration::from_secs(305)).into_std()
+            ) >= FOREGROUND_CHILD_PARENT_FINAL_RESERVE,
+            "terminal delivery must leave the full parent synthesis reserve"
+        );
+    }
+
+    #[test]
+    fn long_budgeted_fanout_is_not_truncated_by_the_unbounded_fallback() {
+        let parent = astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+            astra_services::runs::ExecutionTimeBudget {
+                remaining_seconds: 900,
+            },
+            1_000,
+        )
+        .expect("valid request deadline");
+        let child = derive_foreground_child_deadline(Some(parent))
+            .expect("parent has room for child and parent settlement")
+            .expect("finite parent produces finite child deadline");
+        let wait_deadline = fanout_settlement_deadline(Some(child), Duration::from_secs(305));
+
+        assert_eq!(
+            wait_deadline,
+            tokio::time::Instant::from_std(child.monotonic_deadline())
+                + FANOUT_TERMINAL_DELIVERY_GRACE,
+            "an explicit run budget, not the no-deadline fallback, bounds the fanout"
+        );
+        assert!(
+            wait_deadline > tokio::time::Instant::now() + Duration::from_secs(305),
+            "long-running children must not be cancelled at the fallback's 305s mark"
         );
     }
 
@@ -3613,7 +3866,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_spawn_agent_tool_preserves_explicit_turn_budget() {
+    async fn handle_spawn_agent_tool_treats_model_turn_hint_as_renewable() {
         let executor = Arc::new(CapturingModelExecutor::new());
         let spawner = test_spawner(executor.clone());
         let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
@@ -3621,7 +3874,7 @@ mod tests {
             "description": "Investigate failures",
             "prompt": "Inspect the failing fanout run and report the root cause.",
             "agent_type": "general-purpose",
-            "max_turns": 10,
+            "initial_turns": 10,
             "complexity": "light"
         });
 
@@ -3632,9 +3885,51 @@ mod tests {
         assert_eq!(
             executor.take_captured_max_turns(),
             Some(10),
-            "the child loop must preserve the explicit caller-selected initial slice"
+            "the child loop must preserve the model-suggested initial slice"
         );
-        assert_eq!(executor.take_captured_hard_turn_limit(), Some(Some(10)));
+        assert_eq!(executor.take_captured_hard_turn_limit(), Some(None));
+    }
+
+    #[tokio::test]
+    async fn model_authored_hard_limit_is_rejected_before_child_admission() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let result = handle_agent_spawn_action(
+            &json!({
+                "description": "Investigate failures",
+                "prompt": "Inspect the failure and report evidence.",
+                "max_turns": 2,
+            }),
+            Some(&ctx),
+        )
+        .await;
+
+        assert!(result.contains("unknown field"), "{result}");
+        assert_eq!(executor.spawn_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn fanout_model_authored_hard_limit_is_rejected_before_child_admission() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "target_count": 1,
+                "slots": [{
+                    "description": "Investigate failures",
+                    "prompt": "Inspect the failure and report evidence.",
+                    "max_turns": 2,
+                }],
+            }),
+            Some(&ctx),
+        )
+        .await;
+
+        assert!(result.contains("unknown field `max_turns`"), "{result}");
+        assert_eq!(executor.spawn_count(), 0);
     }
 
     #[tokio::test]
@@ -4791,7 +5086,7 @@ mod tests {
             prompt: "Review storage layer".into(),
             agent_type: None,
             model: None,
-            max_turns: None,
+            initial_turns: None,
             max_output_tokens: None,
             complexity: None,
             isolated: None,
@@ -4819,7 +5114,7 @@ mod tests {
             slots: Vec::new(),
             defaults: Some(AgentFanoutDefaults {
                 agent_type: Some("code-review".into()),
-                max_turns: Some(15),
+                initial_turns: Some(15),
                 complexity: Some("deep".into()),
                 ..Default::default()
             }),
@@ -4830,7 +5125,7 @@ mod tests {
             prompt: "Review correctness deeply".into(),
             agent_type: None,
             model: None,
-            max_turns: None,
+            initial_turns: None,
             max_output_tokens: None,
             complexity: None,
             isolated: None,
@@ -4841,7 +5136,7 @@ mod tests {
 
         assert_eq!(args["agent_type"], "code-review");
         assert_eq!(args["complexity"], "deep");
-        assert_eq!(args["max_turns"], 15);
+        assert_eq!(args["initial_turns"], 15);
     }
 
     #[test]
@@ -4855,7 +5150,7 @@ mod tests {
             slots: Vec::new(),
             defaults: Some(AgentFanoutDefaults {
                 agent_type: Some("general-purpose".into()),
-                max_turns: Some(10),
+                initial_turns: Some(10),
                 complexity: Some("light".into()),
                 ..Default::default()
             }),
@@ -4866,7 +5161,7 @@ mod tests {
             prompt: "Investigate runtime failures".into(),
             agent_type: None,
             model: None,
-            max_turns: None,
+            initial_turns: None,
             max_output_tokens: None,
             complexity: None,
             isolated: None,
@@ -4885,7 +5180,7 @@ mod tests {
 
         assert_eq!(args["agent_type"], "general-purpose");
         assert_eq!(args["complexity"], "light");
-        assert_eq!(args["max_turns"], 10);
+        assert_eq!(args["initial_turns"], 10);
     }
 
     #[test]
@@ -4905,7 +5200,7 @@ mod tests {
             prompt: "Fetch one source and return its URL".into(),
             agent_type: None,
             model: Some("deepseek-v4-flash".into()),
-            max_turns: None,
+            initial_turns: None,
             max_output_tokens: None,
             complexity: None,
             isolated: None,
@@ -4917,7 +5212,7 @@ mod tests {
         assert_eq!(args["agent_type"], "explore");
         assert_eq!(args["model"], "deepseek-v4-flash");
         assert!(
-            args.get("max_turns").is_none(),
+            args.get("initial_turns").is_none(),
             "an implicit persona budget must remain a renewable child slice"
         );
     }
@@ -4942,7 +5237,7 @@ mod tests {
             prompt: "Review correctness and return evidence".into(),
             agent_type: None,
             model: None,
-            max_turns: None,
+            initial_turns: None,
             max_output_tokens: None,
             complexity: None,
             isolated: None,
@@ -4959,7 +5254,7 @@ mod tests {
             None,
         );
 
-        assert!(args.get("max_turns").is_none());
+        assert!(args.get("initial_turns").is_none());
     }
 
     #[tokio::test]
@@ -6124,7 +6419,7 @@ mod tests {
             collected_value["instruction"]
                 .as_str()
                 .is_some_and(|instruction| instruction.contains("0/1")
-                    && instruction.contains("synthesize the retained evidence now")),
+                    && instruction.contains("synthesize the retained evidence")),
             "{collected_value}"
         );
         assert_eq!(
@@ -6174,7 +6469,7 @@ mod tests {
         );
         assert!(
             collected_value["instruction"].as_str().is_some_and(
-                |instruction| instruction.contains("synthesize the retained evidence now")
+                |instruction| instruction.contains("synthesize the retained evidence")
             ),
             "{collected_value}"
         );

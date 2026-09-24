@@ -1446,7 +1446,10 @@ fn append_session_section(
     out.push(Line::from(line1));
 
     let mut line2: Vec<Span<'static>> = vec![Span::raw("    └ ")];
-    line2.push(Span::raw(format!("cost ${:.4}", s.total_cost)));
+    line2.push(Span::raw(format!(
+        "cost {}",
+        crate::cli::slash::slash_stats::format_optional_cost(s.total_cost)
+    )));
     out.push(Line::from(line2));
 
     out.push(Line::from(vec![
@@ -2870,7 +2873,7 @@ mod tests {
             session_id: "abcdef12-full".into(),
             turn: 5,
             model: Some("test-model-x".into()),
-            total_cost: 0.12,
+            total_cost: Some(0.12),
             prompt_tokens: 1200,
             completion_tokens: 300,
             cache_read_tokens: 800,
@@ -2960,7 +2963,7 @@ mod tests {
             session_id: "session-known".into(),
             turn: 4,
             model: Some("model-known".into()),
-            total_cost: 0.02,
+            total_cost: Some(0.02),
             prompt_tokens: 1_000,
             completion_tokens: 200,
             cache_read_tokens: 300,
@@ -3267,7 +3270,7 @@ mod tests {
             session_id: "session-local".into(),
             turn: 4,
             model: Some("model-local".into()),
-            total_cost: 0.02,
+            total_cost: Some(0.02),
             prompt_tokens: 1_200,
             completion_tokens: 800,
             cache_read_tokens: 300,

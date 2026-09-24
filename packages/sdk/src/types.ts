@@ -1749,13 +1749,32 @@ export type SessionActivity = {
   details: Record<string, unknown>;
 };
 
-/** `GET /sessions/{id}/audit/summary` — matches `SessionAuditSummary` in the services crate. */
+/** Nullable lanes retain incomplete evidence; zero is an observed count. */
+export type SessionRequestUsageSummary = {
+  scope: "session_all_runs";
+  request_count: number;
+  fresh_input_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_creation_tokens: number | null;
+  output_tokens: number | null;
+};
+
+export type SessionCostSummary = {
+  estimated_cost_usd?: number;
+  per_model_cost_usd?: Record<string, number>;
+  priced_turn_count: number;
+  unpriced_turn_count: number;
+};
+
+/** `GET /sessions/{id}/audit/summary` — matches the services response. */
 export type SessionAuditSummary = {
   session_id: string;
   status: string;
   turn_count: number;
   tokens_in: number;
   tokens_out: number;
+  request_usage: SessionRequestUsageSummary;
+  cost: SessionCostSummary;
   tool_calls_total: number;
   tool_calls_failed: number;
   error_count: number;

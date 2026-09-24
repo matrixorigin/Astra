@@ -1,9 +1,95 @@
 use crate::cli::slash::slash_stats;
 
-// ── cost_for_tokens ─────────────────────────────────────────────────
+#[test]
+fn displayed_cost_rows_keep_missing_evidence_and_overflow_unknown() {
+    let pricing = astra_services::models::PricingData {
+        prompt: 0.01,
+        completion: 0.02,
+        cache_read: None,
+        cache_write: None,
+    };
+    let complete =
+        slash_stats::scenario_cost_for_lanes([Some(10), Some(2), Some(0), Some(0)], &pricing);
+    let missing =
+        slash_stats::scenario_cost_for_lanes([Some(10), None, Some(0), Some(0)], &pricing);
+    let unpriced =
+        slash_stats::scenario_cost_for_lanes([Some(10), Some(2), Some(1), Some(0)], &pricing);
+    assert!(complete.is_some());
+    for unavailable in [missing, unpriced] {
+        assert_eq!(unavailable, None);
+        for rows in [
+            [complete, unavailable, complete],
+            [unavailable, complete, complete],
+        ] {
+            assert_eq!(
+                rows.into_iter()
+                    .fold(Some(0.0), slash_stats::add_scenario_cost),
+                None
+            );
+        }
+    }
+    assert_eq!(
+        slash_stats::add_scenario_cost(Some(f64::MAX), Some(f64::MAX)),
+        None
+    );
+    let zero = slash_stats::scenario_cost_for_lanes([Some(0); 4], &pricing);
+    assert_eq!(slash_stats::format_optional_cost(zero), "$0.0000");
+}
 
 #[test]
-fn cost_for_tokens() {
+fn unavailable_cost_is_not_formatted_as_free() {
+    for cost in [None, Some(f64::NAN), Some(f64::INFINITY), Some(-1.0)] {
+        assert_eq!(slash_stats::format_optional_cost(cost), "unavailable");
+    }
+    assert_eq!(slash_stats::format_optional_cost(Some(0.0)), "$0.0000");
+    assert_eq!(slash_stats::format_optional_cost(Some(1.5)), "$1.50");
+}
+
+#[test]
+fn current_rate_scenario_preserves_unknown_prices_and_observed_counts() {
+    let mut state = crate::cli::session::session_state::SessionState::default();
+    state.total_prompt_tokens = 100;
+    state.total_completion_tokens = 20;
+    state.total_cache_read_tokens = 900;
+    state.total_cache_creation_tokens = 30;
+    state.turn = 2;
+    state.cached_pricing = astra_services::models::PricingData {
+        prompt: 0.01,
+        completion: 0.02,
+        cache_read: None,
+        cache_write: None,
+    };
+    let rows = slash_stats::current_rate_cost_rows(&state);
+    assert!(rows.contains(&("billing", "not a session bill".into())));
+    assert!(rows.contains(&("coverage", "unknown".into())));
+    assert!(rows.contains(&("attribution", "unknown".into())));
+    assert!(rows.contains(&("cache read", "900 (unavailable)".into())));
+    assert!(rows.contains(&("cache write", "30 (unavailable)".into())));
+    assert!(rows.contains(&("scenario sum", "unavailable".into())));
+    assert!(!rows.iter().any(|(label, value)| label.contains("avg")
+        || value.contains("saved")
+        || value.contains("%")));
+    state.cached_pricing.cache_read = Some(0.001);
+    state.cached_pricing.cache_write = Some(0.01);
+    let rows = slash_stats::current_rate_cost_rows(&state);
+    assert!(rows.contains(&("scenario sum", "$2.60".into())));
+    state.cached_pricing.cache_read = Some(0.0);
+    state.cached_pricing.cache_write = Some(0.0);
+    let rows = slash_stats::current_rate_cost_rows(&state);
+    assert!(rows.contains(&("cache read", "900 ($0.0000)".into())));
+    assert!(rows.contains(&("scenario sum", "$1.40".into())));
+    state.total_cache_read_tokens = 0;
+    state.total_cache_creation_tokens = 0;
+    state.cached_pricing.cache_read = None;
+    state.cached_pricing.cache_write = None;
+    let rows = slash_stats::current_rate_cost_rows(&state);
+    assert!(rows.contains(&("scenario sum", "$1.40".into())));
+}
+
+// ── Explicit-rate scenarios ────────────────────────────────────────
+
+#[test]
+fn explicit_rate_scenarios() {
     let pricing = astra_services::models::PricingData {
         prompt: 0.000_003,
         completion: 0.000_015,
@@ -12,26 +98,22 @@ fn cost_for_tokens() {
     };
 
     // basic: 1000 prompt + 500 completion → $0.0105
-    let cost = slash_stats::cost_for_tokens(1000, 500, 0, 0, &pricing);
+    let cost = pricing.estimated_cost_usd(1000, 500, 0, 0).unwrap();
     assert!((cost - 0.0105).abs() < 1e-10);
 
     // zero inputs
-    assert_eq!(slash_stats::cost_for_tokens(0, 0, 0, 0, &pricing), 0.0);
+    assert_eq!(pricing.estimated_cost_usd(0, 0, 0, 0).unwrap(), 0.0);
 
     // zero pricing
     assert_eq!(
-        slash_stats::cost_for_tokens(
-            10000,
-            5000,
-            0,
-            0,
-            &astra_services::models::PricingData::default()
-        ),
-        0.0
+        astra_services::models::PricingData::default().estimated_cost_usd(10000, 5000, 0, 0,),
+        Some(0.0)
     );
 
     // large values: 1M prompt + 500K completion → $10.50
-    let cost = slash_stats::cost_for_tokens(1_000_000, 500_000, 0, 0, &pricing);
+    let cost = pricing
+        .estimated_cost_usd(1_000_000, 500_000, 0, 0)
+        .unwrap();
     assert!((cost - 10.5).abs() < 1e-6);
 
     // with explicit cache rates
@@ -41,7 +123,9 @@ fn cost_for_tokens() {
         cache_read: Some(0.000_000_3),
         cache_write: Some(0.000_003_75),
     };
-    let cost = slash_stats::cost_for_tokens(500, 200, 1000, 100, &cache_pricing);
+    let cost = cache_pricing
+        .estimated_cost_usd(500, 200, 1000, 100)
+        .unwrap();
     let expected =
         (500.0 * 0.000_003) + (200.0 * 0.000_015) + (1000.0 * 0.000_000_3) + (100.0 * 0.000_003_75);
     assert!((cost - expected).abs() < 1e-10);
@@ -200,7 +284,7 @@ fn fallback_pricing_by_model() {
 #[test]
 fn fallback_cost_calculation_with_cache() {
     let p = slash_stats::fallback_pricing("claude-sonnet-4-20250514");
-    let cost = slash_stats::cost_for_tokens(1000, 500, 2000, 100, &p);
+    let cost = p.estimated_cost_usd(1000, 500, 2000, 100).unwrap();
     let expected = 0.003 + 0.0075 + 0.0006 + 0.000375;
     assert!((cost - expected).abs() < 1e-8);
 }

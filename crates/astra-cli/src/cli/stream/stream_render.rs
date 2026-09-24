@@ -43,6 +43,14 @@ const STRUCTURED_WORK_OUTPUT_EVENT_LIMIT_BYTES: usize = 64_000;
 /// stalled interactive renderer.
 const RELIABLE_STREAM_EVENT_RESERVE: usize = 2;
 
+fn approval_unavailable_tool_output(reason: &str) -> String {
+    let (redacted, _) = astra_tools::credential_redaction::redact_credentials_for_display(reason);
+    let reason = astra_text_utils::str_preview::truncate_line(&redacted, 240);
+    format!(
+        "Operation not executed: {reason}. Approval is unavailable in this execution context. Use an operation within the permitted scope, or report this blocker to the parent/user."
+    )
+}
+
 pub(crate) fn agent_control_action(args: &Value) -> Option<&str> {
     args.get("action")
         .and_then(Value::as_str)
@@ -596,6 +604,7 @@ fn normalized_fanout_start_status(event: &Value, output: &str) -> String {
         output,
     ) {
         Some(AgentFanoutControlReceiptKind::Group) => "completed".to_string(),
+        Some(AgentFanoutControlReceiptKind::SkippedBeforeAcceptance) => "skipped".to_string(),
         Some(
             AgentFanoutControlReceiptKind::RejectedBeforeAcceptance
             | AgentFanoutControlReceiptKind::ExecutionUnknown,
@@ -1275,9 +1284,8 @@ struct CliSseStreamHost<'a> {
     /// Last durable server run identity forwarded to active-run controls.
     last_bound_run_id: Option<String>,
     /// Last provider-confirmed input occupancy forwarded to observers.
-    last_context_window_measured: Option<u64>,
     /// Last provider-normalized request lanes forwarded to observers.
-    last_request_token_usage: Option<astra_turn_types::RequestTokenUsage>,
+    last_request_token_usage: Option<Option<astra_turn_types::RequestTokenUsage>>,
     /// Optional direct stream sink for bounded/live paths.
     stream_event_sink: Option<chat_stream::SharedStreamEventSink>,
     /// Strict per-exchange protocol observer for `stream-json`.
@@ -1371,16 +1379,7 @@ struct CliSseStreamHost<'a> {
 fn request_token_usage_from_accum(
     accum: &ChatTurnSseAccum,
 ) -> Option<astra_turn_types::RequestTokenUsage> {
-    accum.current_request_usage.or_else(|| {
-        (accum.has_usage && !accum.usage_is_run_total).then_some(
-            astra_turn_types::RequestTokenUsage {
-                fresh_input_tokens: accum.prompt_tokens,
-                cache_read_tokens: accum.cache_read_tokens,
-                cache_creation_tokens: accum.cache_creation_tokens,
-                output_tokens: accum.completion_tokens,
-            },
-        )
-    })
+    accum.current_request_usage
 }
 
 fn terminal_output_failure_for_event(
@@ -1790,7 +1789,6 @@ impl<'a> CliSseStreamHost<'a> {
             last_context_system_prompt_tokens: None,
             last_context_window_policy: None,
             last_bound_run_id: None,
-            last_context_window_measured: None,
             last_request_token_usage: None,
             stream_event_sink: ctx.stream_event_sink,
             stream_json_exchange: None,
@@ -4806,28 +4804,17 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             self.last_context_window_policy = server_policy;
         }
 
-        let measured = request_token_usage_from_accum(accum)
-            .map(|usage| {
-                astra_turn_types::NormalizedPromptCacheUsage::new(
-                    usage.fresh_input_tokens,
-                    usage.cache_read_tokens,
-                    usage.cache_creation_tokens,
-                )
-                .total_input_tokens()
-            })
-            .filter(|tokens| *tokens > 0);
-        if measured != self.last_context_window_measured {
-            if let Some(tokens) = measured {
-                self.try_emit_stream_event(chat_stream::StreamEvent::ContextWindowMeasured(tokens));
-            }
-            self.last_context_window_measured = measured;
-        }
         let request_usage = request_token_usage_from_accum(accum);
-        if request_usage != self.last_request_token_usage {
-            if let Some(usage) = request_usage {
-                self.try_emit_stream_event(chat_stream::StreamEvent::RequestTokenUsage(usage));
-            }
-            self.last_request_token_usage = request_usage;
+        if Some(request_usage) != self.last_request_token_usage {
+            let measured = request_usage.and_then(|usage| {
+                usage
+                    .fresh_input_tokens
+                    .checked_add(usage.cache_read_tokens)?
+                    .checked_add(usage.cache_creation_tokens)
+            });
+            self.try_emit_stream_event(chat_stream::StreamEvent::ContextWindowMeasured(measured));
+            self.try_emit_stream_event(chat_stream::StreamEvent::RequestTokenUsage(request_usage));
+            self.last_request_token_usage = Some(request_usage);
         }
     }
 
@@ -5410,30 +5397,15 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         );
                     }
                     response.is_approved() && stale_revalidation_passed
-                } else if self.render_policy.is_silent() {
-                    astra_core::agent_warn!(
-                        "permission",
-                        "Auto-denied {t} in sub-run mode (no interactive terminal): {reason}"
-                    );
-                    if let Some(pm) = self.perm_manager.as_mut() {
-                        pm.record_approval(&t, Some(args), false);
-                    }
-                    false
                 } else {
-                    // Issue #326 P0 (tui-only) / #331: with the
-                    // REPL deleted upstream, TUI is the sole
-                    // interactive mode and it always installs an
-                    // `approval_request_tx`. Reaching this branch
-                    // means: no approval channel AND not silent —
-                    // a configuration mismatch, not a user
-                    // workflow. Fail closed with an actionable
-                    // reason so the LLM sees a Deny instead of
-                    // hanging on a stdin readline that the user
-                    // can't see.
+                    // Sub-runs cannot prompt, and a non-silent host without
+                    // an approval sink is misconfigured. Both fail closed with
+                    // the actual bounded reason, so the agent can avoid an
+                    // identical denied retry.
+                    denied_output = Some(approval_unavailable_tool_output(&reason));
                     astra_core::agent_warn!(
                         "permission",
-                        "Auto-denied {t}: no approval sink installed (no TUI, not silent). \
-                         Pass --mode auto or attach to a TUI session. reason={reason}"
+                        "Auto-denied {t}: no approval sink installed. reason={reason}"
                     );
                     if let Some(pm) = self.perm_manager.as_mut() {
                         pm.record_approval(&t, Some(args), false);
@@ -9075,17 +9047,18 @@ mod tests {
         apply_edge_callback_failure_result, approval_batch_group_key,
         approval_default_always_scope, approval_memory_action, approval_memory_preview,
         approval_scope_context_for_tool, approval_stale_revalidation_error,
-        catch_tool_execution_panic, dispatch_turn_event_block, durable_allow_was_acknowledged,
-        edge_callback_detach_message, edge_callback_error_kind, edge_tool_is_cacheable_read,
-        edge_tool_outcome_status, execute_with_invocation_metadata_responsive,
-        execute_with_metadata_responsive, extract_cli_diff_block, file_content_sha256,
-        finalize_cli_skill_execution, format_terminal_tool_summary,
-        format_tool_display_from_preview, is_edge_auth_failure, merge_edge_tool_rounds,
-        normalize_sandbox_denied_outcome, path_mtime_ms, recorded_approval_decision,
-        request_token_usage_from_accum, reusable_speculative_output, sanitize_final_stream_text,
-        server_context_window_policy_from_accum, server_tool_completion_id,
-        server_tool_completion_is_authoritative, server_tool_completion_output,
-        server_tool_completion_status, server_tool_event_is_client_owned, server_tool_event_owner,
+        approval_unavailable_tool_output, catch_tool_execution_panic, dispatch_turn_event_block,
+        durable_allow_was_acknowledged, edge_callback_detach_message, edge_callback_error_kind,
+        edge_tool_is_cacheable_read, edge_tool_outcome_status,
+        execute_with_invocation_metadata_responsive, execute_with_metadata_responsive,
+        extract_cli_diff_block, file_content_sha256, finalize_cli_skill_execution,
+        format_terminal_tool_summary, format_tool_display_from_preview, is_edge_auth_failure,
+        merge_edge_tool_rounds, normalize_sandbox_denied_outcome, path_mtime_ms,
+        recorded_approval_decision, request_token_usage_from_accum, reusable_speculative_output,
+        sanitize_final_stream_text, server_context_window_policy_from_accum,
+        server_tool_completion_id, server_tool_completion_is_authoritative,
+        server_tool_completion_output, server_tool_completion_status,
+        server_tool_event_is_client_owned, server_tool_event_owner,
         server_tool_event_requires_provenance, server_tool_start_fields, style_tool_description,
         sync_incremental_accum_state, sync_incremental_tool_result_state,
         terminal_output_failure_for_event, theme, tool_completion_icon,
@@ -9105,6 +9078,76 @@ mod tests {
     use tempfile::tempdir;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn unavailable_approval_explains_denial_without_exposing_credentials() {
+        let output = approval_unavailable_tool_output(
+            "Git command crosses the allowed boundary. token=ghp_123456789012345678901234567890123456",
+        );
+        assert!(output.contains("Git command crosses the allowed boundary"));
+        assert!(output.contains("Approval is unavailable"));
+        assert!(!output.contains("ghp_123456789012345678901234567890123456"));
+    }
+
+    #[tokio::test]
+    async fn missing_approval_sink_fails_closed_with_reason_in_both_render_modes() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let workspace = tempdir().expect("workspace");
+        let args =
+            serde_json::json!({"command": format!("git -C {} status", workspace.path().display())});
+
+        for render_policy in [RenderPolicy::Silent, RenderPolicy::Stream] {
+            let executor =
+                std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
+            let mut tool_cache = EdgeToolCache::new(2);
+            let mut pm = crate::cli::permission_manager::PermissionManager::with_project(
+                false,
+                workspace.path(),
+            );
+            let mut host = CliSseStreamHost::from_edge_ctx(
+                EdgeSseContext {
+                    api: &api,
+                    token: "tok",
+                    executor_id: "edge-test",
+                    executor,
+                    render_policy,
+                    perm_manager: Some(&mut pm),
+                    cancel_token: None,
+                    stream_event_tx: None,
+                    stream_event_sink: None,
+                    approval_request_tx: None,
+                    ask_user_request_tx: None,
+                    skill_resolver: None,
+                    skill_continuation: false,
+                    turn_rollback_on_failure: false,
+                    tool_cache: &mut tool_cache,
+                    observability_hub: None,
+                    incremental_state: None,
+                    request_session_execution_lease: None,
+                },
+                80,
+                false,
+            );
+            let result = host.execute_tool("denied-git", "bash", &args).await;
+            assert_eq!(result.status, "failed", "{}", result.output);
+            assert!(
+                result.output.contains("Approval is unavailable"),
+                "{}",
+                result.output
+            );
+            assert!(
+                result.output.contains("Operation not executed"),
+                "{}",
+                result.output
+            );
+        }
+    }
 
     #[test]
     fn hard_stream_failure_retains_precedence_over_concurrent_stdout_closure() {
@@ -9168,6 +9211,12 @@ mod tests {
     #[test]
     fn request_token_lanes_come_from_one_physical_sse_exchange() {
         let usage = request_token_usage_from_accum(&ChatTurnSseAccum {
+            current_request_usage: Some(astra_turn_types::RequestTokenUsage {
+                fresh_input_tokens: 200,
+                cache_read_tokens: 800,
+                cache_creation_tokens: 100,
+                output_tokens: 50,
+            }),
             prompt_tokens: 200,
             cache_read_tokens: 800,
             cache_creation_tokens: 100,
@@ -9299,10 +9348,40 @@ mod tests {
                 usable_input_tokens: 800_000,
             })
         ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(chat_stream::StreamEvent::ContextWindowMeasured(None))
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(chat_stream::StreamEvent::RequestTokenUsage(None))
+        ));
         assert!(
             event_rx.try_recv().is_err(),
             "unknown metadata and replay must not duplicate the last confirmed server policy"
         );
+
+        host.on_accum_update(&ChatTurnSseAccum {
+            current_request_usage: Some(astra_turn_types::RequestTokenUsage::default()),
+            ..accum.clone()
+        });
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(chat_stream::StreamEvent::ContextWindowMeasured(Some(0)))
+        ));
+        assert!(
+            matches!(event_rx.try_recv(), Ok(chat_stream::StreamEvent::RequestTokenUsage(Some(usage))) if usage == astra_turn_types::RequestTokenUsage::default())
+        );
+        host.on_accum_update(&accum);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(chat_stream::StreamEvent::ContextWindowMeasured(None))
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(chat_stream::StreamEvent::RequestTokenUsage(None))
+        ));
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[test]
@@ -9316,13 +9395,8 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(
-            usage,
-            Some(astra_turn_types::RequestTokenUsage {
-                fresh_input_tokens: 2_127_556,
-                cache_read_tokens: 1_706_112,
-                cache_creation_tokens: 0,
-                output_tokens: 34_000,
-            })
+            usage, None,
+            "aggregate counts cannot certify one physical request"
         );
 
         let aggregate = ChatTurnSseAccum {

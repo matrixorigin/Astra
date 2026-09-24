@@ -47,6 +47,18 @@ impl ExecutionTimeBudgetClock {
         self.remaining_at(tokio::time::Instant::now())
     }
 
+    /// Last instant at which a new Server admission may begin. Retries must
+    /// not keep the user waiting through the final-answer reserve.
+    pub(crate) fn admission_deadline(&self) -> tokio::time::Instant {
+        self.terminal_deadline
+            .checked_sub(
+                self.terminal_reserve
+                    .saturating_add(self.request_safety_margin)
+                    .saturating_add(Duration::from_secs(1)),
+            )
+            .unwrap_or_else(tokio::time::Instant::now)
+    }
+
     fn remaining_at(&self, now: tokio::time::Instant) -> astra_services::runs::ExecutionTimeBudget {
         let available = self
             .terminal_deadline
@@ -134,10 +146,10 @@ pub enum StreamEvent {
     /// Provider-confirmed input occupancy for the just-completed request.
     /// The number includes the canonical fresh/cache-read/cache-write input
     /// buckets exactly once.
-    ContextWindowMeasured(u64),
+    ContextWindowMeasured(Option<u64>),
     /// Provider-normalized lanes for the same physical request as
     /// `ContextWindowMeasured`.
-    RequestTokenUsage(astra_turn_types::RequestTokenUsage),
+    RequestTokenUsage(Option<astra_turn_types::RequestTokenUsage>),
     /// Canonical, bounded runtime observation produced after one provider
     /// round. Consumers may display or persist it, but never treat this live
     /// projection as policy authority.

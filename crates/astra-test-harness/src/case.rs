@@ -69,6 +69,14 @@ pub struct Case {
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
 
+    /// Optional earlier CLI wall deadline, distinct from the harness process
+    /// watchdog above. Use this when a long-running CLI invocation needs time
+    /// to cancel owned work and serialize a terminal result before the
+    /// watchdog kills it. Omitted by default, so existing cases keep their
+    /// full timeout as execution time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_wall_time_seconds: Option<u64>,
+
     /// Capability dimension this case tests. Used for aggregated
     /// reporting by capability × model.
     #[serde(default)]
@@ -421,6 +429,11 @@ pub(crate) const RESERVED_CLI_ARGS: &[&str] = &[
     // Session ID — the harness manages --session-id for multi-turn
     // steps; a case overriding it would break session continuation.
     "--session-id",
+    // Required to archive primary/auxiliary usage before session cleanup.
+    "--explain",
+    // Cases may opt into an earlier CLI deadline via
+    // `cli_wall_time_seconds`; the harness retains the outer watchdog.
+    "--max-wall-time-seconds",
 ];
 
 /// Validate that `args` does not contain any reserved flag. Returns
@@ -549,6 +562,21 @@ impl Case {
                 path.display(),
             );
         }
+        if let Some(cli_wall_time_seconds) = case.cli_wall_time_seconds {
+            if cli_wall_time_seconds <= 72 {
+                anyhow::bail!(
+                    "case {}: cli_wall_time_seconds must exceed the CLI's 72-second terminal/request reserve",
+                    path.display(),
+                );
+            }
+            if cli_wall_time_seconds >= case.timeout_seconds {
+                anyhow::bail!(
+                    "case {}: cli_wall_time_seconds ({cli_wall_time_seconds}) must be less than the harness watchdog timeout_seconds ({}) to leave time for termination and final output",
+                    path.display(),
+                    case.timeout_seconds,
+                );
+            }
+        }
         // Reject criteria with internally-inconsistent bounds
         // (min>max, threshold>1.0, empty expect lists, bad regex).
         // A case author's YAML typo would otherwise turn into a
@@ -652,7 +680,35 @@ mod tests {
         assert_eq!(c.prompt, "just say ok");
         assert!(c.criteria.is_empty());
         assert_eq!(c.timeout_seconds, 180);
+        assert_eq!(c.cli_wall_time_seconds, None);
         assert!(!c.debug_log);
+    }
+
+    #[test]
+    fn cli_wall_deadline_is_opt_in_and_must_precede_the_harness_watchdog() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bounded-case.yaml");
+        std::fs::write(
+            &path,
+            "name: bounded\nprompt: finish\ntimeout_seconds: 360\ncli_wall_time_seconds: 310\n",
+        )
+        .unwrap();
+        let case = Case::from_path(&path).expect("independent inner deadline parses");
+        assert_eq!(case.cli_wall_time_seconds, Some(310));
+
+        for cli_wall_time_seconds in [72, 360, 361] {
+            std::fs::write(
+                &path,
+                format!(
+                    "name: invalid\nprompt: finish\ntimeout_seconds: 360\ncli_wall_time_seconds: {cli_wall_time_seconds}\n"
+                ),
+            )
+            .unwrap();
+            assert!(
+                Case::from_path(&path).is_err(),
+                "invalid CLI wall deadline {cli_wall_time_seconds} must fail before execution"
+            );
+        }
     }
 
     #[test]
@@ -860,7 +916,8 @@ criteria:
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/pipeline_cache_hit_multi_turn.yaml"),
         )
         .unwrap();
-        let mut valid = RunOutcome::new("fixture").with_exit_code(0);
+        let mut valid =
+            crate::exec::test_support::cache_outcome("fixture", 33787, 0).with_exit_code(0);
         valid.text = "ACK\n\nACK\n\nACK\n\nACK".into();
         valid.cached_input_tokens = 33787;
         valid.prompt_tokens = 1341;
@@ -871,13 +928,15 @@ criteria:
         };
         assert!(
             passes(&valid),
-            "reasonable sub-98% inclusive cost is not a correctness failure"
+            "valid canonical cache bounds and exact behavior must pass"
         );
         let mut bad = valid.clone();
-        bad.cached_input_tokens = 9999;
+        bad.explain_capture =
+            crate::exec::test_support::cache_outcome("fixture", 9999, 0).explain_capture;
         assert!(!passes(&bad));
         bad = valid.clone();
-        bad.cache_creation_tokens = 25001;
+        bad.explain_capture =
+            crate::exec::test_support::cache_outcome("fixture", 33787, 25001).explain_capture;
         assert!(!passes(&bad));
         bad = valid.clone();
         bad.tool_calls_count = 1;
@@ -1300,6 +1359,7 @@ steps:
             "--auto-approve",
             "--permission-mode",
             "--system-prompt",
+            "--max-wall-time-seconds",
         ] {
             let dir = tempdir().unwrap();
             let path = dir.path().join("bad.yaml");
@@ -1396,14 +1456,11 @@ steps:
         let path = dir.path().join("ok.yaml");
         std::fs::write(
             &path,
-            "name: c\nprompt: p\nextra_cli_args: [\"--verbose\", \"--explain\"]\n",
+            "name: c\nprompt: p\nextra_cli_args: [\"--verbose\"]\n",
         )
         .unwrap();
         let c = Case::from_path(&path).expect("non-reserved flags should be accepted");
-        assert_eq!(
-            c.extra_cli_args,
-            vec!["--verbose".to_string(), "--explain".to_string()]
-        );
+        assert_eq!(c.extra_cli_args, vec!["--verbose".to_string()]);
     }
 
     #[test]
@@ -1421,6 +1478,7 @@ steps:
             "--permission-mode=auto",
             "--system-prompt=override",
             "--session-id=hijack",
+            "--explain=off",
         ] {
             let err = validate_extra_cli_args(&[bypass.into()]);
             assert!(
@@ -1433,7 +1491,7 @@ steps:
     #[test]
     fn non_reserved_flag_with_equals_accepted() {
         assert!(validate_extra_cli_args(&["--verbose=true".into()]).is_ok());
-        assert!(validate_extra_cli_args(&["--explain=yes".into()]).is_ok());
+        assert!(validate_extra_cli_args(&["--explain=yes".into()]).is_err());
     }
 
     #[test]

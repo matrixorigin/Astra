@@ -8,7 +8,8 @@ use astra_config::user_profile::{
     MutationCompletionScope, TurnIntentDomain, WorkLifecycleIntent, WorkspaceMutationIntent,
 };
 use astra_turn_types::{
-    JudgmentQuestion, JudgmentRequest, JudgmentResponseProvenance, NoulCriteria, judgment_messages,
+    JUDGMENT_SCHEMA_VERSION, JudgmentAnswer, JudgmentNoulDecision, JudgmentQuestion,
+    JudgmentRequest, JudgmentResponseProvenance, NoulCriteria, judgment_messages,
     normalize_judgment_response,
 };
 use serde::{Deserialize, Serialize};
@@ -39,7 +40,8 @@ pub enum WorkAdmissionTruth {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WorkAdmissionFieldEvidence {
-    pub value: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
     pub truth: WorkAdmissionTruth,
 }
 
@@ -135,7 +137,7 @@ pub fn work_admission_classification_request(ctx: &TurnIntentJudgeContext) -> Ju
         "Web access required; local paths alone do not count.".into(),
     );
     JudgmentRequest {
-        schema_version: 1,
+        schema_version: JUDGMENT_SCHEMA_VERSION,
         state: json!({
             "policy": format!("{RULES} {MUTATION_TARGET_SCOPE_POLICY}"),
             "context": serde_json::from_str::<Value>(&build_work_admission_prompt(ctx)).expect("typed context"),
@@ -156,17 +158,37 @@ fn malformed(raw: &str, detail: impl Into<String>) -> TurnIntentJudgeError {
     }
 }
 
-fn field_evidence(value: f64) -> WorkAdmissionFieldEvidence {
-    WorkAdmissionFieldEvidence {
-        value,
-        truth: if value >= 0.8 {
-            WorkAdmissionTruth::Yes
-        } else if value <= 0.2 {
-            WorkAdmissionTruth::No
-        } else {
-            WorkAdmissionTruth::Uncertain
-        },
-    }
+fn field_evidence(
+    answer: JudgmentAnswer,
+    provenance: JudgmentResponseProvenance,
+) -> Result<WorkAdmissionFieldEvidence, &'static str> {
+    let (value, truth) = match provenance {
+        JudgmentResponseProvenance::ProviderProbability => {
+            let value = answer
+                .native_noul_probability()
+                .ok_or("native classification answer is not a Noul probability")?;
+            let truth = if value >= 0.8 {
+                WorkAdmissionTruth::Yes
+            } else if value <= 0.2 {
+                WorkAdmissionTruth::No
+            } else {
+                WorkAdmissionTruth::Uncertain
+            };
+            (Some(value), truth)
+        }
+        JudgmentResponseProvenance::DiscreteDecision => {
+            let truth = match answer
+                .discrete_noul_decision()
+                .ok_or("discrete classification answer is not a Noul decision")?
+            {
+                JudgmentNoulDecision::Yes => WorkAdmissionTruth::Yes,
+                JudgmentNoulDecision::No => WorkAdmissionTruth::No,
+                JudgmentNoulDecision::Unknown => WorkAdmissionTruth::Uncertain,
+            };
+            (None, truth)
+        }
+    };
+    Ok(WorkAdmissionFieldEvidence { value, truth })
 }
 
 fn decode_evidence(
@@ -192,8 +214,12 @@ fn decode_evidence(
             .response
             .answers
             .into_iter()
-            .map(|(id, answer)| (id, field_evidence(answer.probability())))
-            .collect(),
+            .map(|(id, answer)| {
+                field_evidence(answer, normalized.provenance)
+                    .map(|evidence| (id, evidence))
+                    .map_err(|error| malformed(raw, error))
+            })
+            .collect::<Result<_, _>>()?,
         normalized.provenance,
     ))
 }
@@ -492,9 +518,10 @@ mod tests {
         request: &JudgmentRequest,
         raw: &str,
     ) -> Result<WorkAdmissionClassification, TurnIntentJudgeError> {
+        let raw = discrete_fixture(request, raw);
         super::parse_work_admission_classification(
             request,
-            raw,
+            &raw,
             "chat-fixture",
             Some(JudgmentResponseProvenance::DiscreteDecision),
         )
@@ -505,18 +532,84 @@ mod tests {
         raw: &str,
         diagnostics: &WorkAdmissionUncertainty,
     ) -> Result<WorkAdmissionClassification, TurnIntentJudgeError> {
+        let raw = discrete_fixture(request, raw);
         super::parse_work_admission_clarification(
             request,
-            raw,
+            &raw,
             diagnostics,
             "chat-fixture",
             Some(JudgmentResponseProvenance::DiscreteDecision),
         )
     }
 
+    // Compact truth-set notation is only a fixture builder; production accepts
+    // the canonical typed `answers` envelope exclusively.
+    fn discrete_fixture(request: &JudgmentRequest, raw: &str) -> String {
+        let Ok(value) = serde_json::from_str::<Value>(raw) else {
+            return raw.to_owned();
+        };
+        let Some(object) = value.as_object() else {
+            return raw.to_owned();
+        };
+        if object.len() != 2 || !object.contains_key("true") || !object.contains_key("uncertain") {
+            return raw.to_owned();
+        }
+        let Some(yes) = object["true"].as_array() else {
+            return raw.to_owned();
+        };
+        let Some(uncertain) = object["uncertain"].as_array() else {
+            return raw.to_owned();
+        };
+        let Some(yes) = yes.iter().map(Value::as_str).collect::<Option<Vec<_>>>() else {
+            return raw.to_owned();
+        };
+        let Some(uncertain) = uncertain
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()
+        else {
+            return raw.to_owned();
+        };
+        let ids = request
+            .questions
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        if yes.iter().any(|id| !ids.contains(*id))
+            || uncertain.iter().any(|id| !ids.contains(*id))
+            || yes.iter().collect::<std::collections::BTreeSet<_>>().len() != yes.len()
+            || uncertain
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != uncertain.len()
+            || yes.iter().any(|id| uncertain.contains(id))
+        {
+            return raw.to_owned();
+        }
+        let answers = request
+            .questions
+            .keys()
+            .map(|id| {
+                let decision = if yes.contains(&id.as_str()) {
+                    "yes"
+                } else if uncertain.contains(&id.as_str()) {
+                    "unknown"
+                } else {
+                    "no"
+                };
+                (
+                    id.clone(),
+                    json!({"type":"discrete_noul","decision":decision}),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        json!({"answers":answers}).to_string()
+    }
+
     fn response(request: &JudgmentRequest, yes: &[&str]) -> JudgmentResponse {
         JudgmentResponse {
-            schema_version: 1,
+            schema_version: JUDGMENT_SCHEMA_VERSION,
             model: "offline".into(),
             answers: request
                 .questions
@@ -565,7 +658,10 @@ mod tests {
             } = baseline
                 .questions
                 .get_mut(&format!("scope.{scope}"))
-                .unwrap();
+                .unwrap()
+            else {
+                panic!("classification request uses Noul questions");
+            };
             let old = format!("Completion scope={scope}.");
             let criteria = criteria.as_mut().unwrap();
             criteria.yes = criteria.yes.replace(instructions.as_str(), &old);
@@ -633,7 +729,10 @@ mod tests {
             let JudgmentQuestion::Noul {
                 instructions,
                 criteria,
-            } = &request.questions[&format!("scope.{scope}")];
+            } = &request.questions[&format!("scope.{scope}")]
+            else {
+                panic!("classification request uses Noul questions");
+            };
             assert!(instructions.contains(meaning));
             assert!(criteria.as_ref().unwrap().yes.contains(instructions));
             assert!(criteria.as_ref().unwrap().no.contains(instructions));
@@ -667,7 +766,10 @@ mod tests {
             let JudgmentQuestion::Noul {
                 instructions,
                 criteria,
-            } = &request.questions[&format!("mutation.{mutation}")];
+            } = &request.questions[&format!("mutation.{mutation}")]
+            else {
+                panic!("classification request uses Noul questions");
+            };
             assert!(instructions.contains("task-resource"));
             assert!(criteria.as_ref().unwrap().yes.contains(instructions));
             assert!(criteria.as_ref().unwrap().no.contains(instructions));
@@ -974,7 +1076,15 @@ mod tests {
             (0.200001, WorkAdmissionTruth::Uncertain),
             (0.799999, WorkAdmissionTruth::Uncertain),
         ] {
-            assert_eq!(field_evidence(value).truth, truth);
+            assert_eq!(
+                field_evidence(
+                    JudgmentAnswer::Noul { noul: value },
+                    JudgmentResponseProvenance::ProviderProbability,
+                )
+                .unwrap()
+                .truth,
+                truth
+            );
         }
     }
 
@@ -1012,7 +1122,10 @@ mod tests {
         for (provenance, raw) in [
             (
                 JudgmentResponseProvenance::DiscreteDecision,
-                r#"{"true":["mutation.read_only","parallel_subruns"],"uncertain":[]}"#.to_string(),
+                discrete_fixture(
+                    &clarified,
+                    r#"{"true":["mutation.read_only","parallel_subruns"],"uncertain":[]}"#,
+                ),
             ),
             (
                 JudgmentResponseProvenance::ProviderProbability,

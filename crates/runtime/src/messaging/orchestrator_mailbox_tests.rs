@@ -694,7 +694,6 @@ mod tests {
             CoordinationPattern::Fork {
                 agent_id: "worker-a".into(),
                 tasks: vec!["task-1".into(), "task-2".into()],
-                max_turns: 10,
                 aggregation: AggregationStrategy::AllResults,
                 timeout_sec: 10,
             },
@@ -837,7 +836,6 @@ mod tests {
             CoordinationPattern::Fork {
                 agent_id: "worker-a".into(),
                 tasks: vec!["task-1".into(), "task-2".into()],
-                max_turns: 10,
                 aggregation: AggregationStrategy::AllResults,
                 timeout_sec: 0,
             },

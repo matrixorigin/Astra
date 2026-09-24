@@ -4,7 +4,7 @@
   provider: typesafe
   base_url: https://api.typesafe.ai
   api_key: REPLACE_WITH_YOUR_TYPESAFE_KEY
-- name: deepseek-v4-flash
+- name: deepseek-flash
   provider: openai
   base_url: https://api.deepseek.com
   api_key: REPLACE_WITH_YOUR_DEEPSEEK_KEY

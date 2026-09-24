@@ -476,6 +476,35 @@ mod tests {
     };
 
     #[test]
+    fn cost_scenario_qualification_survives_narrow_render() {
+        let state = crate::cli::session::session_state::SessionState::default();
+        let rows = crate::cli::slash::slash_stats::current_rate_cost_rows(&state);
+        let view = InfoView::from_key_value("Current-rate Cost Scenario", rows);
+        for width in [40, 60] {
+            let area = ratatui::layout::Rect::new(0, 0, width, 20);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            view.render(area, &mut buffer);
+            let rendered = (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            for expected in [
+                "observed counters",
+                "not a session bill",
+                "coverage",
+                "attribution",
+            ] {
+                assert!(rendered.contains(expected), "width={width}: {rendered}");
+            }
+            assert_eq!(rendered.matches("unknown").count(), 2);
+        }
+    }
+
+    #[test]
     fn plain_info_content_uses_primary_reading_contrast() {
         let view = InfoView::from_plain("Info", vec!["actual content".into()]);
 

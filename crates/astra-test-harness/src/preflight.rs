@@ -41,6 +41,7 @@ const OWNER_READINESS_PROBE_QUERY: &str = "__astra_owner_auth_readiness_probe__"
 
 fn stderr_indicates_cli_auth_failure(stderr: &str) -> bool {
     stderr.contains("Could not validate credentials")
+        || stderr.contains("Unable to obtain a valid access token")
         || stderr.contains("Session expired")
         || stderr.contains("try /login")
         || stderr.contains("401 Unauthorized")
@@ -721,7 +722,7 @@ async fn check_model(
         });
     }
 
-    if stderr_indicates_cli_auth_failure(&stderr) {
+    if !output.status.success() && stderr_indicates_cli_auth_failure(&stderr) {
         // Try auto-login in an isolated profile and retry. The CLI owns its
         // credential store; the harness must never parse tokens and write that
         // file through a second implementation.
@@ -1187,7 +1188,7 @@ shift 2
 case "$1" in
 health) printf '%s' '{{"status":"healthy","database":"connected","interaction_api_major":"3","build_git_sha":"{SHA}","build_git_dirty":false}}' ;;
 chat)
-  if [ ! -f '{registered}' ]; then printf '401 Unauthorized' >&2; exit 3; fi
+  if [ ! -f '{registered}' ]; then printf 'Error: Unable to obtain a valid access token; run astra login and retry.' >&2; exit 3; fi
   printf '%s' '{outcome}'
   ;;
 admin) if [ "$2" = login ]; then touch '{registered}'; fi ;;
@@ -1718,6 +1719,7 @@ esac
                     "  printf '%s\\n' '{{\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"status\":\"cancelled\",\"execution_settled\":true}}'\n",
                     "  exit 0\n",
                     "fi\n",
+                    "printf '%s\\n' 'Earlier log: Unable to obtain a valid access token' >&2\n",
                     "printf '%s\\n' '{{\"trace_id\":null,\"request_id\":null,\"run_id\":\"run-1\",\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"text\":\"pong\",\"final_state\":\"completed\",\"interruption_kind\":null,\"tool_result_class_counts\":{{}},\"prompt_tokens\":0,\"fresh_prompt_tokens\":0,\"cache\":{{\"hit\":false,\"read_tokens\":0,\"creation_tokens\":0}},\"completion_tokens\":0,\"llm_rounds\":0,\"tool_calls_count\":0,\"tools_used\":[],\"persistence_error\":null,\"exit_code\":0,\"success\":true,\"error_kind\":null}}'\n",
                     "exit 0\n",
                 ),
@@ -1741,6 +1743,7 @@ esac
         let args = fs::read_to_string(log).unwrap();
         assert!(args.contains("--profile\nisolated-harness\n"), "{args}");
         assert!(args.contains("--no-resume\n"), "{args}");
+        assert!(!args.contains("admin\nregister\n"), "{args}");
         assert!(
             args.contains("session\ncancel\n550e8400-e29b-41d4-a716-446655440000\n"),
             "successful model probes must cancel their exact server session: {args}"
@@ -1749,6 +1752,9 @@ esac
 
     #[test]
     fn detects_cli_auth_failure_from_stderr() {
+        assert!(stderr_indicates_cli_auth_failure(
+            "Error: Unable to obtain a valid access token; run `astra login` and retry."
+        ));
         assert!(stderr_indicates_cli_auth_failure(
             "Error: Could not validate credentials"
         ));

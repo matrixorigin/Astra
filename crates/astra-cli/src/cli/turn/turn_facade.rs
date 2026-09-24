@@ -135,6 +135,18 @@ async fn settle_request_session_binding_failure_with_cancel_deadline(
     if binding_failure.is_none() && !remote_cancel_required {
         return result;
     }
+    // A lost response stream is a client-observation failure, not user
+    // authority. DELETE /chat/runs/{id} persists a User cancellation marker;
+    // using it here turns a resumable transport failure into the false
+    // `cancelled_by_user` child state seen by the fanout harness. Leave the
+    // server-owned run under durable recovery. The request-scoped local lease
+    // remains held through canonical partial commit, then drops normally:
+    // server session-slot admission owns any still-active remote run.
+    if binding_failure.is_none()
+        && matches!(&result, Err(failure) if failure.is_clean_internal_stream_detach())
+    {
+        return result;
+    }
     let exact_run_id = exact_run_id_from_turn_result(&result, incremental_state);
     let cancellation_error = match exact_run_id.as_deref() {
         Some(run_id) => {
@@ -638,6 +650,58 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn internal_stream_failure_does_not_persist_user_cancellation() {
+        use wiremock::MockServer;
+
+        let (_sessions, _guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("stream-failure-{}", uuid::Uuid::new_v4());
+        let holder =
+            crate::cli::session::session_execution_lease::RequestSessionExecutionLease::new(Some(
+                &session_id,
+            ))
+            .unwrap();
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let failure = settle_request_session_binding_failure(
+            &api,
+            "token",
+            Some(holder.as_ref()),
+            None,
+            Err(crate::cli::stream::streaming_types::TurnFailure {
+                error: "The model response connection failed.".to_string(),
+                partial: crate::PartialTurnData {
+                    session_id: Some(session_id.clone()),
+                    interruption: Some(serde_json::json!({"kind": "stream_transport"})),
+                    remote_cancel_required: true,
+                    remote_cancel_run_id: Some("run-stream-failure".to_string()),
+                    ..Default::default()
+                },
+            }),
+        )
+        .await
+        .expect_err("the original stream failure remains a hard error");
+
+        assert_eq!(failure.error, "The model response connection failed.");
+        assert!(failure.partial.remote_cancel_required);
+        assert!(
+            astra_services::session_journal::SessionExecutionLease::try_acquire(&session_id)
+                .is_err(),
+            "the caller still owns the local lease through canonical partial commit"
+        );
+        drop(holder);
+        assert!(
+            astra_services::session_journal::SessionExecutionLease::try_acquire(&session_id)
+                .is_ok(),
+            "an internal stream failure must not quarantine the local lock for process lifetime"
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "internal stream cleanup must not call the user cancellation endpoint"
+        );
+    }
+
+    #[tokio::test]
     async fn stdout_closure_cancels_exact_run_once_before_becoming_pipeline_terminal() {
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -751,6 +815,7 @@ mod tests {
             Err(crate::cli::stream::streaming_types::TurnFailure {
                 error: "stream cancelled after identity failure".to_string(),
                 partial: crate::PartialTurnData {
+                    interruption: Some(serde_json::json!({"kind": "stream_transport"})),
                     remote_cancel_required: true,
                     remote_cancel_run_id: Some("run-binding-failure".to_string()),
                     ..Default::default()

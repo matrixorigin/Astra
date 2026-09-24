@@ -331,12 +331,12 @@ enum HeadlessPipelineStage<T> {
 
 pub(crate) struct ValidatedExecution {
     pub execution: HeadlessResolvedExecution,
-    pub idem_key: IdempotencyKey,
+    pub idem_key: Option<IdempotencyKey>,
 }
 
 pub(crate) struct PermittedExecution {
     pub execution: HeadlessResolvedExecution,
-    pub idem_key: IdempotencyKey,
+    pub idem_key: Option<IdempotencyKey>,
     pub pre_tool_context: Option<String>,
     pub resolved_provider_policy:
         Option<astra_turn_core::provider_resolution::ResolvedInvocationPolicy>,
@@ -346,7 +346,7 @@ pub(crate) struct PermittedExecution {
 
 pub(crate) struct ExecutedExecution {
     pub execution: HeadlessResolvedExecution,
-    pub idem_key: IdempotencyKey,
+    pub idem_key: Option<IdempotencyKey>,
     pub pre_tool_context: Option<String>,
     pub is_err: bool,
     pub error_kind: Option<astra_core::ErrorKind>,
@@ -364,7 +364,7 @@ enum SlotSettlement {
     EdgeObserved,
     PendingEdgeValidated {
         execution: HeadlessResolvedExecution,
-        idem_key: IdempotencyKey,
+        idem_key: Option<IdempotencyKey>,
     },
     PendingEdgePermitted(PermittedExecution),
     /// `None` is an internal settled marker for a slot whose canonical
@@ -416,8 +416,6 @@ pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     pub call_counts: &'a mut HashMap<String, u32>,
     pub max_identical_calls: u32,
     pub max_tools_per_turn: u32,
-    /// Consecutive cache-hit suppression cap (was `REPEATED_CACHE_HIT_SUPPRESSION_THRESHOLD`).
-    pub repeated_cache_hit_suppression: u32,
     /// Headless-round abort cap for consecutive empty-name calls (was `MAX_CONSECUTIVE_EMPTY_NAME`).
     pub max_consecutive_empty_name: u32,
     pub tool_call_records: &'a mut Vec<ToolCallRecord>,
@@ -899,13 +897,11 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
     fn begin_execution_trace(
         &mut self,
         execution: &HeadlessResolvedExecution,
-        idem_key: &IdempotencyKey,
+        idem_key: Option<&IdempotencyKey>,
     ) {
-        let tool_idem_key = if READ_ONLY_TOOLS.contains(&execution.name.as_str()) {
-            Some(idem_key.cache_key())
-        } else {
-            None
-        };
+        let tool_idem_key = idem_key
+            .filter(|_| READ_ONLY_TOOLS.contains(&execution.name.as_str()))
+            .map(IdempotencyKey::cache_key);
         let args_preview = safe_args_preview(&execution.name, &execution.args);
         self.ctx.step_recorder.begin_tool_with_key_and_args_preview(
             &execution.name,
@@ -1043,7 +1039,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         // Phase 2: execute all concurrently (no &mut self needed).
         let mut executions: Vec<(
             HeadlessResolvedExecution,
-            IdempotencyKey,
+            Option<IdempotencyKey>,
             Option<astra_turn_core::provider_resolution::ResolvedInvocationPolicy>,
             Option<crate::server::tool_execution_binding::ToolPermissionGrantSnapshot>,
         )> = permitted_batch
@@ -1072,7 +1068,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let started_at: Vec<Instant> = executions
             .iter()
             .map(|(execution, idem_key, _, _)| {
-                self.begin_execution_trace(execution, idem_key);
+                self.begin_execution_trace(execution, idem_key.as_ref());
                 Instant::now()
             })
             .collect();
@@ -1169,8 +1165,13 @@ mod tests {
             .unwrap();
     }
 
-    fn seed_cached_read_file(harness: &mut PipelineHarness, path: &str, output: &str) {
-        let idem_key = read_cache_key_at_epoch(path, 0);
+    fn seed_cached_read_file(
+        harness: &mut PipelineHarness,
+        call_id: &str,
+        path: &str,
+        output: &str,
+    ) {
+        let idem_key = read_cache_key_for_invocation(harness, call_id, path);
         harness.idempotency_cache.record(
             &idem_key,
             CachedToolResult {
@@ -1203,10 +1204,12 @@ mod tests {
     ) {
         harness.valid_tool_names.insert("read_file".to_string());
         configure_server_read_file(harness, call_id, path);
-        seed_cached_read_file(harness, path, &format!("cached {path}"));
+        seed_cached_read_file(harness, call_id, path, &format!("cached {path}"));
 
         harness.call_counts.clear();
-        let mut pipeline = harness.pipeline_with_server_executor(turn_index, None);
+        let workspace = tempfile::tempdir().unwrap();
+        let executor = server_executor_for_test_workspace(workspace.path(), &harness.session_id);
+        let mut pipeline = harness.pipeline_with_server_executor(turn_index, Some(&executor));
         let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
             HeadlessPipelineStage::Continue(validated) => validated,
             _ => panic!("cached read_file must still pass validation"),
@@ -1242,12 +1245,21 @@ mod tests {
             .collect()
     }
 
-    fn read_cache_key_at_epoch(path: &str, workspace_epoch: u64) -> IdempotencyKey {
+    fn read_cache_key_for_invocation(
+        harness: &PipelineHarness,
+        call_id: &str,
+        path: &str,
+    ) -> IdempotencyKey {
         let args = json!({ "path": path });
-        IdempotencyKey::semantic("read_file", &args).with_context(ContextSignature {
-            workspace_version: Some(format!("workspace_epoch:{workspace_epoch}")),
-            memory_snapshot_id: None,
-        })
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "test-user",
+            harness.session_id.clone(),
+            harness.run_id.clone(),
+            harness.turn_chain_id.clone(),
+            call_id,
+        )
+        .expect("test invocation identity");
+        IdempotencyKey::new(&identity.storage_key(), 0, "read_file", &args)
     }
 
     #[test]
@@ -1354,7 +1366,6 @@ mod tests {
         tool_event_hooks: ToolEventHookRegistry,
         permission_context: Option<PermissionSyncHandle>,
         term: NoopHeadlessTerminal,
-        repeated_cache_hit_suppression: u32,
         max_consecutive_empty_name: u32,
         session_id: String,
         run_id: String,
@@ -1405,7 +1416,6 @@ mod tests {
                 term: NoopHeadlessTerminal,
                 // Tests assume the legacy threshold of 2 unless they override.
                 // Production runs derive these from the per-model policy.
-                repeated_cache_hit_suppression: 2,
                 max_consecutive_empty_name: 3,
                 session_id: "test-session".to_string(),
                 run_id: "test-run".to_string(),
@@ -1508,7 +1518,6 @@ mod tests {
                     call_counts: &mut self.call_counts,
                     max_identical_calls: 2,
                     max_tools_per_turn: 15,
-                    repeated_cache_hit_suppression: self.repeated_cache_hit_suppression,
                     max_consecutive_empty_name: self.max_consecutive_empty_name,
                     tool_call_records: &mut self.tool_call_records,
                     tool_event_hooks: &self.tool_event_hooks,
@@ -1665,14 +1674,9 @@ mod tests {
         match pipeline.permit_execution(validated).await {
             HeadlessPipelineStage::Continue(permitted) => {
                 assert_eq!(permitted.execution.name, "grep");
-                assert_eq!(
-                    permitted.idem_key.cache_key(),
-                    IdempotencyKey::semantic("grep", &json!({ "pattern": "headless" }))
-                        .with_context(ContextSignature {
-                            workspace_version: Some("workspace_epoch:0".into()),
-                            memory_snapshot_id: None,
-                        })
-                        .cache_key()
+                assert!(
+                    permitted.idem_key.is_none(),
+                    "a synthetic edge observation without durable invocation identity cannot be replayed"
                 );
             }
             _ => panic!("expected permitted execution"),
@@ -1722,6 +1726,7 @@ mod tests {
         configure_server_read_file(&mut harness, "call-read-secret", "secret.txt");
         seed_cached_read_file(
             &mut harness,
+            "call-read-secret",
             "secret.txt",
             "cached-secret-that-must-not-be-replayed",
         );
@@ -1760,6 +1765,7 @@ mod tests {
         configure_server_read_file(&mut harness, "call-read-restricted", "policy.txt");
         seed_cached_read_file(
             &mut harness,
+            "call-read-restricted",
             "policy.txt",
             "cached-restricted-output-that-must-not-be-replayed",
         );
@@ -1809,6 +1815,7 @@ mod tests {
         configure_server_read_file(&mut harness, "call-read-hooked", "hooked.txt");
         seed_cached_read_file(
             &mut harness,
+            "call-read-hooked",
             "hooked.txt",
             "cached-hooked-output-that-must-not-be-replayed",
         );
@@ -1838,6 +1845,7 @@ mod tests {
         configure_server_read_file(&mut harness, "call-read-hidden", "hidden.txt");
         seed_cached_read_file(
             &mut harness,
+            "call-read-hidden",
             "hidden.txt",
             "cached-hidden-output-that-must-not-be-replayed",
         );
@@ -2595,88 +2603,223 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn semantic_dedup_short_circuit_records_step_skip_trace() {
+    async fn a_new_read_invocation_observes_external_workspace_changes() {
         let mut harness = PipelineHarness::new();
-        harness.tool_calls = vec![json!({
-            "id": "call-grep-semantic-cache",
-            "type": "function",
-            "function": {
-                "name": "grep",
-                "arguments": serde_json::to_string(&json!({ "pattern": "headless" })).unwrap()
-            }
-        })];
-        harness.edge_tool_round.clear();
-        harness.semantic_dedup.check_and_record(
-            "grep",
-            &json!({ "pattern": "headless" }),
-            "previous grep output that should be reused for semantic dedup blocking",
-            0,
-        );
+        harness.valid_tool_names.insert("read_file".to_string());
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("shared.txt");
+        std::fs::write(&path, "V1 first observation").unwrap();
+        let executor = server_executor_for_test_workspace(workspace.path(), &harness.session_id);
+
+        configure_server_read_file(&mut harness, "call-read-v1", "shared.txt");
         begin_recorded_turn(&mut harness, 1);
+        {
+            let mut pipeline = harness.pipeline_with_server_executor(0, Some(&executor));
+            assert!(
+                pipeline
+                    .run_slot_with_control(HeadlessRoundToolIdx::ServerToolCall(0))
+                    .await
+            );
+        }
+        assert!(
+            harness.tool_results[0]
+                .to_string()
+                .contains("V1 first observation")
+        );
+        assert!(harness.tool_call_records[0].was_executed());
+
+        configure_server_read_file(&mut harness, "call-read-v1", "shared.txt");
+        begin_recorded_turn(&mut harness, 1);
+        harness.call_counts.clear();
+        {
+            let mut pipeline = harness.pipeline_with_server_executor(1, Some(&executor));
+            assert!(
+                pipeline
+                    .run_slot_with_control(HeadlessRoundToolIdx::ServerToolCall(0))
+                    .await
+            );
+        }
+        assert!(
+            harness.tool_results[1]
+                .to_string()
+                .contains("V1 first observation")
+        );
+        assert_eq!(
+            harness.tool_call_records[1].disposition,
+            Some(astra_services::session_journal::ToolCallDisposition::Reused),
+            "a completed invocation retry should replay its own confirmed result"
+        );
+
+        std::fs::write(&path, "V2 externally updated observation").unwrap();
+        configure_server_read_file(&mut harness, "call-read-v2", "shared.txt");
+        begin_recorded_turn(&mut harness, 1);
+        harness.call_counts.clear();
+        {
+            let mut pipeline = harness.pipeline_with_server_executor(2, Some(&executor));
+            assert!(
+                pipeline
+                    .run_slot_with_control(HeadlessRoundToolIdx::ServerToolCall(0))
+                    .await
+            );
+        }
+        assert!(
+            harness.tool_results[2]
+                .to_string()
+                .contains("V2 externally updated observation")
+        );
+        assert!(
+            !harness.tool_results[2]
+                .to_string()
+                .contains("V1 first observation")
+        );
+        assert!(harness.tool_call_records[2].was_executed());
+
+        configure_server_read_file(&mut harness, "call-read-v1", "shared.txt");
+        begin_recorded_turn(&mut harness, 1);
+        harness.call_counts.clear();
+        {
+            let mut pipeline = harness.pipeline_with_server_executor(3, Some(&executor));
+            assert!(
+                pipeline
+                    .run_slot_with_control(HeadlessRoundToolIdx::ServerToolCall(0))
+                    .await
+            );
+        }
+        assert!(
+            harness.tool_results[3]
+                .to_string()
+                .contains("V1 first observation")
+        );
+        assert_eq!(
+            harness.tool_call_records[3].disposition,
+            Some(astra_services::session_journal::ToolCallDisposition::Reused),
+            "a retry after an external edit must remain bound to its original outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_distinct_session_does_not_replay_another_sessions_read() {
+        let mut first = PipelineHarness::new();
+        first.valid_tool_names.insert("read_file".to_string());
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("shared.txt");
+        std::fs::write(&path, "session A observation").unwrap();
+        let first_executor =
+            server_executor_for_test_workspace(workspace.path(), &first.session_id);
+
+        configure_server_read_file(&mut first, "same-provider-call-id", "shared.txt");
+        begin_recorded_turn(&mut first, 1);
+        {
+            let mut pipeline = first.pipeline_with_server_executor(0, Some(&first_executor));
+            assert!(
+                pipeline
+                    .run_slot_with_control(HeadlessRoundToolIdx::ServerToolCall(0))
+                    .await
+            );
+        }
+        assert!(
+            first.tool_results[0]
+                .to_string()
+                .contains("session A observation")
+        );
+
+        let shared_cache = std::mem::replace(
+            &mut first.idempotency_cache,
+            InMemoryIdempotencyCache::new(),
+        );
+        std::fs::write(&path, "session B observation").unwrap();
+
+        let mut second = PipelineHarness::new();
+        second.session_id = "other-session".to_string();
+        second.run_id = first.run_id.clone();
+        second.turn_chain_id = first.turn_chain_id.clone();
+        second.idempotency_cache = shared_cache;
+        second.valid_tool_names.insert("read_file".to_string());
+        let second_executor =
+            server_executor_for_test_workspace(workspace.path(), &second.session_id);
+        configure_server_read_file(&mut second, "same-provider-call-id", "shared.txt");
+        begin_recorded_turn(&mut second, 1);
 
         {
-            let mut pipeline = harness.pipeline_with_server_executor(1, None);
-            let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
-                HeadlessPipelineStage::Continue(validated) => validated,
-                _ => panic!("semantic cache candidates must still pass validation"),
-            };
-            assert!(matches!(
-                pipeline.permit_execution(validated).await,
-                HeadlessPipelineStage::ShortCircuit
-            ));
+            let mut pipeline = second.pipeline_with_server_executor(0, Some(&second_executor));
+            assert!(
+                pipeline
+                    .run_slot_with_control(HeadlessRoundToolIdx::ServerToolCall(0))
+                    .await
+            );
         }
 
-        let tool_events = tool_trace_events(&harness);
-        assert_eq!(
-            tool_events.len(),
-            2,
-            "semantic dedup short-circuit should emit started+skipped trace events"
-        );
-        assert!(matches!(
-            tool_events[0].0,
-            astra_pipeline::step_protocol::StepEventType::ToolCallStarted
-        ));
-        assert!(matches!(
-            tool_events[1].0,
-            astra_pipeline::step_protocol::StepEventType::ToolCallSkipped
-        ));
-        assert_eq!(
-            tool_events[1]
-                .1
-                .as_ref()
-                .and_then(|payload| payload.get("reason"))
-                .and_then(Value::as_str),
-            Some("semantic_dedup_pre_check")
-        );
         assert!(
-            tool_events[1]
-                .1
-                .as_ref()
-                .and_then(|payload| payload.get("args_preview"))
-                .and_then(Value::as_str)
-                .is_some_and(|preview| preview.contains("headless")),
-            "semantic dedup skip should carry structured args_preview: {:?}",
-            tool_events[1].1
+            second.tool_results[0]
+                .to_string()
+                .contains("session B observation"),
+            "a session must observe current shared workspace content, not another session's cache"
         );
-        let skipped_output = tool_events[1]
-            .1
-            .as_ref()
-            .and_then(|payload| payload.get("output"))
-            .and_then(Value::as_str)
-            .expect("semantic dedup skip output");
-        assert!(
-            skipped_output.contains("previous grep output"),
-            "semantic dedup cache hit should replay the useful prior output: {skipped_output}"
-        );
-        let model_tool_output = harness.messages.last().and_then(|msg| {
-            msg.get("content")
-                .or_else(|| msg.get("output"))
-                .and_then(Value::as_str)
-        });
-        assert!(
-            model_tool_output.is_some_and(|output| output.contains("previous grep output")),
-            "model-facing semantic cache hit must include usable evidence: {model_tool_output:?}"
-        );
+        assert!(second.tool_call_records[0].was_executed());
+    }
+
+    #[tokio::test]
+    async fn within_batch_duplicate_limit_resets_after_each_successful_write() {
+        let mut harness = PipelineHarness::new();
+        harness.edge_tool_round.clear();
+        harness
+            .valid_tool_names
+            .extend(["read_file".into(), "write_file".into()]);
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("shared.txt"), "version-0").unwrap();
+        let executor = server_executor_for_test_workspace(workspace.path(), &harness.session_id);
+        harness.tool_calls = (0..3)
+            .flat_map(|version| {
+                [
+                    json!({
+                        "id": format!("call-read-{version}"),
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": serde_json::to_string(&json!({ "path": "shared.txt" })).unwrap(),
+                        }
+                    }),
+                    json!({
+                        "id": format!("call-write-{version}"),
+                        "type": "function",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": serde_json::to_string(&json!({
+                                "path": "shared.txt",
+                                "content": format!("version-{}", version + 1),
+                            })).unwrap(),
+                        }
+                    }),
+                ]
+            })
+            .take(5)
+            .collect();
+        begin_recorded_turn(&mut harness, 5);
+
+        {
+            let mut pipeline = harness.pipeline_with_server_executor(0, Some(&executor));
+            for index in 0..5 {
+                assert!(
+                    pipeline
+                        .run_slot_with_control(HeadlessRoundToolIdx::ServerToolCall(index))
+                        .await,
+                    "tool call {index} should execute in the same provider batch"
+                );
+            }
+        }
+
+        for (read_index, version) in [(0, 0), (2, 1), (4, 2)] {
+            assert!(
+                harness.tool_results[read_index]
+                    .to_string()
+                    .contains(&format!("version-{version}")),
+                "read at slot {read_index} should observe version-{version}"
+            );
+            assert!(
+                harness.tool_call_records[read_index].was_executed(),
+                "read at slot {read_index} must execute rather than be suppressed as a duplicate"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2724,7 +2867,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_cross_turn_short_circuit_records_explicit_trace_payload() {
+    async fn same_invocation_replay_records_explicit_trace_payload() {
         let mut harness = PipelineHarness::new();
         begin_recorded_turn(&mut harness, 1);
 
@@ -2734,7 +2877,7 @@ mod tests {
         assert_eq!(
             tool_events.len(),
             2,
-            "cached cross-turn short-circuit should emit started+completed trace events"
+            "same-invocation replay should emit started+completed trace events"
         );
         assert!(matches!(
             tool_events[0].0,
@@ -2764,7 +2907,7 @@ mod tests {
         let completed_payload = tool_events[1].1.as_ref().expect("completed payload");
         assert_eq!(
             completed_payload.get("reason").and_then(Value::as_str),
-            Some("cached_cross_turn")
+            Some("cached_same_invocation")
         );
         assert_eq!(
             completed_payload.get("cached").and_then(Value::as_bool),
@@ -2795,92 +2938,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_mutation_invalidates_cached_read_only_results() {
-        let cases = [
-            (
-                "write_file",
-                json!({ "path": "a.txt", "content": "new content" }),
-                false,
-                true,
-            ),
-            (
-                "str_replace",
-                json!({ "path": "a.txt", "old_str": "old", "new_str": "new" }),
-                false,
-                true,
-            ),
-            (
-                "worktree",
-                json!({ "action": "enter", "name": "review" }),
-                false,
-                true,
-            ),
-            (
-                "bash",
-                json!({ "command": "printf new > a.txt" }),
-                false,
-                true,
-            ),
-            (
-                "write_file",
-                json!({ "path": "a.txt", "content": "new content" }),
-                true,
-                false,
-            ),
-        ];
+    async fn successful_mutation_preserves_exact_read_replay_but_new_call_misses() {
+        let mut harness = PipelineHarness::new();
+        begin_recorded_turn(&mut harness, 1);
+        let replay_key = read_cache_key_for_invocation(&harness, "call-read-before-write", "a.txt");
+        harness.idempotency_cache.record(
+            &replay_key,
+            CachedToolResult {
+                tool_name: "read_file".into(),
+                output: "confirmed old observation".into(),
+                is_error: false,
+                cached_at: 0,
+                context_signature: replay_key.context_signature.clone(),
+            },
+        );
 
-        for (tool_name, args, is_err, should_evict) in cases {
-            let mut harness = PipelineHarness::new();
-            begin_recorded_turn(&mut harness, 1);
-            let read_key = read_cache_key_at_epoch("a.txt", 0);
-            harness.idempotency_cache.record(
-                &read_key,
-                CachedToolResult {
-                    tool_name: "read_file".into(),
-                    output: "old content".into(),
-                    is_error: false,
-                    cached_at: 0,
-                    context_signature: read_key.context_signature.clone(),
+        let mut pipeline = harness.pipeline();
+        pipeline
+            .record_execution(ExecutedExecution {
+                execution: HeadlessResolvedExecution {
+                    id: "call-write".into(),
+                    name: "write_file".into(),
+                    args: json!({ "path": "a.txt", "content": "new content" }),
+                    result_str: "mutation succeeded".into(),
+                    tool_result_fields: None,
+                    authoritative_is_error: None,
+                    pending_runtime_completion: None,
+                    confirmed_invocation: None,
+                    edge_duration_ms: 1,
+                    is_edge_tool: true,
+                    edge_result_missing: false,
+                    edge_terminal_authority: true,
+                    early_exit_ms: 0,
                 },
-            );
+                idem_key: None,
+                pre_tool_context: None,
+                is_err: false,
+                error_kind: None,
+                executed_ms: 1,
+            })
+            .await;
+        drop(pipeline);
 
-            let mut pipeline = harness.pipeline();
-            pipeline
-                .record_execution(ExecutedExecution {
-                    execution: HeadlessResolvedExecution {
-                        id: format!("call-{tool_name}"),
-                        name: tool_name.into(),
-                        args: args.clone(),
-                        result_str: "mutation succeeded".into(),
-                        tool_result_fields: None,
-                        authoritative_is_error: None,
-                        pending_runtime_completion: None,
-                        confirmed_invocation: None,
-                        edge_duration_ms: 1,
-                        is_edge_tool: true,
-                        edge_result_missing: false,
-                        edge_terminal_authority: true,
-                        early_exit_ms: 0,
-                    },
-                    idem_key: IdempotencyKey::semantic(tool_name, &args),
-                    pre_tool_context: None,
-                    is_err,
-                    error_kind: None,
-                    executed_ms: 1,
-                })
-                .await;
-            drop(pipeline);
-
-            assert_eq!(
-                harness.idempotency_cache.check(&read_key).is_none(),
-                should_evict,
-                "{tool_name} with is_err={is_err} eviction mismatch"
-            );
-        }
+        assert!(
+            harness.idempotency_cache.check(&replay_key).is_some(),
+            "a confirmed result remains bound to its original invocation"
+        );
+        let fresh_key = read_cache_key_for_invocation(&harness, "call-read-after-write", "a.txt");
+        assert_ne!(replay_key, fresh_key);
+        assert!(
+            harness.idempotency_cache.check(&fresh_key).is_none(),
+            "a new read invocation must not reuse the pre-mutation result"
+        );
     }
 
     #[tokio::test]
-    async fn successful_mutation_clears_semantic_dedup_observations() {
+    async fn semantic_dedup_observation_does_not_replace_a_new_read_invocation() {
         let mut harness = PipelineHarness::new();
         harness.edge_tool_round.clear();
         harness.valid_tool_names.insert("read_file".to_string());
@@ -2908,15 +3021,12 @@ mod tests {
             let mut pipeline = harness.pipeline_with_server_executor(1, None);
             let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
                 HeadlessPipelineStage::Continue(validated) => validated,
-                _ => panic!("semantic cache candidates must still pass validation"),
+                _ => panic!("semantic evidence must not block validation"),
             };
-            assert!(
-                matches!(
-                    pipeline.permit_execution(validated).await,
-                    HeadlessPipelineStage::ShortCircuit
-                ),
-                "same epoch should reuse the semantic cache after authorization"
-            );
+            assert!(matches!(
+                pipeline.permit_execution(validated).await,
+                HeadlessPipelineStage::Continue(_)
+            ));
         }
 
         {
@@ -2939,7 +3049,7 @@ mod tests {
                         edge_terminal_authority: true,
                         early_exit_ms: 0,
                     },
-                    idem_key: IdempotencyKey::semantic("str_replace", &args),
+                    idem_key: None,
                     pre_tool_context: None,
                     is_err: false,
                     error_kind: None,
@@ -2971,12 +3081,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redundant_validation_is_suppressed_until_workspace_mutates() {
+    async fn repeated_validation_and_changed_compound_command_reach_permission_boundary() {
         let mut harness = PipelineHarness::new();
         harness.edge_tool_round.clear();
         harness.valid_tool_names.insert("bash".to_string());
 
-        for i in 0..2 {
+        for i in 0..3 {
             harness.tool_calls = vec![json!({
                 "id": format!("call-check-{i}"),
                 "type": "function",
@@ -2986,85 +3096,66 @@ mod tests {
                 }
             })];
             let mut pipeline = harness.pipeline_with_server_executor(i, None);
-            assert!(
-                matches!(
-                    pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)),
-                    HeadlessPipelineStage::Continue(_)
-                ),
-                "first two validation attempts in an epoch are allowed"
-            );
-        }
-
-        harness.tool_calls = vec![json!({
-            "id": "call-check-blocked",
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": r#"{"command":"cargo check 2>&1 | tail -50"}"#
-            }
-        })];
-        {
-            let mut pipeline = harness.pipeline_with_server_executor(2, None);
-            assert!(
-                matches!(
-                    pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)),
-                    HeadlessPipelineStage::ShortCircuit
-                ),
-                "third same-prefix validation in one epoch should be policy-blocked"
-            );
-        }
-        assert!(
-            harness.tool_results.last().is_some_and(|result| result
-                .to_string()
-                .contains("Redundant validation suppressed")),
-            "blocked validation should give an explicit model-facing reason"
-        );
-
-        {
-            let mut pipeline = harness.pipeline();
-            let args = json!({"path": "src/lib.rs", "old_str": "a", "new_str": "b"});
-            pipeline
-                .record_execution(ExecutedExecution {
-                    execution: HeadlessResolvedExecution {
-                        id: "call-edit".into(),
-                        name: "str_replace".into(),
-                        args: args.clone(),
-                        result_str: "mutation succeeded".into(),
-                        tool_result_fields: None,
-                        authoritative_is_error: None,
-                        pending_runtime_completion: None,
-                        confirmed_invocation: None,
-                        edge_duration_ms: 1,
-                        is_edge_tool: true,
-                        edge_result_missing: false,
-                        edge_terminal_authority: true,
-                        early_exit_ms: 0,
-                    },
-                    idem_key: IdempotencyKey::semantic("str_replace", &args),
-                    pre_tool_context: None,
-                    is_err: false,
-                    error_kind: None,
-                    executed_ms: 1,
-                })
-                .await;
-        }
-
-        harness.tool_calls = vec![json!({
-            "id": "call-check-after-edit",
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": r#"{"command":"cargo check 2>&1 | head -50"}"#
-            }
-        })];
-        let mut pipeline = harness.pipeline_with_server_executor(3, None);
-        assert!(
-            matches!(
-                pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)),
+            let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+                HeadlessPipelineStage::Continue(validated) => validated,
+                _ => panic!("repetition alone must not deny an authorized recheck"),
+            };
+            assert!(matches!(
+                pipeline.permit_execution(validated).await,
                 HeadlessPipelineStage::Continue(_)
-            ),
-            "workspace mutation must reset validation retry policy"
-        );
+            ));
+        }
+
+        harness.tool_calls = vec![json!({
+            "id": "call-check-after-repair",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command":"repair-command && cargo check 2>&1 | tail -50"}"#
+            }
+        })];
+        {
+            let mut pipeline = harness.pipeline_with_server_executor(3, None);
+            let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+                HeadlessPipelineStage::Continue(validated) => validated,
+                _ => panic!("changed command must not be denied by a partial validation prefix"),
+            };
+            assert!(matches!(
+                pipeline.permit_execution(validated).await,
+                HeadlessPipelineStage::Continue(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_validation_does_not_poison_later_authorized_recheck() {
+        let mut harness = PipelineHarness::new();
+        harness.edge_tool_round.clear();
+        harness.valid_tool_names.insert("bash".to_string());
+        let permission = harness.permission_context.take();
+        for i in 0..3 {
+            harness.tool_calls = vec![json!({
+                "id": format!("call-validation-{i}"),
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": r#"{"command":"cargo test"}"#
+                }
+            })];
+            if i == 2 {
+                harness.permission_context = permission.clone();
+            }
+            let mut pipeline = harness.pipeline_with_server_executor(i, None);
+            let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+                HeadlessPipelineStage::Continue(validated) => validated,
+                _ => panic!("repetition must not short-circuit before permission evaluation"),
+            };
+            let admitted = matches!(
+                pipeline.permit_execution(validated).await,
+                HeadlessPipelineStage::Continue(_)
+            );
+            assert_eq!(admitted, i == 2);
+        }
     }
 
     #[tokio::test]
@@ -3201,6 +3292,75 @@ mod tests {
         assert_eq!(pipeline.ctx.tool_results.len(), 1);
         assert_eq!(pipeline.executed_this_turn, 1);
         assert_eq!(pipeline.ctx.tool_call_records.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn edge_nonexecution_and_real_failure_keep_distinct_dispositions_and_steps() {
+        use astra_pipeline::step_protocol::StepEventType;
+        use astra_services::session_journal::ToolCallDisposition;
+
+        for (status, started, explicit_disposition, expected_disposition, expected_step) in [
+            (
+                "blocked",
+                false,
+                None,
+                ToolCallDisposition::Rejected,
+                StepEventType::ToolCallSkipped,
+            ),
+            (
+                "deferred",
+                false,
+                Some("deferred"),
+                ToolCallDisposition::Deferred,
+                StepEventType::ToolCallSkipped,
+            ),
+            (
+                "failed",
+                true,
+                None,
+                ToolCallDisposition::Executed,
+                StepEventType::ToolCallFailed,
+            ),
+        ] {
+            let mut harness = PipelineHarness::new();
+            begin_recorded_turn(&mut harness, 1);
+            let edge = &mut harness.edge_tool_round[0];
+            edge.request_id = format!("call-{status}");
+            edge.status = status.into();
+            edge.output = format!("{status} result");
+            let fields = edge.tool_result_fields.as_mut().unwrap();
+            fields.insert("execution_started".into(), Value::Bool(started));
+            fields.insert("error_kind".into(), Value::String("execution_error".into()));
+            if let Some(disposition) = explicit_disposition {
+                fields.insert("disposition".into(), Value::String(disposition.into()));
+            }
+
+            assert!(
+                harness
+                    .pipeline()
+                    .run_slot_with_control(HeadlessRoundToolIdx::SyntheticEdge(0))
+                    .await,
+                "status={status}"
+            );
+            assert_eq!(
+                harness.tool_call_records[0].effective_disposition(),
+                expected_disposition,
+                "status={status}"
+            );
+            let events = tool_trace_events(&harness);
+            assert!(events.iter().any(|(kind, _)| *kind == expected_step));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|(kind, _)| matches!(
+                        kind,
+                        StepEventType::ToolCallFailed | StepEventType::ToolCallSkipped
+                    ))
+                    .count(),
+                1,
+                "status={status} must have one precise terminal step event"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3551,7 +3711,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_tool_hooks_transform_visible_output_without_polluting_observation_cache() {
+    async fn edge_post_tool_hook_result_is_not_cached_for_server_replay() {
         let mut harness = PipelineHarness::new();
         harness.tool_event_hooks = ToolEventHookRegistry::new(vec![ToolEventHook {
             event: ToolEventKind::PostToolUse,
@@ -3565,11 +3725,6 @@ mod tests {
             once: false,
             priority: 0,
         }]);
-        let idem_key = IdempotencyKey::semantic("grep", &json!({ "pattern": "headless" }))
-            .with_context(ContextSignature {
-                workspace_version: Some("workspace_epoch:0".into()),
-                memory_snapshot_id: None,
-            });
         let mut pipeline = harness.pipeline();
         let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
             HeadlessPipelineStage::Continue(validated) => validated,
@@ -3583,12 +3738,10 @@ mod tests {
         let executed = pipeline.execute_execution(permitted).await;
         pipeline.record_execution(executed).await;
 
-        let cached = pipeline
-            .ctx
-            .idempotency_cache
-            .check(&idem_key)
-            .expect("cache entry should be recorded");
-        assert_eq!(cached.output, "found result");
+        assert!(
+            pipeline.ctx.idempotency_cache.is_empty(),
+            "an edge observation without a complete server invocation identity is not replay state"
+        );
         assert!(
             pipeline.ctx.tool_call_records[0]
                 .result_preview
@@ -3637,6 +3790,8 @@ mod tests {
             "call-governed",
         )
         .unwrap();
+        let governed_cache_key =
+            read_cache_key_for_invocation(&harness, "call-governed", "governed.txt");
 
         let mut pipeline = harness.durable_pipeline_with_server_executor(&executor);
         let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
@@ -3709,7 +3864,7 @@ mod tests {
         let cached = pipeline
             .ctx
             .idempotency_cache
-            .check(&read_cache_key_at_epoch("governed.txt", 0))
+            .check(&governed_cache_key)
             .expect("successful read should populate the observation cache");
         assert!(cached.output.contains("[REDACTED:"), "{}", cached.output);
         assert!(!cached.output.contains("AKIA1234567890ABCDEF"));
@@ -3817,7 +3972,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_post_tool_hook_transforms_reused_observation() {
+    async fn current_post_tool_hook_transforms_same_invocation_replay() {
         let mut harness = PipelineHarness::new();
         harness.valid_tool_names.insert("read_file".to_string());
         harness.tool_event_hooks = ToolEventHookRegistry::new(vec![ToolEventHook {
@@ -3835,11 +3990,14 @@ mod tests {
         configure_server_read_file(&mut harness, "call-read-post-hook", "cached.txt");
         seed_cached_read_file(
             &mut harness,
+            "call-read-post-hook",
             "cached.txt",
             "raw-cached-observation-that-must-be-transformed",
         );
 
-        let mut pipeline = harness.pipeline();
+        let workspace = tempfile::tempdir().unwrap();
+        let executor = server_executor_for_test_workspace(workspace.path(), &harness.session_id);
+        let mut pipeline = harness.pipeline_with_server_executor(0, Some(&executor));
         let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
             HeadlessPipelineStage::Continue(validated) => validated,
             _ => panic!("cache presence must not replace validation"),
@@ -3859,7 +4017,11 @@ mod tests {
         assert_eq!(
             harness
                 .idempotency_cache
-                .check(&read_cache_key_at_epoch("cached.txt", 0))
+                .check(&read_cache_key_for_invocation(
+                    &harness,
+                    "call-read-post-hook",
+                    "cached.txt"
+                ))
                 .map(|cached| cached.output.as_str()),
             Some("raw-cached-observation-that-must-be-transformed"),
             "per-invocation hook transforms must not mutate the observation cache"
@@ -3982,6 +4144,7 @@ mod tests {
         configure_server_read_file(&mut harness, "call-read-context", "context.txt");
         seed_cached_read_file(
             &mut harness,
+            "call-read-context",
             "context.txt",
             "stale-cache-that-context-sensitive-calls-must-not-reuse",
         );
@@ -4010,7 +4173,11 @@ mod tests {
 
         let cached = harness
             .idempotency_cache
-            .check(&read_cache_key_at_epoch("context.txt", 0))
+            .check(&read_cache_key_for_invocation(
+                &harness,
+                "call-read-context",
+                "context.txt",
+            ))
             .expect("fresh provider observation must replace the old cache entry");
         assert!(cached.output.contains("fresh provider observation"));
         assert!(!cached.output.contains("current policy context"));
@@ -4226,7 +4393,7 @@ mod tests {
                     edge_terminal_authority: false,
                     early_exit_ms: 0,
                 },
-                idem_key: IdempotencyKey::semantic("agent_fanout", &args),
+                idem_key: None,
                 pre_tool_context: None,
                 is_err: result.is_error,
                 error_kind: None,
@@ -4329,7 +4496,7 @@ mod tests {
                 edge_terminal_authority: false,
                 early_exit_ms: 0,
             },
-            idem_key: IdempotencyKey::semantic("write_file", &args),
+            idem_key: None,
             pre_tool_context: None,
             resolved_provider_policy: None,
             permission_grant: None,
@@ -4377,7 +4544,7 @@ mod tests {
                 edge_terminal_authority: false,
                 early_exit_ms: 0,
             },
-            idem_key: IdempotencyKey::semantic("write_file", &args),
+            idem_key: None,
             pre_tool_context: None,
             resolved_provider_policy: None,
             permission_grant: None,
@@ -4433,7 +4600,7 @@ mod tests {
                 edge_terminal_authority: false,
                 early_exit_ms: 0,
             },
-            idem_key: IdempotencyKey::semantic("read_file", &args),
+            idem_key: None,
             pre_tool_context: None,
             resolved_provider_policy: None,
             permission_grant: None,
@@ -4486,7 +4653,7 @@ mod tests {
                 edge_terminal_authority: false,
                 early_exit_ms: 0,
             },
-            idem_key: IdempotencyKey::semantic("bash", &args),
+            idem_key: None,
             pre_tool_context: None,
             resolved_provider_policy: None,
             permission_grant: None,
@@ -4537,7 +4704,7 @@ mod tests {
                 edge_terminal_authority: false,
                 early_exit_ms: 0,
             },
-            idem_key: IdempotencyKey::semantic("write_file", &args),
+            idem_key: None,
             pre_tool_context: None,
             resolved_provider_policy: None,
             permission_grant: None,
@@ -6016,7 +6183,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_settled_edge_result_wins_over_backoff_and_validation_cap() {
+    async fn exact_settled_edge_result_wins_over_backoff() {
         use astra_turn_core::action_compensation::FailureCategory;
 
         let mut harness = PipelineHarness::new();
@@ -6049,7 +6216,6 @@ mod tests {
                     failure_category: Some(FailureCategory::NonProgress),
                 },
             );
-            harness.turn_guard.record_validation_attempt("cargo test");
         }
 
         begin_recorded_turn(&mut harness, 1);
@@ -6295,32 +6461,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_identical_cached_reads_are_suppressed_after_threshold() {
+    async fn repeated_same_invocation_replays_preserve_the_original_result() {
         let mut harness = PipelineHarness::new();
 
         short_circuit_cached_read_file(&mut harness, 0, "call-read-a-1", "a.txt").await;
-        short_circuit_cached_read_file(&mut harness, 1, "call-read-a-2", "a.txt").await;
-        short_circuit_cached_read_file(&mut harness, 2, "call-read-a-3", "a.txt").await;
+        short_circuit_cached_read_file(&mut harness, 1, "call-read-a-1", "a.txt").await;
+        short_circuit_cached_read_file(&mut harness, 2, "call-read-a-1", "a.txt").await;
 
         assert!(
-            harness.tool_results[2]
-                .to_string()
-                .contains("Repeated cached read suppressed"),
-            "third identical cached read should be a suppression advisory instead of replaying output, got: {:?}",
+            harness.tool_results[2].to_string().contains("cached a.txt"),
+            "every replay of one completed invocation must return its original result, got: {:?}",
             harness.tool_results
         );
         let tool_events = tool_trace_events(&harness);
-        let suppressed = tool_events
+        let replayed = tool_events
             .iter()
             .find(|(_, payload)| {
                 payload.as_ref().is_some_and(|payload| {
-                    payload.get("reason").and_then(Value::as_str)
-                        == Some("repeated_cache_hit_suppressed")
+                    payload.get("reason").and_then(Value::as_str) == Some("cached_same_invocation")
                 })
             })
-            .expect("expected repeated cache-hit suppression trace");
+            .expect("expected same-invocation replay trace");
         assert_eq!(
-            suppressed
+            replayed
                 .1
                 .as_ref()
                 .and_then(|payload| payload.get("cached"))

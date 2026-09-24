@@ -1792,7 +1792,7 @@ mod state_command_tests {
         state.total_completion_tokens = 22;
         state.total_cache_read_tokens = 33;
         state.total_cache_creation_tokens = 44;
-        state.total_session_cost = 1.5;
+        state.total_session_cost = Some(1.5);
         state.recent_tools = vec!["bash".into()];
         state.redo_stack = vec![("q".into(), "a".into(), 1)];
         state.last_response = Some("a".into());
@@ -1835,7 +1835,7 @@ mod state_command_tests {
         assert_eq!(state.total_completion_tokens, 0);
         assert_eq!(state.total_cache_read_tokens, 0);
         assert_eq!(state.total_cache_creation_tokens, 0);
-        assert_eq!(state.total_session_cost, 0.0);
+        assert_eq!(state.total_session_cost, Some(0.0));
         assert!(state.recent_tools.is_empty());
         assert!(state.redo_stack.is_empty());
         assert!(state.last_response.is_none());

@@ -1,5 +1,7 @@
 //! Incremental completion obligations; presentation history is not recovery authority.
 
+use std::collections::HashMap;
+
 use astra_services::session_journal::ToolCallRecord;
 use astra_turn_types::{StopHook, ToolInvocationCompletionRef};
 
@@ -95,6 +97,7 @@ impl WorkspaceObservationFacts {
         ordinal: u64,
         verified_explicit_hook: bool,
         root: Option<&str>,
+        parallel_mutating_peer: bool,
     ) {
         if !record.was_executed() {
             return;
@@ -129,17 +132,12 @@ impl WorkspaceObservationFacts {
                     .filter(|source| source.delivered_path.as_ref() == Some(&target))
             })
             .cloned();
-        let observes = verified_explicit_hook
-            || (record.ok
-                && super::lifecycle::record_can_observe_bound_workspace(root, record)
-                && (full_scope || literal_command.is_none() || literal_source.is_some()));
-        let barrier = !verified_explicit_hook
-            && crate::turn::tool_side_effects::tool_call_may_mutate_workspace(
-                &record.name,
-                args.as_ref(),
-            )
-            && !super::lifecycle::is_authoritative_unchanged_bash_observation_record(record)
-            && !super::execution_phase::record_is_proven_external_scratch_mutation(root, record);
+        let observes = !parallel_mutating_peer
+            && (verified_explicit_hook
+                || (record.ok
+                    && super::lifecycle::record_can_observe_bound_workspace(root, record)
+                    && (full_scope || literal_command.is_none() || literal_source.is_some())));
+        let barrier = !verified_explicit_hook && workspace_mutation_risk(record, root);
         if barrier {
             self.barrier = Some(evidence.clone());
             // A compound invocation may itself supply the post-mutation receipt.
@@ -208,6 +206,43 @@ impl WorkspaceObservationFacts {
             latest_source: snapshot.latest_source.as_ref().map(MutationSource::restore),
         }
     }
+}
+
+fn workspace_mutation_risk(record: &ToolCallRecord, root: Option<&str>) -> bool {
+    record.was_executed()
+        && crate::turn::tool_side_effects::tool_call_may_mutate_workspace(
+            &record.name,
+            super::lifecycle::extract_tool_args(record.authoritative_args_full()).as_ref(),
+        )
+        && !super::lifecycle::is_authoritative_unchanged_bash_observation_record(record)
+        && !super::execution_phase::record_is_proven_external_scratch_mutation(root, record)
+}
+
+fn parallel_mutator_batches<'a>(
+    records: &'a [ToolCallRecord],
+    root: Option<&str>,
+) -> HashMap<&'a str, Vec<usize>> {
+    let mut batches: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, record) in records.iter().enumerate() {
+        if workspace_mutation_risk(record, root)
+            && let Some(batch_id) = record.batch_id.as_deref()
+        {
+            batches.entry(batch_id).or_default().push(index);
+        }
+    }
+    batches
+}
+
+fn has_parallel_mutating_peer(
+    record: &ToolCallRecord,
+    index: usize,
+    batches: &HashMap<&str, Vec<usize>>,
+) -> bool {
+    record.batch_id.as_deref().is_some_and(|batch_id| {
+        batches
+            .get(batch_id)
+            .is_some_and(|indices| indices.iter().any(|peer| *peer != index))
+    })
 }
 
 #[cfg(test)]
@@ -510,6 +545,150 @@ pub(crate) mod tests {
         let mut frontier = VerificationFrontier::default();
         frontier.advance(Some("/app"), &[], &records).unwrap();
         restore_from_ledger(&frontier, &records, &ledger)
+    }
+
+    #[test]
+    fn parallel_read_and_opaque_writer_never_prove_post_writer_observation() {
+        let mut ledger = astra_turn_core::invocation_ledger::InMemoryInvocationLedger::default();
+        let writer = executed_with_args(
+            &mut ledger,
+            "writer",
+            "write_file",
+            serde_json::json!({"path": "/app/answer.txt", "content": "new"}),
+        );
+        let mut bash = executed_with_args(
+            &mut ledger,
+            "opaque",
+            "bash",
+            serde_json::json!({"command": "./verify.sh"}),
+        );
+        let mut read = executed_with_args(
+            &mut ledger,
+            "read",
+            "read_file",
+            serde_json::json!({"path": "/app/answer.txt"}),
+        );
+        bash.batch_id = Some("parallel-observation".into());
+        read.batch_id = bash.batch_id.clone();
+        bash.parallel = Some(true);
+        read.parallel = Some(true);
+        let later_read = executed_with_args(
+            &mut ledger,
+            "later-read",
+            "read_file",
+            serde_json::json!({"path": "/app/answer.txt"}),
+        );
+        for pair in [[bash.clone(), read.clone()], [read.clone(), bash.clone()]] {
+            let mut frontier = VerificationFrontier::default();
+            let mut records = [vec![writer.clone()], pair.to_vec()].concat();
+            frontier.advance(Some("/app"), &[], &records).unwrap();
+            assert!(
+                !frontier
+                    .evaluate_workspace_observation(Some("/app"), &[], &records)
+                    .unwrap(),
+                "batch ledger order cannot establish a happens-after relation"
+            );
+            assert!(
+                !frontier
+                    .task_resolution_workspace_evidence_is_current(
+                        Some("/app"),
+                        &[],
+                        &records,
+                        &[read.execution_completion.clone().unwrap()],
+                    )
+                    .unwrap(),
+                "reconciliation cannot use a concurrent read as fresh evidence"
+            );
+            records.push(later_read.clone());
+            frontier.advance(Some("/app"), &[], &records).unwrap();
+            assert!(
+                frontier
+                    .evaluate_workspace_observation(Some("/app"), &[], &records)
+                    .unwrap(),
+                "a separate later read may close the observation debt"
+            );
+            assert!(
+                frontier
+                    .task_resolution_workspace_evidence_is_current(
+                        Some("/app"),
+                        &[],
+                        &records,
+                        &[later_read.execution_completion.clone().unwrap()],
+                    )
+                    .unwrap()
+            );
+            let restored = restore_from_ledger(&frontier, &records, &ledger);
+            assert!(
+                restored
+                    .task_resolution_workspace_evidence_is_current(
+                        Some("/app"),
+                        &[],
+                        &[],
+                        &[later_read.execution_completion.clone().unwrap()],
+                    )
+                    .unwrap()
+            );
+            assert!(
+                !restored
+                    .task_resolution_workspace_evidence_is_current(
+                        Some("/app"),
+                        &[],
+                        &[],
+                        &[read.execution_completion.clone().unwrap()],
+                    )
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_explicit_verifier_does_not_prove_a_concurrent_write() {
+        let mut ledger = astra_turn_core::invocation_ledger::InMemoryInvocationLedger::default();
+        let mut writer = executed_with_args(
+            &mut ledger,
+            "writer",
+            "write_file",
+            serde_json::json!({"path": "/app/answer.txt", "content": "new"}),
+        );
+        let mut verifier = executed(&mut ledger, "verifier", "bash", "./verify");
+        writer.batch_id = Some("parallel-verify".into());
+        verifier.batch_id = writer.batch_id.clone();
+        let hooks = [hook("./verify")];
+        for pair in [
+            [writer.clone(), verifier.clone()],
+            [verifier.clone(), writer.clone()],
+        ] {
+            let mut frontier = VerificationFrontier::default();
+            frontier.advance(Some("/app"), &hooks, &pair).unwrap();
+            assert_eq!(frontier.missing(), Some(vec!["same label".into()]));
+        }
+    }
+
+    #[test]
+    fn incremental_frontier_rejects_a_late_member_of_a_processed_batch() {
+        let mut ledger = astra_turn_core::invocation_ledger::InMemoryInvocationLedger::default();
+        let mut writer = executed_with_args(
+            &mut ledger,
+            "writer",
+            "write_file",
+            serde_json::json!({"path": "/app/answer.txt", "content": "new"}),
+        );
+        let mut read = executed_with_args(
+            &mut ledger,
+            "read",
+            "read_file",
+            serde_json::json!({"path": "/app/answer.txt"}),
+        );
+        writer.batch_id = Some("incomplete-batch".into());
+        read.batch_id = writer.batch_id.clone();
+        let mut frontier = VerificationFrontier::default();
+        frontier
+            .advance(Some("/app"), &[], &[writer.clone()])
+            .unwrap();
+        assert_eq!(
+            frontier.advance(Some("/app"), &[], &[writer, read]),
+            Err(VerificationRecoveryError::HistoryUnavailable)
+        );
     }
 
     #[test]
@@ -1335,25 +1514,28 @@ impl VerificationFrontier {
             return Ok(true);
         };
         let base = view.processed_through.saturating_sub(records.len() as u64);
+        let parallel_mutators = parallel_mutator_batches(records, workspace_root);
         for reference in workspace_evidence {
-            let ordinal = records
+            let local = records
                 .iter()
                 .position(|record| record.execution_completion.as_ref() == Some(reference))
-                .map(|index| base + index as u64 + 1)
-                .or_else(|| {
-                    view.observation
-                        .proof
-                        .as_ref()
-                        .map(|proof| &proof.evidence)
-                        .into_iter()
-                        .chain(std::iter::once(barrier))
-                        .find(|evidence| {
-                            reference.as_invocation().is_some_and(|reference| {
-                                evidence.invocation.as_ref() == Some(reference)
-                            })
-                        })
-                        .map(|evidence| evidence.ordinal)
-                });
+                .map(|index| (index, base + index as u64 + 1));
+            let ordinal = if let Some((index, ordinal)) = local {
+                if has_parallel_mutating_peer(&records[index], index, &parallel_mutators) {
+                    return Ok(false);
+                }
+                Some(ordinal)
+            } else {
+                // Restored history retains only actual observation proof. A
+                // barrier identity is not itself an observation, and an
+                // unretained concurrent read cannot become fresh by citation.
+                view.observation.proof.as_ref().and_then(|proof| {
+                    reference.as_invocation().and_then(|reference| {
+                        (proof.evidence.invocation.as_ref() == Some(reference))
+                            .then_some(proof.evidence.ordinal)
+                    })
+                })
+            };
             if ordinal.is_none_or(|ordinal| ordinal < barrier.ordinal) {
                 // A restored prefix must use retained bound ordinals, never
                 // the absence of a local record as evidence of freshness.
@@ -1382,6 +1564,16 @@ impl VerificationFrontier {
         if contract_changed && self.historical_prefix {
             return Err(VerificationRecoveryError::ContractChanged);
         }
+        if self.cursor > 0
+            && self.cursor < records.len()
+            && records[self.cursor - 1].batch_id.is_some()
+            && records[self.cursor - 1].batch_id == records[self.cursor].batch_id
+        {
+            // A batch is folded only after the tool phase has collected every
+            // member. Otherwise an earlier observer could have been granted
+            // proof before its concurrent writer arrived.
+            return Err(VerificationRecoveryError::HistoryUnavailable);
+        }
         let (base, start) = if contract_changed {
             (0, 0)
         } else {
@@ -1401,11 +1593,20 @@ impl VerificationFrontier {
                 ..Self::default()
             };
         }
-        for record in &records[self.cursor..] {
+        if !contract_changed && self.cursor == records.len() {
+            return Ok(());
+        }
+        // Tool-phase hands off a complete batch with the round snapshot. A
+        // retained prefix cannot gain a later member of the same batch.
+        let suffix = &records[self.cursor..];
+        let parallel_mutators = parallel_mutator_batches(suffix, workspace_root);
+        for (index, record) in suffix.iter().enumerate() {
             self.processed_through += 1;
             if !record.was_executed() {
                 continue;
             }
+            let parallel_mutating_peer =
+                has_parallel_mutating_peer(record, index, &parallel_mutators);
             let evidence = Evidence {
                 ordinal: self.processed_through,
                 invocation: record
@@ -1416,7 +1617,9 @@ impl VerificationFrontier {
             };
             let mut verified = false;
             for (hook, proof) in self.contract.iter().zip(&mut self.proofs) {
-                if super::execution_phase::record_verifies_explicit_hook(record, hook) {
+                if !parallel_mutating_peer
+                    && super::execution_phase::record_verifies_explicit_hook(record, hook)
+                {
                     *proof = Some(evidence.clone());
                     verified = true;
                 }
@@ -1430,8 +1633,13 @@ impl VerificationFrontier {
                 self.mutation = Some(evidence);
                 self.proofs.fill(None);
             }
-            self.observation
-                .observe(record, self.processed_through, verified, workspace_root);
+            self.observation.observe(
+                record,
+                self.processed_through,
+                verified,
+                workspace_root,
+                parallel_mutating_peer,
+            );
         }
         self.cursor = records.len();
         tracing::trace!(

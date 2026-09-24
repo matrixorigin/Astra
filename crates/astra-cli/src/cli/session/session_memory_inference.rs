@@ -16,6 +16,32 @@ pub(crate) struct MemoryInferenceOffering {
     pub thinking_capability: Option<astra_services::models::ThinkingCapability>,
 }
 
+/// Session-local resolution. An empty catalog is a valid no-judge result;
+/// transport failures remain retryable rather than disabling judgment forever.
+#[derive(Debug)]
+pub(crate) enum MemoryJudgmentOffering {
+    Unresolved,
+    Available(MemoryInferenceOffering),
+    RetryAfter(std::time::Instant),
+}
+
+impl MemoryJudgmentOffering {
+    pub(crate) fn should_resolve(&self) -> bool {
+        match self {
+            Self::Unresolved => true,
+            Self::Available(_) => false,
+            Self::RetryAfter(until) => std::time::Instant::now() >= *until,
+        }
+    }
+
+    pub(crate) fn offering(&self) -> Option<&MemoryInferenceOffering> {
+        match self {
+            Self::Available(offering) => Some(offering),
+            Self::Unresolved | Self::RetryAfter(_) => None,
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MemoryInferenceOfferingsEnvelope {
@@ -26,7 +52,12 @@ pub(crate) async fn fetch_memory_inference_offerings(
     api: &astra_thin_client::ThinClient,
     token: &str,
 ) -> Result<Vec<MemoryInferenceOffering>, String> {
-    fetch_memory_offerings_path(api, token, astra_thin_client::paths::model_memory()).await
+    let offerings =
+        fetch_memory_offerings_path(api, token, astra_thin_client::paths::model_memory()).await?;
+    if offerings.is_empty() {
+        return Err("memory inference catalog contains no usable Offering".to_string());
+    }
+    Ok(offerings)
 }
 
 pub(crate) async fn fetch_memory_judgment_offerings(
@@ -57,9 +88,6 @@ async fn fetch_memory_offerings_path(
 fn validate_memory_inference_offerings(
     offerings: Vec<MemoryInferenceOffering>,
 ) -> Result<Vec<MemoryInferenceOffering>, String> {
-    if offerings.is_empty() {
-        return Err("memory inference catalog contains no usable Offering".to_string());
-    }
     let mut seen = std::collections::HashSet::new();
     for offering in &offerings {
         astra_services::validate_model_offering_id(&offering.offering_id).map_err(|_| {
@@ -189,6 +217,10 @@ impl MemoryInferencePort for CliServerMemoryInferenceClient {
 
 fn classify_thin_client_error(error: ThinClientError) -> ClassifiedError {
     let (kind, message) = match error {
+        ThinClientError::AdmissionDeadlineExpired => (
+            ErrorKind::BudgetExhausted,
+            "Astra Server memory inference admission deadline expired",
+        ),
         ThinClientError::InvalidBaseUrl(_) | ThinClientError::InvalidInput(_) => (
             ErrorKind::InvalidRequest,
             "Astra Server memory inference configuration is invalid",
@@ -490,6 +522,35 @@ mod tests {
         assert_eq!(
             *seen.lock().unwrap(),
             vec!["/models/memory", "/models/memory?operation=judgment"]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn empty_catalog_is_valid_only_for_judgment() {
+        use axum::{Json, Router, routing::get};
+        let app = Router::new().route(
+            "/models/memory",
+            get(|| async { Json(serde_json::json!({"offerings": []})) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = astra_thin_client::ThinClient::new(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            None,
+        )
+        .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        assert!(
+            fetch_memory_inference_offerings(&api, "token")
+                .await
+                .is_err()
+        );
+        assert!(
+            fetch_memory_judgment_offerings(&api, "token")
+                .await
+                .unwrap()
+                .is_empty()
         );
         server.abort();
     }

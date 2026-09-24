@@ -511,8 +511,19 @@ impl SessionCapture {
     /// a parent dispatch tool. The child run must differ from the dispatching
     /// run; a coordinator using the same tool itself is not child evidence.
     pub fn causal_child_tool_call_count(&self, parent_tool: &str, child_tool: &str) -> usize {
+        self.causal_child_tool_calls_by_run(parent_tool, child_tool)
+            .values()
+            .sum()
+    }
+
+    /// Successful causal descendant calls grouped by producing run. A child
+    /// that terminated without executing the requested tool contributes none.
+    pub fn causal_child_tool_calls_by_run(
+        &self,
+        parent_tool: &str,
+        child_tool: &str,
+    ) -> std::collections::BTreeMap<String, usize> {
         let mut children_by_cause = std::collections::HashMap::<String, Vec<String>>::new();
-        let mut event_run_ids = std::collections::HashMap::<String, String>::new();
         let mut completed_tools =
             std::collections::HashMap::<String, (String, String, bool)>::new();
         let mut dispatches = Vec::<(String, String)>::new();
@@ -532,7 +543,6 @@ impl SessionCapture {
             else {
                 continue;
             };
-            event_run_ids.insert(event_id.to_string(), run_id.to_string());
             if let Some(caused_by) = logical
                 .get("caused_by")
                 .and_then(serde_json::Value::as_array)
@@ -603,7 +613,13 @@ impl SessionCapture {
                 }
             }
         }
-        child_event_ids.len()
+        let mut calls_by_run = std::collections::BTreeMap::new();
+        for event_id in child_event_ids {
+            if let Some((run_id, _, _)) = completed_tools.get(&event_id) {
+                *calls_by_run.entry(run_id.clone()).or_insert(0) += 1;
+            }
+        }
+        calls_by_run
     }
 
     /// Complete, de-duplicated tool calls persisted in turn records.
@@ -2907,6 +2923,21 @@ mod tests {
     }
 
     #[test]
+    fn step_event_stats_counts_failed_tool_attempts() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("step_events.jsonl");
+        let body = [
+            r#"{"event_id":"tool-1","run_id":"run-1","event_type":"ToolCallCompleted","step_id":"step-1","caused_by":[],"created_at":1,"payload":{"tool_name":"read_file","call_id":"call-1","cached":true,"is_error":false}}"#,
+            r#"{"event_id":"tool-2","run_id":"run-1","event_type":"ToolCallFailed","step_id":"step-1","caused_by":[],"created_at":2,"payload":{"tool_name":"start_work","call_id":"call-2","cached":false,"is_error":true}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, body).unwrap();
+        let stats = super::load_step_event_stats_from_path(&path, 1024 * 1024).unwrap();
+        assert_eq!(stats.total_tool_calls, 2);
+        assert_eq!(stats.cache_hits, 1);
+    }
+
+    #[test]
     fn step_event_stats_prefers_provider_rounds_over_legacy_step_markers() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("step_events.jsonl");
@@ -3841,9 +3872,9 @@ fn aggregate_step_event_records(records: Vec<StepEventRecord>) -> Option<StepEve
             // turn-round bounds on mixed-version journals.
             "LlmRoundStarted" => provider_rounds = provider_rounds.saturating_add(1),
             "StepStarted" => legacy_step_rounds = legacy_step_rounds.saturating_add(1),
-            "ToolCallCompleted" => {
+            "ToolCallCompleted" | "ToolCallFailed" => {
                 stats.total_tool_calls = stats.total_tool_calls.saturating_add(1);
-                if record.cached {
+                if record.event_type == "ToolCallCompleted" && record.cached {
                     stats.cache_hits = stats.cache_hits.saturating_add(1);
                 }
             }

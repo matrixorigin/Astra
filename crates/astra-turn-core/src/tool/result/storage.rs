@@ -98,12 +98,7 @@ pub const TOOL_RESULT_RUN_ID_FIELD: &str = "_astra_tool_result_run_id";
 /// use this typed marker instead of classifying the rendered body.
 pub const TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD: &str = "_astra_tool_result_artifact";
 
-/// Trusted canonical-history marker for results whose generic presentation
-/// may be replaced by an optional, source-bound projection. Absence is not
-/// equivalent to eligibility: older or foreign messages fail closed.
-pub const TOOL_RESULT_OPTIONAL_PROJECTION_FIELD: &str = "_astra_tool_result_optional_projection";
 pub const TOOL_RESULT_TOOL_NAME_FIELD: &str = "_tool_name";
-const TOOL_RESULT_OPTIONAL_PROJECTION_VERSION: u64 = 1;
 
 /// Default payload size for one model-requested artifact window.
 pub const DEFAULT_TOOL_RESULT_WINDOW_BYTES: usize = 8 * 1024;
@@ -166,50 +161,6 @@ pub enum ToolResultArtifactMetadataError {
     Conflict,
     #[error("tool-result artifact descriptor identity does not match its message")]
     IdentityMismatch,
-}
-
-/// Mark a freshly produced canonical result as eligible for optional generic
-/// projection. This marker is runtime-owned metadata and must never be
-/// inferred from result text or user-provided metadata.
-pub fn mark_tool_result_optional_projection(
-    message: &mut Value,
-    eligible: bool,
-) -> Result<(), ToolResultArtifactMetadataError> {
-    let Some(object) = message.as_object_mut() else {
-        return Err(ToolResultArtifactMetadataError::NotAnObject);
-    };
-    if !eligible {
-        object.remove(TOOL_RESULT_OPTIONAL_PROJECTION_FIELD);
-        return Ok(());
-    }
-    let marker = serde_json::json!({
-        "schema_version": TOOL_RESULT_OPTIONAL_PROJECTION_VERSION,
-        "presentation": "generic",
-    });
-    if let Some(existing) = object.get(TOOL_RESULT_OPTIONAL_PROJECTION_FIELD) {
-        if existing == &marker {
-            return Ok(());
-        }
-        return Err(ToolResultArtifactMetadataError::Conflict);
-    }
-    object.insert(TOOL_RESULT_OPTIONAL_PROJECTION_FIELD.to_string(), marker);
-    Ok(())
-}
-
-/// Read eligibility only from the exact trusted marker shape.
-#[must_use]
-pub fn tool_result_optional_projection_eligible(message: &Value) -> bool {
-    message
-        .get(TOOL_RESULT_OPTIONAL_PROJECTION_FIELD)
-        .is_some_and(is_tool_result_optional_projection_marker)
-}
-
-#[must_use]
-pub fn is_tool_result_optional_projection_marker(marker: &Value) -> bool {
-    marker.get("schema_version").and_then(Value::as_u64)
-        == Some(TOOL_RESULT_OPTIONAL_PROJECTION_VERSION)
-        && marker.get("presentation").and_then(Value::as_str) == Some("generic")
-        && marker.as_object().is_some_and(|object| object.len() == 2)
 }
 
 /// Return the run identity attached to a canonical tool-result message.
@@ -1141,77 +1092,6 @@ fn read_verified_persisted_result_window(
         return Err("persisted tool-result digest does not match its handle".to_string());
     }
     read_persisted_result_window_at_path(&file_path, offset, max_bytes)
-}
-
-/// Verify one immutable result in its owner-scoped session store, read a
-/// bounded prefix, and derive stable source ranges from that verified window.
-///
-/// Full-file digest verification is storage integrity work and may read the
-/// complete artifact. `scan_bytes` bounds only the bytes exposed to candidate
-/// construction; the returned coverage never conflates those two costs.
-pub fn read_verified_tool_result_chunk_projection(
-    session_dir: &Path,
-    descriptor: &astra_services::session_journal::ToolResultArtifactDescriptor,
-    scan_bytes: usize,
-    target_chunk_bytes: usize,
-    max_chunks: usize,
-) -> Result<Option<crate::tool::result::chunks::ToolResultChunkProjection>, String> {
-    if !descriptor.document_kind.is_result() {
-        return Err("runtime guidance is not eligible for tool-result selection".to_string());
-    }
-    if scan_bytes == 0 || scan_bytes > crate::tool::result::chunks::MAX_TOOL_RESULT_SCAN_BYTES {
-        return Err(format!(
-            "scan_bytes must be between 1 and {}",
-            crate::tool::result::chunks::MAX_TOOL_RESULT_SCAN_BYTES
-        ));
-    }
-    let Some(window) =
-        read_verified_persisted_result_window(session_dir, descriptor, 0, scan_bytes)?
-    else {
-        return Ok(None);
-    };
-    crate::tool::result::chunks::project_tool_result_chunks(
-        descriptor,
-        &window,
-        target_chunk_bytes,
-        max_chunks,
-    )
-    .map(Some)
-    .map_err(ToString::to_string)
-}
-
-/// Verify one owner-scoped artifact and expose bounded exact-source
-/// candidates suitable for a typed relevance judgment. Candidate content is
-/// never reconstructed from a display summary.
-pub fn read_verified_tool_result_chunk_candidates(
-    session_dir: &Path,
-    descriptor: &astra_services::session_journal::ToolResultArtifactDescriptor,
-    scan_bytes: usize,
-    target_chunk_bytes: usize,
-    max_chunks: usize,
-) -> Result<Option<crate::tool::result::chunks::ToolResultChunkCandidateProjection>, String> {
-    if !descriptor.document_kind.is_result() {
-        return Err("runtime guidance is not eligible for tool-result selection".to_string());
-    }
-    if scan_bytes == 0 || scan_bytes > crate::tool::result::chunks::MAX_TOOL_RESULT_SCAN_BYTES {
-        return Err(format!(
-            "scan_bytes must be between 1 and {}",
-            crate::tool::result::chunks::MAX_TOOL_RESULT_SCAN_BYTES
-        ));
-    }
-    let Some(window) =
-        read_verified_persisted_result_window(session_dir, descriptor, 0, scan_bytes)?
-    else {
-        return Ok(None);
-    };
-    crate::tool::result::chunks::project_tool_result_chunk_candidates(
-        descriptor,
-        &window,
-        target_chunk_bytes,
-        max_chunks,
-    )
-    .map(Some)
-    .map_err(ToString::to_string)
 }
 
 /// Return the greatest UTF-8 boundary at or before `offset` without loading
@@ -2214,74 +2094,6 @@ mod tests {
         )));
         assert!(rendered.contains("Continue with introspect("));
         assert!(!rendered.contains(dir.path().to_string_lossy().as_ref()));
-    }
-
-    #[test]
-    fn verified_chunk_projection_is_owner_scoped_bounded_and_makes_unicode_progress() {
-        let owner = tempfile::tempdir().unwrap();
-        let other = tempfile::tempdir().unwrap();
-        let content = format!("😀{}\nTAIL-EVIDENCE\n", "middle\n".repeat(20_000));
-        let persisted = persist_tool_result_with_descriptor(
-            owner.path(),
-            "run-chunks",
-            "call-chunks",
-            "bash",
-            &content,
-        )
-        .unwrap();
-
-        let projection = read_verified_tool_result_chunk_projection(
-            owner.path(),
-            &persisted.descriptor,
-            1,
-            1,
-            2,
-        )
-        .unwrap()
-        .expect("owner can read its artifact");
-        assert_eq!(projection.scanned_bytes, 4);
-        assert!(!projection.scan_complete);
-        assert_eq!(projection.chunks.len(), 1);
-        assert_eq!(projection.chunks[0].start_byte, 0);
-        assert_eq!(projection.chunks[0].end_byte, 4);
-
-        let candidates = read_verified_tool_result_chunk_candidates(
-            owner.path(),
-            &persisted.descriptor,
-            1,
-            1,
-            2,
-        )
-        .unwrap()
-        .expect("owner can read exact judgment candidates");
-        assert_eq!(candidates.candidates().len(), 1);
-        assert_eq!(candidates.candidates()[0].content(), "😀");
-        assert_eq!(candidates.candidates()[0].chunk(), &projection.chunks[0]);
-
-        assert!(
-            read_verified_tool_result_chunk_projection(
-                other.path(),
-                &persisted.descriptor,
-                1024,
-                128,
-                4,
-            )
-            .unwrap()
-            .is_none(),
-            "the same descriptor does not cross its session store boundary"
-        );
-        assert!(
-            read_verified_tool_result_chunk_candidates(
-                other.path(),
-                &persisted.descriptor,
-                1024,
-                128,
-                4,
-            )
-            .unwrap()
-            .is_none(),
-            "candidate content does not cross its session store boundary"
-        );
     }
 
     #[test]

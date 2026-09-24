@@ -274,6 +274,10 @@ pub(crate) fn parse_delegation_request(
     let args: Value =
         serde_json::from_str(args_str).map_err(|e| format!("invalid delegation JSON: {e}"))?;
 
+    if args.get("max_turns").is_some() {
+        return Err("delegate field 'max_turns' is not supported".to_string());
+    }
+
     let task = args
         .get("task")
         .and_then(Value::as_str)
@@ -528,7 +532,6 @@ pub(crate) fn pattern_from_name(
                 astra_services::coordination::CoordinationPattern::Fork {
                     agent_id: agent.clone(),
                     tasks: tasks.into_iter().map(ToString::to_string).collect(),
-                    max_turns: default_fork_max_turns(agent),
                     aggregation: astra_services::coordination::AggregationStrategy::AllResults,
                     timeout_sec: timeout,
                 }
@@ -675,17 +678,9 @@ pub(crate) fn parse_coordination_pattern(
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let max_turns = optional_u64_arg(args, "max_turns")?
-                .unwrap_or_else(|| u64::from(default_fork_max_turns(&agents[0])));
-            if max_turns == 0 {
-                return Err("delegate max_turns must be greater than zero".to_string());
-            }
-            let max_turns = u32::try_from(max_turns)
-                .map_err(|_| "delegate max_turns exceeds the supported range".to_string())?;
             Ok(astra_services::coordination::CoordinationPattern::Fork {
                 tasks,
                 agent_id: agents[0].clone(),
-                max_turns,
                 aggregation: astra_services::coordination::AggregationStrategy::AllResults,
                 timeout_sec: timeout,
             })
@@ -711,26 +706,6 @@ pub(crate) fn parse_coordination_pattern(
             "unknown delegate pattern '{unknown}'; expected sequential, fan_out, pipeline, adversarial, fork, or auto"
         )),
     }
-}
-
-/// Resolve the implicit fork budget from the selected agent profile instead
-/// of imposing one global ten-turn ceiling on every task. An explicit
-/// `max_turns` remains caller authority; unknown/custom agent IDs use the
-/// bounded task profile as the generic execution default.
-fn default_fork_max_turns(agent_id: &str) -> u32 {
-    let definitions = astra_turn_core::orchestration_builtin_agents::get_builtin_agent_types();
-    definitions
-        .iter()
-        .find(|definition| definition.agent_type.eq_ignore_ascii_case(agent_id.trim()))
-        .map(|definition| definition.max_turns)
-        .or_else(|| {
-            definitions
-                .iter()
-                .find(|definition| definition.agent_type == "task")
-                .map(|definition| definition.max_turns)
-        })
-        .unwrap_or(1)
-        .max(1)
 }
 
 /// Splice an allowlist into the cross-process delegation context as a sorted
@@ -1299,7 +1274,6 @@ mod tests {
             "pattern": "fork",
             "agents": ["coder"],
             "tasks": ["inspect storage", "inspect TUI"],
-            "max_turns": 4,
             "timeout": 30
         }))
         .unwrap();
@@ -1308,7 +1282,6 @@ mod tests {
             astra_services::coordination::CoordinationPattern::Fork {
                 tasks,
                 agent_id,
-                max_turns: 4,
                 timeout_sec: 30,
                 ..
             } if tasks == ["inspect storage", "inspect TUI"] && agent_id == "coder"
@@ -1316,32 +1289,22 @@ mod tests {
     }
 
     #[test]
-    fn fork_default_budget_follows_agent_profile() {
-        for (agent, expected) in [("explore", 20), ("code-review", 12), ("task", 30)] {
-            let pattern = parse_coordination_pattern(&json!({
-                "pattern": "fork",
-                "agents": [agent],
-                "tasks": ["first", "second"]
-            }))
-            .expect("fork should parse");
-            assert!(matches!(
-                pattern,
-                astra_services::coordination::CoordinationPattern::Fork { max_turns, .. }
-                    if max_turns == expected
-            ));
+    fn delegate_rejects_obsolete_fork_hard_limit() {
+        for pattern in [Some("fork"), Some("auto"), None] {
+            let mut args = json!({
+                "task": "Inspect and report evidence",
+                "agents": ["coder"],
+                "tasks": ["inspect storage", "inspect TUI"],
+                "max_turns": 2
+            });
+            if let Some(pattern) = pattern {
+                args["pattern"] = json!(pattern);
+            }
+            let call = json!({"function": {"arguments": args.to_string()}});
+            let error = parse_delegation_request(&call, "run-1", "session-1", 0, None)
+                .expect_err("ignored hard limit must not appear accepted");
+            assert!(error.contains("max_turns"), "{error}");
         }
-
-        let custom = parse_coordination_pattern(&json!({
-            "pattern": "fork",
-            "agents": ["custom-agent"],
-            "tasks": ["first", "second"]
-        }))
-        .expect("custom fork should use the generic task profile");
-        assert!(matches!(
-            custom,
-            astra_services::coordination::CoordinationPattern::Fork { max_turns, .. }
-                if max_turns == 30
-        ));
     }
 
     #[test]
@@ -1655,14 +1618,14 @@ mod tests {
     }
 
     #[test]
-    fn pattern_from_name_fork_uses_agent_profile_budget() {
+    fn pattern_from_name_fork_preserves_explicit_tasks() {
         let agents = vec!["code-review".to_string()];
         let args = json!({"tasks": ["inspect", "verify"]});
         let pattern = pattern_from_name("fork", &agents, &args).unwrap();
         assert!(matches!(
             pattern,
-            astra_services::coordination::CoordinationPattern::Fork { max_turns, .. }
-                if max_turns == 12
+            astra_services::coordination::CoordinationPattern::Fork { tasks, .. }
+                if tasks == ["inspect", "verify"]
         ));
     }
 

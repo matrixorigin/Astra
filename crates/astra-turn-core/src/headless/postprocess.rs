@@ -202,14 +202,13 @@ pub struct HeadlessCacheableRecordCtx<'a> {
     pub semantic_dedup: &'a mut SemanticDedup,
 }
 
-/// After a successful cacheable tool: persist idempotency row, attach
-/// to recorder, semantic hint.  Wrapper that no-ops when the tool
-/// errored, so callers don't have to repeat the `!is_err` guard at
-/// every site.
+/// After a successful read, attach an invocation replay result when its full
+/// identity is available and record the semantic duplicate hint. A read with
+/// no replay identity still contributes the hint without becoming reusable.
 pub fn record_headless_cacheable_success_and_semantic_hint_if_ok(
     name: &str,
     args: &Value,
-    idem_key: &IdempotencyKey,
+    idem_key: Option<&IdempotencyKey>,
     ctx: HeadlessCacheableRecordCtx<'_>,
     is_err: bool,
 ) {
@@ -222,24 +221,26 @@ pub fn record_headless_cacheable_success_and_semantic_hint_if_ok(
 pub fn record_headless_cacheable_success_and_semantic_hint(
     name: &str,
     args: &Value,
-    idem_key: &IdempotencyKey,
+    idem_key: Option<&IdempotencyKey>,
     ctx: HeadlessCacheableRecordCtx<'_>,
 ) {
-    let cached_result = CachedToolResult {
-        tool_name: name.to_string(),
-        output: ctx.observation.to_string(),
-        is_error: false,
-        cached_at: epoch_ms(),
-        context_signature: idem_key.context_signature.clone(),
-    };
-    if let Some(call_id) = ctx.call_id {
-        ctx.step_recorder
-            .attach_cached_result_for_call(call_id, cached_result.clone());
-    } else {
-        ctx.step_recorder
-            .attach_cached_result(cached_result.clone());
+    if let Some(idem_key) = idem_key {
+        let cached_result = CachedToolResult {
+            tool_name: name.to_string(),
+            output: ctx.observation.to_string(),
+            is_error: false,
+            cached_at: epoch_ms(),
+            context_signature: idem_key.context_signature.clone(),
+        };
+        if let Some(call_id) = ctx.call_id {
+            ctx.step_recorder
+                .attach_cached_result_for_call(call_id, cached_result.clone());
+        } else {
+            ctx.step_recorder
+                .attach_cached_result(cached_result.clone());
+        }
+        ctx.idempotency_cache.record(idem_key, cached_result);
     }
-    ctx.idempotency_cache.record(idem_key, cached_result);
     if let Some(hint) = ctx
         .semantic_dedup
         .near_duplicate_hint_for_observation_with_generation(

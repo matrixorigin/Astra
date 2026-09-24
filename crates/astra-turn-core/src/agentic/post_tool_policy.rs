@@ -312,7 +312,6 @@ mod tests {
         assert!(messages.is_empty());
         assert!(verdict_events.is_empty());
         assert_eq!(turn_guard.nudge_count, 0);
-        assert!(turn_guard.pending_correction.is_none());
         assert!(last_heavy_checkpoint.is_none());
     }
 
@@ -516,7 +515,6 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(turn_guard.nudge_count, 0);
-        assert!(turn_guard.pending_correction.is_none());
         assert!(!turn_guard.health.is_avoidance_advised("agent_fanout"));
         assert!(restricted_tools.is_empty());
         assert!(messages.is_empty());
@@ -623,6 +621,11 @@ mod tests {
         assert_eq!(verdict_events.len(), 1);
         assert_eq!(verdict_events[0].severity, "warning");
         assert!(turn_guard.health.is_avoidance_advised("write_file"));
+        assert_eq!(
+            turn_guard.recovery_evidence().unwrap().cautioned_tools,
+            ["write_file"],
+            "post-tool audit must preserve the canonical policy's recovery input"
+        );
         assert!(
             !restricted_tools.contains("write_file"),
             "soft health-deprioritized tools must not be hidden"

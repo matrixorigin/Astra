@@ -21,14 +21,14 @@ use crate::chat_turn_sse_dispatch::{
     DurableRunTerminalStatus, EdgeApprovalRequest, SseRenderEffect, StreamRootIdentity,
     dispatch_chat_turn_sse_event_block, durable_run_terminal_from_event,
 };
-use crate::sse::blocks::SseBlankLineUtf8Buf;
+use crate::sse::blocks::{SseBlankLineUtf8Buf, drain_complete_sse_event_blocks};
 use crate::sse::data_lines::{json_events_from_sse_event_block, validate_sse_event_block_json};
 pub use crate::tool::policy::is_tool_concurrency_safe;
 use crate::tool::policy::tool_batch_coalesce_duration;
 use astra_thin_client::ApprovalKind;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 /// Stream idle watchdog default: abort SSE consumption if no chunk arrives within this time.
 ///
@@ -53,6 +53,191 @@ pub const STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS: u64 = 300_000;
 /// this cap prevents a faulty producer from turning cancellation observation
 /// into per-session unbounded memory growth.
 const MAX_EDGE_EXECUTION_READ_AHEAD_BYTES: usize = 1024 * 1024;
+/// Do not let one provider HTTP chunk bypass the read-ahead bound while the
+/// semantic framer is finding recoverable live blocks inside it.
+const EDGE_EXECUTION_READ_AHEAD_FEED_BYTES: usize = 64 * 1024;
+/// A live transcript is recoverable from the durable child snapshot. Keep the
+/// gap map bounded as well as the retained control bytes so an untrusted stream
+/// cannot turn distinct run identities into unbounded client memory.
+const MAX_EDGE_EXECUTION_LIVE_GAP_KEYS: usize = 256;
+const MAX_EDGE_EXECUTION_LIVE_GAP_BYTES: usize = 64 * 1024;
+
+#[derive(Default)]
+struct EdgeExecutionReadAhead {
+    /// Complete non-live SSE blocks that must be replayed after the edge call
+    /// settles. Live observations are intentionally not retained here.
+    queued: VecDeque<Vec<u8>>,
+    queued_bytes: usize,
+    /// A chunk may end in the middle of an SSE block. Keep that fragment until
+    /// the next chunk, then hand it back to the normal framer in order.
+    framing: Vec<u8>,
+    live_gaps: BTreeMap<(String, String), u64>,
+    live_gap_bytes: usize,
+}
+
+impl EdgeExecutionReadAhead {
+    fn pop_front(&mut self) -> Option<Vec<u8>> {
+        let bytes = self.queued.pop_front()?;
+        self.queued_bytes = self.queued_bytes.saturating_sub(bytes.len());
+        Some(bytes)
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8], strict_json: bool) -> Result<(), String> {
+        for feed in bytes.chunks(EDGE_EXECUTION_READ_AHEAD_FEED_BYTES) {
+            self.push_feed(feed, strict_json)?;
+        }
+        Ok(())
+    }
+
+    fn push_feed(&mut self, bytes: &[u8], strict_json: bool) -> Result<(), String> {
+        if self
+            .queued_bytes
+            .saturating_add(self.framing.len())
+            .saturating_add(self.live_gap_bytes)
+            .saturating_add(bytes.len())
+            > MAX_EDGE_EXECUTION_READ_AHEAD_BYTES
+        {
+            return Err(format!(
+                "SSE control read-ahead exceeded {} bytes while Edge work was running",
+                MAX_EDGE_EXECUTION_READ_AHEAD_BYTES
+            ));
+        }
+        self.framing.extend_from_slice(bytes);
+        let blocks = drain_complete_sse_event_blocks(&mut self.framing)
+            .map_err(|error| format!("invalid UTF-8 in SSE read-ahead: {error}"))?;
+        for block in blocks {
+            self.push_block(block, strict_json)?;
+        }
+        self.ensure_bounded()
+    }
+
+    /// Finish one edge execution window without inventing an SSE boundary.
+    /// The partial bytes have already passed the durable terminal probe, so
+    /// replaying them skips that probe and lets the normal framer join them to
+    /// the next network chunk.
+    fn finish_window(&mut self) -> Result<(), String> {
+        if !self.framing.is_empty() {
+            let partial = std::mem::take(&mut self.framing);
+            self.queue_bytes(partial)?;
+        }
+        self.ensure_bounded()
+    }
+
+    fn take_live_gaps(&mut self) -> Vec<AgentLiveGap> {
+        self.live_gap_bytes = 0;
+        std::mem::take(&mut self.live_gaps)
+            .into_iter()
+            .map(|((run_id, agent_id), dropped_event_count)| AgentLiveGap {
+                run_id,
+                agent_id,
+                dropped_event_count,
+            })
+            .collect()
+    }
+
+    fn push_block(&mut self, block: String, strict_json: bool) -> Result<(), String> {
+        if self.record_live_gap_if_only_live(&block, strict_json) {
+            return Ok(());
+        }
+        let mut bytes = block.into_bytes();
+        // The shared framer accepts either LF or CRLF separators. Re-emitting
+        // the canonical LF form avoids retaining transport-specific framing.
+        bytes.extend_from_slice(b"\n\n");
+        self.queue_bytes(bytes)
+    }
+
+    fn queue_bytes(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        self.queued_bytes = self.queued_bytes.saturating_add(bytes.len());
+        self.queued.push_back(bytes);
+        self.ensure_bounded()
+    }
+
+    fn ensure_bounded(&self) -> Result<(), String> {
+        if self
+            .queued_bytes
+            .saturating_add(self.framing.len())
+            .saturating_add(self.live_gap_bytes)
+            > MAX_EDGE_EXECUTION_READ_AHEAD_BYTES
+        {
+            return Err(format!(
+                "SSE control read-ahead exceeded {} bytes while Edge work was running",
+                MAX_EDGE_EXECUTION_READ_AHEAD_BYTES
+            ));
+        }
+        Ok(())
+    }
+
+    /// Return true only when the complete block contains valid, recoverable
+    /// live observations and no control/data event. Malformed or mixed blocks
+    /// stay on the bounded replay lane and therefore retain existing strict
+    /// protocol validation and ordering semantics.
+    fn record_live_gap_if_only_live(&mut self, block: &str, strict_json: bool) -> bool {
+        if strict_json && validate_sse_event_block_json(block).is_err() {
+            return false;
+        }
+        let parsed = json_events_from_sse_event_block(block);
+        if parsed.stream_finished || parsed.events.is_empty() {
+            return false;
+        }
+        let mut gaps = BTreeMap::<(String, String), u64>::new();
+        for event in parsed.events {
+            match event.get("type").and_then(Value::as_str) {
+                Some("agent_live_event") => {
+                    let Ok(live) = agent_live_event_from_sse(&event) else {
+                        return false;
+                    };
+                    let key = (live.run_id, live.agent_id);
+                    let count = gaps.entry(key).or_default();
+                    *count = count.saturating_add(1);
+                }
+                Some("agent_live_gap") => {
+                    let Ok(gap) = agent_live_gap_from_sse(&event) else {
+                        return false;
+                    };
+                    let key = (gap.run_id, gap.agent_id);
+                    let count = gaps.entry(key).or_default();
+                    *count = count.saturating_add(gap.dropped_event_count);
+                }
+                _ => return false,
+            }
+        }
+
+        let new_key_count = gaps
+            .keys()
+            .filter(|key| !self.live_gaps.contains_key(*key))
+            .count();
+        if self.live_gaps.len().saturating_add(new_key_count) > MAX_EDGE_EXECUTION_LIVE_GAP_KEYS {
+            // Keep the event on the bounded replay lane rather than silently
+            // losing the identity needed for reconciliation.
+            return false;
+        }
+        let new_gap_bytes = gaps
+            .keys()
+            .filter(|key| !self.live_gaps.contains_key(*key))
+            .map(live_gap_key_bytes)
+            .sum::<usize>();
+        if self.live_gap_bytes.saturating_add(new_gap_bytes) > MAX_EDGE_EXECUTION_LIVE_GAP_BYTES {
+            return false;
+        }
+
+        // Commit only after all limits have been checked. A block is either
+        // fully represented by one gap projection or replayed intact; it can
+        // never be both.
+        self.live_gap_bytes = self.live_gap_bytes.saturating_add(new_gap_bytes);
+        for (key, dropped_event_count) in gaps {
+            let count = self.live_gaps.entry(key).or_default();
+            *count = count.saturating_add(dropped_event_count);
+        }
+        true
+    }
+}
+
+fn live_gap_key_bytes(key: &(String, String)) -> usize {
+    key.0
+        .len()
+        .saturating_add(key.1.len())
+        .saturating_add(std::mem::size_of::<u64>())
+}
 
 #[derive(Default)]
 struct DurableTerminalProbe {
@@ -481,8 +666,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
     let mut first_sse_frame_seen = false;
     let mut reported_session_id: Option<String> = None;
     let mut terminal_probe = DurableTerminalProbe::default();
-    let mut read_ahead = VecDeque::<Vec<u8>>::new();
-    let mut read_ahead_bytes = 0usize;
+    let mut read_ahead = EdgeExecutionReadAhead::default();
 
     host.on_before_sse_read_loop();
 
@@ -503,7 +687,6 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         let mut chunk_was_probed = false;
         let chunk_result = 'wait: {
             if let Some(bytes) = read_ahead.pop_front() {
-                read_ahead_bytes = read_ahead_bytes.saturating_sub(bytes.len());
                 chunk_was_probed = true;
                 break 'wait Some(Some(Ok(bytes)));
             }
@@ -790,32 +973,34 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             // bounded read-ahead lane alive so an exact-owner run_finished can
             // cancel a long local tool/approval immediately. Ordinary frames
             // remain queued and are dispatched in wire order after execution.
-            let flush = flush_pending_via_host(
-                &mut pending,
-                host,
-                accum.session_id.as_deref(),
-                accum.run_id.as_deref(),
-                &mut tool_results,
-                &mut approval_results,
-            );
-            tokio::pin!(flush);
-            let cancel_wait = async {
-                match cancel_token {
-                    Some(token) => token.cancelled().await,
-                    None => std::future::pending::<()>().await,
-                }
-            };
-            tokio::pin!(cancel_wait);
-            let mut settlement_only = false;
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = &mut flush => break,
-                    _ = &mut cancel_wait, if !settlement_only => {
-                        abort.get_or_insert(astra_core::ErrorKind::Cancelled);
-                        settlement_only = true;
+            let live_gaps = {
+                let strict_read_ahead_json = host.requires_strict_sse_json();
+                let flush = flush_pending_via_host(
+                    &mut pending,
+                    host,
+                    accum.session_id.as_deref(),
+                    accum.run_id.as_deref(),
+                    &mut tool_results,
+                    &mut approval_results,
+                );
+                tokio::pin!(flush);
+                let cancel_wait = async {
+                    match cancel_token {
+                        Some(token) => token.cancelled().await,
+                        None => std::future::pending::<()>().await,
                     }
-                    next = chunks.next(), if !settlement_only => {
+                };
+                tokio::pin!(cancel_wait);
+                let mut settlement_only = false;
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut flush => break,
+                        _ = &mut cancel_wait, if !settlement_only => {
+                            abort.get_or_insert(astra_core::ErrorKind::Cancelled);
+                            settlement_only = true;
+                        }
+                        next = chunks.next(), if !settlement_only => {
                         let Some(next) = next else {
                             match terminal_probe.take_trailing_terminal() {
                                 Ok(Some(terminal)) if terminal.status.is_unsuccessful() => {
@@ -860,19 +1045,15 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                                 settlement_only = true;
                             }
                             Ok(_) => {
-                                read_ahead_bytes = read_ahead_bytes.saturating_add(bytes.len());
-                                if read_ahead_bytes > MAX_EDGE_EXECUTION_READ_AHEAD_BYTES {
+                                if let Err(error) =
+                                    read_ahead.push_bytes(&bytes, strict_read_ahead_json)
+                                {
                                     abort = Some(astra_core::ErrorKind::StreamTransport);
-                                    abort_message = Some(format!(
-                                        "Error: SSE control read-ahead exceeded {} bytes while Edge work was running",
-                                        MAX_EDGE_EXECUTION_READ_AHEAD_BYTES
-                                    ));
+                                    abort_message = Some(format!("Error: {error}"));
                                     if let Some(token) = cancel_token {
                                         token.cancel();
                                     }
                                     settlement_only = true;
-                                } else {
-                                    read_ahead.push_back(bytes);
                                 }
                             }
                             Err(error) => {
@@ -886,8 +1067,26 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                                 settlement_only = true;
                             }
                         }
+                        }
                     }
                 }
+                if abort.is_none() {
+                    if let Err(error) = read_ahead.finish_window() {
+                        abort = Some(astra_core::ErrorKind::StreamTransport);
+                        abort_message = Some(format!("Error: {error}"));
+                        if let Some(token) = cancel_token {
+                            token.cancel();
+                        }
+                        Vec::new()
+                    } else {
+                        read_ahead.take_live_gaps()
+                    }
+                } else {
+                    Vec::new()
+                }
+            };
+            for gap in live_gaps {
+                host.on_agent_live_gap(gap);
             }
         }
         if abort.is_some() {
@@ -1556,6 +1755,7 @@ struct RecordingSseStreamHost {
     approval_kinds: Vec<ApprovalKind>,
     approval_session_ids: Vec<Option<String>>,
     approval_run_ids: Vec<Option<String>>,
+    tool_delay: Option<std::time::Duration>,
     abort_edge_work_after_approval: bool,
     edge_work_aborted: bool,
     agent_communications: Vec<astra_turn_types::AgentCommunicationEvent>,
@@ -1576,6 +1776,7 @@ impl RecordingSseStreamHost {
             approval_kinds: Vec::new(),
             approval_session_ids: Vec::new(),
             approval_run_ids: Vec::new(),
+            tool_delay: None,
             abort_edge_work_after_approval: false,
             edge_work_aborted: false,
             agent_communications: Vec::new(),
@@ -1591,6 +1792,11 @@ impl RecordingSseStreamHost {
     fn with_tool_output(mut self, tool: &str, output: &str) -> Self {
         self.tool_outputs
             .insert(tool.to_string(), output.to_string());
+        self
+    }
+
+    fn with_tool_delay(mut self, delay: std::time::Duration) -> Self {
+        self.tool_delay = Some(delay);
         self
     }
 
@@ -1653,6 +1859,9 @@ impl SseStreamHost for RecordingSseStreamHost {
         tool: &str,
         args: &Value,
     ) -> EdgeToolExecResult {
+        if let Some(delay) = self.tool_delay {
+            tokio::time::sleep(delay).await;
+        }
         let output = self
             .tool_outputs
             .get(tool)
@@ -3671,6 +3880,113 @@ mod tests {
         assert_eq!(result.tool_results[0].output, "commit abc123");
         assert_eq!(result.accum.full_text, "Latest commit: abc123");
         bridge.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn edge_execution_drops_recoverable_live_read_ahead_without_transport_abort() {
+        let (tx, rx) = test_channel();
+        let mut stream = rx;
+        let bridge = tokio::spawn(async move {
+            let first = format!(
+                "{}{}",
+                sse_event(
+                    "session_info",
+                    ",\"session_id\":\"session-1\",\"run_id\":\"root-run\""
+                ),
+                sse_event(
+                    "tool_request",
+                    ",\"request_id\":\"tool-1\",\"tool\":\"agent_fanout\",\"args\":{}"
+                )
+            );
+            tx.send(Ok(first.into_bytes())).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+            // This is deliberately larger than the historical 1 MiB
+            // read-ahead limit. Live child output is reconstructible from the
+            // durable child snapshot and must become a typed gap, not a
+            // transport failure that cancels the parent fanout.
+            let content = "x".repeat(4096);
+            let mut live_burst = String::new();
+            for _ in 0..300 {
+                live_burst.push_str(&sse_event(
+                    "agent_live_event",
+                    &format!(
+                        ",\"run_id\":\"child-run\",\"agent_id\":\"child-agent\",\
+                         \"event_kind\":\"output_delta\",\"content\":{content:?}"
+                    ),
+                ));
+            }
+            tx.send(Ok(live_burst.into_bytes())).await.unwrap();
+            tx.send(Ok(
+                sse_event("text_delta", ",\"content\":\"done\"").into_bytes()
+            ))
+            .await
+            .unwrap();
+            tx.send(Ok(b"data: [DONE]\n\n".to_vec())).await.unwrap();
+        });
+
+        let mut host =
+            RecordingSseStreamHost::new().with_tool_delay(std::time::Duration::from_millis(200));
+        let (result, abort) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            consume_sse_stream(&mut stream, &mut host, stream_idle_timeout()),
+        )
+        .await
+        .expect("bounded live read-ahead must settle");
+
+        assert_eq!(abort, None, "live observation pressure must not abort SSE");
+        assert_eq!(result.accum.full_text, "done");
+        assert_eq!(result.tool_results.len(), 1);
+        assert_eq!(host.agent_live_events.len(), 0);
+        assert_eq!(host.agent_live_gaps.len(), 1);
+        assert_eq!(host.agent_live_gaps[0].run_id, "child-run");
+        assert_eq!(host.agent_live_gaps[0].agent_id, "child-agent");
+        assert_eq!(host.agent_live_gaps[0].dropped_event_count, 300);
+        bridge.await.unwrap();
+    }
+
+    #[test]
+    fn strict_live_compaction_replays_malformed_mixed_block() {
+        let mut read_ahead = EdgeExecutionReadAhead::default();
+        let block = concat!(
+            "data: {\"type\":\"agent_live_event\",\"run_id\":\"r\",",
+            "\"agent_id\":\"a\",\"event_kind\":\"output_delta\",",
+            "\"content\":\"x\"}\n",
+            "data: {not-json}\n\n"
+        );
+
+        read_ahead
+            .push_bytes(block.as_bytes(), true)
+            .expect("malformed block remains replayable under the byte bound");
+
+        assert!(read_ahead.live_gaps.is_empty());
+        assert_eq!(read_ahead.queued.len(), 1);
+        assert!(
+            validate_sse_event_block_json(
+                std::str::from_utf8(read_ahead.queued.front().unwrap()).unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn live_gap_capacity_is_atomic() {
+        let mut read_ahead = EdgeExecutionReadAhead::default();
+        let mut block = String::new();
+        for index in 0..=MAX_EDGE_EXECUTION_LIVE_GAP_KEYS {
+            block.push_str(&format!(
+                "data: {{\"type\":\"agent_live_event\",\"run_id\":\"r-{index}\",\"agent_id\":\"a\",\"event_kind\":\"output_delta\",\"content\":\"x\"}}\n"
+            ));
+        }
+        block.push('\n');
+
+        read_ahead
+            .push_bytes(block.as_bytes(), false)
+            .expect("the intact block fits the replay lane");
+
+        assert!(read_ahead.live_gaps.is_empty());
+        assert_eq!(read_ahead.live_gap_bytes, 0);
+        assert_eq!(read_ahead.queued.len(), 1);
     }
 
     /// Adjacent concurrency-safe tool requests may arrive as separate SSE

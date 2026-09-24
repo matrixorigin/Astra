@@ -1473,14 +1473,6 @@ fn build_skill_extra(state: &AgenticLoopState) -> HashMap<String, String> {
             .collect();
         extra.insert("stall_events".into(), stalls.join(", "));
     }
-    let eff = state.turn_guard.correction_effectiveness();
-    if eff.total_corrections > 0 {
-        extra.insert(
-            "correction_follow_rate".into(),
-            format!("{:.0}%", eff.follow_rate * 100.0),
-        );
-    }
-
     extra
 }
 

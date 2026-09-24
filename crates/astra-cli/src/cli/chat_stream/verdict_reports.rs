@@ -1,6 +1,6 @@
 use astra_turn_core::guardrails::explain_report_lines::{
     REPORT_SEPARATOR_LINE, VERDICT_REPORT_HEADER, verdict_avoid_tools_line,
-    verdict_event_summary_line, verdict_injection_count_line, verdict_injection_preview_line,
+    verdict_event_summary_line, verdict_observation_count_line, verdict_observation_preview_line,
     verdict_severity_icon,
 };
 use crossterm::style::Stylize;
@@ -39,13 +39,13 @@ pub(super) fn print_verdict_report(verdict_events: &[VerdictEvent], verbose: boo
                 let preview: String = inj.chars().take(120).collect();
                 eprintln!(
                     "{}",
-                    verdict_injection_preview_line(i, preview.as_str()).dim()
+                    verdict_observation_preview_line(i, preview.as_str()).dim()
                 );
             }
         } else if !ve.injections.is_empty() {
             eprintln!(
                 "{}",
-                verdict_injection_count_line(ve.injections.len()).dim()
+                verdict_observation_count_line(ve.injections.len()).dim()
             );
         }
     }

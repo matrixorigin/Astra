@@ -420,6 +420,30 @@ impl ExecutionDeadlineAuthority {
     pub fn monotonic_deadline(self) -> std::time::Instant {
         self.monotonic_deadline
     }
+
+    /// Remaining time according to the monotonic authority clock.
+    pub fn remaining(self) -> Duration {
+        self.monotonic_deadline
+            .saturating_duration_since(std::time::Instant::now())
+    }
+
+    /// Derive a strictly earlier deadline while reserving time for the parent
+    /// to consume the child result. The absolute deadline is narrowed; it is
+    /// never reconstructed from a relative snapshot, so retries and nested
+    /// delegation cannot replenish elapsed time.
+    pub fn with_parent_reserve(self, reserve: Duration) -> Option<Self> {
+        if self.remaining() <= reserve {
+            return None;
+        }
+        let monotonic_deadline = self.monotonic_deadline.checked_sub(reserve)?;
+        let reserve_ms = reserve.as_nanos().div_ceil(1_000_000);
+        let reserve_ms = u64::try_from(reserve_ms).ok()?;
+        let deadline_unix_ms = self.deadline_unix_ms.checked_sub(reserve_ms)?;
+        Some(Self {
+            deadline_unix_ms,
+            monotonic_deadline,
+        })
+    }
 }
 
 /// Original execution restrictions, not a grant of permission to reconstruct a

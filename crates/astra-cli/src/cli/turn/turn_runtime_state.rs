@@ -55,13 +55,8 @@ pub(crate) fn update_from_turn_failure(state: &mut SessionState, failure: &crate
     state.total_cache_creation_tokens = state
         .total_cache_creation_tokens
         .saturating_add(failure.partial.cache_creation_tokens);
-    state.total_session_cost += crate::cli::slash::slash_stats::cost_for_tokens(
-        failure.partial.prompt_tokens,
-        failure.partial.completion_tokens,
-        failure.partial.cache_read_tokens,
-        failure.partial.cache_creation_tokens,
-        &state.cached_pricing,
-    );
+    // Missing telemetry cannot prove that failed work was free or fully priced.
+    state.total_session_cost = None;
 
     // A failed turn without a new partial checkpoint did not advance the
     // durable recovery point; keep the previous runtime state intact.
@@ -99,5 +94,6 @@ mod tests {
         assert_eq!(state.total_completion_tokens, 335);
         assert_eq!(state.total_cache_read_tokens, 34_718);
         assert_eq!(state.total_cache_creation_tokens, 57);
+        assert_eq!(state.total_session_cost, None);
     }
 }

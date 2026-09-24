@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::case::PromptCacheReuseScope;
+use crate::explain_capture::primary_execution_cache_groups;
 use crate::pipeline_analysis::analyze_pipeline_health;
 use crate::runner::RunOutcome;
 use crate::session_capture::SessionCapture;
@@ -173,6 +174,7 @@ pub enum Criterion {
         child: String,
         min: u32,
         max: u32,
+        min_distinct_child_runs: u32,
     },
 
     /// Requires that a tool is absent from every canonical user-facing turn
@@ -451,13 +453,13 @@ pub enum Criterion {
         min_calls: u32,
     },
 
-    /// Passes when provider prompt-cache accounting reports the cache-read
-    /// and cache-creation buckets within the expected bounds.
+    /// Passes when canonical primary-attempt input evidence reports cache-read
+    /// and cache-creation buckets within bounds across every physical execution,
+    /// including follow-up steps and retries. Auxiliary usage is excluded.
     ///
-    /// - `min_read` — floor on cumulative `cached_input_tokens`. Fails when
+    /// - `min_read` — floor on cumulative primary cache-read tokens. Fails when
     ///   the prefix doesn't hit enough (cache prefix broken).
-    /// - `min_creation` — floor on `cache_creation_tokens`. Rarely used; set
-    ///   to 0 for backward compatibility.
+    /// - `min_creation` — floor on primary cache-creation tokens.
     /// - `max_creation` — ceiling on `cache_creation_tokens`. When set, fails
     ///   if cache is being rebuilt excessively (partial-hit regressions where
     ///   reads look healthy but creations explode).
@@ -478,11 +480,12 @@ pub enum Criterion {
     /// The denominator is all provider input:
     /// `fresh + cache_read + cache_creation`. This prevents small requests
     /// from dominating an average and prevents cache-write churn from being
-    /// mistaken for a healthy read hit rate. The criterion reads canonical
-    /// `turn` journal usage and falls back to legacy `llm_round` records.
-    /// `warmup_rounds` is an explicit provider-boundary mode for journeys
-    /// whose single user turn contains several model/tool rounds; it uses
-    /// detailed `llm_round` records and leaves `warmup_turns` unchanged.
+    /// mistaken for a healthy read hit rate. Only exact primary input from
+    /// complete canonical execution evidence qualifies; auxiliary usage is
+    /// excluded. Unknown inputs or conflicting captures are unavailable.
+    /// `warmup_turns` removes whole user turns, including retry executions.
+    /// `warmup_rounds` removes typed ModelRound request groups, combining
+    /// physical retries within each parent but retaining phase attempts.
     ProviderPromptCacheReadRatio {
         min: f64,
         #[serde(default = "default_prompt_cache_warmup_turns")]
@@ -498,7 +501,7 @@ pub enum Criterion {
     /// history; this does not measure stable-prefix or absolute input coverage.
     /// Auxiliary requests are outside this feedback's scope. Use
     /// `ProviderPromptCacheReadRatio` for absolute cache-read share from
-    /// aggregate turn/round usage, which can include auxiliary requests.
+    /// canonical primary execution usage, excluding auxiliary requests.
     /// Identity transitions are bounded per run and do not form scored pairs.
     /// Within each epoch, only the first pair with a zero previous read is
     /// exempt as a cold boundary; later zeros remain scored failures.
@@ -517,7 +520,7 @@ pub enum Criterion {
 
     /// Internal hard gate injected when a case declares
     /// `required_cache_scope`. It proves the requested reuse boundary from
-    /// durable provider usage rather than trusting model metadata or a soft
+    /// canonical primary execution facts rather than model metadata or a soft
     /// cache-quality criterion.
     PromptCacheReuseScope { scope: PromptCacheReuseScope },
 
@@ -530,8 +533,9 @@ pub enum Criterion {
         optional: bool,
     },
 
-    /// Passes when the average per-turn prompt cache hit ratio reported
-    /// by pipeline feedback is at least `min`.
+    /// Passes when the arithmetic mean of fully qualified primary ModelRound
+    /// request-group cache-read shares is at least `min`. Zero-input groups
+    /// are not samples; unknown coverage is unavailable, never zero.
     PipelineAvgCacheHitRatio {
         min: f64,
         #[serde(default)]
@@ -805,10 +809,71 @@ pub fn evaluate_deterministic_with_session(
     outcome: &RunOutcome,
     session: Option<&SessionCapture>,
 ) -> Vec<CriterionResult> {
+    evaluate_with_primary_executions(criteria, outcome, session, &[outcome])
+}
+
+/// Borrow physical executions, never the multi-step aggregate's mixed counters.
+pub(crate) fn evaluate_with_primary_executions(
+    criteria: &[Criterion],
+    outcome: &RunOutcome,
+    session: Option<&SessionCapture>,
+    executions: &[&RunOutcome],
+) -> Vec<CriterionResult> {
+    let primary_cache = if criteria.iter().any(requires_primary_cache_evidence) {
+        primary_execution_cache_usage(executions)
+    } else {
+        None
+    };
     criteria
         .iter()
-        .map(|c| evaluate_one(c, outcome, session))
+        .map(|c| evaluate_one_with_primary_cache(c, outcome, session, primary_cache, executions))
         .collect()
+}
+
+fn requires_primary_cache_evidence(criterion: &Criterion) -> bool {
+    match criterion {
+        Criterion::PromptCacheTokens { .. } => true,
+        Criterion::AllOf { criteria } | Criterion::AnyOf { criteria } => {
+            criteria.iter().any(requires_primary_cache_evidence)
+        }
+        _ => false,
+    }
+}
+
+fn primary_execution_cache_usage(
+    executions: &[&RunOutcome],
+) -> Option<astra_turn_types::NormalizedPromptCacheUsage> {
+    if executions.is_empty() {
+        return None;
+    }
+    let mut scopes = std::collections::HashSet::new();
+    let mut total = astra_turn_types::NormalizedPromptCacheUsage::default();
+    for execution in executions {
+        let capture = execution.explain_capture.as_ref()?;
+        let usage = capture.primary_prompt_cache_usage()?;
+        let mut local_scopes = std::collections::HashSet::new();
+        for event in &capture.events {
+            if execution.run_id.as_deref() != Some(event.run_id.as_str()) {
+                return None;
+            }
+            local_scopes.insert((&event.run_id, &event.turn_id, &event.clock_domain_id));
+        }
+        // Overlapping execution archives are ambiguous, not extra billable work.
+        if local_scopes.into_iter().any(|scope| !scopes.insert(scope)) {
+            return None;
+        }
+        total.fresh_input_tokens = total
+            .fresh_input_tokens
+            .checked_add(usage.fresh_input_tokens)?;
+        total.cache_read_tokens = total
+            .cache_read_tokens
+            .checked_add(usage.cache_read_tokens)?;
+        total.cache_creation_tokens = total
+            .cache_creation_tokens
+            .checked_add(usage.cache_creation_tokens)?;
+    }
+    total.checked_total_input_tokens()?;
+    Some(total)
 }
 
 /// A declaration can suppress automatic retry before its evidence is loaded.
@@ -978,10 +1043,8 @@ fn criterion_requires_session_capture(c: &Criterion) -> bool {
         | Criterion::JournalToolValueFlowBound { .. }
         | Criterion::PipelineAlertCount { .. }
         | Criterion::PipelineAvgCacheHitRatio { .. }
-        | Criterion::ProviderPromptCacheReadRatio { .. }
         | Criterion::ProviderPromptCacheReadNonregressionRatio { .. }
-        | Criterion::ProviderStablePrefixCacheCoverage { .. }
-        | Criterion::PromptCacheReuseScope { .. } => true,
+        | Criterion::ProviderStablePrefixCacheCoverage { .. } => true,
         Criterion::AnyOf { criteria } | Criterion::AllOf { criteria } => {
             requires_session_capture(criteria)
         }
@@ -1277,6 +1340,21 @@ fn evaluate_one(
     outcome: &RunOutcome,
     session: Option<&SessionCapture>,
 ) -> CriterionResult {
+    let primary_cache = if requires_primary_cache_evidence(c) {
+        primary_execution_cache_usage(&[outcome])
+    } else {
+        None
+    };
+    evaluate_one_with_primary_cache(c, outcome, session, primary_cache, &[outcome])
+}
+
+fn evaluate_one_with_primary_cache(
+    c: &Criterion,
+    outcome: &RunOutcome,
+    session: Option<&SessionCapture>,
+    primary_cache: Option<astra_turn_types::NormalizedPromptCacheUsage>,
+    executions: &[&RunOutcome],
+) -> CriterionResult {
     if let Some(capture) = session
         && (capture.skipped_lines > 0
             || capture.dropped_lines > 0
@@ -1378,13 +1456,20 @@ fn evaluate_one(
             }
         }
         Criterion::ToolsCountBetween { min, max } => {
-            let n = outcome.tool_calls_count;
+            // The terminal envelope and step-event archive cover the same
+            // inclusive execution but have independent capture paths. A
+            // short/partial step-event archive must never override a larger
+            // terminal count and accidentally certify an upper bound.
+            let n = outcome.total_tool_calls.max(outcome.tool_calls_count);
             let pass = n >= *min && n <= *max;
             CriterionResult {
                 criterion: c.clone(),
                 severity: criterion_severity(c),
                 passed: pass,
-                detail: format!("tool_calls_count={n}, expected {min}..={max}"),
+                detail: format!(
+                    "total_tool_calls={n}, expected {min}..={max} (terminal={}, step_events={})",
+                    outcome.tool_calls_count, outcome.total_tool_calls
+                ),
                 full_detail: None,
                 score: None,
             }
@@ -1572,7 +1657,13 @@ fn evaluate_one(
             let mut nested = Vec::new();
             let mut passed = false;
             for criterion in criteria {
-                let result = evaluate_one(criterion, outcome, session);
+                let result = evaluate_one_with_primary_cache(
+                    criterion,
+                    outcome,
+                    session,
+                    primary_cache,
+                    executions,
+                );
                 passed = result.passed;
                 nested.push(result);
                 if passed {
@@ -1608,7 +1699,13 @@ fn evaluate_one(
             let mut nested = Vec::new();
             let mut passed = true;
             for criterion in criteria {
-                let result = evaluate_one(criterion, outcome, session);
+                let result = evaluate_one_with_primary_cache(
+                    criterion,
+                    outcome,
+                    session,
+                    primary_cache,
+                    executions,
+                );
                 passed = result.passed;
                 nested.push(result);
                 if !passed {
@@ -1900,18 +1997,22 @@ fn evaluate_one(
             child,
             min,
             max,
+            min_distinct_child_runs,
         } => {
             let Some(session) = session else {
                 return missing_required_session(c, "journal_child_tool_call_count");
             };
-            let count = session.causal_child_tool_call_count(parent, child) as u32;
-            let passed = count >= *min && count <= *max;
+            let calls_by_run = session.causal_child_tool_calls_by_run(parent, child);
+            let count = calls_by_run.values().sum::<usize>() as u32;
+            let distinct_runs = calls_by_run.len() as u32;
+            let passed =
+                count >= *min && count <= *max && distinct_runs >= *min_distinct_child_runs;
             CriterionResult {
                 criterion: c.clone(),
                 severity: criterion_severity(c),
                 passed,
                 detail: format!(
-                    "causal child tool {child} under {parent} count={count}, expected {min}..={max}"
+                    "causal child tool {child} under {parent} count={count}, expected {min}..={max}; distinct child runs={distinct_runs}, expected >= {min_distinct_child_runs}; by run={calls_by_run:?}"
                 ),
                 full_detail: None,
                 score: None,
@@ -3080,7 +3181,9 @@ fn evaluate_one(
                 criterion: c.clone(),
                 severity: criterion_severity(c),
                 passed,
-                detail: format!("tokens_total={total}, expected {min}..={max}"),
+                detail: format!(
+                    "terminal_reported_tokens={total}, expected {min}..={max}; not full model cost"
+                ),
                 full_detail: None,
                 score: None,
             }
@@ -3212,10 +3315,17 @@ fn evaluate_one(
             min_creation,
             max_creation,
         } => {
-            let read_ok = outcome.cached_input_tokens >= *min_read;
-            let creation_floor_ok = outcome.cache_creation_tokens >= *min_creation;
+            let Some(usage) = primary_cache else {
+                return CriterionResult {
+                    criterion: c.clone(), severity: criterion_severity(c), passed: false,
+                    detail: "primary prompt-cache evidence unavailable: missing, incomplete, conflicting, or overlapping execution capture".into(),
+                    full_detail: None, score: None,
+                };
+            };
+            let read_ok = usage.cache_read_tokens >= *min_read;
+            let creation_floor_ok = usage.cache_creation_tokens >= *min_creation;
             let creation_ceiling_ok = match max_creation {
-                Some(max) => outcome.cache_creation_tokens <= *max,
+                Some(max) => usage.cache_creation_tokens <= *max,
                 None => true,
             };
             let passed = read_ok && creation_floor_ok && creation_ceiling_ok;
@@ -3228,9 +3338,9 @@ fn evaluate_one(
                 severity: criterion_severity(c),
                 passed,
                 detail: format!(
-                    "prompt_cache read={} creation={}, expected read>={} creation>={}{}",
-                    outcome.cached_input_tokens,
-                    outcome.cache_creation_tokens,
+                    "primary_prompt_cache read={} creation={}, expected read>={} creation>={}{}",
+                    usage.cache_read_tokens,
+                    usage.cache_creation_tokens,
                     min_read,
                     min_creation,
                     ceiling_desc
@@ -3240,76 +3350,77 @@ fn evaluate_one(
             }
         }
         Criterion::PromptCacheReuseScope { scope } => {
-            evaluate_prompt_cache_reuse_scope(c, *scope, session)
+            evaluate_prompt_cache_reuse_scope(c, *scope, executions)
         }
         Criterion::ProviderPromptCacheReadRatio {
             min,
             warmup_turns,
             warmup_rounds,
-        } => match session {
-            None => missing_required_session(c, "provider prompt-cache read ratio"),
-            Some(capture) => {
-                let (usages, warmup, unit) = if *warmup_rounds > 0 {
-                    (
-                        provider_prompt_cache_round_usages(capture),
-                        *warmup_rounds as usize,
-                        "round",
-                    )
-                } else {
-                    (
-                        provider_prompt_cache_usages(capture),
-                        *warmup_turns as usize,
-                        "turn",
-                    )
-                };
-                let measured = usages.iter().skip(warmup);
-                let mut fresh = 0_u128;
-                let mut read = 0_u128;
-                let mut creation = 0_u128;
-                let mut observations = 0_usize;
-                for usage in measured {
-                    fresh += u128::from(usage.fresh);
-                    read += u128::from(usage.read);
-                    creation += u128::from(usage.creation);
-                    observations += 1;
-                }
-                let input = fresh + read + creation;
-                let count_label = if unit == "turn" { "turns" } else { "rounds" };
-                if observations == 0 || input == 0 {
-                    CriterionResult {
+        } => {
+            let (warmup, unit) = if *warmup_rounds > 0 {
+                (*warmup_rounds as usize, "round")
+            } else {
+                (*warmup_turns as usize, "turn")
+            };
+            let Some(groups) =
+                primary_execution_cache_groups(executions, *warmup_rounds > 0, false)
+            else {
+                return CriterionResult {
                         criterion: c.clone(),
                         severity: criterion_severity(c),
                         passed: false,
-                        detail: format!(
-                            "no provider usage after {} warmup {unit}(s) (usage observations={})",
-                            warmup,
-                            usages.len()
-                        ),
+                        detail: "primary prompt-cache evidence unavailable: incomplete, conflicting, or unordered execution coverage".into(),
                         full_detail: None,
                         score: None,
-                    }
-                } else {
-                    let ratio = read as f64 / input as f64;
-                    CriterionResult {
-                        criterion: c.clone(),
-                        severity: criterion_severity(c),
-                        // Token counts are exact integers; tolerate only the
-                        // representational epsilon at an exact decimal
-                        // boundary such as 9_800 / 10_000 == 0.98.
-                        passed: ratio >= *min || (ratio - *min).abs() <= 1e-12,
-                        detail: format!(
-                            "provider_prompt_cache_read_ratio={:.2}% \
+                    };
+            };
+            let usage_count: usize = groups.iter().map(Vec::len).sum();
+            let measured = groups.iter().flatten().skip(warmup);
+            let mut fresh = 0_u128;
+            let mut read = 0_u128;
+            let mut creation = 0_u128;
+            let mut observations = 0_usize;
+            for usage in measured {
+                fresh += u128::from(usage.fresh_input_tokens);
+                read += u128::from(usage.cache_read_tokens);
+                creation += u128::from(usage.cache_creation_tokens);
+                observations += 1;
+            }
+            let input = fresh + read + creation;
+            let count_label = if unit == "turn" { "turns" } else { "rounds" };
+            if observations == 0 || input == 0 {
+                CriterionResult {
+                    criterion: c.clone(),
+                    severity: criterion_severity(c),
+                    passed: false,
+                    detail: format!(
+                        "no provider usage after {} warmup {unit}(s) (usage observations={})",
+                        warmup, usage_count
+                    ),
+                    full_detail: None,
+                    score: None,
+                }
+            } else {
+                let ratio = read as f64 / input as f64;
+                CriterionResult {
+                    criterion: c.clone(),
+                    severity: criterion_severity(c),
+                    // Token counts are exact integers; tolerate only the
+                    // representational epsilon at an exact decimal
+                    // boundary such as 9_800 / 10_000 == 0.98.
+                    passed: ratio >= *min || (ratio - *min).abs() <= 1e-12,
+                    detail: format!(
+                        "provider_prompt_cache_read_ratio={:.2}% \
                              (read={read}, fresh={fresh}, creation={creation}, {count_label}={observations}, \
                              warmup_{unit}={warmup}), expected >= {:.2}%",
-                            ratio * 100.0,
-                            min * 100.0
-                        ),
-                        full_detail: None,
-                        score: None,
-                    }
+                        ratio * 100.0,
+                        min * 100.0
+                    ),
+                    full_detail: None,
+                    score: None,
                 }
             }
-        },
+        }
         Criterion::ProviderPromptCacheReadNonregressionRatio {
             min,
             min_pairs,
@@ -3363,7 +3474,7 @@ fn evaluate_one(
         } => match session {
             None => missing_required_session(c, "provider stable-prefix cache coverage"),
             Some(capture) => {
-                let report = analyze_pipeline_health(capture);
+                let report = analyze_pipeline_health(capture, &[]);
                 let enough_observations =
                     report.provider_prefix_cache_observations >= *min_observations;
                 let coverage_ok = report
@@ -3412,7 +3523,7 @@ fn evaluate_one(
                 score: None,
             },
             Some(capture) => {
-                let report = analyze_pipeline_health(capture);
+                let report = analyze_pipeline_health(capture, &[]);
                 if report.invalid_events > 0 {
                     if *optional {
                         return CriterionResult {
@@ -3472,7 +3583,7 @@ fn evaluate_one(
                 score: None,
             },
             Some(capture) => {
-                let report = analyze_pipeline_health(capture);
+                let report = analyze_pipeline_health(capture, executions);
                 if report.invalid_events > 0 {
                     if *optional {
                         return CriterionResult {
@@ -3499,39 +3610,32 @@ fn evaluate_one(
                         score: Some(0.0),
                     };
                 }
-                if report.turns_with_feedback == 0 {
-                    return if *optional {
-                        CriterionResult {
-                            criterion: c.clone(),
-                            severity: criterion_severity(c),
-                            passed: true,
-                            detail:
-                                "pipeline cache ratio skipped (optional + no pipeline feedback turns)"
-                                    .into(),
-                            full_detail: None,
-                            score: None,
-                        }
-                    } else {
-                        CriterionResult {
-                            criterion: c.clone(),
-                            severity: criterion_severity(c),
-                            passed: false,
-                            detail:
-                                "no pipeline feedback turns available — cannot evaluate cache ratio"
-                                    .into(),
-                            full_detail: None,
-                            score: None,
-                        }
+                let Some(mean) = report.avg_cache_hit_ratio else {
+                    return CriterionResult {
+                        criterion: c.clone(),
+                        severity: criterion_severity(c),
+                        passed: *optional,
+                        detail: format!(
+                            "primary request-group cache mean {}; {}",
+                            report.cache_read_share_label(),
+                            if *optional {
+                                "optional criterion skipped"
+                            } else {
+                                "cannot evaluate cache ratio"
+                            }
+                        ),
+                        full_detail: None,
+                        score: None,
                     };
-                }
-                let passed = report.turns_with_feedback > 0 && report.avg_cache_hit_ratio >= *min;
+                };
+                let passed = mean >= *min;
                 CriterionResult {
                     criterion: c.clone(),
                     severity: criterion_severity(c),
                     passed,
                     detail: format!(
-                        "pipeline_avg_cache_hit_ratio={:.1}%, expected >= {:.1}%",
-                        report.avg_cache_hit_ratio * 100.0,
+                        "primary_request_group_mean_cache_read_share={:.1}%, expected >= {:.1}%",
+                        mean * 100.0,
                         min * 100.0
                     ),
                     full_detail: None,
@@ -3550,13 +3654,6 @@ fn criterion_allows_incomplete_capture(c: &Criterion) -> bool {
             | Criterion::PipelineAlertCount { optional: true, .. }
             | Criterion::PipelineAvgCacheHitRatio { optional: true, .. }
     )
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ProviderPromptCacheUsage {
-    fresh: u64,
-    read: u64,
-    creation: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3712,75 +3809,50 @@ fn assess_cache_read_nonregression(
     })
 }
 
-fn provider_cache_ratio_cmp(
-    left: ProviderPromptCacheUsage,
-    right: ProviderPromptCacheUsage,
-) -> std::cmp::Ordering {
-    let left_total = u128::from(left.fresh) + u128::from(left.read) + u128::from(left.creation);
-    let right_total = u128::from(right.fresh) + u128::from(right.read) + u128::from(right.creation);
-    (u128::from(left.read) * right_total).cmp(&(u128::from(right.read) * left_total))
-}
-
 fn evaluate_prompt_cache_reuse_scope(
     criterion: &Criterion,
     scope: PromptCacheReuseScope,
-    session: Option<&SessionCapture>,
+    executions: &[&RunOutcome],
 ) -> CriterionResult {
-    let Some(capture) = session else {
-        return missing_required_session(criterion, "required prompt-cache reuse scope");
+    let intra = scope == PromptCacheReuseScope::IntraTurnRounds;
+    // Intra-run requests retain the run boundary; conversation turns do not.
+    let Some(groups) = primary_execution_cache_groups(executions, intra, intra) else {
+        return CriterionResult {
+            criterion: criterion.clone(),
+            severity: criterion_severity(criterion),
+            passed: false,
+            detail: "required prompt-cache scope: evidence unavailable: incomplete, conflicting, or unordered primary execution coverage".into(),
+            full_detail: None,
+            score: None,
+        };
     };
-
-    let (observations, reuse_reads, passed, boundary) = match scope {
-        PromptCacheReuseScope::ConversationTurns => {
-            let Some(usages) = required_conversation_prompt_cache_usages(capture) else {
-                return CriterionResult {
-                    criterion: criterion.clone(),
-                    severity: criterion_severity(criterion),
-                    passed: false,
-                    detail: "required prompt-cache scope=conversation_turns: FAILED: every provider usage observation must carry a typed turn identity".into(),
-                    full_detail: None,
-                    score: None,
-                };
-            };
-            let reuse_reads: u64 = usages.iter().skip(1).map(|usage| usage.read).sum();
-            let observations = usages.len();
-            (
-                observations,
-                reuse_reads,
-                observations >= 2 && reuse_reads > 0,
-                "conversation_turns",
-            )
-        }
-        PromptCacheReuseScope::IntraTurnRounds => {
-            let Some(groups) = required_intra_turn_rounds(capture) else {
-                return CriterionResult {
-                    criterion: criterion.clone(),
-                    severity: criterion_severity(criterion),
-                    passed: false,
-                    detail: "required prompt-cache scope=intra_turn_rounds: FAILED: every provider round must carry typed turn, round, and producer run identities".into(),
-                    full_detail: None,
-                    score: None,
-                };
-            };
-            let observations = groups.iter().map(Vec::len).max().unwrap_or(0);
-            let reuse_reads = groups
-                .iter()
-                .filter(|rounds| rounds.len() >= 2)
-                .map(|rounds| rounds.iter().skip(1).map(|usage| usage.read).sum::<u64>())
-                .max()
-                .unwrap_or(0);
-            (
-                observations,
-                reuse_reads,
-                observations >= 2 && reuse_reads > 0,
-                "intra_turn_rounds",
-            )
-        }
+    let (observations, reuse_reads, boundary) = if intra {
+        let witness = groups
+            .iter()
+            .map(|requests| {
+                let reads: u128 = requests
+                    .iter()
+                    .skip(1)
+                    .map(|usage| u128::from(usage.cache_read_tokens))
+                    .sum();
+                (requests.len(), reads)
+            })
+            .max_by_key(|(count, reads)| (*count >= 2 && *reads > 0, *reads, *count))
+            .unwrap_or((0, 0));
+        (witness.0, witness.1, "intra_turn_rounds")
+    } else {
+        let reads: u128 = groups
+            .iter()
+            .skip(1)
+            .flatten()
+            .map(|usage| u128::from(usage.cache_read_tokens))
+            .sum();
+        (groups.len(), reads, "conversation_turns")
     };
     CriterionResult {
         criterion: criterion.clone(),
         severity: criterion_severity(criterion),
-        passed,
+        passed: observations >= 2 && reuse_reads > 0,
         detail: format!(
             "required prompt-cache scope={boundary}: observations={observations}, \
              post-cold cache_read_tokens={reuse_reads}, expected >=2 observations and read>0"
@@ -3788,264 +3860,6 @@ fn evaluate_prompt_cache_reuse_scope(
         full_detail: None,
         score: None,
     }
-}
-
-fn provider_usage_from_event(
-    event: &crate::session_capture::JournalEvent,
-) -> Option<ProviderPromptCacheUsage> {
-    let fresh = event.raw.get("tokens_in").and_then(|value| value.as_u64());
-    let read = event
-        .raw
-        .get("cache_read_tokens")
-        .and_then(|value| value.as_u64());
-    let creation = event
-        .raw
-        .get("cache_creation_tokens")
-        .and_then(|value| value.as_u64());
-    if fresh.is_none() && read.is_none() && creation.is_none() {
-        return None;
-    }
-    let usage = ProviderPromptCacheUsage {
-        fresh: fresh.unwrap_or_default(),
-        read: read.unwrap_or_default(),
-        creation: creation.unwrap_or_default(),
-    };
-    (usage.fresh != 0 || usage.read != 0 || usage.creation != 0).then_some(usage)
-}
-
-/// Strict conversation-boundary evidence. Unlike the advisory cache-ratio
-/// extractor, this path refuses identity-less observations and collapses
-/// mirrored records by their typed turn id. A duplicate turn can therefore
-/// never manufacture a second cold/warm observation.
-fn required_conversation_prompt_cache_usages(
-    capture: &SessionCapture,
-) -> Option<Vec<ProviderPromptCacheUsage>> {
-    let canonical = capture
-        .events
-        .iter()
-        .any(|event| event.event_type == "turn" && provider_usage_from_event(event).is_some());
-    let event_type = if canonical { "turn" } else { "llm_round" };
-    let mut usages = Vec::new();
-    let mut turn_positions = std::collections::HashMap::<u64, usize>::new();
-    for event in capture
-        .events
-        .iter()
-        .filter(|event| event.event_type == event_type)
-    {
-        let Some(usage) = provider_usage_from_event(event) else {
-            continue;
-        };
-        let turn = event.raw.get("turn").and_then(|value| value.as_u64())?;
-        if let Some(index) = turn_positions.get(&turn).copied() {
-            // Mirrored records for one turn are one observation. Keep the
-            // lower ratio so disagreement cannot create a false pass.
-            if provider_cache_ratio_cmp(usage, usages[index]).is_lt() {
-                usages[index] = usage;
-            }
-        } else {
-            turn_positions.insert(turn, usages.len());
-            usages.push(usage);
-        }
-    }
-    Some(usages)
-}
-
-/// Strict intra-turn evidence. Every provider round must have a typed
-/// `(turn, round, producer_scope.run_id)` identity. Records are grouped by
-/// the same `(turn, run_id)` so two rounds from different turns/runs cannot
-/// be mistaken for one intra-turn reuse boundary; mirrored identities are
-/// deduplicated conservatively.
-fn required_intra_turn_rounds(
-    capture: &SessionCapture,
-) -> Option<Vec<Vec<ProviderPromptCacheUsage>>> {
-    let mut groups = std::collections::HashMap::<
-        (u64, String),
-        std::collections::HashMap<u64, ProviderPromptCacheUsage>,
-    >::new();
-    for event in capture
-        .events
-        .iter()
-        .filter(|event| event.event_type == "llm_round")
-    {
-        let Some(usage) = provider_usage_from_event(event) else {
-            continue;
-        };
-        let turn = event.raw.get("turn").and_then(|value| value.as_u64())?;
-        let round = event.raw.get("round").and_then(|value| value.as_u64())?;
-        let run_id = event
-            .raw
-            .pointer("/producer_scope/run_id")
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.is_empty())?
-            .to_owned();
-        let rounds = groups.entry((turn, run_id)).or_default();
-        if let Some(existing) = rounds.get_mut(&round) {
-            if provider_cache_ratio_cmp(usage, *existing).is_lt() {
-                *existing = usage;
-            }
-        } else {
-            rounds.insert(round, usage);
-        }
-    }
-    Some(
-        groups
-            .into_values()
-            .map(|rounds| {
-                let mut rounds: Vec<_> = rounds.into_iter().collect();
-                rounds.sort_by_key(|(round, _)| *round);
-                rounds.into_iter().map(|(_, usage)| usage).collect()
-            })
-            .collect(),
-    )
-}
-
-/// Extract provider usage observations in journal order. Canonical `turn`
-/// records are authoritative; legacy `llm_round` records are considered only
-/// when the session has no canonical usage records, avoiding double-counting
-/// sessions that contain both schemas.
-fn provider_prompt_cache_usages(capture: &SessionCapture) -> Vec<ProviderPromptCacheUsage> {
-    fn extract(
-        capture: &SessionCapture,
-        event_type: &str,
-        aggregate_rounds: bool,
-    ) -> Vec<ProviderPromptCacheUsage> {
-        let mut usages = Vec::<ProviderPromptCacheUsage>::new();
-        let mut turn_positions = std::collections::HashMap::<u64, usize>::new();
-        for event in capture
-            .events
-            .iter()
-            .filter(|event| event.event_type == event_type)
-        {
-            let fresh = event.raw.get("tokens_in").and_then(|value| value.as_u64());
-            let read = event
-                .raw
-                .get("cache_read_tokens")
-                .and_then(|value| value.as_u64());
-            let creation = event
-                .raw
-                .get("cache_creation_tokens")
-                .and_then(|value| value.as_u64());
-            if fresh.is_none() && read.is_none() && creation.is_none() {
-                continue;
-            }
-            let usage = ProviderPromptCacheUsage {
-                fresh: fresh.unwrap_or_default(),
-                read: read.unwrap_or_default(),
-                creation: creation.unwrap_or_default(),
-            };
-            if usage.fresh == 0 && usage.read == 0 && usage.creation == 0 {
-                continue;
-            }
-
-            let Some(turn) = event.raw.get("turn").and_then(|value| value.as_u64()) else {
-                usages.push(usage);
-                continue;
-            };
-            if let Some(index) = turn_positions.get(&turn).copied() {
-                if aggregate_rounds {
-                    let current = &mut usages[index];
-                    current.fresh = current.fresh.saturating_add(usage.fresh);
-                    current.read = current.read.saturating_add(usage.read);
-                    current.creation = current.creation.saturating_add(usage.creation);
-                } else if provider_cache_ratio_cmp(usage, usages[index]).is_lt() {
-                    // Mirrored canonical journals should agree. If they do
-                    // not, retain the lower cache-read ratio so a path-order
-                    // change cannot turn conflicting evidence into a false
-                    // pass.
-                    usages[index] = usage;
-                }
-                continue;
-            }
-            turn_positions.insert(turn, usages.len());
-            usages.push(usage);
-        }
-        usages
-    }
-
-    // Canonical turn records already aggregate every LLM round. Mirrored
-    // records for one turn are de-duplicated; disagreement is resolved
-    // conservatively and independently of artifact path ordering.
-    let canonical = extract(capture, "turn", false);
-    if canonical.is_empty() {
-        // Legacy journals expose one usage record per LLM round. Aggregate
-        // those by user turn so `warmup_turns` never removes only half a turn.
-        extract(capture, "llm_round", true)
-    } else {
-        canonical
-    }
-}
-
-/// Extract provider-boundary usage from detailed `llm_round` records.
-///
-/// A canonical `turn` event intentionally aggregates all model calls in one
-/// user turn, which is the right source for `warmup_turns` but cannot express
-/// "skip the first cold provider call" for a one-turn agentic journey.  This
-/// explicit round-level path is only selected by `warmup_rounds`; it never
-/// silently changes the meaning of the turn-level criterion.
-fn provider_prompt_cache_round_usages(capture: &SessionCapture) -> Vec<ProviderPromptCacheUsage> {
-    let mut usages = Vec::new();
-    let mut seen = std::collections::HashMap::<String, usize>::new();
-
-    for event in capture
-        .events
-        .iter()
-        .filter(|event| event.event_type == "llm_round")
-    {
-        let fresh = event.raw.get("tokens_in").and_then(|value| value.as_u64());
-        let read = event
-            .raw
-            .get("cache_read_tokens")
-            .and_then(|value| value.as_u64());
-        let creation = event
-            .raw
-            .get("cache_creation_tokens")
-            .and_then(|value| value.as_u64());
-        let usage = ProviderPromptCacheUsage {
-            fresh: fresh.unwrap_or_default(),
-            read: read.unwrap_or_default(),
-            creation: creation.unwrap_or_default(),
-        };
-        if fresh.is_none() && read.is_none() && creation.is_none()
-            || (usage.fresh == 0 && usage.read == 0 && usage.creation == 0)
-        {
-            continue;
-        }
-
-        // Server/account journals can be mirrored into more than one owner
-        // artifact. Deduplicate only when the runtime supplied a stable
-        // provider-boundary identity; records without one remain observable
-        // instead of being guessed together by position or text.
-        if let (Some(turn), Some(round), Some(run_id)) = (
-            event.raw.get("turn"),
-            event.raw.get("round"),
-            event
-                .raw
-                .pointer("/producer_scope/run_id")
-                .and_then(|value| value.as_str()),
-        ) {
-            let identity = serde_json::json!({
-                "turn": turn,
-                "round": round,
-                "run_id": run_id,
-                "agentic_step": event.raw.get("agentic_step"),
-            });
-            if let Ok(identity) = serde_json::to_string(&identity) {
-                if let Some(index) = seen.get(&identity).copied() {
-                    // Mirrored provider-boundary records should agree. On a
-                    // conflict retain the lower cache-read ratio so artifact
-                    // ordering cannot turn inconsistent evidence into a
-                    // false pass.
-                    if provider_cache_ratio_cmp(usage, usages[index]).is_lt() {
-                        usages[index] = usage;
-                    }
-                    continue;
-                }
-                seen.insert(identity, usages.len());
-            }
-        }
-        usages.push(usage);
-    }
-    usages
 }
 
 /// Scan stderr for `[fork-cache] {...}` JSON lines and return the
@@ -4159,6 +3973,7 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             child,
             min,
             max,
+            min_distinct_child_runs,
         } => {
             if parent.trim().is_empty() || child.trim().is_empty() {
                 return Err("JournalChildToolCallCount tool names must not be empty".into());
@@ -4166,6 +3981,11 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             if min > max {
                 return Err(format!(
                     "JournalChildToolCallCount: min ({min}) > max ({max})"
+                ));
+            }
+            if *min_distinct_child_runs > *max || (*min > 0 && *min_distinct_child_runs == 0) {
+                return Err(format!(
+                    "JournalChildToolCallCount: min_distinct_child_runs ({min_distinct_child_runs}) must be 1..={max} when min > 0, or 0..={max} when min = 0"
                 ));
             }
             Ok(())
@@ -4763,6 +4583,8 @@ mod tests {
             ttft_ms: 0,
             final_state: None,
             interruption_kind: None,
+            error_kind: None,
+            explain_capture: None,
             tool_result_class_counts: std::collections::BTreeMap::new(),
         }
     }
@@ -5148,6 +4970,35 @@ mod tests {
     }
 
     #[test]
+    fn tools_count_uses_inclusive_child_calls_when_terminal_summary_is_absent() {
+        let out = RunOutcome {
+            tool_calls_count: 0,
+            total_tool_calls: 146,
+            ..RunOutcome::new("m")
+        };
+        let result =
+            evaluate_deterministic(&[Criterion::ToolsCountBetween { min: 4, max: 18 }], &out);
+
+        assert!(!result[0].passed);
+        assert!(result[0].detail.contains("total_tool_calls=146"));
+    }
+
+    #[test]
+    fn tools_count_does_not_let_partial_step_events_override_terminal_total() {
+        let out = RunOutcome {
+            tool_calls_count: 20,
+            total_tool_calls: 5,
+            ..RunOutcome::new("m")
+        };
+        let result =
+            evaluate_deterministic(&[Criterion::ToolsCountBetween { min: 4, max: 18 }], &out);
+
+        assert!(!result[0].passed);
+        assert!(result[0].detail.contains("total_tool_calls=20"));
+        assert!(result[0].detail.contains("terminal=20, step_events=5"));
+    }
+
+    #[test]
     fn final_state_and_interruption_criteria() {
         let out = RunOutcome::new("m")
             .with_final_state("interrupted")
@@ -5235,6 +5086,95 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn child_tool_count_requires_distinct_successful_child_runs() {
+        let criterion = Criterion::JournalChildToolCallCount {
+            parent: "agent_fanout".into(),
+            child: "bash".into(),
+            min: 2,
+            max: 10,
+            min_distinct_child_runs: 2,
+        };
+        let events = [
+            (
+                "ToolCallStarted",
+                "fanout",
+                "root",
+                vec![],
+                "agent_fanout",
+                None,
+            ),
+            ("StepCreated", "child-a", "a", vec!["fanout"], "", None),
+            ("StepCreated", "child-b", "b", vec!["fanout"], "", None),
+            (
+                "ToolCallCompleted",
+                "a-bash-1",
+                "a",
+                vec!["child-a"],
+                "bash",
+                Some(false),
+            ),
+            (
+                "ToolCallCompleted",
+                "a-bash-2",
+                "a",
+                vec!["child-a"],
+                "bash",
+                Some(false),
+            ),
+            (
+                "ToolCallCompleted",
+                "b-bash",
+                "b",
+                vec!["child-b"],
+                "bash",
+                Some(true),
+            ),
+        ];
+        let to_capture = |events: &[_]| {
+            let records: Vec<_> = events
+                .iter()
+                .map(|(kind, id, run, causes, tool, is_error)| {
+                    (
+                        *kind,
+                        serde_json::json!({
+                            "event_id": id,
+                            "run_id": run,
+                            "event_type": kind,
+                            "caused_by": causes,
+                            "payload": {"tool_name": tool, "is_error": is_error},
+                        }),
+                    )
+                })
+                .collect();
+            mk_session(&records)
+        };
+        let denied = to_capture(&events);
+        let outcome = outcome_with_tools(&[]);
+        let result = evaluate_one(&criterion, &outcome, Some(&denied));
+        assert!(
+            !result.passed,
+            "one productive child cannot cover two slots"
+        );
+        assert!(result.detail.contains("distinct child runs=1"));
+
+        let mut successful = events;
+        successful[5].5 = Some(false);
+        let result = evaluate_one(&criterion, &outcome, Some(&to_capture(&successful)));
+        assert!(result.passed, "two productive child runs satisfy coverage");
+        assert!(validate_criterion(&criterion).is_ok());
+        assert!(
+            validate_criterion(&Criterion::JournalChildToolCallCount {
+                parent: "agent_fanout".into(),
+                child: "bash".into(),
+                min: 2,
+                max: 10,
+                min_distinct_child_runs: 11,
+            })
+            .is_err()
+        );
     }
 
     fn pipeline_feedback_event(
@@ -6462,6 +6402,43 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_cache_mean_uses_complete_requests_without_feedback_scalars() {
+        let capture = mk_session(&[]);
+        let out = cache_request_outcome("r", "t", &[(1, 9, 0), (900, 100, 0), (0, 0, 0)]);
+        let criterion = Criterion::PipelineAvgCacheHitRatio {
+            min: 0.5,
+            optional: false,
+        };
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &out,
+            Some(&capture),
+        );
+        assert!(result[0].passed, "{:?}", result[0]);
+        assert!(
+            result[0]
+                .detail
+                .contains("primary_request_group_mean_cache_read_share=50.0%")
+        );
+        let missing = RunOutcome::new("m");
+        let result =
+            evaluate_with_primary_executions(&[criterion], &out, Some(&capture), &[&out, &missing]);
+        assert!(!result[0].passed);
+        assert!(result[0].detail.contains("unknown"));
+        let zero = cache_request_outcome("r", "t", &[(0, 0, 0)]);
+        for optional in [false, true] {
+            let result = evaluate_deterministic_with_session(
+                &[Criterion::PipelineAvgCacheHitRatio { min: 0.0, optional }],
+                &zero,
+                Some(&capture),
+            );
+            assert_eq!(result[0].passed, optional);
+            assert!(result[0].detail.contains("n/a (zero input)"));
+            assert_eq!(result[0].detail.contains("skipped"), optional);
+        }
+    }
+
+    #[test]
     fn pipeline_avg_cache_hit_ratio_rejects_invalid_feedback_payload() {
         let capture = mk_session(&[(
             "pipeline_feedback",
@@ -6516,53 +6493,18 @@ mod tests {
             Some(&sess),
         );
         assert!(!r[0].passed);
-        assert!(r[0].detail.contains("no pipeline feedback turns"));
+        assert!(r[0].detail.contains("unknown (incomplete input evidence)"));
     }
 
     #[test]
     fn provider_prompt_cache_read_ratio_excludes_configured_warmup() {
-        let sess = mk_session(&[
-            (
-                "turn",
-                serde_json::json!({
-                    "turn": 1,
-                    "tokens_in": 10_000,
-                    "cache_read_tokens": 0,
-                    "cache_creation_tokens": 2_000
-                }),
-            ),
-            (
-                "turn",
-                serde_json::json!({
-                    "turn": 2,
-                    "tokens_in": 200,
-                    "cache_read_tokens": 9_800,
-                    "cache_creation_tokens": 0
-                }),
-            ),
-            (
-                "turn",
-                serde_json::json!({
-                    "turn": 3,
-                    "tokens_in": 200,
-                    "cache_read_tokens": 9_800,
-                    "cache_creation_tokens": 0
-                }),
-            ),
-        ]);
-        let result = evaluate_deterministic_with_session(
-            &[Criterion::ProviderPromptCacheReadRatio {
-                min: 0.98,
-                warmup_turns: 1,
-                warmup_rounds: 0,
-            }],
-            &outcome_with_tools(&[]),
-            Some(&sess),
-        );
-
-        assert!(result[0].passed, "{:?}", result[0]);
-        assert!(result[0].detail.contains("98.00%"), "{}", result[0].detail);
-        assert!(result[0].detail.contains("turns=2"), "{}", result[0].detail);
+        let cold = cache_request_outcome("r1", "t1", &[(10_000, 0, 2_000)]);
+        let warm = cache_request_outcome("r2", "t2", &[(200, 9_800, 0)]);
+        let next = cache_request_outcome("r3", "t3", &[(200, 9_800, 0)]);
+        let result = cache_ratio(&[&cold, &warm, &next], 0.98, 1, 0);
+        assert!(result.passed, "{result:?}");
+        assert!(result.detail.contains("98.00%"), "{}", result.detail);
+        assert!(result.detail.contains("turns=2"), "{}", result.detail);
     }
 
     #[test]
@@ -6714,7 +6656,7 @@ mod tests {
                         warmup_rounds: 0,
                     },
                 ],
-                &outcome_with_tools(&[]),
+                &cache_request_outcome("r", "t", &usages.map(|(fresh, read)| (fresh, read, 0))),
                 Some(&mk_session(&events)),
             );
             assert_eq!(
@@ -7001,249 +6943,176 @@ mod tests {
 
     #[test]
     fn required_prompt_cache_scope_is_hard_and_scope_specific() {
-        let one_turn = mk_session(&[(
-            "turn",
-            serde_json::json!({
-                "turn": 1,
-                "tokens_in": 10_000,
-                "cache_creation_tokens": 2_000
-            }),
-        )]);
-        let one_turn_result = evaluate_deterministic_with_session(
-            &[Criterion::PromptCacheReuseScope {
-                scope: PromptCacheReuseScope::ConversationTurns,
-            }],
-            &outcome_with_tools(&[]),
-            Some(&one_turn),
-        );
-        assert!(!one_turn_result[0].passed);
-        assert_eq!(one_turn_result[0].severity, CriterionSeverity::Hard);
-
-        let two_turns = mk_session(&[
-            (
-                "turn",
-                serde_json::json!({
-                    "turn": 1,
-                    "tokens_in": 10_000,
-                    "cache_creation_tokens": 2_000
-                }),
-            ),
-            (
-                "turn",
-                serde_json::json!({
-                    "turn": 2,
-                    "tokens_in": 200,
-                    "cache_read_tokens": 9_800
-                }),
-            ),
-        ]);
-        let conversation_result = evaluate_deterministic_with_session(
-            &[Criterion::PromptCacheReuseScope {
-                scope: PromptCacheReuseScope::ConversationTurns,
-            }],
-            &outcome_with_tools(&[]),
-            Some(&two_turns),
-        );
-        assert!(conversation_result[0].passed, "{conversation_result:?}");
-
-        let one_turn_rounds = mk_session(&[
-            (
-                "llm_round",
-                serde_json::json!({
-                    "turn": 1,
-                    "round": 0,
-                    "agentic_step": 1,
-                    "producer_scope": {"run_id": "run-1"},
-                    "tokens_in": 10_000,
-                    "cache_creation_tokens": 2_000
-                }),
-            ),
-            (
-                "llm_round",
-                serde_json::json!({
-                    "turn": 1,
-                    "round": 1,
-                    "agentic_step": 2,
-                    "producer_scope": {"run_id": "run-1"},
-                    "tokens_in": 200,
-                    "cache_read_tokens": 9_800
-                }),
-            ),
-        ]);
-        let intra_result = evaluate_deterministic_with_session(
-            &[Criterion::PromptCacheReuseScope {
-                scope: PromptCacheReuseScope::IntraTurnRounds,
-            }],
-            &outcome_with_tools(&[]),
-            Some(&one_turn_rounds),
-        );
-        assert!(intra_result[0].passed, "{intra_result:?}");
-
-        let identityless_mirrors = mk_session(&[
-            (
-                "turn",
-                serde_json::json!({
-                    "tokens_in": 10_000,
-                    "cache_creation_tokens": 2_000
-                }),
-            ),
-            (
-                "turn",
-                serde_json::json!({
-                    "tokens_in": 200,
-                    "cache_read_tokens": 9_800
-                }),
-            ),
-        ]);
-        let identityless_result = evaluate_deterministic_with_session(
-            &[Criterion::PromptCacheReuseScope {
-                scope: PromptCacheReuseScope::ConversationTurns,
-            }],
-            &outcome_with_tools(&[]),
-            Some(&identityless_mirrors),
-        );
+        let check = |executions: &[&RunOutcome], scope| {
+            evaluate_with_primary_executions(
+                &[Criterion::PromptCacheReuseScope { scope }],
+                &RunOutcome::new("aggregate"),
+                None,
+                executions,
+            )
+            .remove(0)
+        };
+        let cold = cache_request_outcome("r1", "t1", &[(10_000, 0, 2_000)]);
+        let warm = cache_request_outcome("r2", "t2", &[(200, 9_800, 0)]);
+        let conversation = PromptCacheReuseScope::ConversationTurns;
+        let intra = PromptCacheReuseScope::IntraTurnRounds;
+        let one = check(&[&cold], conversation);
+        assert!(!one.passed);
+        assert_eq!(one.severity, CriterionSeverity::Hard);
+        assert!(check(&[&cold, &warm], conversation).passed);
         assert!(
-            !identityless_result[0].passed,
-            "missing turn IDs must fail closed"
+            !check(&[&cold, &warm], intra).passed,
+            "different turns cannot prove intra-run reuse"
         );
 
-        let missing_run_id = mk_session(&[
-            (
-                "llm_round",
-                serde_json::json!({
-                    "turn": 1,
-                    "round": 0,
-                    "tokens_in": 10_000,
-                    "cache_creation_tokens": 2_000
-                }),
-            ),
-            (
-                "llm_round",
-                serde_json::json!({
-                    "turn": 1,
-                    "round": 1,
-                    "tokens_in": 200,
-                    "cache_read_tokens": 9_800
-                }),
-            ),
-        ]);
-        let missing_run_result = evaluate_deterministic_with_session(
-            &[Criterion::PromptCacheReuseScope {
-                scope: PromptCacheReuseScope::IntraTurnRounds,
-            }],
-            &outcome_with_tools(&[]),
-            Some(&missing_run_id),
-        );
+        let same_turn_other_run = cache_request_outcome("r2", "t1", &[(200, 9_800, 0)]);
         assert!(
-            !missing_run_result[0].passed,
-            "missing run identity must fail closed"
+            !check(&[&cold, &same_turn_other_run], intra).passed,
+            "different runs cannot supply one witness"
         );
+        let mut resumed = cache_request_outcome("r1", "t1", &[(200, 9_800, 0)]);
+        for event in &mut resumed.explain_capture.as_mut().unwrap().events {
+            event.clock_domain_id = "resumed".into();
+        }
+        let resumed_result = check(&[&cold, &resumed], intra);
+        assert!(resumed_result.passed, "{resumed_result:?}");
+        assert!(resumed_result.detail.contains("observations=2"));
+        assert!(resumed_result.detail.contains("cache_read_tokens=9800"));
+        assert!(!check(&[&cold, &resumed], conversation).passed);
 
-        let separate_turns = mk_session(&[
+        let two_requests = cache_request_outcome("r", "t", &[(0, 0, 0), (200, 9_800, 0)]);
+        assert!(
+            check(&[&two_requests], intra).passed,
+            "zero-input cold boundary must remain"
+        );
+        let missing = RunOutcome::new("m");
+        for executions in [
+            vec![&missing, &two_requests],
+            vec![&cold, &cold],
+            vec![&cold, &same_turn_other_run, &resumed],
+        ] {
+            let result = check(&executions, intra);
+            assert!(!result.passed);
+            assert!(result.detail.contains("evidence unavailable"), "{result:?}");
+        }
+
+        // Two physical attempts under one ModelRound are one request group.
+        let mut physical_retry = cold.clone();
+        let capture = physical_retry.explain_capture.as_mut().unwrap();
+        let mut attempts: Vec<_> = capture
+            .events
+            .iter()
+            .filter(|event| {
+                event.kind == astra_turn_types::ExplainAnalyzeNodeKindV1::ProviderAttempt
+            })
+            .cloned()
+            .collect();
+        for event in &mut attempts {
+            event.node_id = "physical-retry".into();
+            event.event_id = format!("retry-{}", event.event_id);
+            event.attempt_index = Some(1);
+            if let Some(usage) = &mut event.usage {
+                usage.cache_read_tokens = Some(100);
+            }
+            assert!(event.is_valid());
+        }
+        capture.events.extend(attempts);
+        assert!(
+            capture
+                .canonical_graph()
+                .unwrap()
+                .primary_prompt_cache_request_groups()
+                .is_some()
+        );
+        let result = check(&[&physical_retry], intra);
+        assert!(!result.passed);
+        assert!(result.detail.contains("observations=1"), "{result:?}");
+
+        let fake_journal = mk_session(&[
             (
-                "llm_round",
-                serde_json::json!({
-                    "turn": 1,
-                    "round": 0,
-                    "producer_scope": {"run_id": "run-1"},
-                    "tokens_in": 10_000,
-                    "cache_creation_tokens": 2_000
-                }),
+                "turn",
+                serde_json::json!({"turn":1,"tokens_in":100,"cache_read_tokens":0}),
             ),
             (
-                "llm_round",
-                serde_json::json!({
-                    "turn": 2,
-                    "round": 0,
-                    "producer_scope": {"run_id": "run-1"},
-                    "tokens_in": 200,
-                    "cache_read_tokens": 9_800
-                }),
+                "turn",
+                serde_json::json!({"turn":2,"tokens_in":0,"cache_read_tokens":100}),
             ),
         ]);
-        let separate_turn_result = evaluate_deterministic_with_session(
+        let result = evaluate_deterministic_with_session(
             &[Criterion::PromptCacheReuseScope {
-                scope: PromptCacheReuseScope::IntraTurnRounds,
+                scope: conversation,
             }],
-            &outcome_with_tools(&[]),
-            Some(&separate_turns),
+            &RunOutcome::new("m"),
+            Some(&fake_journal),
         );
+        assert!(!result[0].passed);
+        assert!(result[0].detail.contains("evidence unavailable"));
+    }
+
+    #[test]
+    fn required_prompt_cache_scope_reports_one_witness_after_full_coverage_validation() {
+        let many = cache_request_outcome("r1", "t1", &[(0, 0, 0); 3]);
+        let witness = cache_request_outcome("r2", "t2", &[(0, 0, 0), (0, 300, 0)]);
+        let criterion = Criterion::PromptCacheReuseScope {
+            scope: PromptCacheReuseScope::IntraTurnRounds,
+        };
+        let result = evaluate_with_primary_executions(
+            std::slice::from_ref(&criterion),
+            &RunOutcome::new("aggregate"),
+            None,
+            &[&many, &witness],
+        );
+        assert!(result[0].passed);
         assert!(
-            !separate_turn_result[0].passed,
-            "cross-turn rounds are not intra-turn reuse"
+            result[0].detail.contains("observations=2"),
+            "{:?}",
+            result[0]
         );
+        assert!(result[0].detail.contains("cache_read_tokens=300"));
+        let mut unknown = cache_request_outcome("r3", "t3", &[(0, 0, 0)]);
+        for event in &mut unknown.explain_capture.as_mut().unwrap().events {
+            if let Some(usage) = &mut event.usage {
+                usage.cache_creation_tokens = None;
+            }
+        }
+        let result = evaluate_with_primary_executions(
+            &[criterion],
+            &RunOutcome::new("aggregate"),
+            None,
+            &[&many, &witness, &unknown],
+        );
+        assert!(!result[0].passed);
+        assert!(result[0].detail.contains("evidence unavailable"));
     }
 
     #[test]
     fn provider_prompt_cache_read_ratio_is_token_weighted_and_counts_creation() {
-        let sess = mk_session(&[
-            (
-                "turn",
-                serde_json::json!({
-                    "tokens_in": 20,
-                    "cache_read_tokens": 980,
-                    "cache_creation_tokens": 0
-                }),
-            ),
-            (
-                "turn",
-                serde_json::json!({
-                    "tokens_in": 0,
-                    "cache_read_tokens": 9_800,
-                    "cache_creation_tokens": 220
-                }),
-            ),
-        ]);
-        let result = evaluate_deterministic_with_session(
-            &[Criterion::ProviderPromptCacheReadRatio {
-                min: 0.98,
-                warmup_turns: 0,
-                warmup_rounds: 0,
-            }],
-            &outcome_with_tools(&[]),
-            Some(&sess),
-        );
-
-        assert!(!result[0].passed, "creation tokens are non-read input");
-        assert!(result[0].detail.contains("97.82%"), "{}", result[0].detail);
+        let out = cache_request_outcome("r", "t", &[(20, 980, 0), (0, 9_800, 220)]);
+        let result = cache_ratio(&[&out], 0.98, 0, 0);
+        assert!(!result.passed, "creation tokens are non-read input");
+        assert!(result.detail.contains("97.82%"), "{}", result.detail);
     }
 
     #[test]
     fn provider_prompt_cache_read_ratio_fails_without_post_warmup_usage() {
-        let sess = mk_session(&[(
-            "turn",
-            serde_json::json!({
-                "tokens_in": 100,
-                "cache_read_tokens": 0
-            }),
-        )]);
-        let result = evaluate_deterministic_with_session(
-            &[Criterion::ProviderPromptCacheReadRatio {
-                min: 0.98,
-                warmup_turns: 1,
-                warmup_rounds: 0,
-            }],
-            &outcome_with_tools(&[]),
-            Some(&sess),
-        );
-
-        assert!(!result[0].passed);
+        let out = cache_request_outcome("r", "t", &[(100, 0, 0)]);
+        let result = cache_ratio(&[&out], 0.98, 1, 0);
+        assert!(!result.passed);
         assert!(
-            result[0]
-                .detail
-                .contains("no provider usage after 1 warmup"),
+            result.detail.contains("no provider usage after 1 warmup"),
             "{}",
-            result[0].detail
+            result.detail
         );
+        let zero = cache_request_outcome("zero", "t", &[(0, 0, 0), (0, 0, 0)]);
+        assert!(!cache_ratio(&[&zero], 0.0, 0, 1).passed);
     }
 
     #[test]
-    fn provider_prompt_cache_read_ratio_falls_back_to_legacy_llm_round_events() {
+    fn provider_prompt_cache_read_ratio_rejects_journal_only_evidence() {
         let sess = mk_session(&[(
             "llm_round",
             serde_json::json!({
-                "tokens_in": 10,
-                "cache_read_tokens": 990
+                "tokens_in":10,"cache_read_tokens":990,"cache_creation_tokens":0
             }),
         )]);
         let result = evaluate_deterministic_with_session(
@@ -7255,115 +7124,52 @@ mod tests {
             &outcome_with_tools(&[]),
             Some(&sess),
         );
-
-        assert!(result[0].passed, "{:?}", result[0]);
+        assert!(!result[0].passed);
+        assert!(result[0].detail.contains("evidence unavailable"));
     }
 
     #[test]
     fn provider_prompt_cache_round_warmup_measures_intra_turn_reuse() {
-        let round = |index: u64, fresh: u64, read: u64| {
-            (
-                "llm_round",
-                serde_json::json!({
-                    "turn": 1,
-                    "round": index,
-                    "agentic_step": index + 1,
-                    "producer_scope": {"run_id": "run-1"},
-                    "tokens_in": fresh,
-                    "cache_read_tokens": read,
-                }),
-            )
-        };
-        let sess = mk_session(&[
-            round(0, 10_000, 0),
-            round(1, 500, 9_500),
-            // A mirrored copy of the second boundary must not inflate the
-            // measured read ratio or make results depend on owner ordering.
-            round(1, 500, 9_500),
-        ]);
-        let result = evaluate_deterministic_with_session(
-            &[Criterion::ProviderPromptCacheReadRatio {
-                min: 0.95,
-                warmup_turns: 0,
-                warmup_rounds: 1,
-            }],
-            &outcome_with_tools(&[]),
-            Some(&sess),
-        );
-
-        assert!(result[0].passed, "{:?}", result[0]);
+        let mut out = cache_request_outcome("r", "t", &[(10_000, 0, 0), (500, 9_500, 0)]);
+        let capture = out.explain_capture.as_mut().unwrap();
+        capture.events.extend(capture.events.clone());
+        let result = cache_ratio(&[&out], 0.95, 0, 1);
+        assert!(result.passed, "{result:?}");
+        assert!(result.detail.contains("rounds=1"), "{}", result.detail);
         assert!(
-            result[0].detail.contains("rounds=1"),
+            result.detail.contains("warmup_round=1"),
             "{}",
-            result[0].detail
-        );
-        assert!(
-            result[0].detail.contains("warmup_round=1"),
-            "{}",
-            result[0].detail
+            result.detail
         );
     }
 
     #[test]
     fn provider_prompt_cache_round_mirrors_fail_closed_on_conflict() {
-        let sess = mk_session(&[
-            (
-                "llm_round",
-                serde_json::json!({
-                    "turn": 1,
-                    "round": 0,
-                    "agentic_step": 1,
-                    "producer_scope": {"run_id": "run-1"},
-                    "tokens_in": 10_000,
-                    "cache_read_tokens": 0,
-                }),
-            ),
-            (
-                "llm_round",
-                serde_json::json!({
-                    "turn": 1,
-                    "round": 1,
-                    "agentic_step": 2,
-                    "producer_scope": {"run_id": "run-1"},
-                    "tokens_in": 10_000,
-                    "cache_read_tokens": 9_900,
-                }),
-            ),
-            (
-                "llm_round",
-                serde_json::json!({
-                    "turn": 1,
-                    "round": 1,
-                    "agentic_step": 2,
-                    "producer_scope": {"run_id": "run-1"},
-                    "tokens_in": 10_000,
-                    "cache_read_tokens": 0,
-                }),
-            ),
-            (
-                "llm_round",
-                serde_json::json!({
-                    "turn": 1,
-                    "round": 2,
-                    "agentic_step": 3,
-                    "producer_scope": {"run_id": "run-1"},
-                    "tokens_in": 500,
-                    "cache_read_tokens": 500,
-                }),
-            ),
-        ]);
-        let result = evaluate_deterministic_with_session(
-            &[Criterion::ProviderPromptCacheReadRatio {
-                min: 0.95,
-                warmup_turns: 0,
-                warmup_rounds: 1,
-            }],
-            &outcome_with_tools(&[]),
-            Some(&sess),
-        );
-
-        assert!(!result[0].passed, "conflicting mirrors must fail closed");
-        assert!(result[0].detail.contains("4.55%"), "{}", result[0].detail);
+        let mut out = cache_request_outcome("r", "t", &[(10_000, 0, 0), (100, 9_900, 0)]);
+        let capture = out.explain_capture.as_mut().unwrap();
+        let mut conflicting = capture
+            .events
+            .iter()
+            .find(|event| event.usage.is_some())
+            .unwrap()
+            .clone();
+        conflicting.usage.as_mut().unwrap().cache_read_tokens = Some(100);
+        capture.events.push(conflicting);
+        for reverse in [false, true] {
+            if reverse {
+                out.explain_capture.as_mut().unwrap().events.reverse();
+            }
+            let result = cache_ratio(&[&out], 0.95, 0, 1);
+            assert!(
+                !result.passed,
+                "cold conflicting evidence must not disappear in warmup"
+            );
+            assert!(
+                result.detail.contains("evidence unavailable"),
+                "{}",
+                result.detail
+            );
+        }
     }
 
     #[test]
@@ -7381,152 +7187,75 @@ mod tests {
     }
 
     #[test]
-    fn provider_prompt_cache_read_ratio_conflicting_mirrors_fail_closed_in_either_order() {
-        let evaluate = |second_turn_first_is_cached: bool| {
-            let cached = (
-                "turn",
-                serde_json::json!({
-                    "turn": 2,
-                    "tokens_in": 20,
-                    "cache_read_tokens": 980
-                }),
-            );
-            let uncached = (
-                "turn",
-                serde_json::json!({
-                    "turn": 2,
-                    "tokens_in": 1_000,
-                    "cache_read_tokens": 0
-                }),
-            );
-            let (first, second) = if second_turn_first_is_cached {
-                (cached, uncached)
-            } else {
-                (uncached, cached)
-            };
-            let sess = mk_session(&[
-                (
-                    "turn",
-                    serde_json::json!({
-                        "turn": 1,
-                        "tokens_in": 1_000,
-                        "cache_read_tokens": 0
-                    }),
-                ),
-                first,
-                second,
-            ]);
-            evaluate_deterministic_with_session(
-                &[Criterion::ProviderPromptCacheReadRatio {
-                    min: 0.98,
-                    warmup_turns: 1,
-                    warmup_rounds: 0,
-                }],
-                &outcome_with_tools(&[]),
-                Some(&sess),
-            )
-        };
-
-        for cached_first in [true, false] {
-            let result = evaluate(cached_first);
-            assert!(
-                !result[0].passed,
-                "conflicting mirrors must not produce an order-dependent false pass: {:?}",
-                result[0]
-            );
-            assert!(result[0].detail.contains("turns=1"), "{}", result[0].detail);
+    fn provider_prompt_cache_read_ratio_rejects_ambiguous_execution_coverage() {
+        let cold = cache_request_outcome("r1", "t1", &[(100, 0, 0)]);
+        let warm = cache_request_outcome("r2", "t2", &[(20, 980, 0)]);
+        let repeated_turn = cache_request_outcome("r3", "t1", &[(20, 980, 0)]);
+        let missing = RunOutcome::new("m");
+        for executions in [
+            vec![&cold, &cold],
+            vec![&cold, &warm, &repeated_turn],
+            vec![&missing, &warm],
+        ] {
+            let result = cache_ratio(&executions, 0.98, 1, 0);
+            assert!(!result.passed);
+            assert!(result.detail.contains("evidence unavailable"));
         }
+        for session in [None, Some("different-session".to_owned())] {
+            let mut other = warm.clone();
+            other.session_id = session;
+            assert!(
+                cache_ratio(&[&cold, &other], 0.98, 1, 0)
+                    .detail
+                    .contains("evidence unavailable")
+            );
+        }
+        let mut unknown = cold.clone();
+        for event in &mut unknown.explain_capture.as_mut().unwrap().events {
+            if let Some(usage) = &mut event.usage {
+                usage.cache_creation_tokens = None;
+            }
+        }
+        assert!(
+            cache_ratio(&[&unknown, &warm], 0.98, 1, 0)
+                .detail
+                .contains("evidence unavailable")
+        );
+        let mut wrong_run = warm.clone();
+        wrong_run.run_id = Some("unrelated".into());
+        assert!(
+            cache_ratio(&[&cold, &wrong_run], 0.98, 1, 0)
+                .detail
+                .contains("evidence unavailable")
+        );
     }
 
     #[test]
     fn provider_prompt_cache_read_ratio_deduplicates_identical_canonical_mirrors() {
-        let sess = mk_session(&[
-            (
-                "turn",
-                serde_json::json!({
-                    "turn": 1,
-                    "tokens_in": 1_000,
-                    "cache_read_tokens": 0
-                }),
-            ),
-            (
-                "turn",
-                serde_json::json!({
-                    "turn": 2,
-                    "tokens_in": 20,
-                    "cache_read_tokens": 980
-                }),
-            ),
-            (
-                "turn",
-                serde_json::json!({
-                    "turn": 2,
-                    "tokens_in": 20,
-                    "cache_read_tokens": 980
-                }),
-            ),
-        ]);
-        let result = evaluate_deterministic_with_session(
-            &[Criterion::ProviderPromptCacheReadRatio {
-                min: 0.98,
-                warmup_turns: 1,
-                warmup_rounds: 0,
-            }],
-            &outcome_with_tools(&[]),
-            Some(&sess),
-        );
-
-        assert!(
-            result[0].passed,
-            "identical mirrors of one canonical turn must be counted once: {:?}",
-            result[0]
-        );
-        assert!(result[0].detail.contains("turns=1"), "{}", result[0].detail);
+        let cold = cache_request_outcome("r1", "t1", &[(1_000, 0, 0)]);
+        let mut warm = cache_request_outcome("r2", "t2", &[(20, 980, 0)]);
+        let capture = warm.explain_capture.as_mut().unwrap();
+        capture.events.extend(capture.events.clone());
+        let result = cache_ratio(&[&cold, &warm], 0.98, 1, 0);
+        assert!(result.passed, "{result:?}");
+        assert!(result.detail.contains("turns=1"), "{}", result.detail);
     }
 
     #[test]
-    fn provider_prompt_cache_warmup_skips_whole_legacy_turn_not_one_round() {
-        let sess = mk_session(&[
-            (
-                "llm_round",
-                serde_json::json!({
-                    "turn": 1,
-                    "tokens_in": 500,
-                    "cache_read_tokens": 0
-                }),
-            ),
-            (
-                "llm_round",
-                serde_json::json!({
-                    "turn": 1,
-                    "tokens_in": 500,
-                    "cache_read_tokens": 0
-                }),
-            ),
-            (
-                "llm_round",
-                serde_json::json!({
-                    "turn": 2,
-                    "tokens_in": 20,
-                    "cache_read_tokens": 980
-                }),
-            ),
-        ]);
-        let result = evaluate_deterministic_with_session(
-            &[Criterion::ProviderPromptCacheReadRatio {
-                min: 0.98,
-                warmup_turns: 1,
-                warmup_rounds: 0,
-            }],
-            &outcome_with_tools(&[]),
-            Some(&sess),
-        );
-
-        assert!(result[0].passed, "{:?}", result[0]);
-        assert!(result[0].detail.contains("turns=1"), "{}", result[0].detail);
+    fn provider_prompt_cache_warmup_skips_whole_user_turn_including_retry() {
+        let cold = cache_request_outcome("r1", "t1", &[(500, 0, 0), (500, 0, 0)]);
+        let mut retry = cache_request_outcome("r1", "t1", &[(500, 0, 0)]);
+        for event in &mut retry.explain_capture.as_mut().unwrap().events {
+            event.clock_domain_id = "resumed-clock".into();
+        }
+        let warm = cache_request_outcome("r3", "t2", &[(20, 980, 0)]);
+        let result = cache_ratio(&[&cold, &retry, &warm], 0.98, 1, 0);
+        assert!(result.passed, "{result:?}");
+        assert!(result.detail.contains("turns=1"), "{}", result.detail);
+        let result = cache_ratio(&[&cold, &retry, &warm], 0.98, 0, 1);
+        assert!(!result.passed);
+        assert!(result.detail.contains("rounds=3"), "{}", result.detail);
     }
-
-    // ── validate_criterion / validate_criteria (R3 #2) ──
 
     #[test]
     fn validate_tools_count_between_rejects_inverted_range() {
@@ -9313,6 +9042,113 @@ mod tests {
         assert!(r[0].detail.contains("step_events missing"));
     }
 
+    use crate::exec::test_support::{cache_outcome, cache_request_outcome};
+
+    fn cache_ratio(
+        executions: &[&RunOutcome],
+        min: f64,
+        warmup_turns: u32,
+        warmup_rounds: u32,
+    ) -> CriterionResult {
+        let criterion = Criterion::ProviderPromptCacheReadRatio {
+            min,
+            warmup_turns,
+            warmup_rounds,
+        };
+        evaluate_with_primary_executions(
+            &[criterion],
+            &RunOutcome::new("aggregate"),
+            None,
+            executions,
+        )
+        .remove(0)
+    }
+
+    #[test]
+    fn prompt_cache_tokens_uses_every_physical_execution_once() {
+        let criterion = Criterion::AllOf {
+            criteria: vec![Criterion::PromptCacheTokens {
+                min_read: 30,
+                min_creation: 3,
+                max_creation: Some(3),
+            }],
+        };
+        let root = cache_outcome("root", 10, 1);
+        let step = cache_outcome("step", 20, 2);
+        let mut aggregate = RunOutcome::new("m");
+        aggregate.cached_input_tokens = 999_999;
+        let evaluate = |executions: &[&RunOutcome]| {
+            evaluate_with_primary_executions(
+                std::slice::from_ref(&criterion),
+                &aggregate,
+                None,
+                executions,
+            )
+            .remove(0)
+        };
+        assert!(evaluate(&[&root, &step]).passed);
+        assert!(!evaluate(&[&root]).passed);
+        for executions in [vec![&root, &root], vec![&root, &aggregate], vec![]] {
+            let result = evaluate(&executions);
+            assert!(!result.passed);
+            assert!(result.detail.contains("evidence unavailable"));
+        }
+        let mut incomplete = step.clone();
+        incomplete
+            .explain_capture
+            .as_mut()
+            .unwrap()
+            .events
+            .iter_mut()
+            .find_map(|fact| fact.usage.as_mut())
+            .unwrap()
+            .cache_creation_tokens = None;
+        assert!(!evaluate(&[&root, &incomplete]).passed);
+        let mut foreign = step.clone();
+        foreign.run_id = Some("different".into());
+        assert!(!evaluate(&[&root, &foreign]).passed);
+        let huge = cache_outcome("huge", u64::MAX - 100, 0);
+        let result = evaluate(&[&root, &huge]);
+        assert!(!result.passed && result.detail.contains("evidence unavailable"));
+    }
+
+    #[test]
+    fn prompt_cache_tokens_negative_witness_cannot_borrow_followup_usage() {
+        let root = cache_outcome("root", 10, 1)
+            .with_exit_code(1)
+            .with_final_state("interrupted")
+            .with_interruption_kind("model_error");
+        let step = cache_outcome("step", 20, 2);
+        let criteria = [Criterion::AllOf {
+            criteria: vec![
+                Criterion::ExitCode { code: 1 },
+                Criterion::PromptCacheTokens {
+                    min_read: 30,
+                    min_creation: 3,
+                    max_creation: Some(3),
+                },
+            ],
+        }];
+        assert!(
+            evaluate_with_primary_executions(&criteria, &root, None, &[&root, &step])[0].passed
+        );
+        assert!(!accepts_negative_terminal(&criteria, &root, None));
+        let alternatives = [Criterion::AnyOf {
+            criteria: vec![criteria[0].clone(), Criterion::ExitCode { code: 1 }],
+        }];
+        assert!(accepts_negative_terminal(&alternatives, &root, None));
+        assert!(!accepts_negative_terminal(
+            &alternatives,
+            &root.clone().with_interruption_kind("timeout"),
+            None
+        ));
+        assert!(!accepts_negative_terminal(
+            &alternatives,
+            &root.with_exit_code(-1),
+            None
+        ));
+    }
+
     #[test]
     fn prompt_cache_tokens_requires_read_and_creation_buckets() {
         let c = Criterion::PromptCacheTokens {
@@ -9320,13 +9156,11 @@ mod tests {
             min_creation: 5,
             max_creation: None,
         };
-        let mut out = RunOutcome::new("m");
-        out.cached_input_tokens = 12;
-        out.cache_creation_tokens = 5;
+        let mut out = cache_outcome("r", 12, 5);
         let r = evaluate_one(&c, &out, None);
         assert!(r.passed, "{r:?}");
 
-        out.cached_input_tokens = 9;
+        out = cache_outcome("r", 9, 5);
         let r = evaluate_one(&c, &out, None);
         assert!(!r.passed, "{r:?}");
     }
@@ -9342,17 +9176,13 @@ mod tests {
             min_creation: 0,
             max_creation: Some(15_000),
         };
-        let mut out = RunOutcome::new("m");
-
         // Healthy: read well past min, creation within ceiling.
-        out.cached_input_tokens = 30_000;
-        out.cache_creation_tokens = 4_000;
+        let mut out = cache_outcome("r", 30_000, 4_000);
         let r = evaluate_one(&c, &out, None);
         assert!(r.passed, "healthy cache should pass: {r:?}");
 
         // Regression: plenty of reads, but creation explodes — partial cache hit.
-        out.cached_input_tokens = 30_000;
-        out.cache_creation_tokens = 25_000;
+        out = cache_outcome("r", 30_000, 25_000);
         let r = evaluate_one(&c, &out, None);
         assert!(
             !r.passed,
@@ -9367,15 +9197,13 @@ mod tests {
 
     #[test]
     fn prompt_cache_tokens_max_creation_defaults_to_unbounded() {
-        // YAML case omitting `max_creation` must remain backward-compatible.
+        // An omitted ceiling is deliberately unbounded.
         let c = Criterion::PromptCacheTokens {
             min_read: 10,
             min_creation: 0,
             max_creation: None,
         };
-        let mut out = RunOutcome::new("m");
-        out.cached_input_tokens = 100;
-        out.cache_creation_tokens = 999_999;
+        let out = cache_outcome("r", 100, 999_999);
         let r = evaluate_one(&c, &out, None);
         assert!(
             r.passed,

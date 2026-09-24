@@ -17,12 +17,13 @@ const RAW_CACHE_BREAK_MIN_RATIO: f64 = 0.25;
 /// Aggregate pipeline health metrics for a session.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PipelineHealthReport {
-    /// Per-turn billable cache-read share (0.0–1.0). This uses the complete
-    /// provider input accounting denominator, so it is not the same as
-    /// stable-prefix coverage when conversation history is uncached.
-    pub cache_hit_ratios: Vec<f64>,
-    /// Average billable cache-read share across all turns.
-    pub avg_cache_hit_ratio: f64,
+    /// Per-ModelRound primary cache-read shares after full execution input
+    /// qualification. None is unknown; Some([]) is all-zero input (n/a).
+    /// Zero-input request groups are not samples in the arithmetic mean.
+    pub cache_hit_ratios: Option<Vec<f64>>,
+    /// Arithmetic mean of the qualified nonzero-input request-group shares,
+    /// not the token-weighted share or an average of user turns.
+    pub avg_cache_hit_ratio: Option<f64>,
     /// Sum of the runtime's stable provider-prefix estimates for feedback
     /// observations with actual request usage and a `provider-prefix-v1`
     /// identity.
@@ -58,8 +59,8 @@ pub struct PipelineHealthReport {
     pub prompt_cache_breaks: u32,
     /// Whether a compaction cascade was detected.
     pub cascade_detected: bool,
-    /// Number of turns with pipeline feedback.
-    pub turns_with_feedback: u32,
+    /// Number of valid typed feedback observations, independent of usage coverage.
+    pub feedback_observations: u32,
     /// Number of pipeline events with invalid typed payloads. Any non-zero
     /// value means the measured health report is incomplete and cannot certify
     /// cache/alert criteria.
@@ -70,6 +71,16 @@ pub struct PipelineHealthReport {
     /// runtime correctness failures.
     #[serde(default)]
     pub execution: ExecutionTraceReport,
+}
+
+impl PipelineHealthReport {
+    pub(crate) fn cache_read_share_label(&self) -> String {
+        match self.avg_cache_hit_ratio {
+            Some(mean) => format!("{:.1}%", mean * 100.0),
+            None if self.cache_hit_ratios.is_some() => "n/a (zero input)".into(),
+            None => "unknown (incomplete input evidence)".into(),
+        }
+    }
 }
 
 /// Bounded, typed execution counters for one captured invocation.
@@ -195,10 +206,11 @@ pub struct PipelineAlertEntry {
 }
 
 /// Analyze a session capture for pipeline health.
-pub fn analyze_pipeline_health(capture: &SessionCapture) -> PipelineHealthReport {
+pub fn analyze_pipeline_health(
+    capture: &SessionCapture,
+    executions: &[&crate::runner::RunOutcome],
+) -> PipelineHealthReport {
     let mut report = PipelineHealthReport::default();
-    let mut feedback_ratios = Vec::new();
-    let mut raw_usage_ratios = Vec::new();
 
     for event in &capture.events {
         let metadata = event.raw.get("metadata");
@@ -229,11 +241,7 @@ pub fn analyze_pipeline_health(capture: &SessionCapture) -> PipelineHealthReport
                     report.invalid_events = report.invalid_events.saturating_add(1);
                     continue;
                 }
-                let Some(ratio) = frame.cache_hit_ratio() else {
-                    report.invalid_events = report.invalid_events.saturating_add(1);
-                    continue;
-                };
-                feedback_ratios.push(ratio);
+                report.feedback_observations = report.feedback_observations.saturating_add(1);
                 if let (Some(eligible), Some(usage)) = (
                     frame.context.estimated_cache_eligible_tokens,
                     frame.request_usage.as_ref(),
@@ -256,11 +264,6 @@ pub fn analyze_pipeline_health(capture: &SessionCapture) -> PipelineHealthReport
                             .stable_prefix_cache_read_tokens
                             .saturating_add(usage.cache_read.min(eligible));
                     }
-                }
-            }
-            "llm_response_full" => {
-                if let Some(ratio) = raw_llm_response_cache_hit_ratio(event) {
-                    raw_usage_ratios.push(ratio);
                 }
             }
             "pipeline_compaction_audit" => {
@@ -317,16 +320,24 @@ pub fn analyze_pipeline_health(capture: &SessionCapture) -> PipelineHealthReport
         report.alerts.extend(raw_breaks);
     }
 
-    report.cache_hit_ratios = if feedback_ratios.is_empty() {
-        raw_usage_ratios
-    } else {
-        feedback_ratios
-    };
-    report.turns_with_feedback = report.cache_hit_ratios.len() as u32;
-    if !report.cache_hit_ratios.is_empty() {
-        report.avg_cache_hit_ratio =
-            report.cache_hit_ratios.iter().sum::<f64>() / report.cache_hit_ratios.len() as f64;
-    }
+    report.cache_hit_ratios = crate::explain_capture::primary_execution_cache_groups(
+        executions, true, false,
+    )
+    .map(|groups| {
+        groups
+            .into_iter()
+            .flatten()
+            .filter_map(|usage| {
+                let input = usage
+                    .checked_total_input_tokens()
+                    .expect("qualified primary input");
+                (input > 0).then(|| usage.cache_read_tokens as f64 / input as f64)
+            })
+            .collect::<Vec<_>>()
+    });
+    report.avg_cache_hit_ratio = report.cache_hit_ratios.as_ref().and_then(|ratios| {
+        (!ratios.is_empty()).then(|| ratios.iter().sum::<f64>() / ratios.len() as f64)
+    });
     if report.stable_prefix_cache_eligible_tokens > 0 {
         report.stable_prefix_cache_coverage = Some(
             report.stable_prefix_cache_read_tokens as f64
@@ -732,25 +743,13 @@ pub fn render_pipeline_health(report: &PipelineHealthReport) -> String {
     let mut out = String::new();
     out.push_str("── Pipeline Health ──\n");
 
-    if report.turns_with_feedback == 0 {
-        if report.invalid_events > 0 {
-            out.push_str(&format!(
-                "  ⚠ Invalid pipeline event payloads: {} (evidence incomplete)\n",
-                report.invalid_events
-            ));
-        }
-        out.push_str("  No pipeline feedback events found.\n");
-        render_execution_summary(report, &mut out);
-        return out;
-    }
-
     out.push_str(&format!(
-        "  Turns with feedback: {}\n",
-        report.turns_with_feedback
+        "  Feedback observations: {}\n",
+        report.feedback_observations
     ));
     out.push_str(&format!(
-        "  Avg billable cache-read share: {:.1}%\n",
-        report.avg_cache_hit_ratio * 100.0
+        "  Mean primary request-group cache-read share: {}\n",
+        report.cache_read_share_label()
     ));
     if let Some(coverage) = report.stable_prefix_cache_coverage {
         out.push_str(&format!(
@@ -768,9 +767,9 @@ pub fn render_pipeline_health(report: &PipelineHealthReport) -> String {
         ));
     }
 
-    if !report.cache_hit_ratios.is_empty() {
-        let first = report.cache_hit_ratios.first().unwrap_or(&0.0);
-        let last = report.cache_hit_ratios.last().unwrap_or(&0.0);
+    if let Some(ratios) = &report.cache_hit_ratios
+        && let (Some(first), Some(last)) = (ratios.first(), ratios.last())
+    {
         let trend = if last > first {
             "↑"
         } else if last < first {
@@ -1050,10 +1049,40 @@ mod tests {
     #[test]
     fn empty_session_produces_empty_report() {
         let capture = make_capture(vec![]);
-        let report = analyze_pipeline_health(&capture);
-        assert_eq!(report.turns_with_feedback, 0);
-        assert_eq!(report.avg_cache_hit_ratio, 0.0);
+        let report = analyze_pipeline_health(&capture, &[]);
+        assert_eq!(report.feedback_observations, 0);
+        assert_eq!(report.avg_cache_hit_ratio, None);
         assert_eq!(report.execution, ExecutionTraceReport::default());
+    }
+
+    #[test]
+    fn canonical_cache_mean_preserves_unknown_zero_and_request_weighting() {
+        use crate::exec::test_support::cache_request_outcome;
+        let capture = make_capture(vec![]);
+        let out = cache_request_outcome("r", "t", &[(1, 9, 0), (900, 100, 0), (0, 0, 0)]);
+        let report = analyze_pipeline_health(&capture, &[&out]);
+        assert_eq!(report.feedback_observations, 0);
+        assert_eq!(report.cache_hit_ratios, Some(vec![0.9, 0.1]));
+        assert_eq!(report.avg_cache_hit_ratio, Some(0.5));
+        assert!(render_pipeline_health(&report).contains("cache-read share: 50.0%"));
+        let zero = cache_request_outcome("zero", "t", &[(0, 0, 0)]);
+        let zero_report = analyze_pipeline_health(&capture, &[&zero]);
+        assert_eq!(zero_report.cache_hit_ratios, Some(vec![]));
+        assert_eq!(zero_report.avg_cache_hit_ratio, None);
+        assert!(render_pipeline_health(&zero_report).contains("n/a (zero input)"));
+        let missing = crate::runner::RunOutcome::new("m");
+        let unknown = analyze_pipeline_health(&capture, &[&out, &missing]);
+        assert_eq!(unknown.cache_hit_ratios, None);
+        assert_eq!(unknown.avg_cache_hit_ratio, None);
+        assert!(render_pipeline_health(&unknown).contains("unknown (incomplete input evidence)"));
+        for report in [report, zero_report, unknown] {
+            let json = serde_json::to_value(&report).unwrap();
+            let restored: PipelineHealthReport = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(restored.cache_hit_ratios, report.cache_hit_ratios);
+            assert_eq!(restored.avg_cache_hit_ratio, report.avg_cache_hit_ratio);
+            assert!(json.get("feedback_observations").is_some());
+            assert!(json.get("turns_with_feedback").is_none());
+        }
     }
 
     #[test]
@@ -1087,7 +1116,7 @@ mod tests {
             }
         ]))]);
 
-        let report = analyze_pipeline_health(&capture);
+        let report = analyze_pipeline_health(&capture, &[]);
         assert_eq!(report.execution.total_tool_calls, 4);
         assert_eq!(report.execution.executed_tool_calls, 3);
         assert_eq!(report.execution.successful_tool_calls, 3);
@@ -1132,6 +1161,13 @@ mod tests {
                 "error_kind": "contract_violation"
             },
             {
+                "name": "bash",
+                "call_id": "bash-budget-deferred",
+                "ok": false,
+                "disposition": "deferred",
+                "error_kind": "execution_time_budget_exhausted"
+            },
+            {
                 "name": "settle_work_item",
                 "call_id": "settle-success",
                 "ok": true,
@@ -1153,12 +1189,13 @@ mod tests {
             }
         ]))]);
 
-        let report = analyze_pipeline_health(&capture);
-        assert_eq!(report.execution.total_tool_calls, 6);
+        let report = analyze_pipeline_health(&capture, &[]);
+        assert_eq!(report.execution.total_tool_calls, 7);
         assert_eq!(report.execution.executed_tool_calls, 3);
         assert_eq!(report.execution.successful_tool_calls, 2);
         assert_eq!(report.execution.failed_tool_calls, 1);
         assert_eq!(report.execution.rejected_tool_calls, 1);
+        assert_eq!(report.execution.deferred_tool_calls, 1);
         assert_eq!(report.execution.suppressed_tool_calls, 2);
         assert_eq!(report.execution.settlement_attempts, 3);
         assert_eq!(report.execution.successful_settlements, 1);
@@ -1166,7 +1203,7 @@ mod tests {
 
         let rendered = render_pipeline_health(&report);
         assert!(rendered.contains(
-            "Execution: tools=6 executed=3 success=2 failed=1 rejected=1 reused=0 suppressed=2 deferred=0 unknown=0 unknown_disposition=0"
+            "Execution: tools=7 executed=3 success=2 failed=1 rejected=1 reused=0 suppressed=2 deferred=1 unknown=0 unknown_disposition=0"
         ));
     }
 
@@ -1211,7 +1248,7 @@ mod tests {
             }
         ]))]);
 
-        let report = analyze_pipeline_health(&capture);
+        let report = analyze_pipeline_health(&capture, &[]);
         assert_eq!(report.execution.total_tool_calls, 6);
         assert_eq!(report.execution.executed_tool_calls, 0);
         assert_eq!(report.execution.successful_tool_calls, 0);
@@ -1307,7 +1344,7 @@ mod tests {
         ]))]);
         capture.skipped_lines = 2;
 
-        let report = analyze_pipeline_health(&capture);
+        let report = analyze_pipeline_health(&capture, &[]);
         assert!(!report.execution.evidence_complete);
         assert_eq!(report.execution.total_tool_calls, 1);
         assert_eq!(report.execution.skipped_lines, 2);
@@ -1328,7 +1365,7 @@ mod tests {
         ]))]);
         capture.integrity_errors = 1;
 
-        let report = analyze_pipeline_health(&capture);
+        let report = analyze_pipeline_health(&capture, &[]);
         assert!(!report.execution.evidence_complete);
         assert_eq!(report.execution.total_tool_calls, 0);
         assert_eq!(report.execution.integrity_errors, 1);
@@ -1338,17 +1375,17 @@ mod tests {
     }
 
     #[test]
-    fn feedback_events_produce_cache_trend() {
+    fn feedback_events_do_not_certify_primary_cache_inputs() {
         let capture = make_capture(vec![
             make_feedback_event(1, 0.0),
             make_feedback_event(2, 0.7),
             make_feedback_event(3, 0.85),
             make_feedback_event(4, 0.9),
         ]);
-        let report = analyze_pipeline_health(&capture);
-        assert_eq!(report.turns_with_feedback, 4);
-        assert_eq!(report.cache_hit_ratios.len(), 4);
-        assert!(report.avg_cache_hit_ratio > 0.5);
+        let report = analyze_pipeline_health(&capture, &[]);
+        assert_eq!(report.feedback_observations, 4);
+        assert_eq!(report.cache_hit_ratios, None);
+        assert_eq!(report.avg_cache_hit_ratio, None);
     }
 
     #[test]
@@ -1357,8 +1394,8 @@ mod tests {
         event.raw["metadata"]["runtime_feedback"]["context"]["token_pressure"] =
             serde_json::json!(-0.1);
         let capture = make_capture(vec![event]);
-        let report = analyze_pipeline_health(&capture);
-        assert_eq!(report.turns_with_feedback, 0);
+        let report = analyze_pipeline_health(&capture, &[]);
+        assert_eq!(report.feedback_observations, 0);
         assert_eq!(report.invalid_events, 1);
     }
 
@@ -1369,24 +1406,22 @@ mod tests {
             .as_object_mut()
             .expect("runtime feedback object")
             .remove("policy_feedback");
-        let report = analyze_pipeline_health(&make_capture(vec![event]));
-        assert_eq!(report.turns_with_feedback, 0);
+        let report = analyze_pipeline_health(&make_capture(vec![event]), &[]);
+        assert_eq!(report.feedback_observations, 0);
         assert_eq!(report.invalid_events, 1);
     }
 
     #[test]
-    fn llm_response_usage_fallback_produces_cache_trend() {
+    fn raw_response_usage_cannot_replace_canonical_input_evidence() {
         let capture = make_capture(vec![
             make_llm_response_event(9_984, 5, 0),
             make_llm_response_event(162, 10_112, 0),
             make_llm_response_event(172, 10_112, 0),
         ]);
-        let report = analyze_pipeline_health(&capture);
-        assert_eq!(report.turns_with_feedback, 3);
-        assert_eq!(report.cache_hit_ratios.len(), 3);
-        assert!(report.cache_hit_ratios[0] < 0.01);
-        assert!(report.cache_hit_ratios[1] > 0.9);
-        assert!(report.avg_cache_hit_ratio > 0.6);
+        let report = analyze_pipeline_health(&capture, &[]);
+        assert_eq!(report.feedback_observations, 0);
+        assert_eq!(report.cache_hit_ratios, None);
+        assert_eq!(report.avg_cache_hit_ratio, None);
     }
 
     #[test]
@@ -1398,7 +1433,7 @@ mod tests {
         second.raw["metadata"]["runtime_feedback"]["context"]["estimated_cache_eligible_tokens"] =
             serde_json::json!(800);
 
-        let report = analyze_pipeline_health(&make_capture(vec![first, second]));
+        let report = analyze_pipeline_health(&make_capture(vec![first, second]), &[]);
 
         assert_eq!(report.stable_prefix_cache_eligible_tokens, 1_600);
         assert_eq!(report.stable_prefix_cache_read_tokens, 1_300);
@@ -1406,7 +1441,7 @@ mod tests {
         assert_eq!(report.provider_prefix_cache_observations, 2);
         assert_eq!(report.stable_prefix_cache_coverage, Some(0.8125));
         let rendered = render_pipeline_health(&report);
-        assert!(rendered.contains("Avg billable cache-read share"));
+        assert!(rendered.contains("Mean primary request-group cache-read share: unknown"));
         assert!(rendered.contains("Stable-prefix cache coverage: 81.2%"));
         assert!(rendered.contains("2 provider-prefix-v1 observations"));
     }
@@ -1427,7 +1462,7 @@ mod tests {
             )
             .expect("identity serializes");
 
-        let report = analyze_pipeline_health(&make_capture(vec![event]));
+        let report = analyze_pipeline_health(&make_capture(vec![event]), &[]);
 
         assert_eq!(report.stable_prefix_cache_observations, 1);
         assert_eq!(report.provider_prefix_cache_observations, 0);
@@ -1435,14 +1470,15 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_feedback_takes_precedence_over_raw_usage_fallback() {
+    fn canonical_input_is_independent_of_feedback_and_raw_scalar_values() {
         let capture = make_capture(vec![
             make_llm_response_event(100, 9_900, 0),
             make_feedback_event(1, 0.2),
         ]);
-        let report = analyze_pipeline_health(&capture);
-        assert_eq!(report.turns_with_feedback, 1);
-        assert_eq!(report.cache_hit_ratios, vec![0.2]);
+        let out = crate::exec::test_support::cache_request_outcome("r", "t", &[(100, 900, 0)]);
+        let report = analyze_pipeline_health(&capture, &[&out]);
+        assert_eq!(report.feedback_observations, 1);
+        assert_eq!(report.cache_hit_ratios, Some(vec![0.9]));
     }
 
     #[test]
@@ -1470,7 +1506,7 @@ mod tests {
             ),
             make_llm_response_event(1_000, 0, 0),
         ]);
-        let report = analyze_pipeline_health(&capture);
+        let report = analyze_pipeline_health(&capture, &[]);
         assert_eq!(report.prompt_cache_breaks, 1);
         assert_eq!(
             report
@@ -1501,7 +1537,7 @@ mod tests {
             ),
             make_llm_response_event(1_000, 0, 0),
         ]);
-        let report = analyze_pipeline_health(&capture);
+        let report = analyze_pipeline_health(&capture, &[]);
         assert_eq!(report.prompt_cache_breaks, 1);
         assert_eq!(
             report
@@ -1519,7 +1555,7 @@ mod tests {
             make_compaction_event(3, 2000),
             make_step_compaction_event(5, 3000),
         ]);
-        let report = analyze_pipeline_health(&capture);
+        let report = analyze_pipeline_health(&capture, &[]);
         assert_eq!(report.compaction_count, 2);
         assert_eq!(report.total_tokens_freed, 5000);
     }
@@ -1527,7 +1563,7 @@ mod tests {
     #[test]
     fn cascade_alert_detected() {
         let capture = make_capture(vec![make_alert_event(7, "compaction_cascade", "Warning")]);
-        let report = analyze_pipeline_health(&capture);
+        let report = analyze_pipeline_health(&capture, &[]);
         assert!(report.cascade_detected);
         assert_eq!(report.alerts.len(), 1);
     }
@@ -1540,9 +1576,14 @@ mod tests {
             make_feedback_event(3, 0.9),
             make_compaction_event(2, 1500),
         ]);
-        let report = analyze_pipeline_health(&capture);
+        let out = crate::exec::test_support::cache_request_outcome(
+            "r",
+            "t",
+            &[(100, 0, 0), (20, 80, 0), (10, 90, 0)],
+        );
+        let report = analyze_pipeline_health(&capture, &[&out]);
         let rendered = render_pipeline_health(&report);
-        assert!(rendered.contains("Avg billable cache-read share"));
+        assert!(rendered.contains("Mean primary request-group cache-read share"));
         assert!(rendered.contains("Compactions: 1"));
         assert!(rendered.contains("Cache trend"));
     }

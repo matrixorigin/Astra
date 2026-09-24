@@ -252,13 +252,22 @@ describe("AstraClient — Sessions", () => {
     expect(call[1].method).toBe("DELETE");
   });
 
-  test("getSessionAudit", async () => {
+  test.each([null, 0, 900])("getSessionAudit preserves cache evidence %s", async (cacheRead) => {
     const summary = {
       session_id: "s4",
       status: "closed",
       turn_count: 2,
       tokens_in: 10,
       tokens_out: 20,
+      request_usage: {
+        scope: "session_all_runs",
+        request_count: 2,
+        fresh_input_tokens: 10,
+        cache_read_tokens: cacheRead,
+        cache_creation_tokens: 0,
+        output_tokens: 20,
+      },
+      cost: { priced_turn_count: 0, unpriced_turn_count: 2 },
       tool_calls_total: 3,
       tool_calls_failed: 0,
       error_count: 0,
@@ -280,6 +289,10 @@ describe("AstraClient — Sessions", () => {
     const result = await createClient().getSessionAudit("s4");
     expect(result.session_id).toBe("s4");
     expect(result.turn_count).toBe(2);
+    expect(result.request_usage.cache_read_tokens).toBe(cacheRead);
+    expect(result.request_usage.cache_creation_tokens).toBe(0);
+    expect(result.cost.unpriced_turn_count).toBe(2);
+    expect(result.cost.estimated_cost_usd).toBeUndefined();
   });
 });
 

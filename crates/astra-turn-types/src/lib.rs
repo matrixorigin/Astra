@@ -10,12 +10,15 @@ mod artifact_publication;
 pub use artifact_publication::{ArtifactPublicationResult, ArtifactPublicationV1};
 mod judgment;
 pub use judgment::{
-    JudgmentAnswer, JudgmentCodecError, JudgmentQuestion, JudgmentRequest, JudgmentResponse,
+    JUDGMENT_SCHEMA_VERSION, JudgmentAnswer, JudgmentCodecError, JudgmentCriterion,
+    JudgmentNoulDecision, JudgmentQuestion, JudgmentRequest, JudgmentResponse,
     JudgmentResponseProvenance, NormalizedJudgmentResponse, NoulCriteria, judgment_messages,
     judgment_request_from_messages, normalize_judgment_response,
-    output_budget_exceeds_completion_cap,
+    output_budget_exceeds_completion_cap, parse_unique_judgment_json,
 };
+mod canonical_token_usage;
 mod canonical_tool_pairing;
+pub use canonical_token_usage::CanonicalTokenUsage;
 mod completion_settlement;
 #[doc(hidden)]
 pub use completion_settlement::deserialize_required_option;

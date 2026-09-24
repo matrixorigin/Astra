@@ -6,7 +6,8 @@
 //! or `None`. There is no keyword/alias fallback.
 
 use astra_turn_types::{
-    JudgmentQuestion, JudgmentRequest, judgment_messages, normalize_judgment_response,
+    JUDGMENT_SCHEMA_VERSION, JudgmentNoulDecision, JudgmentQuestion, JudgmentRequest,
+    JudgmentResponseProvenance, judgment_messages, normalize_judgment_response,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -75,7 +76,7 @@ pub fn skill_auto_route_judgment_request(
         })
         .collect::<Vec<_>>();
     Ok(JudgmentRequest {
-        schema_version: 1,
+        schema_version: JUDGMENT_SCHEMA_VERSION,
         state: json!({"policy":ROUTING_POLICY, "query":ctx.query, "catalog":catalog}),
         questions: ctx
             .visible_skills
@@ -124,15 +125,33 @@ pub fn parse_skill_auto_route_response(
         })?;
     let mut selected = None;
     for (i, skill) in ctx.visible_skills.iter().enumerate() {
-        let value = normalized.response.answers[&i.to_string()].probability();
-        if value <= 0.2 {
-            continue;
+        let answer = &normalized.response.answers[&i.to_string()];
+        match normalized.provenance {
+            JudgmentResponseProvenance::ProviderProbability => {
+                let value = answer.native_noul_probability().ok_or_else(|| {
+                    SkillAutoRouteJudgeError::Malformed {
+                        raw: "native response did not contain a Noul probability".into(),
+                    }
+                })?;
+                if value <= 0.2 {
+                    continue;
+                }
+                // Every competitor must be confidently false; never choose an argmax.
+                if value < 0.8 || selected.is_some() {
+                    return Ok(None);
+                }
+                selected = Some(skill.name.clone());
+            }
+            JudgmentResponseProvenance::DiscreteDecision => match answer.discrete_noul_decision() {
+                Some(JudgmentNoulDecision::No) => continue,
+                Some(JudgmentNoulDecision::Yes) if selected.is_none() => {
+                    selected = Some(skill.name.clone());
+                }
+                Some(JudgmentNoulDecision::Yes | JudgmentNoulDecision::Unknown) | None => {
+                    return Ok(None);
+                }
+            },
         }
-        // Every competitor must be confidently false; never choose an argmax.
-        if value < 0.8 || selected.is_some() {
-            return Ok(None);
-        }
-        selected = Some(skill.name.clone());
     }
     Ok(selected)
 }
@@ -151,7 +170,7 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_turn_types::{JudgmentAnswer, JudgmentResponse};
+    use astra_turn_types::{JudgmentAnswer, JudgmentNoulDecision, JudgmentResponse};
 
     fn context() -> SkillAutoRouteJudgeContext {
         SkillAutoRouteJudgeContext {
@@ -170,7 +189,7 @@ mod tests {
 
     fn native(values: &[f64]) -> String {
         serde_json::to_string(&JudgmentResponse {
-            schema_version: 1,
+            schema_version: JUDGMENT_SCHEMA_VERSION,
             model: "native".into(),
             answers: values
                 .iter()
@@ -179,6 +198,16 @@ mod tests {
                 .collect(),
         })
         .unwrap()
+    }
+
+    fn discrete(decisions: &[JudgmentNoulDecision]) -> String {
+        serde_json::json!({
+            "answers": decisions.iter().enumerate().map(|(i, decision)| (
+                i.to_string(),
+                JudgmentAnswer::DiscreteNoul { decision: *decision },
+            )).collect::<std::collections::BTreeMap<_, _>>()
+        })
+        .to_string()
     }
 
     #[test]
@@ -219,22 +248,35 @@ mod tests {
         let ctx = context();
         for (chat, values, expected) in [
             (
-                r#"{"true":["0"],"uncertain":[]}"#,
+                vec![JudgmentNoulDecision::Yes, JudgmentNoulDecision::No],
                 vec![1.0, 0.0],
                 Some("review-changes"),
             ),
             (
-                r#"{"true":["1"],"uncertain":[]}"#,
+                vec![JudgmentNoulDecision::No, JudgmentNoulDecision::Yes],
                 vec![0.0, 1.0],
                 Some("investigate"),
             ),
-            (r#"{"true":[],"uncertain":[]}"#, vec![0.0, 0.0], None),
-            (r#"{"true":["0","1"],"uncertain":[]}"#, vec![1.0, 1.0], None),
-            (r#"{"true":["0"],"uncertain":["1"]}"#, vec![1.0, 0.5], None),
+            (
+                vec![JudgmentNoulDecision::No, JudgmentNoulDecision::No],
+                vec![0.0, 0.0],
+                None,
+            ),
+            (
+                vec![JudgmentNoulDecision::Yes, JudgmentNoulDecision::Yes],
+                vec![1.0, 1.0],
+                None,
+            ),
+            (
+                vec![JudgmentNoulDecision::Yes, JudgmentNoulDecision::Unknown],
+                vec![1.0, 0.5],
+                None,
+            ),
         ] {
+            let chat = discrete(&chat);
             assert_eq!(
                 parse_skill_auto_route_response(
-                    chat,
+                    &chat,
                     &ctx,
                     "chat-fixture",
                     Some(astra_turn_types::JudgmentResponseProvenance::DiscreteDecision)
@@ -294,14 +336,14 @@ mod tests {
     fn malformed_incomplete_unknown_and_duplicate_answers_are_invalid() {
         let ctx = context();
         for raw in [
-            r#"{"true":["2"],"uncertain":[]}"#,
-            r#"{"true":["0","0"],"uncertain":[]}"#,
-            r#"{"true":["0"],"uncertain":["0"]}"#,
-            r#"{"true":["0"]}"#,
+            r#"{"answers":{"0":{"type":"discrete_noul","decision":"yes"},"1":{"type":"discrete_noul","decision":"no"},"2":{"type":"discrete_noul","decision":"no"}}}"#,
+            r#"{"answers":{"0":{"type":"discrete_noul","decision":"yes"},"0":{"type":"discrete_noul","decision":"no"}}}"#,
+            r#"{"answers":{"0":{"type":"discrete_noul","decision":"yes"}}}"#,
+            r#"{"answers":{"0":{"type":"noul","noul":1.0},"1":{"type":"discrete_noul","decision":"no"}}}"#,
             r#"{"skill_name":"review-changes"}"#,
             r#"[0]"#,
             "not json",
-            "```json\n{\"true\":[\"0\"],\"uncertain\":[]}\n```",
+            "```json\n{\"answers\":{}}\n```",
         ] {
             assert!(
                 matches!(

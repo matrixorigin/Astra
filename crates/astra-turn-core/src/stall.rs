@@ -324,50 +324,6 @@ pub fn detect_divergence_with_window(
     }
 }
 
-// ─── Adaptive stall thresholds ──────────────────────────────────────────────
-
-/// Adaptive stall detection thresholds that can be tuned based on
-/// accumulated correction effectiveness data.
-///
-/// Wired into [`crate::turn_guard::TurnGuard::evaluate()`] — after each
-/// correction outcome is resolved, `adjust_from_effectiveness` is called
-/// with the current follow_rate and effective_rate. The adjusted
-/// `stall_window` overrides the static `TaskExecutionProfile::stall_window`
-/// when corrections have been ineffective (window widens to reduce false
-/// positives).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AdaptiveStallThresholds {
-    /// Repetition window for stall detection (default: SERVER_STALL_WINDOW).
-    pub stall_window: usize,
-    /// Max exploration rounds before divergence (default: MAX_EXPLORATION_ROUNDS).
-    pub max_exploration_rounds: usize,
-}
-
-impl Default for AdaptiveStallThresholds {
-    fn default() -> Self {
-        Self {
-            stall_window: SERVER_STALL_WINDOW,
-            max_exploration_rounds: MAX_EXPLORATION_ROUNDS,
-        }
-    }
-}
-
-impl AdaptiveStallThresholds {
-    /// Adjust thresholds based on false-positive rate.
-    /// If corrections are frequently not followed (low follow rate),
-    /// the thresholds may be too sensitive.
-    pub fn adjust_from_effectiveness(&mut self, follow_rate: f64, effective_rate: f64) {
-        if follow_rate < 0.3 && self.stall_window < 5 {
-            self.stall_window += 1;
-            self.max_exploration_rounds += 1;
-        } else if effective_rate < 0.2 && self.stall_window < 6 {
-            // Only widen window for low effectiveness if follow rate wasn't already low
-            self.stall_window += 1;
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(deprecated)]
 mod tests {
@@ -1234,58 +1190,6 @@ mod tests {
         assert!(
             stalled,
             "stall must be detected despite interleaved text turn"
-        );
-    }
-
-    // ── P0-D: Adaptive stall threshold behavioral tests ─────────────
-
-    /// When corrections are frequently ignored (low follow_rate), the stall
-    /// window should widen to reduce false positives.
-    #[test]
-    fn adaptive_thresholds_widen_on_low_follow_rate() {
-        let mut thresholds = AdaptiveStallThresholds::default();
-        let original_window = thresholds.stall_window;
-
-        // Low follow rate + decent effectiveness → widen
-        thresholds.adjust_from_effectiveness(0.2, 0.5);
-        assert!(
-            thresholds.stall_window > original_window,
-            "stall window must widen when follow_rate < 0.3"
-        );
-        assert!(
-            thresholds.max_exploration_rounds > MAX_EXPLORATION_ROUNDS,
-            "exploration budget must also widen"
-        );
-    }
-
-    /// When corrections are effective, thresholds should NOT change.
-    #[test]
-    fn adaptive_thresholds_stable_when_effective() {
-        let mut thresholds = AdaptiveStallThresholds::default();
-        let original = thresholds.clone();
-
-        // High follow rate + high effectiveness → no change
-        thresholds.adjust_from_effectiveness(0.8, 0.7);
-        assert_eq!(
-            thresholds.stall_window, original.stall_window,
-            "effective corrections should not change thresholds"
-        );
-    }
-
-    /// Thresholds have an upper bound — they can't widen indefinitely.
-    #[test]
-    fn adaptive_thresholds_have_upper_bound() {
-        let mut thresholds = AdaptiveStallThresholds::default();
-
-        // Repeatedly adjust with low rates
-        for _ in 0..20 {
-            thresholds.adjust_from_effectiveness(0.1, 0.1);
-        }
-
-        assert!(
-            thresholds.stall_window <= 6,
-            "stall window must not exceed 6, got {}",
-            thresholds.stall_window
         );
     }
 }

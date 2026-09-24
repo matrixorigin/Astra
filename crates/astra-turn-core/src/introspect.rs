@@ -805,13 +805,7 @@ fn tool_result_judgment_view(
     snapshot: &IntrospectSnapshot,
     request: &IntrospectRequest,
 ) -> Option<astra_services::tool_result_selection_observation::ToolResultJudgmentView> {
-    if !matches!(
-        request.facet,
-        ObservationFacet::Session
-            | ObservationFacet::Overview
-            | ObservationFacet::Recent
-            | ObservationFacet::Trace
-    ) {
+    if request.facet != ObservationFacet::Trace {
         return None;
     }
     Some(if !judgment_source_allowed(request.source_policy, false) {
@@ -2078,7 +2072,17 @@ mod tests {
             }),
             ..Default::default()
         };
-        let request = IntrospectRequest::from_args(&serde_json::json!({"format":"json"}));
+        let overview = IntrospectRequest::from_args(&serde_json::json!({"format":"json"}));
+        let overview_report = build_introspect_report(&snapshot, &overview);
+        assert!(overview_report.tool_result_judgments.is_none());
+        assert!(
+            !overview_report
+                .observations
+                .iter()
+                .any(|item| item.kind == "tool_result_judgment")
+        );
+        let request =
+            IntrospectRequest::from_args(&serde_json::json!({"format":"json", "facet":"trace"}));
         let report = build_introspect_report(&snapshot, &request);
         assert_eq!(report.tool_result_judgments, snapshot.tool_result_judgments);
         let observation = report
@@ -2092,7 +2096,7 @@ mod tests {
                 .contains("execution via Jev · jev-1.13.0")
         );
         assert!(observation.summary.contains("1 included"));
-        let text_request = IntrospectRequest::from_args(&serde_json::json!({}));
+        let text_request = IntrospectRequest::from_args(&serde_json::json!({"facet":"trace"}));
         let text = render_introspect_request(&snapshot, &text_request);
         assert!(text.contains("Tool-result selection ·"));
         assert!(text.contains("execution via Jev · jev-1.13.0"));
@@ -2117,7 +2121,7 @@ mod tests {
         );
 
         let excluded = IntrospectRequest::from_args(
-            &serde_json::json!({"format":"json", "source_policy":"local_only"}),
+            &serde_json::json!({"format":"json", "facet":"trace", "source_policy":"local_only"}),
         );
         assert_eq!(
             build_introspect_report(&snapshot, &excluded)

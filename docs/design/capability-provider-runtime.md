@@ -371,6 +371,19 @@ Equal names and arguments with different invocation IDs are distinct calls.
 The same invocation ID across retry/reconnect/resume returns its durable state
 or terminal outcome.
 
+In the headless runtime path, the in-process replay cache is restricted to the
+same complete owner/session/run/turn-chain/invocation identity. A retry of that
+completed invocation reuses its original outcome; a different invocation ID
+executes normally even when its tool name and arguments are identical. If the
+identity is incomplete, this replay cache is bypassed. The headless path does
+not treat a process-local workspace epoch as proof that a prior read result is
+fresh: the epoch only scopes within-batch duplicate-call counting, and writes
+start a new counting window. A distinct invocation therefore follows the
+ordinary execution, audit, and resource-accounting path. This may perform more
+normal work than an earlier incorrect cross-invocation short circuit; it is
+not a zero-cost optimization claim. Database-cost acceptance must measure the
+canonical path and must not be achieved by skipping required accounting.
+
 Semantic read caching requires enough freshness context:
 
 ```text

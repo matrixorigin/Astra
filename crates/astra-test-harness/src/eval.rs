@@ -445,6 +445,7 @@ mod tests {
             digest: None,
             digest_error: None,
             failure_class: None,
+            cleanup_errors: Vec::new(),
             has_warnings: false,
         }
     }

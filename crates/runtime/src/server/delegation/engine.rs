@@ -3117,7 +3117,6 @@ impl DelegationEngine {
             CoordinationPattern::Fork {
                 tasks,
                 agent_id,
-                max_turns,
                 aggregation,
                 timeout_sec,
             } => {
@@ -3125,7 +3124,6 @@ impl DelegationEngine {
                     &request,
                     tasks,
                     agent_id,
-                    *max_turns,
                     aggregation,
                     &forward_headers,
                     admitted_model_execution.as_ref(),
@@ -4584,7 +4582,6 @@ impl DelegationEngine {
         request: &DelegationRequest,
         tasks: &[String],
         agent_id: &str,
-        _max_turns: u32,
         _aggregation: &AggregationStrategy,
         forward_headers: &HashMap<String, String>,
         admitted_model_execution: Option<&AdmittedModelExecution>,
@@ -9125,7 +9122,6 @@ mod tests {
             pattern: CoordinationPattern::Fork {
                 tasks: tasks.into_iter().map(String::from).collect(),
                 agent_id: agent_id.into(),
-                max_turns: 5,
                 aggregation: AggregationStrategy::AllResults,
                 timeout_sec: 0,
             },

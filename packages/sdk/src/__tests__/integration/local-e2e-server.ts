@@ -255,6 +255,15 @@ export async function startLocalE2eServer(pathPrefix = ''): Promise<LocalE2eServ
               turn_count: sessionRuns.length,
               tokens_in: sessionRuns.length * 10,
               tokens_out: sessionRuns.length * 20,
+              request_usage: {
+                scope: 'session_all_runs',
+                request_count: sessionRuns.length,
+                fresh_input_tokens: sessionRuns.length * 10,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                output_tokens: sessionRuns.length * 20,
+              },
+              cost: { priced_turn_count: 0, unpriced_turn_count: sessionRuns.length },
               tool_calls_total: sessionRuns
                 .flatMap((run) => run.events)
                 .filter((event) => event.type === 'tool_call_start').length,

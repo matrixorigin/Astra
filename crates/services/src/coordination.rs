@@ -365,8 +365,6 @@ pub enum CoordinationPattern {
         tasks: Vec<String>,
         /// Agent ID to use for all fork children (must be a User-tier agent).
         agent_id: String,
-        /// Maximum turns per fork child (lower than normal delegation).
-        max_turns: u32,
         /// How to aggregate fork results.
         aggregation: AggregationStrategy,
         /// Maximum time per fork child (seconds). 0 = no per-child timeout.

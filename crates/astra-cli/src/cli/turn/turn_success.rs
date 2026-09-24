@@ -246,7 +246,7 @@ struct TurnSuccessLiveSnapshot {
     total_completion_tokens: u64,
     total_cache_read_tokens: u64,
     total_cache_creation_tokens: u64,
-    total_session_cost: f64,
+    total_session_cost: Option<f64>,
     last_response: Option<String>,
     continuation_anchor: Option<ContinuationAnchor>,
     pending_followup_suggestion: Option<crate::cli::followup_suggestion::FollowupSuggestion>,
@@ -432,14 +432,9 @@ fn apply_turn_success_primary_sync(
     state.total_cache_read_tokens += result.cache_read_tokens;
     state.total_cache_creation_tokens += result.cache_creation_tokens;
 
-    let turn_cost = crate::cli::slash::slash_stats::cost_for_tokens(
-        result.prompt_tokens,
-        result.completion_tokens,
-        result.cache_read_tokens,
-        result.cache_creation_tokens,
-        &state.cached_pricing,
-    );
-    state.total_session_cost += turn_cost;
+    // Aggregate counters and the currently selected price do not attribute
+    // primary, auxiliary, retry and delegated work to their actual rates.
+    state.total_session_cost = None;
     let effective_user_input = result.effective_user_input(line);
     let latest_user_input = result.latest_user_input(line);
     if !latest_user_input.trim().is_empty() {
@@ -915,7 +910,7 @@ mod tests {
             total_completion_tokens: 50,
             total_cache_read_tokens: 7,
             total_cache_creation_tokens: 3,
-            total_session_cost: 1.25,
+            total_session_cost: Some(1.25),
             last_response: Some("old response".into()),
             history: vec![("old question".into(), "old answer".into())],
             recent_tools: vec!["read_file".into()],
@@ -951,7 +946,7 @@ mod tests {
         assert_eq!(state.total_completion_tokens, 50);
         assert_eq!(state.total_cache_read_tokens, 7);
         assert_eq!(state.total_cache_creation_tokens, 3);
-        assert_eq!(state.total_session_cost, 1.25);
+        assert_eq!(state.total_session_cost, Some(1.25));
         assert_eq!(state.last_response.as_deref(), Some("old response"));
         assert_eq!(
             state.history,

@@ -157,15 +157,6 @@ pub(crate) struct RuntimeSummaryClient {
     prompt_cache_tools: Vec<Value>,
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     execution: SummaryExecution,
-    /// Ordinary auxiliary callers may advance to a fresh logical identity
-    /// after a durable admission collision (the established bounded recovery
-    /// policy). Tool-result selection instead binds one candidate subject to
-    /// one durable identity and must let the existing admission fence reject
-    /// a replay without manufacturing a new attempt.
-    advance_on_admission_conflict: bool,
-    /// Physical turn round for diagnostic attribution. It is deliberately
-    /// carried separately from the canonical durable scope round.
-    execution_round: Option<u32>,
 }
 
 impl RuntimeSummaryClient {
@@ -202,29 +193,7 @@ impl RuntimeSummaryClient {
                 base_scope,
                 attempt_allocator,
             })),
-            advance_on_admission_conflict: true,
-            execution_round: None,
         }
-    }
-
-    pub(crate) fn with_selection_identity(
-        mut self,
-        operation_id: &str,
-        execution_round: u32,
-    ) -> Self {
-        match &mut self.execution {
-            SummaryExecution::Durable(execution) => {
-                let base_scope = execution
-                    .base_scope
-                    .with_operation_id(operation_id.to_string());
-                execution.base_scope = base_scope.with_round(0);
-            }
-            #[cfg(test)]
-            SummaryExecution::Direct => {}
-        }
-        self.advance_on_admission_conflict = false;
-        self.execution_round = Some(execution_round);
-        self
     }
 
     /// Reuse the main inference request's stable tool projection and exact
@@ -364,8 +333,6 @@ impl RuntimeSummaryClient {
             prompt_cache_tools: Vec::new(),
             cache_capability: None,
             execution: SummaryExecution::Direct,
-            advance_on_admission_conflict: true,
-            execution_round: None,
         }
     }
 }
@@ -392,7 +359,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
             temperature_provenance = policy.temperature_provenance.as_str(),
             "resolved auxiliary generation policy"
         );
-        let (result, execution_provenance) = match &self.execution {
+        let (result, execution_provenance, qualified_usage) = match &self.execution {
             SummaryExecution::Durable(execution) => {
                 let DurableSummaryExecution {
                     ledger,
@@ -404,35 +371,23 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                         .map_err(contract_error)?;
                 let mut collisions = 0;
                 loop {
-                    let durable_pair_base = if self.advance_on_admission_conflict {
-                        ledger
-                            .next_logical_attempt_pair_base(
-                                base_scope.clone(),
-                                purpose,
-                                &self.route.model_name,
-                                self.route
-                                    .wire_model_name
-                                    .as_deref()
-                                    .unwrap_or(&self.route.model_name),
-                                &self.route.provider,
-                            )
-                            .await?
-                    } else {
-                        // Selection subjects are content-addressed operation
-                        // IDs. Reusing the same subject must hit the exact
-                        // same durable identity, so a prior row cannot be
-                        // bypassed by advancing its logical-attempt cursor.
-                        0
-                    };
+                    let durable_pair_base = ledger
+                        .next_logical_attempt_pair_base(
+                            base_scope.clone(),
+                            purpose,
+                            &self.route.model_name,
+                            self.route
+                                .wire_model_name
+                                .as_deref()
+                                .unwrap_or(&self.route.model_name),
+                            &self.route.provider,
+                        )
+                        .await?;
                     // Reserve both identities in one short, non-async critical
                     // section. No allocator lock may span provider or database I/O.
-                    let requested_logical_attempt = if self.advance_on_admission_conflict {
-                        attempt_allocator
-                            .reserve_pair_at_least(&allocator_scope_key, durable_pair_base)
-                            .map_err(contract_error)?
-                    } else {
-                        durable_pair_base
-                    };
+                    let requested_logical_attempt = attempt_allocator
+                        .reserve_pair_at_least(&allocator_scope_key, durable_pair_base)
+                        .map_err(contract_error)?;
                     let call = LlmCall {
                         purpose,
                         messages,
@@ -445,46 +400,24 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                         thinking,
                     };
                     let scope = base_scope.with_logical_attempt(requested_logical_attempt);
-                    let outcome = if let Some(execution_round) = self.execution_round {
-                        if self.route.provider == "typesafe" {
-                            ledger
-                                .execute_nonstream_with_execution_round(
-                                    global_llm_client(),
-                                    scope,
-                                    call,
-                                    auxiliary_execution_budget(purpose, llm_nonstream_timeout()),
-                                    execution_round,
-                                )
-                                .await
-                        } else {
-                            ledger
-                                .execute_stream_no_tool_choice_with_execution_round(
-                                    scope,
-                                    call,
-                                    execution_round,
-                                )
-                                .await
-                        }
+                    let outcome = if self.route.provider == "typesafe" {
+                        ledger
+                            .execute_nonstream(
+                                global_llm_client(),
+                                scope,
+                                call,
+                                auxiliary_execution_budget(purpose, llm_nonstream_timeout()),
+                            )
+                            .await
                     } else {
-                        if self.route.provider == "typesafe" {
-                            ledger
-                                .execute_nonstream(
-                                    global_llm_client(),
-                                    scope,
-                                    call,
-                                    auxiliary_execution_budget(purpose, llm_nonstream_timeout()),
-                                )
-                                .await
-                        } else {
-                            ledger.execute_stream_no_tool_choice(scope, call).await
-                        }
+                        ledger.execute_stream_no_tool_choice(scope, call).await
                     };
                     debug_assert!(
                         outcome.logical_attempt() <= requested_logical_attempt.saturating_add(1),
                         "durable summary recovery exceeded its reserved identity pair"
                     );
-                    if self.advance_on_admission_conflict
-                        && outcome.admission_identity_is_occupied()
+                    if outcome.admission_identity_is_occupied()
+                        && outcome.qualified_usage.is_none()
                         && collisions < MAX_DURABLE_SUMMARY_CURSOR_COLLISIONS
                     {
                         collisions += 1;
@@ -497,7 +430,8 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                             provider: self.route.provider.clone(),
                         }
                     });
-                    break (outcome.into_result(), execution_provenance);
+                    let qualified_usage = outcome.qualified_usage;
+                    break (outcome.into_result(), execution_provenance, qualified_usage);
                 }
             }
             #[cfg(test)]
@@ -519,6 +453,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                 )
                 .await,
                 None,
+                None,
             ),
         };
         match result {
@@ -535,6 +470,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                     is_ptl_error: false,
                     finish_reason: result.effective_finish_reason.or(result.finish_reason),
                     usage: result.usage,
+                    qualified_usage,
                     execution: execution_provenance,
                 })
             }
@@ -545,6 +481,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                 is_ptl_error: false,
                 finish_reason: result.effective_finish_reason.or(result.finish_reason),
                 usage: result.usage,
+                qualified_usage,
                 execution: execution_provenance,
             }),
             Err(error) if error.kind == astra_core::ErrorKind::ContextWindow => {
@@ -555,6 +492,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                     is_ptl_error: true,
                     finish_reason: None,
                     usage: serde_json::Map::new(),
+                    qualified_usage,
                     // The durable outcome can identify the invocation even
                     // when the provider rejected the request for context
                     // length. Keep that identity for semantic diagnostics;
@@ -562,7 +500,19 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                     execution: execution_provenance,
                 })
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                let Some(usage) = qualified_usage else {
+                    return Err(error);
+                };
+                let mut details = error
+                    .details_json
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                    .filter(Value::is_object)
+                    .unwrap_or_else(|| serde_json::json!({}));
+                details["qualified_usage"] = usage.to_json();
+                Err(error.with_details_json(details.to_string()))
+            }
         }
     }
 }

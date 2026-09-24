@@ -162,21 +162,11 @@ fn sanitize_json_except_assistant_tool_arguments(
                             tool_result_run_id.as_deref(),
                         )
                     });
-            let optional_projection_is_bound = artifact_descriptor_is_bound
-                && values
-                    .get(crate::tool_result_storage::TOOL_RESULT_OPTIONAL_PROJECTION_FIELD)
-                    .is_some_and(
-                        crate::tool_result_storage::is_tool_result_optional_projection_marker,
-                    );
             if tool_result_frame && !artifact_descriptor_is_bound {
                 // A malformed or cross-message descriptor is not ordinary
                 // user data: drop it rather than retaining a plausible but
                 // unauthorised recovery hint in the durable journal.
                 values.remove(crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD);
-                values.remove(crate::tool_result_storage::TOOL_RESULT_OPTIONAL_PROJECTION_FIELD);
-            }
-            if tool_result_frame && !optional_projection_is_bound {
-                values.remove(crate::tool_result_storage::TOOL_RESULT_OPTIONAL_PROJECTION_FIELD);
             }
             for (key, child) in values {
                 if tool_result_frame
@@ -208,13 +198,6 @@ fn sanitize_json_except_assistant_tool_arguments(
                             *child = canonical;
                             continue;
                         }
-                    }
-                }
-                if tool_result_frame
-                    && key == crate::tool_result_storage::TOOL_RESULT_OPTIONAL_PROJECTION_FIELD
-                {
-                    if optional_projection_is_bound {
-                        continue;
                     }
                 }
                 if assistant_frame
@@ -642,10 +625,6 @@ mod tests {
                 "byte_len": 4,
                 "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             },
-            crate::tool_result_storage::TOOL_RESULT_OPTIONAL_PROJECTION_FIELD: {
-                "schema_version": 1,
-                "presentation": "generic",
-            },
         })];
 
         let safe = sanitize_durable_message_values(messages);
@@ -653,7 +632,6 @@ mod tests {
             safe[0][crate::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD],
             "run-1"
         );
-        assert!(crate::tool_result_storage::tool_result_optional_projection_eligible(&safe[0]));
         assert_eq!(
             safe[0][crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD],
             json!({
@@ -680,10 +658,6 @@ mod tests {
                 "byte_len": 4,
                 "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             },
-            crate::tool_result_storage::TOOL_RESULT_OPTIONAL_PROJECTION_FIELD: {
-                "schema_version": 1,
-                "presentation": "generic",
-            },
         })];
 
         let safe = sanitize_durable_message_values(messages);
@@ -692,12 +666,6 @@ mod tests {
                 .get(crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD)
                 .is_none(),
             "a descriptor bound to another call/run must not survive durable sanitization"
-        );
-        assert!(
-            safe[0]
-                .get(crate::tool_result_storage::TOOL_RESULT_OPTIONAL_PROJECTION_FIELD)
-                .is_none(),
-            "eligibility without a matching descriptor must not survive"
         );
     }
 }

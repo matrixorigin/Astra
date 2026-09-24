@@ -142,6 +142,8 @@ pub fn agent_fanout_result_looks_like(value: &Value) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentFanoutControlReceiptKind {
     Group,
+    /// Delegation was intentionally skipped before any child was accepted.
+    SkippedBeforeAcceptance,
     RejectedBeforeAcceptance,
     /// The control envelope reached a terminal boundary, but the producer
     /// could not prove whether execution began. This is authoritative for
@@ -216,6 +218,14 @@ pub fn agent_fanout_control_receipt_kind(output: &str) -> Option<AgentFanoutCont
     }
     let normalized_status = status.to_ascii_lowercase();
     if execution_fact == Some(AgentFanoutControlExecutionFact::NotExecuted)
+        && normalized_status == "completed"
+        && receipt.get("outcome").and_then(Value::as_str) == Some("delegation_skipped")
+        && receipt.get("reason_code").and_then(Value::as_str)
+            == Some("insufficient_time_to_delegate")
+    {
+        return Some(AgentFanoutControlReceiptKind::SkippedBeforeAcceptance);
+    }
+    if execution_fact == Some(AgentFanoutControlExecutionFact::NotExecuted)
         && matches!(
             normalized_status.as_str(),
             "failed" | "rejected" | "blocked"
@@ -240,7 +250,8 @@ pub fn agent_fanout_control_receipt_kind(output: &str) -> Option<AgentFanoutCont
     }
     // Existing structured fanout errors without an explicit execution fact
     // remain valid admission failures: the typed status+error pair proves
-    // that no group receipt exists. Plain text and incomplete JSON do not.
+    // that no group receipt exists.
+    // Plain text and incomplete JSON do not.
     (AgentToolResultStatusKind::parse_wire(status) == AgentToolResultStatusKind::Failed
         && execution_fact.is_none()
         && receipt
@@ -971,6 +982,12 @@ mod tests {
             ),
             Some(AgentFanoutControlReceiptKind::RejectedBeforeAcceptance)
         );
+        let skipped = r#"{"status":"completed","outcome":"delegation_skipped","reason_code":"insufficient_time_to_delegate","executed":false}"#;
+        assert_eq!(
+            agent_fanout_control_receipt_kind(skipped),
+            Some(AgentFanoutControlReceiptKind::SkippedBeforeAcceptance)
+        );
+        assert!(agent_fanout_control_result_is_usable(skipped));
         assert_eq!(
             agent_fanout_control_receipt_kind(
                 r#"{"status":"unknown","error_kind":"action_outcome_unknown","advisory":{"executed":null}}"#

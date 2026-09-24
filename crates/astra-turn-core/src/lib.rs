@@ -157,7 +157,6 @@ pub use tool::registry::meta as tool_registry_meta;
 pub use tool::registry::plugin as tool_registry_plugin;
 pub use tool::registry::report as tool_registry_report;
 pub use tool::result::compression as tool_result_compression;
-pub use tool::result::dedup as tool_result_dedup;
 pub use tool::result::sanitize as tool_result_sanitize;
 pub use tool::result::semantics as tool_result_semantics;
 pub use tool::result::storage as tool_result_storage;

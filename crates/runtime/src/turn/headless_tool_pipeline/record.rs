@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use astra_services::SessionArtifactStore;
+use astra_services::{SessionArtifactStore, session_journal::ToolCallDisposition};
 
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::execute::execution_error_kind;
@@ -37,6 +37,27 @@ use astra_turn_core::tool_result_sanitize::{
 /// projection authoritative.
 pub(crate) const CANONICAL_WORK_TASK_BOARD_UPDATE_FIELD: &str =
     "_astra_canonical_work_task_board_update";
+
+fn projected_writer_applied_bound(
+    execution: &HeadlessResolvedExecution,
+    record: &ToolCallRecord,
+    owner: TerminalProjectionOwner,
+) -> Option<bool> {
+    (record.was_executed()
+        && record.ok
+        && matches!(
+            owner,
+            TerminalProjectionOwner::RuntimeRoute | TerminalProjectionOwner::EdgeCallback
+        )
+        && execution.tool_result_fields.as_ref().is_some_and(|fields| {
+            fields
+                .get(astra_tools::workspace_observation::WRITER_APPLIED_BOUND_FIELD)
+                .and_then(Value::as_bool)
+                == Some(true)
+        })
+        && astra_tools::executor::is_workspace_mutation_tool(&execution.name, &execution.args))
+    .then_some(true)
+}
 
 fn tool_call_disposition_from_result_fields(
     fields: &serde_json::Map<String, Value>,
@@ -531,6 +552,7 @@ fn truncate_tool_error(result_str: &str) -> String {
 impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
     pub(super) async fn record_execution(&mut self, executed: ExecutedExecution) {
         self.observe_execution_terminal_owner(&executed.execution);
+        let terminal_owner = executed.execution.terminal_projection_owner();
         let ExecutedExecution {
             mut execution,
             idem_key,
@@ -782,6 +804,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         fields.get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
                     })
                     .cloned();
+                rec.workspace_writer_applied_bound =
+                    projected_writer_applied_bound(&execution, rec, terminal_owner);
                 rec.external_effect_observed = fields
                     .get(astra_tools::workspace_observation::EXTERNAL_EFFECT_OBSERVED_FIELD)
                     .and_then(serde_json::Value::as_bool);
@@ -856,17 +880,36 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             }
         }
 
-        self.ctx
-            .step_recorder
-            .complete_tool_with_result_and_metadata(
+        let disposition = self
+            .ctx
+            .tool_call_records
+            .last()
+            .map(|record| record.effective_disposition());
+        if matches!(
+            disposition,
+            Some(ToolCallDisposition::Rejected | ToolCallDisposition::Deferred)
+        ) {
+            self.ctx.step_recorder.skip_tool_with_reason_and_metadata(
                 &execution.name,
-                &execution.id,
+                Some(&execution.id),
                 args_preview.as_deref(),
-                is_err,
-                executed_ms,
+                "not_executed",
                 false,
-                &execution.result_str,
+                Some(&execution.result_str),
             );
+        } else {
+            self.ctx
+                .step_recorder
+                .complete_tool_with_result_and_metadata(
+                    &execution.name,
+                    &execution.id,
+                    args_preview.as_deref(),
+                    is_err,
+                    executed_ms,
+                    false,
+                    &execution.result_str,
+                );
+        }
         self.executed_this_turn += 1;
 
         if let (Some(user_id), Some(sid)) = (self.ctx.current_user_id, self.ctx.current_session_id)
@@ -892,7 +935,6 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 ))
         {
             self.ctx.turn_guard.record_workspace_mutation();
-            self.ctx.idempotency_cache.evict_tools(&READ_ONLY_TOOLS);
             self.ctx.semantic_dedup.clear_observation_cache();
         }
 
@@ -900,13 +942,18 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             let mut advisories = astra_turn_core::tool::result::advisory::advisories(
                 execution.tool_result_fields.as_ref(),
             );
-            // Cache and compare the provider observation, not presentation
-            // transforms from the current Pre/PostTool hook set. Reuse applies
-            // the then-current hooks again after authorization.
+            // Only the same Server invocation may reuse its result. Edge
+            // observations and calls without a complete identity remain
+            // useful semantic evidence but cannot become replay state.
+            let replay_key = if execution.is_edge_tool {
+                None
+            } else {
+                idem_key.as_ref()
+            };
             record_headless_cacheable_success_and_semantic_hint_if_ok(
                 &execution.name,
                 &execution.args,
-                &idem_key,
+                replay_key,
                 HeadlessCacheableRecordCtx {
                     observation: &cache_observation,
                     advisories: &mut advisories,
@@ -1050,21 +1097,6 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     "tool-result artifact descriptor was not attached"
                 );
             }
-            if let Err(error) =
-                astra_turn_core::tool_result_storage::mark_tool_result_optional_projection(
-                    &mut tool_msg,
-                    result_presentation == astra_tools::ModelResultPresentation::Generic
-                        && journal_result.artifact.is_some()
-                        && structural_model_projection.is_none(),
-                )
-            {
-                tracing::error!(
-                    run_id = ?self.ctx.current_run_id,
-                    tool_call_id = %execution.id,
-                    error = %error,
-                    "tool-result optional projection eligibility was not attached"
-                );
-            }
         }
         self.ctx.messages.push(tool_msg);
         self.ctx.tool_results.push(tr);
@@ -1077,6 +1109,92 @@ mod tests {
     use astra_services::session_journal::JournalDirGuard;
     use astra_services::session_journal::ToolCallDisposition;
     use serde_json::json;
+
+    #[test]
+    fn applied_bound_projection_requires_a_trusted_executed_typed_writer() {
+        let mut execution = HeadlessResolvedExecution {
+            confirmed_invocation: None,
+            id: "call-a".into(),
+            name: "str_replace".into(),
+            args: json!({"path":"target.txt","old_str":"before","new_str":"after"}),
+            result_str: "Replaced successfully".into(),
+            tool_result_fields: Some(serde_json::Map::from_iter([(
+                astra_tools::workspace_observation::WRITER_APPLIED_BOUND_FIELD.into(),
+                json!(true),
+            )])),
+            authoritative_is_error: Some(false),
+            pending_runtime_completion: None,
+            edge_duration_ms: 1,
+            is_edge_tool: true,
+            edge_result_missing: false,
+            edge_terminal_authority: true,
+            early_exit_ms: 0,
+        };
+        let mut record = ToolCallRecord {
+            name: "str_replace".into(),
+            ok: true,
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        };
+        assert_eq!(
+            projected_writer_applied_bound(
+                &execution,
+                &record,
+                execution.terminal_projection_owner()
+            ),
+            Some(true)
+        );
+        let mut retained = record.clone();
+        retained.workspace_writer_applied_bound = Some(true);
+        assert_eq!(
+            serde_json::to_vec(&retained).unwrap().len()
+                - serde_json::to_vec(&record).unwrap().len(),
+            38,
+            "journal record adds one bounded applied fact"
+        );
+        let restored: ToolCallRecord =
+            serde_json::from_slice(&serde_json::to_vec(&retained).unwrap()).unwrap();
+        assert_eq!(restored.workspace_writer_applied_bound, Some(true));
+        assert!(restored.runtime_args_full.is_none());
+
+        execution.edge_terminal_authority = false;
+        assert_eq!(
+            projected_writer_applied_bound(
+                &execution,
+                &record,
+                execution.terminal_projection_owner()
+            ),
+            None
+        );
+        execution.edge_terminal_authority = true;
+        for (disposition, ok) in [
+            (ToolCallDisposition::Rejected, true),
+            (ToolCallDisposition::Reused, true),
+            (ToolCallDisposition::Executed, false),
+        ] {
+            record.disposition = Some(disposition);
+            record.ok = ok;
+            assert_eq!(
+                projected_writer_applied_bound(
+                    &execution,
+                    &record,
+                    execution.terminal_projection_owner()
+                ),
+                None
+            );
+        }
+        record.disposition = Some(ToolCallDisposition::Executed);
+        record.ok = true;
+        execution.name = "bash".into();
+        assert_eq!(
+            projected_writer_applied_bound(
+                &execution,
+                &record,
+                execution.terminal_projection_owner()
+            ),
+            None
+        );
+    }
 
     #[test]
     fn guidance_persistence_failure_keeps_evidence_without_fabricating_a_handle() {

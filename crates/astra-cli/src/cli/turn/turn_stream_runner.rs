@@ -236,8 +236,11 @@ async fn await_stream_with_interrupts<'a>(
             if let Err(failure) = &mut result
                 && failure.partial.remote_cancel_required
             {
-                prepared.run_control.request_cancel_for_runtime();
-                cancel_token_for_signal.cancel();
+                apply_stream_failure_local_cancellation(
+                    failure,
+                    &prepared.run_control,
+                    &cancel_token_for_signal,
+                );
                 if failure.partial.callback_client_detached {
                     note_interactive_callback_detach(failure);
                 }
@@ -285,6 +288,17 @@ async fn await_stream_with_interrupts<'a>(
             ).await;
             (drained, true)
         }
+    }
+}
+
+fn apply_stream_failure_local_cancellation(
+    failure: &crate::TurnFailure,
+    run_control: &LocalRunControl,
+    cancel_token: &tokio_util::sync::CancellationToken,
+) {
+    if !failure.is_clean_internal_stream_detach() {
+        run_control.request_cancel_for_runtime();
+        cancel_token.cancel();
     }
 }
 
@@ -384,13 +398,40 @@ fn notify_server_to_cancel_run(
 #[cfg(test)]
 mod tests {
     use super::{
-        PreparedTurnStreamState, TurnExecutionInput, build_turn_stream_params,
-        note_interactive_callback_detach, prepare_turn_stream_state,
+        PreparedTurnStreamState, TurnExecutionInput, apply_stream_failure_local_cancellation,
+        build_turn_stream_params, note_interactive_callback_detach, prepare_turn_stream_state,
         report_server_run_detach_after_internal_failure,
     };
     use crate::cli::session::session_state::SessionState;
     use crate::cli::turn::local_run_control::LocalRunControl;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn clean_stream_detach_does_not_cancel_shared_local_work() {
+        use astra_runtime::turn::run_control::{RunControlStatus, RunStatusProvider};
+
+        let control = LocalRunControl::default();
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut failure = crate::TurnFailure {
+            error: "stream closed".into(),
+            partial: crate::PartialTurnData {
+                remote_cancel_required: true,
+                interruption: Some(serde_json::json!({"kind": "stream_transport"})),
+                ..Default::default()
+            },
+        };
+        apply_stream_failure_local_cancellation(&failure, &control, &token);
+        assert!(!token.is_cancelled());
+        assert_eq!(control.control_status("user", "run").await.unwrap(), None);
+
+        failure.partial.callback_client_detached = true;
+        apply_stream_failure_local_cancellation(&failure, &control, &token);
+        assert!(token.is_cancelled());
+        assert_eq!(
+            control.control_status("user", "run").await.unwrap(),
+            Some(RunControlStatus::Cancelled)
+        );
+    }
 
     #[test]
     fn interactive_callback_detach_tells_the_user_the_server_run_remains() {

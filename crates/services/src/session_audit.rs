@@ -2465,14 +2465,17 @@ pub enum SessionRequestUsageScope {
 /// These values are summed from canonical per-request usage records. They do
 /// not use context-window occupancy or cumulative UI counters, so cache reads
 /// stay visible instead of being folded into generic input tokens.
+/// A null lane means at least one selected sample lacks that lane, or the
+/// sum overflowed. Other lanes remain independently reportable. An empty
+/// selected set is zero; missing summary evidence defaults to unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SessionRequestUsageSummary {
     pub scope: SessionRequestUsageScope,
     pub request_count: u32,
-    pub fresh_input_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_creation_tokens: u64,
-    pub output_tokens: u64,
+    pub fresh_input_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
 }
 
 /// Brief tool-call info within a turn.
@@ -2491,11 +2494,11 @@ pub struct TurnSummary {
     pub turn: u32,
     pub user_input_preview: String,
     pub tool_calls: Vec<ToolCallBrief>,
-    pub tokens_in: u64,
-    pub cached_input_tokens: u64,
-    pub cache_creation_tokens: u64,
-    pub tokens_out: u64,
-    pub total_tokens: u64,
+    pub tokens_in: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub tokens_out: Option<u64>,
+    pub total_tokens: Option<u64>,
     pub duration_ms: u64,
     pub has_error: bool,
     pub has_stall: bool,
@@ -2563,11 +2566,11 @@ pub struct TurnDetail {
     pub user_input: String,
     pub assistant_output: String,
     pub tool_calls: Vec<ToolCallBrief>,
-    pub tokens_in: u64,
-    pub cached_input_tokens: u64,
-    pub cache_creation_tokens: u64,
-    pub tokens_out: u64,
-    pub total_tokens: u64,
+    pub tokens_in: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub tokens_out: Option<u64>,
+    pub total_tokens: Option<u64>,
     pub duration_ms: u64,
     pub ttft_ms: Option<u64>,
     pub context_ms: Option<u64>,
@@ -2596,20 +2599,11 @@ pub struct SessionCostSummary {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ParsedTurnTokenUsage {
-    input_tokens: u64,
-    cached_input_tokens: u64,
-    cache_creation_tokens: u64,
-    output_tokens: u64,
-    total_tokens: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct TurnTokenUsageWire {
-    input_tokens: Option<i64>,
-    cached_input_tokens: Option<i64>,
-    cache_creation_tokens: Option<i64>,
-    output_tokens: Option<i64>,
-    total_tokens: Option<i64>,
+    input_tokens: Option<u64>,
+    cached_input_tokens: Option<u64>,
+    cache_creation_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
 }
 
 fn parse_optional_turn_token_usage(
@@ -2627,75 +2621,33 @@ fn parse_optional_turn_token_usage(
     }
 }
 
-fn non_negative_token_count(value: i64, context: &str, field: &str) -> AuditResult<u64> {
-    u64::try_from(value).map_err(|_| {
-        audit_decode_error(
-            context,
-            field,
-            format!("expected non-negative token count, got {value}"),
-        )
-    })
-}
-
-fn required_token_count(value: Option<i64>, context: &str, field: &str) -> AuditResult<u64> {
-    let value = value.ok_or_else(|| {
-        audit_decode_error(
-            context,
-            field,
-            format!("missing canonical token usage field `{field}`"),
-        )
-    })?;
-    non_negative_token_count(value, context, field)
-}
-
 fn parse_turn_token_usage(raw: &str, context: &str) -> AuditResult<ParsedTurnTokenUsage> {
-    let usage: TurnTokenUsageWire = serde_json::from_str(raw)
+    let value = serde_json::from_str(raw)
         .map_err(|error| audit_decode_error(context, "token_usage", error))?;
-    let input_tokens = required_token_count(usage.input_tokens, context, "input_tokens")?;
-    let cached_input_tokens =
-        required_token_count(usage.cached_input_tokens, context, "cached_input_tokens")?;
-    let cache_creation_tokens = required_token_count(
-        usage.cache_creation_tokens,
-        context,
-        "cache_creation_tokens",
-    )?;
-    let output_tokens = required_token_count(usage.output_tokens, context, "output_tokens")?;
-    let total_tokens = required_token_count(usage.total_tokens, context, "total_tokens")?;
-    let expected_total = astra_turn_types::NormalizedPromptCacheUsage::new(
-        input_tokens,
-        cached_input_tokens,
-        cache_creation_tokens,
-    )
-    .checked_total_tokens_with_output(output_tokens)
-    .ok_or_else(|| audit_decode_error(context, "total_tokens", "token total overflow"))?;
-    if total_tokens != expected_total {
-        return Err(audit_decode_error(
-            context,
-            "total_tokens",
-            format!("expected {expected_total}, got {total_tokens}"),
-        ));
-    }
+    let usage = astra_turn_types::CanonicalTokenUsage::from_json(&value)
+        .map_err(|error| audit_decode_error(context, "token_usage", error))?;
     Ok(ParsedTurnTokenUsage {
-        input_tokens,
-        cached_input_tokens,
-        cache_creation_tokens,
-        output_tokens,
-        total_tokens,
+        input_tokens: usage.input_tokens(),
+        cached_input_tokens: usage.cached_input_tokens(),
+        cache_creation_tokens: usage.cache_creation_tokens(),
+        output_tokens: usage.output_tokens(),
+        total_tokens: usage.total_tokens(),
     })
 }
 
 #[derive(Debug, Clone)]
 struct TurnCostSample {
     model: String,
+    model_attributed: bool,
     usage: ParsedTurnTokenUsage,
 }
 
 fn priced_turn_cost(usage: ParsedTurnTokenUsage, pricing: &PricingData) -> Option<f64> {
     pricing.estimated_cost_usd(
-        usage.input_tokens,
-        usage.output_tokens,
-        usage.cached_input_tokens,
-        usage.cache_creation_tokens,
+        usage.input_tokens?,
+        usage.output_tokens?,
+        usage.cached_input_tokens?,
+        usage.cache_creation_tokens?,
     )
 }
 
@@ -2709,6 +2661,10 @@ fn summarize_session_cost(
     let mut unpriced_turn_count = 0_u32;
 
     for turn in turns {
+        if !turn.model_attributed {
+            unpriced_turn_count = unpriced_turn_count.saturating_add(1);
+            continue;
+        }
         let Some(pricing) = pricing_by_model.get(&turn.model) else {
             unpriced_turn_count = unpriced_turn_count.saturating_add(1);
             continue;
@@ -2733,21 +2689,31 @@ fn summarize_session_cost(
 fn summarize_session_request_usage(
     turns: impl IntoIterator<Item = TurnCostSample>,
 ) -> SessionRequestUsageSummary {
-    let mut summary = SessionRequestUsageSummary::default();
+    let mut summary = SessionRequestUsageSummary {
+        fresh_input_tokens: Some(0),
+        cache_read_tokens: Some(0),
+        cache_creation_tokens: Some(0),
+        output_tokens: Some(0),
+        ..Default::default()
+    };
     for turn in turns {
         summary.request_count = summary.request_count.saturating_add(1);
-        summary.fresh_input_tokens = summary
-            .fresh_input_tokens
-            .saturating_add(turn.usage.input_tokens);
-        summary.cache_read_tokens = summary
-            .cache_read_tokens
-            .saturating_add(turn.usage.cached_input_tokens);
-        summary.cache_creation_tokens = summary
-            .cache_creation_tokens
-            .saturating_add(turn.usage.cache_creation_tokens);
-        summary.output_tokens = summary
-            .output_tokens
-            .saturating_add(turn.usage.output_tokens);
+        for (total, value) in [
+            (&mut summary.fresh_input_tokens, turn.usage.input_tokens),
+            (
+                &mut summary.cache_read_tokens,
+                turn.usage.cached_input_tokens,
+            ),
+            (
+                &mut summary.cache_creation_tokens,
+                turn.usage.cache_creation_tokens,
+            ),
+            (&mut summary.output_tokens, turn.usage.output_tokens),
+        ] {
+            *total = total
+                .zip(value)
+                .and_then(|(sum, value)| sum.checked_add(value));
+        }
     }
     summary
 }
@@ -2868,6 +2834,11 @@ fn session_turn_cost_sample_from_row(row: &impl SessionAuditRow) -> AuditResult<
     let token_usage = audit_row_string(row, context, "token_usage")?;
     Ok(TurnCostSample {
         model,
+        // A turn's last model is not attribution for all its requests.
+        // Neither missing scope nor runtime-accounted totals prove that
+        // retries and auxiliary calls used this model. Preserve the sample
+        // as unpriced until its existing producer supplies that evidence.
+        model_attributed: false,
         usage: parse_turn_token_usage(&token_usage, context)?,
     })
 }
@@ -3517,7 +3488,12 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let duration_secs =
             compute_duration_secs(metrics.first_at.as_deref(), metrics.last_at.as_deref());
         let turn_costs = load_session_turn_cost_samples(&pool, user_id, session_id).await?;
-        let pricing_by_model = load_active_model_pricing_map(&pool, &metrics.models_used).await?;
+        let attributed_models = turn_costs
+            .iter()
+            .filter(|sample| sample.model_attributed)
+            .map(|sample| sample.model.clone())
+            .collect::<Vec<_>>();
+        let pricing_by_model = load_active_model_pricing_map(&pool, &attributed_models).await?;
         let request_usage = summarize_session_request_usage(turn_costs.iter().cloned());
         let cost = summarize_session_cost(turn_costs, &pricing_by_model);
 
@@ -5296,10 +5272,10 @@ mod tests {
             turn_summary_from_row(&FakeSessionAuditRow::complete(), 7).expect("turn row decodes");
         assert_eq!(turn.turn, 42);
         assert_eq!(turn.user_input_preview, "hello from audit turn");
-        assert_eq!(turn.tokens_in, 10);
-        assert_eq!(turn.cached_input_tokens, 2);
-        assert_eq!(turn.tokens_out, 5);
-        assert_eq!(turn.total_tokens, 17);
+        assert_eq!(turn.tokens_in, Some(10));
+        assert_eq!(turn.cached_input_tokens, Some(2));
+        assert_eq!(turn.tokens_out, Some(5));
+        assert_eq!(turn.total_tokens, Some(17));
         assert_eq!(turn.duration_ms, 321);
         assert_eq!(turn.model.as_deref(), Some("gpt-5"));
         assert_eq!(turn.created_at, "2026-06-26 12:00:00");
@@ -5344,6 +5320,42 @@ mod tests {
     }
 
     #[test]
+    fn audit_turn_projections_preserve_partial_evidence_as_null() {
+        let partial = FakeSessionAuditRow::with_token_usage(r#"{"output_tokens":7}"#);
+        let turn = turn_summary_from_row(&partial, 1).unwrap();
+        let parent = turn_detail_parent_from_row(&partial).unwrap();
+        let detail = turn_detail_from_parent(1, parent, vec![]).unwrap();
+        for value in [
+            serde_json::to_value(turn).unwrap(),
+            serde_json::to_value(detail).unwrap(),
+        ] {
+            for key in [
+                "tokens_in",
+                "cached_input_tokens",
+                "cache_creation_tokens",
+                "total_tokens",
+            ] {
+                assert_eq!(value.get(key), Some(&serde_json::Value::Null));
+            }
+            assert_eq!(value["tokens_out"], 7);
+        }
+        let complete = FakeSessionAuditRow::complete();
+        let mut turn = turn_summary_from_row(&complete, 1).unwrap();
+        let parent = turn_detail_parent_from_row(&complete).unwrap();
+        let mut detail = turn_detail_from_parent(1, parent, vec![]).unwrap();
+        let metrics = TurnObservedMetrics {
+            token_usage: Some(parse_turn_token_usage(r#"{"output_tokens":7}"#, "test").unwrap()),
+            ..Default::default()
+        };
+        apply_turn_observed_metrics(&mut turn, &metrics);
+        apply_turn_observed_metrics_to_detail(&mut detail, &metrics);
+        assert_eq!(turn.tokens_in, None);
+        assert_eq!(detail.tokens_in, None);
+        assert_eq!(turn.tokens_out, Some(7));
+        assert_eq!(detail.tokens_out, Some(7));
+    }
+
+    #[test]
     fn session_audit_turn_detail_decode_preserves_values_and_fails_loudly() {
         let parent_metadata = r#"{
             "assistant_output": "done",
@@ -5375,10 +5387,10 @@ mod tests {
         assert_eq!(detail.turn, 4);
         assert_eq!(detail.user_input, "hello from audit turn");
         assert_eq!(detail.assistant_output, "done");
-        assert_eq!(detail.tokens_in, 10);
-        assert_eq!(detail.cached_input_tokens, 2);
-        assert_eq!(detail.tokens_out, 5);
-        assert_eq!(detail.total_tokens, 17);
+        assert_eq!(detail.tokens_in, Some(10));
+        assert_eq!(detail.cached_input_tokens, Some(2));
+        assert_eq!(detail.tokens_out, Some(5));
+        assert_eq!(detail.total_tokens, Some(17));
         assert_eq!(detail.duration_ms, 123);
         assert_eq!(detail.ttft_ms, Some(11));
         assert_eq!(detail.context_ms, Some(22));
@@ -5399,11 +5411,11 @@ mod tests {
             &mut detail,
             &TurnObservedMetrics {
                 token_usage: Some(ParsedTurnTokenUsage {
-                    input_tokens: 100,
-                    cached_input_tokens: 20,
-                    cache_creation_tokens: 3,
-                    output_tokens: 50,
-                    total_tokens: 173,
+                    input_tokens: Some(100),
+                    cached_input_tokens: Some(20),
+                    cache_creation_tokens: Some(3),
+                    output_tokens: Some(50),
+                    total_tokens: Some(173),
                 }),
                 model: Some("observed-model".into()),
                 assistant_output: Some("observed terminal output".into()),
@@ -5414,8 +5426,8 @@ mod tests {
             },
         );
         assert_eq!(detail.assistant_output, "observed terminal output");
-        assert_eq!(detail.tokens_in, 100);
-        assert_eq!(detail.total_tokens, 173);
+        assert_eq!(detail.tokens_in, Some(100));
+        assert_eq!(detail.total_tokens, Some(173));
         assert_eq!(detail.duration_ms, 999);
         assert_eq!(detail.model.as_deref(), Some("observed-model"));
         assert_eq!(detail.error_message.as_deref(), Some("observed turn error"));
@@ -5800,6 +5812,94 @@ mod tests {
     }
 
     #[test]
+    fn partial_usage_remains_unknown_and_unpriced_in_either_order() {
+        let complete = TurnCostSample {
+            model: "model".into(),
+            model_attributed: true,
+            usage: parse_turn_token_usage(
+                r#"{"input_tokens":100,"cached_input_tokens":900,"cache_creation_tokens":0,"output_tokens":20}"#,
+                "test",
+            ).unwrap(),
+        };
+        let partial = TurnCostSample {
+            model: "model".into(),
+            model_attributed: true,
+            usage: parse_turn_token_usage(r#"{"output_tokens":7}"#, "test").unwrap(),
+        };
+        let pricing = HashMap::from([(
+            "model".into(),
+            PricingData {
+                prompt: 0.01,
+                completion: 0.02,
+                cache_read: Some(0.001),
+                cache_write: Some(0.01),
+            },
+        )]);
+        for samples in [
+            [complete.clone(), partial.clone()],
+            [partial.clone(), complete.clone()],
+        ] {
+            let summary = summarize_session_request_usage(samples.clone());
+            assert_eq!(summary.request_count, 2);
+            assert_eq!(summary.fresh_input_tokens, None);
+            assert_eq!(summary.cache_read_tokens, None);
+            assert_eq!(summary.cache_creation_tokens, None);
+            assert_eq!(summary.output_tokens, Some(27));
+            let json = serde_json::to_value(summary).unwrap();
+            assert!(json["cache_read_tokens"].is_null());
+            assert_eq!(json["output_tokens"], 27);
+            let cost = summarize_session_cost(samples, &pricing);
+            assert_eq!(cost.priced_turn_count, 1);
+            assert_eq!(cost.unpriced_turn_count, 1);
+            assert_eq!(
+                cost.estimated_cost_usd,
+                priced_turn_cost(complete.usage, &pricing["model"])
+            );
+        }
+        let mut latest = Some(complete.usage);
+        add_turn_token_usage(&mut latest, partial.usage);
+        assert_eq!(latest, Some(partial.usage));
+        let unpriced = summarize_session_cost([partial], &pricing);
+        assert_eq!(
+            serde_json::to_value(unpriced).unwrap(),
+            serde_json::json!({"priced_turn_count":0,"unpriced_turn_count":1})
+        );
+        assert_eq!(
+            parse_turn_token_usage("{}", "test").unwrap(),
+            ParsedTurnTokenUsage::default()
+        );
+        assert_eq!(
+            parse_optional_turn_token_usage(None, "test").unwrap(),
+            ParsedTurnTokenUsage::default()
+        );
+    }
+
+    #[test]
+    fn request_usage_empty_set_and_overflow_are_not_missing_evidence() {
+        let empty = summarize_session_request_usage([]);
+        assert_eq!(empty.request_count, 0);
+        assert_eq!(empty.fresh_input_tokens, Some(0));
+        assert_eq!(empty.cache_read_tokens, Some(0));
+        assert_eq!(
+            SessionRequestUsageSummary::default().fresh_input_tokens,
+            None
+        );
+        let sample = TurnCostSample {
+            model: "model".into(),
+            model_attributed: true,
+            usage: parse_turn_token_usage(
+                &format!(r#"{{"input_tokens":{},"cached_input_tokens":0,"cache_creation_tokens":0,"output_tokens":0}}"#, i64::MAX),
+                "test",
+            ).unwrap(),
+        };
+        let known = summarize_session_request_usage([sample.clone(), sample.clone()]);
+        assert_eq!(known.fresh_input_tokens, Some(u64::MAX - 1));
+        let overflow = summarize_session_request_usage([sample.clone(), sample.clone(), sample]);
+        assert_eq!(overflow.fresh_input_tokens, None);
+        assert_eq!(overflow.output_tokens, Some(0));
+    }
+
+    #[test]
     fn parse_turn_token_usage_supports_canonical_shape() {
         let usage = parse_turn_token_usage(
             r#"{
@@ -5817,11 +5917,11 @@ mod tests {
             "test_token_usage",
         )
         .unwrap();
-        assert_eq!(usage.input_tokens, 100);
-        assert_eq!(usage.cached_input_tokens, 25);
-        assert_eq!(usage.cache_creation_tokens, 5);
-        assert_eq!(usage.output_tokens, 40);
-        assert_eq!(usage.total_tokens, 170);
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.cached_input_tokens, Some(25));
+        assert_eq!(usage.cache_creation_tokens, Some(5));
+        assert_eq!(usage.output_tokens, Some(40));
+        assert_eq!(usage.total_tokens, Some(170));
     }
 
     #[test]
@@ -5918,14 +6018,43 @@ mod tests {
     }
 
     #[test]
+    fn turn_cost_requires_model_attribution_even_with_complete_tokens_and_prices() {
+        let pricing = HashMap::from([(
+            "gpt-5".into(),
+            PricingData {
+                prompt: 1.0,
+                completion: 2.0,
+                cache_read: Some(0.1),
+                cache_write: Some(1.0),
+            },
+        )]);
+        for usage in [
+            r#"{"input_tokens":10,"cached_input_tokens":2,"cache_creation_tokens":0,"output_tokens":5,"total_tokens":17}"#,
+            r#"{"input_tokens":10,"cached_input_tokens":2,"cache_creation_tokens":0,"output_tokens":5,"total_tokens":17,"scope":"runtime_accounted_usage"}"#,
+            r#"{"input_tokens":10,"cached_input_tokens":2,"cache_creation_tokens":0,"output_tokens":5,"total_tokens":17,"scope":"unknown"}"#,
+        ] {
+            let sample =
+                session_turn_cost_sample_from_row(&FakeSessionAuditRow::with_token_usage(usage))
+                    .unwrap();
+            assert!(!sample.model_attributed);
+            assert_eq!(sample.usage.total_tokens, Some(17));
+            let cost = summarize_session_cost([sample], &pricing);
+            assert_eq!(cost.priced_turn_count, 0);
+            assert_eq!(cost.unpriced_turn_count, 1);
+            assert_eq!(cost.estimated_cost_usd, None);
+            assert!(cost.per_model_cost_usd.is_empty());
+        }
+    }
+
+    #[test]
     fn session_turn_cost_sample_row_decode_preserves_values_and_fails_loudly() {
         let sample = session_turn_cost_sample_from_row(&FakeSessionAuditRow::complete())
             .expect("cost sample row decodes");
         assert_eq!(sample.model, "gpt-5");
-        assert_eq!(sample.usage.input_tokens, 10);
-        assert_eq!(sample.usage.cached_input_tokens, 2);
-        assert_eq!(sample.usage.output_tokens, 5);
-        assert_eq!(sample.usage.total_tokens, 17);
+        assert_eq!(sample.usage.input_tokens, Some(10));
+        assert_eq!(sample.usage.cached_input_tokens, Some(2));
+        assert_eq!(sample.usage.output_tokens, Some(5));
+        assert_eq!(sample.usage.total_tokens, Some(17));
 
         assert_audit_internal_error_mentions(
             session_turn_cost_sample_from_row(&FakeSessionAuditRow::fail_on("llm_model_used")),
@@ -5947,31 +6076,33 @@ mod tests {
             session_turn_cost_sample_from_row(&FakeSessionAuditRow::with_token_usage(
                 r#"{"input_tokens": -1}"#,
             )),
-            "non-negative token count",
+            "field `input_tokens` must be a non-negative integer",
         );
     }
 
     #[test]
-    fn summarize_session_cost_aggregates_priced_turns_and_flags_unpriced_ones() {
+    fn summarize_session_cost_with_model_attribution_aggregates_priced_and_unpriced_turns() {
         let turns = vec![
             TurnCostSample {
                 model: "claude".into(),
+                model_attributed: true,
                 usage: ParsedTurnTokenUsage {
-                    input_tokens: 1_000_000,
-                    cached_input_tokens: 0,
-                    cache_creation_tokens: 0,
-                    output_tokens: 500_000,
-                    total_tokens: 1_500_000,
+                    input_tokens: Some(1_000_000),
+                    cached_input_tokens: Some(0),
+                    cache_creation_tokens: Some(0),
+                    output_tokens: Some(500_000),
+                    total_tokens: Some(1_500_000),
                 },
             },
             TurnCostSample {
                 model: "unknown".into(),
+                model_attributed: true,
                 usage: ParsedTurnTokenUsage {
-                    input_tokens: 100,
-                    cached_input_tokens: 0,
-                    cache_creation_tokens: 0,
-                    output_tokens: 50,
-                    total_tokens: 150,
+                    input_tokens: Some(100),
+                    cached_input_tokens: Some(0),
+                    cache_creation_tokens: Some(0),
+                    output_tokens: Some(50),
+                    total_tokens: Some(150),
                 },
             },
         ];
@@ -5997,44 +6128,47 @@ mod tests {
         let usage = summarize_session_request_usage([
             TurnCostSample {
                 model: "parent".into(),
+                model_attributed: true,
                 usage: ParsedTurnTokenUsage {
-                    input_tokens: 120,
-                    cached_input_tokens: 480,
-                    cache_creation_tokens: 20,
-                    output_tokens: 30,
-                    total_tokens: 650,
+                    input_tokens: Some(120),
+                    cached_input_tokens: Some(480),
+                    cache_creation_tokens: Some(20),
+                    output_tokens: Some(30),
+                    total_tokens: Some(650),
                 },
             },
             TurnCostSample {
                 model: "child".into(),
+                model_attributed: true,
                 usage: ParsedTurnTokenUsage {
-                    input_tokens: 40,
-                    cached_input_tokens: 160,
-                    cache_creation_tokens: 0,
-                    output_tokens: 10,
-                    total_tokens: 210,
+                    input_tokens: Some(40),
+                    cached_input_tokens: Some(160),
+                    cache_creation_tokens: Some(0),
+                    output_tokens: Some(10),
+                    total_tokens: Some(210),
                 },
             },
         ]);
 
         assert_eq!(usage.scope, SessionRequestUsageScope::SessionAllRuns);
         assert_eq!(usage.request_count, 2);
-        assert_eq!(usage.fresh_input_tokens, 160);
-        assert_eq!(usage.cache_read_tokens, 640);
-        assert_eq!(usage.cache_creation_tokens, 20);
-        assert_eq!(usage.output_tokens, 40);
+        assert_eq!(usage.fresh_input_tokens, Some(160));
+        assert_eq!(usage.cache_read_tokens, Some(640));
+        assert_eq!(usage.cache_creation_tokens, Some(20));
+        assert_eq!(usage.output_tokens, Some(40));
     }
 
     #[test]
     fn summarize_session_cost_marks_missing_cache_rate_as_unpriced() {
         let turns = vec![TurnCostSample {
             model: "claude".into(),
+            model_attributed: true,
             usage: ParsedTurnTokenUsage {
-                input_tokens: 100,
-                cached_input_tokens: 10,
-                cache_creation_tokens: 0,
-                output_tokens: 20,
-                total_tokens: 130,
+                input_tokens: Some(100),
+                cached_input_tokens: Some(10),
+                cache_creation_tokens: Some(0),
+                output_tokens: Some(20),
+                total_tokens: Some(130),
             },
         }];
         let pricing_by_model = HashMap::from([(
@@ -6058,11 +6192,13 @@ mod tests {
     fn summarize_session_cost_marks_invalid_required_rate_as_unpriced() {
         let turns = vec![TurnCostSample {
             model: "claude".into(),
+            model_attributed: true,
             usage: ParsedTurnTokenUsage {
-                input_tokens: 100,
-                output_tokens: 20,
-                total_tokens: 120,
-                ..ParsedTurnTokenUsage::default()
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                total_tokens: Some(120),
+                cached_input_tokens: Some(0),
+                cache_creation_tokens: Some(0),
             },
         }];
         let pricing_by_model = HashMap::from([(
@@ -6179,10 +6315,10 @@ mod tests {
             request_usage: SessionRequestUsageSummary {
                 scope: SessionRequestUsageScope::SessionAllRuns,
                 request_count: 12,
-                fresh_input_tokens: 5000,
-                cache_read_tokens: 4200,
-                cache_creation_tokens: 100,
-                output_tokens: 3000,
+                fresh_input_tokens: Some(5000),
+                cache_read_tokens: Some(4200),
+                cache_creation_tokens: Some(100),
+                output_tokens: Some(3000),
             },
             tool_calls_total: 25,
             tool_calls_failed: 2,
@@ -6627,11 +6763,11 @@ mod tests {
             turn: 1,
             user_input_preview: "probe".into(),
             tool_calls: vec![],
-            tokens_in: 0,
-            cached_input_tokens: 0,
-            cache_creation_tokens: 0,
-            tokens_out: 0,
-            total_tokens: 0,
+            tokens_in: Some(0),
+            cached_input_tokens: Some(0),
+            cache_creation_tokens: Some(0),
+            tokens_out: Some(0),
+            total_tokens: Some(0),
             duration_ms: 2,
             has_error: false,
             has_stall: false,
@@ -6640,11 +6776,11 @@ mod tests {
         };
         let metrics = TurnObservedMetrics {
             token_usage: Some(ParsedTurnTokenUsage {
-                input_tokens: 100,
-                cached_input_tokens: 40,
-                cache_creation_tokens: 10,
-                output_tokens: 20,
-                total_tokens: 130,
+                input_tokens: Some(100),
+                cached_input_tokens: Some(40),
+                cache_creation_tokens: Some(10),
+                output_tokens: Some(20),
+                total_tokens: Some(130),
             }),
             model: Some("deepseek-v4-flash".into()),
             tool_calls: vec![ToolCallBrief {
@@ -6661,11 +6797,11 @@ mod tests {
 
         apply_turn_observed_metrics(&mut turn, &metrics);
 
-        assert_eq!(turn.tokens_in, 100);
-        assert_eq!(turn.cached_input_tokens, 40);
-        assert_eq!(turn.cache_creation_tokens, 10);
-        assert_eq!(turn.tokens_out, 20);
-        assert_eq!(turn.total_tokens, 130);
+        assert_eq!(turn.tokens_in, Some(100));
+        assert_eq!(turn.cached_input_tokens, Some(40));
+        assert_eq!(turn.cache_creation_tokens, Some(10));
+        assert_eq!(turn.tokens_out, Some(20));
+        assert_eq!(turn.total_tokens, Some(130));
         assert_eq!(turn.duration_ms, 1_200);
         assert_eq!(turn.model.as_deref(), Some("deepseek-v4-flash"));
         assert_eq!(turn.tool_calls.len(), 1);

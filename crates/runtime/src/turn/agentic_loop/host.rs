@@ -52,7 +52,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::turn::runtime_policy::RuntimePolicy;
 use astra_core::ObservationJournal;
@@ -490,6 +490,13 @@ pub use astra_turn_core::interaction_types::{
 /// streams SSE to client, executes tools via ledger.
 #[async_trait]
 pub trait AgenticLoopHost: Send {
+    /// Remaining wall-clock authority for this execution, when the host has a
+    /// request-scoped deadline. The runtime uses this to stop exploration
+    /// before the host's hard boundary, leaving time for safe settlement.
+    fn execution_time_budget_remaining(&self) -> Option<Duration> {
+        None
+    }
+
     /// Physical request topology owned by this execution host. Remote thin
     /// clients never reconstruct it; they forward the Server-authored frame.
     fn runtime_feedback_topology(&self) -> astra_services::ModelRequestTopology {
@@ -1756,7 +1763,7 @@ pub struct TelemetryState {
     /// Server-owned terminal summaries observed during this *logical* CLI
     /// turn.  The set is intentionally state-local: summaries from another
     /// user turn or session must never be folded into this aggregate.
-    pub server_summary_run_ids: HashSet<String>,
+    pub server_summary_run_usage: HashMap<String, Option<astra_turn_types::CanonicalTokenUsage>>,
     pub server_summary_llm_rounds: u32,
     pub server_summary_tool_calls: u32,
     pub server_summary_observation_tool_calls: u32,
@@ -2382,7 +2389,11 @@ pub(crate) struct OriginalLoopExecutionFacts {
     pub total_tool_calls: u32,
     pub total_observation_tool_calls: u32,
     pub has_any_usage: bool,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
     pub agentic_turn_budget: astra_turn_core::chat_turn_heuristics::AgenticTurnBudget,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub last_request_usage: Option<astra_turn_types::RequestTokenUsage>,
     pub budget_is_explicit: bool,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub budget_policy: Option<crate::turn::runtime_policy::RuntimePolicy>,
@@ -2443,6 +2454,8 @@ impl OriginalLoopExecutionFacts {
             total_tool_calls: state.total_tool_calls,
             total_observation_tool_calls: state.total_observation_tool_calls,
             has_any_usage: state.has_any_usage,
+            qualified_usage: state.qualified_usage,
+            last_request_usage: state.last_request_usage,
             agentic_turn_budget: state.agentic_turn_budget,
             budget_is_explicit: state.budget_is_explicit,
             budget_policy: state.budget_policy.clone(),
@@ -2549,6 +2562,7 @@ fn deserialize_pending_context<'de, D: serde::Deserializer<'de>>(
 /// state size bounded.
 #[derive(Debug, Clone)]
 pub struct RecentRoundSummary {
+    pub qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
     pub purpose: astra_turn_types::InferencePurpose,
     pub turn: u32,
     pub round: u32,
@@ -3353,7 +3367,7 @@ pub struct AgenticLoopState {
     pub final_output_ready_notified: bool,
     // Run-level token aggregators. See `turn::token_usage::TokenUsage` for
     // the per-call invariant: these four fields are DISJOINT buckets whose
-    // sum equals the billable total across the whole run.
+    // sum is the observed subtotal, not proof of complete billable usage.
     //
     // - total_prompt         → fresh input tokens (billed at full rate)
     // - total_cache_read     → cached input tokens (discount rate)
@@ -3370,6 +3384,9 @@ pub struct AgenticLoopState {
     /// window and a bounded replay window retain call identities.
     pub tool_ledger_receipt: ToolLedgerReceiptAccumulator,
     pub has_any_usage: bool,
+    /// Per-lane complete evidence; numeric totals above are observed subtotals.
+    pub qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
+    pub last_request_usage: Option<astra_turn_types::RequestTokenUsage>,
 
     // ── Turn management ──
     pub loop_entry: LoopEntry,
@@ -3427,10 +3444,6 @@ pub struct AgenticLoopState {
     pub max_identical_tool_calls: u32,
     /// Resolved max tool calls per turn (from config, computed once at init).
     pub max_tools_per_turn: u32,
-    /// Consecutive cache-hit suppression cap before the pipeline switches
-    /// from soft-hint to hard-refusal. Replaces the former hardcoded
-    /// `REPEATED_CACHE_HIT_SUPPRESSION_THRESHOLD` (was 2).
-    pub repeated_cache_hit_suppression: u32,
     /// Headless-round abort cap for consecutive empty-name tool calls.
     /// Replaces the former hardcoded `MAX_CONSECUTIVE_EMPTY_NAME` (was 3).
     pub max_consecutive_empty_name: u32,
@@ -3822,6 +3835,19 @@ pub fn runtime_manifest_for_model(
 }
 
 impl AgenticLoopState {
+    pub(crate) fn add_qualified_usage(
+        &mut self,
+        usage: Option<astra_turn_types::CanonicalTokenUsage>,
+    ) {
+        let Some(usage) = usage else { return };
+        self.qualified_usage = Some(match self.qualified_usage {
+            None => usage,
+            Some(total) => total.checked_add(usage).unwrap_or_else(|_| {
+                astra_turn_types::CanonicalTokenUsage::new(None, None, None, None)
+                    .expect("unknown usage is valid")
+            }),
+        });
+    }
     /// Shared projection for all execution checkpoint producers. The enclosing
     /// heavy checkpoint and paired budget own frontier and run identity.
     pub fn run_execution_control_snapshot(
@@ -3887,23 +3913,44 @@ impl AgenticLoopState {
         &mut self,
         run_id: Option<&str>,
         summary: &ServerLoopExecutionSummary,
+        qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
     ) -> bool {
         let run_id = run_id.map(str::trim).filter(|id| !id.is_empty());
         let is_new = match run_id {
-            Some(run_id) => self
-                .telemetry
-                .server_summary_run_ids
-                .insert(run_id.to_string()),
+            Some(run_id) => {
+                if let Some(previous) = self.telemetry.server_summary_run_usage.get(run_id) {
+                    if *previous != qualified_usage {
+                        tracing::warn!("conflicting run usage snapshots; capture unavailable");
+                        self.add_qualified_usage(Some(
+                            astra_turn_types::CanonicalTokenUsage::new(None, None, None, None)
+                                .expect("unknown usage is valid"),
+                        ));
+                    }
+                    false
+                } else {
+                    self.telemetry
+                        .server_summary_run_usage
+                        .insert(run_id.to_string(), qualified_usage);
+                    true
+                }
+            }
             None => {
                 tracing::warn!(
                     target: "astra::turn_projection",
                     "server execution summary has no run_id; refusing anonymous receipt folding"
                 );
+                // Reject anonymous counts without letting an earlier complete
+                // sample conceal the newly observed coverage gap.
+                self.add_qualified_usage(Some(
+                    astra_turn_types::CanonicalTokenUsage::new(None, None, None, None)
+                        .expect("unknown usage is valid"),
+                ));
                 false
             }
         };
 
         if is_new {
+            self.add_qualified_usage(qualified_usage);
             self.tool_ledger_receipt
                 .absorb_remote(&summary.tool_ledger_receipt);
             self.telemetry.server_record_gap_observed |= !summary.has_complete_tool_ledger();
@@ -3953,11 +4000,12 @@ impl AgenticLoopState {
         &mut self,
         run_id: Option<&str>,
         summary: &ServerLoopExecutionSummary,
+        qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
     ) -> bool {
         let local_rounds = self
             .llm_rounds_completed
             .saturating_sub(self.telemetry.server_summary_llm_rounds);
-        let is_new = self.fold_server_execution_summary(run_id, summary);
+        let is_new = self.fold_server_execution_summary(run_id, summary, qualified_usage);
         self.llm_rounds_completed =
             local_rounds.saturating_add(self.telemetry.server_summary_llm_rounds);
         self.telemetry.authoritative_llm_rounds = Some(self.llm_rounds_completed);
@@ -5352,6 +5400,8 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         total_observation_tool_calls: 0,
         tool_ledger_receipt: Default::default(),
         has_any_usage: false,
+        qualified_usage: None,
+        last_request_usage: None,
         last_finish_reason: None,
         max_turns: 10,
         remaining_turns: 10,
@@ -5373,7 +5423,6 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         call_counts: HashMap::new(),
         max_identical_tool_calls: policy.max_identical_tool_calls,
         max_tools_per_turn: policy.max_tools_per_turn,
-        repeated_cache_hit_suppression: policy.repeated_cache_hit_suppression,
         max_consecutive_empty_name: policy.max_consecutive_empty_name,
         stall: Default::default(),
         telemetry: Default::default(),
@@ -5578,9 +5627,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn remote_usage_conflict_is_absorbing_without_double_counting() {
+        use astra_turn_types::CanonicalTokenUsage;
+        let known = Some(CanonicalTokenUsage::new(Some(10), Some(0), Some(0), Some(2)).unwrap());
+        let partial = Some(CanonicalTokenUsage::new(Some(10), None, None, Some(2)).unwrap());
+        let other = Some(CanonicalTokenUsage::new(Some(20), Some(0), Some(0), Some(2)).unwrap());
+        let unknown = Some(CanonicalTokenUsage::new(None, None, None, None).unwrap());
+        for (first, second) in [
+            (known, partial),
+            (partial, known),
+            (known, other),
+            (None, unknown),
+        ] {
+            let mut state = make_test_loop_state();
+            let summary = ServerLoopExecutionSummary {
+                llm_rounds: 1,
+                ..Default::default()
+            };
+            assert!(state.fold_server_execution_summary(Some("run"), &summary, first));
+            assert!(!state.fold_server_execution_summary(Some("run"), &summary, first));
+            assert_eq!(state.qualified_usage, first);
+            assert!(!state.fold_server_execution_summary(Some("run"), &summary, second));
+            assert_eq!(state.qualified_usage, unknown);
+            assert!(!state.fold_server_execution_summary(Some("run"), &summary, first));
+            assert_eq!(state.qualified_usage, unknown);
+            assert!(state.fold_server_execution_summary(Some("another-run"), &summary, known));
+            assert_eq!(state.qualified_usage, unknown);
+            assert_eq!(state.telemetry.server_summary_llm_rounds, 2);
+        }
+    }
+
+    #[test]
     fn prompt_growth_telemetry_uses_logical_cache_aware_input() {
         let mut state = make_test_loop_state();
         let round = |round, fresh, cache_read, cache_creation| RecentRoundSummary {
+            qualified_usage: None,
             purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             turn: 1,
             round,
@@ -5640,9 +5721,9 @@ pub(crate) mod tests {
             runtime_feedback: None,
         };
 
-        assert!(state.fold_server_execution_summary(Some("run-a"), &first));
-        assert!(state.fold_server_execution_summary(Some("run-b"), &second));
-        assert!(!state.fold_server_execution_summary(Some("run-b"), &second));
+        assert!(state.fold_server_execution_summary(Some("run-a"), &first, None));
+        assert!(state.fold_server_execution_summary(Some("run-b"), &second, None));
+        assert!(!state.fold_server_execution_summary(Some("run-b"), &second, None));
 
         assert_eq!(state.telemetry.server_summary_llm_rounds, 35);
         assert_eq!(state.telemetry.server_summary_tool_calls, 34);
@@ -5698,13 +5779,25 @@ pub(crate) mod tests {
         // One local edge round, a remote run, one more local round, then a
         // second remote run: 1 + 10 + 1 + 25, not just the remote subtotal.
         state.llm_rounds_completed = 1;
-        assert!(state.fold_server_execution_summary_and_refresh_rounds(Some("run-a"), &first));
+        assert!(state.fold_server_execution_summary_and_refresh_rounds(
+            Some("run-a"),
+            &first,
+            None
+        ));
         assert_eq!(state.llm_rounds_completed, 11);
         state.record_local_llm_round();
         assert_eq!(state.telemetry.authoritative_llm_rounds, Some(12));
-        assert!(state.fold_server_execution_summary_and_refresh_rounds(Some("run-b"), &second));
+        assert!(state.fold_server_execution_summary_and_refresh_rounds(
+            Some("run-b"),
+            &second,
+            None
+        ));
         assert_eq!(state.llm_rounds_completed, 37);
-        assert!(!state.fold_server_execution_summary_and_refresh_rounds(Some("run-b"), &second));
+        assert!(!state.fold_server_execution_summary_and_refresh_rounds(
+            Some("run-b"),
+            &second,
+            None
+        ));
         assert_eq!(state.llm_rounds_completed, 37);
         assert!(!state.telemetry.server_record_gap_observed);
 
@@ -5732,7 +5825,11 @@ pub(crate) mod tests {
             runtime_feedback: None,
         };
 
-        assert!(state.fold_server_execution_summary_and_refresh_rounds(Some("run-a"), &remote));
+        assert!(state.fold_server_execution_summary_and_refresh_rounds(
+            Some("run-a"),
+            &remote,
+            None
+        ));
         assert_eq!(state.llm_rounds_completed, 10);
         assert_eq!(state.telemetry.authoritative_llm_rounds, Some(10));
 
@@ -6235,6 +6332,7 @@ pub(crate) mod tests {
         committed_work_synthesis: Result<bool, String>,
         committed_work_synthesis_sequence: std::collections::VecDeque<Result<bool, String>>,
         pub(crate) committed_work_synthesis_checks: usize,
+        execution_time_budget_remaining: Option<Duration>,
     }
 
     impl MockHost {
@@ -6285,6 +6383,7 @@ pub(crate) mod tests {
                 committed_work_synthesis: Ok(false),
                 committed_work_synthesis_sequence: std::collections::VecDeque::new(),
                 committed_work_synthesis_checks: 0,
+                execution_time_budget_remaining: None,
             }
         }
 
@@ -6320,6 +6419,11 @@ pub(crate) mod tests {
 
         pub(crate) fn with_cancel_child_agents_delay(mut self, delay: std::time::Duration) -> Self {
             self.cancel_child_agents_delay = Some(delay);
+            self
+        }
+
+        pub(crate) fn with_execution_time_budget_remaining(mut self, remaining: Duration) -> Self {
+            self.execution_time_budget_remaining = Some(remaining);
             self
         }
 
@@ -6388,6 +6492,10 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl AgenticLoopHost for MockHost {
+        fn execution_time_budget_remaining(&self) -> Option<Duration> {
+            self.execution_time_budget_remaining
+        }
+
         async fn hydrate_restored_history(
             &mut self,
             state: &mut AgenticLoopState,
@@ -6682,6 +6790,9 @@ pub(crate) mod tests {
                 has_usage: true,
                 prompt_tokens: prompt,
                 completion_tokens: completion,
+                current_request_usage: Some(
+                    astra_turn_types::RequestTokenUsage::try_new(prompt, 0, 0, completion).unwrap(),
+                ),
                 ..ChatTurnSseAccum::default()
             },
             ttft_ms: ttft,
@@ -6824,6 +6935,9 @@ pub(crate) mod tests {
                 prompt_tokens: prompt,
                 completion_tokens: completion,
                 tool_calls,
+                current_request_usage: Some(
+                    astra_turn_types::RequestTokenUsage::try_new(prompt, 0, 0, completion).unwrap(),
+                ),
                 ..ChatTurnSseAccum::default()
             },
             ttft_ms: ttft,
@@ -6846,6 +6960,9 @@ pub(crate) mod tests {
                 prompt_tokens: prompt,
                 completion_tokens: completion,
                 tool_calls,
+                current_request_usage: Some(
+                    astra_turn_types::RequestTokenUsage::try_new(prompt, 0, 0, completion).unwrap(),
+                ),
                 ..ChatTurnSseAccum::default()
             },
             ttft_ms: ttft,
@@ -6867,6 +6984,9 @@ pub(crate) mod tests {
                 full_text: preamble.to_string(),
                 has_tool_calls: true,
                 has_usage: true,
+                current_request_usage: Some(
+                    astra_turn_types::RequestTokenUsage::try_new(prompt, 0, 0, completion).unwrap(),
+                ),
                 prompt_tokens: prompt,
                 completion_tokens: completion,
                 tool_calls,
@@ -7201,6 +7321,8 @@ pub(crate) mod tests {
             total_observation_tool_calls: 0,
             tool_ledger_receipt: Default::default(),
             has_any_usage: false,
+            qualified_usage: None,
+            last_request_usage: None,
             max_turns: 10,
             remaining_turns: 10,
             charged_iterations: 0,
@@ -7225,7 +7347,6 @@ pub(crate) mod tests {
             max_tools_per_turn: astra_config::runtime_config::RuntimeConfig::load()
                 .tool_policy
                 .effective_max_tools_per_turn(),
-            repeated_cache_hit_suppression: 3,
             max_consecutive_empty_name: 3,
             stall: Default::default(),
             telemetry: Default::default(),
@@ -7680,6 +7801,9 @@ pub(crate) mod tests {
                 cache_read_tokens: 800,
                 cache_creation_tokens: 100,
                 completion_tokens: 50,
+                current_request_usage: Some(
+                    astra_turn_types::RequestTokenUsage::try_new(200, 800, 100, 50).unwrap(),
+                ),
                 has_usage: true,
                 ..Default::default()
             },
@@ -7745,6 +7869,9 @@ pub(crate) mod tests {
                 cache_read_tokens: 800,
                 cache_creation_tokens: 100,
                 completion_tokens: 50,
+                current_request_usage: Some(
+                    astra_turn_types::RequestTokenUsage::try_new(200, 800, 100, 50).unwrap(),
+                ),
                 has_usage: true,
                 ..Default::default()
             },
@@ -9441,6 +9568,52 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn incomplete_terminal_fanout_leaves_parent_fallback_available() {
+        let mut fanout = make_terminal_agent_fanout_edge_tool("review-group");
+        fanout.output = json!({
+            "status": "completed_with_issues",
+            "group_id": "review-group",
+            "target_count": 3,
+            "active": 0,
+            "terminal": 3,
+            "completed": 1,
+            "failed": 2,
+            "results": [
+                {"slot_index": 0, "status": "completed", "result": "finding-a"},
+                {"slot_index": 1, "status": "failed", "result": {"status": "failed", "error": "no deliverable"}},
+                {"slot_index": 2, "status": "failed", "result": {"status": "failed", "error": "no deliverable"}}
+            ]
+        })
+        .to_string();
+
+        let mut host = MockHost::new(vec![
+            edge_tool_result(vec![fanout], 10, 5, None),
+            edge_tool_result(
+                vec![make_edge_tool("read_file", "parent fallback evidence")],
+                10,
+                5,
+                None,
+            ),
+            text_result("Parent continued with available evidence.", 10, 5, None),
+        ])
+        .with_valid_tools(&["agent_fanout", "read_file"]);
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(
+            matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
+            "{outcome:?}"
+        );
+        assert_eq!(host.turn_count(), 3);
+        assert_eq!(host.text_only_turns, vec![false, false, false]);
+        assert_eq!(
+            state.final_text,
+            "Parent continued with available evidence."
+        );
+    }
+
+    #[tokio::test]
     async fn tool_call_records_populated_from_edge_round() {
         let mut host = MockHost::new(vec![
             edge_tool_result(vec![make_edge_tool("bash", "ok")], 10, 5, None),
@@ -10918,6 +11091,30 @@ pub(crate) mod tests {
         };
         assert!(exhausted.advance().is_err());
         assert_eq!(exhausted.iteration_index(), Some(u32::MAX));
+    }
+
+    #[test]
+    fn original_execution_facts_preserve_required_usage_evidence() {
+        use astra_turn_types::CanonicalTokenUsage;
+        for usage in [
+            None,
+            Some(CanonicalTokenUsage::new(None, None, None, None).unwrap()),
+            Some(CanonicalTokenUsage::new(Some(10), None, None, Some(2)).unwrap()),
+            Some(CanonicalTokenUsage::new(Some(0), Some(0), Some(0), Some(0)).unwrap()),
+        ] {
+            let mut state = make_state();
+            state.qualified_usage = usage;
+            let wire =
+                serde_json::to_value(OriginalLoopExecutionFacts::capture(&state).unwrap()).unwrap();
+            let facts: OriginalLoopExecutionFacts = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(facts.qualified_usage, usage);
+            let mut missing = wire.clone();
+            missing.as_object_mut().unwrap().remove("qualified_usage");
+            assert!(serde_json::from_value::<OriginalLoopExecutionFacts>(missing).is_err());
+            let mut invalid = wire;
+            invalid["qualified_usage"] = json!({"output_tokens":-1});
+            assert!(serde_json::from_value::<OriginalLoopExecutionFacts>(invalid).is_err());
+        }
     }
 
     #[test]

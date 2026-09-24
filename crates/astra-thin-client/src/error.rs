@@ -25,6 +25,8 @@ pub enum ThinClientError {
     IncompatibleRuntime { expected: String, actual: String },
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    #[error("Server admission deadline expired before request dispatch")]
+    AdmissionDeadlineExpired,
     #[error(
         "session {session_id} cancellation has not been confirmed complete: {reason}. Retry `astra session cancel {session_id}`; keep the session history"
     )]
@@ -62,6 +64,11 @@ mod tests {
     fn invalid_auth_header_display() {
         let err = ThinClientError::InvalidAuthHeader;
         assert!(err.to_string().contains("Authorization"));
+    }
+
+    #[test]
+    fn admission_deadline_expiry_is_not_a_retriable_transport_error() {
+        assert!(!ThinClientError::AdmissionDeadlineExpired.is_transport());
     }
 
     #[test]

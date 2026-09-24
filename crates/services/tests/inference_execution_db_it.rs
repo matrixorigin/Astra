@@ -36,6 +36,147 @@ use uuid::Uuid;
 
 const TEST_INFERENCE_OWNER_POD_ID: &str = "inference-db-it-owner";
 
+/// Opt-in measurement fixture, not a provider benchmark. Collect statement_info
+/// separately after this emits its connection IDs and DB-clock window.
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1 and ASTRA_LEDGER_COST_PROBE=1"]
+#[serial]
+async fn session_success_ledger_cost_probe() {
+    match std::env::var("ASTRA_LEDGER_COST_PROBE") {
+        Err(std::env::VarError::NotPresent) => {
+            eprintln!("SKIP ledger cost probe: set ASTRA_LEDGER_COST_PROBE=1 to measure");
+            return;
+        }
+        value => assert_eq!(value.as_deref(), Ok("1")),
+    }
+    let mut settings = common::require_db_it_env();
+    assert!(
+        settings.database.starts_with("astra_ledger_cost_probe_"),
+        "cost probe requires an explicitly isolated astra_ledger_cost_probe_* database"
+    );
+    settings.db_pool_max_connections = 2;
+    settings.db_pool_min_connections = 2;
+    let catalog =
+        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+    astra_services::ensure_core_schema(&settings, &catalog)
+        .await
+        .unwrap();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user = format!("ledger-cost-{suffix}");
+    let session = format!("ledger-cost-session-{suffix}");
+    let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+    sqlx::query("INSERT INTO agent_sessions (session_id, user_id, status, event_count, project_retention_policy, created_at, updated_at, last_active_at) VALUES (?, ?, 'active', 0, 'session', NOW(6), NOW(6), NOW(6))")
+        .bind(&session).bind(&user).execute(pool.get()).await.unwrap();
+    let mut first = pool.get().acquire().await.unwrap();
+    let mut second = pool.get().acquire().await.unwrap();
+    let mut before_ids = Vec::new();
+    for connection in [&mut first, &mut second] {
+        sqlx::raw_sql("SET SESSION disable_agg_statement = ON")
+            .execute(&mut **connection)
+            .await
+            .unwrap();
+        let enabled: String = sqlx::query_scalar("SELECT @@session.disable_agg_statement")
+            .fetch_one(&mut **connection)
+            .await
+            .unwrap();
+        assert_eq!(enabled, "1");
+        let id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(&mut **connection)
+            .await
+            .unwrap();
+        before_ids.push(id);
+        // UUID-generated hex literal remains identifiable even when trace
+        // does not expand prepared statement bindings.
+        sqlx::query(&format!("SELECT '{suffix}' AS astra_cost_begin_sentinel"))
+            .fetch_one(&mut **connection)
+            .await
+            .unwrap();
+    }
+    before_ids.sort_unstable();
+    assert_ne!(before_ids[0], before_ids[1]);
+    let started: chrono::NaiveDateTime = sqlx::query_scalar("SELECT CAST(NOW(6) AS DATETIME(6))")
+        .fetch_one(&mut *first)
+        .await
+        .unwrap();
+    drop((first, second));
+
+    let mut input = run_input(&user, &session, "unused", 1, "ledger_cost_probe");
+    input.scope = InferenceInvocationScope::Session {
+        session_id: session,
+        turn: 1,
+        round: 1,
+        operation_id: "ledger_cost_probe".into(),
+        logical_attempt: 0,
+    };
+    input.run_authority = None;
+    input.purpose = InferencePurpose::VerificationJudge;
+    let plan = plan_inference_invocation(input).unwrap();
+    let attempt = provider_attempt(&plan, 0);
+    let terminal = InferenceInvocationTerminal::succeeded(
+        InferenceUsage {
+            input: astra_turn_types::NormalizedPromptCacheUsage::new(13, 8, 2),
+            output_tokens: 6,
+        },
+        Some("fixture-response-not-a-provider-call".into()),
+    );
+    let wall = std::time::Instant::now();
+    admit_inference_invocation(&pool, &plan).await.unwrap();
+    let admission_us = wall.elapsed().as_micros();
+    begin_inference_provider_attempt(&pool, &attempt)
+        .await
+        .unwrap();
+    let before_provider_us = wall.elapsed().as_micros();
+    finish_successful_inference_provider_attempt_and_invocation(&pool, &plan, &attempt, &terminal)
+        .await
+        .unwrap();
+    let total_us = wall.elapsed().as_micros();
+
+    let mut first = pool.get().acquire().await.unwrap();
+    let mut second = pool.get().acquire().await.unwrap();
+    let ended: chrono::NaiveDateTime = sqlx::query_scalar("SELECT CAST(NOW(6) AS DATETIME(6))")
+        .fetch_one(&mut *first)
+        .await
+        .unwrap();
+    let mut after_ids = Vec::new();
+    for connection in [&mut first, &mut second] {
+        let id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(&mut **connection)
+            .await
+            .unwrap();
+        after_ids.push(id);
+        let enabled: String = sqlx::query_scalar("SELECT @@session.disable_agg_statement")
+            .fetch_one(&mut **connection)
+            .await
+            .unwrap();
+        assert_eq!(
+            enabled, "1",
+            "measurement connection lost its capture setting"
+        );
+        sqlx::query(&format!("SELECT '{suffix}' AS astra_cost_end_sentinel"))
+            .fetch_one(&mut **connection)
+            .await
+            .unwrap();
+    }
+    after_ids.sort_unstable();
+    assert_eq!(
+        before_ids, after_ids,
+        "connection replacement invalidates measurement"
+    );
+    eprintln!(
+        "LEDGER_COST_PROBE {}",
+        serde_json::json!({
+            "capture_status": "pending_external_trace_validation",
+            "database": settings.database, "connection_ids": before_ids,
+            "probe": suffix, "start": started, "end": ended,
+            "admission_us": admission_us, "before_provider_us": before_provider_us,
+            "ledger_total_us": total_us, "provider_calls": 0,
+            "usage": "fixture_not_measured", "physical_write_bytes": null,
+        })
+    );
+    drop((first, second));
+    pool.close().await;
+}
+
 fn run_authority() -> Option<InferenceRunAdmissionAuthority> {
     Some(InferenceRunAdmissionAuthority {
         expected_owner_generation: 0,

@@ -1307,6 +1307,7 @@ async fn execute_run(
     astra_services::configure_local_owner_scope(runner_identity.local_owner_scope.clone());
     runner_cfg.profile = Some(runner_identity.profile_name);
     runner_cfg.artifact_owner_scopes = runner_identity.artifact_owner_scopes.clone();
+    runner_cfg.cancel_flag = Some(cancel_flag.clone());
 
     let judger_model = req.judger_model.as_deref().unwrap_or(&config.judger_model);
     let judger_cfg = JudgerConfig::new(config.astra_bin.clone(), judger_model);

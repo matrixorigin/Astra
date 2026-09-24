@@ -555,7 +555,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             permission_grant,
         } = permitted;
 
-        self.begin_execution_trace(&execution, &idem_key);
+        self.begin_execution_trace(&execution, idem_key.as_ref());
         let tool_start = Instant::now();
         let dispatch_control = execute_tool_pure(
             &mut execution,
@@ -604,7 +604,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
     pub(super) fn postprocess_execution(
         &mut self,
         mut execution: super::HeadlessResolvedExecution,
-        idem_key: IdempotencyKey,
+        idem_key: Option<IdempotencyKey>,
         tool_start: Instant,
     ) -> ExecutedExecution {
         // TurnGuard/ToolHealth compute result fingerprints before the durable

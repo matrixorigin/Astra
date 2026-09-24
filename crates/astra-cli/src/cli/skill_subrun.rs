@@ -99,6 +99,9 @@ pub(crate) struct SubRunHost {
     pub(crate) effort: Option<String>,
     /// Agent type hint from the skill manifest.
     pub(crate) agent_type: Option<String>,
+    /// Child's inherited absolute deadline. Read on every boundary so time
+    /// spent in model calls or tool callbacks cannot replenish the allowance.
+    pub(crate) execution_deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
     /// Parent cancellation token — so Ctrl+C / stop propagates into sub-runs.
     pub(crate) cancel_token: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
     /// Same resolver as the parent loop so `skill` tool calls during the SSE edge
@@ -394,6 +397,10 @@ fn attach_runtime_volatile_injections(
 
 #[async_trait]
 impl AgenticLoopHost for SubRunHost {
+    fn execution_time_budget_remaining(&self) -> Option<std::time::Duration> {
+        self.execution_deadline.map(|deadline| deadline.remaining())
+    }
+
     fn deferred_tool_contract_schemas(&self) -> &[Value] {
         &self.all_schemas
     }
@@ -581,13 +588,63 @@ impl AgenticLoopHost for SubRunHost {
         );
 
         let server_payload =
-            crate::cli::chat_stream::server_loop_admission_payload(&payload, &state.message, false)
-                .map_err(str::to_string)?;
-        let resp = self
-            .api
-            .post_developer_loop_retry_429(&self.token, &server_payload, 3, true)
-            .await
-            .map_err(|e| e.to_string())?;
+            crate::cli::chat_stream::server_loop_admission_payload_with_execution_time_budget(
+                &payload,
+                &state.message,
+                false,
+                self.execution_deadline
+                    .map(|deadline| astra_services::runs::ExecutionTimeBudget {
+                        remaining_seconds: deadline.remaining().as_secs(),
+                    }),
+            )
+            .map_err(str::to_string)?;
+        let deadline = self.execution_deadline;
+        let admission =
+            self.api
+                .post_developer_loop_retry_429_with_payload(&self.token, 3, true, || {
+                    let mut payload = server_payload.clone();
+                    if let Some(deadline) = deadline {
+                        let admission_deadline = deadline
+                            .monotonic_deadline()
+                            .checked_sub(std::time::Duration::from_secs(1))
+                            .unwrap_or_else(std::time::Instant::now);
+                        let remaining_seconds = deadline.remaining().as_secs();
+                        if std::time::Instant::now() >= admission_deadline || remaining_seconds == 0
+                        {
+                            return Err(
+                                astra_thin_client::ThinClientError::AdmissionDeadlineExpired,
+                            );
+                        }
+                        payload["execution_time_budget"]["remaining_seconds"] =
+                            json!(remaining_seconds);
+                    }
+                    Ok(payload)
+                });
+        let resp = if let Some(deadline) = deadline {
+            let admission_deadline = deadline
+                .monotonic_deadline()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap_or_else(std::time::Instant::now);
+            tokio::time::timeout_at(admission_deadline.into(), admission)
+                .await
+                .map_err(|_| {
+                    astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::BudgetExhausted,
+                        "child admission deadline expired",
+                    )
+                })?
+        } else {
+            admission.await
+        }
+        .map_err(|e| match e {
+            astra_thin_client::ThinClientError::AdmissionDeadlineExpired => {
+                astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::BudgetExhausted,
+                    "child admission deadline expired before request dispatch",
+                )
+            }
+            other => astra_core::ClassifiedError::from(other.to_string()),
+        })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -1181,6 +1238,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             max_completion_tokens: max_tokens,
             effort: effort.map(String::from),
             agent_type: agent_type.map(String::from),
+            execution_deadline: None,
             cancel_token: Some(child_cancel_token.clone()),
             skill_resolver: self.skill_resolver.clone(),
             progress_tx: None,
@@ -1280,6 +1338,8 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             last_finish_reason: None,
             total_observation_tool_calls: 0,
             has_any_usage: false,
+            qualified_usage: None,
+            last_request_usage: None,
             max_turns: initial_turns,
             remaining_turns: initial_turns,
             charged_iterations: 0,
@@ -1302,7 +1362,6 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             call_counts: HashMap::new(),
             max_identical_tool_calls: resolved_tool_policy.max_identical_tool_calls,
             max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
-            repeated_cache_hit_suppression: resolved_tool_policy.repeated_cache_hit_suppression,
             max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
             stall: Default::default(),
             telemetry: Default::default(),
@@ -1807,6 +1866,7 @@ mod tests {
             max_completion_tokens: None,
             effort: None,
             agent_type: None,
+            execution_deadline: None,
             cancel_token: None,
             skill_resolver: None,
             progress_tx: None,
@@ -1837,6 +1897,7 @@ mod tests {
             max_completion_tokens: None,
             effort: None,
             agent_type: None,
+            execution_deadline: None,
             cancel_token: None,
             skill_resolver: None,
             progress_tx: None,
@@ -1848,6 +1909,24 @@ mod tests {
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
         }
+    }
+
+    #[test]
+    fn subrun_host_reports_a_shrinking_inherited_deadline() {
+        let mut host = bare_subrun_host();
+        host.execution_deadline = Some(
+            astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+                astra_services::runs::ExecutionTimeBudget {
+                    remaining_seconds: 2,
+                },
+                1_000,
+            )
+            .expect("valid child deadline"),
+        );
+        let first = host.execution_time_budget_remaining().expect("deadline");
+        let second = host.execution_time_budget_remaining().expect("deadline");
+        assert!(second <= first);
+        assert!(first <= std::time::Duration::from_secs(2));
     }
 
     #[test]
@@ -1925,6 +2004,7 @@ mod tests {
             max_completion_tokens: None,
             effort: None,
             agent_type: None,
+            execution_deadline: None,
             cancel_token: None,
             skill_resolver: None,
             progress_tx: None,
@@ -1958,6 +2038,7 @@ mod tests {
             max_completion_tokens: None,
             effort: None,
             agent_type: None,
+            execution_deadline: None,
             cancel_token: None,
             skill_resolver: None,
             progress_tx: Some(tx),
@@ -2077,6 +2158,7 @@ mod tests {
             max_completion_tokens: None,
             effort: None,
             agent_type: None,
+            execution_deadline: None,
             cancel_token: None,
             skill_resolver: None,
             progress_tx: None,
@@ -2111,6 +2193,7 @@ mod tests {
             max_completion_tokens: None,
             effort: None,
             agent_type: None,
+            execution_deadline: None,
             cancel_token: None,
             skill_resolver: None,
             progress_tx: None,

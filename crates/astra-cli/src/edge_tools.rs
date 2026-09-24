@@ -4705,13 +4705,14 @@ impl ToolExecutor {
                 "\n\nError: workspace binding or coordination generation changed during execution; the mutation may have applied, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
             );
         }
-        let writer_applied_by_owner = receipt_authority_valid
+        let direct_writer_applied = coordination_integrity_valid
             && !nested_run_script_callback
             && tool_result_fields
                 .as_ref()
                 .and_then(|fields| fields.get("workspace_mutation_applied"))
                 .and_then(Value::as_bool)
                 == Some(true);
+        let writer_applied_by_owner = receipt_authority_valid && direct_writer_applied;
         let writer_applied_by_fingerprint = if writer_applied_by_owner {
             false
         } else {
@@ -4764,6 +4765,22 @@ impl ToolExecutor {
                 None
             }
         };
+        if !receipt_authority_valid
+            && astra_tools::workspace_observation::typed_workspace_tool_applied_bound(
+                name,
+                args,
+                &self.project_root,
+                is_error,
+                direct_writer_applied,
+            )
+        {
+            tool_result_fields
+                .get_or_insert_with(Default::default)
+                .insert(
+                    astra_tools::workspace_observation::WRITER_APPLIED_BOUND_FIELD.to_string(),
+                    Value::Bool(true),
+                );
+        }
         // Structured workspace writers have already been checked by this
         // Edge executor against its bound workspace. Preserve that typed
         // owner fact across the Edge→server ledger; the server may not stat
@@ -6314,6 +6331,7 @@ mod tests {
             client_tool_delivery_tx: None,
             trace_context: None,
             execution_metadata: None,
+            execution_deadline: None,
             workspace_mutation: astra_runtime::orchestration::WorkspaceMutationAuthority::default(),
             transcript_location:
                 astra_runtime::orchestration::AgentTranscriptLocation::LocalJournal,
@@ -6468,6 +6486,54 @@ mod tests {
                 .get(astra_tools::workspace_observation::RECEIPT_FIELD)
                 .is_some_and(astra_tools::workspace_observation::is_typed_workspace_tool_receipt),
             "missing typed mutation receipt: {fields:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn weak_workspace_attribution_does_not_erase_direct_writer_applied_fact() {
+        let (dir, executor) = temp_executor();
+        std::fs::write(dir.path().join("target.txt"), "before\n").unwrap();
+        assert!(
+            astra_tools::workspace_observation::quarantine_after_weak_receipt(
+                dir.path(),
+                Some(astra_tools::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP),
+            )
+        );
+
+        let outcome = executor
+            .execute_with_metadata(
+                "str_replace",
+                &serde_json::json!({
+                    "path": "target.txt", "old_str": "before", "new_str": "after"
+                }),
+            )
+            .await;
+        assert!(
+            !outcome.is_error,
+            "direct writer should still run: {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("target.txt")).unwrap(),
+            "after\n"
+        );
+        let fields = outcome.tool_result_fields.as_ref().unwrap();
+        assert_eq!(fields["workspace_mutation_applied"], true);
+        assert_eq!(
+            fields[astra_tools::workspace_observation::WRITER_APPLIED_BOUND_FIELD],
+            true
+        );
+        let mut without_applied = fields.clone();
+        without_applied.remove(astra_tools::workspace_observation::WRITER_APPLIED_BOUND_FIELD);
+        assert_eq!(
+            serde_json::to_vec(fields).unwrap().len()
+                - serde_json::to_vec(&without_applied).unwrap().len(),
+            38,
+            "weak writer adds one bounded metadata fact"
+        );
+        assert!(
+            fields
+                .get(astra_tools::workspace_observation::RECEIPT_FIELD)
+                .is_none()
         );
     }
 

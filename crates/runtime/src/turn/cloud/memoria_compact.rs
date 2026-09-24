@@ -2298,6 +2298,7 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match self.response.lock().unwrap().as_ref() {
                 Some(text) => Ok(astra_turn_core::cloud_summary::SummaryResponse {
+                    qualified_usage: None,
                     judgment_provenance: None,
                     model_used: "fixture-model".into(),
                     text: text.clone(),

@@ -430,6 +430,147 @@ impl ExplainAnalyzeGraphV1 {
         &self.nodes
     }
 
+    /// Exact primary input buckets across all observed execution scopes.
+    /// Output and timing coverage do not determine prompt-cache coverage.
+    /// Callers must separately reject transport loss or unverified identity.
+    /// Missing lanes remain unknown; auxiliary and stage totals are excluded.
+    pub fn primary_prompt_cache_usage(&self) -> Option<crate::NormalizedPromptCacheUsage> {
+        let mut total = crate::NormalizedPromptCacheUsage::default();
+        for (_, usage) in self.primary_prompt_cache_inputs()? {
+            total.fresh_input_tokens = total
+                .fresh_input_tokens
+                .checked_add(usage.fresh_input_tokens)?;
+            total.cache_read_tokens = total
+                .cache_read_tokens
+                .checked_add(usage.cache_read_tokens)?;
+            total.cache_creation_tokens = total
+                .cache_creation_tokens
+                .checked_add(usage.cache_creation_tokens)?;
+        }
+        total.checked_total_input_tokens()?;
+        Some(total)
+    }
+
+    /// Validated physical primary input records, without allocating another
+    /// graph or inventing ordering between clock domains. Consumers can use
+    /// the existing typed node/parent identity for grouping.
+    pub fn primary_prompt_cache_inputs(
+        &self,
+    ) -> Option<
+        impl Iterator<
+            Item = (
+                &ExplainAnalyzeProjectedNodeV1,
+                crate::NormalizedPromptCacheUsage,
+            ),
+        > + '_,
+    > {
+        if self.integrity() != ExplainAnalyzeGraphIntegrityV1::Consistent
+            || self
+                .execution_scope_coverage()
+                .iter()
+                .any(|scope| !scope.terminal_turn_observed || scope.turn_conflicted)
+        {
+            return None;
+        }
+        let nodes = self
+            .nodes
+            .iter()
+            .filter(|node| node.kind == ExplainAnalyzeNodeKindV1::ProviderAttempt);
+        let mut observed = false;
+        for node in nodes.clone() {
+            Self::exact_primary_input(node)?;
+            observed = true;
+        }
+        observed.then(|| {
+            nodes.map(|node| {
+                (
+                    node,
+                    Self::exact_primary_input(node).expect("immutable validated primary input"),
+                )
+            })
+        })
+    }
+
+    /// Ordered request groups within one physical scope. Physical retries
+    /// share their typed ModelRound parent; phase attempts remain distinct.
+    /// Multiple clocks have no shared ordering evidence and are not guessed.
+    pub fn primary_prompt_cache_request_groups(
+        &self,
+    ) -> Option<Vec<crate::NormalizedPromptCacheUsage>> {
+        if self.execution_scope_coverage().len() != 1 {
+            return None;
+        }
+        let mut groups = BTreeMap::<(u32, u32), (&str, crate::NormalizedPromptCacheUsage)>::new();
+        let mut physical_attempts = HashSet::new();
+        for (node, usage) in self.primary_prompt_cache_inputs()? {
+            let parent = self.nodes.get(node.parent_index?)?;
+            if parent.kind != ExplainAnalyzeNodeKindV1::ModelRound
+                || !parent.start_observed
+                || !parent.terminal_observed
+                || parent.conflicted
+                || parent.run_id != node.run_id
+                || parent.turn_id != node.turn_id
+                || parent.clock_domain_id != node.clock_domain_id
+                || parent.round_index != node.round_index
+            {
+                return None;
+            }
+            let key = (parent.round_index?, parent.attempt_index?);
+            if !physical_attempts.insert((parent.node_id.as_str(), node.attempt_index?)) {
+                return None;
+            }
+            let (id, total) = groups.entry(key).or_insert((
+                parent.node_id.as_str(),
+                crate::NormalizedPromptCacheUsage::default(),
+            ));
+            if *id != parent.node_id {
+                return None;
+            }
+            total.fresh_input_tokens = total
+                .fresh_input_tokens
+                .checked_add(usage.fresh_input_tokens)?;
+            total.cache_read_tokens = total
+                .cache_read_tokens
+                .checked_add(usage.cache_read_tokens)?;
+            total.cache_creation_tokens = total
+                .cache_creation_tokens
+                .checked_add(usage.cache_creation_tokens)?;
+            total.checked_total_input_tokens()?;
+        }
+        // A model-request boundary without any physical input evidence must
+        // not disappear before a caller applies its warmup count.
+        for parent in self
+            .nodes
+            .iter()
+            .filter(|node| node.kind == ExplainAnalyzeNodeKindV1::ModelRound)
+        {
+            let (id, _) = groups.get(&(parent.round_index?, parent.attempt_index?))?;
+            if *id != parent.node_id {
+                return None;
+            }
+        }
+        Some(groups.into_values().map(|(_, usage)| usage).collect())
+    }
+
+    fn exact_primary_input(
+        node: &ExplainAnalyzeProjectedNodeV1,
+    ) -> Option<crate::NormalizedPromptCacheUsage> {
+        if !node.start_observed || !node.terminal_observed || node.conflicted {
+            return None;
+        }
+        let usage = node.usage.as_ref()?;
+        if usage.basis != crate::ExplainAnalyzeUsageBasisV1::ProviderExact {
+            return None;
+        }
+        let input = crate::NormalizedPromptCacheUsage::new(
+            usage.fresh_input_tokens?,
+            usage.cache_read_tokens?,
+            usage.cache_creation_tokens?,
+        );
+        input.checked_total_input_tokens()?;
+        Some(input)
+    }
+
     /// Return capture coverage grouped by the producer's physical execution
     /// scope. The grouping identity is the complete `(run, turn, clock)`
     /// tuple; a prior scope must never satisfy a later scope's terminal or
@@ -1166,6 +1307,213 @@ mod tests {
         event.duration_ms = Some(end_elapsed_ms - start_elapsed_ms);
         event.outcome = Some(ExplainAnalyzeOutcomeV1::Succeeded);
         event
+    }
+
+    #[test]
+    fn primary_cache_request_groups_preserve_phase_attempts_and_physical_retries() {
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        let turn = started("turn", ExplainAnalyzeNodeKindV1::Turn, None, "c", 0);
+        graph.apply(turn.clone());
+        // Arrival order is not request order, and zero-input groups still
+        // consume a warmup position.
+        for (phase, reads) in [(2, vec![0]), (0, vec![10, 20]), (1, vec![50])] {
+            let parent_id = format!("phase-{phase}");
+            let mut parent = started(
+                &parent_id,
+                ExplainAnalyzeNodeKindV1::ModelRound,
+                Some("turn"),
+                "c",
+                0,
+            );
+            parent.round_index = Some(7); // Gaps and nonzero starts are legitimate.
+            parent.attempt_index = Some(phase);
+            graph.apply(parent.clone());
+            for (attempt, read) in reads.into_iter().enumerate() {
+                let mut child = started(
+                    &format!("{parent_id}-{attempt}"),
+                    ExplainAnalyzeNodeKindV1::ProviderAttempt,
+                    Some(&parent_id),
+                    "c",
+                    0,
+                );
+                child.round_index = Some(7);
+                child.attempt_index = Some(attempt as u32);
+                graph.apply(child.clone());
+                let mut terminal = finished(child, 0, 1);
+                terminal.usage = Some(ExplainAnalyzeTokenUsageV1 {
+                    basis: crate::ExplainAnalyzeUsageBasisV1::ProviderExact,
+                    fresh_input_tokens: Some(0),
+                    cache_read_tokens: Some(read),
+                    cache_creation_tokens: Some(0),
+                    output_tokens: None,
+                });
+                graph.apply(terminal);
+            }
+            graph.apply(finished(parent, 0, 2));
+        }
+        graph.apply(finished(turn, 0, 3));
+        graph.finish_ingest();
+        let groups = graph.primary_prompt_cache_request_groups().unwrap();
+        assert_eq!(
+            groups
+                .iter()
+                .map(|usage| usage.cache_read_tokens)
+                .collect::<Vec<_>>(),
+            vec![30, 50, 0]
+        );
+        let mut duplicate_physical = graph.clone();
+        let mut duplicate = started(
+            "duplicate-physical",
+            ExplainAnalyzeNodeKindV1::ProviderAttempt,
+            Some("phase-0"),
+            "c",
+            0,
+        );
+        duplicate.round_index = Some(7);
+        duplicate.attempt_index = Some(0);
+        duplicate_physical.apply(duplicate.clone());
+        let mut duplicate = finished(duplicate, 0, 1);
+        duplicate.usage = Some(ExplainAnalyzeTokenUsageV1 {
+            basis: crate::ExplainAnalyzeUsageBasisV1::ProviderExact,
+            fresh_input_tokens: Some(0),
+            cache_read_tokens: Some(10),
+            cache_creation_tokens: Some(0),
+            output_tokens: None,
+        });
+        duplicate_physical.apply(duplicate);
+        duplicate_physical.finish_ingest();
+        assert_eq!(
+            duplicate_physical.integrity(),
+            ExplainAnalyzeGraphIntegrityV1::Consistent
+        );
+        assert!(
+            duplicate_physical
+                .primary_prompt_cache_request_groups()
+                .is_none()
+        );
+
+        let mut undispatched = graph.clone();
+        let mut parent = started(
+            "no-physical-evidence",
+            ExplainAnalyzeNodeKindV1::ModelRound,
+            Some("turn"),
+            "c",
+            0,
+        );
+        parent.round_index = Some(8);
+        parent.attempt_index = Some(0);
+        undispatched.apply(parent.clone());
+        undispatched.apply(finished(parent, 0, 1));
+        undispatched.finish_ingest();
+        assert_eq!(
+            undispatched.integrity(),
+            ExplainAnalyzeGraphIntegrityV1::Consistent
+        );
+        assert!(undispatched.primary_prompt_cache_request_groups().is_none());
+        let mut multiscoped = graph.clone();
+        multiscoped.apply(finished(
+            started(
+                "next",
+                ExplainAnalyzeNodeKindV1::Turn,
+                None,
+                "other-clock",
+                0,
+            ),
+            0,
+            1,
+        ));
+        multiscoped.finish_ingest();
+        assert_eq!(
+            multiscoped.integrity(),
+            ExplainAnalyzeGraphIntegrityV1::Consistent
+        );
+        assert!(multiscoped.primary_prompt_cache_request_groups().is_none());
+        let mut colliding = started(
+            "collision",
+            ExplainAnalyzeNodeKindV1::ModelRound,
+            Some("turn"),
+            "c",
+            0,
+        );
+        colliding.round_index = Some(7);
+        colliding.attempt_index = Some(1);
+        graph.apply(colliding.clone());
+        graph.apply(finished(colliding, 0, 1));
+        graph.finish_ingest();
+        assert_eq!(
+            graph.integrity(),
+            ExplainAnalyzeGraphIntegrityV1::Consistent
+        );
+        assert!(graph.primary_prompt_cache_request_groups().is_none());
+    }
+
+    #[test]
+    fn primary_cache_input_requires_coverage_not_output() {
+        let turn = started("turn", ExplainAnalyzeNodeKindV1::Turn, None, "c", 0);
+        let request = started(
+            "request",
+            ExplainAnalyzeNodeKindV1::ProviderAttempt,
+            Some("turn"),
+            "c",
+            0,
+        );
+        let mut terminal = finished(request.clone(), 0, 1);
+        terminal.usage = Some(ExplainAnalyzeTokenUsageV1 {
+            basis: crate::ExplainAnalyzeUsageBasisV1::ProviderExact,
+            fresh_input_tokens: Some(100),
+            cache_read_tokens: Some(900),
+            cache_creation_tokens: Some(0),
+            output_tokens: None,
+        });
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        for event in [
+            turn.clone(),
+            request.clone(),
+            terminal.clone(),
+            terminal.clone(),
+            finished(turn.clone(), 0, 2),
+        ] {
+            graph.apply(event);
+        }
+        graph.finish_ingest();
+        assert_eq!(
+            graph.primary_prompt_cache_usage(),
+            Some(crate::NormalizedPromptCacheUsage::new(100, 900, 0))
+        );
+        for missing in 0..3 {
+            let mut partial = ExplainAnalyzeGraphV1::default();
+            let mut partial_terminal = terminal.clone();
+            let usage = partial_terminal.usage.as_mut().unwrap();
+            match missing {
+                0 => usage.fresh_input_tokens = None,
+                1 => usage.cache_read_tokens = None,
+                _ => usage.cache_creation_tokens = None,
+            }
+            for event in [
+                turn.clone(),
+                request.clone(),
+                partial_terminal,
+                finished(turn.clone(), 0, 2),
+            ] {
+                partial.apply(event);
+            }
+            partial.finish_ingest();
+            assert_eq!(partial.primary_prompt_cache_usage(), None);
+        }
+        let mut resumed = graph.clone();
+        resumed.apply(started(
+            "next",
+            ExplainAnalyzeNodeKindV1::Turn,
+            None,
+            "next-clock",
+            0,
+        ));
+        resumed.finish_ingest();
+        assert_eq!(resumed.primary_prompt_cache_usage(), None);
+        terminal.usage.as_mut().unwrap().cache_read_tokens = Some(800);
+        graph.apply(terminal);
+        graph.finish_ingest();
+        assert_eq!(graph.primary_prompt_cache_usage(), None);
     }
 
     #[test]

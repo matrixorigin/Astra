@@ -606,6 +606,28 @@ impl ToolExecutor for DefaultToolExecutor {
                     None
                 }
             };
+        let direct_writer_applied = coordination_integrity_valid
+            && !nested_run_script_callback
+            && result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("workspace_mutation_applied"))
+                .and_then(Value::as_bool)
+                == Some(true);
+        if !receipt_authority_valid
+            && crate::workspace_observation::typed_workspace_tool_applied_bound(
+                name,
+                args,
+                &self.ctx.workspace_root,
+                result.is_error,
+                direct_writer_applied,
+            )
+        {
+            result.metadata.get_or_insert_with(Default::default).insert(
+                crate::workspace_observation::WRITER_APPLIED_BOUND_FIELD.to_string(),
+                Value::Bool(true),
+            );
+        }
         // A successful structured workspace writer already crossed the
         // owner executor's path/permission boundary. Carry that typed fact
         // through the server/edge result ledger instead of making a remote
@@ -618,14 +640,7 @@ impl ToolExecutor for DefaultToolExecutor {
                 args,
                 &self.ctx.workspace_root,
                 result.is_error,
-                receipt_authority_valid
-                    && !nested_run_script_callback
-                    && result
-                        .metadata
-                        .as_ref()
-                        .and_then(|fields| fields.get("workspace_mutation_applied"))
-                        .and_then(Value::as_bool)
-                        == Some(true),
+                receipt_authority_valid && direct_writer_applied,
             )
         {
             result
@@ -1443,6 +1458,39 @@ mod tests {
             .await;
         assert!(!result.is_error);
         assert!(tmp.path().join("out.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn weak_attribution_retains_only_bound_direct_writer_applied_fact() {
+        let (tmp, exec) = test_executor();
+        std::fs::write(tmp.path().join("out.txt"), "before\n").unwrap();
+        assert!(crate::workspace_observation::quarantine_after_weak_receipt(
+            tmp.path(),
+            Some(crate::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP),
+        ));
+        let result = exec
+            .execute(
+                "str_replace",
+                &serde_json::json!({
+                    "path": "out.txt", "old_str": "before", "new_str": "after"
+                }),
+            )
+            .await;
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("out.txt")).unwrap(),
+            "after\n"
+        );
+        let fields = result.metadata.as_ref().unwrap();
+        assert_eq!(
+            fields[crate::workspace_observation::WRITER_APPLIED_BOUND_FIELD],
+            true
+        );
+        assert!(
+            fields
+                .get(crate::workspace_observation::RECEIPT_FIELD)
+                .is_none()
+        );
     }
 
     #[tokio::test]

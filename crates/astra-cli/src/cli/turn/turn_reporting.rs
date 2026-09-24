@@ -154,6 +154,7 @@ pub(crate) fn format_primary_usage_summary(
     cache_creation_tokens: Option<u64>,
     observed: bool,
     complete: bool,
+    input_complete: bool,
 ) -> Option<String> {
     let has_lane = tokens_in.is_some()
         || tokens_out.is_some()
@@ -176,7 +177,7 @@ pub(crate) fn format_primary_usage_summary(
         tokens_in,
         cache_read_tokens,
         cache_creation_tokens,
-        complete,
+        input_complete,
     ) {
         summary.push_str(&format!(" · {cache}"));
     }
@@ -254,6 +255,7 @@ pub(crate) struct PrimaryUsageProjection {
     pub output_tokens: Option<u64>,
     pub observed: bool,
     pub complete: bool,
+    pub input_complete: bool,
 }
 
 pub(crate) fn project_primary_usage(
@@ -268,6 +270,7 @@ pub(crate) fn project_primary_usage(
         output_tokens: primary.and_then(|usage| usage.output_tokens),
         observed: attribution.has_observed_state() || raw_usage_observed,
         complete: primary.is_some() && attribution.primary_complete,
+        input_complete: primary.is_some() && attribution.primary_input_complete,
     }
 }
 
@@ -287,6 +290,7 @@ fn primary_usage_summary(result: &StreamResult) -> Option<String> {
         projection.cache_creation_tokens,
         projection.observed,
         projection.complete,
+        projection.input_complete,
     )
 }
 
@@ -579,6 +583,7 @@ mod tests {
                 output_tokens: Some(9),
             });
         result.usage_attribution.primary_complete = true;
+        result.usage_attribution.primary_input_complete = true;
         result.usage_attribution.primary_model = Some("deepseek-flash".into());
 
         assert_eq!(
@@ -618,6 +623,7 @@ mod tests {
                 Some(0),
                 true,
                 false,
+                false,
             )
             .as_deref(),
             Some("≥46.2k tokens · ≥34.9k cached · 77% of known input")
@@ -646,9 +652,34 @@ mod tests {
     #[test]
     fn explicit_zero_cache_lane_renders_zero_percent() {
         assert_eq!(
-            super::format_primary_usage_summary(Some(100), Some(9), Some(0), Some(0), true, true)
-                .as_deref(),
+            super::format_primary_usage_summary(
+                Some(100),
+                Some(9),
+                Some(0),
+                Some(0),
+                true,
+                true,
+                true
+            )
+            .as_deref(),
             Some("109 tokens · 0% cached")
+        );
+    }
+
+    #[test]
+    fn complete_input_keeps_cache_rate_when_output_is_unknown() {
+        assert_eq!(
+            super::format_primary_usage_summary(
+                Some(100),
+                None,
+                Some(900),
+                Some(0),
+                true,
+                false,
+                true
+            )
+            .as_deref(),
+            Some("≥1.0k tokens · 90% cached")
         );
     }
 

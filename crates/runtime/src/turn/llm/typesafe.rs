@@ -2,7 +2,8 @@
 use super::client::LlmCallResult;
 use astra_core::{ClassifiedError, ErrorKind};
 use astra_turn_types::{
-    JudgmentAnswer, JudgmentRequest, JudgmentResponse, judgment_request_from_messages,
+    JUDGMENT_SCHEMA_VERSION, JudgmentAnswer, JudgmentRequest, JudgmentResponse,
+    judgment_request_from_messages, parse_unique_judgment_json,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -33,14 +34,16 @@ struct Response {
 }
 
 pub(super) fn response(
-    value: &Value,
+    raw: &[u8],
     request: &Value,
     started: Instant,
 ) -> Result<LlmCallResult, ClassifiedError> {
-    let response: Response = serde_json::from_value(value.clone())
+    let value = parse_unique_judgment_json(raw)
+        .map_err(|_| invalid("Malformed TypeSafe judgment response"))?;
+    let response: Response = serde_json::from_value(value)
         .map_err(|_| invalid("Malformed TypeSafe judgment response"))?;
     let judgment_request = JudgmentRequest {
-        schema_version: 1,
+        schema_version: JUDGMENT_SCHEMA_VERSION,
         state: request
             .get("state")
             .cloned()
@@ -54,36 +57,32 @@ pub(super) fn response(
         .map_err(|_| invalid("Invalid TypeSafe questions"))?,
     };
     let judgment = JudgmentResponse {
-        schema_version: 1,
+        schema_version: JUDGMENT_SCHEMA_VERSION,
         model: response.model.clone(),
         answers: response.answers,
     };
-    judgment.validate_for(&judgment_request).map_err(invalid)?;
+    judgment
+        .validate_for_provenance(
+            &judgment_request,
+            astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+        )
+        .map_err(invalid)?;
     // Billing metadata does not decide whether a valid judgment succeeded.
-    // Preserve only provider-reported valid counters; absent/invalid is unknown.
+    // Preserve raw fields until the shared disjoint decoder qualifies them.
     let mut raw_usage = serde_json::Map::new();
-    for (source, normalized) in [
-        ("input_tokens", "prompt_tokens"),
-        ("output_tokens", "completion_tokens"),
-    ] {
-        if let Some(count) = response
-            .usage
-            .as_ref()
-            .and_then(|u| u.get(source))
-            .and_then(Value::as_u64)
-        {
-            raw_usage.insert(normalized.into(), json!(count));
+    for key in ["input_tokens", "output_tokens"] {
+        if let Some(value) = response.usage.as_ref().and_then(|u| u.get(key)) {
+            raw_usage.insert(key.into(), value.clone());
         }
     }
-    let usage_presence = crate::turn::token_usage::extract_usage_presence(
-        crate::turn::token_usage::UsageDialect::OpenAi,
-        &raw_usage,
-    );
-    let usage = crate::turn::token_usage::extract_usage(
-        crate::turn::token_usage::UsageDialect::OpenAi,
+    let (usage, usage_presence) = crate::turn::token_usage::parse_usage(
+        crate::turn::token_usage::UsageDialect::AnthropicMessages,
         &raw_usage,
     )
-    .map(|usage| usage.to_json_map())
+    .map(|(usage, presence)| {
+        let (usage, presence) = usage.qualified_snapshot(presence);
+        (usage.to_qualified_json_map(presence), presence)
+    })
     .unwrap_or_default();
     Ok(LlmCallResult {
         judgment_provenance: Some(
@@ -134,13 +133,17 @@ mod tests {
     fn messages() -> Vec<Value> {
         vec![
             json!({"role":"user", "content": serde_json::to_string(&JudgmentRequest {
-            schema_version: 1, state: json!({"lesson":"example"}),
+            schema_version: JUDGMENT_SCHEMA_VERSION, state: json!({"lesson":"example"}),
             questions: [("0".into(), astra_turn_types::JudgmentQuestion::Noul { instructions: "Is this useful?".into(), criteria: None })].into(),
         }).unwrap()}),
         ]
     }
     fn good() -> Value {
         json!({"model":"jev-1.13.0", "answers":{"0":{"type":"noul","noul":0.9}}, "usage":{"input_tokens":100,"output_tokens":4}})
+    }
+
+    fn decode_response(value: &Value, request: &Value) -> Result<LlmCallResult, ClassifiedError> {
+        response(&serde_json::to_vec(value).unwrap(), request, Instant::now())
     }
 
     #[test]
@@ -164,22 +167,58 @@ mod tests {
             json!({"model":"m","answers":{"0":{"type":"noul","noul":1.1}},"usage":{"input_tokens":1,"output_tokens":1}}),
             json!({"model":"m","answers":{"1":{"type":"noul","noul":0.9}},"usage":{"input_tokens":1,"output_tokens":1}}),
         ] {
-            assert!(response(&v, &req, Instant::now()).is_err());
+            assert!(decode_response(&v, &req).is_err());
         }
-        let result = response(&good(), &req, Instant::now()).unwrap();
+        let result = decode_response(&good(), &req).unwrap();
         let decoded: JudgmentResponse = serde_json::from_str(&result.full_text).unwrap();
-        assert_eq!(decoded.answers["0"].probability(), 0.9);
+        assert_eq!(decoded.answers["0"].native_noul_probability(), Some(0.9));
         assert_eq!(result.usage["input_tokens"], 100);
         assert_eq!(result.usage["output_tokens"], 4);
+        assert!(!result.usage.contains_key("cached_input_tokens"));
+        assert!(!result.usage.contains_key("cache_creation_tokens"));
+        assert!(!result.usage.contains_key("total_tokens"));
         let terminal = crate::turn::llm::client::provider_attempt_terminal_from_result(&result);
         assert_eq!(terminal.usage.input.fresh_input_tokens, 100);
         assert_eq!(terminal.usage.output_tokens, 4);
         assert_eq!(
             terminal.usage_status,
-            astra_services::InferenceUsageStatus::ProviderExact
+            astra_services::InferenceUsageStatus::ProviderPartial
         );
         assert_eq!(result.model_used, "jev-1.13.0");
     }
+
+    #[test]
+    fn response_rejects_duplicate_keys_before_json_object_conversion() {
+        let req = request(&messages(), "jev-1.13.0").unwrap();
+        let raw =
+            br#"{"model":"jev-1.13.0","answers":{"0":{"type":"noul","noul":0.9,"noul":0.1}}}"#;
+        let error = response(raw, &req, Instant::now()).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::ContractViolation);
+    }
+
+    #[test]
+    fn response_rejects_discrete_answers_for_every_native_primitive() {
+        for (question, answer) in [
+            (
+                json!({"type":"noul","instructions":"Is this supported?"}),
+                json!({"type":"discrete_noul","decision":"yes"}),
+            ),
+            (
+                json!({"type":"choice","instructions":"Which?","criteria":{"a":"A"}}),
+                json!({"type":"discrete_choice","option":"a"}),
+            ),
+            (
+                json!({"type":"score","instructions":"How much?","criteria":["low","high"]}),
+                json!({"type":"discrete_score","level":1}),
+            ),
+        ] {
+            let request = json!({"state":{"evidence":"bounded"},"questions":{"q":question}});
+            let response = json!({"model":"jev-1.13.0","answers":{"q":answer}});
+            let error = decode_response(&response, &request).unwrap_err();
+            assert_eq!(error.kind, ErrorKind::ContractViolation);
+        }
+    }
+
     #[test]
     fn missing_or_invalid_usage_does_not_discard_valid_judgments() {
         let req = request(&messages(), "jev-1.13.0").unwrap();
@@ -190,24 +229,35 @@ mod tests {
         ] {
             let mut body = good();
             body["usage"] = usage;
-            let result = response(&body, &req, Instant::now()).unwrap();
+            let result = decode_response(&body, &req).unwrap();
             assert!(result.usage.is_empty());
             let decoded: JudgmentResponse = serde_json::from_str(&result.full_text).unwrap();
-            assert_eq!(decoded.answers["0"].probability(), 0.9);
+            assert_eq!(decoded.answers["0"].native_noul_probability(), Some(0.9));
         }
         let mut body = good();
         body.as_object_mut().unwrap().remove("usage");
-        assert!(
-            response(&body, &req, Instant::now())
-                .unwrap()
-                .usage
-                .is_empty()
-        );
+        assert!(decode_response(&body, &req).unwrap().usage.is_empty());
         body["usage"] = json!({"input_tokens": 0, "output_tokens": "invalid"});
-        let result = response(&body, &req, Instant::now()).unwrap();
+        let result = decode_response(&body, &req).unwrap();
         assert_eq!(result.usage["input_tokens"], 0);
         assert!(result.usage_presence.fresh_input_tokens);
         assert!(!result.usage_presence.output_tokens);
+        assert!(result.usage_presence.output_invalid);
+        assert!(!result.usage_presence.input_invalid);
+        assert_eq!(
+            result.usage,
+            serde_json::from_value::<serde_json::Map<String, Value>>(json!({"input_tokens": 0}))
+                .unwrap()
+        );
+        body["usage"] = json!({"input_tokens":-1,"output_tokens":7});
+        let result = decode_response(&body, &req).unwrap();
+        assert!(result.usage_presence.input_invalid);
+        assert!(!result.usage_presence.output_invalid);
+        assert_eq!(
+            result.usage,
+            serde_json::from_value::<serde_json::Map<String, Value>>(json!({"output_tokens":7}))
+                .unwrap()
+        );
     }
 
     #[tokio::test]

@@ -155,21 +155,29 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
         .iter()
         .any(|r| r.passed && matches!(r.criterion, Criterion::TextContains { .. }));
 
-    if tools_count_failed {
-        // Check if tool_calls_count exceeds the max bound.
-        let exceeded_max = criteria_results.iter().any(|r| {
-            if let Criterion::ToolsCountBetween { max, .. } = &r.criterion {
-                !r.passed && outcome.tool_calls_count > *max
-            } else {
-                false
-            }
-        });
-        if exceeded_max {
-            return FailureClass::ModelInstructionFollowing;
-        }
-        if text_contains_passed {
-            return FailureClass::ModelInstructionFollowing;
-        }
+    // A failed hard oracle or unavailable required judge describes the case's
+    // substantive outcome. Tool-count overrun is only a secondary efficiency
+    // symptom and must not hide either result.
+    let judger_unavailable = criteria_results.iter().any(|r| {
+        !r.passed
+            && matches!(r.criterion, Criterion::HardJudger { .. })
+            && (r.detail.contains("required judger unavailable")
+                || r.detail.starts_with("judger call failed:"))
+    });
+    if judger_unavailable {
+        return FailureClass::InfraVerificationUnavailable;
+    }
+    let hard_oracle_failed = criteria_results.iter().any(|result| {
+        !result.passed
+            && result.severity == crate::criteria::CriterionSeverity::Hard
+            && !is_deterministic(&result.criterion)
+            && !matches!(
+                result.criterion,
+                Criterion::HardJudger { .. } | Criterion::ToolsCountBetween { .. }
+            )
+    });
+    if outcome.exit_code == 0 && hard_oracle_failed {
+        return FailureClass::BehaviorContractViolation;
     }
 
     // Tool unavailable: the agent reported a required tool is missing.
@@ -193,7 +201,10 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
     // All deterministic criteria failed → model can't do the task.
     let deterministic_results: Vec<_> = criteria_results
         .iter()
-        .filter(|r| is_deterministic(&r.criterion))
+        .filter(|r| {
+            is_deterministic(&r.criterion)
+                && !matches!(r.criterion, Criterion::ToolsCountBetween { .. })
+        })
         .collect();
     if !deterministic_results.is_empty() && deterministic_results.iter().all(|r| !r.passed) {
         return FailureClass::ModelCapability;
@@ -212,28 +223,14 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
         .iter()
         .filter(|r| {
             r.severity == crate::criteria::CriterionSeverity::Hard
-                && !matches!(r.criterion, Criterion::HardJudger { .. })
+                && !matches!(
+                    r.criterion,
+                    Criterion::HardJudger { .. } | Criterion::ToolsCountBetween { .. }
+                )
         })
         .all(|r| r.passed);
-    let judger_unavailable = criteria_results.iter().any(|r| {
-        !r.passed
-            && matches!(r.criterion, Criterion::HardJudger { .. })
-            && (r.detail.contains("required judger unavailable")
-                || r.detail.starts_with("judger call failed:"))
-    });
-    if judger_unavailable {
-        return FailureClass::InfraVerificationUnavailable;
-    }
     if judger_failed && hard_non_judger_pass {
         return FailureClass::ModelQualityLow;
-    }
-
-    // Soft criteria failure only (efficiency bounds exceeded).
-    let soft_failed = criteria_results
-        .iter()
-        .any(|r| !r.passed && r.severity == crate::criteria::CriterionSeverity::Soft);
-    if soft_failed && hard_non_judger_pass {
-        return FailureClass::EfficiencyBoundsExceeded;
     }
 
     // A successful process with failed typed hard evidence is neither an
@@ -244,10 +241,36 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
     let hard_contract_failed = criteria_results.iter().any(|result| {
         !result.passed
             && result.severity == crate::criteria::CriterionSeverity::Hard
-            && !matches!(result.criterion, Criterion::HardJudger { .. })
+            && !matches!(
+                result.criterion,
+                Criterion::HardJudger { .. } | Criterion::ToolsCountBetween { .. }
+            )
     });
     if outcome.exit_code == 0 && hard_contract_failed {
         return FailureClass::BehaviorContractViolation;
+    }
+
+    if tools_count_failed {
+        let exceeded_max = criteria_results.iter().any(|r| {
+            if let Criterion::ToolsCountBetween { max, .. } = &r.criterion {
+                !r.passed && outcome.total_tool_calls.max(outcome.tool_calls_count) > *max
+            } else {
+                false
+            }
+        });
+        if exceeded_max {
+            return FailureClass::EfficiencyBoundsExceeded;
+        }
+        if text_contains_passed {
+            return FailureClass::ModelInstructionFollowing;
+        }
+    }
+
+    let soft_failed = criteria_results
+        .iter()
+        .any(|r| !r.passed && r.severity == crate::criteria::CriterionSeverity::Soft);
+    if soft_failed && hard_non_judger_pass {
+        return FailureClass::EfficiencyBoundsExceeded;
     }
 
     FailureClass::Unknown
@@ -458,6 +481,14 @@ mod tests {
         }
     }
 
+    fn overrun() -> CriterionResult {
+        let criterion = Criterion::ToolsCountBetween { min: 1, max: 2 };
+        CriterionResult {
+            severity: crate::criteria::criterion_severity(&criterion),
+            ..cr(criterion, false)
+        }
+    }
+
     #[test]
     fn timeout_classification() {
         let outcome = make_outcome().with_exit_code(124);
@@ -646,12 +677,110 @@ mod tests {
     }
 
     #[test]
-    fn instruction_following_when_tools_exceed_max() {
+    fn tool_count_ceiling_is_an_efficiency_bound_not_instruction_evidence() {
         let outcome = make_outcome().with_tools_used(vec!["a".into(), "b".into(), "c".into()]);
-        let results = vec![cr(Criterion::ToolsCountBetween { min: 1, max: 2 }, false)];
+        let results = vec![overrun()];
         assert_eq!(
             classify(&outcome, &results),
-            FailureClass::ModelInstructionFollowing
+            FailureClass::EfficiencyBoundsExceeded
+        );
+    }
+
+    #[test]
+    fn tool_overrun_does_not_hide_failed_hard_oracle() {
+        let outcome = make_outcome().with_tools_used(vec!["a".into(), "b".into(), "c".into()]);
+        let results = vec![
+            overrun(),
+            cr(
+                Criterion::JournalToolOutcomeCount {
+                    name: "settle_work_item".into(),
+                    ok: false,
+                    min: 0,
+                    max: 0,
+                },
+                false,
+            ),
+        ];
+        assert_eq!(
+            classify(&outcome, &results),
+            FailureClass::BehaviorContractViolation
+        );
+    }
+
+    #[test]
+    fn tool_overrun_does_not_hide_unavailable_required_judger() {
+        let outcome = make_outcome().with_tools_used(vec!["a".into(), "b".into(), "c".into()]);
+        let mut judger = cr(
+            Criterion::HardJudger {
+                question: "was the work complete?".into(),
+                threshold: 0.7,
+                model: None,
+            },
+            false,
+        );
+        judger.detail = "required judger unavailable (--no-judger)".into();
+        let results = vec![overrun(), judger];
+        assert_eq!(
+            classify(&outcome, &results),
+            FailureClass::InfraVerificationUnavailable
+        );
+    }
+
+    #[test]
+    fn tool_overrun_does_not_hide_failed_task_requirement() {
+        let outcome = make_outcome().with_tools_used(vec!["a".into(), "b".into(), "c".into()]);
+        let results = vec![
+            overrun(),
+            cr(
+                Criterion::TextContains {
+                    needle: "done".into(),
+                },
+                false,
+            ),
+        ];
+        assert_eq!(classify(&outcome, &results), FailureClass::ModelCapability);
+    }
+
+    #[test]
+    fn tool_overrun_does_not_hide_low_hard_judger_score() {
+        let outcome = make_outcome().with_tools_used(vec!["a".into(), "b".into(), "c".into()]);
+        let results = vec![
+            overrun(),
+            cr(
+                Criterion::HardJudger {
+                    question: "was the work complete?".into(),
+                    threshold: 0.7,
+                    model: None,
+                },
+                false,
+            ),
+        ];
+        assert_eq!(classify(&outcome, &results), FailureClass::ModelQualityLow);
+    }
+
+    #[test]
+    fn archived_child_tool_count_and_classifier_share_the_same_ceiling() {
+        let mut outcome = make_outcome().with_text("A useful synthesis");
+        outcome.tool_calls_count = 0;
+        outcome.total_tool_calls = 146;
+        let results = crate::criteria::evaluate_deterministic(
+            &[
+                Criterion::ToolsCountBetween { min: 4, max: 18 },
+                Criterion::TextContains {
+                    needle: "synthesis".into(),
+                },
+            ],
+            &outcome,
+        );
+        assert!(!results[0].passed);
+        assert_eq!(
+            results[0].severity,
+            crate::criteria::CriterionSeverity::Soft
+        );
+        assert!(results[1].passed);
+        assert_eq!(
+            classify(&outcome, &results),
+            FailureClass::EfficiencyBoundsExceeded
         );
     }
 

@@ -1633,9 +1633,29 @@ impl ThinClient {
         max_attempts: u32,
         quiet: bool,
     ) -> Result<Response, ThinClientError> {
+        self.post_developer_loop_retry_429_with_payload(token, max_attempts, quiet, || {
+            Ok(payload.clone())
+        })
+        .await
+    }
+
+    /// Retry admission with a fresh payload at every physical attempt.
+    /// Callers with an absolute execution deadline use this to publish a
+    /// monotonically shrinking budget after 429 or transport waits.
+    pub async fn post_developer_loop_retry_429_with_payload<F>(
+        &self,
+        token: &str,
+        max_attempts: u32,
+        quiet: bool,
+        mut payload_for_attempt: F,
+    ) -> Result<Response, ThinClientError>
+    where
+        F: FnMut() -> Result<Value, ThinClientError>,
+    {
         let mut last_err: Option<ThinClientError> = None;
         for attempt in 0..max_attempts {
-            match self.post_developer_loop(token, payload).await {
+            let payload = payload_for_attempt()?;
+            match self.post_developer_loop(token, &payload).await {
                 Ok(resp) => {
                     if resp.status().as_u16() == 429 && attempt + 1 < max_attempts {
                         let delay_secs =
@@ -5050,6 +5070,92 @@ mod tests {
             Some(1),
             "Retry-After: 1 should be honoured over default exponential backoff"
         );
+    }
+
+    #[tokio::test]
+    async fn retry_admission_builds_a_fresh_payload_after_rate_limit() {
+        let _guard = set_test_retry_sleep_ms(0);
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/stream"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
+            .up_to_n_times(1)
+            .mount(&srv)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/stream"))
+            .respond_with(ResponseTemplate::new(200).insert_header(
+                astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER,
+                astra_server_types::AGENT_INTERACTION_API_MAJOR,
+            ))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let mut remaining = 60;
+        let response = client
+            .post_developer_loop_retry_429_with_payload("t", 3, true, || {
+                let current = remaining;
+                remaining -= 20;
+                Ok(serde_json::json!({"execution_time_budget": {"remaining_seconds": current}}))
+            })
+            .await
+            .expect("second admission succeeds");
+        assert_eq!(response.status().as_u16(), 200);
+        let requests = srv.received_requests().await.expect("request history");
+        assert_eq!(requests.len(), 2);
+        let budgets = requests
+            .iter()
+            .map(|request| {
+                serde_json::from_slice::<Value>(&request.body)
+                    .expect("JSON request")
+                    ["execution_time_budget"]["remaining_seconds"]
+                    .as_u64()
+                    .expect("budget")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(budgets, [60, 40]);
+    }
+
+    #[tokio::test]
+    async fn expired_admission_dispatches_no_request() {
+        let srv = MockServer::start().await;
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let error = client
+            .post_developer_loop_retry_429_with_payload("t", 3, true, || {
+                Err(ThinClientError::AdmissionDeadlineExpired)
+            })
+            .await
+            .expect_err("expired admission must stop before POST");
+        assert!(matches!(error, ThinClientError::AdmissionDeadlineExpired));
+        assert_eq!(srv.received_requests().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn expired_admission_after_rate_limit_dispatches_no_retry() {
+        let _guard = set_test_retry_sleep_ms(0);
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/stream"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
+            .mount(&srv)
+            .await;
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let mut attempts = 0;
+        let error = client
+            .post_developer_loop_retry_429_with_payload("t", 3, true, || {
+                attempts += 1;
+                if attempts == 1 {
+                    Ok(serde_json::json!({"msg": "first attempt"}))
+                } else {
+                    Err(ThinClientError::AdmissionDeadlineExpired)
+                }
+            })
+            .await
+            .expect_err("expired retry must stop before a second POST");
+        assert!(matches!(error, ThinClientError::AdmissionDeadlineExpired));
+        assert_eq!(attempts, 2);
+        assert_eq!(srv.received_requests().await.unwrap().len(), 1);
     }
 
     #[test]

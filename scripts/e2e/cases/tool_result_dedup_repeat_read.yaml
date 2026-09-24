@@ -1,5 +1,5 @@
 name: tool_result_dedup_repeat_read
-description: "工具结果去重 (gap #4) 基线守护：多轮对同一文件的重复只读调用应返回一致内容且不报错。当 SharedResultCache 在 cloud_tool_delivery 接入后，同键调用可命中缓存；接入前，本用例充当回归守护，确保重复读不会退化。"
+description: "重复读取基线：两轮读取同一文件时，回答应保持一致；本用例不声称运行时缓存命中或调用被省略。"
 requires: [llm]
 
 turns:

@@ -141,11 +141,6 @@ pub(crate) fn delegate_tool_schema() -> Value {
                         "minimum": 1,
                         "description": "Maximum rounds for adversarial pattern (default: 2)."
                     },
-                    "max_turns": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Maximum turns for each explicit fork task. If omitted, the selected agent profile supplies the bounded default; set this explicitly when a different hard limit is intended."
-                    },
                     "timeout": {
                         "type": "integer",
                         "minimum": 0,
@@ -283,7 +278,7 @@ mod tests {
         assert!(props["needs_review"].is_object());
         assert!(props["has_dependencies"].is_object());
         assert!(props["max_rounds"].is_object());
-        assert!(props["max_turns"].is_object());
+        assert!(props.get("max_turns").is_none());
         assert!(props["timeout"].is_object());
         assert!(props["context"].is_object());
     }
@@ -307,7 +302,7 @@ mod tests {
         assert!(props.get("needs_review").is_some());
         assert!(props.get("has_dependencies").is_some());
         assert!(props.get("max_rounds").is_some());
-        assert!(props.get("max_turns").is_some());
+        assert!(props.get("max_turns").is_none());
         assert!(props.get("timeout").is_some());
         assert!(props.get("context").is_some());
     }

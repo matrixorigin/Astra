@@ -1454,7 +1454,7 @@ pub(crate) async fn handle_info_command(
                 )
                 .with_tool_calls(sr.tool_call_records)
                 .with_budget_pressure(sr.budget_pressure)
-                .with_cache_tokens(sr.cache_read_tokens, sr.cache_creation_tokens)
+                .with_qualified_usage(sr.qualified_usage)
                 .with_tool_surface(
                     sr.visible_tools,
                     sr.selected_skills,
@@ -1815,7 +1815,7 @@ pub(crate) async fn handle_info_command(
                 "  {:<12}  {}",
                 "cache".magenta(),
                 format!(
-                    "{cache_emoji} total: read {}k / write {}k",
+                    "{cache_emoji} observed: read {}k / write {}k",
                     total_cr / 1000,
                     total_cw / 1000
                 )

@@ -1300,11 +1300,15 @@ fn fanout_completion_is_authoritative(output_summary: Option<&str>, output: Opti
 /// summary. The raw tool payload remains protocol evidence upstream; dumping
 /// it into the transcript makes a simple rejected launch look like a broken
 /// JSON document and obscures the only user-relevant fact: no child ran.
-fn fanout_rejection_summary(output_summary: Option<&str>, output: Option<&str>) -> Option<String> {
+fn fanout_start_summary(output_summary: Option<&str>, output: Option<&str>) -> Option<String> {
     [output, output_summary].into_iter().flatten().find_map(|text| {
-        (agent_fanout_control_receipt_kind(text)
-            == Some(AgentFanoutControlReceiptKind::RejectedBeforeAcceptance))
-        .then_some(())?;
+        match agent_fanout_control_receipt_kind(text)? {
+            AgentFanoutControlReceiptKind::SkippedBeforeAcceptance => {
+                return Some("Parallel work wasn’t started because there wasn’t enough time to safely finish it · Astra will continue here and flag anything it cannot verify.".to_string());
+            }
+            AgentFanoutControlReceiptKind::RejectedBeforeAcceptance => {}
+            _ => return None,
+        }
         let payload = agent_control_result_value(text)?;
         let error = payload
             .get("error")
@@ -4071,7 +4075,7 @@ impl ChatWidget {
             ),
             None if name == "agent_fanout" => {
                 if let Some(summary) =
-                    fanout_rejection_summary(output_summary.as_deref(), output.as_deref())
+                    fanout_start_summary(output_summary.as_deref(), output.as_deref())
                 {
                     (status, Some(summary), None)
                 } else if status == "failed" && receipt_missing {
@@ -8427,12 +8431,22 @@ mod tests {
         })
         .to_string();
 
-        let summary = fanout_rejection_summary(None, Some(&payload))
+        let summary = fanout_start_summary(None, Some(&payload))
             .expect("typed fanout admission failure should have a user surface");
         assert_eq!(
             summary,
             "Fanout did not start · its arguments were invalid, so no agents were launched. Create one new complete JSON tool call that matches the advertised schema."
         );
+    }
+
+    #[test]
+    fn typed_deadline_skip_has_a_user_facing_summary_without_raw_json() {
+        let payload = r#"{"status":"completed","outcome":"delegation_skipped","reason_code":"insufficient_time_to_delegate","executed":false}"#;
+        let summary = fanout_start_summary(None, Some(payload))
+            .expect("typed deadline skip should have a user surface");
+        assert!(summary.contains("Parallel work wasn’t started"));
+        assert!(summary.contains("continue here"));
+        assert!(!summary.contains("delegation_skipped"));
     }
 
     #[test]

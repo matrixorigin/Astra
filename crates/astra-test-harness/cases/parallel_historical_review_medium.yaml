@@ -33,7 +33,10 @@ models:
 capability: delegation
 difficulty: 4
 weight: 3.0
-timeout_seconds: 180
+# CLI gives the runtime 238s before its 70s terminal + 2s request reserve;
+# the outer watchdog leaves a further 50s for process cleanup and capture.
+timeout_seconds: 360
+cli_wall_time_seconds: 310
 debug_log: true
 setup_cmd: git merge-base --is-ancestor 449b13b95 origin/main
 criteria:
@@ -91,6 +94,7 @@ criteria:
     child: bash
     min: 2
     max: 100
+    min_distinct_child_runs: 2
   - type: journal_tool_json_contains
     name: bash
     document: arguments

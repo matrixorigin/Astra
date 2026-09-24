@@ -533,21 +533,15 @@ pub(crate) async fn handle_slash_command(
                 diag_parts.push("[Runtime Diagnostics]".to_string());
                 diag_parts.push(format!("Turn: {}", state.turn));
                 diag_parts.push(format!(
-                    "Tokens: {}in + {}out (cache_read={}, cache_create={})",
+                    "Observed token subtotals: {} fresh input + {} output (cache_read={}, cache_create={})",
                     state.total_prompt_tokens,
                     state.total_completion_tokens,
                     state.total_cache_read_tokens,
                     state.total_cache_creation_tokens,
                 ));
-                let total_in = state.total_prompt_tokens
-                    + state.total_cache_read_tokens
-                    + state.total_cache_creation_tokens;
-                let cache_pct = if total_in > 0 {
-                    state.total_cache_read_tokens as f64 / total_in as f64 * 100.0
-                } else {
-                    0.0
-                };
-                diag_parts.push(format!("Cache hit rate: {cache_pct:.1}%"));
+                diag_parts.push(
+                    "Coverage and model attribution of these session counters are unknown. Do not infer a session cache-hit rate, bill, or savings from them.".to_string(),
+                );
                 diag_parts.push(format!(
                     "\nAnswer this question using the diagnostics above: {}",
                     arg

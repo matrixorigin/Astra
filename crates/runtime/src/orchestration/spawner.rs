@@ -984,6 +984,9 @@ pub struct SpawnRunConfig {
     /// Caller-owned explicit hard limit. Persona defaults and qualitative
     /// complexity hints must not populate this field.
     pub hard_turn_limit: Option<u32>,
+    /// Absolute wall-clock authority inherited by this foreground child.
+    /// It is absent for unbounded/background execution.
+    pub execution_deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
     /// Allowed tools for this agent type.
     pub allowed_tools: Vec<String>,
     /// Whether the agent is read-only.
@@ -1115,6 +1118,7 @@ impl std::fmt::Debug for SpawnRunConfig {
             .field("model", &self.model)
             .field("initial_turns", &self.initial_turns)
             .field("hard_turn_limit", &self.hard_turn_limit)
+            .field("has_execution_deadline", &self.execution_deadline.is_some())
             .field("mailbox", &self.mailbox.is_some())
             .finish()
     }
@@ -1370,8 +1374,7 @@ pub struct DynamicAgentSpawner {
     #[cfg(test)]
     spawn_preparation_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
-    spawn_before_reservation_barriers:
-        Arc<std::sync::Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>>,
+    spawn_before_reservation_hook: Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>,
     #[cfg(test)]
     cancellation_before_in_flight_hook:
         Arc<std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
@@ -1505,6 +1508,15 @@ struct CancellationRetryBatchGuard {
     armed: bool,
 }
 
+fn foreground_child_has_work_time(
+    deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
+) -> bool {
+    deadline.is_none_or(|deadline| {
+        deadline.remaining()
+            >= astra_turn_core::chat_turn_heuristics::MIN_FOREGROUND_CHILD_EXECUTION_BUDGET
+    })
+}
+
 impl CancellationRetryBatchGuard {
     fn new(spawner: &DynamicAgentSpawner, scheduled: Vec<(String, String)>) -> Self {
         Self {
@@ -1584,7 +1596,7 @@ impl DynamicAgentSpawner {
                 TEST_SPAWN_PREPARATION_PERMITS as usize,
             )),
             #[cfg(test)]
-            spawn_before_reservation_barriers: Arc::new(std::sync::Mutex::new(None)),
+            spawn_before_reservation_hook: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             cancellation_before_in_flight_hook: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -2258,6 +2270,7 @@ impl DynamicAgentSpawner {
                         &state.description,
                         None,
                         &state.parent_run_id,
+                        None,
                     )
                     .await
                 {
@@ -2349,6 +2362,7 @@ impl DynamicAgentSpawner {
                         &state.description,
                         None,
                         &state.parent_run_id,
+                        None,
                     )
                     .await
                     .is_ok()
@@ -2822,6 +2836,7 @@ impl DynamicAgentSpawner {
         description: &str,
         created_by_tool_use_id: Option<&str>,
         parent_run_id: &str,
+        execution_deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
     ) -> Result<(), SpawnError> {
         let (mut groups, evicted_agent_ids) = self
             .get_or_validate_fanout_group(
@@ -2848,6 +2863,47 @@ impl DynamicAgentSpawner {
                 identity.group_id
             ))
         })?;
+        // Admission is the mutation below, not the earlier active-agent
+        // reservation. Recheck after obtaining every admission lock so lock
+        // contention cannot make an expired child look accepted.
+        if execution_deadline
+            .is_some_and(|deadline| !foreground_child_has_work_time(Some(deadline)))
+        {
+            let slot = group
+                .slots
+                .get(identity.slot_index)
+                .ok_or_else(|| SpawnError::InvalidInput("fanout slot is out of range".into()))?;
+            if slot.agent_id.is_some() || slot.status.is_terminal() {
+                return Err(SpawnError::Race(format!(
+                    "fanout slot {} settled before child admission",
+                    identity.slot_index
+                )));
+            }
+            let active_before = group.summary().active;
+            group
+                .set_slot_request(
+                    identity.slot_index,
+                    identity.slot_id.clone(),
+                    agent_type,
+                    description,
+                )
+                .map_err(SpawnError::InvalidInput)?;
+            group
+                .record_spawn_rejected(
+                    identity.slot_index,
+                    "execution deadline expired while waiting for child admission",
+                )
+                .map_err(SpawnError::InvalidInput)?;
+            let active_after = group.summary().active;
+            group.touch();
+            self.fanout_terminal_result_cache
+                .write()
+                .await
+                .remove(&identity.group_id);
+            self.adjust_cached_active_fanout_slots(active_before, active_after);
+            self.publish_fanout_group(group);
+            return Err(SpawnError::ExecutionDeadlineElapsed);
+        }
         let active_before = group.summary().active;
         group
             .set_slot_request(
@@ -3460,6 +3516,18 @@ impl DynamicAgentSpawner {
         input: SpawnAgentInput,
         context: &SpawnContext,
     ) -> Result<SpawnAgentOutput, SpawnError> {
+        self.spawn_with_execution_deadline(input, context, None)
+            .await
+    }
+
+    /// Spawn with a caller-owned absolute deadline. Passing the authority
+    /// through unchanged ensures preparation and retries cannot replenish it.
+    pub async fn spawn_with_execution_deadline(
+        &self,
+        input: SpawnAgentInput,
+        context: &SpawnContext,
+        execution_deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
+    ) -> Result<SpawnAgentOutput, SpawnError> {
         let _activity = self.begin_lifecycle_activity();
         if !*self
             .background_task_admission
@@ -3470,7 +3538,12 @@ impl DynamicAgentSpawner {
         }
         let shutdown = self.background_task_shutdown.clone();
         let preparation_installed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let prepared = self.prepare_and_spawn(input, context, Arc::clone(&preparation_installed));
+        let prepared = self.prepare_and_spawn(
+            input,
+            context,
+            Arc::clone(&preparation_installed),
+            execution_deadline,
+        );
         tokio::pin!(prepared);
         tokio::select! {
             biased;
@@ -3490,6 +3563,7 @@ impl DynamicAgentSpawner {
         input: SpawnAgentInput,
         context: &SpawnContext,
         preparation_installed: Arc<std::sync::atomic::AtomicBool>,
+        execution_deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
     ) -> Result<SpawnAgentOutput, SpawnError> {
         #[cfg(test)]
         let _preparation_permit = self
@@ -3501,6 +3575,16 @@ impl DynamicAgentSpawner {
         let fanout_slot = input
             .fanout_slot_identity()
             .map_err(SpawnError::InvalidInput)?;
+        if !foreground_child_has_work_time(execution_deadline) {
+            self.record_fanout_spawn_rejected_for_input(
+                fanout_slot.as_ref(),
+                &input,
+                context,
+                "parent execution deadline leaves insufficient time for safe child settlement before preparation",
+            )
+            .await;
+            return Err(SpawnError::ExecutionDeadlineElapsed);
+        }
         if context.parent_is_fork_child && input.inherit_prefix.is_some() {
             self.record_fanout_spawn_rejected_for_input(
                 fanout_slot.as_ref(),
@@ -3576,19 +3660,16 @@ impl DynamicAgentSpawner {
 
         // 3. Determine model and turns
         let model = context.resolved_model_name.clone();
-        // Budget resolution composes numeric and complexity ceilings by
-        // taking the smaller value; with only one constraint, that constraint
-        // is authoritative. See `resolve_turn_budget`.
+        // Model-authored numeric and complexity hints size only the first
+        // renewable slice. They never grant authority to stop a child.
         let initial_turns = astra_turn_core::orchestration_spawn_tool::resolve_turn_budget(
-            input.max_turns,
+            input.initial_turns,
             input.complexity.as_deref(),
             agent_def.max_turns,
         );
-        // Preserve provenance: only an explicit numeric caller limit is a
-        // hard boundary. Agent-type defaults and qualitative complexity are
-        // initial scheduling slices that may renew while observed work keeps
-        // making progress.
-        let hard_turn_limit = input.max_turns.map(|turns| turns.max(1));
+        // The model tool has no user-owned hard-limit input. The runtime
+        // ceiling and inherited deadline remain authoritative.
+        let hard_turn_limit = None;
         // 3b. Resolve fork-prefix inheritance before any side effects
         // (mailbox, worktree, active_agents state). A hard-fail from
         // `required=true` must NOT leave half-constructed state
@@ -3689,18 +3770,18 @@ impl DynamicAgentSpawner {
             execution_metadata: context.execution_metadata.clone(),
         };
         #[cfg(test)]
-        if let Some((entered, release)) = self
-            .spawn_before_reservation_barriers
+        let reservation_hook = self
+            .spawn_before_reservation_hook
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-        {
+            .take();
+        #[cfg(test)]
+        if let Some(hook) = reservation_hook {
             // Deliberately synchronous: the regression must hold one
             // `prepare_and_spawn` poll in the exact window after the outer
             // select checked cancellation but before the first transferable
             // lifecycle owner is installed.
-            entered.wait();
-            release.wait();
+            hook();
         }
         if let Some(identity) = fanout_slot.as_ref()
             && self
@@ -3713,7 +3794,7 @@ impl DynamicAgentSpawner {
                 identity.group_id
             )));
         }
-        let capacity_rejection = {
+        let (capacity_rejection, deadline_rejection) = {
             // Hold the cancellation read fence through reservation. Therefore
             // cancellation either snapshots this child or wins first and
             // rejects it; no descendant can appear after the snapshot.
@@ -3750,18 +3831,37 @@ impl DynamicAgentSpawner {
                 drop(cancellation_fence);
                 return Err(SpawnError::LifecycleShuttingDown);
             }
-            let capacity_rejection = self.max_concurrent_agents.and_then(|limit| {
-                let active = active_agents.len();
-                (active >= limit).then_some((active, limit))
-            });
-            if capacity_rejection.is_none() {
+            // Preparation above can await on prefix resolution, group state,
+            // and lifecycle locks. Recheck at the first side-effectful
+            // admission point so an expired child never consumes capacity or
+            // proceeds to mailbox, worktree, or durable run setup.
+            let deadline_rejection = !foreground_child_has_work_time(execution_deadline);
+            let capacity_rejection = if deadline_rejection {
+                None
+            } else {
+                self.max_concurrent_agents.and_then(|limit| {
+                    let active = active_agents.len();
+                    (active >= limit).then_some((active, limit))
+                })
+            };
+            if !deadline_rejection && capacity_rejection.is_none() {
                 active_agents.insert(agent_id.clone(), state);
             }
             drop(admission);
             drop(active_agents);
             drop(cancellation_fence);
-            capacity_rejection
+            (capacity_rejection, deadline_rejection)
         };
+        if deadline_rejection {
+            self.record_fanout_spawn_rejected_for_input(
+                fanout_slot.as_ref(),
+                &input,
+                context,
+                "parent execution deadline no longer leaves enough time for safe child settlement after preparation",
+            )
+            .await;
+            return Err(SpawnError::ExecutionDeadlineElapsed);
+        }
         if let Some((active, limit)) = capacity_rejection {
             if let Some(identity) = fanout_slot.as_ref() {
                 let _ = self
@@ -3899,6 +3999,20 @@ impl DynamicAgentSpawner {
                 "agent {agent_id} was cancelled before spawn completed"
             )));
         };
+        if !foreground_child_has_work_time(execution_deadline) {
+            self.active_agents.write().await.remove(&agent_id);
+            if let Some(address) = messaging_address.as_ref() {
+                let _ = self.mailbox_router.unregister(address).await;
+            }
+            self.record_fanout_spawn_rejected_for_input(
+                fanout_slot.as_ref(),
+                &input,
+                context,
+                "parent execution deadline no longer leaves enough time for safe child settlement after child preparation".to_string(),
+            )
+            .await;
+            return Err(SpawnError::ExecutionDeadlineElapsed);
+        }
         // Active state now owns both mailbox and worktree cleanup.
         pending_worktree_cleanup.disarm();
         if let Some(identity) = fanout_slot.as_ref()
@@ -3912,6 +4026,7 @@ impl DynamicAgentSpawner {
                     &input.description,
                     context.spawn_tool_call_id.as_deref(),
                     &context.parent_run_id,
+                    execution_deadline,
                 )
                 .await
         {
@@ -4010,6 +4125,7 @@ impl DynamicAgentSpawner {
             model,
             initial_turns,
             hard_turn_limit,
+            execution_deadline,
             allowed_tools: effective_allowed_tools,
             read_only: workspace_mutation
                 == astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
@@ -5726,7 +5842,7 @@ impl DynamicAgentSpawner {
             #[cfg(test)]
             spawn_preparation_gate: Arc::clone(&self.spawn_preparation_gate),
             #[cfg(test)]
-            spawn_before_reservation_barriers: Arc::clone(&self.spawn_before_reservation_barriers),
+            spawn_before_reservation_hook: Arc::clone(&self.spawn_before_reservation_hook),
             #[cfg(test)]
             cancellation_before_in_flight_hook: Arc::clone(
                 &self.cancellation_before_in_flight_hook,
@@ -6196,6 +6312,9 @@ pub enum SpawnError {
     /// failure; callers must start work in the replacement session runtime.
     #[error("Agent lifecycle is shutting down; no new child work is accepted")]
     LifecycleShuttingDown,
+
+    #[error("The parent execution deadline elapsed before child admission")]
+    ExecutionDeadlineElapsed,
 
     /// Fork children are allowed to spawn normal children, but not
     /// another inherit-prefix fork. This mirrors the reference agent's
@@ -6929,6 +7048,7 @@ mod tests {
                 "Review correctness",
                 None,
                 "root-run",
+                None,
             )
             .await
             .unwrap();
@@ -10412,6 +10532,45 @@ mod tests {
         }
     }
 
+    fn pause_before_spawn_reservation(
+        spawner: &DynamicAgentSpawner,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        *spawner
+            .spawn_before_reservation_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(15));
+        }));
+        (entered_rx, release_tx)
+    }
+
+    async fn wait_for_spawn_reservation(
+        entered: &std::sync::mpsc::Receiver<()>,
+        release: &std::sync::mpsc::SyncSender<()>,
+    ) {
+        let reached = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match entered.try_recv() {
+                    Ok(()) => return true,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if !reached {
+            let _ = release.send(());
+            panic!("spawn must reach the bounded pre-reservation test hook");
+        }
+    }
+
     fn completed_test_state(index: usize) -> SpawnedAgentState {
         SpawnedAgentState {
             agent_id: format!("agent-{index}"),
@@ -10865,6 +11024,7 @@ mod tests {
                 "review storage",
                 Some("call-1"),
                 "parent-123",
+                None,
             )
             .await
             .unwrap();
@@ -11171,6 +11331,64 @@ mod tests {
         assert_eq!(
             groups[0].summary_sentence(),
             "3-agent fanout failed to start fully: 1 spawn rejected."
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_admission_rechecks_deadline_after_index_lock_wait() {
+        let spawner = Arc::new(DynamicAgentSpawner::new(mock_router()));
+        let identity =
+            AgentFanoutSlotIdentity::new("deadline-lock-wait", 1, 0, Some("review".into()))
+                .unwrap();
+        spawner
+            .declare_fanout_group("deadline-lock-wait", "Deadline lock wait", 1, None, "root")
+            .await
+            .expect("declare group");
+
+        let held_index = spawner.fanout_agent_index.write().await;
+        let deadline = astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+            astra_services::runs::ExecutionTimeBudget {
+                remaining_seconds: 1,
+            },
+            1_000,
+        )
+        .expect("valid absolute deadline");
+        let admission = {
+            let spawner = Arc::clone(&spawner);
+            tokio::spawn(async move {
+                spawner
+                    .record_fanout_spawn_accepted(
+                        &identity,
+                        Some("Deadline lock wait"),
+                        "late-agent",
+                        "late-run",
+                        "general-purpose",
+                        "review",
+                        None,
+                        "root",
+                        Some(deadline),
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        drop(held_index);
+
+        assert!(matches!(
+            admission.await.expect("admission task"),
+            Err(SpawnError::ExecutionDeadlineElapsed)
+        ));
+        assert!(spawner.active_agents.read().await.is_empty());
+        let group = spawner
+            .fanout_group("deadline-lock-wait")
+            .await
+            .expect("group remains inspectable");
+        assert_eq!(group.slots[0].status, AgentFanoutSlotStatus::SpawnRejected);
+        assert!(
+            group.slots[0]
+                .terminal_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("deadline expired"))
         );
     }
 
@@ -12268,6 +12486,78 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exhausted_child_work_budget_after_preparation_rejects_before_spawn_admission() {
+        let spawner = Arc::new(
+            DynamicAgentSpawner::new(mock_router())
+                .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>),
+        );
+        let make_deadline = |remaining_seconds| {
+            astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+                astra_services::runs::ExecutionTimeBudget { remaining_seconds },
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock is after the Unix epoch")
+                    .as_millis()
+                    .try_into()
+                    .expect("current Unix timestamp fits u64 milliseconds"),
+            )
+            .expect("valid bounded deadline")
+        };
+        let make_slot = |slot_index| {
+            let mut input = make_sync_input();
+            input.fanout_group_id = Some("deadline-admission".to_string());
+            input.fanout_group_title = Some("Deadline admission".to_string());
+            input.fanout_target_count = Some(2);
+            input.fanout_slot_index = Some(slot_index);
+            input.fanout_slot_id = Some(format!("reviewer-{slot_index}"));
+            input
+        };
+
+        let early = spawner
+            .spawn_with_execution_deadline(
+                make_slot(0),
+                &make_bg_context(),
+                Some(make_deadline(30)),
+            )
+            .await;
+        assert!(matches!(early, Err(SpawnError::ExecutionDeadlineElapsed)));
+
+        let (reservation_entered, release_reservation) = pause_before_spawn_reservation(&spawner);
+        let spawn_task = {
+            let spawner = Arc::clone(&spawner);
+            tokio::spawn(async move {
+                spawner
+                    .spawn_with_execution_deadline(
+                        make_slot(1),
+                        &make_bg_context(),
+                        Some(make_deadline(66)),
+                    )
+                    .await
+            })
+        };
+        wait_for_spawn_reservation(&reservation_entered, &release_reservation).await;
+        tokio::time::sleep(Duration::from_millis(6_100)).await;
+        release_reservation
+            .send(())
+            .expect("spawn hook is waiting for its release signal");
+
+        let result = tokio::time::timeout(Duration::from_secs(3), spawn_task)
+            .await
+            .expect("budget-expired spawn must be rejected promptly")
+            .expect("spawn host must not panic");
+        assert!(matches!(result, Err(SpawnError::ExecutionDeadlineElapsed)));
+        assert!(spawner.list_all_agents().await.is_empty());
+        let group = spawner
+            .fanout_group("deadline-admission")
+            .await
+            .expect("each rejected fanout slot is still accounted");
+        assert_eq!(group.status, AgentFanoutStatus::Finished);
+        assert!(group.slots.iter().all(|slot| {
+            slot.status == AgentFanoutSlotStatus::SpawnRejected && slot.terminal_reason.is_some()
+        }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_close_linearizes_before_the_first_spawn_side_effect() {
         let register_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let router = Arc::new(AgentMailboxRouter::new(
@@ -12280,15 +12570,7 @@ mod tests {
             DynamicAgentSpawner::new(router)
                 .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>),
         );
-        let reservation_entered = Arc::new(std::sync::Barrier::new(2));
-        let release_reservation = Arc::new(std::sync::Barrier::new(2));
-        *spawner
-            .spawn_before_reservation_barriers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((
-            Arc::clone(&reservation_entered),
-            Arc::clone(&release_reservation),
-        ));
+        let (reservation_entered, release_reservation) = pause_before_spawn_reservation(&spawner);
 
         let spawn_task = {
             let spawner = Arc::clone(&spawner);
@@ -12296,7 +12578,7 @@ mod tests {
         };
         // The spawn is inside one in-progress poll: the outer biased select has
         // already checked cancellation, but no active/mailbox owner exists yet.
-        reservation_entered.wait();
+        wait_for_spawn_reservation(&reservation_entered, &release_reservation).await;
 
         let shutdown = {
             let spawner = Arc::clone(&spawner);
@@ -12320,7 +12602,9 @@ mod tests {
         })
         .await
         .expect("shutdown must close admission and snapshot active ownership");
-        release_reservation.wait();
+        release_reservation
+            .send(())
+            .expect("spawn hook is waiting for its release signal");
 
         tokio::time::timeout(Duration::from_secs(1), shutdown)
             .await
@@ -12609,15 +12893,7 @@ mod tests {
             )
             .await
             .expect("declare fixed fanout group");
-        let reservation_entered = Arc::new(std::sync::Barrier::new(2));
-        let release_reservation = Arc::new(std::sync::Barrier::new(2));
-        *spawner
-            .spawn_before_reservation_barriers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((
-            Arc::clone(&reservation_entered),
-            Arc::clone(&release_reservation),
-        ));
+        let (reservation_entered, release_reservation) = pause_before_spawn_reservation(&spawner);
 
         let spawn = {
             let spawner = Arc::clone(&spawner);
@@ -12629,7 +12905,7 @@ mod tests {
                 spawner.spawn(input, &make_bg_context()).await
             })
         };
-        reservation_entered.wait();
+        wait_for_spawn_reservation(&reservation_entered, &release_reservation).await;
         let cancellation = spawner
             .cancel_fanout_group_for_user("pre-admission-user-stop", "user stopped declared fanout")
             .await
@@ -12640,7 +12916,9 @@ mod tests {
             AgentFanoutSlotStatus::CancelledByUser
         );
         assert_eq!(cancellation.group.summary().cancelled_by_user, 1);
-        release_reservation.wait();
+        release_reservation
+            .send(())
+            .expect("spawn hook is waiting for its release signal");
 
         let result = tokio::time::timeout(Duration::from_secs(1), spawn)
             .await

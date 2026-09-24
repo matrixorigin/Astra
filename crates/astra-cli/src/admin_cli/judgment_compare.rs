@@ -2,9 +2,10 @@
 use super::cli_args::ModelCompareArgs;
 use astra_thin_client::{CompletionOperation, CompletionRequest, ThinClient, ThinClientError};
 #[cfg(test)]
-use astra_turn_types::JudgmentResponse;
+use astra_turn_types::{JUDGMENT_SCHEMA_VERSION, JudgmentResponse};
 use astra_turn_types::{
-    JudgmentRequest, JudgmentResponseProvenance, judgment_messages, normalize_judgment_response,
+    JudgmentNoulDecision, JudgmentQuestion, JudgmentRequest, JudgmentResponseProvenance,
+    judgment_messages, normalize_judgment_response,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -65,6 +66,17 @@ fn validate_cases(cases: &[Case]) -> Result<(), String> {
         case.request
             .validate()
             .map_err(|e| format!("Case {}: {e}", case.id))?;
+        if case
+            .request
+            .questions
+            .values()
+            .any(|question| !matches!(question, JudgmentQuestion::Noul { .. }))
+        {
+            return Err(format!(
+                "Case {}: this comparison supports Noul questions only.",
+                case.id
+            ));
+        }
         if !case.threshold.is_finite() || !(0.0..=1.0).contains(&case.threshold) {
             return Err(format!(
                 "Case {}: threshold must be between 0 and 1.",
@@ -94,20 +106,32 @@ fn selection(
 ) -> Result<Vec<String>, String> {
     let normalized = normalize_judgment_response(&case.request, text, model, provenance)
         .map_err(|_| "invalid_judgment".to_owned())?;
-    let mut selected: Vec<String> = normalized
-        .response
-        .answers
-        .into_iter()
-        .filter_map(|(id, answer)| {
-            let selected = match normalized.provenance {
-                JudgmentResponseProvenance::ProviderProbability => {
-                    answer.probability() > case.threshold
+    let mut selected = Vec::new();
+    for (id, answer) in normalized.response.answers {
+        let selected_answer = match normalized.provenance {
+            JudgmentResponseProvenance::ProviderProbability => {
+                answer
+                    .native_noul_probability()
+                    .ok_or_else(|| "invalid_judgment".to_owned())?
+                    > case.threshold
+            }
+            JudgmentResponseProvenance::DiscreteDecision => {
+                match answer
+                    .discrete_noul_decision()
+                    .ok_or_else(|| "invalid_judgment".to_owned())?
+                {
+                    JudgmentNoulDecision::Yes => true,
+                    JudgmentNoulDecision::No => false,
+                    JudgmentNoulDecision::Unknown => {
+                        return Err("uncertain_judgment".to_owned());
+                    }
                 }
-                JudgmentResponseProvenance::DiscreteDecision => answer.probability() == 1.0,
-            };
-            selected.then_some(id)
-        })
-        .collect();
+            }
+        };
+        if selected_answer {
+            selected.push(id);
+        }
+    }
     selected.sort();
     Ok(selected)
 }
@@ -463,7 +487,7 @@ mod tests {
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(completion(
                 "offer-baseline",
-                r#"{"true":["0"],"uncertain":[]}"#,
+                r#"{"answers":{"0":{"type":"discrete_noul","decision":"yes"}}}"#,
             )))
             .expect(2)
             .mount(&server)
@@ -486,7 +510,7 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(truncated_completion(
                     "offer-jev",
-                    r#"{"true":["0"],"uncertain":[]}"#,
+                    r#"{"answers":{"0":{"type":"discrete_noul","decision":"yes"}}}"#,
                 )),
             )
             .expect(1)
@@ -585,7 +609,7 @@ mod tests {
         validate_cases(&cases).unwrap();
         let mut case = cases[0].clone();
         let response = JudgmentResponse {
-            schema_version: 1,
+            schema_version: JUDGMENT_SCHEMA_VERSION,
             model: "model".into(),
             answers: [
                 (
@@ -623,12 +647,22 @@ mod tests {
         );
         assert!(
             selection(
-                r#"{"true":["unknown"],"uncertain":[]}"#,
+                r#"{"answers":{"unknown":{"type":"discrete_noul","decision":"yes"}}}"#,
                 &case,
                 "chat-fixture",
                 Some(JudgmentResponseProvenance::DiscreteDecision)
             )
             .is_err()
+        );
+        assert_eq!(
+            selection(
+                r#"{"answers":{"0":{"type":"discrete_noul","decision":"unknown"},"1":{"type":"discrete_noul","decision":"no"}}}"#,
+                &case,
+                "chat-fixture",
+                Some(JudgmentResponseProvenance::DiscreteDecision)
+            )
+            .unwrap_err(),
+            "uncertain_judgment"
         );
         assert_eq!(order(0), [0, 1]);
         assert_eq!(order(1), [1, 0]);
@@ -641,5 +675,36 @@ mod tests {
         cases[0].expected = None;
         cases[0].operation = CompletionOperation::MemoryExtraction;
         assert!(validate_cases(&cases).is_err());
+    }
+
+    #[test]
+    fn fixtures_reject_choice_and_score_before_comparison() {
+        let mut cases = built_in_cases();
+        cases[0].request.questions.insert(
+            "route".into(),
+            JudgmentQuestion::Choice {
+                instructions: "Choose a route".into(),
+                criteria: [("a".into(), json!("A")), ("b".into(), json!("B"))].into(),
+            },
+        );
+        assert!(
+            validate_cases(&cases)
+                .unwrap_err()
+                .contains("Noul questions only")
+        );
+
+        cases[0].request.questions.remove("route");
+        cases[0].request.questions.insert(
+            "progress".into(),
+            JudgmentQuestion::Score {
+                instructions: "Rate progress".into(),
+                criteria: vec![json!("low"), json!("high")],
+            },
+        );
+        assert!(
+            validate_cases(&cases)
+                .unwrap_err()
+                .contains("Noul questions only")
+        );
     }
 }

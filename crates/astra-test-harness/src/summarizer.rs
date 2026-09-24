@@ -43,6 +43,7 @@ fn build_summary_payload(report: &SuiteReport) -> serde_json::Value {
                         "attempt_index": attempt.attempt_index,
                         "exit_code": outcome.exit_code,
                         "final_state": outcome.final_state,
+                        "error_kind": outcome.error_kind,
                         "session_id": outcome.session_id,
                         "run_id": outcome.run_id,
                         "tokens": outcome.prompt_tokens + outcome.completion_tokens,
@@ -64,12 +65,14 @@ fn build_summary_payload(report: &SuiteReport) -> serde_json::Value {
                 "capability": r.capability.as_ref().map(|c| c.to_string()),
                 "difficulty": r.difficulty,
                 "exit_code": r.outcome.exit_code,
+                "error_kind": r.outcome.error_kind,
                 "tokens": r.outcome.prompt_tokens + r.outcome.completion_tokens,
                 "duration_ms": r.outcome.duration_ms,
                 "turn_rounds": r.outcome.turn_rounds,
                 "tool_calls": r.outcome.tool_calls_count,
                 "tools_used": r.outcome.tools_used,
                 "failure_class": r.failure_class.as_ref().map(|c| c.to_string()),
+                "cleanup_errors": r.cleanup_errors,
                 "execution": r.execution.as_ref().map(|execution| serde_json::json!({
                     "scope": match execution.scope {
                         crate::pipeline_analysis::ExecutionTraceScope::Session => "session",
@@ -290,6 +293,7 @@ mod tests {
                 digest: None,
                 digest_error: None,
                 failure_class: None,
+                cleanup_errors: Vec::new(),
                 has_warnings: false,
             }],
             ..Default::default()
@@ -334,6 +338,7 @@ mod tests {
             digest: None,
             digest_error: None,
             failure_class: None,
+            cleanup_errors: Vec::new(),
             has_warnings: false,
         };
         cancelled.outcome.text = "not executed".into();
@@ -374,6 +379,7 @@ mod tests {
                 digest: None,
                 digest_error: None,
                 failure_class: None,
+                cleanup_errors: Vec::new(),
                 has_warnings: true,
             }],
             ..Default::default()

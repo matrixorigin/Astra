@@ -46,26 +46,19 @@ fn unknown_model_falls_back_to_global_defaults() {
 }
 
 #[test]
-fn opus_state_carries_cache_suppression_and_empty_name_from_profile() {
-    // These fields replaced the hardcoded
-    // `REPEATED_CACHE_HIT_SUPPRESSION_THRESHOLD` / `MAX_CONSECUTIVE_EMPTY_NAME`
-    // constants that used to live in `headless_tool_pipeline`. Opus profile
-    // loosens cache suppression to 4 and keeps empty-name cap at 3.
+fn opus_state_carries_empty_name_limit_from_profile() {
     let state = make_test_loop_state_for_model(Some("claude-opus-4-7"));
-    assert_eq!(state.repeated_cache_hit_suppression, 4);
     assert_eq!(state.max_consecutive_empty_name, 3);
 }
 
 #[test]
-fn haiku_state_tightens_both_new_guards() {
+fn haiku_state_tightens_empty_name_guard() {
     let state = make_test_loop_state_for_model(Some("claude-haiku-4-5"));
-    assert_eq!(state.repeated_cache_hit_suppression, 2);
     assert_eq!(state.max_consecutive_empty_name, 2);
 }
 
 #[test]
-fn no_model_state_uses_global_default_new_guards() {
+fn no_model_state_uses_global_empty_name_default() {
     let state = make_test_loop_state_for_model(None);
-    assert_eq!(state.repeated_cache_hit_suppression, 3);
     assert_eq!(state.max_consecutive_empty_name, 3);
 }

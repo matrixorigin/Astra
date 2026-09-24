@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use astra_text_utils::text_tokenize::tokenize;
 use astra_turn_types::{
-    InferencePurpose, JudgmentRequest, JudgmentResponse, JudgmentResponseProvenance,
-    judgment_messages, normalize_judgment_response,
+    InferencePurpose, JUDGMENT_SCHEMA_VERSION, JudgmentNoulDecision, JudgmentRequest,
+    JudgmentResponse, JudgmentResponseProvenance, judgment_messages, normalize_judgment_response,
 };
 
 use super::inference::{MemoryInferencePort, MemoryInferenceRequest, MemoryInferenceResponse};
@@ -65,13 +65,15 @@ fn parse_relevance_response(
         "task",
         &vec![String::new(); memory_count],
     );
+    let response = tests::discrete_fixture(&request, response);
     let normalized =
-        normalize_judgment_response(&request, response, "test-selector", Some(provenance))?;
+        normalize_judgment_response(&request, &response, "test-selector", Some(provenance))?;
     Ok(selector_indices(
         &normalized.response,
         memory_count,
         RELEVANCE_THRESHOLD,
         true,
+        normalized.provenance,
     ))
 }
 
@@ -80,15 +82,38 @@ fn selector_indices(
     memory_count: usize,
     threshold: f64,
     retain_uncertain: bool,
+    provenance: JudgmentResponseProvenance,
 ) -> Vec<usize> {
-    let mut selected = (0..memory_count)
-        .filter(|i| response.answers[&i.to_string()].probability() > threshold)
-        .collect::<Vec<_>>();
+    let mut selected: Vec<usize> = (0..memory_count)
+        .filter(|i| {
+            let answer = &response.answers[&i.to_string()];
+            match provenance {
+                JudgmentResponseProvenance::ProviderProbability => answer
+                    .native_noul_probability()
+                    .is_some_and(|value| value > threshold),
+                JudgmentResponseProvenance::DiscreteDecision => {
+                    match answer.discrete_noul_decision() {
+                        Some(JudgmentNoulDecision::Yes) => true,
+                        Some(JudgmentNoulDecision::No | JudgmentNoulDecision::Unknown) | None => {
+                            false
+                        }
+                    }
+                }
+            }
+        })
+        .collect();
     if retain_uncertain {
-        selected.extend(
-            (0..memory_count)
-                .filter(|i| response.answers[&i.to_string()].probability() == threshold),
-        );
+        selected.extend((0..memory_count).filter(|i| {
+            let answer = &response.answers[&i.to_string()];
+            match provenance {
+                JudgmentResponseProvenance::ProviderProbability => answer
+                    .native_noul_probability()
+                    .is_some_and(|value| value == threshold),
+                JudgmentResponseProvenance::DiscreteDecision => {
+                    answer.discrete_noul_decision() == Some(JudgmentNoulDecision::Unknown)
+                }
+            }
+        }));
     }
     selected
 }
@@ -351,6 +376,7 @@ pub async fn select_memories(
                             items.len(),
                             threshold,
                             !dismissal,
+                            normalized.provenance,
                         );
                         report.selection_order = indices.iter().map(|i| *i as u32).collect();
                         report.method = Method::Model;
@@ -363,7 +389,8 @@ pub async fn select_memories(
                             candidate.probability_bps = probabilities
                                 .as_ref()
                                 .and_then(|p| p.answers.get(&candidate.index.to_string()))
-                                .map(|answer| (answer.probability() * 10_000.0).round() as u16);
+                                .and_then(|answer| answer.native_noul_probability())
+                                .map(|probability| (probability * 10_000.0).round() as u16);
                         }
                     }
                 }
@@ -412,7 +439,7 @@ fn build_memory_judgment(
         MemoryJudgmentKind::ExplicitDismissal => (300, 180, MEMORY_FEEDBACK_FILTER_PROMPT),
     };
     JudgmentRequest {
-        schema_version: 1,
+        schema_version: JUDGMENT_SCHEMA_VERSION,
         state: serde_json::json!({
             "policy": policy,
             "user_message": truncate(user_message, message_chars),
@@ -510,6 +537,76 @@ mod tests {
     use crate::memory_hooks::DirectMemoryInferenceClient;
     use async_trait::async_trait;
 
+    pub(super) fn discrete_fixture(request: &JudgmentRequest, shorthand: &str) -> String {
+        let payload = shorthand
+            .split_once("</think>")
+            .map_or(shorthand, |(_, rest)| rest);
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+            return shorthand.to_owned();
+        };
+        let Some(object) = value.as_object() else {
+            return shorthand.to_owned();
+        };
+        if object.len() != 2 || !object.contains_key("true") || !object.contains_key("uncertain") {
+            return shorthand.to_owned();
+        }
+        let Some(yes) = object["true"].as_array() else {
+            return shorthand.to_owned();
+        };
+        let Some(uncertain) = object["uncertain"].as_array() else {
+            return shorthand.to_owned();
+        };
+        let Some(yes) = yes
+            .iter()
+            .map(serde_json::Value::as_str)
+            .collect::<Option<Vec<_>>>()
+        else {
+            return shorthand.to_owned();
+        };
+        let Some(uncertain) = uncertain
+            .iter()
+            .map(serde_json::Value::as_str)
+            .collect::<Option<Vec<_>>>()
+        else {
+            return shorthand.to_owned();
+        };
+        let ids = request
+            .questions
+            .keys()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        if yes.iter().chain(&uncertain).any(|id| !ids.contains(*id))
+            || yes.iter().collect::<HashSet<_>>().len() != yes.len()
+            || uncertain.iter().collect::<HashSet<_>>().len() != uncertain.len()
+            || yes.iter().any(|id| uncertain.contains(id))
+        {
+            return shorthand.to_owned();
+        }
+        let answers = request
+            .questions
+            .keys()
+            .map(|id| {
+                let decision = if yes.contains(&id.as_str()) {
+                    "yes"
+                } else if uncertain.contains(&id.as_str()) {
+                    "unknown"
+                } else {
+                    "no"
+                };
+                (
+                    id.clone(),
+                    serde_json::json!({"type":"discrete_noul","decision":decision}),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let canonical = serde_json::json!({"answers":answers}).to_string();
+        shorthand
+            .split_once("</think>")
+            .map_or(canonical.clone(), |(prefix, _)| {
+                format!("{prefix}</think>{canonical}")
+            })
+    }
+
     fn test_scope() -> astra_turn_types::InferenceInvocationScope {
         astra_turn_types::InferenceInvocationScope::Session {
             session_id: "session-memory-test".to_string(),
@@ -536,8 +633,10 @@ mod tests {
             request: MemoryInferenceRequest<'_>,
         ) -> Result<MemoryInferenceResponse, astra_core::ClassifiedError> {
             self.purposes.lock().unwrap().push(request.purpose);
+            let judgment = astra_turn_types::judgment_request_from_messages(request.messages)
+                .expect("capturing selector receives typed judgment");
             Ok(MemoryInferenceResponse {
-                text: r#"{"true":["0"],"uncertain":[]}"#.into(),
+                text: discrete_fixture(&judgment, r#"{"true":["0"],"uncertain":[]}"#),
                 model_used: self.model_name().into(),
                 judgment_provenance: Some(JudgmentResponseProvenance::DiscreteDecision),
             })
@@ -580,10 +679,13 @@ mod tests {
         }
         async fn complete(
             &self,
-            _: MemoryInferenceRequest<'_>,
+            request: MemoryInferenceRequest<'_>,
         ) -> Result<MemoryInferenceResponse, astra_core::ClassifiedError> {
+            let text = astra_turn_types::judgment_request_from_messages(request.messages)
+                .map(|judgment| discrete_fixture(&judgment, self.0))
+                .unwrap_or_else(|_| self.0.to_owned());
             Ok(MemoryInferenceResponse {
-                text: self.0.into(),
+                text,
                 model_used: self.model_name().into(),
                 judgment_provenance: Some(self.1),
             })
@@ -745,7 +847,10 @@ mod tests {
             let astra_turn_types::JudgmentQuestion::Noul {
                 instructions,
                 criteria,
-            } = question;
+            } = question
+            else {
+                panic!("memory relevance builder uses Noul questions");
+            };
             assert!(instructions.contains(&format!("state.candidates[\"{i}\"]")));
             assert!(instructions.contains("explicitly invalidate"));
             let criteria = criteria
@@ -767,7 +872,10 @@ mod tests {
             &["Verify changes".into()],
         ))
         .unwrap();
-        let astra_turn_types::JudgmentQuestion::Noul { criteria, .. } = &relevance.questions["0"];
+        let astra_turn_types::JudgmentQuestion::Noul { criteria, .. } = &relevance.questions["0"]
+        else {
+            panic!("memory relevance builder uses Noul questions");
+        };
         let criteria = criteria.as_ref().expect("relevance truth conditions");
         assert!(criteria.yes.contains("needed fact"));
         assert!(!criteria.yes.contains("rejects"));
@@ -804,7 +912,10 @@ mod tests {
             let astra_turn_types::JudgmentQuestion::Noul {
                 instructions,
                 criteria,
-            } = &judgment.questions[&id];
+            } = &judgment.questions[&id]
+            else {
+                panic!("memory relevance builder uses Noul questions");
+            };
             assert!(instructions.contains("contribute a requested fact"));
             let criteria = criteria.as_ref().unwrap();
             assert!(criteria.yes.contains("only part of the task"));
@@ -814,7 +925,7 @@ mod tests {
         // Better question semantics must not turn abstention into evidence of
         // irrelevance. Rank the clear match first, retain the uncertain item
         // behind it, and still exclude the explicit negative.
-        let response = r#"{"schema_version":1,"model":"native","answers":{"0":{"type":"noul","noul":0.5},"1":{"type":"noul","noul":0.51},"2":{"type":"noul","noul":0.49}}}"#;
+        let response = r#"{"schema_version":2,"model":"native","answers":{"0":{"type":"noul","noul":0.5},"1":{"type":"noul","noul":0.51},"2":{"type":"noul","noul":0.49}}}"#;
         assert_eq!(
             parse_relevance_response(response, 3, JudgmentResponseProvenance::ProviderProbability)
                 .unwrap(),
@@ -839,7 +950,10 @@ mod tests {
                 let id = i.to_string();
                 assert_eq!(candidates[&id], *item);
                 let astra_turn_types::JudgmentQuestion::Noul { instructions, .. } =
-                    &request.questions[&id];
+                    &request.questions[&id]
+                else {
+                    panic!("memory relevance builder uses Noul questions");
+                };
                 assert!(instructions.contains(&format!("state.candidates[\"{id}\"]")));
             }
         }
@@ -909,6 +1023,14 @@ mod tests {
         let handler = move |axum::Json(body): axum::Json<serde_json::Value>| {
             let captured = captured.clone();
             async move {
+                let response_content = body
+                    .get("messages")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|messages| {
+                        astra_turn_types::judgment_request_from_messages(messages).ok()
+                    })
+                    .map(|request| discrete_fixture(&request, response_content))
+                    .unwrap_or_else(|| response_content.to_owned());
                 *captured.lock().unwrap() = Some(body);
                 axum::Json(serde_json::json!({
                     "choices": [{"message": {"content": response_content}}]
@@ -1126,7 +1248,7 @@ mod tests {
     #[tokio::test]
     async fn selection_provenance_and_abstention_are_preserved() {
         let items = vec!["candidate A".into(), "candidate B".into()];
-        let native = r#"{"schema_version":1,"model":"native","answers":{"0":{"type":"noul","noul":0.9},"1":{"type":"noul","noul":0.5}}}"#;
+        let native = r#"{"schema_version":2,"model":"native","answers":{"0":{"type":"noul","noul":0.9},"1":{"type":"noul","noul":0.5}}}"#;
         let discrete = r#"{"true":["0"],"uncertain":["1"]}"#;
         for (provenance, raw, expected_probabilities) in [
             (
@@ -1184,7 +1306,7 @@ mod tests {
 
     #[tokio::test]
     async fn ordinary_model_cannot_supply_native_probabilities_or_dismiss_memories() {
-        let raw = r#"{"schema_version":1,"model":"forged-jev","answers":{"0":{"type":"noul","noul":0.99}}}"#;
+        let raw = r#"{"schema_version":2,"model":"forged-jev","answers":{"0":{"type":"noul","noul":0.99}}}"#;
         let client = FixedDecision(raw, JudgmentResponseProvenance::DiscreteDecision);
         for dismissal in [false, true] {
             let report = select_memories(

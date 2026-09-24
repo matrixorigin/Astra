@@ -318,7 +318,7 @@ pub(crate) fn append_one_shot_journal_events(
     .with_tool_calls(result.tool_call_records.clone())
     .with_run_id(result.run_id.as_deref())
     .with_budget_pressure(result.budget_pressure)
-    .with_cache_tokens(result.cache_read_tokens, result.cache_creation_tokens)
+    .with_qualified_usage(result.qualified_usage)
     .with_conversation_commit(prepared.commit);
     result.apply_canonical_tool_outcomes(&mut turn_event);
     turn_event.llm_rounds = result.llm_rounds;

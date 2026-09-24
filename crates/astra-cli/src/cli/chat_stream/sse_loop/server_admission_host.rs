@@ -1417,17 +1417,13 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
             // the TUI rail instead belong to the final physical root request,
             // which the server reports explicitly.  Preserve that distinction
             // before the runtime finalizes the root context trace.
-            if let Some(usage) = turn_result.core.current_request_usage {
-                let measured = astra_turn_types::NormalizedPromptCacheUsage::new(
-                    usage.fresh_input_tokens,
-                    usage.cache_read_tokens,
-                    usage.cache_creation_tokens,
-                )
-                .total_input_tokens();
-                if measured > 0 {
-                    state.last_measured_prompt_tokens = Some(measured);
-                }
-            }
+            state.last_measured_prompt_tokens =
+                turn_result.core.current_request_usage.and_then(|usage| {
+                    usage
+                        .fresh_input_tokens
+                        .checked_add(usage.cache_read_tokens)?
+                        .checked_add(usage.cache_creation_tokens)
+                });
         }
 
         // Write per-round token counts into incremental state immediately

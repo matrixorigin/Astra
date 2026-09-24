@@ -357,6 +357,18 @@ mod tests {
             j.contains(r#""kind":"turn_summary""#),
             "unexpected tag: {j}"
         );
+        let value: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(
+            value.get("cumulative_cost_usd"),
+            Some(&serde_json::Value::Null)
+        );
+        assert!(matches!(
+            serde_json::from_str::<TurnEvent>(&j).unwrap(),
+            TurnEvent::TurnSummary {
+                cumulative_cost_usd: None,
+                ..
+            }
+        ));
     }
 
     #[test]

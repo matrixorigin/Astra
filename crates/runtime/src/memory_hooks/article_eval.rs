@@ -218,7 +218,7 @@ async fn memory_injection_article_live() {
         .expect("JEV configured");
     let flash = entries
         .iter()
-        .find(|m| m.name == "deepseek-v4-flash")
+        .find(|m| m.name == "deepseek-flash")
         .expect("Flash configured");
     assert!(!jev.api_key.is_empty() && !flash.api_key.is_empty());
     let out = Path::new(&output);

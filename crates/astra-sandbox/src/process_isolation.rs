@@ -371,6 +371,13 @@ impl BashInvocationOwner {
         self.supervisor.is_some()
     }
 
+    /// Whether this prepared invocation can ever prove that all descendants
+    /// have settled. A process group alone cannot attest to escaped children.
+    /// This is an admission check, not a receipt: start/settlement can fail.
+    pub fn can_authoritatively_observe(&self) -> bool {
+        self.process_scope.active() || self.supervisor.is_some()
+    }
+
     /// Consume the final owner receipt after the child/helper has exited.
     pub fn settle_after_exit(&mut self, leader_pid: Option<u32>) -> Option<ScopeOwnership> {
         self.settle_after_exit_detailed(leader_pid)
@@ -2821,6 +2828,27 @@ async fn execute_isolated_with_cancel_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn foreground_process_group_cannot_admit_authoritative_verification() {
+        let (_command, owner) =
+            BashInvocationOwner::prepare("bash", &["-c".into(), "true".into()]).unwrap();
+        assert!(!owner.can_authoritatively_observe());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepared_supervisor_can_admit_authoritative_verification() {
+        let (_command, owner) = BashInvocationOwner::prepare_with_supervisor_helper(
+            std::env::current_exe().unwrap(),
+            ["--exact".to_string(), SUPERVISOR_HELPER_TEST.to_string()],
+            "bash",
+            &["-c".into(), "true".into()],
+        )
+        .unwrap();
+        assert!(owner.can_authoritatively_observe());
+    }
 
     #[cfg(target_os = "linux")]
     const SUPERVISOR_HELPER_TEST: &str =

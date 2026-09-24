@@ -3636,7 +3636,8 @@ impl GuidanceSubmissionError {
             }
             astra_thin_client::ThinClientError::InvalidBaseUrl(_)
             | astra_thin_client::ThinClientError::InvalidAuthHeader
-            | astra_thin_client::ThinClientError::InvalidInput(_) => {
+            | astra_thin_client::ThinClientError::InvalidInput(_)
+            | astra_thin_client::ThinClientError::AdmissionDeadlineExpired => {
                 Self::Rejected(error.to_string())
             }
             // A transport failure, a successful response with an invalid
@@ -10590,7 +10591,7 @@ pub(crate) async fn run_tui_session(
                                             }),
                                             cumulative_cost_usd: turn_usage
                                                 .as_ref()
-                                                .map(|_| state.total_session_cost),
+                                                .and(state.total_session_cost),
                                         };
                                         if let Some(ev) = chat_widget::translate(
                                             TuiAppEvent::TurnComplete,

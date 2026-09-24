@@ -187,7 +187,7 @@ pub(crate) struct SessionSummary {
     pub session_id: String,
     pub turn: u32,
     pub model: Option<String>,
-    pub total_cost: f64,
+    pub total_cost: Option<f64>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub cache_read_tokens: u64,

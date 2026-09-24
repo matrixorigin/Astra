@@ -36,7 +36,6 @@ You've been going in circles or hitting dead ends. Use the runtime data below to
 | Errors | ${{CTX_ERROR_COUNT}} |
 | Tool retry cautions | ${{CTX_HEALTH_AVOIDANCE_TOOLS}} |
 | Stall events | ${{CTX_STALL_EVENTS}} |
-| Correction follow rate | ${{CTX_CORRECTION_FOLLOW_RATE}} |
 
 ## Step 1: Diagnose the Impasse
 

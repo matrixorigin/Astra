@@ -18,7 +18,7 @@ use serde_json::{Map, Value, json};
 use super::super::llm::client::{
     LlmCallResult, MAX_STREAM_ACCUMULATION_BYTES, MAX_STREAM_TOOL_CALLS,
 };
-use super::super::token_usage::{TokenUsage, UsageDialect, extract_usage};
+use super::super::token_usage::{TokenUsage, UsageDialect, parse_usage};
 use super::eventstream::EventStreamFrame;
 
 /// Incremental events yielded by the accumulator as frames arrive.
@@ -92,6 +92,7 @@ pub struct BedrockStreamAccumulator {
     tool_calls: BTreeMap<u64, ToolCallInProgress>,
     usage: Option<TokenUsage>,
     usage_presence: crate::turn::token_usage::TokenUsagePresence,
+    usage_metadata_received: bool,
     finish_reason: Option<String>,
     exception: Option<(String, String)>,
     /// Total bytes retained across all response fields. This must remain
@@ -196,12 +197,13 @@ impl BedrockStreamAccumulator {
         self.finish_reason.is_some()
     }
 
-    /// Whether the trailing Bedrock metadata frame supplied normalized usage.
+    /// Whether a trailing metadata frame supplied a usage object, independently
+    /// of whether its counters can be used for accounting.
     ///
-    /// `messageStop` without this fact is not an accounting-complete success:
+    /// `messageStop` without this fact is not a protocol-complete success:
     /// metadata is emitted after the semantic stop frame.
     pub fn has_usage_metadata(&self) -> bool {
-        self.usage.is_some()
+        self.usage_metadata_received
     }
 
     pub fn has_complete_terminal_facts(&self) -> bool {
@@ -413,16 +415,17 @@ impl BedrockStreamAccumulator {
                 let Some(usage_obj) = payload.get("usage").and_then(Value::as_object) else {
                     return Ok(vec![]);
                 };
-                let Some(u) = extract_usage(UsageDialect::BedrockConverse, usage_obj) else {
+                self.usage_metadata_received = true;
+                let Some((update, observed)) =
+                    parse_usage(UsageDialect::BedrockConverse, usage_obj)
+                else {
                     return Ok(vec![]);
                 };
-                self.usage_presence
-                    .merge(crate::turn::token_usage::extract_usage_presence(
-                        UsageDialect::BedrockConverse,
-                        usage_obj,
-                    ));
-                self.usage = Some(u);
-                Ok(vec![BedrockStreamEvent::Usage(u)])
+                let usage = self.usage.get_or_insert_default();
+                usage.update_disjoint_lanes(&mut self.usage_presence, update, observed);
+                Ok(vec![BedrockStreamEvent::Usage(
+                    usage.qualified_snapshot(self.usage_presence).0,
+                )])
             }
 
             // Unknown event types (future extensions) — ignore. Do not
@@ -460,8 +463,13 @@ impl BedrockStreamAccumulator {
             })
             .collect::<Vec<_>>();
 
-        let usage_map: Map<String, Value> = self.usage.map(|u| u.to_json_map()).unwrap_or_default();
-        let usage_presence = self.usage_presence;
+        let (usage_map, usage_presence) = self
+            .usage
+            .map(|u| {
+                let (usage, presence) = u.qualified_snapshot(self.usage_presence);
+                (usage.to_qualified_json_map(presence), presence)
+            })
+            .unwrap_or_default();
 
         // If an exception killed the stream and no stopReason arrived, tag
         // the finish_reason so the finalization layer doesn't think the
@@ -509,6 +517,106 @@ fn parse_json_or_empty(bytes: &[u8]) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invalid_metadata_revokes_input_without_reviving_on_later_valid_frame() {
+        for valid_first in [false, true] {
+            let mut acc = BedrockStreamAccumulator::new();
+            let valid = json!({"inputTokens":10,"cacheReadInputTokens":80,"cacheWriteInputTokens":0,"outputTokens":7});
+            let mut updates = Vec::new();
+            if valid_first {
+                updates.push(valid.clone());
+            }
+            updates.push(json!({"inputTokens":-1}));
+            updates.push(valid);
+            for usage in updates {
+                acc.push_frame(&frame(
+                    "event",
+                    "metadata",
+                    &serde_json::to_vec(&json!({"usage":usage})).unwrap(),
+                ))
+                .unwrap();
+            }
+            assert!(acc.has_usage_metadata());
+            let result = acc.into_result("test-model", 0);
+            assert!(result.usage_presence.input_invalid);
+            assert_eq!(
+                result.usage,
+                serde_json::from_value::<Map<String, Value>>(json!({"output_tokens":7})).unwrap()
+            );
+            let terminal = crate::turn::llm::client::provider_attempt_terminal_from_result(&result);
+            assert_eq!(
+                terminal.usage_status,
+                astra_services::InferenceUsageStatus::ProviderPartial
+            );
+            assert_eq!(terminal.usage.input.fresh_input_tokens, 0);
+        }
+    }
+
+    #[test]
+    fn unavailable_counters_do_not_erase_protocol_metadata_receipt() {
+        for usage in [
+            json!({}),
+            json!({"inputTokens":-1,"outputTokens":"unknown"}),
+        ] {
+            let mut acc = BedrockStreamAccumulator::new();
+            acc.push_frame(&frame(
+                "event",
+                "messageStop",
+                br#"{"stopReason":"end_turn"}"#,
+            ))
+            .unwrap();
+            let payload = serde_json::to_vec(&json!({"usage":usage})).unwrap();
+            acc.push_frame(&frame("event", "metadata", &payload))
+                .unwrap();
+            assert!(acc.has_complete_terminal_facts());
+            let result = acc.into_result("test-model", 0);
+            assert!(result.usage.is_empty());
+            assert!(!result.usage_presence.any());
+            assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+        }
+        for payload in [json!({}), json!({"usage":null}), json!({"usage":7})] {
+            let mut acc = BedrockStreamAccumulator::new();
+            acc.push_frame(&frame(
+                "event",
+                "metadata",
+                &serde_json::to_vec(&payload).unwrap(),
+            ))
+            .unwrap();
+            assert!(!acc.has_usage_metadata());
+        }
+    }
+
+    #[test]
+    fn metadata_updates_preserve_missing_lanes_and_replace_explicit_zero() {
+        for reversed in [false, true] {
+            let mut acc = BedrockStreamAccumulator::new();
+            let mut updates = vec![
+                json!({"inputTokens":100,"cacheReadInputTokens":80}),
+                json!({"outputTokens":7,"cacheWriteInputTokens":0}),
+            ];
+            if reversed {
+                updates.reverse();
+            }
+            // Repeated cumulative metadata is not additive.
+            updates.push(updates[0].clone());
+            updates.push(json!({"inputTokens":0}));
+            for usage in updates {
+                let payload = serde_json::to_vec(&json!({"usage":usage})).unwrap();
+                let events = acc
+                    .push_frame(&frame("event", "metadata", &payload))
+                    .unwrap();
+                assert_eq!(events, vec![BedrockStreamEvent::Usage(acc.usage.unwrap())]);
+            }
+            assert!(acc.has_usage_metadata());
+            let result = acc.into_result("test-model", 0);
+            assert_eq!(result.usage["input_tokens"], 0);
+            assert_eq!(result.usage["cached_input_tokens"], 80);
+            assert_eq!(result.usage["cache_creation_tokens"], 0);
+            assert_eq!(result.usage["output_tokens"], 7);
+            assert_eq!(result.usage["total_tokens"], 87);
+        }
+    }
+
     use super::super::eventstream::EventStreamFrame;
     use super::*;
 
@@ -572,13 +680,21 @@ mod tests {
         ))
         .unwrap();
 
+        assert!(acc.has_usage_metadata());
         let r = acc.into_result("claude", 42);
         assert_eq!(r.full_text, "Hello world");
         assert!(r.tool_calls.is_empty());
         assert_eq!(r.finish_reason.as_deref(), Some("stop"));
         assert_eq!(r.usage["input_tokens"], 10);
         assert_eq!(r.usage["output_tokens"], 5);
-        assert_eq!(r.usage["total_tokens"], 15);
+        assert!(!r.usage.contains_key("cached_input_tokens"));
+        assert!(!r.usage.contains_key("cache_creation_tokens"));
+        assert!(!r.usage.contains_key("total_tokens"));
+        let terminal = crate::turn::llm::client::provider_attempt_terminal_from_result(&r);
+        assert_eq!(
+            terminal.usage_status,
+            astra_services::InferenceUsageStatus::ProviderPartial
+        );
         assert_eq!(r.duration_ms, 42);
     }
 

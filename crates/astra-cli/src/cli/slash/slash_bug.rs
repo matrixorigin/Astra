@@ -87,10 +87,10 @@ fn build_bug_report(state: &SessionState) -> String {
         state.total_cache_read_tokens,
         state.total_cache_creation_tokens,
     ));
-    if state.total_session_cost > 0.0 {
+    if let Some(cost) = state.total_session_cost {
         lines.push(format!(
             "- **Cost**: {}",
-            crate::cli::slash::slash_stats::format_cost(state.total_session_cost)
+            crate::cli::slash::slash_stats::format_cost(cost)
         ));
     }
     lines.push(String::new());

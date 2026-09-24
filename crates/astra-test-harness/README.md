@@ -70,6 +70,69 @@ it does not validate a native MOI endpoint and then execute on a legacy one.
 An automatic switch to the isolated `harness-auto` profile rechecks readiness
 and revision before registration and again before retrying the model probe.
 Artifact-only `--build-info-json` remains independent of profiles/configuration.
+The built-in executor enables `--explain=on` and retains bounded canonical
+Explain facts in each attempt's `outcome.explain_capture` before deleting its
+temporary machine-event file or owned session. Cases cannot override this flag.
+Multi-step/retry aggregates have no combined capture: inspect their individual
+attempts and steps. Capture diagnostics and execution-scope coverage must be
+checked before treating token counts as complete; absent capture means unknown,
+not zero auxiliary calls. Use the canonical Explain graph reducer for attempt
+deduplication and conflict detection, not differences between overall totals
+and round totals. All comparison arms use the same observation mode; its local
+snapshot/artifact overhead remains part of measured elapsed time.
+The text summary and `tokens_between` use terminal-reported counters, which can
+mix primary usage with only some auxiliary operations. They do not certify full
+model cost. Do not add all auxiliary usage to those counters: already included
+operations would be counted twice. Cost comparisons require separate canonical
+primary and auxiliary evidence; missing token lanes remain unknown, not zero.
+The primary prompt-cache percentage uses the canonical Explain graph and only
+certifies complete, exact input buckets across closed execution scopes. Output
+coverage is independent. Missing input evidence, conflicts or transport gaps
+produce an unknown percentage while terminal-reported cache counts remain
+visible under their separate, non-authoritative accounting label. No provider
+or model name is used to infer an unreported cache-write lane as zero.
+In particular, terminal `cache-write=0` does not prove an explicitly reported
+provider zero: those scalar counters no longer retain field presence. Retry
+and multi-step aggregate captures remain unknown here; their individual
+attempt/step facts are retained. Other journal-based cache criteria and pipeline
+statistics have not yet all been migrated to this coverage check.
+`prompt_cache_tokens` uses complete canonical primary input evidence from every
+physical attempt and follow-up step, not mixed terminal counters. Missing or
+overlapping captures cannot certify the bounds, including when an earlier retry
+has no usage evidence. Auxiliary judgments do not contribute to this criterion;
+thresholds retain their values but now refer explicitly to primary requests.
+`provider_prompt_cache_read_ratio` uses the same primary-only input qualification
+before applying warmup. It preserves zero-input groups, combines adjacent
+executions of the same user turn, and orders request groups by typed ModelRound
+coordinates within each execution. Multiple executions require the same session;
+overlapping archives, nonadjacent repeated turns, and multiple physical scopes
+inside one capture are unavailable rather than assigned a guessed order. There
+is no journal or terminal-counter fallback for this ratio.
+The injected `required_cache_scope` hard gate uses these same qualified facts.
+Conversation reuse requires reads after the first user turn; intra-turn reuse
+requires reads after the first ModelRound request in one user turn and run.
+Physical retries alone cannot establish another request boundary. Consecutive
+recovery captures of the same run may contribute, but different runs cannot
+combine into an intra-run witness; nonadjacent run reappearance is unavailable.
+This proves observed reads at the requested boundary, not which prefix was hit.
+Pipeline absolute cache statistics also use qualified canonical primary request
+groups, never feedback scalars or raw-response fallback. `pipeline_avg_cache_hit_ratio`
+is the arithmetic mean of nonzero-input **ModelRound request-group** read shares,
+not a user-turn average and not the token-weighted `provider_prompt_cache_read_ratio`.
+Its numeric thresholds are unchanged, but old feedback-based measurements are not
+numerically equivalent. All executions must qualify before zero-input groups are
+excluded from this mean. Required checks cannot pass unknown or all-zero evidence;
+optional checks explicitly report a skip.
+
+In harness pipeline JSON, `cache_hit_ratios: null` and `avg_cache_hit_ratio: null`
+mean unknown coverage; `cache_hit_ratios: []` with a null mean means qualified
+all-zero input (n/a). Valid nonzero groups produce an array and numeric mean.
+`feedback_observations` independently counts valid typed feedback events, replacing
+the misleading `turns_with_feedback` field. Both text reports retain compaction
+and alert diagnostics even without feedback. This changes harness report data,
+not runtime wire or database storage. Raw cache-break heuristics and feedback-based
+stable-prefix estimates remain separate diagnostics; canonical mean qualification
+does not certify their coverage or accuracy.
 The CLI binary is resolved to an absolute path before constructing any consumer,
 so a case's working directory cannot select a different relative executable.
 All CLI subprocesses inherit the caller's proxy and bypass environment unchanged;
@@ -160,6 +223,9 @@ prompt_variants:
       并设置 inherit_prefix: {required: true}。呈现其持久化结果。
 debug_log: true # turn on session journal capture
 timeout_seconds: 240
+# Optional: let Astra settle before the harness watchdog kills the process.
+# Must be >72 and <= timeout_seconds; omitted by default.
+# cli_wall_time_seconds: 220
 criteria:
   - type: exit_code
     code: 0
@@ -199,13 +265,14 @@ focus without duplicating the whole scripted journey.
 | `tool_called { name }`                              | `tools_used` envelope contains `name`                        | envelope    |
 | `tools_count_between { min, max }`                  | `tool_calls_count` inclusive                                 | envelope    |
 | `tool_sequence { tools }`                           | `tools_used` contains tools as ordered subsequence           | envelope    |
-| `tokens_between { min, max }`                       | total tokens (prompt + completion) in range                  | envelope    |
+| `tokens_between { min, max }`                       | terminal-reported input (fresh + cache) and output in range; not full model cost | envelope    |
 | `duration_between { min_ms, max_ms }`               | wall-clock duration in range                                 | envelope    |
 | `turn_rounds_between { min, max }`                  | Provider LLM round-trips (`LlmRoundStarted`, with a bounded legacy fallback) in range | step_events |
 | `cache_rate_above { threshold }`                    | tool cache hit rate ≥ threshold (0.0–1.0)                    | step_events |
-| `prompt_cache_tokens { min_read, min_creation }`    | provider prompt-cache read/write token buckets meet minimums | envelope    |
-| `provider_prompt_cache_read_ratio { min, warmup_turns, warmup_rounds }` | token-weighted cache-read ratio after explicit turn- or provider-round warm-up ≥ `min` | journal |
-| `provider_prompt_cache_read_nonregression_ratio { min, min_pairs, max_identity_transitions_per_run }` | within typed system/tool identity epochs, primary-request `current cache_read / previous cache_read` ≥ `min`, with enough pairs in every multi-observation run and bounded identity transitions; only the first pair with a zero previous read per epoch is exempt. Ratios may exceed 1.0; reads include history. Auxiliary requests are outside this metric; `provider_prompt_cache_read_ratio` measures absolute share from aggregate turn/round usage, which can include them | canonical pipeline feedback |
+| `prompt_cache_tokens { min_read, min_creation }`    | exact primary prompt-cache read/write token buckets meet minimums; incomplete evidence is unavailable | canonical Explain execution facts |
+| `provider_prompt_cache_read_ratio { min, warmup_turns, warmup_rounds }` | token-weighted primary cache-read ratio after explicit user-turn or ModelRound-request warmup ≥ `min`; physical retries share their parent group, phase attempts remain distinct; all executions must qualify before warmup | canonical Explain execution facts |
+| `pipeline_avg_cache_hit_ratio { min, optional }` | arithmetic mean of complete primary ModelRound request-group cache-read shares ≥ `min`; zero input is n/a, unknown is not zero; optional unavailable checks explicitly skip | canonical Explain execution facts |
+| `provider_prompt_cache_read_nonregression_ratio { min, min_pairs, max_identity_transitions_per_run }` | within typed system/tool identity epochs, primary-request `current cache_read / previous cache_read` ≥ `min`, with enough pairs in every multi-observation run and bounded identity transitions; only the first pair with a zero previous read per epoch is exempt. Ratios may exceed 1.0; reads include history. Auxiliary requests are outside this metric; `provider_prompt_cache_read_ratio` measures absolute primary-input share, also excluding them | canonical pipeline feedback |
 | `provider_stable_prefix_cache_coverage { min, min_observations }` | token-weighted provider cache reads capped at the runtime-estimated stable system/tool prefix; requires enough typed `provider-prefix-v1` observations and valid pipeline evidence | canonical pipeline feedback |
 | `stderr_matches { pattern }`                        | multi-line regex on stderr                                   | stderr      |
 | `text_contains { needle }`                          | substring in final text                                      | envelope    |
@@ -287,6 +354,10 @@ Enable capture by either:
 
 `extra_cli_args` supports pass-through flags like `--explain`, but
 rejects at case-load time any flag the harness manages:
+
+- Wall-time budget: `--max-wall-time-seconds` (use `cli_wall_time_seconds` when
+  a case needs an earlier graceful CLI deadline; `timeout_seconds` remains the
+  outer process watchdog)
 
 - Prompt / input: `-m`, `--message`, `--stdin`
 - Model selection: `--model`

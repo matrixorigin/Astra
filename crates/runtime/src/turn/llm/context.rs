@@ -4491,8 +4491,11 @@ mod context_cache_contract_tests {
     }
 
     #[test]
-    fn edge_profile_active_turn_frame_cannot_churn_strict_provider_prefix() {
-        fn provider_messages(frame_value: &str) -> Vec<Value> {
+    fn edge_profile_advisory_delivery_respects_cache_capability() {
+        fn provider_messages(
+            frame_value: &str,
+            cache_cap: astra_turn_core::cache_placement::CacheCapability,
+        ) -> Vec<Value> {
             let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
             state.messages = vec![
                 json!({"role": "user", "content": "review the current change"}),
@@ -4503,18 +4506,26 @@ mod context_cache_contract_tests {
             edge_profile.insert(
                 astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS
                     .to_string(),
-                json!([astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
-                    kind: "active_turn_frame".to_string(),
-                    delivery_class: astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext,
-                    payload: json!({"latest_user_message": frame_value, "turn_id": frame_value}),
-                    round_index: 1,
-                    authority_lifetime: None,
-                }]),
+                json!([
+                    astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
+                        kind: "active_turn_frame".to_string(),
+                        delivery_class: astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext,
+                        payload: json!({"latest_user_message": frame_value, "turn_id": frame_value}),
+                        round_index: 1,
+                        authority_lifetime: None,
+                    },
+                    astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
+                        kind: "policy_advisory".to_string(),
+                        delivery_class: astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::AdvisoryEvidence,
+                        payload: json!({"revision": 3, "instruction": frame_value}),
+                        round_index: 1,
+                        authority_lifetime: None,
+                    }
+                ]),
             );
             let visible_tools = vec![tool("bash")];
             let restricted_tools = HashSet::new();
             let cache_cfg = PromptCacheConfig::latch("openai");
-            let strict_history = strict_history_cache_capability();
             let output = assemble_context_pipeline(LlmContextAssemblyInput {
                 state: &mut state,
                 session_id: "sid-edge-frame",
@@ -4528,7 +4539,7 @@ mod context_cache_contract_tests {
                 model_name: "deepseek-v4-flash",
                 context_window: Some(200_000),
                 max_completion_tokens: Some(16_384),
-                cache_capability: Some(strict_history),
+                cache_capability: Some(cache_cap),
                 user_content: "summarize it",
                 query_source: "test",
             })
@@ -4543,18 +4554,19 @@ mod context_cache_contract_tests {
                 "openai",
                 "deepseek-v4-flash",
                 &astra_turn_core::thinking_config::ThinkingConfig::Off,
-                Some(strict_history),
+                Some(cache_cap),
                 &cache_cfg,
             );
             crate::turn::llm::client::consolidate_system_messages_for_provider(
                 &wire,
                 "openai",
-                Some(strict_history),
+                Some(cache_cap),
             )
         }
 
-        let first = provider_messages("frame-alpha-dynamic-value");
-        let second = provider_messages("frame-beta-dynamic-value");
+        let strict = strict_history_cache_capability();
+        let first = provider_messages("frame-alpha-dynamic-value", strict);
+        let second = provider_messages("frame-beta-dynamic-value", strict);
         assert_eq!(first[0]["role"], "system");
         assert_eq!(
             first[0], second[0],
@@ -4564,6 +4576,50 @@ mod context_cache_contract_tests {
         assert!(system.contains("active_turn_focus_policy.v1"));
         assert!(!system.contains("frame-alpha-dynamic-value"));
         assert!(!message_text(&second[0]).contains("frame-beta-dynamic-value"));
+        assert!(
+            first
+                .iter()
+                .all(|message| { !message_text(message).contains("runtime-advisory-evidence") }),
+            "required-only cache capability must suppress optional advisory"
+        );
+        let all = astra_turn_core::cache_placement::CacheCapability {
+            volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
+            ..strict
+        };
+        let delivered_first = provider_messages("frame-alpha-dynamic-value", all);
+        let delivered_second = provider_messages("frame-beta-dynamic-value", all);
+        let advisory_index = delivered_first
+            .iter()
+            .position(|message| message_text(message).contains("runtime-advisory-evidence"))
+            .expect("all-delivery capability must include advisory on the wire");
+        assert!(
+            advisory_index >= 3,
+            "current-user placement must retain the preceding conversation prefix"
+        );
+        assert_eq!(
+            delivered_first[advisory_index + 1]["role"],
+            "user",
+            "required active-turn context must remain after optional advisory"
+        );
+        assert!(message_text(&delivered_first[advisory_index + 1]).contains("active_turn_frame"));
+        assert_eq!(delivered_first[advisory_index + 2]["role"], "user");
+        assert_eq!(
+            message_text(&delivered_first[advisory_index + 2]),
+            "summarize it"
+        );
+        assert_eq!(
+            &delivered_first[..advisory_index],
+            &delivered_second[..advisory_index],
+            "dynamic advisory must not churn the provider prefix before its tail"
+        );
+        assert!(delivered_first.iter().any(|message| {
+            message_text(message).contains("runtime-advisory-evidence")
+                && message_text(message).contains("frame-alpha-dynamic-value")
+        }));
+        assert!(delivered_second.iter().any(|message| {
+            message_text(message).contains("runtime-advisory-evidence")
+                && message_text(message).contains("frame-beta-dynamic-value")
+        }));
         assert!(first.iter().any(|message| {
             message.get("role").and_then(Value::as_str) == Some("user")
                 && message_text(message) == "summarize it"
@@ -5267,6 +5323,9 @@ mod context_cache_contract_tests {
             .expect("prepare provider body once");
             let wire = prepared.identity();
             attempts.push(crate::turn::llm::durable::DurableProviderAttemptFact {
+                qualified_usage: Some(
+                    astra_turn_types::CanonicalTokenUsage::new(None, None, None, None).unwrap(),
+                ),
                 request: crate::turn::llm::durable::DurableProviderRequestIdentity {
                     request_id: format!("attempt-{attempt}"),
                     request_hash: wire.provider_wire_hash.clone(),

@@ -2352,14 +2352,28 @@ async fn execute_cli_command_impl(
         Some(Command::Session(SessionCmd::Cancel(args))) => {
             let session_id = validated_cli_session_arg(&args.session_id)?;
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let body = api
+            let body = match api
                 .cancel_session_until_settled_text(
                     &token,
                     session_id,
                     std::time::Duration::from_secs(10),
                 )
                 .await
-                .map_err(map_thin_err)?;
+            {
+                Ok(body) => body,
+                Err(astra_thin_client::ThinClientError::SessionCancellationPending {
+                    session_id: pending_id,
+                    reason,
+                }) if pending_id == args.session_id => {
+                    let error = astra_thin_client::ThinClientError::SessionCancellationPending {
+                        session_id: pending_id,
+                        reason,
+                    };
+                    eprintln!("Error: {error}");
+                    return Ok(ExitCode::CancellationPending);
+                }
+                Err(error) => return Err(map_thin_err(error)),
+            };
             clear_profile_last_session_if_matches_or_warn(
                 profile.as_deref(),
                 session_id,
@@ -2962,6 +2976,7 @@ fn error_kind_for_exit_code(exit_code: ExitCode) -> Option<&'static str> {
         ExitCode::PersistenceError => Some("persistence_error"),
         ExitCode::Partial => Some("partial"),
         ExitCode::Unfinished => Some("unfinished"),
+        ExitCode::CancellationPending => Some("session_cancellation_pending"),
     }
 }
 
@@ -4776,6 +4791,7 @@ mod one_shot_persistence_tests {
         std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o444)).unwrap();
 
         let mut sr = StreamResult {
+            qualified_usage: None,
             session_id: Some(sid.clone()),
             run_id: None,
             session_persistence_error: None,
@@ -4910,6 +4926,7 @@ mod one_shot_persistence_tests {
         std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o444)).unwrap();
 
         let mut sr = StreamResult {
+            qualified_usage: None,
             session_id: Some(sid.clone()),
             run_id: None,
             session_persistence_error: None,
@@ -4984,7 +5001,6 @@ mod show_policy_tests {
         EffectiveToolPolicy {
             max_identical_tool_calls: 4,
             max_tools_per_turn: 20,
-            repeated_cache_hit_suppression: 4,
             max_consecutive_empty_name: 3,
             parallel_batching_force_streak: 5,
         }
@@ -5001,10 +5017,6 @@ mod show_policy_tests {
         assert!(out.contains("= 4"), "opus's value 4 missing: {out}");
         assert!(out.contains("max_tools_per_turn"), "field missing: {out}");
         assert!(out.contains("= 20"), "opus's value 20 missing: {out}");
-        assert!(
-            out.contains("repeated_cache_hit_suppression"),
-            "field missing: {out}"
-        );
         assert!(
             out.contains("max_consecutive_empty_name"),
             "field missing: {out}"
@@ -5045,7 +5057,6 @@ mod show_policy_tests {
         assert_eq!(parsed["trust_mode"], "strict");
         assert_eq!(parsed["max_identical_tool_calls"], 4);
         assert_eq!(parsed["max_tools_per_turn"], 20);
-        assert_eq!(parsed["repeated_cache_hit_suppression"], 4);
         assert_eq!(parsed["max_consecutive_empty_name"], 3);
     }
 

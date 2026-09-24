@@ -1244,16 +1244,19 @@ scope is an authenticated agent run, a real session-owned operation, or a
 durable Harness run. Memory and compaction require session ownership; Skillify
 requires Harness ownership. Neither fabricates a run or session identity.
 
-Typed judgment responses carry execution-owned `judgment_provenance` alongside
-text and the adapter's model identity. TypeSafe System One supplies
-`provider_probability`; ordinary model execution supplies `discrete_decision`.
-Both streaming and non-streaming adapters preserve this distinction through
-summary, memory and Server completion boundaries. Ordinary prose responses
-omit the field. Judgment consumers reject missing provenance, mismatched answer
-formats and missing execution identity: answer JSON and model-name strings do
-not select the decoder or establish native probability capability. The model
-identity is the existing adapter's execution identity, not a guarantee that
-every upstream provider exposes a resolved model version.
+Version-2 typed judgment responses carry execution-owned `judgment_provenance`
+alongside text and the adapter's model identity. TypeSafe System One supplies
+native Noul/Choice/Score values and distributions; ordinary model execution
+supplies explicit discrete Noul/Choice/Score answers with unknown represented
+directly, never as a fabricated probability. Both streaming and non-streaming
+adapters preserve this distinction through summary, memory and Server completion
+boundaries. Ordinary prose responses omit the field. Judgment consumers reject
+missing provenance, mismatched answer formats and missing execution identity:
+answer JSON and model-name strings do not select the decoder or establish native
+probability capability. Raw TypeSafe response JSON is checked for duplicate
+object keys before conversion into a map. The model identity is the existing
+adapter's execution identity, not a guarantee that every upstream provider
+exposes a resolved model version.
 
 These response facts do not add a ledger, query or persistence projection.
 Malformed judgments use the consumer's existing failure/baseline behavior;

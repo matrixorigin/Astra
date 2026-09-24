@@ -97,8 +97,13 @@ fn terminal_completion_disposition(
     }
 
     if !state.budget_wrapup_injected
-        || state.hooks.completion_settlement.wrapup_origin
-            != Some(super::host::BudgetWrapupOrigin::RoundSlice)
+        || !matches!(
+            state.hooks.completion_settlement.wrapup_origin,
+            Some(
+                super::host::BudgetWrapupOrigin::RoundSlice
+                    | super::host::BudgetWrapupOrigin::ExecutionDeadline
+            )
+        )
     {
         return TerminalCompletionDisposition::OrdinaryCompletionCandidate;
     }
@@ -2097,10 +2102,11 @@ fn enforce_workspace_completion_before_text_completion_with_disposition(
             serde_json::json!({
                 "schema": "workspace_completion_required.v1",
                 "signal": if pending_convergence { "desired_state_observation_missing" } else { "post_mutation_observation_missing" },
+                "action_hint": completion_action_hint_for_state(state, &CompletionAction::PostMutationObservation),
                 "instruction": if pending_convergence {
                     "The complete-state writer found the requested bytes already present, but that no-op is not a mutation and cannot finish the turn alone. Do not return prose yet. Make exactly one later full read_file observation of the same target in a new tool round, inspect the result, and then complete."
                 } else {
-                    "The workspace changed after the last trusted observation. Do not return prose yet. Make exactly one trusted post-change observation now. Prefer a workspace read/list/diff tool with an absolute path to the changed work. For a Bash validation command, set `mode` to `verify` and use a foreground read-only command; the executor will attest that the bound workspace stayed unchanged. Do not use a compound shell command such as `cd <dir> && ...` as this observation. Inspect the result, fix any issue found, then complete. If validation cannot run, state the exact reason and distinguish unverified work from a verified result."
+                    "The workspace changed after the last trusted observation. Do not return prose yet. Make exactly one trusted post-change observation now. Prefer a workspace read/list/diff tool with an absolute path to the changed work. Bash `mode=verify` is available only when the selected executor can prove its child processes settled; if rejected before execution, do not retry it. A typed file observation cannot replace a required script or test result. Inspect the result, fix any issue found, then complete. If validation cannot run, state the exact reason and distinguish unverified work from a verified result."
                 },
                 "authority": "executed_tool_ledger",
             }),
@@ -2998,6 +3004,21 @@ fn fold_provider_completion_error_usage(
     else {
         return;
     };
+    // Accounting qualification is independent of successful delivery. An
+    // interrupted dispatched request may carry only an unknown sample.
+    if let Some(usage) = details
+        .get("qualified_usage")
+        .filter(|usage| !usage.is_null())
+    {
+        state.last_request_usage = None;
+        state.last_measured_prompt_tokens = None;
+        state.add_qualified_usage(Some(
+            astra_turn_types::CanonicalTokenUsage::from_json(usage).unwrap_or_else(|_| {
+                astra_turn_types::CanonicalTokenUsage::new(None, None, None, None)
+                    .expect("unknown usage is valid")
+            }),
+        ));
+    }
     if details
         .pointer("/provider_response/transport_success")
         .and_then(serde_json::Value::as_bool)
@@ -3005,37 +3026,52 @@ fn fold_provider_completion_error_usage(
     {
         return;
     }
-    let Some(usage) = details.get("usage").and_then(serde_json::Value::as_object) else {
+    state.last_measured_prompt_tokens = details
+        .get("last_request_usage")
+        .and_then(|usage| astra_turn_types::CanonicalTokenUsage::from_json(usage).ok())
+        .and_then(|usage| usage.input_column())
+        .and_then(|tokens| u64::try_from(tokens).ok());
+    state.last_request_usage = details
+        .get("last_request_usage")
+        .and_then(|usage| astra_turn_types::CanonicalTokenUsage::from_json(usage).ok())
+        .and_then(|usage| {
+            astra_turn_types::RequestTokenUsage::try_new(
+                usage.input_tokens()?,
+                usage.cached_input_tokens()?,
+                usage.cache_creation_tokens()?,
+                usage.output_tokens()?,
+            )
+            .ok()
+        });
+    let Some(usage) = details.get("usage") else {
         return;
     };
-    let field = |name| {
-        usage
-            .get(name)
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0)
+    let Ok(usage) = astra_turn_types::CanonicalTokenUsage::from_json(usage) else {
+        return;
     };
-    state.total_prompt = state.total_prompt.saturating_add(field("input_tokens"));
+    state.total_prompt = state
+        .total_prompt
+        .saturating_add(usage.input_tokens().unwrap_or(0));
     state.total_cache_read = state
         .total_cache_read
-        .saturating_add(field("cached_input_tokens"));
+        .saturating_add(usage.cached_input_tokens().unwrap_or(0));
     state.total_cache_creation = state
         .total_cache_creation
-        .saturating_add(field("cache_creation_tokens"));
+        .saturating_add(usage.cache_creation_tokens().unwrap_or(0));
     state.total_completion = state
         .total_completion
-        .saturating_add(field("output_tokens"));
-    state.has_any_usage = true;
-    state
-        .step_recorder
-        .record_tokens(field("input_tokens"), field("output_tokens"));
-    let measured_prompt = NormalizedPromptCacheUsage::new(
-        field("input_tokens"),
-        field("cached_input_tokens"),
-        field("cache_creation_tokens"),
-    )
-    .total_input_tokens();
-    if measured_prompt > 0 {
-        state.last_measured_prompt_tokens = Some(measured_prompt);
+        .saturating_add(usage.output_tokens().unwrap_or(0));
+    let any_known = usage.input_tokens().is_some()
+        || usage.cached_input_tokens().is_some()
+        || usage.cache_creation_tokens().is_some()
+        || usage.output_tokens().is_some();
+    state.has_any_usage |= any_known;
+    state.step_recorder.record_tokens(
+        usage.input_tokens().unwrap_or(0),
+        usage.output_tokens().unwrap_or(0),
+    );
+    if !any_known {
+        return;
     }
     // The physical provider round was already counted as a local error before
     // this typed payload reached the loop. Reclassify that same attempt; do
@@ -3246,6 +3282,35 @@ fn schedule_safe_provider_recovery(
             "authority": "advisory_evidence_only"
         }),
     );
+    true
+}
+
+/// A runtime-owned provider-work deadline may end an ordinary request just
+/// before the reserved final-answer window. It is safe to enter that window
+/// only when the failed attempt delivered no visible text or selected tool;
+/// otherwise the existing delivery-unknown path must remain authoritative.
+fn provider_deadline_has_no_actionable_delivery(error: &astra_core::ClassifiedError) -> bool {
+    if error.kind != astra_core::ErrorKind::ProviderDeadline {
+        return false;
+    }
+    let Some(raw) = error.details_json.as_deref() else {
+        // The send/response deadline can fire before any provider response is
+        // received; that shape has no partial response to replay or discard.
+        return true;
+    };
+    let Ok(serde_json::Value::Object(details)) = serde_json::from_str(raw) else {
+        return false;
+    };
+    if details.get("partial_full_text").is_some_and(|value| {
+        !value
+            .as_str()
+            .is_some_and(|text| !crate::turn::llm::client::text_has_actionable_content(text))
+    }) || details
+        .get("tool_calls")
+        .is_some_and(|value| !value.as_array().is_some_and(Vec::is_empty))
+    {
+        return false;
+    }
     true
 }
 
@@ -3733,10 +3798,18 @@ fn record_superseded_llm_round(
         let is_new = state.fold_server_execution_summary_and_refresh_rounds(
             turn_result.accum.run_id.as_deref(),
             summary,
+            turn_result.accum.accounted_usage(),
         );
         if !is_new {
             return;
         }
+        state.last_request_usage = turn_result.accum.current_request_usage;
+        state.last_measured_prompt_tokens = state.last_request_usage.and_then(|usage| {
+            usage
+                .fresh_input_tokens
+                .checked_add(usage.cache_read_tokens)?
+                .checked_add(usage.cache_creation_tokens)
+        });
         if state.telemetry.first_ttft_ms.is_none() {
             state.telemetry.first_ttft_ms = turn_result.ttft_ms;
         }
@@ -3785,15 +3858,14 @@ fn record_superseded_llm_round(
         turn_result.accum.completion_tokens,
     );
     state.has_any_usage |= turn_result.accum.has_usage;
-    let billable_input = NormalizedPromptCacheUsage::new(
-        turn_result.accum.prompt_tokens,
-        turn_result.accum.cache_read_tokens,
-        turn_result.accum.cache_creation_tokens,
-    )
-    .total_input_tokens();
-    if turn_result.accum.has_usage && billable_input > 0 {
-        state.last_measured_prompt_tokens = Some(billable_input);
-    }
+    state.add_qualified_usage(turn_result.accum.accounted_usage());
+    state.last_request_usage = turn_result.accum.current_request_usage;
+    state.last_measured_prompt_tokens = turn_result.accum.current_request_usage.and_then(|usage| {
+        usage
+            .fresh_input_tokens
+            .checked_add(usage.cache_read_tokens)?
+            .checked_add(usage.cache_creation_tokens)
+    });
     let tool_names = turn_result
         .accum
         .tool_calls
@@ -3836,6 +3908,7 @@ fn record_observed_llm_round(
         .map(|buffer| buffer.offset_ms().saturating_sub(duration_ms))
         .unwrap_or_default();
     state.push_recent_round(super::host::RecentRoundSummary {
+        qualified_usage: turn_result.accum.qualified_usage,
         purpose: state.inference_purpose,
         turn: state.session_turn,
         round: state.current_round_index,
@@ -3912,9 +3985,15 @@ fn apply_terminal_control_stream_snapshot<H: AgenticLoopHost>(
     state.total_completion += snap.completion_tokens;
     state.total_cache_read += snap.cache_read_tokens;
     state.total_cache_creation += snap.cache_creation_tokens;
+    if snap.server_execution_summary.is_none() {
+        state.add_qualified_usage(snap.qualified_usage);
+    }
     if let Some(summary) = snap.server_execution_summary {
-        let is_new =
-            state.fold_server_execution_summary_and_refresh_rounds(snap.run_id.as_deref(), summary);
+        let is_new = state.fold_server_execution_summary_and_refresh_rounds(
+            snap.run_id.as_deref(),
+            summary,
+            snap.qualified_usage,
+        );
         if is_new {
             state.total_tool_calls = state
                 .total_tool_calls
@@ -3928,20 +4007,16 @@ fn apply_terminal_control_stream_snapshot<H: AgenticLoopHost>(
         .step_recorder
         .record_tokens(snap.prompt_tokens, snap.completion_tokens);
     state.has_any_usage |= snap.has_usage;
-    let billable_input = NormalizedPromptCacheUsage::new(
-        snap.prompt_tokens,
-        snap.cache_read_tokens,
-        snap.cache_creation_tokens,
-    )
-    .total_input_tokens();
-    // A Server-owned terminal reports aggregate run usage for accounting. Its
-    // physical final-request usage is installed by the admission host before
-    // this phase runs; replacing it with a root-plus-children total would make
-    // context pressure and compaction act on the wrong window.
-    if snap.has_usage && billable_input > 0 && snap.server_execution_summary.is_none() {
-        state.last_measured_prompt_tokens = Some(billable_input);
-    }
+    state.last_measured_prompt_tokens = snap.current_request_usage.and_then(|usage| {
+        // Only a physical request can calibrate the next context window.
+        usage
+            .fresh_input_tokens
+            .checked_add(usage.cache_read_tokens)?
+            .checked_add(usage.cache_creation_tokens)
+    });
     state.consecutive_context_window_errors = 0;
+
+    state.last_request_usage = snap.current_request_usage;
 
     match control_outcome {
         crate::turn::terminal_control::TerminalControlOutcome::Requested(_) => {
@@ -4285,9 +4360,12 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         state.push_volatile_payload(super::host::VolatileKind::PolicyAdvisory, payload);
     }
 
-    // Policy evidence always reaches the model. Interaction mode controls only
-    // whether the same evidence is also rendered as user-facing status text.
-    // Auto permission is not a request to disable the feedback loop.
+    // Interaction mode controls only whether policy evidence is also rendered
+    // as user-facing status text. Provider cache capability controls delivery:
+    // RequiredOnly intentionally omits optional advisory evidence from the
+    // wire; All delivers it according to the declared placement. Neither
+    // placement nor generation proves reuse of accumulated history or model
+    // adoption.
     let show_policy_feedback_status = host.turn_interaction_mode().shows_policy_feedback_status();
     // Inject round budget guidance so the model knows to batch or synthesize.
     // Use llm_rounds_completed (actual LLM call count) not turn_index (step
@@ -4750,6 +4828,28 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         Err(error) => {
             state.restore_volatile_attempt_lease();
             fold_provider_completion_error_usage(state, &error);
+            let deadline_settlement_due = !state.hooks.completion_settlement.text_only
+                && !state.budget_wrapup_injected
+                && host
+                    .execution_time_budget_remaining()
+                    .is_some_and(|remaining| {
+                        remaining.as_secs()
+                            <= astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET
+                                .as_secs()
+                    });
+            let run_deadline_stopped_safe_work = error.kind
+                == astra_core::ErrorKind::BudgetExhausted
+                || (error.kind == astra_core::ErrorKind::ProviderDeadline
+                    && provider_deadline_has_no_actionable_delivery(&error));
+            if run_deadline_stopped_safe_work && deadline_settlement_due {
+                // Preparation can cross the reserved boundary before dispatch,
+                // or an ordinary request can reach its shortened provider
+                // deadline. If no text or tool was delivered, re-enter the
+                // owner loop so it can use the same execution's final-answer
+                // window; never replay an uncertain actionable response.
+                state.step_recorder.end_turn(false);
+                return Ok(TurnExecutionControl::ContinueLoop);
+            }
             if crate::turn::llm::durable::is_guidance_admission_fence(&error) {
                 // Admission rejected this request before HTTP delivery. Consume
                 // the authoritative guidance using the ordinary control lane;
@@ -4816,6 +4916,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     if continuation_authority == ContinuationAuthority::RemoteServer
         && (turn_result.accum.has_tool_calls || !turn_result.accum.tool_calls.is_empty())
     {
+        state.last_request_usage = None;
+        state.last_measured_prompt_tokens = None;
         return Err(astra_core::ClassifiedError::new(
             astra_core::ErrorKind::ContractViolation,
             "remote Server declared terminal continuation ownership while returning pending client continuation work",
@@ -4841,6 +4943,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         turn_result.ttft_ms,
         turn_result.error_kind,
     );
+    state.last_request_usage = turn_result.accum.current_request_usage;
     update_turn_trace_collector(state, &turn_result);
 
     if let Some(control_outcome) = host.take_terminal_control_outcome() {
@@ -4863,6 +4966,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     };
     let tool_record_floor = state.stall.tool_call_records.len();
     let transcript_append_start = state.messages.len();
+    if snap.server_execution_summary.is_none() {
+        state.add_qualified_usage(snap.qualified_usage);
+    }
     let ingest_outcome = ingest_agentic_turn_stream(
         &snap,
         edge_len,
@@ -4902,8 +5008,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // replace the just-added raw contribution with the deduplicated aggregate
     // so a repeated terminal frame cannot inflate the logical-turn result.
     if let Some(summary) = snap.server_execution_summary {
-        let is_new =
-            state.fold_server_execution_summary_and_refresh_rounds(snap.run_id.as_deref(), summary);
+        let is_new = state.fold_server_execution_summary_and_refresh_rounds(
+            snap.run_id.as_deref(),
+            summary,
+            snap.qualified_usage,
+        );
         state.total_tool_calls = state
             .total_tool_calls
             .saturating_sub(summary.tool_calls_count)
@@ -4981,35 +5090,20 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                             .and_then(|value| serde_json::from_value(value).ok()),
                     }
                 });
-            let aggregate_usage = || {
-                astra_turn_core::token_accounting::TokenAccounting::from_fields(
-                    turn_result.accum.prompt_tokens,
-                    turn_result.accum.cache_read_tokens,
-                    turn_result.accum.cache_creation_tokens,
-                    turn_result.accum.completion_tokens,
-                )
-            };
             // A logical response may contain multiple physical provider
             // attempts (for example one bounded output-cap retry).  The
             // aggregate belongs in run accounting, while context pressure
             // and cache decisions must use only the final physical request.
-            // Hosts that know both values populate `current_request_usage`;
-            // legacy hosts still fall back to their single-request aggregate.
-            let request_usage = turn_result
-                .accum
-                .current_request_usage
-                .map(|usage| {
-                    astra_turn_core::token_accounting::TokenAccounting::from_fields(
-                        usage.fresh_input_tokens,
-                        usage.cache_read_tokens,
-                        usage.cache_creation_tokens,
-                        usage.output_tokens,
-                    )
-                })
-                .or_else(|| {
-                    (!turn_result.accum.usage_is_run_total && turn_result.accum.has_usage)
-                        .then(aggregate_usage)
-                });
+            // Missing physical evidence stays unknown. A retry/run subtotal
+            // cannot measure the current request's context or cache rate.
+            let request_usage = turn_result.accum.current_request_usage.map(|usage| {
+                astra_turn_core::token_accounting::TokenAccounting::from_fields(
+                    usage.fresh_input_tokens,
+                    usage.cache_read_tokens,
+                    usage.cache_creation_tokens,
+                    usage.output_tokens,
+                )
+            });
             let run_usage = runtime_feedback_run_usage(state, &turn_result.accum);
             let server_execution_summary = turn_result.accum.server_execution_summary.as_ref();
             let forwarded_runtime_feedback = server_execution_summary.and_then(|summary| {
@@ -6103,7 +6197,16 @@ pub(crate) fn has_concrete_workspace_mutation(state: &AgenticLoopState) -> bool 
         .tool_call_records
         .iter()
         .filter(|record| record.was_executed() && record.ok)
-        .any(|record| tool_record_has_bound_positive_mutation(state, record))
+        .any(|record| {
+            tool_record_has_bound_positive_mutation(state, record)
+                || (record.workspace_writer_applied_bound == Some(true)
+                    && record.runtime_args_full.is_some()
+                    && astra_tools::executor::is_workspace_mutation_tool(
+                        &record.name,
+                        &super::lifecycle::extract_tool_args(record.authoritative_args_full())
+                            .unwrap_or(serde_json::Value::Null),
+                    ))
+        })
 }
 
 /// Completion authority for an owed bound-workspace state.  A live desired-
@@ -7737,6 +7840,27 @@ pub(crate) fn completion_action_hint_for_state(
             "already_exact_outcome": "an executor-owned no-op convergence receipt advances only to one later separate full read_file of the same target",
             "evidence_inference_forbidden": ["assistant_text", "bash_output", "bash_exit_status", "server_stat_of_remote_workspace"],
         }]);
+    }
+    if matches!(action, CompletionAction::PostMutationObservation)
+        && state
+            .hooks
+            .completion_settlement
+            .post_mutation_observation_retries
+            > 0
+    {
+        // The text-stop recovery matcher admits typed workspace observers,
+        // while Bash must explicitly request verify mode so the executor can
+        // attach an unchanged-workspace receipt. Project the same distinction
+        // in the correction hint; ordinary progress observation is broader.
+        hint["accepted_action_shapes"] = serde_json::json!([
+            {
+                "constraint": "one typed workspace read/list/diff observation after the latest opaque action; exact arguments and receipt are checked by admission"
+            },
+            {
+                "tool": "bash",
+                "constraint": "only an explicit mode=verify request whose child processes can be proven settled; ordinary Bash stdout or exit status does not satisfy this action"
+            }
+        ]);
     }
     if matches!(action, CompletionAction::PostMutationObservation)
         && let Some(target) = pending_live_desired_state_convergence_target(state)
@@ -9700,6 +9824,7 @@ mod tests {
                                     state.stall.tool_call_records.len() as u64 + 1,
                                     verified,
                                     root,
+                                    false,
                                 );
                                 state.stall.tool_call_records.push(record.clone());
                                 let expected = full_scan_post_mutation_observation(&state);
@@ -13175,6 +13300,40 @@ mod tests {
     }
 
     #[test]
+    fn weak_direct_writer_applied_fact_only_removes_the_repeat_mutation_obligation() {
+        let args = r#"{"path":"/workspace/out.txt","content":"answer"}"#;
+        let mut record = executed_record("write_file", true, Some(args));
+        record.workspace_mutation_observed = None;
+        record.workspace_mutation_scope = None;
+        record.workspace_mutation_receipt = None;
+        record.workspace_writer_applied_bound = Some(true);
+        record.runtime_args_full = Some(args.to_string());
+        let mut state = make_state();
+        mark_must_mutate(&mut state);
+        state.stall.tool_call_records.push(record.clone());
+        state
+            .stall
+            .verification_frontier
+            .advance(
+                state.hooks.workspace_root_hint.as_deref(),
+                &state.hooks.stop_hooks,
+                &state.stall.tool_call_records,
+            )
+            .unwrap();
+
+        assert!(has_concrete_workspace_mutation(&state));
+        assert_eq!(
+            pending_completion_action(&state).unwrap(),
+            Some(CompletionAction::PostMutationObservation),
+        );
+        assert!(!super::super::lifecycle::record_has_typed_workspace_tool_receipt(&record));
+        assert!(!tool_record_has_bound_positive_mutation(&state, &record));
+
+        state.stall.tool_call_records[0].runtime_args_full = None;
+        assert!(!has_concrete_workspace_mutation(&state));
+    }
+
+    #[test]
     fn terminal_completion_action_does_not_repeat_a_successful_task_action() {
         for intent in [
             astra_config::user_profile::WorkspaceMutationIntent::Unknown,
@@ -13352,7 +13511,7 @@ mod tests {
     }
 
     #[test]
-    fn post_mutation_recovery_advertises_executor_bash_verify_receipt() {
+    fn post_mutation_recovery_does_not_assume_bash_verify_capability() {
         let mut state = make_state();
         state
             .stall
@@ -13368,9 +13527,29 @@ mod tests {
             .find(|entry| entry.payload["signal"] == "post_mutation_observation_missing")
             .and_then(|entry| entry.payload["instruction"].as_str())
             .expect("post-mutation recovery instruction");
-        assert!(instruction.contains("`mode` to `verify`"));
-        assert!(instruction.contains("executor will attest"));
+        assert!(instruction.contains("Bash `mode=verify` is available only when"));
+        assert!(instruction.contains("do not retry it"));
+        assert!(instruction.contains("cannot replace a required script or test result"));
         assert!(!instruction.contains("explicit working-directory field"));
+        let hint = state
+            .volatile_pending
+            .iter()
+            .find(|entry| entry.payload["signal"] == "post_mutation_observation_missing")
+            .map(|entry| &entry.payload["action_hint"])
+            .expect("initial recovery must project typed action shapes");
+        assert_eq!(hint["accepted_action_family"], "workspace_observation");
+        assert!(
+            hint["accepted_action_shapes"]
+                .as_array()
+                .is_some_and(|shapes| {
+                    shapes.iter().any(|shape| {
+                        shape["tool"] == "bash"
+                            && shape["constraint"]
+                                .as_str()
+                                .is_some_and(|text| text.contains("mode=verify"))
+                    })
+                })
+        );
         let window = state
             .hooks
             .completion_settlement
@@ -14407,6 +14586,29 @@ mod tests {
             Some("post_mutation_revalidation")
         );
         assert!(completion_action_match_label(&state, &action, &different_validator).is_none());
+    }
+
+    #[test]
+    fn text_stop_observation_hint_matches_typed_and_verify_admission() {
+        let mut state = make_state();
+        state
+            .hooks
+            .completion_settlement
+            .post_mutation_observation_retries = 1;
+        let hint =
+            completion_action_hint_for_state(&state, &CompletionAction::PostMutationObservation);
+        let shapes = hint["accepted_action_shapes"].as_array().unwrap();
+        assert!(shapes.iter().any(|shape| {
+            shape["constraint"]
+                .as_str()
+                .is_some_and(|constraint| constraint.contains("typed workspace"))
+        }));
+        assert!(shapes.iter().any(|shape| {
+            shape["tool"] == "bash"
+                && shape["constraint"]
+                    .as_str()
+                    .is_some_and(|constraint| constraint.contains("mode=verify"))
+        }));
     }
 
     #[test]
@@ -17259,7 +17461,10 @@ mod tests {
             state.interruption.as_ref().map(|record| record.kind),
             Some(InterruptionKind::ExecutionIncomplete)
         );
-        assert_eq!(state.final_text, "Still done.");
+        assert_eq!(
+            state.final_text,
+            state.interruption.as_ref().unwrap().user_message
+        );
         assert!(
             state
                 .interruption
@@ -21209,6 +21414,7 @@ mod tests {
             group_id: "fanout-1".into(),
             target_count: 2,
             pending_slots: std::collections::BTreeMap::from([(1, 1024)]),
+            had_recoverable_issues: false,
         });
         assert_eq!(
             terminal_completion_disposition(&paginated_fanout, true),
@@ -22067,6 +22273,69 @@ mod tests {
     }
 
     #[test]
+    fn run_deadline_yields_to_settlement_only_without_actionable_delivery() {
+        let no_response = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ProviderDeadline,
+            "LLM provider work deadline reached while waiting for provider response",
+        );
+        assert!(provider_deadline_has_no_actionable_delivery(&no_response));
+
+        let no_delivery = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ProviderDeadline,
+            "LLM provider work deadline reached while consuming provider stream",
+        )
+        .with_details_json(
+            serde_json::json!({
+                "partial_full_text": "",
+                "tool_calls": [],
+                "partial_reasoning": "provisional reasoning"
+            })
+            .to_string(),
+        );
+        assert!(provider_deadline_has_no_actionable_delivery(&no_delivery));
+
+        let partial_text = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ProviderDeadline,
+            "deadline after partial text",
+        )
+        .with_details_json(
+            serde_json::json!({ "partial_full_text": "The result is", "tool_calls": [] })
+                .to_string(),
+        );
+        assert!(!provider_deadline_has_no_actionable_delivery(&partial_text));
+
+        let selected_tool = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ProviderDeadline,
+            "deadline after partial tool call",
+        )
+        .with_details_json(
+            serde_json::json!({
+                "partial_full_text": "",
+                "tool_calls": [{ "id": "call-1", "name": "bash" }]
+            })
+            .to_string(),
+        );
+        assert!(!provider_deadline_has_no_actionable_delivery(
+            &selected_tool
+        ));
+
+        let malformed = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ProviderDeadline,
+            "malformed partial data",
+        )
+        .with_details_json("not-json".to_string());
+        assert!(!provider_deadline_has_no_actionable_delivery(&malformed));
+
+        let transport_error = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::StreamTransport,
+            "non-deadline transport failure",
+        );
+        assert!(!provider_deadline_has_no_actionable_delivery(
+            &transport_error
+        ));
+    }
+
+    #[test]
     fn terminal_empty_provider_completion_is_safe_to_recover_once() {
         let mut state = make_state();
         state.remaining_turns = 3;
@@ -22172,6 +22441,45 @@ mod tests {
     }
 
     #[test]
+    fn provider_completion_error_usage_preserves_unknown_without_transport_success() {
+        for qualified in [
+            serde_json::json!({}),
+            serde_json::json!({"output_tokens":7}),
+        ] {
+            let mut state = make_state();
+            state.last_measured_prompt_tokens = Some(1000);
+            state.last_request_usage =
+                Some(astra_turn_types::RequestTokenUsage::try_new(100, 900, 0, 20).unwrap());
+            state.add_qualified_usage(Some(
+                astra_turn_types::CanonicalTokenUsage::new(Some(100), Some(900), Some(0), Some(20))
+                    .unwrap(),
+            ));
+            let error =
+                astra_core::ClassifiedError::new(astra_core::ErrorKind::Cancelled, "cancelled")
+                    .with_details_json(
+                        serde_json::json!({"qualified_usage":qualified}).to_string(),
+                    );
+            fold_provider_completion_error_usage(&mut state, &error);
+            let usage = state.qualified_usage.unwrap();
+            assert!(state.last_request_usage.is_none());
+            assert!(state.last_measured_prompt_tokens.is_none());
+            assert_eq!(usage.input_tokens(), None);
+            assert_eq!(usage.cached_input_tokens(), None);
+            assert_eq!(
+                usage.output_tokens(),
+                qualified
+                    .get("output_tokens")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v + 20)
+            );
+            assert_eq!(
+                state.total_prompt, 0,
+                "qualification does not invent observed counters"
+            );
+        }
+    }
+
+    #[test]
     fn provider_completion_error_usage_is_folded_once_and_reclassified() {
         let mut state = make_state();
         state.record_local_usage_coverage(false);
@@ -22183,6 +22491,7 @@ mod tests {
             serde_json::json!({
                 "deadline": {"scope": "provider_completion", "phase": "actionable_output"},
                 "provider_response": {"transport_success": true},
+                "last_request_usage": {"input_tokens": 10, "cached_input_tokens": 2, "cache_creation_tokens": 1},
                 "usage": {
                     "input_tokens": 21,
                     "cached_input_tokens": 3,
@@ -22199,10 +22508,28 @@ mod tests {
         assert_eq!(state.total_cache_creation, 2);
         assert_eq!(state.total_completion, 8);
         assert!(state.has_any_usage);
-        assert_eq!(state.last_measured_prompt_tokens, Some(26));
+        assert_eq!(state.last_measured_prompt_tokens, Some(13));
         assert_eq!(state.token_usage_coverage().attempts, 1);
         assert_eq!(state.token_usage_coverage().provider_reported, 1);
         assert_eq!(state.token_usage_coverage().unavailable, 0);
+
+        let mut aggregate_only_details: serde_json::Value =
+            serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
+        aggregate_only_details
+            .as_object_mut()
+            .unwrap()
+            .remove("last_request_usage");
+        let aggregate_only_error = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ProviderDeadline,
+            "empty response",
+        )
+        .with_details_json(aggregate_only_details.to_string());
+        let mut aggregate_only_state = make_state();
+        aggregate_only_state.last_measured_prompt_tokens = Some(999);
+        aggregate_only_state.record_local_usage_coverage(false);
+        fold_provider_completion_error_usage(&mut aggregate_only_state, &aggregate_only_error);
+        assert_eq!(aggregate_only_state.total_prompt, 21);
+        assert_eq!(aggregate_only_state.last_measured_prompt_tokens, None);
 
         let mut unavailable_state = make_state();
         unavailable_state.record_local_usage_coverage(false);
@@ -22225,6 +22552,48 @@ mod tests {
             0
         );
         assert_eq!(unavailable_state.token_usage_coverage().unavailable, 1);
+
+        for (usage, expected_measurement, reported) in [
+            (
+                serde_json::json!({"input_tokens": 21, "output_tokens": 8}),
+                None,
+                true,
+            ),
+            (
+                serde_json::json!({"input_tokens": 0, "cached_input_tokens": 0, "cache_creation_tokens": 0, "output_tokens": 0}),
+                Some(0),
+                true,
+            ),
+            (serde_json::json!({}), None, false),
+            (
+                serde_json::json!({"input_tokens": -1, "output_tokens": 8}),
+                None,
+                false,
+            ),
+            (serde_json::Value::Null, None, false),
+        ] {
+            let mut state = make_state();
+            state.last_measured_prompt_tokens = Some(999);
+            state.record_local_usage_coverage(false);
+            let error = astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ProviderDeadline,
+                "empty response",
+            )
+            .with_details_json(
+                serde_json::json!({
+                    "provider_response": {"transport_success": true}, "usage": usage,
+                    "last_request_usage": usage
+                })
+                .to_string(),
+            );
+            fold_provider_completion_error_usage(&mut state, &error);
+            assert_eq!(state.last_measured_prompt_tokens, expected_measurement);
+            assert_eq!(state.has_any_usage, reported);
+            assert_eq!(
+                state.token_usage_coverage().provider_reported,
+                u32::from(reported)
+            );
+        }
     }
 
     #[test]
@@ -22987,8 +23356,8 @@ mod tests {
                 }),
                 expected: Some(TokenUsage {
                     input_tokens: 0,
-                    cached_input_tokens: 800,
-                    cache_creation_tokens: 100,
+                    cached_input_tokens: 0,
+                    cache_creation_tokens: 0,
                     output_tokens: 50,
                 }),
             },
@@ -23086,6 +23455,7 @@ mod tests {
 
     fn exercise_usage_gate(
         usage: Option<crate::turn::token_usage::TokenUsage>,
+        physical: Option<astra_turn_types::RequestTokenUsage>,
         terminal: TypedTerminalGateCase,
         quiet: bool,
     ) -> UsageGateObservation {
@@ -23108,6 +23478,7 @@ mod tests {
         let accum = ChatTurnSseAccum {
             session_id: Some("typed-usage-session".to_string()),
             run_id: Some("typed-usage-run".to_string()),
+            current_request_usage: physical,
             prompt_tokens: usage.input_tokens,
             completion_tokens: usage.output_tokens,
             cache_read_tokens: usage.cached_input_tokens,
@@ -23170,7 +23541,7 @@ mod tests {
 
     #[test]
     fn provider_usage_terminal_quiet_cross_product_preserves_typed_telemetry() {
-        use crate::turn::token_usage::extract_usage;
+        use crate::turn::token_usage::parse_usage;
         use astra_services::InferenceTerminalStatus;
 
         let terminal_cases = [
@@ -23181,10 +23552,27 @@ mod tests {
         ];
 
         for provider in provider_usage_gate_cases() {
-            let extracted = provider
+            let parsed = provider
                 .raw_usage
                 .as_object()
-                .and_then(|usage| extract_usage(provider.dialect, usage));
+                .and_then(|usage| parse_usage(provider.dialect, usage));
+            let extracted = parsed.map(|(usage, _)| usage);
+            let physical = parsed.and_then(|(usage, presence)| {
+                (presence.fresh_input_tokens
+                    && presence.cache_read_tokens
+                    && presence.cache_creation_tokens
+                    && presence.output_tokens)
+                    .then(|| {
+                        astra_turn_types::RequestTokenUsage::try_new(
+                            usage.input_tokens,
+                            usage.cached_input_tokens,
+                            usage.cache_creation_tokens,
+                            usage.output_tokens,
+                        )
+                        .ok()
+                    })
+                    .flatten()
+            });
             assert_eq!(
                 extracted, provider.expected,
                 "provider usage normalization: {}",
@@ -23196,8 +23584,8 @@ mod tests {
                 .total_input_tokens();
 
             for terminal in terminal_cases {
-                let rendered = exercise_usage_gate(extracted, terminal, false);
-                let quiet = exercise_usage_gate(extracted, terminal, true);
+                let rendered = exercise_usage_gate(extracted, physical, terminal, false);
+                let quiet = exercise_usage_gate(extracted, physical, terminal, true);
 
                 assert_eq!(
                     rendered, quiet,
@@ -23258,15 +23646,7 @@ mod tests {
                 };
                 assert_eq!(rendered.execution, expected_execution);
 
-                let expected_calibration = match terminal {
-                    TypedTerminalGateCase::Inference(InferenceTerminalStatus::Succeeded)
-                    | TypedTerminalGateCase::TerminalControl
-                        if extracted.is_some() && expected_total_input > 0 =>
-                    {
-                        Some(expected_total_input)
-                    }
-                    _ => None,
-                };
+                let expected_calibration = physical.map(|_| expected_total_input);
                 assert_eq!(
                     rendered.telemetry.last_measured_prompt_tokens, expected_calibration,
                     "prompt calibration: {} / {terminal:?}",
@@ -24078,8 +24458,13 @@ mod tests {
     #[test]
     fn superseded_provider_round_keeps_usage_and_trace_without_content_authority() {
         let mut state = make_state();
+        state.last_measured_prompt_tokens = Some(999);
         state.current_run_id = Some("run-superseded".into());
         let mut result = text_result("stale answer", 120, 11, Some(7));
+        result.accum.qualified_usage = Some(
+            astra_turn_types::CanonicalTokenUsage::new(Some(120), None, None, Some(11)).unwrap(),
+        );
+        result.accum.current_request_usage = None;
         result.accum.cache_read_tokens = 30;
         result.accum.cache_creation_tokens = 5;
         result.accum.tool_calls = vec![serde_json::json!({
@@ -24091,10 +24476,12 @@ mod tests {
         record_superseded_llm_round(&mut state, &result, Instant::now());
 
         assert_eq!(state.total_prompt, 120);
+        assert_eq!(state.qualified_usage, result.accum.qualified_usage);
         assert_eq!(state.total_completion, 11);
         assert_eq!(state.total_cache_read, 30);
         assert_eq!(state.total_cache_creation, 5);
         assert!(state.has_any_usage);
+        assert_eq!(state.last_measured_prompt_tokens, None);
         let round = state.recent_rounds.last().expect("physical round retained");
         assert_eq!(
             round.finish_reason.as_deref(),
@@ -24109,6 +24496,80 @@ mod tests {
             state.stall.tool_call_records.is_empty(),
             "stale tools must not execute"
         );
+        result.accum.current_request_usage = Some(astra_turn_types::RequestTokenUsage::default());
+        record_superseded_llm_round(&mut state, &result, Instant::now());
+        assert_eq!(state.last_measured_prompt_tokens, Some(0));
+    }
+
+    #[tokio::test]
+    async fn mid_provider_guidance_discards_stale_tool_and_reaches_next_request() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-mid-provider-guidance".into());
+        state.current_run_owner_generation = Some(7);
+        state.context_manifest_user_id = Some("user-mid-provider-guidance".into());
+        let guidance = "answer the revised question without reading files";
+        let provider = Arc::new(StubRunControlProvider::new(vec![
+            UserIntentPoll::default(),
+            UserIntentPoll {
+                next_cursor: 2,
+                snapshot_page_fact_count: 1,
+                inputs: vec![crate::turn::run_control::QueuedUserIntent {
+                    intent_id: "intent-mid-provider".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+                    event_index: 1,
+                    input: serde_json::json!({"content": guidance}),
+                }],
+                ..UserIntentPoll::default()
+            },
+        ]));
+        state.run_control = Some(provider.clone());
+        let mut stale = server_tool_result(
+            vec![serde_json::json!({
+                "id": "stale-tool",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{\"path\":\"README.md\"}"}
+            })],
+            vec![],
+            120,
+            11,
+            Some(7),
+        );
+        stale.accum.cache_read_tokens = 30;
+        stale.accum.cache_creation_tokens = 5;
+        let mut host = MockHost::new(vec![stale, text_result("revised result", 5, 2, None)])
+            .with_valid_tools(&["read_file"])
+            .with_admission_hook();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(
+            matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
+            "{outcome:?}"
+        );
+        assert_eq!(host.turn_count(), 2);
+        // MockHost captures the input to the host, not the serialized HTTP wire.
+        assert!(
+            !serde_json::to_string(&host.executed_messages[0])
+                .unwrap()
+                .contains(guidance)
+        );
+        let next_request = serde_json::to_string(&host.executed_messages[1]).unwrap();
+        assert_eq!(next_request.matches(guidance).count(), 1);
+        assert!(!next_request.contains("stale-tool"));
+        assert!(host.admitted_tool_call_batches.is_empty());
+        assert!(state.stall.tool_call_records.is_empty());
+        assert_eq!(state.total_prompt, 125);
+        assert_eq!(state.total_completion, 13);
+        assert_eq!(state.total_cache_read, 30);
+        assert_eq!(state.total_cache_creation, 5);
+        let discarded = state
+            .recent_rounds
+            .iter()
+            .find(|round| round.finish_reason.as_deref() == Some("superseded_by_user_intent"))
+            .expect("discarded physical round remains observable");
+        assert_eq!(discarded.tool_call_names, ["read_file"]);
+        assert_eq!(*provider.released.lock().await, vec![1]);
+        assert_eq!(state.final_text, "revised result");
     }
 
     #[test]
@@ -24119,6 +24580,8 @@ mod tests {
         state.total_completion = 3;
         let mut result = text_result("answer", 100, 10, Some(7));
         result.accum.cache_read_tokens = 900;
+        result.accum.current_request_usage =
+            Some(astra_turn_types::RequestTokenUsage::try_new(100, 900, 0, 10).unwrap());
         record_superseded_llm_round(&mut state, &result, Instant::now());
         assert_eq!(state.provider_input_tokens(), 2_000);
         assert_eq!(state.provider_total_tokens(), 2_013);
@@ -24134,6 +24597,10 @@ mod tests {
         let mut state = make_state();
         state.current_run_id = Some("parent-run".into());
         let mut result = text_result("stale remote answer", 240, 20, Some(9));
+        result.accum.qualified_usage = Some(
+            astra_turn_types::CanonicalTokenUsage::new(Some(240), Some(80), None, Some(20))
+                .unwrap(),
+        );
         result.accum.run_id = Some("remote-run".into());
         result.accum.cache_read_tokens = 80;
         result.accum.server_execution_summary = Some(ServerLoopExecutionSummary {
@@ -24151,11 +24618,20 @@ mod tests {
         assert_eq!(state.total_tool_calls, 3);
         assert_eq!(state.total_observation_tool_calls, 1);
         assert_eq!(state.total_prompt, 240);
+        assert_eq!(state.qualified_usage, result.accum.qualified_usage);
         assert_eq!(state.total_completion, 20);
         assert_eq!(state.total_cache_read, 80);
         assert!(state.has_any_usage);
         assert!(state.messages.is_empty());
         assert!(state.stall.tool_call_records.is_empty());
+        result.accum.run_id = None;
+        record_superseded_llm_round(&mut state, &result, Instant::now());
+        record_superseded_llm_round(&mut state, &result, Instant::now());
+        assert_eq!(state.qualified_usage.unwrap().input_tokens(), None);
+        assert_eq!(
+            state.total_prompt, 240,
+            "anonymous summaries cannot add numeric counts"
+        );
     }
 
     #[tokio::test]
@@ -24433,6 +24909,7 @@ mod tests {
                 group_id: "old-group".into(),
                 target_count: 1,
                 pending_slots: std::collections::BTreeMap::from([(0, 1024)]),
+                had_recoverable_issues: false,
             },
         );
         state.hooks.completion_settlement.text_only = true;
@@ -25298,6 +25775,43 @@ mod tests {
             delivered_payloads.push(policy[0].payload.clone());
         }
         assert_eq!(delivered_payloads[0], delivered_payloads[1]);
+    }
+
+    #[tokio::test]
+    async fn converged_policy_reaches_provider() {
+        let mut state = make_state();
+        state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
+            "state": "evaluated",
+            "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+            "recovery": null,
+            "revision": 3,
+            "evaluated_at_round": 8,
+            "subject": {"kind": "run"},
+            "entries": [{
+                "signal": "round_activity",
+                "stage": "converge",
+                "observed_at_round": 8,
+                "evidence_count": 8,
+                "recommendation": "review_task_progress"
+            }]
+        }))
+        .expect("valid policy feedback");
+        let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))]);
+
+        execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(false))
+            .await
+            .expect("provider request");
+        let payload = &host.executed_volatile[0]
+            .iter()
+            .find(|entry| entry.kind == VolatileKind::PolicyAdvisory)
+            .expect("policy must reach provider")
+            .payload;
+        assert!(
+            payload["entries"][0]["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("one decisive check or synthesize")
+        );
     }
 
     #[tokio::test]

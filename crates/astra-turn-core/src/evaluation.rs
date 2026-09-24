@@ -4887,7 +4887,7 @@ mod tests {
     #[test]
     fn evaluate_tool_call_records_ignores_noop_human_text_without_structured_signal() {
         let mut record = journal_ok_call("read_file");
-        record.result_preview = Some("[cached_cross_turn: reused 200 bytes]".to_string());
+        record.result_preview = Some("[cached_same_invocation: replayed 200 bytes]".to_string());
 
         let eval = evaluate_tool_call_records("Summarize file", &[], &[record], 0, false, 0.2);
 

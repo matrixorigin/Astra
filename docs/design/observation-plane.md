@@ -268,6 +268,56 @@ building learning examples must retain per-request coverage and treat missing
 or expired diagnostics as unknown. Foreground settlement and recovery share
 the same coverage projection.
 
+## Persisted token evidence and audit projections
+
+Canonical persisted token lanes are disjoint fresh input, cache read, cache
+creation, and output. Missing or null is unknown, not measured zero. Derived
+input and total counts require all contributing lanes. Malformed supplied
+counts, contradictory totals, and overflowing known subtotals are rejected at
+the shared parsing boundary. An observed but unavailable accounting sample is
+distinct from absence of an accounting sample.
+
+Journal numeric evidence stays in the existing nullable token fields. Only an
+all-unknown sample carries `metadata.qualified_usage: {}` as a presence witness;
+this metadata field must not duplicate numeric lanes. Invalid witnesses or
+witnesses conflicting with numeric fields quarantine the sample as unavailable.
+Run summaries retain `total_tokens: null` when accounting scope metadata would
+otherwise erase the canonical empty-sample shape. Recovery requires explicit
+nullable qualified and latest-physical usage fields; checkpoints missing them
+are rejected rather than inferred from observed subtotals.
+
+Audit turn/detail token fields and session request-usage lanes serialize
+unknown values as explicit nulls. Session lane sums use checked addition;
+missing evidence or overflow makes that lane unknown without discarding other
+lanes. An explicitly examined empty sample set has zero totals, whereas a
+missing summary defaults to unknown. A newer cumulative response replaces the
+older response; it must not borrow older values to fill unknown fields.
+
+Cost estimates require all four lanes and their applicable prices. Partial
+samples count as unpriced, not as free requests. An all-unpriced sample set
+omits the cost estimate and per-model map. These counts describe selected
+accounting rows, not proof of coverage of every physical provider attempt.
+Top-level session SQL token sums remain observed subtotals, not certified
+complete totals. Primary and auxiliary attribution must be established before
+interpreting a sample as one model's cost.
+
+Workspace/session restoration counters remain observed subtotals. Combining
+local and cloud counters does not establish common request coverage or model
+attribution. `/ask` must carry that limitation instead of deriving a session
+cache percentage. The current-session `/cost` and TUI `/stats cost` view is a
+current-rate scenario on those counters, not session billing; missing prices
+remain unavailable, and no actual savings or per-turn average is inferred.
+Qualified per-turn metrics remain independent of these historical counters.
+
+Live cumulative monetary estimates are nullable through session state,
+rollback, TUI and dump projections. A known-empty local state may start at
+zero, but attaching a session does not establish historical cost coverage.
+Aggregate token counters plus current or fallback model prices cannot qualify
+the complete cost of primary, auxiliary, delegated and retried work. Until that
+attribution is available, successful and failed turns retain an unknown cost,
+not a zero amount or a priced subset. Journal-only exports likewise have no
+complete monetary evidence. Current-rate scenarios remain available separately.
+
 ## Semantic judgment trace
 
 Server lifecycle observability flushes prepare one annotated journal batch for

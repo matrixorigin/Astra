@@ -43,8 +43,10 @@ pub fn bash_command_is_cache_safe(command: &str) -> bool {
     if COMPOUND_MARKERS.iter().any(|m| cmd.contains(m)) {
         return false;
     }
-    // Bare `&` at end means background exec — treat as unsafe.
-    if cmd.ends_with('&') {
+    // A bare `&` can background an earlier command anywhere in the script,
+    // not only at the end (`read & next`). Quoted ampersands are rejected
+    // conservatively because this classifier does not parse shell syntax.
+    if cmd.contains('&') {
         return false;
     }
 
@@ -414,6 +416,7 @@ mod tests {
             "echo $(pwd)",
             "echo `pwd`",
             "sleep 1 &",
+            "echo hi & pwd",
             "ls\npwd",
             // unknown commands (fail-closed)
             "totally-unknown-tool",

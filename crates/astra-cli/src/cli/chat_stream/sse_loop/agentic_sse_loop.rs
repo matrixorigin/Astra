@@ -82,6 +82,7 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
 }
 
 pub(crate) struct StreamResultBuild<'a> {
+    pub(crate) qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
     pub(crate) tool_health_entries: &'a [ToolHealthEntry],
     pub(crate) session_id: Option<String>,
     pub(crate) run_id: Option<String>,
@@ -227,6 +228,7 @@ pub(crate) fn partial_interruption_notice(result: &StreamResult) -> Option<Strin
 
 pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
     let StreamResultBuild {
+        qualified_usage,
         tool_health_entries,
         session_id,
         run_id,
@@ -339,6 +341,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
     };
 
     StreamResult {
+        qualified_usage,
         session_id,
         run_id,
         session_persistence_error: None,
@@ -424,6 +427,7 @@ mod tests {
         turn_guard: &'a TurnGuard,
     ) -> StreamResultBuild<'a> {
         StreamResultBuild {
+            qualified_usage: None,
             tool_health_entries: &[],
             session_id: Some("sess-1".into()),
             run_id: Some("run-1".into()),

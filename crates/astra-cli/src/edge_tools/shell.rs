@@ -3133,6 +3133,7 @@ struct ShellRunConfig {
     command: String,
     timeout_secs: f64,
     harden_command: bool,
+    explicit_verification: bool,
     effective_project_root: PathBuf,
     sandbox_policy: Option<SandboxPolicy>,
     progress_sink: Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
@@ -3170,6 +3171,7 @@ struct ScopedShellOutput {
 #[derive(Debug)]
 struct ShellRunError {
     message: String,
+    execution_started: bool,
     /// A child was started and its complete descendant set could not be
     /// proven empty. Pre-spawn failures deliberately leave this false.
     ownership_unsettled: bool,
@@ -3180,6 +3182,7 @@ impl ShellRunError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            execution_started: false,
             ownership_unsettled: false,
             scope_ownership: None,
         }
@@ -3191,6 +3194,7 @@ impl ShellRunError {
     ) -> Self {
         Self {
             message: message.into(),
+            execution_started: true,
             ownership_unsettled: scope_ownership.is_none(),
             scope_ownership,
         }
@@ -3230,6 +3234,11 @@ fn run_shell_output_with_config(
             "Error: unable to establish Bash invocation owner: {error}"
         ))
     })?;
+    if config.explicit_verification && !invocation_owner.can_authoritatively_observe() {
+        return Err(ShellRunError::new(
+            "Error: bash mode=verify is unavailable: this executor cannot prove that all child processes have settled. No command was run. A typed workspace observer can check file state, but cannot replace a required script or test result.",
+        ));
+    }
     child_cmd
         .current_dir(&config.effective_project_root)
         .stdout(Stdio::piped())
@@ -3743,33 +3752,7 @@ async fn run_shell_output_with_detach_config(
 ///   * **30s**  — default for anything else (network, shell scripts
 ///     the tiers don't recognize).
 pub(crate) fn default_bash_timeout_secs(command: &str) -> f64 {
-    let cmd_base = command.split_whitespace().next().unwrap_or("");
-    match cmd_base {
-        // Tier 1: instant — no real I/O
-        "echo" | "printf" | "true" | "false" | "pwd" | "whoami" | "date" | "basename"
-        | "dirname" | "which" | "env" | "hostname" | "uname" | "id" | "tty" | "nproc" | "arch"
-        | "yes" => 5.0,
-        // Tier 2: fast reads — single file or dir stat
-        "cat" | "head" | "tail" | "wc" | "stat" | "file" | "ls" | "readlink" | "realpath"
-        | "md5sum" | "sha256sum" | "du" | "df" | "touch" | "mkdir" | "cp" | "mv" | "rm" | "ln"
-        | "chmod" | "chown" => 10.0,
-        // Tier 3: search/traversal — scan many files but bounded
-        "grep" | "rg" | "find" | "fd" | "ag" | "awk" | "sed" | "sort" | "uniq" | "cut" | "tr"
-        | "diff" | "comm" | "xargs" | "tree" | "jq" | "yq" | "column" | "tee" => 15.0,
-        // Tier 5: build/test/package-install — compilation and full
-        // test suites on real workspaces routinely take 30s+. Pick
-        // 120s so the common case doesn't eat a wasted round on
-        // timeout-then-retry-with-larger-timeout.
-        "cargo" | "make" | "go" | "mvn" | "gradle" | "pytest" | "pnpm" | "yarn" | "npm" | "pip"
-        | "uv" | "cmake" | "tox" | "bazel" | "ninja" => 120.0,
-        // Tier 5b: container tooling — first-time image pulls / multi-stage
-        // builds routinely take 30s+ on cold caches. Same 120s floor so a
-        // `docker build`/`docker compose up` first run doesn't burn a
-        // round on timeout-then-retry.
-        "docker" | "podman" | "docker-compose" | "nerdctl" | "buildah" => 120.0,
-        // Tier 4: everything else (network, unrecognized scripts).
-        _ => 30.0,
-    }
+    astra_tools::shell_ops::workspace_edge_bash_timeout_secs(command)
 }
 
 /// Resolve the pipe-read timeout. Tests can shorten it via
@@ -4415,6 +4398,7 @@ impl ToolExecutor {
             command: command.to_string(),
             timeout_secs,
             harden_command,
+            explicit_verification: false,
             effective_project_root: self.effective_project_root(),
             sandbox_policy,
             progress_sink: self.current_bash_progress_sink(),
@@ -4475,8 +4459,11 @@ impl ToolExecutor {
         command: &str,
         timeout_secs: f64,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
+        explicit_verification: bool,
     ) -> Result<ScopedShellOutput, ShellRunError> {
-        let config = self.shell_run_config("bash", "-c", command, timeout_secs, true, cancel_token);
+        let mut config =
+            self.shell_run_config("bash", "-c", command, timeout_secs, true, cancel_token);
+        config.explicit_verification = explicit_verification;
         run_shell_output_with_config(config)
     }
 
@@ -5522,8 +5509,9 @@ impl ToolExecutor {
         if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
             return super::cancelled_tool_execution_outcome("bash", false);
         }
-        let config =
+        let mut config =
             self.shell_run_config("bash", "-c", &command, timeout_secs, true, cancel_token);
+        config.explicit_verification = explicit_verification;
         let shell_result =
             tokio::task::spawn_blocking(move || run_shell_output_with_config(config)).await;
         let coordination_unsettled = _observation_lease
@@ -5563,6 +5551,9 @@ impl ToolExecutor {
                 outcome
             }
             Ok(Err(error)) => {
+                if !error.execution_started {
+                    return bash_preparation_rejection(error.message);
+                }
                 let outcome = if cancel_token
                     .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
                 {
@@ -5878,8 +5869,12 @@ impl ToolExecutor {
         if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
             return super::cancelled_tool_execution_outcome("bash", false);
         }
-        let shell_result =
-            self.run_shell_output_cancelable_scoped(&command, timeout_secs, cancel_token);
+        let shell_result = self.run_shell_output_cancelable_scoped(
+            &command,
+            timeout_secs,
+            cancel_token,
+            explicit_verification,
+        );
         let coordination_unsettled = _observation_lease
             .as_ref()
             .is_some_and(|lease| !lease.coordination_integrity_valid());
@@ -5919,6 +5914,9 @@ impl ToolExecutor {
                 attach_source_preimage_outcome(outcome, source_preimages)
             }
             Err(error) => {
+                if !error.execution_started {
+                    return bash_preparation_rejection(error.message);
+                }
                 let outcome = if cancel_token
                     .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
                 {
@@ -7037,7 +7035,14 @@ mod tests {
         );
 
         assert!(outcome.is_error, "verify may not mutate: {outcome:?}");
-        assert!(dir.path().join("changed.txt").is_file());
+        let rejected_before_execution = outcome
+            .tool_result_fields
+            .as_ref()
+            .is_some_and(|fields| fields["disposition"] == "rejected");
+        assert_eq!(
+            dir.path().join("changed.txt").exists(),
+            !rejected_before_execution
+        );
         assert!(outcome.tool_result_fields.as_ref().is_none_or(|fields| {
             !fields
                 .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
@@ -7045,6 +7050,46 @@ mod tests {
                     astra_tools::workspace_observation::is_explicit_workspace_verification_receipt,
                 )
         }));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn unsupported_bash_verify_is_rejected_before_shell_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = test_executor_in(dir.path()).bash_outcome_with_cancel(
+            &serde_json::json!({"command": "touch sentinel", "mode": "verify"}),
+            astra_tools::tool_engine::ToolInvocationMetadata::default(),
+            None,
+        );
+        assert!(outcome.is_error);
+        assert!(outcome.output.contains("No command was run"));
+        assert!(!dir.path().join("sentinel").exists());
+        let fields = outcome.tool_result_fields.unwrap();
+        assert_eq!(fields["disposition"], "rejected");
+        assert_eq!(fields["execution_started"], false);
+        assert_eq!(fields["side_effects_maybe"], false);
+        assert_ne!(
+            astra_tools::workspace_observation::workspace_observation_is_quarantined(dir.path()),
+            Some(true)
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn unsupported_async_bash_verify_is_rejected_before_shell_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = test_executor_in(dir.path())
+            .bash_outcome_with_cancel_async(
+                &serde_json::json!({"command": "touch sentinel", "mode": "verify"}),
+                astra_tools::tool_engine::ToolInvocationMetadata::default(),
+                None,
+            )
+            .await;
+        assert!(outcome.is_error);
+        assert!(!dir.path().join("sentinel").exists());
+        let fields = outcome.tool_result_fields.unwrap();
+        assert_eq!(fields["disposition"], "rejected");
+        assert_eq!(fields["execution_started"], false);
     }
 
     #[test]

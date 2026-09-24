@@ -1091,7 +1091,7 @@ fn show_correction_timeline(session_id: &str) {
         };
 
         eprintln!(
-            "  T{} {} — {} injection(s){}{}{}",
+            "  T{} {} — {} TurnGuard observation(s), not model feedback{}{}{}",
             turn.bold(),
             severity_colored,
             injections,

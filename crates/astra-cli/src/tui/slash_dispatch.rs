@@ -1716,7 +1716,10 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
                         state.total_prompt_tokens, state.total_completion_tokens
                     ),
                 ),
-                ("cost", format!("${:.4}", state.total_session_cost)),
+                (
+                    "cost",
+                    crate::cli::slash::slash_stats::format_optional_cost(state.total_session_cost),
+                ),
             ];
             if !sid.is_empty() {
                 match crate::cli::session::session_stats_scan::read_session_journal_for_stats(&sid)
@@ -1836,70 +1839,9 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
         }
 
         "cost" => {
-            let pricing = &state.cached_pricing;
-            let cost = crate::cli::slash::slash_stats::cost_for_tokens(
-                state.total_prompt_tokens,
-                state.total_completion_tokens,
-                state.total_cache_read_tokens,
-                state.total_cache_creation_tokens,
-                pricing,
-            );
-            let mut pairs: Vec<(&str, String)> = vec![
-                (
-                    "model",
-                    state.model.clone().unwrap_or_else(|| "<unset>".into()),
-                ),
-                (
-                    "rates",
-                    format!(
-                        "${:.3}/1M prompt, ${:.3}/1M completion",
-                        pricing.prompt * 1_000_000.0,
-                        pricing.completion * 1_000_000.0
-                    ),
-                ),
-                (
-                    "prompt",
-                    format!(
-                        "{} ({})",
-                        state.total_prompt_tokens,
-                        crate::cli::slash::slash_stats::format_cost(
-                            state.total_prompt_tokens as f64 * pricing.prompt
-                        )
-                    ),
-                ),
-                (
-                    "completion",
-                    format!(
-                        "{} ({})",
-                        state.total_completion_tokens,
-                        crate::cli::slash::slash_stats::format_cost(
-                            state.total_completion_tokens as f64 * pricing.completion
-                        )
-                    ),
-                ),
-            ];
-            if state.total_cache_read_tokens > 0 {
-                let rate = pricing.cache_read.unwrap_or(pricing.prompt);
-                pairs.push((
-                    "cache read",
-                    format!(
-                        "{} ({})",
-                        state.total_cache_read_tokens,
-                        crate::cli::slash::slash_stats::format_cost(
-                            state.total_cache_read_tokens as f64 * rate
-                        )
-                    ),
-                ));
-            }
-            pairs.push(("total", crate::cli::slash::slash_stats::format_cost(cost)));
-            if state.turn > 0 {
-                pairs.push((
-                    "avg/turn",
-                    crate::cli::slash::slash_stats::format_cost(cost / state.turn as f64),
-                ));
-            }
+            let pairs = crate::cli::slash::slash_stats::current_rate_cost_rows(state);
             bottom_pane.push_view(Box::new(
-                InfoView::from_key_value("Session Cost", pairs).with_reopen("/stats"),
+                InfoView::from_key_value("Current-rate Cost Scenario", pairs).with_reopen("/stats"),
             ));
         }
 
@@ -3038,7 +2980,7 @@ async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashRes
         ("session total tokens", fmt_tokens(cumulative_tokens)),
         (
             "session cost",
-            format!("${:.4}", ctx.state.total_session_cost),
+            crate::cli::slash::slash_stats::format_optional_cost(ctx.state.total_session_cost),
         ),
     ];
     ctx.open_view(
@@ -3072,7 +3014,7 @@ pub(crate) struct SessionHubSnapshot {
     pending_recovery: Option<String>,
     turn: u32,
     model: String,
-    total_cost: f64,
+    total_cost: Option<f64>,
     prompt_tokens: u64,
     completion_tokens: u64,
     cache_read_tokens: u64,
@@ -3225,7 +3167,10 @@ pub(crate) fn session_hub_view(
     }
 
     // Live state
-    pairs.push(("cost", format!("${:.4}", snapshot.total_cost)));
+    pairs.push((
+        "cost",
+        crate::cli::slash::slash_stats::format_optional_cost(snapshot.total_cost),
+    ));
     pairs.push(("prompt tokens", fmt_tokens(snapshot.prompt_tokens)));
     pairs.push(("completion tokens", fmt_tokens(snapshot.completion_tokens)));
     pairs.push(("cache-read tokens", fmt_tokens(snapshot.cache_read_tokens)));
@@ -3904,7 +3849,7 @@ mod routing_tests {
             session_id: "session-context".into(),
             turn: 3,
             model: Some("model-x".into()),
-            total_cost: 0.01,
+            total_cost: Some(0.01),
             prompt_tokens: 1_200,
             completion_tokens: 600,
             cache_read_tokens: 0,

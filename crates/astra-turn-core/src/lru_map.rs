@@ -30,14 +30,6 @@ where
         }
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     #[cfg(test)]
     pub(crate) fn contains_key(&self, key: &K) -> bool {
         self.entries.contains_key(key)
@@ -66,19 +58,6 @@ where
     pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
         self.remove_order_key(key);
         self.entries.remove(key)
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.order.clear();
-        self.entries.clear();
-    }
-
-    pub(crate) fn retain<F>(&mut self, mut keep: F)
-    where
-        F: FnMut(&K, &V) -> bool,
-    {
-        self.entries.retain(|key, value| keep(key, value));
-        self.order.retain(|key| self.entries.contains_key(key));
     }
 
     #[cfg(test)]

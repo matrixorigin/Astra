@@ -1,6 +1,6 @@
 //! Context pipeline integration tests (Phase 3).
 //!
-//! These tests exercise the compression / dedup / trace modules at the
+//! These tests exercise the compression / trace modules at the
 //! *pipeline* seam — i.e. with inputs shaped like real tool_result payloads
 //! that the runtime actually produces, verifying the contracts documented in
 //! `plan-context-cache.md`:
@@ -9,7 +9,6 @@
 //!     compress to within budget, preserve structure, carry the marker
 //!   * `cp-oversized-single-message` — 500K raw content flows through
 //!     sanitize + compress + truncate without exceeding `MAX_TOOL_RESULT_CHARS`
-//!   * `cp-dedup-cross-turn` — repeated calls hit cache; write invalidates reads
 //!   * `cp-context-assembly-trace-serialize` — full trace struct round-trips
 //!     through JSON preserving all documented fields
 
@@ -21,7 +20,6 @@ use astra_turn_core::tool_result_compression::{
     COMPRESSION_MARKER, DEFAULT_COMPRESSION_BUDGET_CHARS, compress_result_for_context,
     compress_with_default_budget,
 };
-use astra_turn_core::tool_result_dedup::{CallSignature, ResultCache, new_shared_cache};
 use astra_turn_core::tool_result_sanitize::{MAX_TOOL_RESULT_CHARS, tool_result_content_for_model};
 use serde_json::{Value, json};
 
@@ -139,110 +137,6 @@ fn sanitize_then_compress_for_500k_payload_fits_max() {
     // (it can recover structure when the truncator left head + tail slices).
     let compressed = compress_with_default_budget("read_file", &sanitized);
     assert!(compressed.len() <= sanitized.len());
-}
-
-// ─── cp-dedup-cross-turn ──────────────────────────────────────────────────
-
-#[test]
-fn repeat_call_same_signature_hits_cache_across_turns() {
-    let mut cache = ResultCache::new(16, None);
-    let args = json!({"path": "/workspace/README.md"});
-    let sig = CallSignature::from_args("read_file", &args);
-
-    // Turn 1: miss → record.
-    assert!(cache.lookup(&sig).is_none());
-    cache.record(sig.clone(), "file contents A".into());
-
-    // Turn 2: different unrelated call — still a miss for read_file(/other).
-    let other = CallSignature::from_args("read_file", &json!({"path": "/workspace/other"}));
-    assert!(cache.lookup(&other).is_none());
-
-    // Turn 3: repeat same signature — must hit.
-    let hit = cache.lookup(&sig).expect("expected cache hit on repeat");
-    assert_eq!(hit, "file contents A");
-}
-
-#[test]
-fn canonical_arg_form_means_key_order_does_not_break_cache_key() {
-    let a = CallSignature::from_args("read_file", &json!({"path": "/a", "max_bytes": 1000}));
-    let b = CallSignature::from_args("read_file", &json!({"max_bytes": 1000, "path": "/a"}));
-    assert_eq!(
-        a.input_hash, b.input_hash,
-        "canonicalised args must produce identical hash regardless of key order"
-    );
-}
-
-#[test]
-fn context_hash_isolates_identical_reads_across_sessions() {
-    let mut cache = ResultCache::new(8, None);
-    let args = json!({"path": "/workspace/README.md"});
-    let session_a = CallSignature::from_args("read_file", &args).with_ctx_hash(0xA57A);
-    let session_b = CallSignature::from_args("read_file", &args).with_ctx_hash(0xBEEF);
-
-    cache.record(session_a.clone(), "session A contents".into());
-
-    assert_eq!(
-        cache.lookup(&session_a).as_deref(),
-        Some("session A contents")
-    );
-    assert!(
-        cache.lookup(&session_b).is_none(),
-        "same tool args in a different context/session must not reuse stale output"
-    );
-}
-
-#[test]
-fn write_tool_invalidates_matching_read_entries() {
-    let mut cache = ResultCache::new(8, None);
-    let read_sig = CallSignature::from_args("read_file", &json!({"path": "/a"}));
-    cache.record(read_sig.clone(), "contents".into());
-    assert!(cache.lookup(&read_sig).is_some());
-
-    // Caller-side policy: a write tool invalidates prior reads.
-    cache.invalidate_tool("read_file");
-    assert!(
-        cache.lookup(&read_sig).is_none(),
-        "read entry should be gone after invalidate_tool(read_file)"
-    );
-}
-
-#[tokio::test]
-async fn shared_cache_lookup_or_compute_reports_hit_on_second_call() {
-    let cache = new_shared_cache(16, None);
-    let sig = CallSignature::from_args("grep", &json!({"q": "TODO"}));
-
-    let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-
-    let c1 = calls.clone();
-    let (r1, hit1) =
-        astra_turn_core::tool_result_dedup::lookup_or_compute(&cache, &sig, move || {
-            let c1 = c1.clone();
-            async move {
-                c1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                "grep result".to_string()
-            }
-        })
-        .await;
-    assert!(!hit1);
-    assert_eq!(r1, "grep result");
-
-    let c2 = calls.clone();
-    let (r2, hit2) =
-        astra_turn_core::tool_result_dedup::lookup_or_compute(&cache, &sig, move || {
-            let c2 = c2.clone();
-            async move {
-                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                "SHOULD NOT RUN".to_string()
-            }
-        })
-        .await;
-    assert!(hit2, "second lookup_or_compute must report a cache hit");
-    assert_eq!(r2, "grep result");
-    assert_eq!(
-        calls.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "closure should only run on the miss"
-    );
 }
 
 // ─── cp-context-assembly-trace-serialize ──────────────────────────────────

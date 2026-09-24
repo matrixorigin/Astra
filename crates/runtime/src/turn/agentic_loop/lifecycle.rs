@@ -2702,8 +2702,12 @@ fn promote_fallback_budget_after_observed_mutation(state: &mut AgenticLoopState)
     // executor-owned fact that can correct the initial review checkpoint, but
     // it still does not become user intent or authorize further mutation.
     let fallback = astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default();
-    if state.turn_intent.is_some()
-        || state.task_profile != fallback
+    if state.turn_intent.as_ref().is_some_and(|intent| {
+        intent.workspace_mutation != astra_config::user_profile::WorkspaceMutationIntent::Unknown
+            || intent.mutation_completion_scope
+                != astra_config::user_profile::MutationCompletionScope::Unknown
+            || intent.work_lifecycle == astra_config::user_profile::WorkLifecycleIntent::Required
+    }) || state.task_profile != fallback
         || super::execution_phase::workspace_observation_is_quarantined(state)
         || !state.stall.tool_call_records.iter().any(|record| {
             record.was_executed() && record_is_stable_workspace_mutation(state, record)
@@ -2735,12 +2739,41 @@ fn begin_budget_settlement(state: &mut AgenticLoopState) -> bool {
     let active_work_attempt = state.runtime_tool_executor.as_deref().is_some_and(
         crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt,
     );
-    begin_budget_settlement_for_work_state(state, active_work_attempt)
+    begin_budget_settlement_for_work_state(state, active_work_attempt, false, true)
+}
+
+fn begin_deadline_budget_settlement(state: &mut AgenticLoopState) -> bool {
+    let active_work_attempt = state.runtime_tool_executor.as_deref().is_some_and(
+        crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt,
+    );
+    // A round-slice window can outlive its available wall-clock time. Retire
+    // its tool authority before projecting the deadline's narrower boundary;
+    // otherwise the old window suppresses settlement and the provider is
+    // repeatedly rejected for lack of final-answer budget.
+    if state
+        .hooks
+        .completion_settlement
+        .completion_action_window
+        .take()
+        .is_some()
+    {
+        state.clear_volatile(super::host::VolatileKind::FinalAnswerSettlement);
+    }
+    // At the final-answer deadline, there is no room for an additional
+    // completion tool plus its receipt and a following model response.
+    let settled = begin_budget_settlement_for_work_state(state, active_work_attempt, true, false);
+    if settled {
+        state.hooks.completion_settlement.wrapup_origin =
+            Some(BudgetWrapupOrigin::ExecutionDeadline);
+    }
+    settled
 }
 
 fn begin_budget_settlement_for_work_state(
     state: &mut AgenticLoopState,
     active_work_attempt: bool,
+    allow_without_tool_calls: bool,
+    allow_completion_action: bool,
 ) -> bool {
     let pending = match super::execution_phase::pending_terminal_completion_action_for_work_state(
         state,
@@ -2761,12 +2794,13 @@ fn begin_budget_settlement_for_work_state(
             .is_some()
         || state.budget_wrapup_injected
         || state.interruption.is_some()
-        || completed_tool_calls(state) == 0
+        || (!allow_without_tool_calls && completed_tool_calls(state) == 0)
     {
         return false;
     }
 
     if let Some(action) = pending.as_ref()
+        && allow_completion_action
         && !super::execution_phase::completion_action_window_is_batchable(state, action)
     {
         // Do not advertise a one-call window for a dependency chain that
@@ -2778,6 +2812,7 @@ fn begin_budget_settlement_for_work_state(
     state.hooks.completion_settlement.wrapup_origin = Some(BudgetWrapupOrigin::RoundSlice);
 
     if let Some(action) = pending
+        && allow_completion_action
         && super::execution_phase::completion_action_window_is_batchable(state, &action)
         && !matches!(action, super::host::CompletionAction::CompletionTaskAction)
         && !super::execution_phase::external_effect_replay_forbidden(state)
@@ -3333,6 +3368,56 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     // initial slice merely because semantic admission was intentionally
     // deferred to the primary model.
     let _promoted_fallback_budget = promote_fallback_budget_after_observed_mutation(state);
+
+    if host
+        .execution_time_budget_remaining()
+        .is_some_and(|remaining| {
+            remaining.as_secs()
+                <= astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET
+                    .as_secs()
+        })
+    {
+        let settlement_already_active = state.hooks.completion_settlement.text_only
+            || state.hooks.completion_settlement.work_settlement_only
+            || state.budget_wrapup_injected;
+        if !settlement_already_active {
+            if begin_deadline_budget_settlement(state) {
+                let _cancelled = cancel_unfinished_child_agents(
+                    host,
+                    state,
+                    "parent execution deadline is reserved for final settlement",
+                    CancellationOrigin::Runtime,
+                )
+                .await;
+                state.final_text.clear();
+                state.interruption = None;
+            } else {
+                let _cancelled = cancel_unfinished_child_agents(
+                    host,
+                    state,
+                    "parent execution deadline expired before obligations could settle",
+                    CancellationOrigin::Runtime,
+                )
+                .await;
+                if state.interruption.is_none() {
+                    state.final_text = "The execution deadline arrived before the remaining verification could be safely completed. Progress is preserved, but the requested result is incomplete.".into();
+                    state.final_text_streamed = false;
+                    state.interruption = Some(InterruptionRecord::new(
+                        InterruptionKind::ExecutionIncomplete,
+                        ResumeAction::ContinueImmediately,
+                        interruption_state_summary(
+                            state,
+                            Some("safe settlement could not fit within the remaining execution deadline".into()),
+                        ),
+                    ));
+                }
+                try_write_heavy_checkpoint(state);
+                return Ok(PreparedTurnIteration::Finished(
+                    AgenticLoopOutcome::Completed,
+                ));
+            }
+        }
+    }
 
     if state.remaining_turns == 0 {
         // Once the loop enters typed Work settlement, exploration is over.
@@ -4180,7 +4265,9 @@ mod tests {
             state.charged_iterations = 50;
             assert!(!begin_budget_settlement_for_work_state(
                 &mut state,
-                active_work
+                active_work,
+                false,
+                true,
             ));
             let mut host = MockHost::new(Vec::new());
             assert!(matches!(
@@ -4430,6 +4517,63 @@ mod tests {
         assert_eq!(
             state.task_profile, fallback,
             "an observed write is not semantic intent"
+        );
+    }
+
+    #[test]
+    fn optional_effect_abstention_preserves_baseline_observed_mutation_budget() {
+        use astra_config::user_profile::{
+            MutationCompletionScope, TurnIntent, WorkLifecycleIntent, WorkspaceMutationIntent,
+        };
+        let mut baseline = make_state();
+        let fallback = astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default();
+        baseline.task_profile = fallback;
+        baseline.agentic_turn_budget = fallback.agentic_turn_budget;
+        baseline.max_turns = fallback.agentic_turn_budget.initial_turns;
+        baseline.remaining_turns = 0;
+        baseline.hooks.workspace_root_hint = Some("/workspace".into());
+        baseline.stall.tool_call_records = vec![committed_write_record(3, "/workspace/src/lib.rs")];
+        let original_ceiling = baseline.agentic_turn_budget.hard_turn_limit;
+
+        let mut abstained = make_state();
+        abstained.task_profile = baseline.task_profile;
+        abstained.agentic_turn_budget = baseline.agentic_turn_budget;
+        abstained.max_turns = baseline.max_turns;
+        abstained.remaining_turns = baseline.remaining_turns;
+        abstained.hooks.workspace_root_hint = baseline.hooks.workspace_root_hint.clone();
+        abstained.stall.tool_call_records = baseline.stall.tool_call_records.clone();
+        abstained.turn_intent = Some(TurnIntent {
+            work_lifecycle: WorkLifecycleIntent::NotRequired,
+            workspace_mutation: WorkspaceMutationIntent::Unknown,
+            mutation_completion_scope: MutationCompletionScope::Unknown,
+            ..Default::default()
+        });
+
+        abstained
+            .turn_intent
+            .as_mut()
+            .unwrap()
+            .mutation_completion_scope = MutationCompletionScope::Workspace;
+        assert!(!promote_fallback_budget_after_observed_mutation(
+            &mut abstained
+        ));
+        abstained
+            .turn_intent
+            .as_mut()
+            .unwrap()
+            .mutation_completion_scope = MutationCompletionScope::Unknown;
+
+        assert!(promote_fallback_budget_after_observed_mutation(
+            &mut baseline
+        ));
+        assert!(promote_fallback_budget_after_observed_mutation(
+            &mut abstained
+        ));
+        assert_eq!(abstained.max_turns, baseline.max_turns);
+        assert_eq!(abstained.remaining_turns, baseline.remaining_turns);
+        assert_eq!(
+            abstained.agentic_turn_budget.hard_turn_limit,
+            original_ceiling
         );
     }
 
@@ -5643,6 +5787,58 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn execution_deadline_forces_settlement_before_round_budget_expires() {
+        let mut host =
+            MockHost::new(Vec::new()).with_execution_time_budget_remaining(Duration::from_secs(20));
+        let mut state = make_state();
+        state.turn_intent =
+            Some(TurnIntent::default().with_workspace_mutation(WorkspaceMutationIntent::ReadOnly));
+        state.max_turns = 8;
+        state.remaining_turns = 4;
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("deadline-bound execution should enter safe settlement");
+
+        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
+        assert!(state.hooks.completion_settlement.text_only);
+        assert_eq!(state.max_turns, 9);
+        assert_eq!(
+            state.remaining_turns, 4,
+            "the newly reserved settlement boundary is the turn prepared now"
+        );
+        assert_eq!(
+            state.hooks.completion_settlement.wrapup_origin,
+            Some(BudgetWrapupOrigin::ExecutionDeadline)
+        );
+        assert!(state.budget_wrapup_injected);
+        assert!(!state.volatile_pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn execution_deadline_accounts_for_whole_second_provider_budget_rounding() {
+        let remaining = astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET
+            + Duration::from_millis(999);
+        let mut host = MockHost::new(Vec::new()).with_execution_time_budget_remaining(remaining);
+        let mut state = make_state();
+        state.turn_intent =
+            Some(TurnIntent::default().with_workspace_mutation(WorkspaceMutationIntent::ReadOnly));
+        state.max_turns = 8;
+        state.remaining_turns = 4;
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("a sub-second ordinary slice must switch to final settlement");
+
+        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
+        assert!(state.hooks.completion_settlement.text_only);
+        assert_eq!(
+            state.hooks.completion_settlement.wrapup_origin,
+            Some(BudgetWrapupOrigin::ExecutionDeadline)
+        );
+    }
+
     #[test]
     fn hard_boundary_does_not_reopen_execution_for_uncertain_generic_action() {
         let mut state = make_state();
@@ -6174,7 +6370,9 @@ mod tests {
             .tool_call_records
             .push(committed_write_record(0, "/workspace/out.txt"));
 
-        assert!(begin_budget_settlement_for_work_state(&mut state, true));
+        assert!(begin_budget_settlement_for_work_state(
+            &mut state, true, false, true
+        ));
         let window = state
             .hooks
             .completion_settlement
@@ -6189,6 +6387,67 @@ mod tests {
         );
         assert!(!state.hooks.completion_settlement.work_settlement_only);
         assert_eq!(state.remaining_turns, 2);
+    }
+
+    #[test]
+    fn deadline_boundary_does_not_invite_an_action_without_followup_time() {
+        let mut state = make_state();
+        state
+            .stall
+            .tool_call_records
+            .push(committed_write_record(0, "/workspace/out.txt"));
+
+        assert!(begin_budget_settlement_for_work_state(
+            &mut state, true, true, false
+        ));
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .completion_action_window
+                .is_none()
+        );
+        assert!(state.hooks.completion_settlement.work_settlement_only);
+    }
+
+    #[test]
+    fn deadline_retires_an_open_completion_action_window() {
+        let mut state = make_state();
+        state
+            .stall
+            .tool_call_records
+            .push(committed_write_record(0, "/workspace/out.txt"));
+        assert!(begin_budget_settlement_for_work_state(
+            &mut state, false, true, true
+        ));
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .completion_action_window
+                .is_some()
+        );
+
+        assert!(begin_deadline_budget_settlement(&mut state));
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .completion_action_window
+                .is_none()
+        );
+        assert!(state.hooks.completion_settlement.text_only);
+        assert!(state.budget_wrapup_injected);
+        assert_eq!(
+            state.hooks.completion_settlement.wrapup_origin,
+            Some(BudgetWrapupOrigin::ExecutionDeadline)
+        );
+        let settlement = state
+            .volatile_pending
+            .iter()
+            .find(|entry| entry.kind == super::super::host::VolatileKind::FinalAnswerSettlement)
+            .expect("deadline projects a truthful closing boundary");
+        assert_eq!(settlement.payload["execution_authority"], "none");
     }
 
     #[test]
@@ -6228,7 +6487,9 @@ mod tests {
             committed_write_record(31, "/workspace/src/lib.rs"),
         ];
 
-        assert!(begin_budget_settlement_for_work_state(&mut state, true));
+        assert!(begin_budget_settlement_for_work_state(
+            &mut state, true, false, true
+        ));
         let window = state
             .hooks
             .completion_settlement
@@ -6293,7 +6554,9 @@ mod tests {
         assert!(
             !super::super::execution_phase::completion_action_window_is_batchable(&state, &action)
         );
-        assert!(!begin_budget_settlement_for_work_state(&mut state, true));
+        assert!(!begin_budget_settlement_for_work_state(
+            &mut state, true, false, true
+        ));
         assert!(!state.hooks.completion_settlement.work_settlement_only);
         assert!(
             state

@@ -108,9 +108,17 @@ pub struct RunOutcome {
     /// Interruption kind label when final_state is interrupted.
     #[serde(default)]
     pub interruption_kind: Option<String>,
+    /// Root product failure classification from the terminal envelope. This
+    /// is intentionally separate from `interruption_kind`: a transport error
+    /// can cause an interrupted outcome without being a user cancellation.
+    #[serde(default)]
+    pub error_kind: Option<String>,
     /// Counts of tool result classes observed during the run.
     #[serde(default)]
     pub tool_result_class_counts: std::collections::BTreeMap<String, u32>,
+    /// Canonical per-attempt facts; never sum repeated snapshots as usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explain_capture: Option<crate::explain_capture::ExplainCapture>,
 }
 
 impl RunOutcome {
@@ -170,6 +178,11 @@ impl RunOutcome {
         self.interruption_kind = Some(kind.into());
         self
     }
+
+    pub fn with_error_kind(mut self, kind: impl Into<String>) -> Self {
+        self.error_kind = Some(kind.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -200,6 +213,9 @@ pub struct RunnerConfig {
     /// Maximum time to wait for the server's durable asynchronous settlement
     /// marker after the visible chat process exits.
     pub session_settle_timeout: std::time::Duration,
+    /// Shared user-cancel signal for active CLI subprocesses. The suite uses
+    /// the same flag to avoid launching queued cases after cancellation.
+    pub cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Delete sessions created by this harness after their evidence has been
     /// captured. A resumed `--session-id` is never owned by the harness and
     /// is therefore left untouched.
@@ -217,6 +233,7 @@ impl RunnerConfig {
             require_session_subsystem_health: false,
             require_memoria_subsystem_health: false,
             session_settle_timeout: std::time::Duration::ZERO,
+            cancel_flag: None,
             cleanup_created_sessions: false,
         }
     }
@@ -302,6 +319,8 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
                 ttft_ms: 0,
                 final_state: None,
                 interruption_kind: None,
+                error_kind: None,
+                explain_capture: None,
                 tool_result_class_counts: Default::default(),
             };
         }
@@ -434,6 +453,7 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
             .and_then(|x| x.as_u64())
             .unwrap_or(0)
             .min(u64::from(u32::MAX)) as u32,
+        explain_capture: None,
         cache_hits: 0,
         total_tool_calls: 0,
         ttft_ms: v.get("ttft_ms").and_then(|x| x.as_u64()).unwrap_or(0),
@@ -443,6 +463,10 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
             .map(str::to_string),
         interruption_kind: v
             .get("interruption_kind")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        error_kind: v
+            .get("error_kind")
             .and_then(|x| x.as_str())
             .map(str::to_string),
         tool_result_class_counts: v
@@ -673,6 +697,8 @@ fn invalid_json_envelope(model: &str, payload: &str, reason: &str) -> RunOutcome
         ttft_ms: 0,
         final_state: None,
         interruption_kind: None,
+        error_kind: None,
+        explain_capture: None,
         tool_result_class_counts: Default::default(),
     }
 }
@@ -900,6 +926,7 @@ mod tests {
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 180,
+            cli_wall_time_seconds: None,
             capability: None,
             required_cache_scope: None,
             difficulty: None,
@@ -927,6 +954,7 @@ mod tests {
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 180,
+            cli_wall_time_seconds: None,
             capability: None,
             required_cache_scope: None,
             difficulty: None,
@@ -956,6 +984,7 @@ mod tests {
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 180,
+            cli_wall_time_seconds: None,
             capability: None,
             required_cache_scope: None,
             difficulty: None,
@@ -983,6 +1012,7 @@ mod tests {
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 180,
+            cli_wall_time_seconds: None,
             capability: None,
             required_cache_scope: None,
             difficulty: None,

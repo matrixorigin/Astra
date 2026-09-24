@@ -78,7 +78,7 @@ pub struct ChatTurnDump {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Totals {
-    pub cost_usd: f64,
+    pub cost_usd: Option<f64>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub cache_read_tokens: u64,
@@ -302,10 +302,8 @@ fn build_dump_from_journal(session_id: &str) -> Result<ContextDump, String> {
     let mut completion_tokens: u64 = 0;
     let mut cache_read_tokens: u64 = 0;
     let mut cache_creation_tokens: u64 = 0;
-    // Journal doesn't track per-event USD cost today; forensic
-    // dumps report 0 here. Live dumps (the `/context dump` slash)
-    // still carry the accumulated cost from SessionState.
-    let cost_usd: f64 = 0.0;
+    // The journal does not establish complete attributed costs.
+    let cost_usd = None;
 
     match astra_services::session_workspace::read_workspace_optional(session_id) {
         Ok(Some(workspace)) => {
@@ -485,6 +483,24 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn unknown_cost_is_null_in_live_dump() {
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.total_session_cost = None;
+        let dump = super::build_dump_from_repl(&state, vec![]);
+        let value = serde_json::to_value(dump).unwrap();
+        assert_eq!(
+            value["totals"].get("cost_usd"),
+            Some(&serde_json::Value::Null)
+        );
+        state.total_session_cost = Some(0.0);
+        let dump = super::build_dump_from_repl(&state, vec![]);
+        assert_eq!(
+            serde_json::to_value(dump).unwrap()["totals"]["cost_usd"],
+            0.0
+        );
+    }
+
+    #[test]
     fn resolve_path_uses_arg_when_given() {
         let tmp = tempfile::tempdir().unwrap();
         let explicit = tmp.path().join("snap.json");
@@ -533,7 +549,7 @@ mod tests {
                 text: "hi".into(),
             }],
             totals: Totals {
-                cost_usd: 0.0,
+                cost_usd: Some(0.0),
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 cache_read_tokens: 0,
@@ -566,7 +582,7 @@ mod tests {
             trace: None,
             chat_history: Vec::new(),
             totals: Totals {
-                cost_usd: 0.0,
+                cost_usd: Some(0.0),
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 cache_read_tokens: 0,

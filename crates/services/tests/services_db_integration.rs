@@ -4697,8 +4697,8 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
     assert_eq!(turns.total, 1);
     assert_eq!(turns.turns.len(), 1);
     assert_eq!(turns.turns[0].turn, 1);
-    assert_eq!(turns.turns[0].tokens_in, 21);
-    assert_eq!(turns.turns[0].tokens_out, 8);
+    assert_eq!(turns.turns[0].tokens_in, Some(21));
+    assert_eq!(turns.turns[0].tokens_out, Some(8));
     assert_eq!(turns.turns[0].duration_ms, 987);
     assert_eq!(turns.turns[0].model.as_deref(), Some("gpt-5.4"));
     assert_eq!(turns.turns[0].tool_calls.len(), 1);
@@ -4711,8 +4711,8 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
     assert_eq!(detail.turn, 1);
     assert_eq!(detail.user_input, "show audit turn");
     assert_eq!(detail.assistant_output, "assistant reply");
-    assert_eq!(detail.tokens_in, 21);
-    assert_eq!(detail.tokens_out, 8);
+    assert_eq!(detail.tokens_in, Some(21));
+    assert_eq!(detail.tokens_out, Some(8));
     assert_eq!(detail.duration_ms, 987);
     assert_eq!(detail.ttft_ms, Some(42));
     assert_eq!(detail.context_ms, Some(18));

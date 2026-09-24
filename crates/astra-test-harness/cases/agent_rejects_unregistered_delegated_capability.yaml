@@ -51,6 +51,7 @@ criteria:
     child: tool_search
     min: 0
     max: 0
+    min_distinct_child_runs: 0
   - type: journal_tool_call_count
     name: tool_search
     min: 0

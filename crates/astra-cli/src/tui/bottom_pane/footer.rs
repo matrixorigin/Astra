@@ -154,8 +154,8 @@ impl Footer {
         self.pending_context_window_policy = Some((raw_tokens, usable_tokens));
     }
 
-    pub fn set_request_token_usage(&mut self, usage: astra_turn_types::RequestTokenUsage) {
-        self.request_token_usage = Some(usage);
+    pub fn set_request_token_usage(&mut self, usage: Option<astra_turn_types::RequestTokenUsage>) {
+        self.request_token_usage = usage;
     }
 
     /// A new model request has started. Retain the preceding request as
@@ -186,7 +186,20 @@ impl Footer {
     }
 
     /// Replace an estimate with the provider-confirmed request input count.
-    pub fn set_context_window_measured(&mut self, used_tokens: u64) {
+    pub fn set_context_window_measured(&mut self, used_tokens: Option<u64>) {
+        let Some(used_tokens) = used_tokens else {
+            if let Some((non_system_tokens, limit_tokens)) = self.context_window_non_system_tokens {
+                self.context_window = Some(ContextWindowUsage::estimated(
+                    non_system_tokens
+                        .saturating_add(u64::from(self.last_system_prompt_tokens.unwrap_or(0))),
+                    limit_tokens,
+                ));
+                self.context_window_is_previous = false;
+            } else if !self.context_window_is_previous {
+                self.context_window = None;
+            }
+            return;
+        };
         let Some(current) = self.context_window else {
             return;
         };
@@ -272,7 +285,7 @@ mod tests {
             Some(ContextWindowUsage::estimated(14_000, 160_000))
         );
 
-        footer.set_context_window_measured(17_250);
+        footer.set_context_window_measured(Some(17_250));
         assert_eq!(
             footer.context_window,
             Some(ContextWindowUsage::provider_reported(17_250, 160_000))
@@ -296,16 +309,47 @@ mod tests {
     }
 
     #[test]
+    fn withdrawn_measurement_restores_only_current_assembly_estimate() {
+        let mut footer = Footer::new();
+        footer.begin_context_window_estimate(ContextWindowUsage::estimated(500, 10_000));
+        footer.set_context_system_prompt_tokens(100);
+        footer.set_context_window_measured(Some(900));
+        footer.set_request_token_usage(Some(astra_turn_types::RequestTokenUsage::default()));
+        footer.set_context_window_measured(None);
+        footer.set_request_token_usage(None);
+        assert_eq!(
+            footer.context_window,
+            Some(ContextWindowUsage::estimated(600, 10_000))
+        );
+        assert!(footer.request_token_usage.is_none());
+        assert!(!footer.context_window_is_previous());
+
+        footer.set_context_window_measured(Some(0));
+        assert_eq!(
+            footer.context_window,
+            Some(ContextWindowUsage::provider_reported(0, 10_000))
+        );
+        footer.clear_context_window_for_new_request();
+        footer.set_context_window_measured(None);
+        assert!(footer.context_window_is_previous());
+
+        let mut restored = Footer::new();
+        restored.restore_context_window(ContextWindowUsage::provider_reported(900, 10_000));
+        restored.set_context_window_measured(None);
+        assert!(restored.context_window.is_none());
+    }
+
+    #[test]
     fn context_policy_and_request_lanes_remain_separate_from_session_totals() {
         let mut footer = Footer::new();
         footer.set_context_window_policy(1_000_000, 910_000);
         footer.begin_context_window_estimate(ContextWindowUsage::estimated(700_000, 910_000));
-        footer.set_request_token_usage(astra_turn_types::RequestTokenUsage {
+        footer.set_request_token_usage(Some(astra_turn_types::RequestTokenUsage {
             fresh_input_tokens: 100_000,
             cache_read_tokens: 590_000,
             cache_creation_tokens: 10_000,
             output_tokens: 4_000,
-        });
+        }));
 
         assert_eq!(footer.raw_context_window_tokens, Some(1_000_000));
         assert_eq!(

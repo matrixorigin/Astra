@@ -125,15 +125,24 @@ async fn maybe_load_memory_inference_offering(
     api: &astra_thin_client::ThinClient,
     token: &str,
 ) {
-    if state.memory_inference_offering.is_some() {
+    use super::session_memory_inference::MemoryJudgmentOffering;
+    if !state.memory_inference_offering.should_resolve() {
         return;
     }
     match super::session_memory_inference::fetch_memory_judgment_offerings(api, token).await {
         Ok(offerings) => {
-            state.memory_inference_offering = offerings.into_iter().next();
+            state.memory_inference_offering = match offerings.into_iter().next() {
+                Some(offering) => MemoryJudgmentOffering::Available(offering),
+                None => MemoryJudgmentOffering::RetryAfter(
+                    std::time::Instant::now() + std::time::Duration::from_secs(30),
+                ),
+            };
         }
         Err(error) => {
             tracing::debug!("memory inference Offering fetch skipped: {error}");
+            state.memory_inference_offering = MemoryJudgmentOffering::RetryAfter(
+                std::time::Instant::now() + std::time::Duration::from_secs(3),
+            );
         }
     }
 }
@@ -159,8 +168,10 @@ pub(crate) async fn ensure_bootstrapped_lessons(
         })
     };
     if !state.session_lessons.is_empty() {
-        maybe_load_memory_inference_offering(state, api, token).await;
-        let client = state.memory_inference_offering.as_ref().map(|offering| {
+        if session_id_for_scope.is_some() {
+            maybe_load_memory_inference_offering(state, api, token).await;
+        }
+        let client = state.memory_inference_offering.offering().map(|offering| {
             super::session_memory_inference::CliServerMemoryInferenceClient::new(
                 api.clone(),
                 token,
@@ -208,8 +219,6 @@ pub(crate) async fn ensure_bootstrapped_lessons(
         return;
     }
 
-    maybe_load_memory_inference_offering(state, api, token).await;
-
     let retrieval_started = std::time::Instant::now();
     let retrieval = tokio::time::timeout(
         std::time::Duration::from_secs(3),
@@ -243,7 +252,10 @@ pub(crate) async fn ensure_bootstrapped_lessons(
         }
     };
 
-    let client = state.memory_inference_offering.as_ref().map(|offering| {
+    if !retrieval.lessons.is_empty() && session_id_for_scope.is_some() {
+        maybe_load_memory_inference_offering(state, api, token).await;
+    }
+    let client = state.memory_inference_offering.offering().map(|offering| {
         super::session_memory_inference::CliServerMemoryInferenceClient::new(
             api.clone(),
             token,
@@ -374,7 +386,7 @@ mod tests {
     fn memory_offering_starts_unresolved_without_provider_material() {
         let state = SessionState::default();
         assert!(
-            state.memory_inference_offering.is_none(),
+            state.memory_inference_offering.offering().is_none(),
             "memory Offering should start unresolved"
         );
     }
@@ -443,5 +455,130 @@ mod tests {
             state.memory_selection_reports[0].method,
             astra_turn_types::MemorySelectionMethod::Reuse
         );
+    }
+
+    #[tokio::test]
+    async fn judgment_offering_lookup_caches_absence_and_retries_failure() {
+        use super::super::session_memory_inference::MemoryJudgmentOffering;
+        use axum::{Json, Router, http::StatusCode, routing::get};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let app = Router::new().route(
+            "/models/memory",
+            get(move || {
+                let seen = seen.clone();
+                async move {
+                    let call = seen.fetch_add(1, Ordering::SeqCst);
+                    if call == 0 {
+                        (StatusCode::OK, Json(serde_json::json!({"offerings": []})))
+                    } else if call == 1 {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({"error": "temporary"})),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({"offerings": [{
+                                "offering_id": "offer-test",
+                                "model_name": "test-judge",
+                                "thinking_capability": null
+                            }]})),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = astra_thin_client::ThinClient::new(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            None,
+        )
+        .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut state = SessionState::default();
+
+        super::maybe_load_memory_inference_offering(&mut state, &api, "token").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(state.memory_inference_offering.offering().is_none());
+        super::maybe_load_memory_inference_offering(&mut state, &api, "token").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "empty catalog is cached");
+
+        state.memory_inference_offering =
+            MemoryJudgmentOffering::RetryAfter(std::time::Instant::now());
+        super::maybe_load_memory_inference_offering(&mut state, &api, "token").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(state.memory_inference_offering.offering().is_none());
+        super::maybe_load_memory_inference_offering(&mut state, &api, "token").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "failure is rate-limited");
+
+        state.memory_inference_offering =
+            MemoryJudgmentOffering::RetryAfter(std::time::Instant::now());
+        super::maybe_load_memory_inference_offering(&mut state, &api, "token").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            state
+                .memory_inference_offering
+                .offering()
+                .unwrap()
+                .model_name,
+            "test-judge"
+        );
+        super::maybe_load_memory_inference_offering(&mut state, &api, "token").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "success is cached");
+        server.abort();
+    }
+
+    #[test]
+    fn judgment_offering_retry_deadline_is_demand_driven() {
+        use super::super::session_memory_inference::MemoryJudgmentOffering;
+        let now = std::time::Instant::now();
+        assert!(MemoryJudgmentOffering::Unresolved.should_resolve());
+        assert!(
+            !MemoryJudgmentOffering::RetryAfter(now + std::time::Duration::from_secs(3))
+                .should_resolve()
+        );
+        assert!(MemoryJudgmentOffering::RetryAfter(now).should_resolve());
+    }
+
+    #[tokio::test]
+    async fn missing_session_scope_does_not_resolve_memory_judge() {
+        use axum::{Json, Router, routing::get};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let app = Router::new().route(
+            "/models/memory",
+            get(move || {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({"offerings": []}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = astra_thin_client::ThinClient::new(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            None,
+        )
+        .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut state = SessionState {
+            session_lessons: vec![lesson("Keep this applicable lesson")],
+            session_lessons_loaded: true,
+            ..SessionState::default()
+        };
+        super::ensure_bootstrapped_lessons(&mut state, &api, "token", "hi").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        server.abort();
     }
 }

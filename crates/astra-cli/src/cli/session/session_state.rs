@@ -321,8 +321,8 @@ pub(crate) struct SessionState {
     pub total_completion_tokens: u64,
     pub total_cache_read_tokens: u64,
     pub total_cache_creation_tokens: u64,
-    /// Per-turn cost accumulator (sum of all turns in this session).
-    pub total_session_cost: f64,
+    /// Complete attributed estimate, or unknown. Current-rate scenarios are separate.
+    pub total_session_cost: Option<f64>,
     /// Cached pricing data for the active model (used by /cost).
     pub cached_pricing: astra_services::models::PricingData,
     pub skill_dev: Option<SkillDevState>,
@@ -474,7 +474,7 @@ pub(crate) struct SessionState {
     /// Governed memory Offering cached at first use. Provider route material
     /// and credentials remain Server-side and are never retained in session
     /// state.
-    pub memory_inference_offering: Option<super::session_memory_inference::MemoryInferenceOffering>,
+    pub memory_inference_offering: super::session_memory_inference::MemoryJudgmentOffering,
     /// Background session-memory.md extraction coordinator. `None` means
     /// the current CLI path has no API-backed extraction service.
     pub session_memory_extractor:
@@ -632,7 +632,7 @@ impl Default for SessionState {
             total_completion_tokens: 0,
             total_cache_read_tokens: 0,
             total_cache_creation_tokens: 0,
-            total_session_cost: 0.0,
+            total_session_cost: Some(0.0),
             cached_pricing: Default::default(),
             skill_dev: None,
             active_system_skills: Vec::new(),
@@ -701,7 +701,8 @@ impl Default for SessionState {
             memory_selection_reports: Vec::new(),
             session_lessons_loaded: false,
             lesson_checkpointer: astra_runtime::learning::checkpoint::LessonCheckpointer::new(),
-            memory_inference_offering: None,
+            memory_inference_offering:
+                super::session_memory_inference::MemoryJudgmentOffering::Unresolved,
             session_memory_extractor: None,
             auto_invoke_handler: None,
             latest_skill_diagnosis: None,
@@ -800,6 +801,8 @@ impl SessionState {
         let sid: String = session_id.into();
         if self.session_id.as_deref() != Some(sid.as_str()) {
             self.advance_session_attachment();
+            // Attaching an identity does not establish historical billing coverage.
+            self.total_session_cost = None;
         }
         self.perm_manager.set_active_session_id(&sid);
         self.session_id = Some(sid);
@@ -853,7 +856,7 @@ impl SessionState {
         self.total_completion_tokens = 0;
         self.total_cache_read_tokens = 0;
         self.total_cache_creation_tokens = 0;
-        self.total_session_cost = 0.0;
+        self.total_session_cost = Some(0.0);
         self.journal = None;
         self.recent_tools.clear();
         self.deferred_tool_activations.clear();
@@ -871,7 +874,8 @@ impl SessionState {
         self.memory_selection_reports.clear();
         self.session_lessons_loaded = false;
         self.lesson_checkpointer = Default::default();
-        self.memory_inference_offering = None;
+        self.memory_inference_offering =
+            super::session_memory_inference::MemoryJudgmentOffering::Unresolved;
         self.latest_skill_diagnosis = None;
         self.latest_turn_quality_feedback = None;
         self.cloud_plan_mirror = None;
@@ -1073,7 +1077,7 @@ mod default_tests {
             total_completion_tokens: 22,
             total_cache_read_tokens: 33,
             total_cache_creation_tokens: 44,
-            total_session_cost: 1.25,
+            total_session_cost: Some(1.25),
             recent_tools: vec!["bash".into()],
             deferred_tool_activations: vec![astra_turn_types::DeferredToolActivation {
                 name: "write_file".into(),
@@ -1121,7 +1125,7 @@ mod default_tests {
         assert_eq!(state.total_completion_tokens, 0);
         assert_eq!(state.total_cache_read_tokens, 0);
         assert_eq!(state.total_cache_creation_tokens, 0);
-        assert_eq!(state.total_session_cost, 0.0);
+        assert_eq!(state.total_session_cost, Some(0.0));
         assert!(state.recent_tools.is_empty());
         assert!(state.deferred_tool_activations.is_empty());
         assert!(state.redo_stack.is_empty());
@@ -1282,35 +1286,20 @@ mod default_tests {
     }
 
     #[test]
-    fn session_cost_accumulation() {
+    fn attaching_history_does_not_invent_cost_coverage() {
         let mut state = SessionState::default();
-        state.cached_pricing = astra_services::models::PricingData {
-            prompt: 0.000_003,
-            completion: 0.000_015,
-            cache_read: Some(0.000_000_3),
-            cache_write: Some(0.000_003_75),
-        };
-
-        let cost1 = crate::cli::slash::slash_stats::cost_for_tokens(
-            1000,
-            500,
-            800,
-            100,
-            &state.cached_pricing,
-        );
-        state.total_session_cost += cost1;
-        assert!((cost1 - 0.011_115).abs() < 1e-12);
-
-        let cost2 = crate::cli::slash::slash_stats::cost_for_tokens(
-            2000,
-            1000,
-            1500,
-            0,
-            &state.cached_pricing,
-        );
-        state.total_session_cost += cost2;
-
-        assert!((state.total_session_cost - (cost1 + cost2)).abs() < 1e-10);
+        assert_eq!(state.total_session_cost, Some(0.0));
+        state.set_session_id("restored-session");
+        assert_eq!(state.total_session_cost, None);
+        state.set_session_id("restored-session");
+        assert_eq!(state.total_session_cost, None);
+        state.total_session_cost = Some(1.0);
+        state.set_session_id("different-session");
+        assert_eq!(state.total_session_cost, None);
+        state.reset_for_new_session();
+        assert_eq!(state.total_session_cost, Some(0.0));
+        state.set_session_id("new-attached-session");
+        assert_eq!(state.total_session_cost, None);
     }
 
     #[test]

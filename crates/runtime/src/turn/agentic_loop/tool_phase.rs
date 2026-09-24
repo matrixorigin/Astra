@@ -52,7 +52,9 @@ use astra_turn_core::agentic_post_tool_policy::{
 };
 use astra_turn_core::agentic_turn_flow::agentic_round_stall_preflight;
 use astra_turn_core::headless_tool_assembly::HeadlessPreResolvedToolResult;
-use astra_turn_core::orchestration::agent_result_wire::agent_fanout_control_result_is_usable;
+use astra_turn_core::orchestration::agent_result_wire::{
+    agent_fanout_control_result_is_usable, agent_fanout_result_has_recoverable_issue,
+};
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 use astra_turn_core::tool_result_semantics::ToolResultStatus;
 
@@ -323,6 +325,7 @@ fn record_provider_round_observation(
         .map(|buffer| buffer.offset_ms().saturating_sub(duration_ms))
         .unwrap_or_default();
     state.push_recent_round(super::host::RecentRoundSummary {
+        qualified_usage: turn_result.accum.qualified_usage,
         purpose: state.inference_purpose,
         turn: state.session_turn,
         round: state.current_round_index,
@@ -419,15 +422,18 @@ fn work_unit_observation(
     astra_core::work_unit::WorkUnitObservation::from_fields(result.tool_result_fields.as_ref()?)
 }
 
-/// A foreground fanout is a single evidence-producing action. Once every
-/// declared slot is terminal, the parent owns synthesis—not another open-ended
-/// execution phase. Keep this decision on typed tool/action/result fields so
-/// result prose cannot grant or revoke execution authority.
+/// A clean foreground fanout is a complete evidence-producing action. If any
+/// slot has a recoverable issue, preserve the normal parent work path while
+/// budget remains; the fixed group contract still prevents replacement runs.
+/// Keep this decision on typed tool/action/result fields, not result prose.
 #[cfg(test)]
 fn foreground_fanout_reached_synthesis_boundary(result: &EdgeToolExecResult) -> bool {
     result.tool == "agent_fanout"
         && fanout_completion_observation(&result.args, &result.output)
             == FanoutCompletionObservation::Synthesize
+        && serde_json::from_str::<Value>(&result.output)
+            .ok()
+            .is_some_and(|output| !agent_fanout_result_has_recoverable_issue(&output))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -647,9 +653,16 @@ fn observe_foreground_fanout_completion(
                         .and_then(Value::as_u64)
                         .expect("validated start target count"),
                     pending_slots,
+                    had_recoverable_issues: parsed_output
+                        .as_ref()
+                        .is_some_and(agent_fanout_result_has_recoverable_issue),
                 });
             }
-            (Some("start"), FanoutCompletionObservation::Synthesize) => synthesize = true,
+            (Some("start"), FanoutCompletionObservation::Synthesize) => {
+                synthesize = parsed_output
+                    .as_ref()
+                    .is_some_and(|output| !agent_fanout_result_has_recoverable_issue(output));
+            }
             (Some("get_results"), observation) => {
                 let Some(parsed_output) = parsed_output.as_ref() else {
                     return;
@@ -681,6 +694,8 @@ fn observe_foreground_fanout_completion(
                 if observation == FanoutCompletionObservation::None {
                     return;
                 }
+                carrier.had_recoverable_issues |=
+                    agent_fanout_result_has_recoverable_issue(parsed_output);
                 match next_offset {
                     Some(next_offset) => {
                         // A repeated/non-advancing window retains the old
@@ -694,11 +709,12 @@ fn observe_foreground_fanout_completion(
                     }
                 }
                 if carrier.pending_slots.is_empty() {
+                    let clean_results = !carrier.had_recoverable_issues;
                     state
                         .hooks
                         .completion_settlement
                         .foreground_fanout_pagination = None;
-                    synthesize = true;
+                    synthesize = clean_results;
                 }
             }
             _ => {}
@@ -2017,7 +2033,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                         "The current request exceeded its token budget after the model ignored repeated wrap-up advisories, attempting {dropped_count} more tool call(s). Progress from earlier rounds is preserved."
                     ),
                 ),
-                BudgetWrapupOrigin::RoundSlice => (
+                BudgetWrapupOrigin::RoundSlice | BudgetWrapupOrigin::ExecutionDeadline => (
                     astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete,
                     format!(
                         "The bounded execution slice ended after the model ignored repeated wrap-up advisories, attempting {dropped_count} more tool call(s). Progress from earlier rounds is preserved; continue by summarizing verified work or one concrete missing fact."
@@ -2464,7 +2480,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             call_counts: &mut state.call_counts,
             max_identical_calls: state.max_identical_tool_calls,
             max_tools_per_turn: state.max_tools_per_turn,
-            repeated_cache_hit_suppression: state.repeated_cache_hit_suppression,
             max_consecutive_empty_name: state.max_consecutive_empty_name,
             tool_call_records: &mut state.stall.tool_call_records,
             tool_event_hooks: &state.skills.tool_event_hooks,
@@ -4900,9 +4915,10 @@ mod tests {
                 .as_ref()
                 .map(|pagination| (
                     pagination.group_id.as_str(),
-                    pagination.pending_slots.clone()
+                    pagination.pending_slots.clone(),
+                    pagination.had_recoverable_issues,
                 )),
-            Some(("group-paged", BTreeMap::from([(0, 4096), (1, 2048)])))
+            Some(("group-paged", BTreeMap::from([(0, 4096), (1, 2048)]), false,))
         );
 
         let unrelated = EdgeToolExecResult {
@@ -5046,6 +5062,78 @@ mod tests {
                 .completion_settlement
                 .foreground_fanout_pagination
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn paginated_fanout_keeps_early_child_issues_after_a_clean_final_page() {
+        let mut state = make_state();
+        let start = EdgeToolExecResult {
+            execution_completion: None,
+            request_id: "fanout-start-issues".into(),
+            tool: "agent_fanout".into(),
+            args: json!({"action":"start","target_count":1,"slots":[]}),
+            output: json!({
+                "status":"completed_with_issues","group_id":"group-issues",
+                "target_count":1,"active":0,"terminal":1,"failed":1,
+                "results":[{"slot_index":0,"status":"failed","result_truncated":true,
+                    "result_start_offset":0,"result_end_offset":4096,"result_bytes":8192,
+                    "next_call":"read the next result page"}]
+            })
+            .to_string(),
+            tool_result_fields: None,
+            status: "completed".into(),
+            duration_ms: 1,
+        };
+        assert!(!observe_foreground_fanout_completion(
+            &mut state,
+            &[],
+            &[],
+            &[start],
+        ));
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .foreground_fanout_pagination
+                .as_ref()
+                .is_some_and(|page| page.had_recoverable_issues)
+        );
+
+        let final_page = EdgeToolExecResult {
+            execution_completion: None,
+            request_id: "fanout-final-page-issues".into(),
+            tool: "agent_fanout".into(),
+            args: json!({"action":"get_results","group_id":"group-issues","slot_index":0,"offset":4096}),
+            output: json!({
+                "status":"completed","group_id":"group-issues",
+                "target_count":1,"active":0,"terminal":1,"completed":1,
+                "result_read":{"slot_index":0,"offset":4096,"max_bytes":8192},
+                "results":[{"slot_index":0,"status":"completed","result_start_offset":4096,
+                    "result_end_offset":8192,"result_bytes":8192,"result":"partial evidence"}]
+            })
+            .to_string(),
+            tool_result_fields: None,
+            status: "completed".into(),
+            duration_ms: 1,
+        };
+        assert!(!observe_foreground_fanout_completion(
+            &mut state,
+            &[],
+            &[],
+            &[final_page],
+        ));
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .foreground_fanout_pagination
+                .is_none()
+        );
+        assert!(!state.hooks.completion_settlement.text_only);
+        assert!(
+            !state.hooks.completion_settlement.work_settlement_only,
+            "an issue from an earlier page must keep normal parent recovery available"
         );
     }
 

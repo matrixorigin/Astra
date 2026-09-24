@@ -622,7 +622,7 @@ fn session_summary_flows_through_snapshot() {
         session_id: "abcdef12-full-uuid".into(),
         turn: 5,
         model: Some("test-model-x".into()),
-        total_cost: 0.1234,
+        total_cost: Some(0.1234),
         prompt_tokens: 12_000,
         completion_tokens: 3_000,
         cache_read_tokens: 8_000,
@@ -641,7 +641,7 @@ fn session_summary_flows_through_snapshot() {
     let b = ContextBreakdown::from_trace_with(&t, &snap);
     let s = b.session_summary.expect("session populated");
     assert_eq!(s.turn, 5);
-    assert!((s.total_cost - 0.1234).abs() < 1e-9);
+    assert!((s.total_cost.unwrap() - 0.1234).abs() < 1e-9);
     assert_eq!(s.continuation_anchor.as_deref(), Some("refactoring auth"));
 }
 

@@ -33,8 +33,8 @@ pub fn journal_record_duplicate_within_turn(
 /// journal's `result_preview` when a snippet is available. Keeps
 /// forensics useful (you can see *what* was reused) without
 /// blowing up the journal with duplicate content — the full body
-/// is already in the earlier turn the cache hit refers to.
-/// Byte ceiling for the cached-body snippet appended to a cross-turn cache
+/// remains in the associated invocation outcome.
+/// Byte ceiling for the cached-body snippet appended to a same-invocation replay
 /// hit's `result_preview`. We truncate on a UTF-8 char boundary at or below
 /// this many bytes so the snippet stays bounded regardless of how wide the
 /// source encoding is, and never panics on multi-byte input.
@@ -59,26 +59,26 @@ pub fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> (&str, bool) {
     (&s[..end], true)
 }
 
-/// Record a cross-turn cache hit.
+/// Record a same-invocation replay.
 ///
-/// Populates `result_preview` with a `[cached_cross_turn: ...]`
+/// Populates `result_preview` with a `[cached_same_invocation: ...]`
 /// tagged string so downstream analysis (digest, LLM self-
-/// diagnosis) can distinguish "cache reused N bytes" from "tool
+/// diagnosis) can distinguish "same invocation replayed N bytes" from "tool
 /// returned empty body".
 ///
 /// `cached_body` is optional because some short-circuit paths
-/// (e.g. pre-suppressed repeated cache hits) don't have the full
+/// (e.g. a repeated-invocation suppression) don't have the full
 /// body handy; when absent, the preview still carries the byte
 /// count and tag so it's self-identifying.
 #[must_use]
-pub fn journal_record_cross_turn_cache_hit(
+pub fn journal_record_invocation_replay(
     tool_call_id: String,
     name: String,
     output_len: u32,
     args_preview: Option<String>,
     cached_body: Option<&str>,
 ) -> ToolCallRecord {
-    journal_record_cross_turn_cache_hit_with_evidence(
+    journal_record_invocation_replay_with_evidence(
         tool_call_id,
         name,
         output_len,
@@ -89,7 +89,7 @@ pub fn journal_record_cross_turn_cache_hit(
     )
 }
 
-/// Record a cross-turn cache hit together with the bounded, model-visible
+/// Record a same-invocation replay together with the bounded, model-visible
 /// request/result identity needed by the online observation evaluator.
 ///
 /// `cached_body` is presentation-only and may describe a suppressed request;
@@ -98,7 +98,7 @@ pub fn journal_record_cross_turn_cache_hit(
 /// masquerading as delivered evidence.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
-pub fn journal_record_cross_turn_cache_hit_with_evidence(
+pub fn journal_record_invocation_replay_with_evidence(
     tool_call_id: String,
     name: String,
     output_len: u32,
@@ -107,13 +107,13 @@ pub fn journal_record_cross_turn_cache_hit_with_evidence(
     args_full: Option<String>,
     delivered_body: Option<&str>,
 ) -> ToolCallRecord {
-    let preview = format_cross_turn_cache_hit_preview(output_len, cached_body);
+    let preview = format_invocation_replay_preview(output_len, cached_body);
     ToolCallRecord {
         tool_call_id: Some(tool_call_id),
         name,
         ok: true,
         ms: 0,
-        error: Some("cached_cross_turn".to_string()),
+        error: Some("cached_same_invocation".to_string()),
         input_bytes: None,
         output_bytes: Some(output_len),
         args_preview,
@@ -134,8 +134,8 @@ pub fn journal_record_cross_turn_cache_hit_with_evidence(
     }
 }
 
-fn format_cross_turn_cache_hit_preview(output_len: u32, cached_body: Option<&str>) -> String {
-    let tag = format!("[cached_cross_turn: reused {output_len} bytes from earlier turn]");
+fn format_invocation_replay_preview(output_len: u32, cached_body: Option<&str>) -> String {
+    let tag = format!("[cached_same_invocation: replayed {output_len} bytes]");
     match cached_body {
         Some(body) if !body.is_empty() => {
             // Truncate at a char boundary to avoid splitting UTF-8
@@ -411,7 +411,7 @@ mod tests {
 
     #[test]
     fn cache_hit_record_has_output_bytes() {
-        let r = journal_record_cross_turn_cache_hit(
+        let r = journal_record_invocation_replay(
             "call-cache".into(),
             "read_file".into(),
             12,
@@ -425,7 +425,7 @@ mod tests {
 
     #[test]
     fn cache_hit_record_carries_exact_call_identity() {
-        let r = journal_record_cross_turn_cache_hit(
+        let r = journal_record_invocation_replay(
             "call-cache".into(),
             "read_file".into(),
             12,
@@ -452,7 +452,7 @@ mod tests {
         // hallucinating a `{}`-return bug.  The fix is to populate
         // `result_preview` with a synthetic explanatory string that
         // makes the cache-hit nature explicit.
-        let r = journal_record_cross_turn_cache_hit(
+        let r = journal_record_invocation_replay(
             "call-cache".into(),
             "read_file".into(),
             2000,
@@ -461,7 +461,7 @@ mod tests {
         );
         let preview = r.result_preview.expect("cache-hit must carry a preview");
         assert!(
-            preview.starts_with("[cached_cross_turn:"),
+            preview.starts_with("[cached_same_invocation:"),
             "preview must be tagged so analysis tools can classify it: {preview:?}"
         );
         assert!(
@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn cache_hit_evidence_keeps_delivery_identity_separate_from_preview() {
-        let record = journal_record_cross_turn_cache_hit_with_evidence(
+        let record = journal_record_invocation_replay_with_evidence(
             "call-cache".into(),
             "introspect".into(),
             120,
@@ -501,7 +501,7 @@ mod tests {
             "live evidence must retain the delivered body separately from its bounded durable form"
         );
 
-        let suppressed = journal_record_cross_turn_cache_hit_with_evidence(
+        let suppressed = journal_record_invocation_replay_with_evidence(
             "call-suppressed".into(),
             "introspect".into(),
             80,
@@ -523,7 +523,7 @@ mod tests {
         // intact (no panic, no truncation, no replacement char).
         let body: String = "中".repeat(100);
         assert_eq!(body.len(), 300, "setup: 100 Han chars must be 300 bytes");
-        let r = journal_record_cross_turn_cache_hit(
+        let r = journal_record_invocation_replay(
             "call-cache".into(),
             "read_file".into(),
             body.len() as u32,
@@ -553,7 +553,7 @@ mod tests {
         let body: String = "中".repeat(200);
         assert_eq!(body.len(), 600, "setup: 200 Han chars must be 600 bytes");
 
-        let r = journal_record_cross_turn_cache_hit(
+        let r = journal_record_invocation_replay(
             "call-cache".into(),
             "read_file".into(),
             body.len() as u32,
@@ -568,8 +568,8 @@ mod tests {
 
         // Extract the snippet between the tag line and the trailing
         // ellipsis.  The prefix is fixed per
-        // format_cross_turn_cache_hit_preview.
-        let tag_line = "[cached_cross_turn: reused 600 bytes from earlier turn]\n";
+        // format_invocation_replay_preview.
+        let tag_line = "[cached_same_invocation: replayed 600 bytes]\n";
         let snippet = preview
             .strip_prefix(tag_line)
             .expect("preview must start with tag line")
@@ -629,7 +629,7 @@ mod tests {
         // pre-suppressed "repeated cache hit" short-circuit), we
         // still emit a non-empty preview so downstream tooling
         // isn't misled.
-        let r = journal_record_cross_turn_cache_hit(
+        let r = journal_record_invocation_replay(
             "call-cache".into(),
             "read_file".into(),
             1024,
@@ -639,7 +639,7 @@ mod tests {
         let preview = r
             .result_preview
             .expect("cache-hit with no snippet must still carry a preview");
-        assert!(preview.starts_with("[cached_cross_turn:"));
+        assert!(preview.starts_with("[cached_same_invocation:"));
         assert!(preview.contains("1024 bytes"));
     }
 

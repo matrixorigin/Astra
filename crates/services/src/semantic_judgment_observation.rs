@@ -131,9 +131,26 @@ fn checked_request_judgment_result(
                         .evidence
                         .iter()
                         .map(|(id, evidence)| {
+                            let score = match (diagnostics.provenance, evidence.value) {
+                                (
+                                    astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+                                    Some(value),
+                                ) => value,
+                                (
+                                    astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
+                                    None,
+                                ) => match evidence.truth {
+                                    crate::WorkAdmissionTruth::No => 0.0,
+                                    crate::WorkAdmissionTruth::Uncertain => 0.5,
+                                    crate::WorkAdmissionTruth::Yes => 1.0,
+                                },
+                                _ => {
+                                    return Err(SemanticJudgmentValidationError::InvalidContract);
+                                }
+                            };
                             Ok(RequestJudgmentFieldAssessmentV1 {
                                 field: field(id)?,
-                                score: SemanticJudgmentScoreV1::from_f64(evidence.value)?,
+                                score: SemanticJudgmentScoreV1::from_f64(score)?,
                             })
                         })
                         .collect::<Result<_, SemanticJudgmentValidationError>>()?,
@@ -1505,6 +1522,31 @@ mod tests {
     use astra_turn_types::*;
     use serde_json::json;
 
+    fn discrete_classification(
+        request: &astra_turn_types::JudgmentRequest,
+        yes: &[&str],
+        unknown: &[&str],
+    ) -> String {
+        let answers = request
+            .questions
+            .keys()
+            .map(|id| {
+                let decision = if yes.contains(&id.as_str()) {
+                    "yes"
+                } else if unknown.contains(&id.as_str()) {
+                    "unknown"
+                } else {
+                    "no"
+                };
+                (
+                    id.clone(),
+                    json!({"type":"discrete_noul","decision":decision}),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        json!({"answers":answers}).to_string()
+    }
+
     fn observation() -> SemanticJudgmentObservationV1 {
         SemanticJudgmentObservationV1 {
             schema_version: 1,
@@ -1870,9 +1912,10 @@ mod tests {
     fn decided() -> RequestJudgmentResultV1 {
         let request =
             crate::work_admission_classification_request(&crate::TurnIntentJudgeContext::default());
+        let raw = discrete_classification(&request, &["mutation.read_only"], &[]);
         request_judgment_result(&crate::parse_work_admission_classification(
             &request,
-            r#"{"true":["mutation.read_only"],"uncertain":[]}"#,
+            &raw,
             "chat-fixture",
             Some(astra_turn_types::JudgmentResponseProvenance::DiscreteDecision),
         ))
@@ -1881,9 +1924,10 @@ mod tests {
     fn abstained() -> RequestJudgmentResultV1 {
         let request =
             crate::work_admission_classification_request(&crate::TurnIntentJudgeContext::default());
+        let raw = discrete_classification(&request, &["mutation.read_only"], &["required"]);
         request_judgment_result(&crate::parse_work_admission_classification(
             &request,
-            r#"{"true":["mutation.read_only"],"uncertain":["required"]}"#,
+            &raw,
             "chat-fixture",
             Some(astra_turn_types::JudgmentResponseProvenance::DiscreteDecision),
         ))
@@ -1980,7 +2024,7 @@ mod tests {
             crate::work_admission_classification_request(&crate::TurnIntentJudgeContext::default());
         let score = 0.512_345_678_901_234_5;
         let response = JudgmentResponse {
-            schema_version: 1,
+            schema_version: JUDGMENT_SCHEMA_VERSION,
             model: "offline".into(),
             answers: request
                 .questions
@@ -2062,16 +2106,17 @@ mod tests {
     {
         let request =
             crate::work_admission_classification_request(&crate::TurnIntentJudgeContext::default());
+        let raw = discrete_classification(&request, &["mutation.read_only"], &["required"]);
         let mut result = crate::parse_work_admission_classification(
             &request,
-            r#"{"true":["mutation.read_only"],"uncertain":["required"]}"#,
+            &raw,
             "chat-fixture",
             Some(astra_turn_types::JudgmentResponseProvenance::DiscreteDecision),
         );
         let Err(crate::TurnIntentJudgeError::Uncertain { diagnostics }) = &mut result else {
             panic!("uncertain");
         };
-        diagnostics.evidence.get_mut("required").unwrap().value = f64::NAN;
+        diagnostics.evidence.get_mut("required").unwrap().value = Some(f64::NAN);
         assert_eq!(
             request_judgment_result(&result),
             RequestJudgmentResultV1::Invalid {

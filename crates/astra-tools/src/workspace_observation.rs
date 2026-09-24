@@ -50,6 +50,10 @@ const TRUSTED_GIT_PATH: &str = r"C:\Windows\System32";
 pub const OBSERVED_FIELD: &str = "workspace_mutation_observed";
 pub const SCOPE_FIELD: &str = "workspace_mutation_scope";
 pub const RECEIPT_FIELD: &str = "workspace_mutation_receipt";
+/// A direct typed writer committed inside the bound workspace, but later
+/// workspace attribution is unavailable. This is not a mutation or observer
+/// receipt and must never be used to certify current file contents.
+pub const WRITER_APPLIED_BOUND_FIELD: &str = "workspace_writer_applied_bound";
 pub const OWNERSHIP_FIELD: &str = "workspace_mutation_ownership";
 pub const BOUND_WORKSPACE_SCOPE: &str = "bound_workspace";
 pub const INVOCATION_CGROUP_OWNERSHIP: &str = "invocation_cgroup";
@@ -3759,6 +3763,19 @@ pub fn typed_workspace_tool_receipt_for_applied(
     is_error: bool,
     applied: bool,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
+    typed_workspace_tool_applied_bound(name, args, workspace_root, is_error, applied)
+        .then(typed_workspace_tool_receipt)
+}
+
+/// Validate a direct writer's applied fact against its original bound target.
+/// The caller must obtain `applied` from the executor, never from tool prose.
+pub fn typed_workspace_tool_applied_bound(
+    name: &str,
+    args: &serde_json::Value,
+    workspace_root: &Path,
+    is_error: bool,
+    applied: bool,
+) -> bool {
     // `rename_symbol` and the LSP contract are preview-first: omitted
     // `dry_run` means preview, not an applied mutation.  Do not infer a
     // changed receipt merely because the tool is in the mutation family.
@@ -3766,15 +3783,11 @@ pub fn typed_workspace_tool_receipt_for_applied(
         .get("dry_run")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(matches!(name, "rename_symbol" | "lsp"));
-    if is_error
+    !(is_error
         || !applied
         || dry_run
         || !crate::executor::is_workspace_mutation_tool(name, args)
-        || !structured_targets_are_bound(name, args, workspace_root)
-    {
-        return None;
-    }
-    Some(typed_workspace_tool_receipt())
+        || !structured_targets_are_bound(name, args, workspace_root))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -5147,6 +5160,55 @@ mod tests {
                 "changed": true,
                 "ownership": INVOCATION_CGROUP_OWNERSHIP
             })
+        ));
+    }
+
+    #[test]
+    fn applied_bound_fact_requires_a_successful_direct_writer_and_all_bound_targets() {
+        let workspace = tempfile::tempdir().unwrap();
+        let valid =
+            serde_json::json!({"path": "target.txt", "old_str": "before", "new_str": "after"});
+        assert!(typed_workspace_tool_applied_bound(
+            "str_replace",
+            &valid,
+            workspace.path(),
+            false,
+            true
+        ));
+        assert!(!typed_workspace_tool_applied_bound(
+            "str_replace",
+            &valid,
+            workspace.path(),
+            false,
+            false
+        ));
+        assert!(!typed_workspace_tool_applied_bound(
+            "str_replace",
+            &valid,
+            workspace.path(),
+            true,
+            true
+        ));
+        assert!(!typed_workspace_tool_applied_bound(
+            "bash",
+            &valid,
+            workspace.path(),
+            false,
+            true
+        ));
+        assert!(!typed_workspace_tool_applied_bound(
+            "str_replace",
+            &serde_json::json!({"path": "../outside.txt", "old_str": "before", "new_str": "after"}),
+            workspace.path(),
+            false,
+            true
+        ));
+        assert!(!typed_workspace_tool_applied_bound(
+            "multi_edit",
+            &serde_json::json!({"edits": [{"path": "target.txt"}, {"path": "../outside.txt"}]}),
+            workspace.path(),
+            false,
+            true
         ));
     }
 

@@ -7665,10 +7665,13 @@ mod resume_tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
         let mut state = SessionState::default();
+        state.set_session_id(session_id.clone());
+        state.total_session_cost = Some(1.25);
         restore_session_into_state(&session_id, None, &api, &mut state)
             .await
             .expect("cloud-only restore should succeed");
 
+        assert_eq!(state.total_session_cost, None);
         assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
         assert_eq!(state.turn, 3);
         assert_eq!(state.total_prompt_tokens, 120);

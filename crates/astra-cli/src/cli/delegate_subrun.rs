@@ -393,6 +393,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             max_completion_tokens: None,
             effort: None,
             agent_type: None,
+            execution_deadline: None,
             cancel_token: self.cancel_token.clone(),
             skill_resolver: self.skill_resolver.clone(),
             progress_tx: self.progress_tx.clone(),
@@ -540,6 +541,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             last_finish_reason: None,
             total_observation_tool_calls: 0,
             has_any_usage: false,
+            qualified_usage: None,
+            last_request_usage: None,
             max_turns: agentic_turn_budget.initial_turns,
             remaining_turns: agentic_turn_budget.initial_turns,
             charged_iterations: 0,
@@ -562,7 +565,6 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             call_counts: HashMap::new(),
             max_identical_tool_calls: resolved_tool_policy.max_identical_tool_calls,
             max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
-            repeated_cache_hit_suppression: resolved_tool_policy.repeated_cache_hit_suppression,
             max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
             stall: {
                 let mut s = astra_runtime::turn::agentic_loop::host::StallTrackingState::default();

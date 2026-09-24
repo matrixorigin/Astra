@@ -440,6 +440,35 @@ fn max_class(a: BashCommandClass, b: BashCommandClass) -> BashCommandClass {
 pub(crate) fn default_bash_timeout_for(command: &str) -> f64 {
     classify_bash_command(command).default_timeout_secs()
 }
+
+/// Resolve the timeout used by the workspace Edge Bash executor when callers
+/// omit `timeout`. Server-side admission uses the same value so it reserves
+/// enough time to execute and settle the command without rejecting short
+/// commands against the generic server ceiling.
+pub fn workspace_edge_bash_timeout_secs(command: &str) -> f64 {
+    let cmd_base = command.split_whitespace().next().unwrap_or("");
+    match cmd_base {
+        // Instant commands that perform no meaningful I/O.
+        "echo" | "printf" | "true" | "false" | "pwd" | "whoami" | "date" | "basename"
+        | "dirname" | "which" | "env" | "hostname" | "uname" | "id" | "tty" | "nproc" | "arch"
+        | "yes" => 5.0,
+        // Single-file and directory reads.
+        "cat" | "head" | "tail" | "wc" | "stat" | "file" | "ls" | "readlink" | "realpath"
+        | "md5sum" | "sha256sum" | "du" | "df" | "touch" | "mkdir" | "cp" | "mv" | "rm" | "ln"
+        | "chmod" | "chown" => 10.0,
+        // Search and traversal commands.
+        "grep" | "rg" | "find" | "fd" | "ag" | "awk" | "sed" | "sort" | "uniq" | "cut" | "tr"
+        | "diff" | "comm" | "xargs" | "tree" | "jq" | "yq" | "column" | "tee" => 15.0,
+        // Build, test, package, and container commands retain the established
+        // bounded 120-second Edge default; callers can explicitly request
+        // more when the run budget permits.
+        "cargo" | "make" | "go" | "mvn" | "gradle" | "pytest" | "pnpm" | "yarn" | "npm" | "pip"
+        | "uv" | "cmake" | "tox" | "bazel" | "ninja" | "docker" | "podman" | "docker-compose"
+        | "nerdctl" | "buildah" => 120.0,
+        // Network and unrecognized commands retain the bounded fallback.
+        _ => 30.0,
+    }
+}
 const GREP_DEFAULT_HEAD_LIMIT: usize = 100;
 const GLOB_DEFAULT_HEAD_LIMIT: usize = 100;
 const RAW_GREP_OUTPUT_LIMIT: usize = 30_000;
@@ -1454,6 +1483,8 @@ async fn execute_bash_inner(
         }
     };
     let timeout_secs = parse_bash_timeout_secs_for(args, command);
+    let explicit_verification =
+        crate::workspace_observation::is_explicit_workspace_verification_request("bash", args);
 
     // A detach handle is only a transport affordance; it is not permission
     // to let an arbitrary shell outlive this call.  In particular, a detached
@@ -1463,7 +1494,8 @@ async fn execute_bash_inner(
     // where the outer execute_bash wrapper owns the lease and captures the
     // post-state.  This gate lives here as well as in the edge adapter because
     // server/RPC paths can reach the shared DefaultToolExecutor directly.
-    let detachable_requested = ctx.detach_shell_handle.is_some()
+    let detachable_requested = !explicit_verification
+        && ctx.detach_shell_handle.is_some()
         && crate::workspace_observation::bash_command_is_detachable_safe(command);
 
     if let Err(reason) = validate_prepared_bash_command(command, workdir) {
@@ -1540,6 +1572,23 @@ async fn execute_bash_inner(
                     ));
                 }
             };
+        if explicit_verification && !owner.can_authoritatively_observe() {
+            let mut rejected = ToolResult::error(
+                "Error: bash mode=verify is unavailable: this executor cannot prove that all child processes have settled. No command was run. Use a typed workspace observer for file state; it does not replace a required script or test result."
+                    .into(),
+            );
+            rejected.metadata = Some(serde_json::Map::from_iter([
+                ("disposition".into(), Value::String("rejected".into())),
+                ("execution_started".into(), Value::Bool(false)),
+                ("side_effects_maybe".into(), Value::Bool(false)),
+                (
+                    "error_kind".into(),
+                    Value::String("tool_unavailable".into()),
+                ),
+                ("retryable".into(), Value::Bool(false)),
+            ]));
+            return rejected;
+        }
         if let Err(error) = owner.install(&mut command) {
             return ToolResult::error(format!(
                 "Error: unable to install Bash invocation owner: {error}"
@@ -6375,6 +6424,10 @@ printf 'probe.txt:1:needle\n'
             "python3 worker.py",
             weak
         ));
+        assert!(bash_scope_requires_attribution_quarantine(
+            "echo hi & pwd",
+            weak
+        ));
         assert!(!bash_scope_requires_attribution_quarantine(
             "python3 worker.py",
             authoritative
@@ -7352,14 +7405,56 @@ printf 'probe.txt:1:needle\n'
             .metadata
             .as_ref()
             .and_then(|fields| fields.get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD));
-        if astra_sandbox::apply_process_scope().ownership_guaranteed() {
-            assert!(!result.is_error, "verify result: {result:?}");
+        if !result.is_error {
             assert!(receipt.is_some_and(
                 crate::workspace_observation::is_explicit_workspace_verification_receipt,
             ));
         } else {
-            assert!(result.is_error, "weak scope must not mint receipt");
+            assert!(result.output.contains("No command was run"));
+            assert_eq!(result.metadata.as_ref().unwrap()["disposition"], "rejected");
             assert!(receipt.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_verify_mode_never_uses_detach_path() {
+        let dir = tempdir().unwrap();
+        let mut ctx = crate::ToolContext::test(dir.path());
+        let (slot, listener) = crate::detach::new_slot_with_handle();
+        ctx.detach_shell_handle = Some(slot);
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": "printf ran", "mode": "verify"}),
+        )
+        .await;
+
+        assert!(!listener.is_active(), "verify must not arm detach");
+        assert_ne!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("bash_detached")),
+            Some(&Value::Bool(true)),
+        );
+        if result.is_error {
+            assert!(result.output.contains("No command was run"));
+            assert!(!result.output.contains("ran"));
+            let fields = result.metadata.as_ref().unwrap();
+            assert_eq!(fields["disposition"], "rejected");
+            assert_eq!(fields["execution_started"], false);
+        } else {
+            assert_eq!(result.output, "ran");
+            assert!(
+                result
+                    .metadata
+                    .as_ref()
+                    .and_then(|fields| fields
+                        .get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD))
+                    .is_some_and(
+                        crate::workspace_observation::is_explicit_workspace_verification_receipt
+                    )
+            );
         }
     }
 
@@ -7378,7 +7473,12 @@ printf 'probe.txt:1:needle\n'
             result.is_error,
             "a verify command may not mutate: {result:?}"
         );
-        assert!(dir.path().join("changed.txt").is_file());
+        if result.output.contains("No command was run") {
+            assert!(!dir.path().join("changed.txt").exists());
+            assert_eq!(result.metadata.as_ref().unwrap()["disposition"], "rejected");
+        } else {
+            assert!(dir.path().join("changed.txt").is_file());
+        }
         assert!(result.metadata.as_ref().is_none_or(|fields| {
             !fields
                 .get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD)
@@ -7918,6 +8018,20 @@ printf 'probe.txt:1:needle\n'
             let t = class.default_timeout_secs();
             assert!((BASH_TIMEOUT_MIN_SECS..=BASH_TIMEOUT_MAX_SECS).contains(&t));
         }
+    }
+
+    #[test]
+    fn workspace_edge_timeout_preserves_executor_defaults_for_server_admission() {
+        assert_eq!(workspace_edge_bash_timeout_secs("echo hello"), 5.0);
+        assert_eq!(workspace_edge_bash_timeout_secs("ls -la"), 10.0);
+        assert_eq!(workspace_edge_bash_timeout_secs("rg --files"), 15.0);
+        assert_eq!(workspace_edge_bash_timeout_secs("cargo test --lib"), 120.0);
+        assert_eq!(workspace_edge_bash_timeout_secs("./review.sh"), 30.0);
+        assert_eq!(
+            workspace_edge_bash_timeout_secs("cd /tmp && git show HEAD:README.md"),
+            30.0,
+            "compound commands retain the executor's first-command fallback"
+        );
     }
 
     #[test]

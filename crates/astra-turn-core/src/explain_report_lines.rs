@@ -192,13 +192,16 @@ pub fn verdict_avoid_tools_line(tools_csv: &str) -> String {
 }
 
 #[must_use]
-pub fn verdict_injection_preview_line(index: usize, preview: &str) -> String {
-    format!("  ├─ injection[{}]: {}…", index, preview)
+pub fn verdict_observation_preview_line(index: usize, preview: &str) -> String {
+    format!(
+        "  ├─ observation[{}] (not model feedback): {}…",
+        index, preview
+    )
 }
 
 #[must_use]
-pub fn verdict_injection_count_line(n: usize) -> String {
-    format!("  └─ {} injection(s)", n)
+pub fn verdict_observation_count_line(n: usize) -> String {
+    format!("  └─ {} observation(s) · not model feedback", n)
 }
 
 #[cfg(test)]
@@ -454,7 +457,7 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────
-    // verdict_avoid_tools_line / verdict_injection_*
+    // verdict_avoid_tools_line / verdict_observation_*
     // ──────────────────────────────────────────────────────────
 
     #[test]
@@ -464,14 +467,17 @@ mod tests {
     }
 
     #[test]
-    fn verdict_injection_preview_line_format() {
-        let s = verdict_injection_preview_line(0, "You should not use bash");
-        assert!(s.contains("injection[0]:"));
+    fn verdict_observation_preview_line_format() {
+        let s = verdict_observation_preview_line(0, "You should not use bash");
+        assert!(s.contains("observation[0] (not model feedback):"));
         assert!(s.contains("You should not use bash"));
     }
 
     #[test]
-    fn verdict_injection_count_line_format() {
-        assert!(verdict_injection_count_line(3).contains("3 injection(s)"));
+    fn verdict_observation_count_line_format() {
+        assert_eq!(
+            verdict_observation_count_line(3),
+            "  └─ 3 observation(s) · not model feedback"
+        );
     }
 }

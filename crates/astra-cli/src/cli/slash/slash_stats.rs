@@ -250,6 +250,7 @@ pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
                 "\n{}",
                 "─── Per-Turn Cost Breakdown ─────────────────────".bold()
             );
+            eprintln!("  Current-rate scenario on observed counters; not session billing.");
             if let Some(ref m) = state.model {
                 eprintln!("  {:<14} {}", "model:".dim(), m.as_str().magenta());
             }
@@ -263,7 +264,7 @@ pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
 
             let mut total_in = 0u64;
             let mut total_out = 0u64;
-            let mut total_cost = 0.0f64;
+            let mut total_cost = Some(0.0f64);
             let mut turn_num = 0u32;
 
             for ev in &events {
@@ -273,23 +274,25 @@ pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
                     let c_tok = ev.tokens_out.unwrap_or(0);
                     let cr = ev.cache_read_tokens.unwrap_or(0);
                     let cw = ev.cache_creation_tokens.unwrap_or(0);
-                    let cost = cost_for_tokens(p_tok, c_tok, cr, cw, pricing);
+                    let cost = scenario_cost_for_lanes(
+                        [
+                            ev.tokens_in,
+                            ev.tokens_out,
+                            ev.cache_read_tokens,
+                            ev.cache_creation_tokens,
+                        ],
+                        pricing,
+                    );
                     total_in += p_tok;
                     total_out += c_tok;
-                    total_cost += cost;
-
-                    let cache_info = if cr > 0 {
-                        let pct = cr as f64 / (p_tok + cr).max(1) as f64 * 100.0;
-                        format!("  cache:{pct:.0}%")
-                    } else {
-                        String::new()
-                    };
+                    total_cost = add_scenario_cost(total_cost, cost);
+                    let cache_info = format!("  observed cache read:{cr} write:{cw}");
                     eprintln!(
                         "  {} {:>6}+{:<6} tok  {}{}",
                         format!("Turn {:>3}", turn_num).dim(),
                         p_tok,
                         c_tok,
-                        format_cost(cost),
+                        format_optional_cost(cost),
                         cache_info.dim()
                     );
                 }
@@ -301,10 +304,10 @@ pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
             );
             eprintln!(
                 "  {:<14} {}+{} tok  {}",
-                "total:".bold(),
+                "displayed rows:".bold(),
                 total_in,
                 total_out,
-                format_cost(total_cost).bold(),
+                format_optional_cost(total_cost).bold(),
             );
             eprintln!();
         }
@@ -341,6 +344,7 @@ pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
                 "\n{}",
                 "─── Session Cost History ────────────────────────".bold()
             );
+            eprintln!("  Current-rate scenario on observed counters; not session billing.");
             eprintln!(
                 "  {:<14} ${:.3}/1M prompt, ${:.3}/1M completion",
                 "rates:".dim(),
@@ -349,17 +353,16 @@ pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
             );
             eprintln!();
 
-            let mut grand_total = 0.0f64;
+            let mut grand_total = Some(0.0f64);
 
             for stats in &scan.stats {
-                let cost = cost_for_tokens(
+                let cost = pricing.estimated_cost_usd(
                     stats.total_tokens_in,
                     stats.total_tokens_out,
                     stats.total_cache_read,
                     stats.total_cache_creation,
-                    pricing,
                 );
-                grand_total += cost;
+                grand_total = add_scenario_cost(grand_total, cost);
 
                 let short = &stats.session_id[..8.min(stats.session_id.len())];
                 let model = stats.model.as_deref().unwrap_or("?");
@@ -369,14 +372,14 @@ pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
                     stats.turn_count,
                     stats.total_tokens_in,
                     stats.total_tokens_out,
-                    format_cost(cost),
+                    format_optional_cost(cost),
                     model.dim(),
                 );
             }
 
             eprintln!(
                 "\n  {} across {} sessions",
-                format_cost(grand_total).bold(),
+                format_optional_cost(grand_total).bold(),
                 scan.stats.len(),
             );
             if !scan.unreadable.is_empty() {
@@ -389,21 +392,9 @@ pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
         }
 
         _ => {
-            // Current session summary
-            let pricing = &state.cached_pricing;
-            let cache_read_rate = pricing.cache_read.unwrap_or(pricing.prompt);
-            let cache_write_rate = pricing.cache_write.unwrap_or(pricing.prompt);
-            let cost = cost_for_tokens(
-                state.total_prompt_tokens,
-                state.total_completion_tokens,
-                state.total_cache_read_tokens,
-                state.total_cache_creation_tokens,
-                pricing,
-            );
-
             eprintln!(
                 "\n{}",
-                "─── Session Cost ────────────────────────────────".bold()
+                "─── Current-rate Cost Scenario ──────────────────".bold()
             );
             if let Some(ref sid) = state.session_id {
                 eprintln!(
@@ -412,72 +403,8 @@ pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
                     sid[..8.min(sid.len())].magenta()
                 );
             }
-            if let Some(ref m) = state.model {
-                eprintln!("  {:<14} {}", "model:".dim(), m.as_str().magenta());
-            }
-            eprintln!(
-                "  {:<14} ${:.3}/1M prompt, ${:.3}/1M completion",
-                "rates:".dim(),
-                pricing.prompt * 1_000_000.0,
-                pricing.completion * 1_000_000.0
-            );
-            eprintln!();
-            eprintln!(
-                "  {:<14} {} ({})",
-                "prompt:".dim(),
-                state.total_prompt_tokens,
-                format_cost(state.total_prompt_tokens as f64 * pricing.prompt),
-            );
-            eprintln!(
-                "  {:<14} {} ({})",
-                "completion:".dim(),
-                state.total_completion_tokens,
-                format_cost(state.total_completion_tokens as f64 * pricing.completion),
-            );
-            if state.total_cache_read_tokens > 0 {
-                eprintln!(
-                    "  {:<14} {} ({})",
-                    "cache read:".dim(),
-                    state.total_cache_read_tokens,
-                    format_cost(state.total_cache_read_tokens as f64 * cache_read_rate),
-                );
-            }
-            if state.total_cache_creation_tokens > 0 {
-                eprintln!(
-                    "  {:<14} {} ({})",
-                    "cache write:".dim(),
-                    state.total_cache_creation_tokens,
-                    format_cost(state.total_cache_creation_tokens as f64 * cache_write_rate),
-                );
-            }
-            eprintln!("  {:<14} {}", "total:".bold(), format_cost(cost).bold());
-            if state.turn > 0 {
-                eprintln!(
-                    "  {:<14} {} per turn",
-                    "avg:".dim(),
-                    format_cost(cost / state.turn as f64)
-                );
-            }
-            if state.total_cache_read_tokens > 0 {
-                // Denominator = full billable input (fresh + cache-read + cache-creation)
-                // so cache-creation-heavy sessions don't report misleadingly high hit
-                // rates.
-                let total_input = astra_turn_types::NormalizedPromptCacheUsage::new(
-                    state.total_prompt_tokens,
-                    state.total_cache_read_tokens,
-                    state.total_cache_creation_tokens,
-                )
-                .total_input_tokens();
-                let cache_pct =
-                    state.total_cache_read_tokens as f64 / total_input.max(1) as f64 * 100.0;
-                let saved =
-                    state.total_cache_read_tokens as f64 * (pricing.prompt - cache_read_rate);
-                eprintln!(
-                    "  {:<14} {:.0}% cache hit, {} saved",
-                    "savings:".dim(),
-                    cache_pct,
-                    format_cost(saved),
-                );
+            for (label, value) in current_rate_cost_rows(state) {
+                eprintln!("  {:<14} {}", label.dim(), value);
             }
             eprintln!(
                 "\n  {}",
@@ -488,29 +415,67 @@ pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
     }
 }
 
-/// Calculate cost in dollars for given token counts.
-pub(crate) fn cost_for_tokens(
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    cache_read_tokens: u64,
-    cache_creation_tokens: u64,
+/// A journal-row scenario requires all four observed lanes, including zeros.
+pub(crate) fn scenario_cost_for_lanes(
+    lanes: [Option<u64>; 4],
     pricing: &astra_services::models::PricingData,
-) -> f64 {
-    debug_assert!(
-        pricing.is_valid(),
-        "CLI pricing must be validated at ingress"
-    );
-    pricing
-        .estimated_cost_usd(
-            prompt_tokens,
-            completion_tokens,
-            cache_read_tokens,
-            cache_creation_tokens,
-        )
-        .unwrap_or(0.0)
+) -> Option<f64> {
+    pricing.estimated_cost_usd(lanes[0]?, lanes[1]?, lanes[2]?, lanes[3]?)
+}
+
+pub(crate) fn add_scenario_cost(total: Option<f64>, cost: Option<f64>) -> Option<f64> {
+    total.zip(cost).and_then(|(total, cost)| {
+        let sum = total + cost;
+        (total >= 0.0 && cost >= 0.0 && sum.is_finite()).then_some(sum)
+    })
+}
+
+/// Shared CLI/TUI scenario, not a reconstruction of historical model billing.
+pub(crate) fn current_rate_cost_rows(state: &SessionState) -> Vec<(&'static str, String)> {
+    let pricing = &state.cached_pricing;
+    let amount = |usage: [u64; 4]| {
+        format_optional_cost(pricing.estimated_cost_usd(usage[0], usage[1], usage[2], usage[3]))
+    };
+    let mut rows = vec![
+        ("basis", "observed counters".into()),
+        ("billing", "not a session bill".into()),
+        ("coverage", "unknown".into()),
+        ("attribution", "unknown".into()),
+        (
+            "model",
+            state.model.clone().unwrap_or_else(|| "<unset>".into()),
+        ),
+    ];
+    for (label, count, index) in [
+        ("fresh input", state.total_prompt_tokens, 0),
+        ("output", state.total_completion_tokens, 1),
+        ("cache read", state.total_cache_read_tokens, 2),
+        ("cache write", state.total_cache_creation_tokens, 3),
+    ] {
+        let mut usage = [0; 4];
+        usage[index] = count;
+        rows.push((label, format!("{count} ({})", amount(usage))));
+    }
+    rows.push((
+        "scenario sum",
+        amount([
+            state.total_prompt_tokens,
+            state.total_completion_tokens,
+            state.total_cache_read_tokens,
+            state.total_cache_creation_tokens,
+        ]),
+    ));
+    rows
 }
 
 /// Format a dollar cost for display.
+pub(crate) fn format_optional_cost(cost: Option<f64>) -> String {
+    cost.filter(|cost| cost.is_finite() && *cost >= 0.0)
+        .map(format_cost)
+        .unwrap_or_else(|| "unavailable".into())
+}
+
+/// Format a known dollar cost for display.
 pub(crate) fn format_cost(cost: f64) -> String {
     if cost < 0.01 {
         format!("${:.4}", cost)

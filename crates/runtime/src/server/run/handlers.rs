@@ -116,6 +116,11 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
                         "usage_scope".to_string(),
                         serde_json::Value::String("run_total".to_string()),
                     );
+                    for key in ["qualified_usage", "last_request_usage"] {
+                        if let Some(value) = data.get(key) {
+                            usage.insert(key.to_string(), value.clone());
+                        }
+                    }
                     if let Some(tool_call_count) = data
                         .get("tool_call_count")
                         .and_then(serde_json::Value::as_u64)

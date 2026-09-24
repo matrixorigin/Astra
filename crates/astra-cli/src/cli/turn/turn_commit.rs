@@ -641,7 +641,7 @@ fn build_primary_turn_event(
         result.entity_learn_skipped_no_domain,
     )
     .with_memoria_time(result.memoria_ms)
-    .with_cache_tokens(result.cache_read_tokens, result.cache_creation_tokens);
+    .with_qualified_usage(result.qualified_usage);
     // Server-owned runs expose a complete fixed-size ledger aggregate even
     // though the Edge cannot retain their per-call records. Persist that
     // authority alongside any local detail window so offline journal tools do
@@ -843,6 +843,40 @@ mod tests {
             state.session_persistence_error = Some(error.to_string());
         }
         outcome
+    }
+
+    #[test]
+    fn journal_usage_roundtrip_preserves_unknown_partial_and_zero() {
+        use astra_turn_types::CanonicalTokenUsage;
+        let state = SessionState {
+            turn: 1,
+            session_id: Some("usage-session".into()),
+            ..Default::default()
+        };
+        for usage in [
+            None,
+            Some(CanonicalTokenUsage::new(None, None, None, None).unwrap()),
+            Some(CanonicalTokenUsage::new(Some(10), None, None, Some(2)).unwrap()),
+            Some(CanonicalTokenUsage::new(Some(0), Some(0), Some(0), Some(0)).unwrap()),
+        ] {
+            let mut result = crate::tests::stub_stream_result("done");
+            result.qualified_usage = usage;
+            result.prompt_tokens = 999;
+            result.cache_read_tokens = 888;
+            result.run_id = Some("usage-run".into());
+            result.interruption =
+                Some(serde_json::json!({"kind":"budget_exhausted","resumable":true}));
+            let (event, _) =
+                build_primary_turn_event(&state, "review", &mut result, Instant::now());
+            let restored: session_journal::JournalEvent =
+                serde_json::from_value(serde_json::to_value(event).unwrap()).unwrap();
+            assert_eq!(restored.metadata.as_ref().unwrap()["partial"], true);
+            let ingestion = astra_services::event_ingestion::IngestionEvent::from_journal_event(
+                &restored, "user",
+            )
+            .unwrap();
+            assert_eq!(ingestion.token_usage, usage.map(|usage| usage.to_json()));
+        }
     }
 
     #[test]
