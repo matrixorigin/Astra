@@ -13324,16 +13324,34 @@ impl ServerAgenticLoopHost {
         // direct Anthropic-style aliases. Normalize through the shared
         // [`TokenUsage`] extractor so the emitted SSE uses canonical keys
         // regardless of fixture provenance.
-        let extracted = crate::turn::token_usage::extract_usage(
+        let measured = crate::turn::token_usage::parse_usage(
             crate::turn::token_usage::UsageDialect::OpenAi,
             &usage,
         );
-        let u = extracted.unwrap_or(crate::turn::token_usage::TokenUsage {
-            input_tokens: 10,
-            cached_input_tokens: 0,
-            cache_creation_tokens: 0,
-            output_tokens: 5,
+        let qualified_usage = measured.and_then(|(tokens, presence)| {
+            astra_turn_types::CanonicalTokenUsage::from_json(&Value::Object(
+                tokens.to_qualified_json_map(presence),
+            ))
+            .ok()
         });
+        let current_request_usage = qualified_usage.and_then(|tokens| {
+            astra_turn_types::RequestTokenUsage::try_new(
+                tokens.input_tokens()?,
+                tokens.cached_input_tokens()?,
+                tokens.cache_creation_tokens()?,
+                tokens.output_tokens()?,
+            )
+            .ok()
+        });
+        let u =
+            measured
+                .map(|(tokens, _)| tokens)
+                .unwrap_or(crate::turn::token_usage::TokenUsage {
+                    input_tokens: 10,
+                    cached_input_tokens: 0,
+                    cache_creation_tokens: 0,
+                    output_tokens: 5,
+                });
         self.emit_progress_event(json!({
             "type": "usage",
             "input_tokens": u.input_tokens,
@@ -13353,6 +13371,8 @@ impl ServerAgenticLoopHost {
             cache_read_tokens: u.cached_input_tokens,
             cache_creation_tokens: u.cache_creation_tokens,
             has_usage: true,
+            qualified_usage,
+            current_request_usage,
             system_prompt_tokens: Some(mock_pipeline.breakdown.total_tokens),
             system_prompt_breakdown: serde_json::to_value(&mock_pipeline.breakdown).ok(),
             context_manifest_trace: clone_server_context_trace(
@@ -24782,7 +24802,11 @@ mod tests {
             session_id.to_string(),
         )
         .with_execution_time_budget(Some(ExecutionTimeBudget {
-            remaining_seconds: 2,
+            // Preserve the final-answer window while exercising a local
+            // approval timeout before durable reconciliation.
+            remaining_seconds:
+                astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET.as_secs()
+                    + 2,
         }))
         .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
         .with_interactive_client(true)
@@ -24998,11 +25022,11 @@ mod tests {
         for (provenance, raw) in [
             (
                 astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
-                json!({"true":["0"],"uncertain":[]}),
+                json!({"answers":{"0":{"type":"discrete_noul","decision":"yes"}}}),
             ),
             (
                 astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-                json!({"schema_version":1,"model":"jev","answers":{"0":{"type":"noul","noul":0.95}}}),
+                json!({"schema_version":astra_turn_types::JUDGMENT_SCHEMA_VERSION,"model":"jev","answers":{"0":{"type":"noul","noul":0.95}}}),
             ),
         ] {
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -25159,7 +25183,29 @@ mod tests {
                 json!({"type":"noul", "noul": if yes { 1.0 } else { 0.0 }}),
             );
         }
-        json!({"schema_version":1,"model":"offline-judgment","answers":answers}).to_string()
+        json!({"schema_version":astra_turn_types::JUDGMENT_SCHEMA_VERSION,"model":"offline-judgment","answers":answers}).to_string()
+    }
+
+    fn discrete_classification_response(uncertain_required: bool) -> String {
+        let request = astra_services::work_admission_classification_request(&Default::default());
+        let answers = request
+            .questions
+            .keys()
+            .map(|id| {
+                let decision = if uncertain_required && id == "required" {
+                    "unknown"
+                } else if id == "mutation.read_only" {
+                    "yes"
+                } else {
+                    "no"
+                };
+                (
+                    id.clone(),
+                    json!({"type":"discrete_noul", "decision":decision}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        json!({"answers":answers}).to_string()
     }
 
     #[tokio::test]
@@ -25502,18 +25548,18 @@ mod tests {
 
     #[tokio::test]
     async fn request_classification_keeps_stage_local_execution_provenance() {
-        let uncertain = json!({"true":["mutation.read_only"], "uncertain":["required"]});
+        let uncertain = discrete_classification_response(true);
         let judge = SummaryClientWorkAdmissionJudge::new(Box::new(UsageSequencedSummaryClient {
             responses: std::sync::Mutex::new(
                 [
                     Ok(summary_response_with_execution(
-                        &uncertain.to_string(),
+                        &uncertain,
                         "invocation-initial",
                         "deepseek-flash",
                         "deepseek",
                     )),
                     Ok(summary_response_with_execution(
-                        r#"{"true":["mutation.read_only"],"uncertain":[]}"#,
+                        &discrete_classification_response(false),
                         "invocation-clarification",
                         "fallback-llm",
                         "openai-compatible",
@@ -41090,7 +41136,7 @@ mod tests {
         let classification_client = SequencedSummaryClient {
             provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
             responses: std::sync::Mutex::new(std::collections::VecDeque::from([json!({
-                "schema_version": 1,
+                "schema_version": astra_turn_types::JUDGMENT_SCHEMA_VERSION,
                 "model": "test",
                 "answers": {
                     "required": {"type": "noul", "noul": 0.0},
@@ -45447,6 +45493,18 @@ mod tests {
         assert_eq!(state.total_cache_read, 202);
         assert_eq!(state.total_cache_creation, 303);
         assert_eq!(state.total_completion, 404);
+        let qualified = state.qualified_usage.expect("mock usage evidence");
+        assert_eq!(qualified.input_tokens(), Some(101));
+        assert_eq!(qualified.cached_input_tokens(), Some(202));
+        assert_eq!(qualified.cache_creation_tokens(), Some(303));
+        assert_eq!(qualified.output_tokens(), Some(404));
+        assert_eq!(
+            state
+                .last_request_usage
+                .expect("physical mock usage")
+                .fresh_input_tokens,
+            101
+        );
         let last = state.recent_rounds.last().expect("physical mock round");
         assert_eq!(last.prompt_tokens, 101);
         assert_eq!(last.cache_read_tokens, 202);

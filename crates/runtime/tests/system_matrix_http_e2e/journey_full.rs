@@ -1010,7 +1010,9 @@ pub async fn run_product_matrix_full_journey(
             "test_llm_rounds": [{
                 "full_text": LLM_TEXT,
                 "reasoning": "",
-                "usage": { "prompt_tokens": 5, "completion_tokens": 15, "total_tokens": 20 }
+                "usage": { "prompt_tokens": 5, "completion_tokens": 15,
+                    "prompt_tokens_details": {"cached_tokens": 0, "cache_creation_input_tokens": 0},
+                    "total_tokens": 20 }
             }]
         }
     });

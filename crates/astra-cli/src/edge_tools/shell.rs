@@ -7035,10 +7035,11 @@ mod tests {
         );
 
         assert!(outcome.is_error, "verify may not mutate: {outcome:?}");
-        let rejected_before_execution = outcome
-            .tool_result_fields
-            .as_ref()
-            .is_some_and(|fields| fields["disposition"] == "rejected");
+        let rejected_before_execution = outcome.tool_result_fields.as_ref().is_some_and(|fields| {
+            fields
+                .get("disposition")
+                .is_some_and(|value| value == "rejected")
+        });
         assert_eq!(
             dir.path().join("changed.txt").exists(),
             !rejected_before_execution

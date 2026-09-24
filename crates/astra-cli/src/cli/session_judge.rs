@@ -167,6 +167,7 @@ pub(crate) async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_turn_types::JUDGMENT_SCHEMA_VERSION;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{header, method, path},
@@ -177,7 +178,7 @@ mod tests {
     #[tokio::test]
     async fn session_judge_resolves_typesafe_through_typed_catalog_before_execution() {
         let native =
-            json!({"schema_version":1,"model":"jev","answers":{"0":{"type":"noul","noul":0.9}}})
+            json!({"schema_version":JUDGMENT_SCHEMA_VERSION,"model":"jev","answers":{"0":{"type":"noul","noul":0.9}}})
                 .to_string();
         let server = session_server(ResponseTemplate::new(200).set_body_json(json!({
             "id":"completion-1", "object":"chat.completion", "offering_id":"offering-1", "model":"jev",
@@ -249,13 +250,13 @@ mod tests {
         ResponseTemplate::new(200).set_body_json(json!({
             "id": "completion-1", "object": "chat.completion", "offering_id": "offering-1", "model": "judge",
             "judgment_provenance": "discrete_decision",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": "{\"true\":[],\"uncertain\":[]}"}, "finish_reason": reason}],
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "{\"answers\":{\"0\":{\"type\":\"discrete_noul\",\"decision\":\"no\"}}}"}, "finish_reason": reason}],
             "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110},
         }))
     }
 
     fn judgment_input() -> String {
-        json!({"schema_version":1,"state":{"evidence":"quoted evidence"},"questions":{"0":{"type":"noul","instructions":"Evidence supports the criterion."}}}).to_string()
+        json!({"schema_version":JUDGMENT_SCHEMA_VERSION,"state":{"evidence":"quoted evidence"},"questions":{"0":{"type":"noul","instructions":"Evidence supports the criterion."}}}).to_string()
     }
 
     fn completion() -> ResponseTemplate {
@@ -307,7 +308,7 @@ mod tests {
         assert_eq!(body["max_tokens"], judgment.output_token_budget());
         assert_eq!(body["messages"], json!(judgment_messages(&judgment)));
         assert_eq!(result["provenance"], "discrete_decision");
-        assert_eq!(result["judgment"]["answers"]["0"]["noul"], 0.0);
+        assert_eq!(result["judgment"]["answers"]["0"]["decision"], "no");
         assert_eq!(body["timeout_ms"], 37_000);
         assert!(body.get("tools").is_none());
         let metadata: Value = serde_json::from_slice(&requests[0].body).unwrap();
@@ -389,7 +390,7 @@ mod tests {
             (Some("discrete_decision"), false),
             (None, false),
         ] {
-            let text = json!({"schema_version":1,"model":"untrusted-answer-model","answers":{"0":{"type":"noul","noul":0.93}}}).to_string();
+            let text = json!({"schema_version":JUDGMENT_SCHEMA_VERSION,"model":"untrusted-answer-model","answers":{"0":{"type":"noul","noul":0.93}}}).to_string();
             let body = json!({"id":"completion-1","object":"chat.completion","offering_id":"offering-1","model":"native-judge","judgment_provenance":provenance,"choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}]});
             let server =
                 session_server(ResponseTemplate::new(200).set_body_json(body), Some(200)).await;

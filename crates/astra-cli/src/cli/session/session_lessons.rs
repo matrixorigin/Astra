@@ -404,7 +404,7 @@ mod tests {
         ) -> Result<astra_runtime::memory_hooks::MemoryInferenceResponse, astra_core::ClassifiedError>
         {
             Ok(astra_runtime::memory_hooks::MemoryInferenceResponse {
-                text: r#"{"true":["1"],"uncertain":[]}"#.into(),
+                text: r#"{"answers":{"0":{"type":"discrete_noul","decision":"no"},"1":{"type":"discrete_noul","decision":"yes"}}}"#.into(),
                 model_used: self.model_name().into(),
                 judgment_provenance: Some(
                     astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,

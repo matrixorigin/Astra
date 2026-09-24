@@ -2195,7 +2195,8 @@ pub async fn run_stream_context_trace_persistence() {
         "context": {
             "test_llm_rounds": [{
                 "full_text": "Context trace reply.",
-                "usage": { "prompt_tokens": 100, "completion_tokens": 50 }
+                "usage": { "prompt_tokens": 100, "completion_tokens": 50,
+                    "prompt_tokens_details": {"cached_tokens": 0, "cache_creation_input_tokens": 0} }
             }]
         }
     });

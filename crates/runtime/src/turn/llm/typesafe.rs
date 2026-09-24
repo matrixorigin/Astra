@@ -70,7 +70,12 @@ pub(super) fn response(
     // Billing metadata does not decide whether a valid judgment succeeded.
     // Preserve raw fields until the shared disjoint decoder qualifies them.
     let mut raw_usage = serde_json::Map::new();
-    for key in ["input_tokens", "output_tokens"] {
+    for key in [
+        "input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "output_tokens",
+    ] {
         if let Some(value) = response.usage.as_ref().and_then(|u| u.get(key)) {
             raw_usage.insert(key.into(), value.clone());
         }
@@ -185,6 +190,23 @@ mod tests {
             astra_services::InferenceUsageStatus::ProviderPartial
         );
         assert_eq!(result.model_used, "jev-1.13.0");
+    }
+
+    #[test]
+    fn response_preserves_explicit_cache_usage_lanes() {
+        let req = request(&messages(), "jev-1.13.0").unwrap();
+        let mut value = good();
+        value["usage"]["cache_read_input_tokens"] = json!(7);
+        value["usage"]["cache_creation_input_tokens"] = json!(3);
+        let result = decode_response(&value, &req).unwrap();
+        assert_eq!(result.usage["cached_input_tokens"], 7);
+        assert_eq!(result.usage["cache_creation_tokens"], 3);
+        assert_eq!(result.usage["total_tokens"], 114);
+        let terminal = crate::turn::llm::client::provider_attempt_terminal_from_result(&result);
+        assert_eq!(
+            terminal.usage_status,
+            astra_services::InferenceUsageStatus::ProviderExact
+        );
     }
 
     #[test]

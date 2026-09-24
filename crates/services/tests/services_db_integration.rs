@@ -4754,7 +4754,7 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn session_audit_cost_uses_canonical_events_and_active_model_pricing() {
+async fn session_audit_does_not_price_unattributed_turn_usage() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
 
@@ -4839,10 +4839,10 @@ async fn session_audit_cost_uses_canonical_events_and_active_model_pricing() {
         .get_summary(&user_id, &session_id)
         .await
         .expect("get priced session summary");
-    assert_eq!(summary.cost.priced_turn_count, 1);
-    assert_eq!(summary.cost.unpriced_turn_count, 0);
-    assert_eq!(summary.cost.estimated_cost_usd, Some(8.5));
-    assert_eq!(summary.cost.per_model_cost_usd.get(&model_name), Some(&8.5));
+    assert_eq!(summary.cost.priced_turn_count, 0);
+    assert_eq!(summary.cost.unpriced_turn_count, 1);
+    assert_eq!(summary.cost.estimated_cost_usd, None);
+    assert!(summary.cost.per_model_cost_usd.is_empty());
 
     cleanup_agent_sessions_and_events_for_owner(
         &pool,

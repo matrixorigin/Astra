@@ -487,7 +487,7 @@ mod tests {
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(completion(
                 "offer-baseline",
-                r#"{"answers":{"0":{"type":"discrete_noul","decision":"yes"}}}"#,
+                r#"{"answers":{"0":{"type":"discrete_noul","decision":"yes"},"1":{"type":"discrete_noul","decision":"no"}}}"#,
             )))
             .expect(2)
             .mount(&server)

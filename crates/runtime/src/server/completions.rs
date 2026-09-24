@@ -978,7 +978,8 @@ mod tests {
                                 "message": {"role": "assistant", "content": "durable memory"},
                                 "finish_reason": "stop"
                             }],
-                            "usage": {"prompt_tokens": 13, "completion_tokens": 5}
+                            "usage": {"prompt_tokens": 13, "completion_tokens": 5,
+                                "prompt_tokens_details": {"cached_tokens": 0, "cache_creation_input_tokens": 0}}
                         }))
                         .into_response()
                     }
@@ -1278,7 +1279,7 @@ mod tests {
             assert!(body["questions"].get("evidence").is_some());
             let mut response = json!({"model":"mock-jev-returned-model","answers":{"evidence":{"type":"noul","noul":0.9}}});
             match body["state"]["usage"].as_str().unwrap() {
-                "exact" => response["usage"] = json!({"input_tokens":100,"output_tokens":4}),
+                "exact" => response["usage"] = json!({"input_tokens":100,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":4}),
                 "partial" => response["usage"] = json!({"input_tokens":70}),
                 "missing" => {},
                 other => panic!("unexpected fixture mode {other}"),

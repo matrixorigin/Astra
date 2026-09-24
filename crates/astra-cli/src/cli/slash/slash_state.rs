@@ -1835,7 +1835,7 @@ mod state_command_tests {
         assert_eq!(state.total_completion_tokens, 0);
         assert_eq!(state.total_cache_read_tokens, 0);
         assert_eq!(state.total_cache_creation_tokens, 0);
-        assert_eq!(state.total_session_cost, Some(0.0));
+        assert_eq!(state.total_session_cost, None);
         assert!(state.recent_tools.is_empty());
         assert!(state.redo_stack.is_empty());
         assert!(state.last_response.is_none());

@@ -12371,6 +12371,12 @@ mod tests {
             cache_read_tokens: 5,
             cache_creation_tokens: 3,
             has_usage: true,
+            current_request_usage: Some(astra_turn_types::RequestTokenUsage {
+                fresh_input_tokens: 21,
+                cache_read_tokens: 5,
+                cache_creation_tokens: 3,
+                output_tokens: 13,
+            }),
             ..Default::default()
         });
         host.on_tool_result(&EdgeToolExecResult {
@@ -16832,6 +16838,12 @@ mod tests {
         accum.cache_read_tokens = 50;
         accum.cache_creation_tokens = 0;
         accum.has_usage = true;
+        accum.current_request_usage = Some(astra_turn_types::RequestTokenUsage {
+            fresh_input_tokens: 300,
+            cache_read_tokens: 50,
+            cache_creation_tokens: 0,
+            output_tokens: 200,
+        });
         sync_incremental_accum_state(&state, &accum);
         let snap = state.snapshot();
         assert_eq!(snap.prompt_tokens, 300);

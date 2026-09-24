@@ -455,6 +455,10 @@ mod tests {
         );
         first.prompt_tokens = 11;
         first.completion_tokens = 7;
+        first.qualified_usage = Some(
+            astra_turn_types::CanonicalTokenUsage::new(Some(11), Some(0), Some(0), Some(7))
+                .unwrap(),
+        );
         first.llm_rounds = Some(2);
         first.pending_context_assembly_trace = Some((
             41,

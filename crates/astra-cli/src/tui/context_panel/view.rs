@@ -2929,7 +2929,7 @@ mod tests {
         assert!(text.contains("sid abcdef12"), "short sid: {text}");
         assert!(text.contains("turn 5"));
         assert!(text.contains("test-model-x"));
-        assert!(text.contains("$0.1200"));
+        assert!(text.contains("$0.120"));
         assert!(
             text.contains(
                 "canonical cursor · turn 5 · journal/conversation 17/13 · compaction gen 3 · journal"

@@ -7193,6 +7193,21 @@ pub(crate) mod tests {
         }
     }
 
+    fn verified_workspace_observation() -> EdgeToolExecResult {
+        let mut result = make_edge_tool_with_args(
+            "bash",
+            json!({"command": "test -f src/lib.rs", "mode": "verify"}),
+            "workspace verified",
+        );
+        result.request_id = "req-bash-verify".into();
+        result
+            .tool_result_fields
+            .as_mut()
+            .expect("test edge result has owner metadata")
+            .extend(astra_tools::workspace_observation::explicit_workspace_verification_receipt());
+        result
+    }
+
     fn make_shell_task_output_observation(
         task_id: &str,
         mode: &str,
@@ -8527,6 +8542,7 @@ pub(crate) mod tests {
                 5,
                 Some(20),
             ),
+            edge_tool_result(vec![verified_workspace_observation()], 10, 5, Some(20)),
             text_result("completed after extension", 10, 5, Some(20)),
         ])
         .with_valid_tools(&["read_file", "write_file", "bash"]);
@@ -8546,9 +8562,12 @@ pub(crate) mod tests {
         state.remaining_turns = 2;
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok());
-        assert_eq!(host.current_turn, 3);
-        assert_eq!(state.max_turns, 4);
+        assert!(outcome.is_ok(), "adaptive budget outcome: {outcome:?}");
+        assert_eq!(host.current_turn, 4);
+        assert_eq!(
+            state.max_turns, 5,
+            "verified post-mutation settlement gets one reserved boundary"
+        );
         assert_eq!(state.final_text, "completed after extension");
         assert!(
             state.volatile_pending.iter().all(|inj| {
@@ -8625,9 +8644,10 @@ pub(crate) mod tests {
                 5,
                 Some(20),
             ),
+            edge_tool_result(vec![verified_workspace_observation()], 10, 5, Some(20)),
             text_result("summarized after warning", 10, 5, Some(20)),
         ])
-        .with_valid_tools(&["read_file", "write_file"]);
+        .with_valid_tools(&["read_file", "write_file", "bash"]);
         let mut state = make_state();
         state.task_profile = structured_task_profile(
             true,
@@ -8663,8 +8683,8 @@ pub(crate) mod tests {
         );
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok());
-        assert_eq!(host.current_turn, 3);
+        assert!(outcome.is_ok(), "adaptive budget outcome: {outcome:?}");
+        assert_eq!(host.current_turn, 4);
         assert_eq!(state.final_text, "summarized after warning");
         assert!(state.interruption.is_none());
         assert!(

@@ -22,8 +22,8 @@
 //! 3. Each turn's accumulator is **independent** (not cumulative).
 //! 4. **Missing cache fields default to 0** without erroring.
 //! 5. **Null-valued cache fields are tolerated** — same as missing.
-//! 6. Usage event missing BOTH `input_tokens` AND `output_tokens` is
-//!    **rejected** (`has_usage == false`, error recorded).
+//! 6. Cache-only usage is valid measured usage, even without fresh input or
+//!    output tokens.
 //! 7. Negative cache values fall back to 0 (no panic, no wrap).
 
 use astra_turn_core::chat_turn_sse_dispatch::{
@@ -155,23 +155,19 @@ fn null_cache_fields_are_tolerated() {
 }
 
 #[test]
-fn usage_missing_both_token_counts_is_rejected() {
-    let bad = json!({
+fn cache_only_usage_is_measured() {
+    let cache_only = json!({
         "type": "usage",
         "cached_input_tokens": 999u64,
         "cache_creation_tokens": 999u64,
     });
-    let accum = drive(&bad);
-    assert!(
-        !accum.has_usage,
-        "usage with neither input nor output tokens is invalid"
-    );
-    assert_eq!(
-        accum.cache_read_tokens, 0,
-        "invalid usage must not partially populate cache fields"
-    );
-    assert_eq!(accum.cache_creation_tokens, 0);
-    assert!(accum.error_message.is_some());
+    let accum = drive(&cache_only);
+    assert!(accum.has_usage);
+    assert_eq!(accum.prompt_tokens, 0);
+    assert_eq!(accum.completion_tokens, 0);
+    assert_eq!(accum.cache_read_tokens, 999);
+    assert_eq!(accum.cache_creation_tokens, 999);
+    assert!(accum.error_message.is_none());
 }
 
 #[test]

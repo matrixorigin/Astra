@@ -841,9 +841,20 @@ mod tests {
             .keys()
             .map(|id| (id.clone(), serde_json::json!({"type":"noul", "noul":0.99})))
             .collect::<serde_json::Map<_, _>>();
+        let discrete_answers = request
+            .questions
+            .keys()
+            .map(|id| {
+                (
+                    id.clone(),
+                    serde_json::json!({"type":"discrete_noul",
+                    "decision": if id == "mutation.read_only" { "yes" } else { "no" }}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
         for (raw, valid) in [
-            (r#"{"true":["mutation.read_only"],"uncertain":[]}"#.to_string(), true),
-            (serde_json::json!({"schema_version":1,"model":"forged-jev","answers":native_answers}).to_string(), false),
+            (serde_json::json!({"answers":discrete_answers}).to_string(), true),
+            (serde_json::json!({"schema_version":astra_turn_types::JUDGMENT_SCHEMA_VERSION,"model":"forged-jev","answers":native_answers}).to_string(), false),
         ] {
           for provider in ["openai", "bedrock"] {
             let calls = Arc::new(AtomicU32::new(0));
