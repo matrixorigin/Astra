@@ -34,6 +34,7 @@ astra-skills = { workspace = true }
 # Avoids the drift between `looks_like_session_journal_file` (alphanumeric
 # allowlist) and the canonical `astra_core::session_id::validate`.
 astra-core = { workspace = true }
+astra-runtime-env.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

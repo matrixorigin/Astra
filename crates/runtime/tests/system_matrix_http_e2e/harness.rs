@@ -593,6 +593,22 @@ pub async fn cleanup_session_data(shared_pool: &SharedPool, user_id: &str, sessi
     }
 }
 
+async fn cleanup_evaluation_data(pool: &sqlx::MySqlPool, user_id: &str) {
+    for table in [
+        "evaluation_task_assessments",
+        "evaluation_trial_observations",
+        "evaluation_materialization_receipts",
+        "evaluation_trial_bindings",
+        "evaluation_experiments",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE owner_user_id = ?"))
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|error| panic!("remove {table} for Matrix E2E fixture: {error}"));
+    }
+}
+
 pub async fn cleanup_edge_registry(pool: &sqlx::MySqlPool, user_id: &str, edge_agent_id: &str) {
     let _ = sqlx::query("DELETE FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?")
         .bind(user_id)
@@ -779,6 +795,7 @@ impl MatrixE2eCtx {
                 .stop_background_runs(std::time::Duration::from_secs(2))
                 .await;
         }
+        cleanup_evaluation_data(&self.pool, &self.user_id).await;
         cleanup_session_data(&self.shared_pool, &self.user_id, &self.session_id).await;
         cleanup_edge_registry(&self.pool, &self.user_id, &self.edge_agent_id).await;
         // Each bootstrap creates an isolated mock Offering. Remove it before
@@ -1261,6 +1278,7 @@ async fn cleanup_interrupted_matrix_e2e_sessions(state: &astra_runtime::AppState
             .fetch_all(pool.get())
             .await
             .expect("list old interrupted Matrix E2E sessions");
+        cleanup_evaluation_data(pool.get(), &user_id).await;
         for session in sessions {
             let session_id: String = session.try_get("session_id").expect("fixture session_id");
             cleanup_session_data(pool, &user_id, &session_id).await;

@@ -332,18 +332,20 @@ pub async fn run_product_matrix_full_journey(
     assert_eq!(st_msearch, StatusCode::OK, "marketplace search: {ms_j}");
     assert!(ms_j["results"].is_array(), "search results: {ms_j}");
 
-    let xuid = &[("x-user-id", user_id.as_str())];
-    let (st_gates, gates_j) = get_json(app, "/evaluation/gates?limit=10", None, xuid).await;
-    assert_eq!(st_gates, StatusCode::OK, "evaluation gates: {gates_j}");
-
-    let (st_cal, cal_j) = get_json(app, "/evaluation/calibration?days=7", None, xuid).await;
+    let (st_cal, cal_j) = get_json(
+        app,
+        "/evaluation/calibration?days=7",
+        Some(auth_header),
+        &[],
+    )
+    .await;
     assert_eq!(st_cal, StatusCode::OK, "evaluation calibration: {cal_j}");
 
     let (st_scores, scores_j) = get_json(
         app,
         "/evaluation/sessions/scores?limit=10&min_score=0",
-        None,
-        xuid,
+        Some(auth_header),
+        &[],
     )
     .await;
     assert_eq!(
@@ -356,17 +358,28 @@ pub async fn run_product_matrix_full_journey(
         "session scores payload: {scores_j}"
     );
 
-    let (st_qt, qt_j) = get_json(app, "/evaluation/quality/trend?days=7", None, xuid).await;
+    let (st_qt, qt_j) = get_json(
+        app,
+        "/evaluation/quality/trend?days=7",
+        Some(auth_header),
+        &[],
+    )
+    .await;
     assert_eq!(st_qt, StatusCode::OK, "evaluation quality trend: {qt_j}");
 
-    let (st_slo, slo_j) =
-        get_json(app, "/evaluation/slo/dashboard?period_days=7", None, xuid).await;
+    let (st_slo, slo_j) = get_json(
+        app,
+        "/evaluation/slo/dashboard?period_days=7",
+        Some(auth_header),
+        &[],
+    )
+    .await;
     assert_eq!(st_slo, StatusCode::OK, "evaluation slo dashboard: {slo_j}");
 
-    let (st_mh, mh_j) = get_json(app, "/evaluation/memory-health", None, xuid).await;
+    let (st_mh, mh_j) = get_json(app, "/evaluation/memory-health", Some(auth_header), &[]).await;
     assert_eq!(st_mh, StatusCode::OK, "evaluation memory-health: {mh_j}");
 
-    let (st_mm, mm_j) = get_json(app, "/evaluation/memory-metrics", None, xuid).await;
+    let (st_mm, mm_j) = get_json(app, "/evaluation/memory-metrics", Some(auth_header), &[]).await;
     assert_eq!(st_mm, StatusCode::OK, "evaluation memory-metrics: {mm_j}");
 
     let (st_agent, agent_j) = post_json(
@@ -434,7 +447,7 @@ pub async fn run_product_matrix_full_journey(
     );
 
     let trust_path = format!("/evaluation/trust-report?agent_id={agent_id}&days=7");
-    let (st_trust, trust_j) = get_json(app, &trust_path, None, xuid).await;
+    let (st_trust, trust_j) = get_json(app, &trust_path, Some(auth_header), &[]).await;
     assert_eq!(
         st_trust,
         StatusCode::OK,
@@ -442,7 +455,7 @@ pub async fn run_product_matrix_full_journey(
     );
 
     let slo_hist = format!("/evaluation/slo/{agent_id}/history?days=7");
-    let (st_slo_hist, slo_hist_j) = get_json(app, &slo_hist, None, xuid).await;
+    let (st_slo_hist, slo_hist_j) = get_json(app, &slo_hist, Some(auth_header), &[]).await;
     assert_eq!(
         st_slo_hist,
         StatusCode::OK,
@@ -450,7 +463,7 @@ pub async fn run_product_matrix_full_journey(
     );
 
     let obs_path = format!("/evaluation/observability/metrics?agent_id={agent_id}&days=7");
-    let (st_obs, obs_j) = get_json(app, &obs_path, None, xuid).await;
+    let (st_obs, obs_j) = get_json(app, &obs_path, Some(auth_header), &[]).await;
     assert_eq!(
         st_obs,
         StatusCode::OK,
@@ -982,13 +995,7 @@ pub async fn run_product_matrix_full_journey(
         "GET /models should return a paginated envelope: {models_j}"
     );
 
-    let (st_drift, drift) = get_json(
-        app,
-        "/evaluation/drift",
-        None,
-        &[("x-user-id", user_id.as_str())],
-    )
-    .await;
+    let (st_drift, drift) = get_json(app, "/evaluation/drift", Some(auth_header), &[]).await;
     assert_eq!(st_drift, StatusCode::OK, "evaluation drift: {drift}");
 
     let reflect_path = format!("/chat/session/{session_id}/reflect");
@@ -1336,8 +1343,13 @@ pub async fn run_product_matrix_full_journey(
         "session quality assessment should record tool-backed step_count"
     );
 
-    let (st_cal_after, cal_after_j) =
-        get_json(app, "/evaluation/calibration?days=7", None, xuid).await;
+    let (st_cal_after, cal_after_j) = get_json(
+        app,
+        "/evaluation/calibration?days=7",
+        Some(auth_header),
+        &[],
+    )
+    .await;
     assert_eq!(
         st_cal_after,
         StatusCode::OK,

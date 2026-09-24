@@ -1210,6 +1210,12 @@ async fn execute_cli_command_impl(
             Ok(ExitCode::Success)
         }
 
+        Some(Command::Evaluation(command)) => {
+            let token = fresh_access_token_or_error(api, profile.as_deref()).await?;
+            crate::cli::evaluation::run(api, &token, command).await?;
+            Ok(ExitCode::Success)
+        }
+
         // Inline message: astra "what is the answer to life?"
         Some(Command::Message(words)) => {
             let raw_message = words.join(" ");

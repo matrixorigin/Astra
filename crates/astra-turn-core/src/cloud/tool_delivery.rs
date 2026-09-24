@@ -62,6 +62,11 @@ fn terminal_tool_result(
                 "error_kind".to_string(),
                 Value::String(error_kind.to_string()),
             ),
+            (
+                "disposition".to_string(),
+                Value::String("rejected".to_string()),
+            ),
+            ("execution_started".to_string(), Value::Bool(false)),
             ("retryable".to_string(), Value::Bool(retryable)),
         ])),
     }
@@ -2110,6 +2115,14 @@ mod tests {
             assert_eq!(
                 fields.get("retryable").and_then(Value::as_bool),
                 Some(retryable)
+            );
+            assert_eq!(
+                fields.get("disposition").and_then(Value::as_str),
+                Some("rejected")
+            );
+            assert_eq!(
+                fields.get("execution_started").and_then(Value::as_bool),
+                Some(false)
             );
         }
     }

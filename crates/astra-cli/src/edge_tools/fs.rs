@@ -203,7 +203,22 @@ impl ToolExecutor {
         session.record_fuzzy_match_event(path.display().to_string(), strategy, outcome);
     }
 
+    fn auto_format_after_edit(&self, path: &Path) -> Option<String> {
+        if self.shell_process_boundary.is_some() {
+            return None;
+        }
+        auto_format_file(path, &self.project_root)
+    }
+
     fn resolve_checked_result(&self, path: &str) -> Result<PathBuf, FsLeafError> {
+        self.resolve_checked_access(path, false)
+    }
+
+    fn resolve_checked_write(&self, path: &str) -> Result<PathBuf, FsLeafError> {
+        self.resolve_checked_access(path, true)
+    }
+
+    fn resolve_checked_access(&self, path: &str, write: bool) -> Result<PathBuf, FsLeafError> {
         if is_unc_path(path) {
             return Err("Error: UNC/network paths are not supported (security risk)"
                 .to_string()
@@ -222,6 +237,14 @@ impl ToolExecutor {
         } else {
             self.project_root.join(p)
         };
+
+        // Immutable host constraint intersects the mutable permission policy.
+        // This path check does not replace descriptor-relative access against races.
+        if let Some(boundary) = &self.shell_process_boundary {
+            boundary
+                .validate_file_access(&resolved, write)
+                .map_err(FsLeafError::sandbox_denied)?;
+        }
 
         // Symlink loop / depth guard: canonicalize to detect circular symlinks.
         // Skip for non-existent paths (let the caller produce a clear NotFound).
@@ -264,6 +287,11 @@ impl ToolExecutor {
 
     /// String API adapter for current filesystem callers that still consume
     /// the sandbox-denial wire prefix.
+    pub(crate) fn resolve_checked_for_write(&self, path: &str) -> Result<PathBuf, String> {
+        self.resolve_checked_write(path)
+            .map_err(FsLeafError::into_string_output)
+    }
+
     pub(crate) fn resolve_checked(&self, path: &str) -> Result<PathBuf, String> {
         self.resolve_checked_result(path)
             .map_err(FsLeafError::into_string_output)
@@ -838,7 +866,10 @@ impl ToolExecutor {
             Some(p) => p,
             None => return json!({ "success": false, "error": "missing 'path'" }).to_string(),
         };
-        let path = match self.resolve_checked(path_arg) {
+        let path = match self
+            .resolve_checked_write(path_arg)
+            .map_err(FsLeafError::into_string_output)
+        {
             Ok(safe) => safe,
             Err(e) => return json!({ "success": false, "error": e }).to_string(),
         };
@@ -1003,7 +1034,7 @@ impl ToolExecutor {
 
     fn str_replace_impl(&self, args: &Value, applied: &mut bool) -> Result<String, FsLeafError> {
         let path = match args.get("path").and_then(Value::as_str) {
-            Some(p) => self.resolve_checked_result(p)?,
+            Some(p) => self.resolve_checked_write(p)?,
             None => return Err("Error: missing 'path'".to_string().into()),
         };
         let old_str = match args.get("old_str").and_then(Value::as_str) {
@@ -1145,7 +1176,7 @@ impl ToolExecutor {
                         if let Ok(mut journal) = self.file_journal.lock() {
                             journal.record_after(&path, &journal_call_id, new_content.as_bytes());
                         }
-                        let format_result = auto_format_file(&path, &self.project_root);
+                        let format_result = self.auto_format_after_edit(&path);
                         if format_result.is_some() {
                             self.record_write(&path);
                         }
@@ -1286,7 +1317,7 @@ impl ToolExecutor {
                 }
 
                 // Auto-format if formatter is available
-                let format_result = auto_format_file(&path, &self.project_root);
+                let format_result = self.auto_format_after_edit(&path);
                 // Re-record after format (mtime may have changed)
                 if format_result.is_some() {
                     self.record_write(&path);
@@ -1359,7 +1390,10 @@ impl ToolExecutor {
 
     fn delete_file_impl(&self, args: &Value, applied: &mut bool) -> String {
         let path = match args.get("path").and_then(Value::as_str) {
-            Some(p) => match self.resolve_checked(p) {
+            Some(p) => match self
+                .resolve_checked_write(p)
+                .map_err(FsLeafError::into_string_output)
+            {
                 Ok(safe) => safe,
                 Err(e) => return e,
             },
@@ -1450,6 +1484,25 @@ impl ToolExecutor {
     /// Used by `str_replace_batch` to recover from partial multi-file
     /// write failures.
     pub(crate) fn rollback_files_since_checkpoint(&self, turn_index: u32, checkpoint: u64) {
+        if let Some(boundary) = &self.shell_process_boundary {
+            let paths = match self.file_journal.lock() {
+                Ok(journal) => journal.paths_for_turn_since(turn_index, checkpoint),
+                Err(poisoned) => poisoned
+                    .into_inner()
+                    .paths_for_turn_since(turn_index, checkpoint),
+            };
+            if let Some(path) = paths
+                .iter()
+                .find(|path| boundary.validate_file_access(path, true).is_err())
+            {
+                astra_core::agent_warn!(
+                    "file_edit",
+                    "refused rollback outside immutable host boundary: {}",
+                    path.display()
+                );
+                return;
+            }
+        }
         let result = match self.file_journal.lock() {
             Ok(journal) => journal.undo_turn_since_transactional(turn_index, checkpoint),
             Err(poisoned) => poisoned
@@ -1476,6 +1529,16 @@ impl ToolExecutor {
             .get("scope")
             .and_then(Value::as_str)
             .unwrap_or("current_turn");
+        if self.shell_process_boundary.is_some()
+            && matches!(scope, "current_turn" | "turn" | "source_receipt")
+        {
+            return json!({
+                "success": false,
+                "scope": scope,
+                "error": "rollback scope is unavailable under the immutable host file boundary; use scope=file for an explicitly authorized workspace file",
+            })
+            .to_string();
+        }
         let explicit_turn_index = if scope == "turn" {
             match args.get("turn_index").and_then(Value::as_u64) {
                 Some(turn_index) => Some(turn_index),
@@ -1810,6 +1873,14 @@ impl ToolExecutor {
                 }
             })
             .unwrap_or("current_turn");
+        if self.shell_process_boundary.is_some() && scope != "list" && scope != "file" {
+            return json!({
+                "success": false,
+                "scope": scope,
+                "error": "rollback scope is unavailable under the immutable host file boundary; use scope=file for an explicitly authorized workspace file",
+            })
+            .to_string();
+        }
 
         match scope {
             "source_receipt" => {
@@ -1891,7 +1962,7 @@ impl ToolExecutor {
                         .to_string();
                     }
                 };
-                let path = match self.resolve_checked(raw_path) {
+                let path = match self.resolve_checked_for_write(raw_path) {
                     Ok(path) => path,
                     Err(error) => return error,
                 };
@@ -1899,6 +1970,13 @@ impl ToolExecutor {
                 let aliased = self.prefer_project_root_alias(&path);
                 if !candidates.iter().any(|candidate| candidate == &aliased) {
                     candidates.push(aliased);
+                }
+                if let Some(boundary) = &self.shell_process_boundary {
+                    for candidate in &candidates {
+                        if let Err(error) = boundary.validate_file_access(candidate, true) {
+                            return json!({"success": false, "error": error}).to_string();
+                        }
+                    }
                 }
                 let undo_result = match self.file_journal.lock() {
                     Ok(journal) => {
@@ -2074,7 +2152,7 @@ impl ToolExecutor {
         // all files are staged first, then rename() commits them atomically.
         // No journal checkpoint, no preimage capture, no dual rollback.
         for (path, _) in &groups {
-            if let Err(error) = self.resolve_checked_result(path) {
+            if let Err(error) = self.resolve_checked_write(path) {
                 return error.into_tool_result();
             }
         }
@@ -2098,7 +2176,14 @@ impl ToolExecutor {
             delegated.insert("allow_structural_change".to_string(), allow.clone());
         }
 
-        astra_tools::fs_ops::str_replace(&self.project_root, &Value::Object(delegated))
+        if self.shell_process_boundary.is_some() {
+            astra_tools::fs_ops::str_replace_without_formatter(
+                &self.project_root,
+                &Value::Object(delegated),
+            )
+        } else {
+            astra_tools::fs_ops::str_replace(&self.project_root, &Value::Object(delegated))
+        }
     }
 
     pub(crate) fn str_replace_batch(&self, args: &Value) -> String {
@@ -2120,7 +2205,7 @@ impl ToolExecutor {
 
     fn multi_edit_impl(&self, args: &Value, applied: &mut bool) -> Result<String, FsLeafError> {
         let path = match args.get("path").and_then(Value::as_str) {
-            Some(p) => self.resolve_checked_result(p)?,
+            Some(p) => self.resolve_checked_write(p)?,
             None => return Err("Error: missing 'path'".to_string().into()),
         };
         let edits = match args.get("edits").and_then(Value::as_array) {
@@ -2314,7 +2399,7 @@ impl ToolExecutor {
                 if let Ok(mut journal) = self.file_journal.lock() {
                     journal.record_after(&path, &journal_call_id, working.as_bytes());
                 }
-                let format_result = auto_format_file(&path, &self.project_root);
+                let format_result = self.auto_format_after_edit(&path);
                 if format_result.is_some() {
                     self.record_write(&path);
                 }
@@ -2571,6 +2656,9 @@ impl ToolExecutor {
     /// Query LSP diagnostics for a file after a write/edit and return a compact
     /// inline summary. Returns None if LSP is not available or has no diagnostics.
     fn inline_lsp_diagnostics(&self, path: &std::path::Path) -> Option<String> {
+        if self.shell_process_boundary.is_some() {
+            return None;
+        }
         let diag_value = self
             .passive_lsp
             .diagnostics_for_file(&self.project_root, path)
@@ -3261,6 +3349,139 @@ mod tests {
     use astra_turn_core::tool_result_sanitize::READ_FILE_MODEL_RESULT_CHARS;
     use serde_json::{Value, json};
     use std::io::Write;
+
+    #[tokio::test]
+    async fn host_file_boundary_survives_permission_policy_removal() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let temp = root.path().join("tmp");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&temp).unwrap();
+        std::fs::write(outside.path().join("input.txt"), "outside").unwrap();
+        let executor = ToolExecutor::new(root.path())
+            .with_shell_process_boundary(astra_sandbox::ShellProcessBoundary {
+                workspace: root.path().into(),
+                home,
+                temp,
+                read_only_paths: vec![outside.path().into()],
+            })
+            .unwrap();
+        *executor.sandbox_policy.write().unwrap() = None;
+        executor.set_current_visible_tool_schemas(
+            &["read_file", "write_file", "str_replace"]
+                .map(|name| json!({"type":"function", "function":{"name":name}})),
+        );
+        let write = executor
+            .execute_with_metadata(
+                "write_file",
+                &json!({"path":"file.txt", "content":"before"}),
+            )
+            .await;
+        assert!(!write.is_error, "{}", write.output);
+        let read = executor
+            .execute_with_metadata("read_file", &json!({"path":"file.txt"}))
+            .await;
+        assert!(!read.is_error, "{}", read.output);
+        let edit = executor
+            .execute_with_metadata(
+                "str_replace",
+                &json!({"path":"file.txt", "old_str":"before", "new_str":"after"}),
+            )
+            .await;
+        assert!(!edit.is_error, "{}", edit.output);
+        let read = executor
+            .execute_with_metadata(
+                "read_file",
+                &json!({"path":outside.path().join("input.txt")}),
+            )
+            .await;
+        assert!(!read.is_error, "{}", read.output);
+        for path in [
+            outside.path().join("input.txt"),
+            outside.path().join("new.txt"),
+        ] {
+            let write = executor
+                .execute_with_metadata("write_file", &json!({"path":path,"content":"changed"}))
+                .await;
+            assert!(write.is_error, "{}", write.output);
+        }
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("input.txt")).unwrap(),
+            "outside"
+        );
+        assert!(!outside.path().join("new.txt").exists());
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        let rust_file = root.path().join("main.rs");
+        std::fs::write(&rust_file, "fn main( ) { }\n").unwrap();
+        let notebook = outside.path().join("readonly.ipynb");
+        std::fs::write(&notebook, "{}").unwrap();
+        let denied = executor.notebook_edit(&json!({"notebook_path": notebook}));
+        assert!(denied.contains("immutable host file boundary"), "{denied}");
+        assert_eq!(std::fs::read_to_string(&notebook).unwrap(), "{}");
+        {
+            let mut journal = executor.file_journal.lock().unwrap();
+            journal.record_before(&notebook, "fixture", 0);
+            std::fs::write(&notebook, "changed").unwrap();
+            journal.record_after(&notebook, "fixture", b"changed");
+        }
+        let denied = executor.rollback_file_edits(&json!({"scope":"file", "path":notebook}));
+        assert!(denied.contains("immutable host file boundary"), "{denied}");
+        assert_eq!(std::fs::read_to_string(&notebook).unwrap(), "changed");
+        let denied = executor.rollback_file_edits(&json!({"scope":"turn", "turn_index":0}));
+        assert!(denied.contains("rollback scope is unavailable"), "{denied}");
+        let denied = executor
+            .rollback_recorded_turn_mutations(&json!({"scope":"current_turn"}))
+            .await;
+        assert!(denied.contains("rollback scope is unavailable"), "{denied}");
+        assert_eq!(std::fs::read_to_string(&notebook).unwrap(), "changed");
+        #[cfg(unix)]
+        {
+            let script = root.path().join("fake-lsp.sh");
+            let marker = outside.path().join("lsp-started");
+            std::fs::write(&script, "printf started > \"$1\"\n").unwrap();
+            let config = json!({"enabled":true,"command":"/bin/sh","args":[script,marker]});
+            std::fs::write(
+                root.path().join("astra-lsp.json"),
+                json!({"rust":config,"typescript":config}).to_string(),
+            )
+            .unwrap();
+            for path in ["new.rs", "new.ts"] {
+                let write = executor
+                    .execute_with_metadata(
+                        "write_file",
+                        &json!({"path":path,"content":"// fixture\n"}),
+                    )
+                    .await;
+                assert!(!write.is_error, "{}", write.output);
+            }
+            assert!(
+                !marker.exists(),
+                "constrained file writes must not spawn LSP"
+            );
+        }
+        executor.record_write(&rust_file);
+        assert!(
+            !executor
+                .passive_cargo_pending
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(executor.auto_format_after_edit(&rust_file).is_none());
+        assert_eq!(
+            std::fs::read_to_string(&rust_file).unwrap(),
+            "fn main( ) { }\n"
+        );
+        assert!(
+            executor
+                .take_passive_workspace_diagnostic_messages(root.path(), true)
+                .await
+                .is_empty()
+        );
+    }
 
     fn test_executor_in(dir: &std::path::Path) -> ToolExecutor {
         ToolExecutor::new(dir)

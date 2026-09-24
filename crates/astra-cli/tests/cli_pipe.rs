@@ -188,6 +188,10 @@ async fn active_stream_closed_after_run_binding_cancels_exact_server_run() {
             }),
         )
         .route(
+            "/agents/edge",
+            post(|| async { axum::Json(serde_json::json!({"registered": true})) }),
+        )
+        .route(
             "/models",
             get(move || {
                 let model_count_for_route = model_count_for_route.clone();
@@ -321,24 +325,37 @@ async fn active_stream_closed_after_run_binding_cancels_exact_server_run() {
     let mut child = child.spawn().expect("spawn active-stream Astra");
     let mut stdout_lines =
         tokio::io::BufReader::new(child.stdout.take().expect("piped stdout")).lines();
+    let stderr_reader = child.stderr.take().expect("piped stderr");
+    let stderr_task = tokio::spawn(async move {
+        let mut stderr_text = String::new();
+        let mut reader = tokio::io::BufReader::new(stderr_reader);
+        tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut stderr_text)
+            .await
+            .expect("read active-stream stderr");
+        stderr_text
+    });
     let mut stdout = String::new();
     loop {
-        let line = tokio::time::timeout(
+        let line = match tokio::time::timeout(
             std::time::Duration::from_secs(15),
             stdout_lines.next_line(),
         )
         .await
-        .unwrap_or_else(|_| {
-            panic!(
+        {
+            Err(_) => panic!(
                 "Astra must bind the streamed run; models={}, chats={}, stdout so far: {stdout}",
                 model_count.load(Ordering::SeqCst),
                 chat_count.load(Ordering::SeqCst),
-            )
-        })
-        .expect("read Astra stdout")
-        .unwrap_or_else(|| {
-            panic!("Astra exited before binding the streamed run; stdout: {stdout}")
-        });
+            ),
+            Ok(Err(error)) => panic!("read Astra stdout: {error}; stdout so far: {stdout}"),
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) => {
+                let stderr = stderr_task.await.expect("join active-stream stderr reader");
+                panic!(
+                    "Astra exited before binding the streamed run; stdout: {stdout}; stderr: {stderr}"
+                )
+            }
+        };
         stdout.push_str(&line);
         stdout.push('\n');
         let bound = serde_json::from_str::<serde_json::Value>(&line)
@@ -363,13 +380,7 @@ async fn active_stream_closed_after_run_binding_cancels_exact_server_run() {
         .await
         .expect("Astra must settle the closed output")
         .expect("wait for active-stream Astra");
-    let mut stderr = String::new();
-    tokio::io::AsyncReadExt::read_to_string(
-        &mut child.stderr.take().expect("piped stderr"),
-        &mut stderr,
-    )
-    .await
-    .expect("read final stderr");
+    let stderr = stderr_task.await.expect("join active-stream stderr reader");
     server.abort();
 
     assert_eq!(status.signal(), None, "closed stdout is not a signal");
@@ -390,9 +401,17 @@ fn assert_public_stdout_closes_quietly(args: &[&str]) {
     use std::os::unix::process::ExitStatusExt;
     use std::process::{Command, Stdio};
 
+    let home = tempfile::tempdir().expect("isolated Astra home");
     let mut child = Command::new(env!("CARGO_BIN_EXE_astra"))
         .args(args)
         .env("NO_COLOR", "1")
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("XDG_CACHE_HOME", home.path().join(".cache"))
+        .env("XDG_DATA_HOME", home.path().join(".local/share"))
+        .env_remove("ASTRA_ACCESS_TOKEN")
+        .env_remove("ASTRA_API_URL")
+        .env_remove("ASTRA_PROFILE")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

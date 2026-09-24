@@ -11,6 +11,7 @@ pub(crate) mod model_cooldown;
 /// Re-export compaction engine types and helpers for convenience.
 pub use cloud::compaction_engine::{CompactionEngine, PipelineOutcome, TokenBudget};
 pub(crate) mod context_pipeline_adapter;
+pub(crate) mod execution_config;
 pub mod harness_adapter;
 pub mod headless_tool_pipeline;
 pub mod inspection_service;

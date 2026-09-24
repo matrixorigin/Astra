@@ -2,7 +2,7 @@ mod test_support;
 
 use astra_services::{
     ActivateUserSkillVersion, CreateUserSkillSource, DatabasePersonalSkillStore,
-    PersonalSkillError, RecordUserSkillEvaluation, SubmitUserSkillVersion, skill_md_content_hash,
+    PersonalSkillError, SubmitUserSkillVersion, skill_md_content_hash,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -141,19 +141,31 @@ async fn l2_45_active_switch_accepts_only_published_version() {
         .await
         .unwrap();
     store
-        .activate_version(&user_id, &session_id, &skill_name, &v1.version_id)
+        .activate_version_with_expected(&user_id, &session_id, &skill_name, &v1.version_id, None)
         .await
         .unwrap();
     assert!(matches!(
         store
-            .activate_version(&user_id, &session_id, &skill_name, &v2.version_id)
+            .activate_version_with_expected(
+                &user_id,
+                &session_id,
+                &skill_name,
+                &v2.version_id,
+                Some(&v1.version_id),
+            )
             .await,
         Err(PersonalSkillError::VersionNotActivatable { .. })
     ));
     let typo_session = format!("typo-{}", Uuid::new_v4());
     assert!(matches!(
         store
-            .activate_version(&user_id, &typo_session, &skill_name, &v1.version_id)
+            .activate_version_with_expected(
+                &user_id,
+                &typo_session,
+                &skill_name,
+                &v1.version_id,
+                None,
+            )
             .await,
         Err(PersonalSkillError::SessionNotActive { .. })
     ));
@@ -186,80 +198,6 @@ async fn l2_45_active_switch_accepts_only_published_version() {
             .unwrap()
             .contains(&v1.version_id)
     );
-}
-
-#[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_46_skill_evaluations_use_independent_table_and_unified_denominator() {
-    let pool = setup_pool().await;
-    let store = DatabasePersonalSkillStore::new(pool.clone());
-    let (user_id, skill_name) = test_ids();
-    let version = store
-        .submit_version(&user_id, &skill_name, submit_request("v1", "published"))
-        .await
-        .unwrap();
-    let evaluation = store
-        .record_evaluation(
-            &user_id,
-            &skill_name,
-            RecordUserSkillEvaluation {
-                source_id: version.source_id.clone(),
-                version_id: version.version_id.clone(),
-                run_id: None,
-                hits: 7,
-                suspects: 10,
-                false_positives: 2,
-                payload_json: Some(json!({"denominator": "suspects", "hit_rate": 0.7})),
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(evaluation.owner_user_id, user_id);
-    assert_eq!(evaluation.hits, 7);
-    assert_eq!(evaluation.suspects, 10);
-    let foreign_user_id = Uuid::new_v4().to_string();
-    let rejected = store
-        .record_evaluation(
-            &foreign_user_id,
-            &skill_name,
-            RecordUserSkillEvaluation {
-                source_id: version.source_id.clone(),
-                version_id: version.version_id.clone(),
-                run_id: Some(format!("run-{}", Uuid::new_v4())),
-                hits: 1,
-                suspects: 1,
-                false_positives: 0,
-                payload_json: Some(json!({"should_not_insert": true})),
-            },
-        )
-        .await
-        .expect_err("foreign owner must not record evaluation for another user's skill version");
-    assert!(
-        matches!(
-            rejected,
-            PersonalSkillError::RunNotFound {
-                ref owner_user_id,
-                ref run_id,
-                ..
-            } if owner_user_id == &foreign_user_id && !run_id.is_empty()
-        ),
-        "unexpected foreign-owner error: {rejected:?}"
-    );
-    let row = sqlx::query(
-        "SELECT
-          (SELECT COUNT(*) FROM user_skill_evaluations WHERE owner_user_id = ? AND version_id = ?) AS eval_count,
-          (SELECT COUNT(*) FROM user_skill_evaluations WHERE owner_user_id = ?) AS foreign_eval_count,
-          (SELECT COUNT(*) FROM session_state_items WHERE category = 'skill_evaluation') AS state_count",
-    )
-    .bind(&user_id)
-    .bind(&version.version_id)
-    .bind(&foreign_user_id)
-    .fetch_one(pool.get())
-    .await
-    .unwrap();
-    assert_eq!(row.try_get::<i64, _>("eval_count").unwrap(), 1);
-    assert_eq!(row.try_get::<i64, _>("foreign_eval_count").unwrap(), 0);
-    assert_eq!(row.try_get::<i64, _>("state_count").unwrap(), 0);
 }
 
 #[tokio::test]
@@ -315,7 +253,13 @@ async fn l2_48_active_personal_skill_content_is_exactly_session_and_owner_scoped
         .await
         .unwrap();
     store
-        .activate_version(&user_id, &session_a, &skill_name, &version.version_id)
+        .activate_version_with_expected(
+            &user_id,
+            &session_a,
+            &skill_name,
+            &version.version_id,
+            None,
+        )
         .await
         .unwrap();
     let active = store
@@ -421,12 +365,18 @@ async fn l3_16_s13_seven_version_iteration_append_only_and_structured_switch_bac
     }
     let v2 = versions[1].clone();
     store
-        .activate_version(&user_id, &session_id, &skill_name, &v2.version_id)
+        .activate_version_with_expected(&user_id, &session_id, &skill_name, &v2.version_id, None)
         .await
         .unwrap();
     assert!(
         store
-            .activate_version(&user_id, &session_id, &skill_name, &versions[6].version_id)
+            .activate_version_with_expected(
+                &user_id,
+                &session_id,
+                &skill_name,
+                &versions[6].version_id,
+                Some(&v2.version_id),
+            )
             .await
             .is_err(),
         "quarantined version must be ready for quarantine enforcement"
@@ -459,5 +409,124 @@ async fn l3_16_s13_seven_version_iteration_append_only_and_structured_switch_bac
     let _structured_request = ActivateUserSkillVersion {
         session_id,
         version_id: v2.version_id,
+        expected_active_version_id: None,
     };
+}
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn activation_capacity_serializes_additions_and_preserves_runnable_replacements() {
+    let pool = setup_pool().await;
+    let store = DatabasePersonalSkillStore::new(pool.clone());
+    let (user_id, prefix) = test_ids();
+    let session_id = format!("session-{}", Uuid::new_v4());
+    insert_session(&pool, &session_id, &user_id).await;
+    let limit = astra_services::personal_skills::MAX_ACTIVE_PERSONAL_SKILLS;
+    let mut versions = Vec::new();
+    for index in 0..=limit {
+        let name = format!("{prefix}-{index}");
+        let version = store
+            .submit_version(&user_id, &name, submit_request("v1", "published"))
+            .await
+            .unwrap();
+        if index < limit - 1 {
+            store
+                .activate_version_with_expected(
+                    &user_id,
+                    &session_id,
+                    &name,
+                    &version.version_id,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        versions.push(version);
+    }
+    let left = &versions[limit - 1];
+    let right = &versions[limit];
+    let (a, b) = tokio::join!(
+        store.activate_version_with_expected(
+            &user_id,
+            &session_id,
+            &left.skill_name,
+            &left.version_id,
+            None
+        ),
+        store.activate_version_with_expected(
+            &user_id,
+            &session_id,
+            &right.skill_name,
+            &right.version_id,
+            None
+        ),
+    );
+    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+    let rejected = if a.is_err() { left } else { right };
+    let error = a.err().or(b.err()).unwrap();
+    assert!(
+        matches!(error, PersonalSkillError::ActivationLimitReached { .. }),
+        "{error}"
+    );
+    let events_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE session_id = ?")
+            .bind(&session_id)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+    assert!(matches!(
+        store
+            .activate_version_with_expected(
+                &user_id,
+                &session_id,
+                &rejected.skill_name,
+                &rejected.version_id,
+                None
+            )
+            .await,
+        Err(PersonalSkillError::ActivationLimitReached { .. })
+    ));
+    let events_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE session_id = ?")
+            .bind(&session_id)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+    assert_eq!(
+        events_before, events_after,
+        "rejected activation must not append events"
+    );
+    let before = store
+        .load_active_for_session(&user_id, &session_id)
+        .await
+        .unwrap();
+    assert_eq!(before.len(), limit);
+    let replacement = store
+        .submit_version(
+            &user_id,
+            &versions[0].skill_name,
+            submit_request("v2", "published"),
+        )
+        .await
+        .unwrap();
+    store
+        .activate_version_with_expected(
+            &user_id,
+            &session_id,
+            &replacement.skill_name,
+            &replacement.version_id,
+            Some(&versions[0].version_id),
+        )
+        .await
+        .unwrap();
+    let after = store
+        .load_active_for_session(&user_id, &session_id)
+        .await
+        .unwrap();
+    assert_eq!(after.len(), limit);
+    assert!(
+        after
+            .iter()
+            .any(|active| active.version_id == replacement.version_id)
+    );
 }

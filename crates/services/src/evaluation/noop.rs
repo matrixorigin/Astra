@@ -20,9 +20,6 @@ impl EvaluationService for UnconfiguredEvaluationService {
     async fn detect_drift(&self, _: &str) -> ServiceResult<DriftDetectResponse> {
         Err(internal_error("evaluation service not configured"))
     }
-    async fn get_gate_history(&self, _: &str, _: i32) -> ServiceResult<GateHistoryResponse> {
-        Err(internal_error("evaluation service not configured"))
-    }
     async fn get_calibration(
         &self,
         _: &str,
@@ -44,19 +41,6 @@ impl EvaluationService for UnconfiguredEvaluationService {
         _: &str,
         _: SessionQualityAssessmentRequest,
     ) -> ServiceResult<()> {
-        Err(internal_error("evaluation service not configured"))
-    }
-    async fn validate_gate(
-        &self,
-        _: &str,
-        _: GateValidateRequest,
-    ) -> ServiceResult<GateValidateResponse> {
-        Err(internal_error("evaluation service not configured"))
-    }
-    async fn run_drift_pipeline(&self, _: &str) -> ServiceResult<DriftPipelineResponse> {
-        Err(internal_error("evaluation service not configured"))
-    }
-    async fn run_closed_loop(&self, _: &str, _: i32, _: bool) -> ServiceResult<ClosedLoopResponse> {
         Err(internal_error("evaluation service not configured"))
     }
     async fn trust_report(&self, _: &str, _: &str, _: i32) -> ServiceResult<TrustReportResponse> {

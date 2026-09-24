@@ -9,40 +9,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::compaction_types::CompactionTier;
 use crate::section_types::SectionKind;
-/// Pressure threshold above which schema trimming begins.
-/// Shared with `microcompact::AdaptiveCompactConfig::from_pressure()`.
-pub const PRESSURE_TRIM_SCHEMAS: f64 = 0.60;
-/// Pressure threshold above which message history compaction activates.
-pub const PRESSURE_COMPACT_HISTORY: f64 = 0.75;
-/// Pressure threshold above which aggressive pruning engages.
-pub const PRESSURE_AGGRESSIVE_PRUNE: f64 = 0.90;
+pub use astra_turn_types::context_execution::{
+    CompactionThresholds, PRESSURE_AGGRESSIVE_PRUNE, PRESSURE_COMPACT_HISTORY,
+    PRESSURE_TRIM_SCHEMAS,
+};
 
-/// Select the compaction tier from a raw or predictive pressure value.
-///
-/// Thresholds are defined as constants (`PRESSURE_TRIM_SCHEMAS`,
-/// `PRESSURE_COMPACT_HISTORY`, `PRESSURE_AGGRESSIVE_PRUNE`) shared with
-/// the microcompact layer to eliminate comment-only alignment.
+/// Select a tier from the admitted policy, never process-wide thresholds.
 #[must_use]
-pub fn select_compaction_tier(pressure: f64) -> CompactionTier {
-    if pressure >= PRESSURE_AGGRESSIVE_PRUNE {
-        CompactionTier::AggressivePrune
-    } else if pressure >= PRESSURE_COMPACT_HISTORY {
-        CompactionTier::CompactHistory
-    } else if pressure >= PRESSURE_TRIM_SCHEMAS {
-        CompactionTier::TrimSchemas
-    } else {
-        CompactionTier::Normal
-    }
+pub fn select_compaction_tier(pressure: f64, thresholds: CompactionThresholds) -> CompactionTier {
+    thresholds.select_tier(pressure)
 }
 
-/// Gated tier selection: predictive can only INCREASE the tier, never
-/// decrease it below what raw pressure alone would select. This prevents
-/// a temporarily inflated reserve estimate from under-compacting.
+/// Predictive pressure can escalate, never lower the raw-pressure tier.
 #[must_use]
-pub fn select_tier_gated(raw_pressure: f64, predictive_pressure: f64) -> CompactionTier {
-    let raw_tier = select_compaction_tier(raw_pressure);
-    let predictive_tier = select_compaction_tier(predictive_pressure);
-    raw_tier.max(predictive_tier)
+pub fn select_tier_gated(
+    raw_pressure: f64,
+    predictive_pressure: f64,
+    thresholds: CompactionThresholds,
+) -> CompactionTier {
+    select_compaction_tier(raw_pressure, thresholds)
+        .max(select_compaction_tier(predictive_pressure, thresholds))
 }
 
 /// Token budget allocated per section kind.
@@ -152,22 +138,71 @@ mod tests {
 
     #[test]
     fn tier_from_pressure_boundaries() {
-        assert_eq!(select_compaction_tier(0.55), CompactionTier::Normal);
-        assert_eq!(select_compaction_tier(0.60), CompactionTier::TrimSchemas);
-        assert_eq!(select_compaction_tier(0.65), CompactionTier::TrimSchemas);
-        assert_eq!(select_compaction_tier(0.75), CompactionTier::CompactHistory);
-        assert_eq!(select_compaction_tier(0.80), CompactionTier::CompactHistory);
         assert_eq!(
-            select_compaction_tier(0.90),
+            select_compaction_tier(0.55, CompactionThresholds::default()),
+            CompactionTier::Normal
+        );
+        assert_eq!(
+            select_compaction_tier(0.60, CompactionThresholds::default()),
+            CompactionTier::Normal
+        );
+        assert_eq!(
+            select_compaction_tier(0.65, CompactionThresholds::default()),
+            CompactionTier::TrimSchemas
+        );
+        assert_eq!(
+            select_compaction_tier(0.75, CompactionThresholds::default()),
+            CompactionTier::TrimSchemas
+        );
+        assert_eq!(
+            select_compaction_tier(0.80, CompactionThresholds::default()),
+            CompactionTier::CompactHistory
+        );
+        assert_eq!(
+            select_compaction_tier(0.90, CompactionThresholds::default()),
             CompactionTier::AggressivePrune
         );
         assert_eq!(
-            select_compaction_tier(0.92),
+            select_compaction_tier(0.92, CompactionThresholds::default()),
             CompactionTier::AggressivePrune
         );
         assert_eq!(
-            select_compaction_tier(1.05),
+            select_compaction_tier(1.05, CompactionThresholds::default()),
             CompactionTier::AggressivePrune
+        );
+    }
+
+    #[test]
+    fn custom_thresholds_preserve_predictive_escalation_and_raw_floor() {
+        use astra_turn_types::context_execution::{CompactConfig, ContextBudget};
+        let policy = ContextBudget::resolve(
+            Some(200_000),
+            Some(16_384),
+            0.6,
+            6,
+            8_000,
+            CompactConfig::default(),
+        );
+        let thresholds = policy.compaction_thresholds();
+        assert_eq!(
+            select_tier_gated(0.30, 0.65, thresholds),
+            CompactionTier::CompactHistory
+        );
+        assert_eq!(
+            select_tier_gated(0.65, 0.30, thresholds),
+            CompactionTier::CompactHistory
+        );
+        assert_eq!(
+            select_tier_gated(0.65, 0.70, thresholds),
+            CompactionTier::AggressivePrune
+        );
+        assert_eq!(
+            select_compaction_tier(0.60, thresholds),
+            CompactionTier::TrimSchemas
+        );
+        assert_eq!(
+            select_compaction_tier(0.60001, thresholds),
+            CompactionTier::CompactHistory
         );
     }
 
@@ -176,11 +211,11 @@ mod tests {
         let mut r = RecoveryState::default();
         r.record_ptl_error();
         let base = CompactionTier::Normal;
-        let escalated = base.escalate_for_recovery(&r);
+        let escalated = base.escalate_for_recovery(r.consecutive_ptl_errors);
         assert!(escalated > base, "1 PTL should escalate Normal");
 
         r.record_ptl_error();
-        let escalated2 = CompactionTier::Normal.escalate_for_recovery(&r);
+        let escalated2 = CompactionTier::Normal.escalate_for_recovery(r.consecutive_ptl_errors);
         assert!(
             escalated2 >= CompactionTier::CompactHistory,
             "2 PTL should reach CompactHistory+"
@@ -198,12 +233,12 @@ mod tests {
     fn gated_tier_never_deescalates() {
         // raw = 0.80 (CompactHistory), predictive = 0.55 (Normal)
         // Gated should stay at CompactHistory, not drop to Normal
-        let tier = select_tier_gated(0.80, 0.55);
+        let tier = select_tier_gated(0.80, 0.55, CompactionThresholds::default());
         assert_eq!(tier, CompactionTier::CompactHistory);
 
         // raw = 0.55 (Normal), predictive = 0.80 (CompactHistory)
         // Gated should escalate to CompactHistory
-        let tier2 = select_tier_gated(0.55, 0.80);
+        let tier2 = select_tier_gated(0.55, 0.80, CompactionThresholds::default());
         assert_eq!(tier2, CompactionTier::CompactHistory);
     }
 
@@ -264,9 +299,9 @@ mod tests {
             raw in 0.0f64..1.5,
             predictive in 0.0f64..1.5,
         ) {
-            let gated = select_tier_gated(raw, predictive);
-            prop_assert!(gated >= select_compaction_tier(raw));
-            prop_assert!(gated >= select_compaction_tier(predictive));
+            let gated = select_tier_gated(raw, predictive, CompactionThresholds::default());
+            prop_assert!(gated >= select_compaction_tier(raw, CompactionThresholds::default()));
+            prop_assert!(gated >= select_compaction_tier(predictive, CompactionThresholds::default()));
         }
     }
 

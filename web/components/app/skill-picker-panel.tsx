@@ -4,6 +4,7 @@ import { ArrowLeft, Check, Loader2, Search } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { useSkillCatalog } from '@/hooks/use-skill-catalog';
 import type { SkillSummary } from '@/lib/api/types';
+import { PersonalSkillPicker } from '@/components/app/personal-skill-picker';
 import { cn } from '@/lib/utils/cn';
 
 type SkillPickerPanelProps = {
@@ -29,6 +30,7 @@ function selectedSet(skills: string[]) {
 }
 
 export function SkillPickerPanel({ selected, onChange, onBack }: SkillPickerPanelProps) {
+  const [personal, setPersonal] = useState(false);
   const [query, setQuery] = useState('');
   const {
     items,
@@ -65,6 +67,8 @@ export function SkillPickerPanel({ selected, onChange, onBack }: SkillPickerPane
     onChange([...next].sort((left, right) => left.localeCompare(right)));
   }
 
+  if (personal) return <PersonalSkillPicker onBack={() => setPersonal(false)} />;
+
   return (
     <div className="w-96 max-w-[calc(100vw-2rem)]">
       <div className="flex items-center gap-2 px-1 pb-2">
@@ -82,6 +86,7 @@ export function SkillPickerPanel({ selected, onChange, onBack }: SkillPickerPane
         </div>
       </div>
 
+      <button type="button" onClick={() => setPersonal(true)} className="mb-3 text-sm text-accent">我的 Skill：选择已发布版本并启用到会话</button>
       <label className="flex h-9 items-center gap-2 rounded-control border border-border bg-surface px-3 focus-within:border-accent">
         <Search className="size-4 shrink-0 text-text-muted" />
         <input

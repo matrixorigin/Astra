@@ -22,6 +22,7 @@ futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+sha1 = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "signal", "time"] }
 tokio-util = { workspace = true, features = ["io"] }
 tokio-tungstenite = { workspace = true }
@@ -38,6 +39,7 @@ tempfile.workspace = true
 astra-runtime-env.workspace = true
 astra-credentials.workspace = true
 astra-tools.workspace = true
+astra-sandbox.workspace = true
 astra-server-types.workspace = true
 astra-turn-types.workspace = true
 thiserror.workspace = true

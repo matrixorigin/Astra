@@ -322,6 +322,7 @@ impl DatabaseModelService {
             api_key: catalog.api_key,
             base_url: format!("{}/v1", provider.settings.genesis_url),
             provider: "openai".into(),
+            pricing: None,
             cache_capability: None,
             thinking_capability: None,
             fixed_temperature: None,

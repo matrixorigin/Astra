@@ -78,6 +78,7 @@ impl MockLoopState {
 
     fn build_session_context(&self) -> SessionContext {
         SessionContext {
+            compaction_thresholds: Default::default(),
             session_id: self.session_id.clone(),
             run_id: "run-1".into(),
             model_id: self.model_id.clone(),

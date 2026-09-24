@@ -114,7 +114,6 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 | Triggers | P1 | `/triggers`, fire, delete | `wf_triggers` | `product_matrix_*` |
 | Skills / introspection | P1 | `/skills`, `/introspection/*` | mixed | `product_matrix_*` |
 | Evaluation | P1 | `/evaluation/*` reads | — | `product_matrix_*`, `e2e_matrix_evaluation_reads` |
-| Evaluation (writes) | P1 | `POST` gate/validate, drift/run, loop | — | — (no system E2E; add when implementations return success) |
 | Marketplace | P1 | quality report, stats, search | marketplace stats tables | `product_matrix_*` |
 | Chat (server-owned SSE) | P0 | `POST /chat/stream` | `agent_events`, `session_transcript_items`, audit/session projections | `product_matrix_*`, `e2e_matrix_chat_stream_session_info`, `e2e_matrix_edge_callback_http_boundary_failures`, `e2e_matrix_saas_edge_tool_result_success_path`, duplicate/mixed/out-of-order callback journeys |
 | Chat / runs | P0 | `POST /chat`, `/chat/stream`, `/chat/runs/*` | **In-memory** run store in `build_server_state` (not Matrix table today) | `e2e_matrix_chat_run_pause_resume_http`, `e2e_matrix_chat_stream_session_info` |
@@ -146,7 +145,7 @@ Same prefixes as [`router_builder` `all_api_groups_have_routes`](../../crates/ru
 | agents | `/agents` | Yes | Includes edge register path |
 | events | `/events` | Yes | |
 | skills | `/skills` | Partial | List/status; not publish/config/resources E2E |
-| evaluation | `/evaluation/` | Partial | Reads in `product_matrix_*`; POST write paths not covered in system E2E until implemented; training-data extract/export not in system E2E |
+| evaluation | `/evaluation/` | Partial | Reads in `product_matrix_*`; durable experiment prepare/start/assess have focused lifecycle DB tests; training-data extract/export not in system E2E |
 | introspection | `/introspection/` | Yes | |
 | branches | `/branches` | Partial | `POST /branches/cost-estimate` in `e2e_matrix_branches_cost_estimate_http`; create/merge/diff not in system E2E |
 | marketplace | `/marketplace/` | Partial | Quality report / stats / search; not full install/upgrade/rollback/credentials |
@@ -170,7 +169,6 @@ Additional route families in `router_builder` not named above: **memory** (`/mem
 ## Future work
 
 - **Runs + DB**: when `RunStateStore` is backed by Matrix for `build_server_state`, add SQL assertions alongside `e2e_matrix_chat_run_pause_resume_http`.
-- **Evaluation writes**: add a focused test when `validate_gate` / `run_drift_pipeline` / `run_closed_loop` return **200** with stable response shapes.
 - **Branches / admin HTTP** (beyond cost estimate + token list): optional deeper journeys when routes stabilize.
 - **`/chat/ws`**, **successful delegation execute** (long-running): optional fixtures; validation-only delegation is in `e2e_matrix_delegate_http_boundaries`.
 - **Teams execute**: optional `system_matrix_http_e2e` for `POST /teams/{name}/execute` with real `ServerSubRunExecutor` (long-running; not added by default). CRUD/snapshots/DB for `/teams` are in `e2e_matrix_team_*`.

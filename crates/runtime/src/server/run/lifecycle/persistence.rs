@@ -1040,7 +1040,64 @@ pub(crate) async fn persist_server_loop_canonical_terminal_settlement(
     state: &AgenticLoopState,
     settlement: CanonicalTerminalSettlement<'_>,
 ) -> Result<CanonicalTerminalSettlementCommit, String> {
-    persist_server_loop_canonical_append_inner(pool, append, state, Some(settlement)).await
+    let mut events = Vec::with_capacity(settlement.events.len() + 2);
+    if let Some(receipt) =
+        terminal_output_receipt_event(&append, state, settlement.expected_owner_generation)
+    {
+        events.push(receipt);
+    }
+    events.extend_from_slice(settlement.events);
+    events.push(
+        super::AgenticRunLifecycleService::finalized_accounting_event(
+            state,
+            settlement.expected_owner_generation,
+        ),
+    );
+    persist_server_loop_canonical_append_inner(
+        pool,
+        append,
+        state,
+        Some(CanonicalTerminalSettlement {
+            events: &events,
+            ..settlement
+        }),
+    )
+    .await
+}
+
+/// Address the exact assistant content committed by the terminal transaction.
+/// This is a persistence receipt, not a claim that the task or model completed
+/// successfully. Empty/unpersisted output deliberately has no receipt.
+fn terminal_output_receipt_event(
+    append: &CanonicalLoopAppend<'_>,
+    state: &AgenticLoopState,
+    generation: u64,
+) -> Option<Value> {
+    if !append.include_terminal_assistant {
+        return None;
+    }
+    let item = terminal_assistant_transcript_item(
+        append.user_id,
+        append.session_id,
+        append.run_id,
+        append.trace_context.as_ref(),
+        append.user_message,
+        state,
+    )?;
+    Some(json!({
+        "event_type": "run_output_recorded",
+        "idempotency_key": format!("run-output-recorded:{generation}"),
+        "data": {
+            "schema_version": 1,
+            "owner_user_id": append.user_id,
+            "session_id": append.session_id,
+            "run_id": append.run_id,
+            "run_generation": generation,
+            "source_event_id": item.source_event_id,
+            "content_hash": astra_services::evaluation::content_fingerprint(&item.content),
+            "content_bytes": item.content.len(),
+        },
+    }))
 }
 
 async fn persist_server_loop_canonical_append_inner(
@@ -3121,8 +3178,12 @@ pub(crate) async fn append_session_transcript_items_admitted_in_tx(
             membership.push_bind(&item.source_event_id);
         }
         membership.push(
-            ") SELECT MIN(c.input_ordinal) AS input_ordinal
+            ") SELECT c.input_ordinal, first_input.input_ordinal AS first_ordinal,
+                      stored.item_seq, stored.run_id, stored.role, stored.content
              FROM candidates c
+             JOIN (SELECT source_event_id, MIN(input_ordinal) AS input_ordinal
+                   FROM candidates GROUP BY source_event_id) first_input
+               ON first_input.source_event_id = c.source_event_id
              LEFT JOIN session_transcript_items stored
                ON stored.source_event_id = c.source_event_id
               AND stored.user_id = ",
@@ -3130,14 +3191,32 @@ pub(crate) async fn append_session_transcript_items_admitted_in_tx(
         membership.push_bind(user_id);
         membership.push(" AND stored.session_id = ");
         membership.push_bind(session_id);
-        membership.push(
-            " WHERE stored.item_seq IS NULL
-              GROUP BY c.source_event_id ORDER BY input_ordinal ASC",
-        );
-        let ordinals = membership
-            .build_query_scalar::<i64>()
-            .fetch_all(&mut **tx)
-            .await?;
+        membership.push(" ORDER BY c.input_ordinal ASC");
+        let membership_rows = membership.build().fetch_all(&mut **tx).await?;
+        let mut ordinals = Vec::new();
+        for row in membership_rows {
+            let ordinal = row.try_get::<i64, _>("input_ordinal")?;
+            let first = row.try_get::<i64, _>("first_ordinal")?;
+            let item = &chunk[ordinal as usize];
+            let first_item = &chunk[first as usize];
+            let stored = row.try_get::<Option<i64>, _>("item_seq")?.is_some();
+            let same_input = item.run_id == first_item.run_id
+                && item.role == first_item.role
+                && item.content == first_item.content;
+            let same_stored = !stored
+                || (row.try_get::<Option<String>, _>("run_id")? == item.run_id
+                    && row.try_get::<String, _>("role")? == item.role
+                    && row.try_get::<String, _>("content")? == item.content);
+            if !same_input || !same_stored {
+                return Err(sqlx::Error::Protocol(format!(
+                    "transcript source event {} conflicts with persisted content",
+                    item.source_event_id
+                )));
+            }
+            if !stored && ordinal == first {
+                ordinals.push(ordinal);
+            }
+        }
         if !ordinals.is_empty() && next_seq.is_none() {
             next_seq = Some(
                 sqlx::query_scalar::<_, i64>(
@@ -3702,6 +3781,23 @@ mod tests {
                 .iter()
                 .any(|item| { item.role == "assistant" && item.content == "durable final answer" })
         );
+        let receipt = terminal_output_receipt_event(&append, &state, 7).unwrap();
+        let assistant = items.iter().find(|item| item.role == "assistant").unwrap();
+        assert_eq!(
+            receipt["data"]["source_event_id"],
+            assistant.source_event_id
+        );
+        assert_eq!(
+            receipt["data"]["content_hash"],
+            astra_services::evaluation::content_fingerprint(&assistant.content)
+        );
+        assert_eq!(receipt["data"]["run_generation"], 7);
+        assert_ne!(
+            receipt,
+            terminal_output_receipt_event(&append, &state, 8).unwrap()
+        );
+        state.final_text.clear();
+        assert!(terminal_output_receipt_event(&append, &state, 7).is_none());
     }
 
     #[tokio::test]
@@ -6456,26 +6552,28 @@ mod tests {
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
     async fn canonical_terminal_success_commits_evidence_usage_and_terminal_together() {
         for with_buffer in [false, true] {
-            assert_canonical_terminal_replay(with_buffer, None).await;
+            assert_canonical_terminal_replay(with_buffer, &[]).await;
         }
     }
 
     #[tokio::test]
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
     async fn canonical_terminal_rejects_colliding_evidence_before_settlement() {
-        for event_type in [
-            "user_query",
-            "llm_response",
-            "user_message",
-            "llm_round_completed",
-            "tool_call_started",
-            "tool_call_completed",
-        ] {
-            assert_canonical_terminal_replay(true, Some(event_type)).await;
-        }
+        assert_canonical_terminal_replay(
+            true,
+            &[
+                "user_query",
+                "llm_response",
+                "user_message",
+                "llm_round_completed",
+                "tool_call_started",
+                "tool_call_completed",
+            ],
+        )
+        .await;
     }
 
-    async fn assert_canonical_terminal_replay(with_buffer: bool, collision: Option<&str>) {
+    async fn assert_canonical_terminal_replay(with_buffer: bool, collisions: &[&str]) {
         let pool = setup_pool().await;
         let db = pool.get().clone();
         let user_id = Uuid::new_v4().to_string();
@@ -6572,6 +6670,10 @@ mod tests {
         } else {
             None
         };
+        state.total_prompt = 37;
+        state.total_completion = 17;
+        state.total_tool_calls = 6;
+        state.has_any_usage = true;
         let terminal_events = vec![
             json!({
                 "event_type": "text_done",
@@ -6608,7 +6710,7 @@ mod tests {
             completion_tokens: 17,
             tool_calls: 6,
         };
-        if let Some(event_type) = collision {
+        if !collisions.is_empty() {
             // First capture exact evidence through the ordinary append boundary,
             // where valid siblings remain independent. Inject a hash mismatch
             // without changing identity/content, as with a metadata collision.
@@ -6616,6 +6718,10 @@ mod tests {
                 .persist_core_and_trace_in_transaction(&state)
                 .await
                 .expect("capture evidence before injecting a conflicting hash");
+        }
+        // Reuse the same frozen evidence; every rejected corruption must leave
+        // the run unchanged before restoring it and checking the next event.
+        for &event_type in collisions {
             let event_id: String = sqlx::query_scalar(
                 "SELECT event_id FROM agent_events
                  WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = ?",
@@ -6686,8 +6792,8 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(terminals, 0);
-            // Restore the fixture; the same state must now commit, replay, and
-            // resolve a lost acknowledgement through the checks below.
+            // Restore this event before the next corruption. Once all variants
+            // reject, the same run must commit, replay, and resolve a lost ack.
             sqlx::query(
                 "UPDATE agent_events SET payload_hash = ? WHERE user_id = ? AND event_id = ?",
             )
@@ -6704,7 +6810,6 @@ mod tests {
                 .expect("commit canonical terminal settlement");
         let committed_count = assert_session_event_count(&db, &user_id, &session_id).await;
         assert!(committed_count > 0);
-        assert_eq!(commit.terminal_events, terminal_events);
         assert!(commit.terminal_assistant_source_event_id.is_some());
         if let Some(execution_started_at) = execution_started_at {
             let timestamps = sqlx::query(
@@ -6741,9 +6846,15 @@ mod tests {
         // Exercise the same authoritative resolver used after a lost COMMIT
         // acknowledgement, including its receipt and canonical-evidence checks.
         let request_append = append();
+        // The public entrypoint adds output/accounting receipts before calling
+        // this lower-level resolver. Resolve that complete frozen batch here.
+        let resolution_settlement = CanonicalTerminalSettlement {
+            events: &commit.terminal_events,
+            ..settlement
+        };
         let receipts = DatabaseRunStateStore::new(pool.clone())
             .resolve_atomic_terminal_settlement(
-                atomic_terminal_request(&request_append, settlement),
+                atomic_terminal_request(&request_append, resolution_settlement),
                 None,
             )
             .await
@@ -6757,13 +6868,13 @@ mod tests {
             &pool,
             &append(),
             &state,
-            settlement,
+            resolution_settlement,
             Some(&receipts),
         )
         .await
         .expect("delayed lost-ack resolution retains the original capture")
         .expect("commit must remain authoritative");
-        assert_eq!(resolved.committed_events, terminal_events);
+        assert_eq!(resolved.committed_events, commit.terminal_events);
         assert_eq!(
             assert_session_event_count(&db, &user_id, &session_id).await,
             committed_count
@@ -6779,6 +6890,39 @@ mod tests {
             committed_count
         );
         assert_eq!(replay.terminal_events, commit.terminal_events);
+        let original_output = state.final_text.clone();
+        state.final_text = "changed replay output".into();
+        persist_server_loop_canonical_terminal_settlement(&pool, append(), &state, settlement)
+            .await
+            .expect_err("reject changed terminal output");
+        state.final_text = original_output;
+        assert_eq!(
+            &commit.terminal_events[1..commit.terminal_events.len() - 1],
+            terminal_events.as_slice()
+        );
+        let accounting = commit.terminal_events.last().unwrap();
+        assert_eq!(accounting["event_type"], "run_accounting_finalized");
+        assert_eq!(accounting["data"]["prompt_tokens"], 37);
+        assert_eq!(accounting["data"]["completion_tokens"], 17);
+        assert_eq!(accounting["data"]["tool_call_count"], 6);
+        let output_receipt = &commit.terminal_events[0];
+        assert_eq!(output_receipt["event_type"], "run_output_recorded");
+        assert_eq!(commit.terminal_events.len(), 4);
+        assert_eq!(output_receipt["data"]["owner_user_id"], user_id);
+        assert_eq!(output_receipt["data"]["session_id"], session_id);
+        assert_eq!(output_receipt["data"]["run_id"], run_id);
+        assert_eq!(
+            output_receipt["data"]["source_event_id"],
+            json!(commit.terminal_assistant_source_event_id)
+        );
+        assert_eq!(
+            output_receipt["data"]["content_hash"],
+            astra_services::evaluation::content_fingerprint("atomically committed answer")
+        );
+        assert_eq!(
+            output_receipt["data"]["content_bytes"],
+            "atomically committed answer".len()
+        );
         assert_eq!(
             replay.terminal_assistant_source_event_id,
             commit.terminal_assistant_source_event_id
@@ -6790,7 +6934,7 @@ mod tests {
             &pool,
             &append(),
             &state,
-            settlement,
+            resolution_settlement,
             Some(&receipts),
         )
         .await
@@ -6955,6 +7099,21 @@ mod tests {
             .await
             .expect("owner transcript persist");
 
+        persist_session_transcript_items(&pool, &owner_user_id, &session_id, &items)
+            .await
+            .expect("identical transcript replay");
+        let conflict = [TranscriptPersistItem {
+            run_id: Some(run_id.clone()),
+            role: "assistant",
+            content: "conflicting answer".into(),
+            payload: None,
+            source_event_id: items[2].source_event_id.clone(),
+        }];
+        let error = persist_session_transcript_items(&pool, &owner_user_id, &session_id, &conflict)
+            .await
+            .expect_err("conflicting transcript replay");
+        assert!(error.contains("conflicts with persisted content"));
+
         let owner_rows = sqlx::query(
             "SELECT role, content
              FROM session_transcript_items
@@ -7073,11 +7232,40 @@ mod tests {
         .await
         .expect("read column equality");
 
+        for cross_batch in [false, true] {
+            let mut conflicting = vec![make_item("new-conflict", "original")];
+            if cross_batch {
+                for index in 0..TRANSCRIPT_MEMBERSHIP_ROWS {
+                    conflicting.push(make_item(&format!("rollback-{index}"), "new"));
+                }
+            }
+            conflicting.push(make_item("new-conflict", "changed"));
+            persist_session_transcript_items(&pool, &owner_user_id, &session_id, &conflicting)
+                .await
+                .expect_err("conflicting duplicate must roll back every chunk");
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM session_transcript_items
+                 WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(&owner_user_id)
+            .bind(&session_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            assert_eq!(count, items.len() as i64 + 1);
+        }
+
         let mut mixed = vec![
-            make_item(&items[0].source_event_id, "conflicting replay"),
+            TranscriptPersistItem {
+                run_id: items[0].run_id.clone(),
+                role: items[0].role,
+                content: items[0].content.clone(),
+                payload: None,
+                source_event_id: items[0].source_event_id.clone(),
+            },
             make_item("within-chunk", "first within"),
-            make_item("WITHIN-CHUNK", "case variant"),
-            make_item("within-chunk", "conflicting duplicate"),
+            make_item("WITHIN-CHUNK", "first within"),
+            make_item("within-chunk", "first within"),
             make_item("across-chunks", "first across"),
             make_item("equal-text-one", "equal text"),
             make_item("equal-text-two", "equal text"),
@@ -7086,8 +7274,8 @@ mod tests {
         for index in 0..filler_count {
             mixed.push(make_item(&format!("filler-{index}"), &"x".repeat(6000)));
         }
-        mixed.push(make_item("ACROSS-CHUNKS", "case variant across"));
-        mixed.push(make_item("across-chunks", "conflicting across"));
+        mixed.push(make_item("ACROSS-CHUNKS", "first across"));
+        mixed.push(make_item("across-chunks", "first across"));
         mixed.push(make_item("last-new", "last"));
         persist_session_transcript_items(&pool, &owner_user_id, &session_id, &mixed)
             .await
@@ -7112,7 +7300,7 @@ mod tests {
         expected.push(("CaseProbe".into(), "probe".into()));
         expected.push(("within-chunk".into(), "first within".into()));
         if case_equivalent == 0 {
-            expected.push(("WITHIN-CHUNK".into(), "case variant".into()));
+            expected.push(("WITHIN-CHUNK".into(), "first within".into()));
         }
         expected.extend([
             ("across-chunks".into(), "first across".into()),
@@ -7123,7 +7311,7 @@ mod tests {
             expected.push((format!("filler-{index}"), "x".repeat(6000)));
         }
         if case_equivalent == 0 {
-            expected.push(("ACROSS-CHUNKS".into(), "case variant across".into()));
+            expected.push(("ACROSS-CHUNKS".into(), "first across".into()));
         }
         expected.push(("last-new".into(), "last".into()));
         assert_eq!(actual.len(), expected.len());
@@ -7146,7 +7334,7 @@ mod tests {
         .await
         .expect("first writer's uncommitted item");
         let overlapping = [
-            make_item("concurrent-shared", "second writer conflict"),
+            make_item("concurrent-shared", "first writer"),
             make_item("concurrent-new", "second writer new"),
         ];
         let mut waiting = Box::pin(persist_session_transcript_items(

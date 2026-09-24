@@ -110,12 +110,13 @@ async fn assert_no_summary(port: &dyn MemoriaPort) {
             session_facts: None,
         },
         Some(port),
-        Some(&CompactConfig {
+        &CompactConfig {
             enable_summary: true,
             summary_min_tier: CompactionTier::AggressivePrune,
             ..Default::default()
-        }),
+        },
         Some(&NoSummary),
+        &astra_turn_core::cloud_summary::canonical_summary_prompt_templates(),
     )
     .await;
 }

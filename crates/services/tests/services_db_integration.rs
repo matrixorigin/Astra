@@ -1791,18 +1791,6 @@ async fn cleanup_session_delete_fixture_for_owner(
     .execute(pool)
     .await;
 
-    let _ = sqlx::query(
-        "DELETE FROM user_skill_evaluations \
-         WHERE (owner_user_id, run_id) IN (
-             SELECT user_id, run_id FROM agent_runs
-             WHERE session_id = ? AND user_id = ?
-         )",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .execute(pool)
-    .await;
-
     for table in [
         "harness_citations",
         "harness_skill_rules",
@@ -7801,8 +7789,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
     let foreign_calibration_id = Uuid::new_v4().to_string();
     let owner_run_id = Uuid::new_v4().to_string();
     let foreign_run_id = Uuid::new_v4().to_string();
-    let owner_skill_eval_id = Uuid::new_v4().to_string();
-    let foreign_skill_eval_id = Uuid::new_v4().to_string();
     let owner_artifact_id = Uuid::new_v4().to_string();
     let foreign_artifact_id = Uuid::new_v4().to_string();
     let owner_workspace_id = format!("workspace-{}", Uuid::new_v4());
@@ -7935,14 +7921,9 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
     )
     .await;
 
-    for (user_id, run_id, evaluation_id, marker) in [
-        (&owner_user_id, &owner_run_id, &owner_skill_eval_id, "owner"),
-        (
-            &other_user_id,
-            &foreign_run_id,
-            &foreign_skill_eval_id,
-            "foreign",
-        ),
+    for (user_id, run_id) in [
+        (&owner_user_id, &owner_run_id),
+        (&other_user_id, &foreign_run_id),
     ] {
         sqlx::query(
             "INSERT INTO agent_runs \
@@ -7956,21 +7937,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         .execute(&pool)
         .await
         .expect("insert session run");
-
-        sqlx::query(
-            "INSERT INTO user_skill_evaluations \
-             (evaluation_id, owner_user_id, source_id, version_id, run_id, hits, suspects, false_positives, payload_json) \
-             VALUES (?, ?, ?, ?, ?, 1, 1, 0, ?)",
-        )
-        .bind(evaluation_id)
-        .bind(user_id)
-        .bind(format!("skill-source-{marker}"))
-        .bind(format!("skill-version-{marker}"))
-        .bind(run_id)
-        .bind(format!("{{\"marker\":\"{marker}\"}}"))
-        .execute(&pool)
-        .await
-            .expect("insert skill evaluation");
     }
 
     for (user_id, run_id) in [
@@ -8220,10 +8186,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         1
     );
     assert_eq!(
-        deleted_rows_for_table(&delete_audit, "user_skill_evaluations"),
-        1
-    );
-    assert_eq!(
         deleted_rows_for_table(&delete_audit, "workspace_records"),
         2
     );
@@ -8273,36 +8235,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
             "{label} foreign rows must not be touched by owner delete"
         );
     }
-
-    let owner_skill_eval_remaining = sqlx::query(
-        "SELECT COUNT(*) AS c FROM user_skill_evaluations WHERE owner_user_id = ? AND evaluation_id = ?",
-    )
-    .bind(&owner_user_id)
-    .bind(&owner_skill_eval_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count owner skill evaluation")
-    .try_get::<i64, _>("c")
-    .expect("decode owner skill evaluation count");
-    assert_eq!(
-        owner_skill_eval_remaining, 0,
-        "owner skill evaluation must be deleted through owner/run match"
-    );
-
-    let foreign_skill_eval_remaining = sqlx::query(
-        "SELECT COUNT(*) AS c FROM user_skill_evaluations WHERE owner_user_id = ? AND evaluation_id = ?",
-    )
-    .bind(&other_user_id)
-    .bind(&foreign_skill_eval_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count foreign skill evaluation")
-    .try_get::<i64, _>("c")
-    .expect("decode foreign skill evaluation count");
-    assert_eq!(
-        foreign_skill_eval_remaining, 1,
-        "foreign skill evaluation must not be touched by owner delete"
-    );
 
     let owner_edge_remaining = sqlx::query(
         "SELECT COUNT(*) AS c FROM agent_event_edges WHERE user_id = ? AND child_event_id = ?",
@@ -9080,11 +9012,12 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
         .await
         .expect("publish personal skill version fixture");
     state_projection_store
-        .activate_personal_skill_from_ui(
+        .activate_personal_skill_from_ui_with_expected(
             &user_id,
             &state_session,
             &active_skill_name,
             &active_skill_version.version_id,
+            None,
         )
         .await
         .expect("activate personal skill");

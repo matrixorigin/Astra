@@ -55,58 +55,127 @@ pub fn build_internal_http_client(
     }
 }
 
-/// Apply proxy settings from the environment to a `reqwest::ClientBuilder`.
-///
-/// Precedence (first match wins): `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`,
-/// `all_proxy`. For `HTTPS_PROXY`/`https_proxy` we register an HTTPS-scheme
-/// proxy; for `ALL_PROXY`/`all_proxy` we register an all-scheme proxy so that
-/// `socks5://` URLs (which only make sense as all-scheme) are honoured.
-///
-/// `NO_PROXY` / `no_proxy` is always respected via `reqwest::NoProxy::from_env`.
-///
-/// Malformed or empty proxy URLs are logged at warn level and skipped; the
-/// returned builder is always usable.
-pub fn apply_env_proxy(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-    let no_proxy = reqwest::NoProxy::from_env();
-    for var in &["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
-        let Ok(proxy_url) = std::env::var(var) else {
-            continue;
-        };
-        if proxy_url.is_empty() {
-            continue;
+/// Captured external-provider proxy policy. Debug and serialization deliberately
+/// do not expose private proxy addresses or credentials.
+#[derive(Clone)]
+pub struct ResolvedProxyConfig {
+    proxy: Option<reqwest::Proxy>,
+    private_binding: Vec<u8>,
+}
+
+impl std::fmt::Debug for ResolvedProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedProxyConfig")
+            .field("configured", &self.proxy.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResolvedProxyConfig {
+    /// Resolve the existing proxy precedence once. Malformed values are skipped.
+    pub fn capture() -> Self {
+        let no_proxy_raw = std::env::var("NO_PROXY")
+            .or_else(|_| std::env::var("no_proxy"))
+            .ok();
+        for (var, scope) in [
+            ("HTTPS_PROXY", "https"),
+            ("https_proxy", "https"),
+            ("ALL_PROXY", "all"),
+            ("all_proxy", "all"),
+        ] {
+            let Ok(proxy_url) = std::env::var(var) else {
+                continue;
+            };
+            if proxy_url.is_empty() {
+                continue;
+            }
+            if let Some(config) = Self::resolve(&proxy_url, scope, no_proxy_raw.as_deref()) {
+                tracing::info!(env_var = var, "captured provider proxy");
+                return config;
+            }
+            tracing::warn!(env_var = var, "invalid provider proxy; ignoring");
         }
-        let is_all = matches!(*var, "ALL_PROXY" | "all_proxy");
-        let parsed = if is_all {
-            reqwest::Proxy::all(&proxy_url)
-        } else {
-            reqwest::Proxy::https(&proxy_url)
-        };
-        match parsed {
-            Ok(mut proxy) => {
-                if let Some(np) = no_proxy.clone() {
-                    proxy = proxy.no_proxy(Some(np));
-                }
-                tracing::info!(
-                    target: "astra_core::net",
-                    env_var = *var,
-                    proxy = %proxy_url,
-                    "applying proxy from environment"
-                );
-                builder = builder.proxy(proxy);
-                return builder;
+        // With no explicit Astra proxy, reqwest's environment matcher also
+        // considers HTTP_PROXY. Its CGI guard disables the entire implicit
+        // matcher. Native OS proxy discovery is not enabled by Astra's reqwest
+        // feature configuration. Preserve this remaining environment behavior
+        // before disabling reqwest's ambient matcher in apply().
+        if std::env::var_os("REQUEST_METHOD").is_none()
+            && let Ok(raw) = std::env::var("HTTP_PROXY").or_else(|_| std::env::var("http_proxy"))
+        {
+            // The implicit matcher uses http::Uri, unlike Proxy's more
+            // permissive URL input. Invalid implicit values remain ignored.
+            if raw
+                .parse::<axum::http::Uri>()
+                .ok()
+                .filter(|uri| {
+                    matches!(
+                        uri.scheme_str(),
+                        None | Some("http" | "https" | "socks4" | "socks4a" | "socks5" | "socks5h")
+                    )
+                })
+                .and_then(|uri| uri.authority().cloned())
+                .is_some()
+                && let Some(config) = Self::resolve(&raw, "http", no_proxy_raw.as_deref())
+            {
+                return config;
             }
-            Err(e) => {
-                tracing::warn!(
-                    target: "astra_core::net",
-                    env_var = *var,
-                    proxy = %proxy_url,
-                    error = %e,
-                    "failed to parse proxy URL; ignoring"
-                );
-            }
+        }
+        Self {
+            proxy: None,
+            private_binding: b"astra:resolved-provider-proxy:v1:none".to_vec(),
         }
     }
-    builder
+
+    fn resolve(raw: &str, scope: &str, no_proxy_raw: Option<&str>) -> Option<Self> {
+        let proxy = match scope {
+            "https" => reqwest::Proxy::https(raw),
+            "http" => reqwest::Proxy::http(raw),
+            _ => reqwest::Proxy::all(raw),
+        }
+        .ok()?;
+        let no_proxy =
+            no_proxy_raw.map(|raw| reqwest::NoProxy::from_string(raw).unwrap_or_default());
+        // Proxy accepts schemeless addresses. Canonicalize the same address for
+        // private binding, but omit pure authentication material.
+        let mut route = reqwest::Url::parse(raw)
+            .ok()
+            .filter(|url| url.host_str().is_some())
+            .or_else(|| reqwest::Url::parse(&format!("http://{raw}")).ok())?;
+        route.set_username("").ok()?;
+        route.set_password(None).ok()?;
+        let mut private_binding = b"astra:resolved-provider-proxy:v1".to_vec();
+        for value in [scope, route.as_str(), no_proxy_raw.unwrap_or("")] {
+            private_binding.extend_from_slice(&(value.len() as u64).to_be_bytes());
+            private_binding.extend_from_slice(value.as_bytes());
+        }
+        Some(Self {
+            proxy: Some(proxy.no_proxy(no_proxy)),
+            private_binding,
+        })
+    }
+
+    /// Apply exactly the captured policy, without consulting process environment.
+    pub fn apply(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        let builder = builder.no_proxy();
+        match &self.proxy {
+            Some(proxy) => builder.proxy(proxy.clone()),
+            None => builder,
+        }
+    }
+
+    /// Only the caller's established private digest owner may project this material.
+    pub fn private_binding_digest<E>(
+        &self,
+        digest: impl FnOnce(&[u8]) -> Result<String, E>,
+    ) -> Result<String, E> {
+        digest(&self.private_binding)
+    }
+}
+
+/// Apply the canonical captured external-provider environment policy.
+pub fn apply_env_proxy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    ResolvedProxyConfig::capture().apply(builder)
 }
 
 /// Returns `true` when `url` targets the local host (`localhost`,
@@ -173,14 +242,129 @@ mod apply_env_proxy_tests {
 
     /// All four recognized env var names must be cleared for isolation, since
     /// `apply_env_proxy` reads them in precedence order.
-    const PROXY_VARS: &[&str] = &["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"];
+    const PROXY_VARS: &[&str] = &[
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        "REQUEST_METHOD",
+    ];
 
     fn clear_all() -> Vec<(&'static str, Option<String>)> {
         PROXY_VARS.iter().map(|v| (*v, None)).collect()
     }
 
     #[test]
-    fn no_env_vars_leaves_builder_unmodified() {
+    fn captured_proxy_binding_excludes_credentials_and_tracks_route_and_bypass() {
+        use super::ResolvedProxyConfig;
+        let first = ResolvedProxyConfig::resolve(
+            "http://alice:secret@proxy.example:8080",
+            "https",
+            Some("internal.example"),
+        )
+        .unwrap();
+        let rotated = ResolvedProxyConfig::resolve(
+            "http://bob:other@proxy.example:8080",
+            "https",
+            Some("internal.example"),
+        )
+        .unwrap();
+        assert_eq!(first.private_binding, rotated.private_binding);
+        for changed in [
+            ResolvedProxyConfig::resolve(
+                "http://proxy.example:8081",
+                "https",
+                Some("internal.example"),
+            ),
+            ResolvedProxyConfig::resolve(
+                "http://proxy.example:8080",
+                "all",
+                Some("internal.example"),
+            ),
+            ResolvedProxyConfig::resolve(
+                "http://proxy.example:8080",
+                "https",
+                Some("other.example"),
+            ),
+        ] {
+            assert_ne!(first.private_binding, changed.unwrap().private_binding);
+        }
+        let debug = format!("{first:?}");
+        for secret in ["alice", "secret", "proxy.example", "internal.example"] {
+            assert!(!debug.contains(secret));
+            if matches!(secret, "alice" | "secret") {
+                assert!(!String::from_utf8_lossy(&first.private_binding).contains(secret));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn captured_http_proxy_survives_environment_change() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().fallback(|| async { "captured proxy" }),
+            )
+            .await
+            .unwrap();
+        });
+        let mut vars = clear_all();
+        vars.iter_mut()
+            .find(|(name, _)| *name == "HTTP_PROXY")
+            .unwrap()
+            .1 = Some(proxy_url);
+        let captured = temp_env::with_vars(vars, super::ResolvedProxyConfig::capture);
+        let client = temp_env::with_vars(clear_all(), || {
+            captured
+                .apply(reqwest::Client::builder())
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .unwrap()
+        });
+        let response = client
+            .get("http://frozen-proxy.invalid/")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.text().await.unwrap(), "captured proxy");
+        server.abort();
+    }
+
+    #[test]
+    fn implicit_http_proxy_obeys_cgi_and_explicit_https_precedence() {
+        let mut vars = clear_all();
+        for (name, value) in &mut vars {
+            *value = match *name {
+                "HTTP_PROXY" => Some("http://proxy.example:8080".into()),
+                "REQUEST_METHOD" => Some("GET".into()),
+                _ => None,
+            };
+        }
+        temp_env::with_vars(vars, || {
+            assert!(super::ResolvedProxyConfig::capture().proxy.is_none());
+            temp_env::with_var(
+                "HTTPS_PROXY",
+                Some("http://secure-proxy.example:8080"),
+                || {
+                    let captured = super::ResolvedProxyConfig::capture();
+                    assert!(captured.proxy.is_some());
+                    assert!(
+                        String::from_utf8_lossy(&captured.private_binding)
+                            .contains("secure-proxy.example")
+                    );
+                },
+            );
+        });
+    }
+
+    #[test]
+    fn no_env_vars_builds_direct_client() {
         temp_env::with_vars(clear_all(), || {
             let builder = reqwest::Client::builder();
             let builder = apply_env_proxy(builder);

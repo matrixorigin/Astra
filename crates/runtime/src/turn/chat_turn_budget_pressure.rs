@@ -8,46 +8,17 @@ const ABSOLUTE_TRIM_SCHEMA_TOKENS: usize = 128_000;
 const ABSOLUTE_COMPACT_HISTORY_TOKENS: usize = 200_000;
 const ABSOLUTE_AGGRESSIVE_PRUNE_TOKENS: usize = 320_000;
 
-/// Same pressure value used when building `SelectionContext` for tool surface.
+/// Classify pressure against the same admitted policy used by wire assembly.
+/// Resolution belongs to the caller; this helper never reconstructs a budget
+/// from a model name, a raw window, or an already-reserved input token count.
 #[must_use]
-#[cfg(test)]
-fn budget_pressure_for_chat_turn(
-    messages: &[Value],
-    model: Option<&str>,
-    always_load_schema_tokens: usize,
-) -> f64 {
-    let estimated = prompts::estimate_tokens(messages, always_load_schema_tokens, 0);
-    let budget = prompts::budget_for_model(model);
-    budget_pressure_for_estimate(estimated, &budget)
-}
-
-#[must_use]
-pub fn budget_pressure_for_chat_turn_with_input_budget(
+pub fn budget_pressure_for_chat_turn(
     messages: &[Value],
     always_load_schema_tokens: usize,
-    effective_input_budget_tokens: u64,
+    budget: &prompts::ContextBudget,
 ) -> f64 {
     let estimated = prompts::estimate_tokens(messages, always_load_schema_tokens, 0);
-    if effective_input_budget_tokens == 0 {
-        return budget_pressure_for_estimate(estimated, &prompts::ContextBudget::default());
-    }
-    let budget = prompts::ContextBudget {
-        model_limit: effective_input_budget_tokens.min(usize::MAX as u64) as usize,
-        output_reserve_ratio: 0.0,
-        ..Default::default()
-    };
-    budget_pressure_for_estimate(estimated, &budget)
-}
-
-#[must_use]
-pub fn budget_pressure_for_chat_turn_with_context_window(
-    messages: &[Value],
-    always_load_schema_tokens: usize,
-    context_window_tokens: u32,
-) -> f64 {
-    let estimated = prompts::estimate_tokens(messages, always_load_schema_tokens, 0);
-    let budget = prompts::budget_for_model_with_override(None, Some(context_window_tokens));
-    budget_pressure_for_estimate(estimated, &budget)
+    budget_pressure_for_estimate(estimated, budget)
 }
 
 fn budget_pressure_for_estimate(estimated: usize, budget: &prompts::ContextBudget) -> f64 {
@@ -73,9 +44,22 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn test_budget(context_window: u32) -> prompts::ContextBudget {
+        crate::turn::execution_config::resolve_context_budget(
+            &astra_config::RuntimeConfig::default(),
+            Some(context_window),
+            Some(32_000),
+            prompts::CompactConfig::default(),
+        )
+    }
+
     #[test]
     fn budget_pressure_is_finite_for_minimal_messages() {
-        let p = budget_pressure_for_chat_turn(&[json!({"role":"user","content":"hi"})], None, 0);
+        let p = budget_pressure_for_chat_turn(
+            &[json!({"role":"user","content":"hi"})],
+            0,
+            &test_budget(200_000),
+        );
         assert!(p.is_finite());
     }
 
@@ -93,15 +77,15 @@ mod tests {
         }
 
         let pressure_without_schema =
-            budget_pressure_for_chat_turn_with_input_budget(&messages, 0, 80_000);
+            budget_pressure_for_chat_turn(&messages, 0, &test_budget(80_000));
         let pressure_with_schema =
-            budget_pressure_for_chat_turn_with_input_budget(&messages, 50_000, 80_000);
+            budget_pressure_for_chat_turn(&messages, 50_000, &test_budget(80_000));
 
         assert!(
             pressure_with_schema > pressure_without_schema,
             "schema tokens must increase pressure: without={pressure_without_schema}, with={pressure_with_schema}"
         );
-        // 50K schema tokens in an 80K effective input budget produce at least a tier jump
+        // 50K schema tokens in an explicitly resolved 80K window produce at least a tier jump
         // (Normal→TrimSchemas = +0.3). Without schema the 40 CJK messages
         // alone land in Normal (0.0), so the delta must be meaningful.
         assert!(
@@ -119,7 +103,7 @@ mod tests {
     /// Realistic scenario from session 540c37d1: ~130 messages (50+ turns
     /// with tool results), CJK content, ~50K tool schema tokens.
     /// Total estimated tokens should exceed ~81K (Compact trigger for
-    /// default 128K model) and cross TrimSchemas (pressure >= 0.3).
+    /// explicitly resolved 128K window) and cross TrimSchemas (pressure >= 0.3).
     #[test]
     fn realistic_cjk_session_reaches_compact_pressure() {
         let mut messages = Vec::new();
@@ -139,7 +123,7 @@ mod tests {
             }
         }
 
-        let pressure = budget_pressure_for_chat_turn_with_input_budget(&messages, 50_000, 128_000);
+        let pressure = budget_pressure_for_chat_turn(&messages, 50_000, &test_budget(128_000));
 
         // At minimum must trigger TrimSchemas (0.3).
         assert!(
@@ -173,7 +157,11 @@ mod tests {
                     json!({"role":"user","content": format!("请帮我分析和修复第{i}个代码问题")})
                 })
                 .collect();
-            pressures.push(budget_pressure_for_chat_turn(&messages, None, 40_000));
+            pressures.push(budget_pressure_for_chat_turn(
+                &messages,
+                40_000,
+                &test_budget(200_000),
+            ));
             let (cp, _) = crate::turn::agentic_loop::lifecycle::estimate_context_pressure(
                 &messages, 0, 40_000,
             );
@@ -201,40 +189,34 @@ mod tests {
     /// Empty messages + no schema = Normal tier (0.0)
     #[test]
     fn empty_messages_zero_schema_is_normal() {
-        let p = budget_pressure_for_chat_turn(&[], None, 0);
+        let p = budget_pressure_for_chat_turn(&[], 0, &test_budget(200_000));
         assert_eq!(p, 0.0);
     }
 
     #[test]
     fn large_absolute_prompt_escalates_pressure_even_on_large_context_model() {
         assert_eq!(
-            budget_pressure_for_chat_turn_with_input_budget(&[], 80_000, 800_000),
+            budget_pressure_for_chat_turn(&[], 80_000, &test_budget(800_000)),
             0.0
         );
-        assert!(budget_pressure_for_chat_turn_with_input_budget(&[], 128_000, 800_000) >= 0.3);
-        assert!(budget_pressure_for_chat_turn_with_input_budget(&[], 200_000, 800_000) >= 0.6);
-        assert!(budget_pressure_for_chat_turn_with_input_budget(&[], 320_000, 800_000) >= 0.9);
+        assert!(budget_pressure_for_chat_turn(&[], 128_000, &test_budget(800_000)) >= 0.3);
+        assert!(budget_pressure_for_chat_turn(&[], 200_000, &test_budget(800_000)) >= 0.6);
+        assert!(budget_pressure_for_chat_turn(&[], 320_000, &test_budget(800_000)) >= 0.9);
     }
 
     #[test]
-    fn zero_effective_input_budget_falls_back_to_default_context_budget() {
-        assert!(
-            budget_pressure_for_chat_turn_with_input_budget(&[], 110_000, 0) >= 0.3,
-            "legacy zero sentinel should use the default 200K context budget, not only absolute latency thresholds"
-        );
-    }
-
-    #[test]
-    fn context_window_path_applies_the_resolved_policy_before_classifying_pressure() {
-        let trim_pressure = budget_pressure_for_chat_turn_with_context_window(&[], 90_000, 200_000);
-        let compact_pressure =
-            budget_pressure_for_chat_turn_with_context_window(&[], 115_000, 200_000);
-
-        assert_eq!(trim_pressure, 0.3);
-        assert_eq!(
-            compact_pressure, 0.6,
-            "the exact output, summary, and protocol reserves must all affect pressure"
-        );
+    fn pressure_uses_the_admitted_policy_reserves() {
+        let budget = test_budget(200_000);
+        for schema_tokens in [90_000, 115_000] {
+            let estimated = prompts::estimate_tokens(&[], schema_tokens, 0);
+            assert_eq!(
+                budget_pressure_for_chat_turn(&[], schema_tokens, &budget),
+                budget
+                    .compaction_tier(estimated)
+                    .budget_pressure()
+                    .max(absolute_latency_pressure(estimated))
+            );
+        }
     }
 
     /// Even with many messages, if they're all short and no schema tokens,
@@ -244,7 +226,7 @@ mod tests {
         let messages: Vec<_> = (0..100)
             .map(|i| json!({"role":"user","content": format!("msg{i}")}))
             .collect();
-        let p = budget_pressure_for_chat_turn(&messages, Some("gpt-4o"), 0);
+        let p = budget_pressure_for_chat_turn(&messages, 0, &test_budget(200_000));
         assert!(
             p < 0.6,
             "100 short ASCII messages with no schema should be below CompactHistory threshold: {p}"

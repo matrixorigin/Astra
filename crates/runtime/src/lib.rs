@@ -165,11 +165,12 @@ pub use astra_services::{
         EventRecord, EventService, UnconfiguredEventService,
     },
     harness::{
-        DatabaseHarnessService, HarnessCitationRecord, HarnessDecisionRequest, HarnessItemRecord,
-        HarnessNodeCatalogRecord, HarnessRunRecord, HarnessService, HarnessSkillDraftRecord,
-        HarnessSkillRuleRecord, HarnessTemplateRecord, SkillifyAgentCitation, SkillifyAgentDraft,
-        SkillifyAgentExecutor, SkillifyAgentOutput, SkillifyAgentRequest, SkillifyAgentRule,
-        SkillifyDraftRecord, SkillifyDraftRequest, SkillifyPublishRecord, SkillifyPublishRequest,
+        AuthoringEvaluationSummary, AuthoringInferenceEvidence, AuthoringIntentRecord,
+        AuthoringIntentRequest, DatabaseHarnessService, HarnessCitationRecord,
+        HarnessDecisionRequest, HarnessItemRecord, HarnessNodeCatalogRecord, HarnessRunRecord,
+        HarnessService, HarnessSkillDraftRecord, HarnessSkillRuleRecord, HarnessTemplateRecord,
+        SkillifyAgentCitation, SkillifyAgentDraft, SkillifyAgentExecutor, SkillifyAgentOutput,
+        SkillifyAgentRequest, SkillifyAgentRule, SkillifyPublishRecord, SkillifyPublishRequest,
         SkillifyRunRequest, SkillifySourceFile, SkillifySourcePacket, UnconfiguredHarnessService,
     },
     jobs::{
@@ -205,9 +206,6 @@ pub use astra_services::{
         ModelUsageBrief, SessionAuditService, ToolUsageBrief, UnconfiguredSessionAuditService,
     },
     session_journal,
-    skill_config::{
-        DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,
-    },
     skills::{DatabaseSkillService, SkillRecord, SkillService, UnconfiguredSkillService},
     triggers::{DatabaseTriggerService, TriggerRecord, TriggerService, UnconfiguredTriggerService},
     workflows::{

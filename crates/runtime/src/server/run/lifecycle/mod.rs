@@ -14,6 +14,7 @@ mod projection;
 pub(crate) mod run_state;
 
 use admission::*;
+use astra_services::runs::EvaluationObservationRepairOutcome;
 use projection::*;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -39,24 +40,39 @@ use uuid::Uuid;
 use crate::turn::canonical_commit::{
     CanonicalRewriteProof, canonical_commit_delta, pack_canonical_turn_segments,
 };
-use crate::turn::run_control::{RunControlProvider, RunControlStatus, UserIntentProvider};
+use crate::turn::run_control::{
+    ProviderBoundaryAuthorization, RunControlProvider, RunControlStatus,
+    UserIntentAdmissionAuthority, UserIntentProvider,
+};
 use astra_core::{
     ErrorResponse, SharedPool, connect_matrixone, error_response, error_response_coded,
     error_response_coded_with_metadata,
 };
 use astra_services::ModelService;
 use astra_services::coordination::{AgentProfile, AgentTier};
+use astra_services::evaluation::{
+    DatabaseEvaluationObservationStore, DatabaseEvaluationPlanStore,
+    DatabaseMaterializationReceiptStore, EvaluationObservationRequest,
+    EvaluationPolicyFingerprintInput, EvaluationRunAdmission, EvaluationSkillRevision,
+    EvidenceAvailability, EvidenceKind, EvidenceRef, JudgmentExecutionObservation,
+    JudgmentExecutionStatus, MaterializationComponentKind, MaterializationOutcome,
+    MaterializationReceiptRequest, TrialStatus, TrustedMaterializerContext,
+    apply_inference_evidence, apply_tool_outcome_evidence, content_fingerprint,
+    evaluation_component_idempotency_key, evaluation_policy_fingerprint, is_no_skill_revision,
+    prompt_context_fingerprint, prompt_only_snapshot_envelope, terminal_run_observation,
+};
 use astra_services::runs::{
     AgentBindingRuntimeRequest, AtomicRunGuidanceAdmission, AtomicRunGuidanceAdmissionRequest,
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunEventDelta,
     DurableRunInteractionAttachmentGuard, DurableRunRecord, DurableRunStartClaim,
     DurableRunStatusKind, DurableRunStatusSnapshot, DurableRunWorkScope, DurableWorkItemRunBinding,
-    DurableWorkRunBinding, ModelSelectionMode, RequestedTurnInteractionMode,
-    ResolvedModelSelection, RunContinuationRecord, RunLifecycleService, RunListCursor,
-    RunListRecord, RunMutationDisposition, RunMutationRecord, RunProjectionCheckpointRecord,
-    RunProjectionRecord, RunStartIdempotency, RunStartIdempotencyKind, RunStatusRecord,
-    RunUserIntentData, RunUserIntentRecord, RuntimeAuthRequest, RuntimeProfileRequest,
-    durable_run_status_blocks_session, durable_run_status_is_terminal, durable_run_status_kind,
+    DurableWorkRunBinding, ExecutionDeadlineAuthority, ModelSelectionMode,
+    RequestedTurnInteractionMode, ResolvedModelSelection, RunContinuationRecord,
+    RunLifecycleService, RunListCursor, RunListRecord, RunMutationDisposition, RunMutationRecord,
+    RunProjectionCheckpointRecord, RunProjectionRecord, RunStartIdempotency,
+    RunStartIdempotencyKind, RunStatusRecord, RunUserIntentData, RunUserIntentRecord,
+    RuntimeAuthRequest, RuntimeProfileRequest, durable_run_status_blocks_session,
+    durable_run_status_is_terminal, durable_run_status_kind,
 };
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
 use astra_services::session_restore::{
@@ -87,6 +103,123 @@ struct RuntimeEdgeDispatchAuthorizationMetadata {
     contract_version: u32,
     task_id: String,
     executor_id: String,
+}
+
+/// Owns one server-created per-trial Edge clone for the lifetime of the
+/// canonical Run task. The Edge preserves dirty clones for evidence and
+/// removes clean clones; dropping this guard also covers cancellation and
+/// capacity admission failures before the agent loop starts.
+#[derive(Debug)]
+struct EvaluationWorkspaceLease {
+    pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
+    user_id: String,
+    edge_agent_id: Option<String>,
+    connection_generation: Option<u64>,
+    workspace_dir: Option<String>,
+    source_commit: String,
+    allocation: astra_runtime_env::EvaluationAllocationReceipt,
+    claimed: Arc<AtomicBool>,
+}
+
+impl EvaluationWorkspaceLease {
+    fn new(
+        pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
+        user_id: String,
+        edge_agent_id: Option<String>,
+        connection_generation: Option<u64>,
+        allocation: astra_runtime_env::EvaluationAllocationReceipt,
+    ) -> Self {
+        Self {
+            pool,
+            user_id,
+            edge_agent_id,
+            connection_generation,
+            workspace_dir: Some(allocation.workspace_dir.clone()),
+            source_commit: allocation.source_commit.clone(),
+            allocation,
+            claimed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn connection_generation(&self) -> Option<u64> {
+        self.connection_generation
+    }
+
+    fn workspace_dir(&self) -> Option<&str> {
+        self.workspace_dir.as_deref()
+    }
+
+    fn activate_after_run_claim(&self) {
+        self.claimed.store(true, Ordering::Release);
+    }
+
+    async fn finalize(
+        &self,
+        verifier_command: &str,
+        verifier_timeout_secs: u64,
+        timeout: Duration,
+        cancel_token: &CancellationToken,
+    ) -> Option<astra_server_types::edge_connection_pool::EdgeWorkspaceOperationResult> {
+        let pool = self.pool.as_ref()?;
+        pool.finalize_evaluation_workspace(
+            &self.user_id,
+            self.edge_agent_id.as_deref()?,
+            astra_server_types::edge_connection_pool::EdgeWorkspaceFinalizationRequest {
+                connection_generation: self.connection_generation?,
+                allocation: &self.allocation,
+                verifier_command,
+                verifier_timeout_secs,
+            },
+            timeout,
+            cancel_token,
+        )
+        .await
+    }
+}
+
+impl Drop for EvaluationWorkspaceLease {
+    fn drop(&mut self) {
+        // Preparation happens before the durable Run claim so the request can
+        // establish the typed workspace binding. The trial key is stable, so
+        // every exact retry refers to the same clone. Only the request that
+        // actually owns the durable Run may release it; a concurrent loser
+        // must leave the winner's clone untouched.
+        if !self.claimed.load(Ordering::Acquire) {
+            return;
+        }
+        let (Some(pool), Some(edge_agent_id), Some(connection_generation), Some(workspace_dir)) = (
+            self.pool.take(),
+            self.edge_agent_id.take(),
+            self.connection_generation.take(),
+            self.workspace_dir.take(),
+        ) else {
+            return;
+        };
+        let user_id = self.user_id.clone();
+        let allocation = self.allocation.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if !pool
+                    .release_evaluation_workspace(
+                        &user_id,
+                        &edge_agent_id,
+                        astra_server_types::edge_connection_pool::EdgeWorkspaceAllocationTarget {
+                            connection_generation,
+                            allocation: &allocation,
+                        },
+                    )
+                    .await
+                {
+                    tracing::debug!(
+                        owner_id = %user_id,
+                        edge_agent_id = %edge_agent_id,
+                        workspace_dir = %workspace_dir,
+                        "evaluation workspace release was not delivered"
+                    );
+                }
+            });
+        }
+    }
 }
 
 fn valid_runtime_http_endpoint(endpoint: &str) -> bool {
@@ -3459,6 +3592,73 @@ type ServerSkillResolverBundle = (
     Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
 );
 
+/// The database catalog is a user-scoped snapshot. A turn may rebuild its
+/// process-local loop state, but it must not repeat the catalog walk for every
+/// turn. The short TTL lets a normal server observe publishes without making
+/// the hot path depend on a database read; explicit refresh removes the entry
+/// immediately when a caller needs a new snapshot.
+const SERVER_SKILL_REGISTRY_CACHE_TTL: Duration = Duration::from_secs(60);
+const SERVER_SKILL_REGISTRY_CACHE_MAX_USERS: usize = 256;
+
+struct CachedServerSkillRegistry {
+    registry: Option<Arc<crate::skills::UnifiedSkillRegistry>>,
+    refreshed_at: Instant,
+}
+
+type ServerSkillRegistryCache = Arc<StdMutex<HashMap<String, Arc<ServerSkillRegistryCacheEntry>>>>;
+
+struct ServerSkillRegistryCacheEntry {
+    value: StdMutex<Option<CachedServerSkillRegistry>>,
+    inserted_at: Instant,
+}
+
+fn cached_server_skill_registry_for(
+    cache: &ServerSkillRegistryCache,
+    skill_service: Option<Arc<dyn SkillService>>,
+    user_id: &str,
+) -> Option<Arc<crate::skills::UnifiedSkillRegistry>> {
+    let entry = {
+        let mut entries = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !entries.contains_key(user_id)
+            && entries.len() >= SERVER_SKILL_REGISTRY_CACHE_MAX_USERS
+            && let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.inserted_at)
+                .map(|(user, _)| user.clone())
+        {
+            entries.remove(&oldest);
+        }
+        entries
+            .entry(user_id.to_owned())
+            .or_insert_with(|| {
+                Arc::new(ServerSkillRegistryCacheEntry {
+                    value: StdMutex::new(None),
+                    inserted_at: Instant::now(),
+                })
+            })
+            .clone()
+    };
+    // Only this user's cold discovery is single-flight. Other users, including
+    // cache hits, never wait on its database query under the global map lock.
+    let mut value = entry
+        .value
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(cached) = value.as_ref()
+        && cached.refreshed_at.elapsed() < SERVER_SKILL_REGISTRY_CACHE_TTL
+    {
+        return cached.registry.clone();
+    }
+    let registry = crate::capabilities::build_server_skill_registry(skill_service, user_id);
+    *value = Some(CachedServerSkillRegistry {
+        registry: registry.clone(),
+        refreshed_at: Instant::now(),
+    });
+    registry
+}
+
 /// Post-loop session-memory settlement shared by `create_run` and
 /// `stream_chat`. A terminal turn is not a session close: this worker drains
 /// run-scoped extraction and writes settlement evidence, while session-scoped
@@ -3837,14 +4037,12 @@ async fn run_post_loop_memory_cleanup_work(
 /// skills visible to the authenticated user. Request `allow_skills` is a
 /// selector/execution filter over that catalog, not a switch that enables the
 /// catalog.
-fn build_server_skill_resolver(
-    skill_service: Option<Arc<dyn SkillService>>,
-    user_id: &str,
+fn build_server_skill_resolver_from_registry(
+    registry: Option<Arc<crate::skills::UnifiedSkillRegistry>>,
 ) -> ServerSkillResolverBundle {
     use crate::turn::skill_tool::SkillResolver as _;
 
-    let Some(registry) = crate::capabilities::build_server_skill_registry(skill_service, user_id)
-    else {
+    let Some(registry) = registry else {
         return (None, None);
     };
 
@@ -3885,23 +4083,19 @@ fn install_active_personal_skills(
     state: &mut AgenticLoopState,
     active_skills: Vec<astra_services::ActivePersonalSkillRecord>,
 ) {
-    for skill in active_skills {
-        state
-            .skills
-            .execution
-            .pinned
-            .insert(skill.skill_name.clone());
-        state.skills.execution.invoked.insert(
-            skill.skill_name.clone(),
-            crate::turn::skill_tool::InvokedSkill {
-                name: skill.skill_name,
-                content: skill.content_markdown,
-                invoked_at_turn: state.current_session_turn_number(),
-                reentry_count: 0,
-                execution_topology: None,
-            },
-        );
-    }
+    state.skills.execution.adopted = active_skills
+        .into_iter()
+        .map(|skill| {
+            (
+                skill.skill_name,
+                crate::turn::agentic_loop::host::AdoptedSkillRevision {
+                    version_id: skill.version_id,
+                    content_hash: skill.content_hash,
+                    content_markdown: skill.content_markdown,
+                },
+            )
+        })
+        .collect();
 }
 
 fn normalize_allowlist_entry(entry: &str, field: &str) -> Result<String, String> {
@@ -4228,13 +4422,15 @@ async fn initialize_runtime_controllers(
     session_id: &str,
     evaluation_persistence: Option<EvaluationPersistenceContext>,
     context_trace_persistence: Option<ContextTracePersistenceContext>,
+    production_state_policy: RuntimeProductionStatePolicy,
 ) {
     let hub = Arc::new(ObservabilityHub::new());
     let session = hub.start_session(user_id, session_id);
 
     loop_state.telemetry.observability_hub = Some(hub);
     loop_state.telemetry.observability_session = Some(session);
-    loop_state.telemetry.evaluation_persistence = evaluation_persistence;
+    loop_state.telemetry.evaluation_persistence =
+        production_state_policy.select(evaluation_persistence);
     loop_state.telemetry.context_trace_persistence = context_trace_persistence;
 }
 
@@ -4245,6 +4441,7 @@ async fn configure_runtime_controllers(
     user_id: &str,
     session_id: &str,
     trace_ingestion: Option<astra_services::event_ingestion::IngestionSender>,
+    production_state_policy: RuntimeProductionStatePolicy,
 ) {
     loop_state.telemetry.trace_ingestion = trace_ingestion;
     let evaluation_persistence = shared_pool.map(|pool| EvaluationPersistenceContext {
@@ -4264,6 +4461,7 @@ async fn configure_runtime_controllers(
         session_id,
         evaluation_persistence,
         context_trace_persistence,
+        production_state_policy,
     )
     .await
 }
@@ -4579,6 +4777,112 @@ struct PreparedRuntimeCapabilities {
     agent_binding: Option<PreparedAgentBindingLoopContext>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum EvaluationObservationRepairError {
+    #[error(transparent)]
+    Execution(#[from] astra_services::evaluation::EvaluationExecutionError),
+    #[error(transparent)]
+    Persistence(#[from] astra_services::evaluation::EvaluationPersistenceError),
+    #[error("evaluation repair evidence serialization failed: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("evaluation repair storage unavailable")]
+    StorageUnavailable,
+    #[error("evaluation repair Run read failed: {0}")]
+    RunRead(String),
+    #[error(transparent)]
+    TerminalProof(astra_services::runs::RunProofReadError),
+    #[error("evaluation repair binding mismatch")]
+    BindingMismatch,
+    #[error("evaluation repair Run not found")]
+    NotFound,
+}
+
+impl EvaluationObservationRepairError {
+    fn into_http(self) -> (StatusCode, Json<ErrorResponse>) {
+        use astra_services::evaluation::{
+            EvaluationExecutionError as Execution, EvaluationPersistenceError as Persistence,
+        };
+        if let Self::Execution(Execution::Persistence(error)) = self {
+            return Self::Persistence(error).into_http();
+        }
+        let (status, code) = match &self {
+            Self::BindingMismatch
+            | Self::TerminalProof(astra_services::runs::RunProofReadError::Integrity(_))
+            | Self::Execution(Execution::Conflict(_))
+            | Self::Persistence(Persistence::Conflict(_) | Persistence::ProtocolBlocked(_))
+            | Self::Serialization(_)
+            | Self::Execution(Execution::Json { .. })
+            | Self::Persistence(Persistence::Json { .. }) => {
+                (StatusCode::CONFLICT, "evaluation_repair_integrity")
+            }
+            Self::NotFound
+            | Self::Execution(Execution::NotFound(_))
+            | Self::Persistence(Persistence::NotFound(_)) => {
+                (StatusCode::NOT_FOUND, "evaluation_repair_not_found")
+            }
+            Self::Execution(Execution::InvalidInput(_))
+            | Self::Persistence(Persistence::InvalidInput(_)) => {
+                (StatusCode::BAD_REQUEST, "evaluation_repair_invalid_input")
+            }
+            _ => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_repair_store_unavailable",
+            ),
+        };
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            tracing::warn!(error = %self, "evaluation observation repair storage failure");
+            error_response_coded(
+                status,
+                "Evaluation observation repair storage is unavailable; retry later",
+                code,
+            )
+        } else {
+            error_response_coded(status, self.to_string(), code)
+        }
+    }
+}
+
+/// Preserve the canonical reader's pending/integrity/storage distinction.
+/// Both custody and atomic-batch discovery use this same conversion.
+fn terminal_proof_for_repair<T>(
+    result: Result<Option<T>, astra_services::runs::RunProofReadError>,
+) -> Result<Option<T>, EvaluationObservationRepairError> {
+    result.map_err(EvaluationObservationRepairError::TerminalProof)
+}
+
+struct AdmittedEvaluationTrial {
+    workspace:
+        Option<astra_services::evaluation::workspace_evidence::EvaluationWorkspaceMaterialization>,
+    admission: EvaluationRunAdmission,
+    skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
+}
+
+/// Select production-state dependencies once at composition boundaries.
+/// Evaluation must not inherit production recall, extraction, observer, or
+/// quality-learning persistence. Observational telemetry remains independent.
+#[derive(Clone, Copy)]
+enum RuntimeProductionStatePolicy {
+    Enabled,
+    Disabled,
+}
+
+impl RuntimeProductionStatePolicy {
+    fn for_request(request: &ChatRequestData) -> Self {
+        if request.evaluation_admission.is_some() {
+            Self::Disabled
+        } else {
+            Self::Enabled
+        }
+    }
+
+    fn select<T>(self, service: Option<T>) -> Option<T> {
+        match self {
+            Self::Enabled => service,
+            Self::Disabled => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct PreparedAgentBindingLoopContext {
     bindings: Vec<astra_services::AgentBindingRecord>,
@@ -4639,6 +4943,7 @@ struct OwnedBackgroundExecution {
     pause_flag: Arc<AtomicBool>,
     llm_cancel_token: Arc<CancellationToken>,
     execution_lease_lost: Arc<AtomicBool>,
+    evaluation_workspace_lease: Option<EvaluationWorkspaceLease>,
 }
 
 #[derive(Clone)]
@@ -5285,6 +5590,14 @@ pub struct AgenticRunLifecycleService {
     workspace_record_store: Option<Arc<dyn WorkspaceStateStore>>,
     /// Optional database skill provider for runtime skill resolution.
     skill_service: Option<Arc<dyn SkillService>>,
+    /// User-scoped server skill snapshots reused across turns. The registry
+    /// itself still owns provider and loaded-skill caches; this outer cache
+    /// keeps a new loop environment from reconstructing those caches.
+    server_skill_registry_cache: ServerSkillRegistryCache,
+    /// Standard server service for the model-facing Skill Creator tool.
+    /// Authoring is coordinator-owned and is intentionally absent from
+    /// delegated task executors.
+    skill_creator_service: Option<Arc<dyn runtime_tool_executor::SkillCreatorToolService>>,
     /// Exact model catalog used to resolve client-visible Offering IDs.
     model_service: Arc<dyn ModelService>,
     /// Registry-backed MCP bindings available to server-side chat loops.
@@ -5419,6 +5732,8 @@ impl AgenticRunLifecycleService {
             edge_connection_pool: None,
             workspace_record_store: None,
             skill_service: None,
+            server_skill_registry_cache: Arc::new(StdMutex::new(HashMap::new())),
+            skill_creator_service: None,
             model_service: Arc::new(astra_services::UnconfiguredModelService),
             mcp_registry_service: Arc::new(astra_services::UnconfiguredMcpRegistryService),
             agent_binding_service: Arc::new(astra_services::UnconfiguredAgentBindingService),
@@ -5444,6 +5759,29 @@ impl AgenticRunLifecycleService {
             tool_execution_service: None,
             reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
         }
+    }
+
+    fn cached_server_skill_registry(
+        &self,
+        user_id: &str,
+    ) -> Option<Arc<crate::skills::UnifiedSkillRegistry>> {
+        cached_server_skill_registry_for(
+            &self.server_skill_registry_cache,
+            self.skill_service.clone(),
+            user_id,
+        )
+    }
+
+    /// Drop one user's server catalog snapshot so the next turn performs an
+    /// explicit fresh discovery.
+    pub fn refresh_server_skill_catalog(&self, user_id: &str) {
+        if let Ok(mut cache) = self.server_skill_registry_cache.lock() {
+            cache.remove(user_id);
+        }
+    }
+
+    fn cached_server_skill_resolver(&self, user_id: &str) -> ServerSkillResolverBundle {
+        build_server_skill_resolver_from_registry(self.cached_server_skill_registry(user_id))
     }
 
     async fn prepare_canonical_turn(
@@ -6190,6 +6528,17 @@ impl AgenticRunLifecycleService {
 
     pub fn with_skill_service(mut self, service: Arc<dyn SkillService>) -> Self {
         self.skill_service = Some(service);
+        if let Ok(mut cache) = self.server_skill_registry_cache.lock() {
+            cache.clear();
+        }
+        self
+    }
+
+    pub fn with_skill_creator_service(
+        mut self,
+        service: Arc<dyn runtime_tool_executor::SkillCreatorToolService>,
+    ) -> Self {
+        self.skill_creator_service = Some(service);
         self
     }
 
@@ -6513,6 +6862,7 @@ impl AgenticRunLifecycleService {
         .with_model_service(Some(self.model_service.clone()))
         .with_edge_connection_pool(self.edge_connection_pool.clone())
         .with_skill_service(self.skill_service.clone())
+        .with_server_skill_registry_cache(Arc::clone(&self.server_skill_registry_cache))
         .with_memory_extraction_service(self.memory_extraction_service.clone())
         .with_reflect_service(Arc::clone(&self.reflect_service))
         .with_auxiliary_event_writer(self.auxiliary_event_writer.clone())
@@ -7783,6 +8133,20 @@ impl AgenticRunLifecycleService {
             execution_bindings,
             agent_binding_context.map(|context| context.bindings.as_slice()),
         );
+        if let Some(admission) = request.evaluation_admission.as_ref() {
+            context
+                .execution_metadata
+                .get_or_insert_with(Map::new)
+                .insert(
+                    "evaluation_admission".to_string(),
+                    serde_json::to_value(admission).map_err(|error| {
+                        error_response(
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid evaluation admission metadata: {error}"),
+                        )
+                    })?,
+                );
+        }
         context.work_binding = work_binding.map(ValidatedWorkRuntimeBinding::durable_binding);
         use astra_services::runs::{
             DurableAdmissionSource, ModelAdmissionSource, RuntimeCapabilitySource,
@@ -7845,6 +8209,29 @@ impl AgenticRunLifecycleService {
             }
         };
         result.map_err(|error| {
+            if request.evaluation_admission.is_some()
+                && let Some((code, detail)) = error.split_once(": ")
+            {
+                let rejection = match code {
+                    "evaluation_trial_order_blocked" => {
+                        Some((StatusCode::CONFLICT, "evaluation_trial_order_blocked"))
+                    }
+                    "evaluation_trial_capacity_exhausted" => {
+                        Some((StatusCode::CONFLICT, "evaluation_trial_capacity_exhausted"))
+                    }
+                    "evaluation_trial_binding_conflict" => {
+                        Some((StatusCode::CONFLICT, "evaluation_trial_binding_conflict"))
+                    }
+                    "evaluation_trial_admission_invalid" => Some((
+                        StatusCode::BAD_REQUEST,
+                        "evaluation_trial_admission_invalid",
+                    )),
+                    _ => None,
+                };
+                if let Some((status, code)) = rejection {
+                    return evaluation_preflight_error(status, code, detail);
+                }
+            }
             let status = if error == "session already has an active run" {
                 StatusCode::CONFLICT
             } else {
@@ -7859,6 +8246,769 @@ impl AgenticRunLifecycleService {
         })
     }
 
+    /// Admit the evaluation metadata at the canonical Run boundary.  The
+    /// ordinary lifecycle has already selected the model/provider and checked
+    /// request capabilities when this runs; no provider or tool work starts
+    /// before this method returns successfully.
+    async fn admit_evaluation_trial(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        execution_owner_generation: u64,
+        expected_edge_connection_generation: Option<u64>,
+        expected_allocation: Option<&astra_runtime_env::EvaluationAllocationReceipt>,
+        request: &ChatRequestData,
+        admission: &EvaluationRunAdmission,
+    ) -> Result<AdmittedEvaluationTrial, (StatusCode, Json<ErrorResponse>)> {
+        admission.validate_shape().map_err(|error| {
+            evaluation_preflight_error(
+                StatusCode::BAD_REQUEST,
+                "evaluation_admission_invalid",
+                error,
+            )
+        })?;
+        let pool = self.shared_pool.clone().ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_store_unavailable",
+                "evaluation admission requires the shared durable database",
+            )
+        })?;
+        let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
+        // Read and validate the frozen trial before claiming it.  All request
+        // and policy checks below are pure admission checks; a rejected
+        // request must not strand the planned trial in a durable binding that
+        // can never be retried.
+        let binding = plan_store
+            .load_trial(user_id, &admission.trial_id)
+            .await
+            .map_err(|error| {
+                evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_trial_binding_rejected",
+                    error,
+                )
+            })?;
+        if binding.experiment_id != admission.experiment_id {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_trial_identity_conflict",
+                "trial belongs to another experiment",
+            ));
+        }
+        if binding.binding_status == "bound"
+            && binding.run_generation != Some(execution_owner_generation)
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_run_generation_conflict",
+                "trial binding was created for another canonical Run generation",
+            ));
+        }
+        let experiment = plan_store
+            .load_experiment(user_id, &admission.experiment_id)
+            .await
+            .map_err(|error| {
+                evaluation_preflight_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "evaluation_store_error",
+                    error,
+                )
+            })?;
+        let run_created_at = sqlx::query_scalar::<_, chrono::NaiveDateTime>(
+            "SELECT created_at FROM agent_runs
+             WHERE user_id = ? AND run_id = ? AND session_id = ? LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .bind(session_id)
+        .fetch_one(pool.get())
+        .await
+        .map_err(|error| {
+            evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_run_start_time_unavailable",
+                error,
+            )
+        })?;
+        let run_created_at =
+            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(run_created_at, chrono::Utc);
+        let Some(execution_deadline) = request.admitted_execution_deadline else {
+            return Err(evaluation_preflight_error(
+                StatusCode::BAD_REQUEST,
+                "evaluation_deadline_missing",
+                "evaluation requires an admitted execution deadline",
+            ));
+        };
+        let execution_deadline = chrono::DateTime::from_timestamp_millis(
+            i64::try_from(execution_deadline.deadline_unix_ms).map_err(|_| {
+                evaluation_preflight_error(
+                    StatusCode::BAD_REQUEST,
+                    "evaluation_deadline_invalid",
+                    "admitted execution deadline exceeds the supported timestamp range",
+                )
+            })?,
+        )
+        .ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::BAD_REQUEST,
+                "evaluation_deadline_invalid",
+                "admitted execution deadline is outside the supported timestamp range",
+            )
+        })?;
+        let max_wall_time_secs =
+            i64::try_from(experiment.spec.budget.max_wall_time_secs).map_err(|_| {
+                evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_budget_invalid",
+                    "frozen experiment wall-time budget exceeds the supported duration range",
+                )
+            })?;
+        let wall_time = chrono::Duration::try_seconds(max_wall_time_secs).ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_budget_invalid",
+                "frozen experiment wall-time budget exceeds the supported duration range",
+            )
+        })?;
+        let frozen_deadline = run_created_at
+            .checked_add_signed(wall_time)
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_budget_invalid",
+                    "frozen experiment wall-time budget cannot be represented as a deadline",
+                )
+            })?;
+        if execution_deadline > frozen_deadline {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_deadline_exceeds_budget",
+                "admitted execution deadline exceeds the frozen experiment wall-time budget",
+            ));
+        }
+        let receipt_expiry = execution_deadline.min(frozen_deadline);
+        let run_created_at = run_created_at.to_rfc3339();
+        let trial = &binding.trial;
+        let expected_revision_hash = match trial.arm {
+            astra_services::evaluation::ComparisonArm::Baseline => {
+                &experiment.spec.target.baseline.content_hash
+            }
+            astra_services::evaluation::ComparisonArm::Candidate => {
+                &experiment.spec.target.candidate.content_hash
+            }
+        };
+        if &admission.revision_content_hash != expected_revision_hash {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_revision_mismatch",
+                "trial revision content does not match the frozen baseline/candidate",
+            ));
+        }
+        let evaluation_skill_resolver = match experiment.spec.target.kind {
+            astra_services::evaluation::EvaluationTargetKind::Prompt => {
+                if admission.skill_revision.is_some() {
+                    return Err(evaluation_preflight_error(
+                        StatusCode::BAD_REQUEST,
+                        "evaluation_skill_revision_unexpected",
+                        "prompt evaluation must not carry a Skill revision identity",
+                    ));
+                }
+                let Some(revision_prompt) = request.stable_runtime_system_prompt.as_deref() else {
+                    return Err(evaluation_preflight_error(
+                        StatusCode::BAD_REQUEST,
+                        "evaluation_revision_content_missing",
+                        "prompt evaluation requires the frozen revision content",
+                    ));
+                };
+                if content_fingerprint(revision_prompt) != admission.revision_content_hash {
+                    return Err(evaluation_preflight_error(
+                        StatusCode::CONFLICT,
+                        "evaluation_revision_content_mismatch",
+                        "revision content hash does not match the frozen prompt identity",
+                    ));
+                }
+                None
+            }
+            astra_services::evaluation::EvaluationTargetKind::Skill
+            | astra_services::evaluation::EvaluationTargetKind::SkillRoutingJudgment => {
+                if request.stable_runtime_system_prompt.is_some() {
+                    return Err(evaluation_preflight_error(
+                        StatusCode::NOT_IMPLEMENTED,
+                        "evaluation_skill_system_prompt_unsupported",
+                        "instruction-only Skill evaluation cannot carry an unfrozen system prompt",
+                    ));
+                }
+                let expected_revision_id = match trial.arm {
+                    astra_services::evaluation::ComparisonArm::Baseline => {
+                        &experiment.spec.target.baseline.revision_id
+                    }
+                    astra_services::evaluation::ComparisonArm::Candidate => {
+                        &experiment.spec.target.candidate.revision_id
+                    }
+                };
+                if is_no_skill_revision(
+                    expected_revision_id,
+                    match trial.arm {
+                        astra_services::evaluation::ComparisonArm::Baseline => {
+                            &experiment.spec.target.baseline.content_hash
+                        }
+                        astra_services::evaluation::ComparisonArm::Candidate => {
+                            &experiment.spec.target.candidate.content_hash
+                        }
+                    },
+                ) {
+                    if admission.skill_revision.is_some() {
+                        return Err(evaluation_preflight_error(
+                            StatusCode::CONFLICT,
+                            "evaluation_skill_revision_unexpected",
+                            "the no-skill baseline cannot carry a Skill revision identity",
+                        ));
+                    }
+                    None
+                } else {
+                    let Some(skill_revision) = admission.skill_revision.as_ref() else {
+                        return Err(evaluation_preflight_error(
+                            StatusCode::BAD_REQUEST,
+                            "evaluation_skill_revision_missing",
+                            "Skill evaluation requires an owner-scoped immutable revision identity",
+                        ));
+                    };
+                    if skill_revision.revision_id != *expected_revision_id {
+                        return Err(evaluation_preflight_error(
+                            StatusCode::CONFLICT,
+                            "evaluation_skill_revision_mismatch",
+                            "Skill revision id does not match the frozen baseline/candidate",
+                        ));
+                    }
+                    let skill_store = astra_services::DatabasePersonalSkillStore::new(pool.clone());
+                    let revision = skill_store
+                        .load_version(
+                            user_id,
+                            &skill_revision.skill_name,
+                            &skill_revision.revision_id,
+                        )
+                        .await
+                        .map_err(|error| {
+                            evaluation_preflight_error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "evaluation_skill_revision_unavailable",
+                                error,
+                            )
+                        })?
+                        .ok_or_else(|| {
+                            evaluation_preflight_error(
+                                StatusCode::CONFLICT,
+                                "evaluation_skill_revision_not_found",
+                                "the requested owner-scoped Skill revision no longer exists",
+                            )
+                        })?;
+                    if !evaluation_skill_revision_matches(
+                        &revision,
+                        user_id,
+                        skill_revision,
+                        &admission.revision_content_hash,
+                    ) {
+                        return Err(evaluation_preflight_error(
+                            StatusCode::CONFLICT,
+                            "evaluation_skill_revision_mismatch",
+                            "loaded Skill content does not match the frozen owner/version/hash identity",
+                        ));
+                    }
+                    if !matches!(revision.status.as_str(), "published" | "draft") {
+                        return Err(evaluation_preflight_error(
+                            StatusCode::CONFLICT,
+                            "evaluation_skill_revision_unavailable",
+                            "only published or evaluation-draft Skill revisions can enter an evaluation",
+                        ));
+                    }
+                    let resolver =
+                        crate::turn::skill_tool::PinnedSkillResolver::from_user_skill_revision(
+                            &revision,
+                        )
+                        .map_err(|error| {
+                            evaluation_preflight_error(
+                                StatusCode::NOT_IMPLEMENTED,
+                                "evaluation_skill_surface_unsupported",
+                                error,
+                            )
+                        })?;
+                    Some(Arc::new(resolver) as Arc<dyn crate::turn::skill_tool::SkillResolver>)
+                }
+            }
+            _ => {
+                return Err(evaluation_preflight_error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "evaluation_target_unsupported",
+                    "this execution adapter supports Prompt and instruction-only Skill targets",
+                ));
+            }
+        };
+        if trial.input_content_hash != admission.input_content_hash {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_input_identity_conflict",
+                "trial input hash does not match the admission metadata",
+            ));
+        }
+        let context_hash = prompt_context_fingerprint(
+            &request.message,
+            &request.parts,
+            &request.attachments,
+            request.context.as_ref(),
+        );
+        // The evaluation adapter defines Context as the canonical request
+        // payload (message, parts, attachments, and explicit context).  The
+        // frozen case input and the frozen Context snapshot must therefore
+        // both name this exact assembly; a caller cannot manufacture an
+        // Available Context receipt from a declaration alone.
+        if context_hash != admission.input_content_hash
+            || context_hash != experiment.spec.conditions.context_snapshot_hash
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_context_mismatch",
+                "actual prompt Context does not match the frozen trial and Context identities",
+            ));
+        }
+        let Some(resolved_model) = request.resolved_model_selection.as_ref() else {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_model_unresolved",
+                "evaluation requires a resolved model offering before execution",
+            ));
+        };
+        if resolved_model.offering_id != experiment.spec.conditions.model_binding {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_model_binding_mismatch",
+                "resolved model offering differs from the frozen model binding",
+            ));
+        }
+        let Some(admitted_model) = request.admitted_model_execution.as_ref() else {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_model_unresolved",
+                "evaluation requires admitted provider execution material",
+            ));
+        };
+        if admitted_model.offering_id != resolved_model.offering_id
+            || admitted_model.provider != experiment.spec.conditions.provider_binding
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_provider_binding_mismatch",
+                "admitted provider execution differs from the frozen provider binding",
+            ));
+        }
+        // The adapter can prove only the cache modes that the normal model
+        // admission already selected.  Keep the experiment label deliberately
+        // small and closed: provider-default means no explicit deployment
+        // capability, while explicit-recorded means the trusted offering
+        // supplied one.  Other labels would claim behavior this adapter does
+        // not verify and are rejected before any receipt is issued.
+        let expected_cache_policy = if admitted_model.cache_capability.is_some() {
+            "explicit_recorded"
+        } else {
+            "provider_default_recorded"
+        };
+        if experiment.spec.conditions.cache_policy != expected_cache_policy {
+            return Err(evaluation_preflight_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "evaluation_cache_policy_unsupported",
+                format!(
+                    "this evaluation adapter supports cache policy {expected_cache_policy}, not {}",
+                    experiment.spec.conditions.cache_policy
+                ),
+            ));
+        }
+        if !matches!(
+            experiment.spec.conditions.memory_isolation,
+            astra_services::evaluation::MemoryIsolation::Disabled
+        ) || !matches!(
+            experiment.spec.conditions.data_isolation,
+            astra_services::evaluation::DataIsolation::Disabled
+        ) {
+            return Err(evaluation_preflight_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "evaluation_isolation_unsupported",
+                "this execution adapter does not materialize Memory/Data branches",
+            ));
+        }
+        let edge_context = Self::extract_edge_context(request)?;
+        let evaluation_edge_requested = request
+            .edge_executor_id
+            .as_deref()
+            .is_some_and(|executor_id| !executor_id.trim().is_empty());
+        let workspace_policy = experiment.spec.conditions.workspace_execution.as_ref();
+        let edge_binding_complete =
+            request.workspace_binding.as_ref().is_some_and(|workspace| {
+                workspace.kind == astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace
+                    && workspace
+                        .root
+                        .as_deref()
+                        .is_some_and(|root| !root.trim().is_empty())
+                    && workspace.source.as_ref().is_some_and(|source| {
+                        matches!(
+                            source,
+                            astra_services::runs::WorkspaceSourceRequest::EdgePath { path }
+                                if !path.trim().is_empty()
+                        )
+                    })
+                    && workspace.authority
+                        == Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite)
+            }) && request.executor_binding.as_ref().is_some_and(|executor| {
+                executor.kind == astra_services::runs::ExecutorBindingRequestKind::EdgeAgent
+                    && executor.executor_id.as_deref() == request.edge_executor_id.as_deref()
+                    && executor.transport
+                        == Some(astra_services::runs::ToolTransportKindRequest::EdgeWs)
+                    && executor.status == Some(astra_services::runs::ExecutorStatusRequest::Online)
+            });
+        if evaluation_edge_requested && !edge_binding_complete {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_execution_binding_mismatch",
+                "the canonical lifecycle did not establish the selected Edge binding",
+            ));
+        }
+        if workspace_policy.is_some() && !evaluation_edge_requested {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_execution_target_missing",
+                "a workspace-backed evaluation requires its frozen Edge executor",
+            ));
+        }
+        if workspace_policy.is_none()
+            && (evaluation_edge_requested
+                || request.workspace_binding.is_some()
+                || request.executor_binding.is_some()
+                || request.edge_executor_id.is_some())
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "evaluation_execution_surface_unsupported",
+                "evaluation does not admit workspace or Edge side effects",
+            ));
+        }
+        if let Some(workspace) = workspace_policy {
+            if request.edge_executor_id.as_deref() != Some(workspace.edge_executor_id.as_str()) {
+                return Err(evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_execution_target_mismatch",
+                    "the selected Edge does not match the frozen workspace execution",
+                ));
+            }
+            if request.allow_tools.as_deref() != Some(workspace.tool_names.as_slice()) {
+                return Err(evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_tool_policy_mismatch",
+                    "the Edge tool surface does not match the frozen workspace policy",
+                ));
+            }
+        }
+        if !request.runtime_mcp_bindings.is_empty()
+            || !request.agent_bindings.is_empty()
+            || request.agent_binding.is_some()
+            || request.runtime_skill_binding.is_some()
+            || request.provider_runtime_authorized
+            || request.runtime_system_prompt.is_some()
+            || request.capability_descriptors.is_some()
+            || request.skill_search.is_some()
+            || request.explain
+            || request
+                .allow_skills
+                .as_ref()
+                .is_some_and(|skills| !skills.is_empty())
+            || request
+                .allow_skill_sources
+                .as_ref()
+                .is_some_and(|sources| !sources.is_empty())
+            || (workspace_policy.is_none()
+                && request
+                    .allow_tools
+                    .as_ref()
+                    .is_some_and(|tools| !tools.is_empty()))
+            || request
+                .enabled_tools
+                .as_ref()
+                .is_some_and(|tools| !tools.is_empty())
+            || !edge_context.edge_tools.is_empty()
+            || !edge_context.edge_skills.is_empty()
+            || !edge_context.edge_profile.extra.is_empty()
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "evaluation_execution_surface_unsupported",
+                "evaluation does not admit workspace, edge, MCP, or tool side effects",
+            ));
+        }
+        let workspace_materialization = self
+            .prove_evaluation_workspace_materialization(
+                user_id,
+                session_id,
+                request,
+                workspace_policy,
+                expected_edge_connection_generation,
+                expected_allocation,
+            )
+            .await?;
+        let policy_hash = evaluation_policy_fingerprint(&EvaluationPolicyFingerprintInput {
+            model_binding: &experiment.spec.conditions.model_binding,
+            provider_binding: &experiment.spec.conditions.provider_binding,
+            cache_policy: &experiment.spec.conditions.cache_policy,
+            resolved_model_selection: request.resolved_model_selection.as_ref(),
+            admitted_provider: &admitted_model.provider,
+            admitted_cache_capability: admitted_model.cache_capability.as_ref(),
+            execution_policy: &request.execution_policy,
+            allow_skills: request.allow_skills.as_deref(),
+            allow_skill_sources: request.allow_skill_sources.as_deref(),
+            allow_tools: request.allow_tools.as_deref(),
+            enabled_tools: request.enabled_tools.as_deref(),
+            runtime_profile: request.runtime_profile.as_ref(),
+            workspace_execution: workspace_policy,
+        })
+        .map_err(|detail| {
+            evaluation_preflight_error(StatusCode::CONFLICT, "evaluation_policy_mismatch", &detail)
+        })?;
+        if policy_hash != experiment.spec.conditions.tool_policy_hash {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_policy_mismatch",
+                "actual resolved policy does not match the frozen tool policy",
+            ));
+        }
+        let envelope = if let Some(envelope) = admission.snapshot_envelope.as_ref() {
+            envelope
+                .validate_for(
+                    user_id,
+                    &experiment.experiment_id,
+                    Some(&trial.trial_id),
+                    Some(session_id),
+                )
+                .map_err(|error| {
+                    evaluation_preflight_error(
+                        StatusCode::CONFLICT,
+                        "evaluation_snapshot_mismatch",
+                        error,
+                    )
+                })?;
+            envelope.clone()
+        } else {
+            prompt_only_snapshot_envelope(
+                user_id,
+                &experiment.experiment_id,
+                &trial.trial_id,
+                session_id,
+                trial.repetition,
+                &run_created_at,
+                &context_hash,
+                &experiment.spec.conditions.tool_policy_hash,
+            )
+            .map_err(|error| {
+                evaluation_preflight_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "evaluation_snapshot_unavailable",
+                    error,
+                )
+            })?
+        };
+        if envelope.context_snapshot_hash != context_hash
+            || envelope.policy_snapshot_hash != policy_hash
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_snapshot_mismatch",
+                "snapshot envelope does not prove the admitted Context and policy",
+            ));
+        }
+        // Run creation already bound this trial atomically under the frozen
+        // execution protocol. Confirm that identity before materialization;
+        // this path cannot claim a planned trial or allocate another slot.
+        let binding = plan_store
+            .bind_trial_run(user_id, &admission.trial_id, session_id, run_id)
+            .await
+            .map_err(|error| {
+                evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_trial_binding_rejected",
+                    error,
+                )
+            })?;
+        if binding.experiment_id != admission.experiment_id
+            || binding.run_generation != Some(execution_owner_generation)
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_trial_binding_rejected",
+                "trial binding changed before materialization",
+            ));
+        }
+        let workspace_artifact = if let Some(allocation) = workspace_materialization {
+            use astra_services::evaluation::workspace_evidence::EvaluationWorkspaceMaterialization;
+            let evidence = EvaluationWorkspaceMaterialization {
+                schema_version: 1,
+                experiment_id: experiment.experiment_id.clone(),
+                trial_id: trial.trial_id.clone(),
+                run_generation: execution_owner_generation,
+                spec_fingerprint: binding.spec_fingerprint.clone(),
+                edge_executor_id: workspace_policy
+                    .expect("workspace proof requires frozen policy")
+                    .edge_executor_id
+                    .clone(),
+                connection_generation: expected_edge_connection_generation.ok_or_else(|| {
+                    evaluation_preflight_error(
+                        StatusCode::CONFLICT,
+                        "evaluation_allocation_missing",
+                        "workspace connection generation is absent",
+                    )
+                })?,
+                allocation,
+            };
+            evidence
+                .validate_binding(&binding, &experiment.spec)
+                .map_err(|error| {
+                    evaluation_preflight_error(
+                        StatusCode::CONFLICT,
+                        "evaluation_allocation_mismatch",
+                        error,
+                    )
+                })?;
+            Some(evidence.persist(&pool).await.map_err(|error| {
+                evaluation_preflight_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "evaluation_materialization_failed",
+                    error,
+                )
+            })?)
+        } else {
+            None
+        };
+        let materializer = DatabaseMaterializationReceiptStore::new(pool.clone());
+        let receipt_ids = if admission.receipt_ids.is_empty() {
+            // The receipt lifetime is the shorter of the frozen experiment
+            // budget and the canonical execution deadline. Retries reproduce
+            // this exact timestamp from the durable Run start rather than
+            // extending a queued evaluation with a fresh wall-clock window.
+            let expires_at = receipt_expiry;
+            let trusted = TrustedMaterializerContext {
+                owner_user_id: user_id.to_string(),
+                materializer_kind: "runtime.evaluation.v1".to_string(),
+                provider_binding_id: Some(experiment.spec.conditions.provider_binding.clone()),
+                execution_run_id: Some(run_id.to_string()),
+                execution_run_generation: Some(execution_owner_generation),
+            };
+            let mut ids = Vec::with_capacity(if workspace_policy.is_some() { 3 } else { 2 });
+            for (component_kind, fingerprint) in [
+                (MaterializationComponentKind::Context, context_hash.as_str()),
+                (MaterializationComponentKind::Policy, policy_hash.as_str()),
+            ] {
+                let record = materializer
+                    .record_receipt(
+                        &trusted,
+                        &MaterializationReceiptRequest {
+                            trial_id: trial.trial_id.clone(),
+                            session_id: session_id.to_string(),
+                            envelope: envelope.clone(),
+                            component_kind,
+                            component_snapshot_ref: Some(format!(
+                                "evaluation://{}/{}/{fingerprint}",
+                                experiment.experiment_id, trial.trial_id
+                            )),
+                            component_base_snapshot_ref: None,
+                            component_content_fingerprint: Some(fingerprint.to_string()),
+                            outcome: MaterializationOutcome::Available,
+                            failure_code: None,
+                            expires_at: Some(expires_at),
+                            idempotency_key: evaluation_component_idempotency_key(
+                                &trial.trial_id,
+                                run_id,
+                                execution_owner_generation,
+                                component_kind.as_str(),
+                            ),
+                        },
+                    )
+                    .await
+                    .map_err(|error| {
+                        evaluation_preflight_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "evaluation_materialization_failed",
+                            error,
+                        )
+                    })?;
+                ids.push(record.receipt_id);
+            }
+            if let Some((artifact_id, fingerprint)) = workspace_artifact.as_ref() {
+                let record = materializer
+                    .record_receipt(
+                        &trusted,
+                        &MaterializationReceiptRequest {
+                            trial_id: trial.trial_id.clone(),
+                            session_id: session_id.to_string(),
+                            envelope: envelope.clone(),
+                            component_kind: MaterializationComponentKind::Workspace,
+                            component_snapshot_ref: Some(format!("artifact://{artifact_id}")),
+                            component_base_snapshot_ref: None,
+                            component_content_fingerprint: Some(fingerprint.clone()),
+                            outcome: MaterializationOutcome::Available,
+                            failure_code: None,
+                            expires_at: Some(expires_at),
+                            idempotency_key: evaluation_component_idempotency_key(
+                                &trial.trial_id,
+                                run_id,
+                                execution_owner_generation,
+                                MaterializationComponentKind::Workspace.as_str(),
+                            ),
+                        },
+                    )
+                    .await
+                    .map_err(|error| {
+                        evaluation_preflight_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "evaluation_materialization_failed",
+                            error,
+                        )
+                    })?;
+                ids.push(record.receipt_id);
+            }
+            ids
+        } else {
+            admission.receipt_ids.clone()
+        };
+        let materialization = materializer
+            .validate_receipts_for_execution(
+                user_id,
+                &trial.trial_id,
+                session_id,
+                &experiment.spec,
+                &envelope,
+                &receipt_ids,
+                chrono::Utc::now(),
+            )
+            .await
+            .map_err(|error| {
+                evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_materialization_rejected",
+                    error,
+                )
+            })?;
+        Ok(AdmittedEvaluationTrial {
+            workspace: materialization.workspace,
+            admission: EvaluationRunAdmission {
+                experiment_id: admission.experiment_id.clone(),
+                trial_id: admission.trial_id.clone(),
+                input_content_hash: admission.input_content_hash.clone(),
+                revision_content_hash: admission.revision_content_hash.clone(),
+                skill_revision: admission.skill_revision.clone(),
+                judgment_policy: admission.judgment_policy.clone(),
+                receipt_ids,
+                snapshot_envelope: Some(envelope),
+            },
+            skill_resolver: evaluation_skill_resolver,
+        })
+    }
+
     async fn fail_started_run_before_spawn_with_handles(
         run_engine: &RunEngine,
         runs: &Arc<RwLock<HashMap<String, RunState>>>,
@@ -7869,7 +9019,12 @@ impl AgenticRunLifecycleService {
         message: &str,
         failure_code: PreSpawnFailureCode,
     ) -> bool {
-        let terminal_events = pre_spawn_failure_terminal_events(message, failure_code);
+        let mut terminal_events = pre_spawn_failure_terminal_events(message, failure_code)
+            .into_iter()
+            .collect::<Vec<_>>();
+        terminal_events.extend(Self::zero_execution_settlement_events(
+            execution_owner_generation,
+        ));
         let committed = match run_engine
             .commit_terminal_status_with_events_if_current_owner(
                 user_id,
@@ -7937,6 +9092,10 @@ impl AgenticRunLifecycleService {
             "run-pre-admission-user-cancelled:{run_id}:generation:{execution_owner_generation}"
         ));
         let terminal_events = vec![terminal_event];
+        let mut persisted_terminal_events = terminal_events.clone();
+        persisted_terminal_events.extend(Self::zero_execution_settlement_events(
+            execution_owner_generation,
+        ));
         let committed = match run_engine
             .commit_terminal_status_with_events_if_current_owner(
                 user_id,
@@ -7947,7 +9106,7 @@ impl AgenticRunLifecycleService {
                 STATUS_CANCELLED,
                 None,
                 None,
-                &terminal_events,
+                &persisted_terminal_events,
             )
             .await
         {
@@ -8009,7 +9168,42 @@ impl AgenticRunLifecycleService {
                 PreSpawnFailureCode::PreSpawnFailure,
             )
             .await;
+            self.reconcile_evaluation_observation_for_run(
+                user_id,
+                run_id,
+                expected_session_id,
+                execution_owner_generation,
+                STATUS_FAILED,
+            )
+            .await;
         }
+    }
+
+    async fn fail_evaluation_run_before_spawn(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+        execution_owner_generation: u64,
+        message: &str,
+    ) {
+        self.fail_started_run_before_spawn(
+            user_id,
+            expected_session_id,
+            run_id,
+            execution_owner_generation,
+            message,
+            PreSpawnFailureCode::PreSpawnFailure,
+        )
+        .await;
+        self.reconcile_evaluation_observation_for_run(
+            user_id,
+            run_id,
+            expected_session_id,
+            execution_owner_generation,
+            STATUS_FAILED,
+        )
+        .await;
     }
 
     fn durable_run_accounting(loop_state: &AgenticLoopState) -> Value {
@@ -8024,6 +9218,7 @@ impl AgenticRunLifecycleService {
             "cache_creation_tokens": loop_state.total_cache_creation,
             "completion_tokens": loop_state.total_completion,
             "tool_call_count": loop_state.total_tool_calls,
+            "usage_available": loop_state.has_any_usage,
             // This is the sum of every physical model request in the run,
             // not a context-window measurement.
             "usage_scope": "run_total",
@@ -8056,6 +9251,44 @@ impl AgenticRunLifecycleService {
             ),
             "data": Self::durable_run_accounting(loop_state),
         })
+    }
+
+    fn zero_execution_settlement_events(execution_owner_generation: u64) -> [Value; 2] {
+        [
+            json!({
+                "event_type": "run_accounting_finalized",
+                "idempotency_key": format!(
+                    "run-accounting-finalized:{execution_owner_generation}"
+                ),
+                "data": {
+                    "prompt_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_creation_tokens": 0,
+                    "completion_tokens": 0,
+                "tool_call_count": 0,
+                    "tool_outcomes": {
+                        "requested": 0,
+                        "executed": 0,
+                        "succeeded": 0,
+                        "failed": 0,
+                        "rejected": 0,
+                        "reused": 0,
+                        "suppressed": 0,
+                        "deferred": 0,
+                        "policy_denied": 0,
+                    },
+                    "usage_available": false,
+                    "usage_scope": "run_total",
+                },
+            }),
+            json!({
+                "event_type": "run_settlement_finished",
+                "idempotency_key": format!(
+                    "run-settlement-finished:{execution_owner_generation}"
+                ),
+                "data": {"owner_generation": execution_owner_generation},
+            }),
+        ]
     }
 
     fn settlement_started_event(execution_owner_generation: u64) -> Value {
@@ -8323,6 +9556,54 @@ impl AgenticRunLifecycleService {
                 false
             }
         }
+    }
+
+    async fn persist_finalized_accounting_after_terminal(
+        run_engine: &RunEngine,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+        status: RunStatus,
+        execution_owner_generation: u64,
+        loop_state: &AgenticLoopState,
+    ) -> bool {
+        let event = Self::finalized_accounting_event(loop_state, execution_owner_generation);
+        for attempt in 1..=3u64 {
+            match run_engine
+                .append_events_if_current_generation_and_status(
+                    user_id,
+                    expected_session_id,
+                    run_id,
+                    execution_owner_generation,
+                    &[
+                        STATUS_CANCELLED,
+                        STATUS_PAUSED,
+                        STATUS_COMPLETED,
+                        STATUS_FAILED,
+                        STATUS_DELEGATED,
+                    ],
+                    std::slice::from_ref(&event),
+                )
+                .await
+            {
+                Ok(committed) => return committed,
+                Err(error) if attempt == 3 => {
+                    tracing::warn!(
+                        target: "astra_runtime::run_lifecycle",
+                        run_id,
+                        status = status.as_str(),
+                        execution_owner_generation,
+                        error = %error,
+                        "failed to persist generation-fenced terminal accounting"
+                    );
+                }
+                Err(_) => {}
+            }
+            if attempt < 3 {
+                tokio::time::sleep(Duration::from_millis(attempt * 10)).await;
+            }
+        }
+        false
     }
 
     fn finalize_run_events(
@@ -8787,8 +10068,10 @@ impl AgenticRunLifecycleService {
                 "runtime_executor_authorization_invalid",
             )
         })?;
-        Self::thinking_from_chat_context(&request.context, request.model.as_deref())
-            .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+        if request.evaluation_admission.is_none() {
+            Self::thinking_from_chat_context(&request.context, request.model.as_deref())
+                .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+        }
         let provider_model_descriptor = Self::provider_model_descriptor(request)?;
         if provider_model_descriptor.is_some() {
             Self::validate_provider_runtime_authorized(request)?;
@@ -8832,11 +10115,13 @@ impl AgenticRunLifecycleService {
             self.validate_runtime_process_authorization_executor(request)
                 .await?;
         }
-        if !request.has_agent_binding_runtime() && request.runtime_skill_binding.is_none() {
+        if request.evaluation_admission.is_none()
+            && !request.has_agent_binding_runtime()
+            && request.runtime_skill_binding.is_none()
+        {
             let skill_policy = request_constraints.skill_surfacing_policy();
             if skill_policy.requires_catalog_validation() {
-                let (_, resolver) =
-                    build_server_skill_resolver(self.skill_service.clone(), user_id);
+                let (_, resolver) = self.cached_server_skill_resolver(user_id);
                 apply_normalized_skill_allowlist(resolver, &request_constraints)
                     .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
             }
@@ -9321,8 +10606,29 @@ impl AgenticRunLifecycleService {
         user_id: &str,
         session_id: &str,
         request: &mut ChatRequestData,
+        evaluation_workspace_key: Option<&str>,
         work_binding: Option<&ValidatedWorkRuntimeBinding>,
-    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<Option<EvaluationWorkspaceLease>, (StatusCode, Json<ErrorResponse>)> {
+        // Evaluation start carries only an owner-scoped executor choice. The
+        // canonical binding owner resolves the live registry record here so
+        // a start retry can replay an existing Run without requiring the Edge
+        // to be online, while a new claim cannot smuggle a root or
+        // materialization identity through the request.
+        let mut evaluation_workspace_lease = None;
+        if request.evaluation_admission.is_some()
+            && request.edge_executor_id.is_some()
+            && request.workspace_binding.is_none()
+            && request.executor_binding.is_none()
+        {
+            evaluation_workspace_lease = self
+                .populate_evaluation_edge_binding(
+                    user_id,
+                    session_id,
+                    request,
+                    evaluation_workspace_key,
+                )
+                .await?;
+        }
         let request_is_edge = request.workspace_binding.as_ref().is_some_and(|binding| {
             binding.kind == astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace
         }) || request.executor_binding.as_ref().is_some_and(|binding| {
@@ -9382,7 +10688,7 @@ impl AgenticRunLifecycleService {
                 }
             }
             request.execution_binding_generation = None;
-            return Ok(());
+            return Ok(evaluation_workspace_lease);
         }
 
         let Some(pool) = self.shared_pool.clone() else {
@@ -9404,7 +10710,7 @@ impl AgenticRunLifecycleService {
             // Work requests still fail closed until durable selection exists.
             if work_binding.is_none() && (!request_is_edge || edge_ledger || edge_offline) {
                 request.execution_binding_generation = None;
-                return Ok(());
+                return Ok(evaluation_workspace_lease);
             }
             return Err(error_response_coded(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -9491,7 +10797,7 @@ impl AgenticRunLifecycleService {
                 // explicitly selects Server), the row above is created and
                 // all subsequent writes are fenced by its claim.
                 request.execution_binding_generation = None;
-                return Ok(());
+                return Ok(evaluation_workspace_lease);
             }
             (Some(existing), _) => existing.clone(),
         };
@@ -9639,7 +10945,514 @@ impl AgenticRunLifecycleService {
         request.workspace_binding = Some(binding.workspace);
         request.executor_binding = Some(binding.executor);
         request.execution_binding_generation = Some(binding.generation);
-        Ok(())
+        Ok(evaluation_workspace_lease)
+    }
+
+    async fn prove_evaluation_workspace_materialization(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        request: &ChatRequestData,
+        workspace_policy: Option<&astra_services::evaluation::FrozenWorkspaceExecution>,
+        expected_edge_connection_generation: Option<u64>,
+        expected_allocation: Option<&astra_runtime_env::EvaluationAllocationReceipt>,
+    ) -> Result<
+        Option<astra_runtime_env::EvaluationAllocationReceipt>,
+        (StatusCode, Json<ErrorResponse>),
+    > {
+        let Some(workspace_policy) = workspace_policy else {
+            return Ok(None);
+        };
+        let registry = self.edge_registry_service.as_ref().ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_execution_target_unavailable",
+                "the Edge registry is temporarily unavailable",
+            )
+        })?;
+        let record = registry
+            .find_by_user_agent_and_workspace(user_id, &workspace_policy.edge_executor_id, None)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    owner_id = %user_id,
+                    executor_id = %workspace_policy.edge_executor_id,
+                    error = %error,
+                    "evaluation Edge registry lookup failed while proving workspace materialization"
+                );
+                evaluation_preflight_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "evaluation_execution_target_unavailable",
+                    "the selected Edge registry is temporarily unavailable",
+                )
+            })?
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::PRECONDITION_FAILED,
+                    "evaluation_workspace_materialization_unavailable",
+                    "the frozen Edge workspace is not currently registered",
+                )
+            })?;
+        let request_root = request
+            .workspace_binding
+            .as_ref()
+            .and_then(|workspace| workspace.root.as_deref())
+            .map(str::trim)
+            .filter(|root| !root.is_empty())
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_execution_binding_mismatch",
+                    "the canonical lifecycle did not establish the frozen workspace root",
+                )
+            })?;
+        let registered_root = record
+            .worktree_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|root| !root.is_empty());
+        let materialization_id = record
+            .materialization_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|identity| !identity.is_empty());
+        let base_root = request
+            .evaluation_workspace_base_root
+            .as_deref()
+            .map(str::trim)
+            .filter(|root| !root.is_empty())
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_execution_binding_mismatch",
+                    "the evaluation workspace has no server-generated base root",
+                )
+            })?;
+        if !is_managed_evaluation_workspace_path(base_root, request_root)
+            || record.workspace_id.is_some()
+            || record.edge_agent_id != workspace_policy.edge_executor_id
+            || registered_root != Some(base_root)
+            || materialization_id.is_none()
+            || expected_allocation.map(|a| a.workspace_dir.as_str()) != Some(request_root)
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_workspace_materialization_mismatch",
+                "the live Edge registry does not prove the frozen workspace identity",
+            ));
+        }
+        let pool = self.edge_connection_pool.as_ref().ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_execution_target_unavailable",
+                "the selected Edge connection is unavailable",
+            )
+        })?;
+        let connected = pool
+            .find_user_edge_by_agent_and_workspace(
+                user_id,
+                &workspace_policy.edge_executor_id,
+                None,
+            )
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::PRECONDITION_FAILED,
+                    "evaluation_workspace_materialization_unavailable",
+                    "the selected Edge connection is no longer live",
+                )
+            })?;
+        if connected.workspace_dir.as_deref().map(str::trim) != Some(base_root)
+            || connected.registry_id.as_deref() != Some(record.registry_id.as_str())
+            || connected.materialization_id.as_deref() != materialization_id
+            || expected_edge_connection_generation != Some(connected.generation)
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_workspace_materialization_mismatch",
+                "the live Edge connection and registry no longer identify the same checkout",
+            ));
+        }
+        let canonical_binding = self.shared_pool.clone().ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_execution_target_unavailable",
+                "the canonical execution binding store is unavailable",
+            )
+        })?;
+        let key = astra_turn_types::SessionKeyV1::owner_session(
+            "server",
+            user_id,
+            session_id,
+            astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+        );
+        let binding = astra_services::DatabaseSessionContextCoordinator::new(canonical_binding)
+            .load_execution_binding(&key)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    owner_id = %user_id,
+                    session_id = %session_id,
+                    error = %error,
+                    "failed to load canonical evaluation execution binding"
+                );
+                evaluation_preflight_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "evaluation_execution_target_unavailable",
+                    "the canonical evaluation execution binding is unavailable",
+                )
+            })?
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_execution_binding_mismatch",
+                    "the evaluation Run has no canonical execution binding",
+                )
+            })?;
+        let materialization_id = materialization_id.expect("materialization id checked above");
+        let expected_physical =
+            astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+                materialization_id,
+                request_root,
+            );
+        if binding.generation != request.execution_binding_generation.unwrap_or_default()
+            || binding.executor.kind != astra_services::runs::ExecutorBindingRequestKind::EdgeAgent
+            || binding.executor.executor_id.as_deref()
+                != Some(workspace_policy.edge_executor_id.as_str())
+            || binding.workspace.root.as_deref() != Some(request_root)
+            || binding.physical_workspace_id.as_deref() != Some(expected_physical.as_str())
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_execution_binding_mismatch",
+                "the canonical execution binding does not own the prepared trial workspace",
+            ));
+        }
+        let snapshot = pool
+            .snapshot_evaluation_workspace(
+                user_id,
+                &workspace_policy.edge_executor_id,
+                astra_server_types::edge_connection_pool::EdgeWorkspaceAllocationTarget {
+                    connection_generation: connected.generation,
+                    allocation: expected_allocation.ok_or_else(|| {
+                        evaluation_preflight_error(
+                            StatusCode::CONFLICT,
+                            "evaluation_allocation_missing",
+                            "the Run has no retained allocation receipt",
+                        )
+                    })?,
+                },
+                std::time::Duration::from_secs(15),
+            )
+            .await
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::PRECONDITION_FAILED,
+                    "evaluation_workspace_materialization_unavailable",
+                    "the selected Edge did not return a live workspace snapshot",
+                )
+            })?;
+        if snapshot.error.is_some()
+            || snapshot.allocation.as_ref() != expected_allocation
+            || snapshot.source_tree.as_deref()
+                != expected_allocation.map(|receipt| receipt.source_tree.as_str())
+            || snapshot.connection_generation != connected.generation
+            || !snapshot.clean
+            || snapshot.workspace_dir.trim() != request_root
+            || snapshot.source_commit.as_deref() != Some(workspace_policy.source_commit.as_str())
+            || snapshot
+                .source_tree
+                .as_deref()
+                .is_none_or(|tree| !is_git_object_id(tree))
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_workspace_materialization_mismatch",
+                "the live Edge workspace is dirty or no longer matches the frozen source",
+            ));
+        }
+        crate::evaluation::workspace::validate_frozen_workspace_capability(
+            user_id,
+            workspace_policy,
+            &connected,
+            &record,
+        )
+        .map_err(|detail| {
+            evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_workspace_materialization_mismatch",
+                &detail,
+            )
+        })?;
+        Ok(snapshot.allocation)
+    }
+
+    async fn populate_evaluation_edge_binding(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        request: &mut ChatRequestData,
+        workspace_key: Option<&str>,
+    ) -> Result<Option<EvaluationWorkspaceLease>, (StatusCode, Json<ErrorResponse>)> {
+        let executor_id = request
+            .edge_executor_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::BAD_REQUEST,
+                    "evaluation_execution_target_invalid",
+                    "edge_executor_id must not be empty",
+                )
+            })?;
+        let registry = self.edge_registry_service.as_ref().ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_execution_target_unavailable",
+                "the Edge registry is temporarily unavailable",
+            )
+        })?;
+        let admission = request.evaluation_admission.as_ref().ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_execution_target_invalid",
+                "workspace Edge selection requires an evaluation admission",
+            )
+        })?;
+        let workspace_key = workspace_key.ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_workspace_materialization_mismatch",
+                "the evaluation Run has no workspace allocation identity",
+            )
+        })?;
+        let record = registry
+            .find_by_user_agent_and_workspace(user_id, executor_id, None)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    owner_id = %user_id,
+                    executor_id,
+                    error = %error,
+                    "evaluation Edge registry lookup failed during canonical binding"
+                );
+                evaluation_preflight_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "evaluation_execution_target_unavailable",
+                    "the selected Edge registry is temporarily unavailable",
+                )
+            })?
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::PRECONDITION_FAILED,
+                    "evaluation_execution_target_unavailable",
+                    "the selected Edge is not currently registered for this user",
+                )
+            })?;
+        if record.workspace_id.is_some() || record.edge_agent_id != executor_id {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_execution_target_mismatch",
+                "the selected Edge is outside the native owner execution scope",
+            ));
+        }
+        let root = record
+            .worktree_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::PRECONDITION_FAILED,
+                    "evaluation_execution_target_incomplete",
+                    "the selected Edge has no registered workspace root",
+                )
+            })?;
+        let materialization_id = record
+            .materialization_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::PRECONDITION_FAILED,
+                    "evaluation_execution_target_incomplete",
+                    "the selected Edge has no stable checkout materialization",
+                )
+            })?;
+        let base_root = root.to_string();
+        let expected_workspace =
+            expected_evaluation_workspace_path(&base_root, materialization_id, workspace_key)
+                .ok_or_else(|| {
+                    evaluation_preflight_error(
+                        StatusCode::CONFLICT,
+                        "evaluation_workspace_materialization_mismatch",
+                        "the evaluation trial cannot produce a managed workspace identity",
+                    )
+                })?;
+        // Resolve the authenticated source checkout before attempting the
+        // per-trial clone. If the live Edge transport is unavailable, the
+        // request still carries the canonical provider identity that produced
+        // the typed failure; no caller can substitute a different root.
+        request.evaluation_workspace_base_root = Some(base_root.clone());
+        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+            kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+            display_name: Some(executor_id.to_string()),
+            root: Some(base_root.clone()),
+            source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
+                path: base_root.clone(),
+            }),
+            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+        });
+        request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+            kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+            executor_id: Some(executor_id.to_string()),
+            display_name: Some(executor_id.to_string()),
+            transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeWs),
+            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+        });
+        let pool = self.shared_pool.clone().ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_execution_target_unavailable",
+                "evaluation workspace preparation requires the durable evaluation store",
+            )
+        })?;
+        let experiment = DatabaseEvaluationPlanStore::new(pool)
+            .load_experiment(user_id, &admission.experiment_id)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    owner_id = %user_id,
+                    experiment_id = %admission.experiment_id,
+                    error = %error,
+                    "failed to load frozen workspace policy during Edge binding"
+                );
+                evaluation_preflight_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "evaluation_store_error",
+                    "the frozen evaluation workspace policy is temporarily unavailable",
+                )
+            })?;
+        let workspace_policy = experiment
+            .spec
+            .conditions
+            .workspace_execution
+            .as_ref()
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "evaluation_execution_surface_unsupported",
+                    "this evaluation has no frozen workspace execution policy",
+                )
+            })?;
+        let pool = self.edge_connection_pool.as_ref().ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_execution_target_unavailable",
+                "the selected Edge has no live WebSocket connection",
+            )
+        })?;
+        let connected = pool
+            .find_user_edge_by_agent_and_workspace(user_id, executor_id, None)
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::PRECONDITION_FAILED,
+                    "evaluation_execution_target_unavailable",
+                    "the selected Edge connection is no longer live",
+                )
+            })?;
+        crate::evaluation::workspace::validate_frozen_workspace_capability(
+            user_id,
+            workspace_policy,
+            &connected,
+            &record,
+        )
+        .map_err(|detail| {
+            evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_workspace_materialization_mismatch",
+                &detail,
+            )
+        })?;
+        let prepared = pool
+            .prepare_evaluation_workspace(
+                user_id,
+                executor_id,
+                astra_server_types::edge_connection_pool::EdgeWorkspacePreparationRequest {
+                    connection_generation: connected.generation,
+                    workspace_key,
+                    session_id,
+                    source_commit: &workspace_policy.source_commit,
+                    confinement: &workspace_policy.confinement,
+                },
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::PRECONDITION_FAILED,
+                    "evaluation_workspace_materialization_unavailable",
+                    "the selected Edge did not return an isolated workspace clone",
+                )
+            })?;
+        let expected_fingerprint = workspace_policy
+            .confinement
+            .fingerprint()
+            .map_err(|error| {
+                evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_confinement_invalid",
+                    error,
+                )
+            })?;
+        let prepared_is_invalid = prepared.error.is_some()
+            || prepared.connection_generation != connected.generation
+            || prepared.workspace_dir != expected_workspace
+            || prepared.allocation.as_ref().is_none_or(|allocation| {
+                allocation.validate().is_err()
+                    || allocation.owner_user_id != user_id
+                    || allocation.session_id != session_id
+                    || Some(allocation.run_id.as_str()) != workspace_key.strip_prefix("trial-")
+                    || allocation.materialization_id != materialization_id
+                    || allocation.workspace_dir != prepared.workspace_dir
+                    || allocation.source_commit != workspace_policy.source_commit
+                    || prepared.source_commit.as_deref() != Some(allocation.source_commit.as_str())
+                    || prepared.source_tree.as_deref() != Some(allocation.source_tree.as_str())
+                    || allocation.confinement_fingerprint != expected_fingerprint
+            });
+        if prepared_is_invalid {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_workspace_materialization_mismatch",
+                "the selected Edge did not prove the frozen allocation; no unknown workspace was released",
+            ));
+        }
+        let allocation = prepared.allocation.expect("validated allocation");
+        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+            kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+            display_name: Some(executor_id.to_string()),
+            root: Some(prepared.workspace_dir.clone()),
+            source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
+                path: prepared.workspace_dir,
+            }),
+            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+        });
+        request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+            kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+            executor_id: Some(executor_id.to_string()),
+            display_name: Some(executor_id.to_string()),
+            transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeWs),
+            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+        });
+        let lease_pool = (*pool).clone();
+        Ok(Some(EvaluationWorkspaceLease::new(
+            Some(lease_pool),
+            user_id.to_string(),
+            Some(executor_id.to_string()),
+            Some(prepared.connection_generation),
+            allocation,
+        )))
     }
 
     /// A first-party user request may select only an Edge connection that is
@@ -9690,9 +11503,15 @@ impl AgenticRunLifecycleService {
                 )
             })?;
 
+        let expected_registered_root = request
+            .evaluation_workspace_base_root
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(root);
         let path_matches = |path: Option<&str>| {
             path.map(str::trim)
-                .is_some_and(|candidate| candidate == root)
+                .is_some_and(|candidate| candidate == expected_registered_root)
         };
         // Native first-party registrations are intentionally unscoped. A
         // workspace-scoped Edge can only be selected through the provider
@@ -9866,7 +11685,13 @@ impl AgenticRunLifecycleService {
         &self,
         user_id: &str,
         mut request: ChatRequestData,
-    ) -> Result<ChatRequestData, (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<
+        (
+            ChatRequestData,
+            crate::turn::execution_config::PreparedExecutionInputs,
+        ),
+        (StatusCode, Json<ErrorResponse>),
+    > {
         if self.execution_handoff_requested.load(Ordering::Acquire) {
             return Err(error_response_coded(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -9902,14 +11727,20 @@ impl AgenticRunLifecycleService {
                 .transpose()
                 .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
         }
-        astra_config::RuntimeConfig::cached()
-            .runtime_limits
-            .resolve_turn_ceiling(
-                astra_turn_core::stop_hooks_yaml::is_plan_subtask_from_chat_context(
-                    &request.context,
-                ),
-            )
-            .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        let runtime_config = request
+            .evaluation_admission
+            .is_none()
+            .then(astra_config::RuntimeConfig::load);
+        if let Some(runtime_config) = runtime_config.as_ref() {
+            runtime_config
+                .runtime_limits
+                .resolve_turn_ceiling(
+                    astra_turn_core::stop_hooks_yaml::is_plan_subtask_from_chat_context(
+                        &request.context,
+                    ),
+                )
+                .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        }
         if request.model_selection_mode == ModelSelectionMode::ServerDefault {
             if request.provider_runtime_authorized
                 || request.model_selection.is_some()
@@ -9953,7 +11784,10 @@ impl AgenticRunLifecycleService {
             request.model = Some(resolved.model_name.clone());
             request.resolved_model_selection = Some(resolved);
             request.admitted_model_execution = Some(admitted);
-            return Ok(request);
+            let execution_inputs = self
+                .prepare_execution_inputs(user_id, &request, runtime_config)
+                .await?;
+            return Ok((request, execution_inputs));
         }
         let selection = Self::validate_model_selection_shape(request.model_selection.as_ref())?;
         if request.admitted_model_execution.is_some() {
@@ -10003,7 +11837,10 @@ impl AgenticRunLifecycleService {
                 .await?,
             );
             request.model = Some(resolved.model_name.clone());
-            return Ok(request);
+            let execution_inputs = self
+                .prepare_execution_inputs(user_id, &request, runtime_config)
+                .await?;
+            return Ok((request, execution_inputs));
         }
         if request.resolved_model_selection.is_some() {
             return Err(error_response_coded(
@@ -10029,7 +11866,10 @@ impl AgenticRunLifecycleService {
         request.model = Some(resolved.model_name.clone());
         request.resolved_model_selection = Some(resolved);
         request.admitted_model_execution = Some(admitted);
-        Ok(request)
+        let execution_inputs = self
+            .prepare_execution_inputs(user_id, &request, runtime_config)
+            .await?;
+        Ok((request, execution_inputs))
     }
 
     async fn plan_resume_snapshot_for_request(
@@ -10051,6 +11891,84 @@ impl AgenticRunLifecycleService {
             };
         }
         astra_plan::plan_resume_snapshot_for_session(&repo, user_id, session_id).await
+    }
+
+    async fn prepare_execution_inputs(
+        &self,
+        user_id: &str,
+        request: &ChatRequestData,
+        runtime_config: Option<astra_config::RuntimeConfig>,
+    ) -> Result<
+        crate::turn::execution_config::PreparedExecutionInputs,
+        (StatusCode, Json<ErrorResponse>),
+    > {
+        use crate::turn::execution_config::PreparedExecutionInputs;
+
+        let Some(admission) = request.evaluation_admission.as_ref() else {
+            return Ok(PreparedExecutionInputs::capture(
+                runtime_config.expect("ordinary request captured runtime configuration"),
+                user_id,
+                request.session_id.as_deref().unwrap_or_default(),
+            ));
+        };
+        let pool = self.shared_pool.clone().ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_store_unavailable",
+                "frozen execution configuration requires the durable evaluation store",
+            )
+        })?;
+        let store = DatabaseEvaluationPlanStore::new(pool);
+        let experiment = store
+            .load_experiment(user_id, &admission.experiment_id)
+            .await
+            .map_err(|error| {
+                evaluation_preflight_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "evaluation_store_error",
+                    error,
+                )
+            })?;
+        let binding = store
+            .load_trial(user_id, &admission.trial_id)
+            .await
+            .map_err(|error| {
+                evaluation_preflight_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "evaluation_store_error",
+                    error,
+                )
+            })?;
+        if binding.experiment_id != experiment.experiment_id
+            || binding.spec_fingerprint != experiment.spec_fingerprint
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_trial_identity_conflict",
+                "trial does not belong to the frozen experiment configuration",
+            ));
+        }
+        let admitted = request.admitted_model_execution.as_ref().ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_model_admission_missing",
+                "frozen execution requires current model authorization",
+            )
+        })?;
+        PreparedExecutionInputs::from_frozen(
+            &experiment.spec.conditions.execution_config,
+            admitted,
+            &self.encryptor,
+            &binding.trial.case_id,
+            admission.judgment_policy.as_ref(),
+        )
+        .map_err(|error| {
+            evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_execution_config_mismatch",
+                error,
+            )
+        })
     }
 
     fn validate_effective_user_input(
@@ -10184,7 +12102,10 @@ impl AgenticRunLifecycleService {
                 "agent_binding_runtime_profile_conflict",
             ));
         }
-        if !has_agent_bindings && request.stable_runtime_system_prompt.is_some() {
+        if !has_agent_bindings
+            && request.stable_runtime_system_prompt.is_some()
+            && request.evaluation_admission.is_none()
+        {
             return Err(error_response_coded(
                 StatusCode::BAD_REQUEST,
                 "stable_runtime_system_prompt requires agent_binding or agent_bindings",
@@ -10475,6 +12396,10 @@ impl AgenticRunLifecycleService {
                 "Work turn request identity is already bound to a different payload",
                 "idempotency_mismatch",
             ),
+            RunStartIdempotencyKind::EvaluationTrial => (
+                "evaluation trial is already bound to a different start request",
+                "evaluation_trial_start_mismatch",
+            ),
         };
         Err(error_response_coded(StatusCode::CONFLICT, detail, code))
     }
@@ -10494,8 +12419,28 @@ impl AgenticRunLifecycleService {
                     "Work turn request identity is already bound to a different branch",
                     "idempotency_mismatch",
                 ),
+                RunStartIdempotencyKind::EvaluationTrial => (
+                    "evaluation trial is already bound to a different session",
+                    "evaluation_trial_start_mismatch",
+                ),
             };
             return Err(error_response_coded(StatusCode::CONFLICT, detail, code));
+        }
+        Ok(())
+    }
+
+    fn validate_start_request_authority(
+        identity: Option<&RunStartIdempotency>,
+        authority_run_id: Option<&str>,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        if let (Some(identity), Some(authority_run_id)) = (identity, authority_run_id)
+            && identity.run_id() != authority_run_id
+        {
+            return Err(error_response_coded(
+                StatusCode::CONFLICT,
+                "request idempotency and conversation authority identify different runs",
+                "conversation_authority_run_conflict",
+            ));
         }
         Ok(())
     }
@@ -11627,13 +13572,30 @@ impl AgenticRunLifecycleService {
         plan_resume_hint: Option<String>,
         plan_authoring_active: bool,
         work_runtime_binding: Option<&ValidatedWorkRuntimeBinding>,
+        execution_inputs: &crate::turn::execution_config::PreparedExecutionInputs,
     ) -> server_loop_host::ServerAgenticLoopHost {
+        let skill_auto_route_policy = match &execution_inputs.policy {
+            crate::turn::execution_config::PreparedExecutionPolicy::Evaluation(frozen) => {
+                if matches!(
+                    frozen.judgment_policy,
+                    Some(astra_services::evaluation::FrozenSkillRoutingPolicy::Available { .. })
+                ) {
+                    astra_services::runs::SkillAutoRouteExecutionPolicy::Auto
+                } else {
+                    astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled
+                }
+            }
+            crate::turn::execution_config::PreparedExecutionPolicy::Normal(_) => {
+                request.execution_policy.skill_auto_route
+            }
+        };
         let mut builder = ServerAgenticLoopHostBuilder::new(
             self.matrixone.clone(),
             self.encryptor.clone(),
             user_id.to_string(),
             session_id.to_string(),
         )
+        .with_execution_inputs(execution_inputs.clone())
         .with_model(request.model.clone())
         .with_model_service(Some(self.model_service.clone()))
         .with_admitted_execution_deadline(request.admitted_execution_deadline)
@@ -11651,7 +13613,7 @@ impl AgenticRunLifecycleService {
         .with_edge_callback_ledger(self.edge_callback_ledger.clone())
         .with_interaction_mode(Some(Self::effective_requested_interaction_mode(request)))
         .with_turn_intent_policy(request.execution_policy.turn_intent)
-        .with_skill_auto_route_policy(request.execution_policy.skill_auto_route)
+        .with_skill_auto_route_policy(skill_auto_route_policy)
         .with_interactive_client(request.interactive_client)
         .with_plan_resume_hint(plan_resume_hint)
         .with_plan_authoring_active(plan_authoring_active)
@@ -11664,8 +13626,8 @@ impl AgenticRunLifecycleService {
         }
 
         builder = builder.with_memoria_client(
-            self.memory_extraction_service
-                .as_ref()
+            RuntimeProductionStatePolicy::for_request(request)
+                .select(self.memory_extraction_service.as_ref())
                 .and_then(|svc| svc.memoria_client_for_owner(user_id).ok()),
         );
 
@@ -11908,6 +13870,200 @@ impl AgenticRunLifecycleService {
         }
     }
 
+    async fn evaluation_session_has_only_expected_run(
+        pool: &sqlx::Pool<sqlx::MySql>,
+        user_id: &str,
+        session_id: &str,
+        expected_run_id: &str,
+    ) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
+        let expected_run_exists = sqlx::query(
+            "SELECT run_id FROM agent_runs
+             WHERE user_id = ? AND session_id = ? AND run_id = ? LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(expected_run_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| {
+            evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_session_check_failed",
+                format!("failed to inspect the evaluation Run identity: {error}"),
+            )
+        })?
+        .is_some();
+        if !expected_run_exists {
+            return Ok(false);
+        }
+        let foreign_run = sqlx::query(
+            "SELECT run_id FROM agent_runs
+             WHERE user_id = ? AND session_id = ? AND run_id <> ? LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(expected_run_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| {
+            evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_session_check_failed",
+                format!("failed to inspect competing evaluation Runs: {error}"),
+            )
+        })?;
+        if foreign_run.is_some() {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_session_not_clean",
+                "evaluation session already contains another Run",
+            ));
+        }
+        Ok(true)
+    }
+
+    /// Evaluation trials must start from a genuinely empty
+    /// session. Reusing a normal chat session would silently import canonical
+    /// history, checkpoints, state projections, or context snapshots that
+    /// are absent from the frozen Context receipt.
+    async fn ensure_evaluation_session_clean(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        expected_run_id: &str,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        let Some(shared) = &self.shared_pool else {
+            return Err(evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_store_unavailable",
+                "evaluation admission requires the shared durable database",
+            ));
+        };
+        let pool = shared.get();
+        // The stable evaluation session is also the retry boundary. Once the
+        // canonical Run for this exact trial exists, its own in-flight rows
+        // are valid state and concurrent retries must reach the durable claim
+        // instead of being mistaken for cross-run contamination. A different
+        // Run still rejects the session below. The same check is repeated when
+        // a later table query observes state, closing the race where another
+        // process claims this exact Run between the first query and that scan.
+        if Self::evaluation_session_has_only_expected_run(
+            pool,
+            user_id,
+            session_id,
+            expected_run_id,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let checks = [
+            (
+                "agent_events",
+                "SELECT 1 FROM agent_events WHERE user_id = ? AND session_id = ? LIMIT 1",
+            ),
+            (
+                "agent_runs",
+                "SELECT 1 FROM agent_runs WHERE user_id = ? AND session_id = ? LIMIT 1",
+            ),
+            (
+                "session_context_heads",
+                "SELECT 1 FROM session_context_heads WHERE owner_user_id = ? AND session_id = ? LIMIT 1",
+            ),
+            (
+                "session_state_items",
+                "SELECT 1 FROM session_state_items WHERE user_id = ? AND session_id = ? LIMIT 1",
+            ),
+            (
+                "ctx_snapshots",
+                "SELECT 1 FROM ctx_snapshots WHERE user_id = ? AND session_id = ? LIMIT 1",
+            ),
+            (
+                "run_checkpoints",
+                "SELECT 1 FROM run_checkpoints WHERE user_id = ? AND session_id = ? LIMIT 1",
+            ),
+            (
+                "session_execution_bindings",
+                "SELECT 1 FROM session_execution_bindings WHERE owner_user_id = ? AND session_id = ? LIMIT 1",
+            ),
+            (
+                "conversation_log",
+                "SELECT 1 FROM conversation_log WHERE user_id = ? AND session_id = ? LIMIT 1",
+            ),
+        ];
+        for (table, sql) in checks {
+            let present = sqlx::query(sql)
+                .bind(user_id)
+                .bind(session_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|error| {
+                    evaluation_preflight_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "evaluation_session_check_failed",
+                        format!("failed to inspect {table}: {error}"),
+                    )
+                })?
+                .is_some();
+            if present {
+                if Self::evaluation_session_has_only_expected_run(
+                    pool,
+                    user_id,
+                    session_id,
+                    expected_run_id,
+                )
+                .await?
+                {
+                    // The canonical ClaimOrReplay below revalidates the
+                    // request fingerprint and owner authority. This branch
+                    // only prevents a concurrent exact retry from being
+                    // rejected as session contamination.
+                    return Ok(());
+                }
+                return Err(evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_session_not_clean",
+                    format!("evaluation requires a new session; {table} already has state"),
+                ));
+            }
+        }
+        // The transcript helper is intentionally best-effort for ordinary
+        // resume hydration. Admission is different: an unavailable history
+        // query must fail closed, otherwise a partially visible old prompt
+        // could contaminate a supposedly evaluation trial.
+        let transcript_present = sqlx::query(PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL)
+            .bind(session_id)
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| {
+                evaluation_preflight_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "evaluation_session_check_failed",
+                    format!("failed to inspect prompt history transcript: {error}"),
+                )
+            })?
+            .is_some();
+        if transcript_present {
+            if Self::evaluation_session_has_only_expected_run(
+                pool,
+                user_id,
+                session_id,
+                expected_run_id,
+            )
+            .await?
+            {
+                return Ok(());
+            }
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_session_not_clean",
+                "evaluation requires a new session without conversation history",
+            ));
+        }
+        Ok(())
+    }
+
     fn session_resume_hydration_hint_from_sources(
         primary_messages: &[Value],
         transcript_messages: &[Value],
@@ -12004,6 +14160,11 @@ impl AgenticRunLifecycleService {
             None,
             None,
             None,
+            &crate::turn::execution_config::PreparedExecutionInputs::capture(
+                astra_config::runtime_config::RuntimeConfig::default(),
+                user_id,
+                session_id,
+            ),
         )
         .expect("valid test execution budget")
     }
@@ -12027,14 +14188,25 @@ impl AgenticRunLifecycleService {
         agent_binding_context: Option<&PreparedAgentBindingLoopContext>,
         execution_owner_generation: Option<u64>,
     ) -> LoopEnvironment {
-        let (skill_registry, skill_resolver) = if let Some(binding_context) = agent_binding_context
+        let (skill_registry, skill_resolver) = if let Some(admission) =
+            &request.evaluation_admission
         {
+            // A Prompt trial has no Skill catalog. A Skill trial receives only
+            // the immutable resolver constructed by admission, never the
+            // owner's mutable catalog or an Agent Binding catalog.
+            (
+                None,
+                admission
+                    .skill_revision
+                    .as_ref()
+                    .and(request_scoped_skill_resolver),
+            )
+        } else if let Some(binding_context) = agent_binding_context {
             (None, binding_context.skill_resolver.clone())
         } else if let Some(skill_resolver) = request_scoped_skill_resolver {
             (None, Some(skill_resolver))
         } else {
-            let (skill_registry, raw_skill_resolver) =
-                build_server_skill_resolver(self.skill_service.clone(), user_id);
+            let (skill_registry, raw_skill_resolver) = self.cached_server_skill_resolver(user_id);
             let skill_resolver =
                     apply_normalized_skill_allowlist(raw_skill_resolver, request_constraints)
                         .unwrap_or_else(|err| {
@@ -12076,20 +14248,21 @@ impl AgenticRunLifecycleService {
         let edge_profile = edge_profile_override.cloned().unwrap_or_else(|| {
             Self::edge_profile_with_skill_listing(edge_context, request_constraints)
         });
-        let memory_extraction_service = self.memory_extraction_service.as_ref().and_then(|svc| {
-            match svc.scoped_to_owner(user_id) {
-                Ok(scoped) => Some(scoped),
-                Err(error) => {
-                    tracing::error!(
-                        user_id,
-                        session_id,
-                        error = %error,
-                        "session-memory extraction disabled because the transport could not bind the authenticated owner"
-                    );
-                    None
+        let memory_extraction_service = RuntimeProductionStatePolicy::for_request(request)
+            .select(self.memory_extraction_service.as_ref()).and_then(|svc| {
+                match svc.scoped_to_owner(user_id) {
+                    Ok(scoped) => Some(scoped),
+                    Err(error) => {
+                        tracing::error!(
+                            user_id,
+                            session_id,
+                            error = %error,
+                            "session-memory extraction disabled because the transport could not bind the authenticated owner"
+                        );
+                        None
+                    }
                 }
-            }
-        });
+            });
         let skill_executor = build_server_skill_executor(
             &self.matrixone,
             &self.encryptor,
@@ -12200,6 +14373,7 @@ impl AgenticRunLifecycleService {
         request_scoped_skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
         agent_binding_context: Option<&PreparedAgentBindingLoopContext>,
         execution_owner_generation: Option<u64>,
+        execution_inputs: &crate::turn::execution_config::PreparedExecutionInputs,
     ) -> Result<AgenticLoopState, (StatusCode, Json<ErrorResponse>)> {
         let facts = self.prepare_initial_execution_facts(
             user_id,
@@ -12208,6 +14382,7 @@ impl AgenticRunLifecycleService {
             run_id,
             workspace_override,
             edge_context,
+            execution_inputs,
         )?;
         let environment = self.assemble_loop_environment(
             user_id,
@@ -12226,7 +14401,6 @@ impl AgenticRunLifecycleService {
             execution_owner_generation,
         );
         Ok(self.assemble_loop_state(
-            user_id,
             request,
             session_id,
             run_id,
@@ -12235,6 +14409,7 @@ impl AgenticRunLifecycleService {
             agent_binding_context,
             environment,
             facts,
+            execution_inputs,
         ))
     }
 
@@ -12246,6 +14421,7 @@ impl AgenticRunLifecycleService {
         run_id: &str,
         workspace_override: Option<&std::path::Path>,
         edge_context: &EdgeContext,
+        execution_inputs: &crate::turn::execution_config::PreparedExecutionInputs,
     ) -> Result<LoopExecutionFacts, (StatusCode, Json<ErrorResponse>)> {
         use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
         use astra_turn_core::stop_hooks_yaml::{
@@ -12268,39 +14444,51 @@ impl AgenticRunLifecycleService {
         });
 
         let task_profile = infer_task_execution_profile(&prompt_user_message);
-        let runtime_turn_ceiling = astra_config::runtime_config::RuntimeConfig::cached()
-            .runtime_limits
-            .resolve_turn_ceiling(is_plan_subtask_from_chat_context(&request.context))
-            .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-        let requested_budget = request
-            .execution_budget
-            .as_ref()
-            .map(|budget| {
-                Ok::<_, (StatusCode, Json<ErrorResponse>)>(
-                    astra_turn_core::chat_turn_heuristics::AgenticTurnBudgetOverride {
-                        initial_turns: budget.initial_turns.map(|value| value as usize),
-                        hard_turn_limit: budget
-                            .hard_turn_limit
-                            .map(|value| {
-                                std::num::NonZeroUsize::new(value as usize).ok_or_else(|| {
-                                    error_response(
-                                        StatusCode::BAD_REQUEST,
-                                        "hard_turn_limit must be positive".to_string(),
-                                    )
-                                })
-                            })
-                            .transpose()?,
-                    },
+        let agentic_turn_budget = match &execution_inputs.policy {
+            crate::turn::execution_config::PreparedExecutionPolicy::Evaluation(frozen) => {
+                frozen.case_budget
+            }
+            crate::turn::execution_config::PreparedExecutionPolicy::Normal(runtime) => {
+                let runtime_turn_ceiling = runtime
+                    .runtime_limits
+                    .resolve_turn_ceiling(is_plan_subtask_from_chat_context(&request.context))
+                    .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+                let requested_budget = request
+                    .execution_budget
+                    .as_ref()
+                    .map(|budget| {
+                        Ok::<_, (StatusCode, Json<ErrorResponse>)>(
+                            astra_turn_core::chat_turn_heuristics::AgenticTurnBudgetOverride {
+                                initial_turns: budget.initial_turns.map(|value| value as usize),
+                                hard_turn_limit: budget
+                                    .hard_turn_limit
+                                    .map(|value| {
+                                        std::num::NonZeroUsize::new(value as usize).ok_or_else(
+                                            || {
+                                                error_response(
+                                                    StatusCode::BAD_REQUEST,
+                                                    "hard_turn_limit must be positive".to_string(),
+                                                )
+                                            },
+                                        )
+                                    })
+                                    .transpose()?,
+                            },
+                        )
+                    })
+                    .transpose()?;
+                astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
+                    task_profile,
+                    runtime_turn_ceiling,
+                    requested_budget,
                 )
-            })
-            .transpose()?;
-        let agentic_turn_budget =
-            astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
-                task_profile,
-                runtime_turn_ceiling,
-                requested_budget,
+            }
+        };
+        let budget_is_explicit = request.execution_budget.is_some()
+            || matches!(
+                &execution_inputs.policy,
+                crate::turn::execution_config::PreparedExecutionPolicy::Evaluation(_)
             );
-        let budget_is_explicit = request.execution_budget.is_some();
         let max_turns = agentic_turn_budget.initial_turns;
         // Use edge profile's git_root/cwd if available; fall back to provisioned
         // server workspace so web-agent sessions still load stop-hooks.yaml.
@@ -12321,11 +14509,18 @@ impl AgenticRunLifecycleService {
             .as_ref()
             .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
             .unwrap_or_default();
-        let max_turn_input_tokens = effective_max_turn_input_tokens(
-            astra_core::RuntimeLimits::global(),
-            request.model.as_deref(),
-            request.admitted_model_execution.as_ref(),
-        );
+        let max_turn_input_tokens = match &execution_inputs.policy {
+            crate::turn::execution_config::PreparedExecutionPolicy::Evaluation(frozen) => {
+                frozen.config.runtime.max_turn_input_tokens
+            }
+            crate::turn::execution_config::PreparedExecutionPolicy::Normal(_) => {
+                effective_max_turn_input_tokens(
+                    astra_core::RuntimeLimits::global(),
+                    request.model.as_deref(),
+                    request.admitted_model_execution.as_ref(),
+                )
+            }
+        };
         Ok(LoopExecutionFacts {
             messages: vec![user_message],
             tool_ledger_receipt: Default::default(),
@@ -12392,7 +14587,6 @@ impl AgenticRunLifecycleService {
     /// Assemble one loop without inferring or resetting its execution facts.
     fn assemble_loop_state(
         &self,
-        user_id: &str,
         request: &ChatRequestData,
         session_id: &str,
         run_id: &str,
@@ -12401,6 +14595,7 @@ impl AgenticRunLifecycleService {
         agent_binding_context: Option<&PreparedAgentBindingLoopContext>,
         environment: LoopEnvironment,
         facts: LoopExecutionFacts,
+        execution_inputs: &crate::turn::execution_config::PreparedExecutionInputs,
     ) -> AgenticLoopState {
         use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
         use astra_text_utils::semantic_dedup::SemanticDedup;
@@ -12412,12 +14607,43 @@ impl AgenticRunLifecycleService {
             memory_extraction_service,
             harness,
         } = environment;
-        let thinking_config =
-            Self::thinking_from_chat_context(&request.context, request.model.as_deref())
-                .expect("thinking configuration was validated during request admission");
-        let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
-            .tool_selection
-            .resolve_for_model(request.model.as_deref());
+        let (thinking_config, tool_limits) = match &execution_inputs.policy {
+            crate::turn::execution_config::PreparedExecutionPolicy::Evaluation(frozen) => {
+                let limits = &frozen.config.runtime;
+                (
+                    frozen.config.primary_thinking.clone(),
+                    (
+                        limits.max_identical_tool_calls,
+                        limits.max_tools_per_turn,
+                        limits.repeated_cache_hit_suppression,
+                        limits.max_consecutive_empty_name,
+                    ),
+                )
+            }
+            crate::turn::execution_config::PreparedExecutionPolicy::Normal(runtime) => {
+                let thinking =
+                    Self::thinking_from_chat_context(&request.context, request.model.as_deref())
+                        .expect("thinking configuration was validated during request admission");
+                let limits = runtime
+                    .tool_selection
+                    .resolve_for_model(request.model.as_deref());
+                (
+                    thinking,
+                    (
+                        limits.max_identical_tool_calls,
+                        limits.max_tools_per_turn,
+                        limits.repeated_cache_hit_suppression,
+                        limits.max_consecutive_empty_name,
+                    ),
+                )
+            }
+        };
+        let (
+            max_identical_tool_calls,
+            max_tools_per_turn,
+            repeated_cache_hit_suppression,
+            max_consecutive_empty_name,
+        ) = tool_limits;
         AgenticLoopState {
             messages: facts.messages,
             run_transcript_capture: None,
@@ -12469,10 +14695,10 @@ impl AgenticRunLifecycleService {
             // give stronger models (opus/sonnet-4) more rope than haiku.
             // Security guards (shell_obfuscation, destructive_sql) are
             // unaffected and stay uniform across models.
-            max_identical_tool_calls: resolved_tool_policy.max_identical_tool_calls,
-            max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
-            repeated_cache_hit_suppression: resolved_tool_policy.repeated_cache_hit_suppression,
-            max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
+            max_identical_tool_calls,
+            max_tools_per_turn,
+            repeated_cache_hit_suppression,
+            max_consecutive_empty_name,
             stall: crate::turn::agentic_loop::host::StallTrackingState {
                 active_policy_feedback: facts.original.runtime_policy_evaluation.latest().clone(),
                 runtime_policy_evaluation: facts.original.runtime_policy_evaluation,
@@ -12505,7 +14731,6 @@ impl AgenticRunLifecycleService {
                     })
                 }),
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
                 tool_event_hooks: facts.tool_event_hooks,
                 session_event_hooks: facts.session_event_hooks,
                 ..Default::default()
@@ -12517,14 +14742,7 @@ impl AgenticRunLifecycleService {
             error_recovery: facts.original.error_recovery,
             provider_adaptation: facts.original.provider_adaptation,
             run_control: None,
-            pipeline_session: Some(
-                astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
-                    astra_turn_core::pipeline_config::PipelineConfig::default(),
-                    crate::turn::session_current_date::resolve_session_current_date_for_user(
-                        user_id, session_id,
-                    ),
-                ),
-            ),
+            pipeline_session: Some(execution_inputs.new_pipeline_session()),
             message: facts.original.message,
             user_intent: facts.original.user_intent,
             recent_tools: Vec::new(),
@@ -13309,6 +15527,181 @@ impl AgenticRunLifecycleService {
         Ok(run)
     }
 
+    /// Rebuild a missing Eval observation from bounded durable admission and
+    /// settlement facts, verifying an atomic terminal batch when the later
+    /// drain marker is absent. This is intentionally
+    /// a projection retry, not a second executor: owner/session/generation/
+    /// terminal checks remain in `DatabaseEvaluationObservationStore`.
+    pub(crate) async fn reconcile_evaluation_observation_for_run(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        session_id: &str,
+        run_generation: u64,
+        durable_status: &str,
+    ) {
+        if let Err(error) = self
+            .reconcile_evaluation_observation(
+                user_id,
+                run_id,
+                session_id,
+                run_generation,
+                durable_status,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(user_id, run_id, %error, "evaluation observation repair deferred");
+        }
+    }
+
+    /// Explicit projection repair for a trial already scoped to the authenticated
+    /// owner. Loads current durable authority; never starts or resumes execution.
+    async fn repair_evaluation_observation_inner(
+        &self,
+        owner_user_id: &str,
+        trial_id: &str,
+        run_id: &str,
+        session_id: &str,
+    ) -> Result<EvaluationObservationRepairOutcome, EvaluationObservationRepairError> {
+        let pool = self
+            .shared_pool
+            .as_ref()
+            .ok_or(EvaluationObservationRepairError::StorageUnavailable)?;
+        let binding = DatabaseEvaluationPlanStore::new(pool.clone())
+            .load_trial(owner_user_id, trial_id)
+            .await?;
+        if binding.run_id.as_deref() != Some(run_id)
+            || binding.session_id.as_deref() != Some(session_id)
+        {
+            return Err(EvaluationObservationRepairError::BindingMismatch);
+        }
+        let run = self
+            .run_engine
+            .load_run(owner_user_id, run_id)
+            .await
+            .map_err(|error| EvaluationObservationRepairError::RunRead(error.to_string()))?
+            .ok_or(EvaluationObservationRepairError::NotFound)?;
+        if run.session_id != session_id {
+            return Err(EvaluationObservationRepairError::BindingMismatch);
+        }
+        self.reconcile_evaluation_observation(
+            owner_user_id,
+            run_id,
+            session_id,
+            run.run_generation,
+            &run.status,
+            Some(trial_id),
+        )
+        .await
+    }
+
+    async fn reconcile_evaluation_observation(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        session_id: &str,
+        run_generation: u64,
+        durable_status: &str,
+        expected_trial_id: Option<&str>,
+    ) -> Result<EvaluationObservationRepairOutcome, EvaluationObservationRepairError> {
+        use EvaluationObservationRepairOutcome::{NotEvaluation, NotReady, Ready};
+        let pool = self
+            .shared_pool
+            .as_ref()
+            .ok_or(EvaluationObservationRepairError::StorageUnavailable)?;
+        let observation_store = DatabaseEvaluationObservationStore::new(pool.clone());
+        let Some(marker) = observation_store
+            .load_admission_marker_for_run(user_id, run_id, run_generation)
+            .await?
+        else {
+            return Ok(if expected_trial_id.is_some() {
+                NotReady
+            } else {
+                NotEvaluation
+            });
+        };
+        if expected_trial_id.is_some_and(|trial_id| trial_id != marker.admission.trial_id) {
+            return Err(EvaluationObservationRepairError::BindingMismatch);
+        }
+        // Immutable observation lookup stays ahead of full event hydration.
+        if observation_store
+            .load_by_trial(user_id, &marker.admission.trial_id)
+            .await?
+            .is_some()
+        {
+            return Ok(Ready);
+        }
+        let run = self
+            .run_engine
+            .load_run(user_id, run_id)
+            .await
+            .map_err(|error| EvaluationObservationRepairError::RunRead(error.to_string()))?
+            .ok_or(EvaluationObservationRepairError::NotFound)?;
+        if run.session_id != session_id {
+            return Err(EvaluationObservationRepairError::BindingMismatch);
+        }
+        if run.run_generation != run_generation || run.status != durable_status {
+            return Ok(NotReady);
+        }
+        let Some(status) = RunStatus::from_durable_status(durable_status) else {
+            return Ok(NotReady);
+        };
+        if evaluation_trial_status(status).is_none() {
+            return Ok(NotReady);
+        }
+        let run_store = astra_services::runs::DatabaseRunStateStore::new(pool.clone());
+        let recovery_terminal_event_idx = if marker.admission_run_generation != run_generation {
+            let Some(proof) = terminal_proof_for_repair(
+                run_store
+                    .load_verified_recovery_terminal(
+                        user_id,
+                        session_id,
+                        run_id,
+                        marker.admission_run_generation,
+                        run_generation,
+                        marker.admission_event_idx,
+                    )
+                    .await,
+            )?
+            else {
+                return Ok(NotReady);
+            };
+            Some(proof.terminal_event_idx)
+        } else {
+            if !marker.settlement_finished
+                && terminal_proof_for_repair(
+                    run_store
+                        .load_committed_atomic_terminal_settlement(
+                            user_id,
+                            session_id,
+                            run_id,
+                            run_generation,
+                        )
+                        .await,
+                )?
+                .is_none()
+            {
+                return Ok(NotReady);
+            }
+            None
+        };
+        persist_evaluation_observation_after_settlement(
+            &self.run_engine,
+            Some(pool),
+            user_id,
+            session_id,
+            run_id,
+            run_generation,
+            marker.admission_run_generation,
+            recovery_terminal_event_idx,
+            Some(&marker.admission),
+            status,
+            true,
+        )
+        .await
+    }
+
     async fn require_durable_run_for_user(
         &self,
         run_id: &str,
@@ -13822,6 +16215,52 @@ fn runtime_workspace_authority_from_request(
     }
 }
 
+fn is_git_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn safe_evaluation_workspace_component(value: &str) -> Option<String> {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    (!sanitized.is_empty() && sanitized != "." && sanitized != ".." && sanitized.len() <= 160)
+        .then_some(sanitized)
+}
+
+fn expected_evaluation_workspace_path(
+    base_root: &str,
+    materialization_id: &str,
+    workspace_key: &str,
+) -> Option<String> {
+    let materialization = safe_evaluation_workspace_component(materialization_id)?;
+    let key = safe_evaluation_workspace_component(workspace_key)?;
+    let base = Path::new(base_root);
+    Some(
+        base.parent()?
+            .join(format!(".astra-evaluation-{materialization}-{key}"))
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+fn is_managed_evaluation_workspace_path(base_root: &str, candidate: &str) -> bool {
+    let base = Path::new(base_root);
+    let candidate = Path::new(candidate);
+    candidate != base
+        && candidate.parent() == base.parent()
+        && candidate
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".astra-evaluation-"))
+}
+
 fn execution_bindings_from_workspace_record(
     record: &RuntimeWorkspaceRecord,
 ) -> ExecutionBindingSnapshot {
@@ -13965,6 +16404,909 @@ fn work_subject_invalidation_response(
         "work_subject_unavailable",
     )
 }
+
+fn evaluation_preflight_error(
+    status: StatusCode,
+    code: &'static str,
+    detail: impl std::fmt::Display,
+) -> (StatusCode, Json<ErrorResponse>) {
+    error_response_coded(
+        status,
+        format!("evaluation trial admission rejected: {detail}"),
+        code,
+    )
+}
+
+fn evaluation_trial_status(status: RunStatus) -> Option<TrialStatus> {
+    match status {
+        RunStatus::Completed => Some(TrialStatus::Completed),
+        RunStatus::Failed => Some(TrialStatus::Failed),
+        RunStatus::Cancelled => Some(TrialStatus::Cancelled),
+        // Delegation is a terminal Run fact, but it is not evidence that the
+        // evaluated revision completed the case. Keep it explicitly
+        // unavailable so comparison code cannot mistake it for success.
+        RunStatus::Delegated => Some(TrialStatus::Unavailable),
+        RunStatus::Running | RunStatus::Paused | RunStatus::Waiting => None,
+    }
+}
+
+async fn revalidate_evaluation_before_provider(
+    run_engine: &RunEngine,
+    pool: Option<&SharedPool>,
+    owner_user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    run_generation: u64,
+    admission: &EvaluationRunAdmission,
+    execution_deadline: Option<ExecutionDeadlineAuthority>,
+) -> Result<(), String> {
+    let Some(deadline) = execution_deadline else {
+        return Err("evaluation execution deadline is missing at provider admission".to_string());
+    };
+    let now_unix_ms = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("evaluation admission clock is unavailable: {error}"))?
+        .as_millis();
+    let now_unix_ms = u64::try_from(now_unix_ms)
+        .map_err(|_| "evaluation admission clock exceeds supported range".to_string())?;
+    if now_unix_ms >= deadline.deadline_unix_ms || Instant::now() >= deadline.monotonic_deadline() {
+        return Err("evaluation execution deadline expired before provider admission".to_string());
+    }
+    let authority = run_engine
+        .authorize_provider_boundary(
+            owner_user_id,
+            session_id,
+            run_id,
+            UserIntentAdmissionAuthority::DurableOwnerGeneration(run_generation),
+        )
+        .await
+        .map_err(|error| {
+            format!("evaluation execution authority could not be authorized: {error}")
+        })?;
+    if !matches!(authority, ProviderBoundaryAuthorization::Authorized) {
+        return Err(format!(
+            "evaluation execution authority changed before provider admission: {authority:?}"
+        ));
+    }
+    let pool = pool
+        .ok_or_else(|| "evaluation execution requires the shared durable database".to_string())?;
+    let envelope = admission
+        .snapshot_envelope
+        .as_ref()
+        .ok_or_else(|| "evaluation admission has no snapshot envelope".to_string())?;
+    let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
+    let binding = plan_store
+        .load_trial(owner_user_id, &admission.trial_id)
+        .await
+        .map_err(|error| format!("evaluation trial could not be reloaded: {error}"))?;
+    if binding.binding_status != "bound"
+        || binding.session_id.as_deref() != Some(session_id)
+        || binding.run_id.as_deref() != Some(run_id)
+        || binding.run_generation != Some(run_generation)
+    {
+        return Err("evaluation trial binding changed before provider admission".to_string());
+    }
+    let experiment = plan_store
+        .load_experiment(owner_user_id, &admission.experiment_id)
+        .await
+        .map_err(|error| format!("evaluation experiment could not be reloaded: {error}"))?;
+    DatabaseMaterializationReceiptStore::new(pool.clone())
+        .validate_receipts_for_execution(
+            owner_user_id,
+            &binding.trial_id,
+            session_id,
+            &experiment.spec,
+            envelope,
+            &admission.receipt_ids,
+            chrono::Utc::now(),
+        )
+        .await
+        .map_err(|error| {
+            format!("evaluation materialization expired before provider admission: {error}")
+        })?;
+    Ok(())
+}
+
+/// Persist the last Context proof before the shared agentic loop can cross the
+/// provider boundary. This event is the durable join between frozen Context
+/// identity and actual execution admission; the run's immutable request keeps
+/// the proof valid for the loop that follows it.
+async fn admit_evaluation_context_before_provider(
+    run_engine: &RunEngine,
+    owner_user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    run_generation: u64,
+    admission: &EvaluationRunAdmission,
+) -> Result<(), String> {
+    let envelope = admission
+        .snapshot_envelope
+        .as_ref()
+        .ok_or_else(|| "evaluation admission has no snapshot envelope".to_string())?;
+    let event = json!({
+        "event_type": "evaluation_context_admitted",
+        "run_generation": run_generation,
+        "idempotency_key": format!("evaluation-context-admitted:{run_id}:{run_generation}"),
+        "data": {
+            "schema_version": astra_services::evaluation::EVALUATION_EXECUTION_SCHEMA_VERSION,
+            "trial_id": admission.trial_id,
+            "input_content_hash": admission.input_content_hash,
+            "context_snapshot_hash": envelope.context_snapshot_hash,
+            "policy_snapshot_hash": envelope.policy_snapshot_hash,
+            "snapshot_id": envelope.snapshot_id,
+            "snapshot_fingerprint": envelope.snapshot_fingerprint,
+        },
+    });
+    let appended = run_engine
+        .append_events_if_current_generation_and_status(
+            owner_user_id,
+            session_id,
+            run_id,
+            run_generation,
+            &[STATUS_RUNNING],
+            std::slice::from_ref(&event),
+        )
+        .await?;
+    if appended {
+        Ok(())
+    } else {
+        Err("evaluation Context authority changed before provider admission".to_string())
+    }
+}
+
+async fn persist_evaluation_observation_after_settlement(
+    run_engine: &RunEngine,
+    pool: Option<&SharedPool>,
+    owner_user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    run_generation: u64,
+    admission_run_generation: u64,
+    recovery_terminal_event_idx: Option<i64>,
+    admission: Option<&EvaluationRunAdmission>,
+    persisted_status: RunStatus,
+    settlement_evidence_ready: bool,
+) -> Result<EvaluationObservationRepairOutcome, EvaluationObservationRepairError> {
+    use EvaluationObservationRepairOutcome::{NotEvaluation, NotReady, Ready};
+    let Some(admission) = admission else {
+        return Ok(NotEvaluation);
+    };
+    let Some(status) = evaluation_trial_status(persisted_status) else {
+        return Ok(NotReady);
+    };
+    if !settlement_evidence_ready {
+        return Ok(NotReady);
+    }
+    let pool = pool.ok_or(EvaluationObservationRepairError::StorageUnavailable)?;
+    let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
+    let binding = plan_store
+        .load_trial(owner_user_id, &admission.trial_id)
+        .await?;
+    let experiment = plan_store
+        .load_experiment(owner_user_id, &admission.experiment_id)
+        .await?;
+    let run = run_engine
+        .load_run(owner_user_id, run_id)
+        .await
+        .map_err(|error| EvaluationObservationRepairError::RunRead(error.to_string()))?
+        .ok_or(EvaluationObservationRepairError::NotFound)?;
+    if run.session_id != session_id {
+        return Err(EvaluationObservationRepairError::BindingMismatch);
+    }
+    if run.run_id != run_id
+        || run.run_generation != run_generation
+        || run.status != persisted_status.as_str()
+    {
+        return Ok(NotReady);
+    }
+    let canonical_events = run.events;
+    let accounting_key = format!("run-accounting-finalized:{run_generation}");
+    let accounting_index = recovery_terminal_event_idx
+        .is_none()
+        .then(|| {
+            canonical_events.iter().rposition(|event| {
+                event.get("event_type").and_then(Value::as_str) == Some("run_accounting_finalized")
+                    && event.get("idempotency_key").and_then(Value::as_str)
+                        == Some(accounting_key.as_str())
+            })
+        })
+        .flatten();
+    let (prompt_tokens, completion_tokens, tool_calls, tool_outcomes) = accounting_index
+        .and_then(|index| canonical_events.get(index))
+        .map(|event| {
+            let data = event.get("data").unwrap_or(&Value::Null);
+            let usage_available = data
+                .get("usage_available")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let tool_outcomes = data
+                .get("tool_outcomes")
+                .cloned()
+                .and_then(|value| {
+                    serde_json::from_value::<astra_services::session_journal::ToolOutcomeSummary>(
+                        value,
+                    )
+                    .ok()
+                })
+                .filter(|outcomes| outcomes.is_consistent());
+            (
+                usage_available
+                    .then(|| data.get("prompt_tokens").and_then(Value::as_u64))
+                    .flatten(),
+                usage_available
+                    .then(|| data.get("completion_tokens").and_then(Value::as_u64))
+                    .flatten(),
+                data.get("tool_call_count")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok()),
+                tool_outcomes,
+            )
+        })
+        .unwrap_or((None, None, None, None));
+    let evidence_index = if let Some(terminal_event_idx) = recovery_terminal_event_idx {
+        let Some(index) = canonical_events.iter().position(|event| {
+            event.get("index").and_then(Value::as_i64) == Some(terminal_event_idx)
+        }) else {
+            return Ok(NotReady);
+        };
+        Some(index)
+    } else {
+        accounting_index
+    };
+    if evidence_index.is_none() {
+        return Ok(NotReady);
+    }
+    let evidence_available = true;
+    let evidence_events = evidence_index
+        .map(|index| canonical_events[..=index].to_vec())
+        .unwrap_or_default();
+    let evidence_payload = json!({
+        "run_id": run_id,
+        "run_generation": run_generation,
+        "status": persisted_status.as_str(),
+        "event_watermark": evidence_index,
+        "events": evidence_events,
+    });
+    let evidence_json = Some(serde_json::to_string(&evidence_payload)?);
+    let mut evidence = vec![EvidenceRef {
+        evidence_id: format!("run:{run_id}:{run_generation}"),
+        kind: EvidenceKind::Trace,
+        availability: if evidence_available && evidence_json.is_some() {
+            EvidenceAvailability::Available
+        } else {
+            EvidenceAvailability::Missing
+        },
+        content_hash: evidence_json
+            .as_deref()
+            .filter(|_| evidence_available)
+            .map(content_fingerprint),
+        locator: Some(format!("run://{owner_user_id}/{session_id}/{run_id}")),
+    }];
+    let context_event = evidence_index.and_then(|index| {
+        canonical_events[..=index].iter().find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("evaluation_context_admitted")
+                && event
+                    .get("run_generation")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|generation| {
+                        generation == run_generation || generation == admission_run_generation
+                    })
+                && event.pointer("/data/trial_id").and_then(Value::as_str)
+                    == Some(binding.trial_id.as_str())
+                && event
+                    .pointer("/data/input_content_hash")
+                    .and_then(Value::as_str)
+                    == Some(binding.trial.input_content_hash.as_str())
+                && event
+                    .pointer("/data/context_snapshot_hash")
+                    .and_then(Value::as_str)
+                    == Some(experiment.spec.conditions.context_snapshot_hash.as_str())
+                && event
+                    .pointer("/data/policy_snapshot_hash")
+                    .and_then(Value::as_str)
+                    == Some(experiment.spec.conditions.tool_policy_hash.as_str())
+        })
+    });
+    let context_evidence_id = format!("context-evidence:{run_id}:{admission_run_generation}");
+    let context_event_json = context_event.map(serde_json::to_string).transpose()?;
+    evidence.push(EvidenceRef {
+        evidence_id: context_evidence_id,
+        kind: EvidenceKind::Trace,
+        availability: if context_event_json.is_some() {
+            EvidenceAvailability::Available
+        } else {
+            EvidenceAvailability::Missing
+        },
+        content_hash: context_event_json.as_deref().map(content_fingerprint),
+        locator: Some(format!("run://{owner_user_id}/{session_id}/{run_id}")),
+    });
+    if let Some(skill_revision) = admission.skill_revision.as_ref() {
+        let skill_event = evidence_index.and_then(|index| {
+            canonical_events[..=index].iter().find(|event| {
+                event.get("event_type").and_then(Value::as_str) == Some("evaluation_skill_invoked")
+                    && event.get("run_generation").and_then(Value::as_u64)
+                        == Some(admission_run_generation)
+                    && event.pointer("/data/skill_name").and_then(Value::as_str)
+                        == Some(skill_revision.skill_name.as_str())
+                    && event.pointer("/data/revision_id").and_then(Value::as_str)
+                        == Some(skill_revision.revision_id.as_str())
+                    && event.pointer("/data/content_hash").and_then(Value::as_str)
+                        == Some(skill_revision.content_hash.as_str())
+            })
+        });
+        let skill_event_json = skill_event.map(serde_json::to_string).transpose()?;
+        evidence.push(EvidenceRef {
+            evidence_id: format!("skill-invocation:{run_id}:{admission_run_generation}"),
+            kind: EvidenceKind::Trace,
+            availability: if skill_event_json.is_some() {
+                EvidenceAvailability::Available
+            } else {
+                EvidenceAvailability::Missing
+            },
+            content_hash: skill_event_json.as_deref().map(content_fingerprint),
+            locator: Some(format!("run://{owner_user_id}/{session_id}/{run_id}")),
+        });
+    }
+    let mut observation = terminal_run_observation(
+        experiment.spec_fingerprint.clone(),
+        binding.trial.trial_id.clone(),
+        binding.trial.case_id.clone(),
+        binding.trial.arm.clone(),
+        binding.trial.repetition,
+        status,
+        prompt_tokens,
+        completion_tokens,
+        tool_calls,
+        evidence,
+    );
+    if let Some(tool_outcomes) = tool_outcomes.as_ref() {
+        apply_tool_outcome_evidence(&mut observation, tool_outcomes);
+    }
+    if context_event_json.is_some() {
+        astra_services::evaluation::apply_context_evidence(&mut observation);
+    }
+    let mut expected_judgment_inference: Option<(String, String, String, u32)> = None;
+    if let Some(policy) = admission.judgment_policy.as_ref() {
+        match policy {
+            astra_services::evaluation::FrozenSkillRoutingPolicy::Unavailable {
+                reason, ..
+            } => {
+                observation.judgment = Some(JudgmentExecutionObservation {
+                    operation_id: "skill_auto_route".to_string(),
+                    status: JudgmentExecutionStatus::Unavailable,
+                    skill_name: None,
+                    reason: Some(reason.clone()),
+                    evidence_id: None,
+                });
+            }
+            astra_services::evaluation::FrozenSkillRoutingPolicy::Available {
+                model,
+                judgment_contract_fingerprint,
+                ..
+            } => {
+                let judgment_event = evidence_index.and_then(|index| {
+                    canonical_events[..=index].iter().find(|event| {
+                        event.get("event_type").and_then(Value::as_str)
+                            == Some("evaluation_judgment")
+                            && event.get("run_generation").and_then(Value::as_u64)
+                                == Some(admission_run_generation)
+                            && event.pointer("/data/operation_id").and_then(Value::as_str)
+                                == Some("skill_auto_route")
+                    })
+                });
+                let judgment_evidence_id =
+                    format!("judgment-evidence:{run_id}:{admission_run_generation}");
+                let judgment_event_json = judgment_event.map(serde_json::to_string).transpose()?;
+                let (judgment_status, usable_judgment_evidence) = judgment_event
+                    .map(|event| {
+                        let data = event.get("data").unwrap_or(&Value::Null);
+                        let status = match data.get("status").and_then(Value::as_str) {
+                            Some("disabled") => JudgmentExecutionStatus::Disabled,
+                            Some("not_dispatched") => JudgmentExecutionStatus::NotDispatched,
+                            Some("negative") => JudgmentExecutionStatus::Negative,
+                            Some("uncertain") => JudgmentExecutionStatus::Uncertain,
+                            Some("selected") => JudgmentExecutionStatus::Selected,
+                            Some("failed") => JudgmentExecutionStatus::Failed,
+                            _ => JudgmentExecutionStatus::Failed,
+                        };
+                        let contract_matches =
+                            data.get("contract_fingerprint").and_then(Value::as_str)
+                                == Some(judgment_contract_fingerprint.as_str());
+                        let route_matches = data.get("offering_id").and_then(Value::as_str)
+                            == Some(model.offering_id.as_str())
+                            && data.get("provider").and_then(Value::as_str)
+                                == Some(model.provider.as_str());
+                        let needs_invocation = matches!(
+                            &status,
+                            JudgmentExecutionStatus::Negative
+                                | JudgmentExecutionStatus::Uncertain
+                                | JudgmentExecutionStatus::Selected
+                                | JudgmentExecutionStatus::Failed
+                        );
+                        let invocation_id = data
+                            .get("invocation_id")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.trim().is_empty());
+                        let request_fingerprint = data
+                            .get("request_fingerprint")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.trim().is_empty());
+                        let logical_attempt = data
+                            .get("logical_attempt")
+                            .and_then(Value::as_u64)
+                            .and_then(|value| u32::try_from(value).ok());
+                        let identity_present = invocation_id.is_some()
+                            && request_fingerprint.is_some()
+                            && logical_attempt.is_some();
+                        let usable = contract_matches
+                            && route_matches
+                            && (!needs_invocation || identity_present);
+                        if usable && needs_invocation {
+                            expected_judgment_inference = Some((
+                                invocation_id
+                                    .expect("identity_present implies invocation id")
+                                    .to_string(),
+                                model.offering_id.clone(),
+                                model.provider.clone(),
+                                logical_attempt.expect("identity_present implies logical attempt"),
+                            ));
+                        }
+                        (status, usable)
+                    })
+                    .unwrap_or((JudgmentExecutionStatus::NotDispatched, false));
+                observation.evidence.push(EvidenceRef {
+                    evidence_id: judgment_evidence_id.clone(),
+                    kind: EvidenceKind::Trace,
+                    availability: if judgment_event_json.is_some() && usable_judgment_evidence {
+                        EvidenceAvailability::Available
+                    } else {
+                        EvidenceAvailability::Missing
+                    },
+                    content_hash: judgment_event_json.as_deref().map(content_fingerprint),
+                    locator: Some(format!("run://{owner_user_id}/{session_id}/{run_id}")),
+                });
+                observation.judgment = Some(match judgment_event {
+                    Some(event) => {
+                        let data = event.get("data").unwrap_or(&Value::Null);
+                        JudgmentExecutionObservation {
+                            operation_id: "skill_auto_route".to_string(),
+                            status: if usable_judgment_evidence {
+                                judgment_status
+                            } else {
+                                JudgmentExecutionStatus::Failed
+                            },
+                            skill_name: data
+                                .get("skill_name")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            reason: if usable_judgment_evidence {
+                                data.get("reason")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                            } else {
+                                Some("invalid_or_unbound_judgment_evidence".to_string())
+                            },
+                            evidence_id: Some(judgment_evidence_id.clone()),
+                        }
+                    }
+                    None => JudgmentExecutionObservation {
+                        operation_id: "skill_auto_route".to_string(),
+                        status: JudgmentExecutionStatus::NotDispatched,
+                        skill_name: None,
+                        reason: Some("no_durable_judgment_outcome".to_string()),
+                        evidence_id: Some(judgment_evidence_id.clone()),
+                    },
+                });
+            }
+        }
+    }
+    match astra_services::load_evaluation_inference_evidence(
+        pool,
+        owner_user_id,
+        session_id,
+        run_id,
+        &experiment.spec.conditions.model_binding,
+        &experiment.spec.conditions.provider_binding,
+        expected_judgment_inference.as_ref().map(
+            |(invocation_id, offering_id, provider, logical_attempt)| {
+                (
+                    invocation_id.as_str(),
+                    offering_id.as_str(),
+                    provider.as_str(),
+                    *logical_attempt,
+                )
+            },
+        ),
+    )
+    .await
+    {
+        Ok(inference) if inference.settlement_pending => {
+            tracing::debug!(
+                owner_user_id,
+                session_id,
+                run_id,
+                "evaluation inference settlement is still pending; observation remains repairable"
+            );
+            return Ok(EvaluationObservationRepairOutcome::NotReady);
+        }
+        Ok(inference) => apply_inference_evidence(&mut observation, &inference),
+        Err(error)
+            if matches!(
+                error.kind,
+                astra_services::ServiceErrorKind::Persistence
+                    | astra_services::ServiceErrorKind::Network
+                    | astra_services::ServiceErrorKind::ConflictTransient
+                    | astra_services::ServiceErrorKind::Internal
+            ) =>
+        {
+            tracing::warn!(
+                owner_user_id,
+                session_id,
+                run_id,
+                %error,
+                "evaluation inference evidence storage is temporarily unavailable; observation remains repairable"
+            );
+            return Err(EvaluationObservationRepairError::StorageUnavailable);
+        }
+        Err(error) => {
+            tracing::warn!(
+                owner_user_id,
+                session_id,
+                run_id,
+                %error,
+                "evaluation inference evidence failed its integrity check"
+            );
+            return Err(EvaluationObservationRepairError::Execution(
+                astra_services::evaluation::EvaluationExecutionError::Conflict(format!(
+                    "inference evidence integrity failure: {error}"
+                )),
+            ));
+        }
+    }
+    let request = EvaluationObservationRequest {
+        session_id: session_id.to_string(),
+        execution_run_id: run_id.to_string(),
+        execution_run_generation: run_generation,
+        admission_run_generation,
+        observation,
+        materialization_receipt_ids: admission.receipt_ids.clone(),
+        idempotency_key: format!("eval-observation:{run_id}:{run_generation}"),
+    };
+    let record = DatabaseEvaluationObservationStore::new(pool.clone())
+        .record_observation(owner_user_id, &request)
+        .await?;
+    tracing::debug!(
+        owner_user_id, session_id, run_id,
+        trial_id = %record.trial_id, observation_id = %record.observation_id,
+        "durable evaluation observation settled"
+    );
+    Ok(Ready)
+}
+
+/// Emit a durable fact only when the canonical loop recorded a successful
+/// invocation of the exact owner-scoped revision admitted for this Run. A
+/// Skill resolver being installed is not evidence that the model used it.
+fn evaluation_skill_invocation_event(
+    admission: Option<&EvaluationRunAdmission>,
+    state: &AgenticLoopState,
+    run_id: &str,
+    run_generation: u64,
+) -> Option<Value> {
+    let skill_revision = admission?.skill_revision.as_ref()?;
+    let invocation = state
+        .skills
+        .execution
+        .invoked
+        .get(&skill_revision.skill_name)
+        .or_else(|| {
+            state
+                .skills
+                .execution
+                .invoked
+                .iter()
+                .find(|(name, _)| {
+                    state.skills.resolver.as_ref().is_some_and(|resolver| {
+                        resolver.available_skills().iter().any(|skill| {
+                            skill.name.eq_ignore_ascii_case(&skill_revision.skill_name)
+                                && skill
+                                    .aliases
+                                    .iter()
+                                    .any(|alias| alias.eq_ignore_ascii_case(name))
+                        })
+                    })
+                })
+                .map(|(_, invocation)| invocation)
+        })?;
+    Some(json!({
+        "event_type": "evaluation_skill_invoked",
+        "run_generation": run_generation,
+        "idempotency_key": format!("evaluation-skill-invoked:{run_id}:{run_generation}"),
+        "data": {
+            "skill_name": skill_revision.skill_name,
+            "invoked_name": invocation.name,
+            "revision_id": skill_revision.revision_id,
+            "content_hash": skill_revision.content_hash,
+            "invoked_at_turn": invocation.invoked_at_turn,
+            "reentry_count": invocation.reentry_count,
+        },
+    }))
+}
+
+fn evaluation_judgment_event(
+    admission: Option<&EvaluationRunAdmission>,
+    outcome: Option<crate::turn::agentic_loop::host::SkillAutoRouteJudgmentOutcome>,
+    evidence: Option<crate::turn::agentic_loop::host::SkillAutoRouteJudgmentEvidence>,
+    run_id: &str,
+    run_generation: u64,
+) -> Option<Value> {
+    let admission = admission?;
+    let policy = admission.judgment_policy.as_ref()?;
+    let outcome = outcome?;
+    let mut data = serde_json::Map::new();
+    data.insert("operation_id".to_string(), json!("skill_auto_route"));
+    match outcome {
+        crate::turn::agentic_loop::host::SkillAutoRouteJudgmentOutcome::Disabled => {
+            data.insert("status".to_string(), json!("disabled"));
+        }
+        crate::turn::agentic_loop::host::SkillAutoRouteJudgmentOutcome::NotDispatched {
+            reason,
+        } => {
+            data.insert("status".to_string(), json!("not_dispatched"));
+            data.insert("reason".to_string(), json!(reason));
+        }
+        crate::turn::agentic_loop::host::SkillAutoRouteJudgmentOutcome::Negative => {
+            data.insert("status".to_string(), json!("negative"));
+        }
+        crate::turn::agentic_loop::host::SkillAutoRouteJudgmentOutcome::Uncertain => {
+            data.insert("status".to_string(), json!("uncertain"));
+        }
+        crate::turn::agentic_loop::host::SkillAutoRouteJudgmentOutcome::Selected { skill_name } => {
+            data.insert("status".to_string(), json!("selected"));
+            data.insert("skill_name".to_string(), json!(skill_name));
+        }
+        crate::turn::agentic_loop::host::SkillAutoRouteJudgmentOutcome::Failed { reason } => {
+            data.insert("status".to_string(), json!("failed"));
+            data.insert("reason".to_string(), json!(reason));
+        }
+    }
+    if let astra_services::evaluation::FrozenSkillRoutingPolicy::Available {
+        model,
+        judgment_contract_fingerprint,
+        ..
+    } = policy
+    {
+        data.insert(
+            "contract_fingerprint".to_string(),
+            json!(judgment_contract_fingerprint),
+        );
+        data.insert("offering_id".to_string(), json!(model.offering_id));
+        data.insert("provider".to_string(), json!(model.provider));
+    }
+    if let Some(evidence) = evidence {
+        data.insert("invocation_id".to_string(), json!(evidence.invocation_id));
+        data.insert(
+            "logical_attempt".to_string(),
+            json!(evidence.logical_attempt),
+        );
+        data.insert(
+            "request_fingerprint".to_string(),
+            json!(evidence.request_fingerprint),
+        );
+    }
+    Some(json!({
+        "event_type": "evaluation_judgment",
+        "run_generation": run_generation,
+        "idempotency_key": format!("evaluation-judgment:{run_id}:{run_generation}"),
+        "data": Value::Object(data),
+    }))
+}
+
+fn evaluation_skill_revision_matches(
+    revision: &astra_services::UserSkillVersionRecord,
+    owner_user_id: &str,
+    expected: &EvaluationSkillRevision,
+    frozen_content_hash: &str,
+) -> bool {
+    revision.owner_user_id == owner_user_id
+        && revision.skill_name == expected.skill_name
+        && revision.version_id == expected.revision_id
+        && revision.content_hash == frozen_content_hash
+        && revision.content_hash
+            == astra_services::skill_md_content_hash(
+                &revision.manifest_json,
+                &revision.content_markdown,
+            )
+        && expected.content_hash == frozen_content_hash
+}
+
+async fn finalize_evaluation_coding_evidence(
+    shared_pool: Option<&astra_core::SharedPool>,
+    owner_user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    run_generation: u64,
+    admission: Option<&EvaluationRunAdmission>,
+    lease: Option<&EvaluationWorkspaceLease>,
+    execution_deadline: Option<ExecutionDeadlineAuthority>,
+    cancel_token: &CancellationToken,
+) -> Option<Value> {
+    let admission = admission?;
+    let event = |status: &str, data: Value| {
+        json!({
+            "event_type": "evaluation_coding_evidence",
+            "run_generation": run_generation,
+            "idempotency_key": format!("evaluation-coding-evidence:{run_id}:{run_generation}"),
+            "data": {"status": status, "detail": data},
+        })
+    };
+    let Some(pool) = shared_pool else {
+        return Some(event(
+            "unavailable",
+            json!({"reason":"durable_pool_unavailable"}),
+        ));
+    };
+    let experiment =
+        match astra_services::evaluation::DatabaseEvaluationPlanStore::new(pool.clone())
+            .load_experiment(owner_user_id, &admission.experiment_id)
+            .await
+        {
+            Ok(experiment) => experiment,
+            Err(error) => return Some(event("unavailable", json!({"reason":error.to_string()}))),
+        };
+    let planned = match experiment.spec.plan_trials() {
+        Ok(planned) => planned,
+        Err(error) => return Some(event("unavailable", json!({"reason":error}))),
+    };
+    let Some(trial) = planned
+        .iter()
+        .find(|trial| trial.trial_id == admission.trial_id)
+    else {
+        return Some(event(
+            "unavailable",
+            json!({"reason":"frozen_trial_missing"}),
+        ));
+    };
+    let Some(case) = experiment
+        .spec
+        .cases
+        .iter()
+        .find(|case| case.case_id == trial.case_id)
+    else {
+        return Some(event(
+            "unavailable",
+            json!({"reason":"frozen_case_missing"}),
+        ));
+    };
+    let astra_services::evaluation::task_verifier::TaskVerifierConfig::WorkspaceCommand {
+        command,
+        expected_exit_code,
+        timeout_secs,
+    } = &case.task_verifier.config
+    else {
+        return None;
+    };
+    let Some(lease) = lease else {
+        return Some(event(
+            "unavailable",
+            json!({"reason":"workspace_lease_missing"}),
+        ));
+    };
+    let Some(deadline) = execution_deadline else {
+        return Some(event(
+            "unavailable",
+            json!({"reason":"execution_deadline_missing"}),
+        ));
+    };
+    let remaining = deadline
+        .monotonic_deadline()
+        .saturating_duration_since(Instant::now());
+    if remaining.is_zero() || cancel_token.is_cancelled() {
+        return Some(event(
+            "unavailable",
+            json!({"reason":"execution_deadline_expired"}),
+        ));
+    }
+    let finalize_timeout = remaining.min(Duration::from_secs(timeout_secs.saturating_add(10)));
+    let Some(result) = lease
+        .finalize(command, *timeout_secs, finalize_timeout, cancel_token)
+        .await
+    else {
+        return Some(event(
+            "unavailable",
+            json!({"reason":"edge_finalize_unavailable"}),
+        ));
+    };
+    let expected_generation = lease.connection_generation();
+    let expected_workspace = lease.workspace_dir();
+    let complete = result.error.is_none()
+        && result.allocation.as_ref() == Some(&lease.allocation)
+        && Some(result.connection_generation) == expected_generation
+        && Some(result.workspace_dir.as_str()) == expected_workspace
+        && result.source_commit.as_deref() == Some(lease.source_commit.as_str())
+        && result.source_tree.is_some()
+        && result.base_revision.is_some()
+        && result.result_revision.is_some()
+        && result.patch.is_some()
+        && result.verifier_exit_code.is_some()
+        && result.verifier_output.is_some()
+        && result.namespace_active
+        && result.scope_settled
+        && !result.timed_out;
+    if !complete {
+        return Some(event(
+            "unavailable",
+            json!({"reason":result.error.unwrap_or_else(|| "incomplete_edge_finalize_evidence".into())}),
+        ));
+    }
+    let artifact_id = format!("evaluation-coding-{}", admission.trial_id);
+    let verifier_passed = result.verifier_exit_code == Some(*expected_exit_code);
+    let content = json!({
+        "schema_version": 1,
+        "experiment_id": admission.experiment_id,
+        "trial_id": admission.trial_id,
+        "session_id": session_id,
+        "run_id": run_id,
+        "run_generation": run_generation,
+        "spec_fingerprint": experiment.spec_fingerprint,
+        "verifier": case.task_verifier,
+        "workspace": {
+            "connection_generation": result.connection_generation,
+            "workspace_dir": result.workspace_dir,
+            "source_commit": result.source_commit,
+            "source_tree": result.source_tree,
+            "base_revision": result.base_revision,
+            "result_revision": result.result_revision,
+        },
+        "patch": result.patch,
+        "verifier_exit_code": result.verifier_exit_code,
+        "verifier_output": result.verifier_output,
+        "isolation": {
+            "namespace_active": result.namespace_active,
+            "network_namespace": true,
+            "scope_settled": result.scope_settled,
+        },
+        "verifier_passed": verifier_passed,
+    });
+    let artifact_hash = astra_services::evaluation::content_fingerprint(
+        &astra_core::canonical_json_string(&content),
+    );
+    let store =
+        astra_services::DatabaseSessionArtifactStore::new(astra_core::MatrixOneSettings::default())
+            .with_pool(pool.clone());
+    let record = astra_services::SessionArtifactJsonRecord {
+        artifact_id: artifact_id.clone(),
+        session_id: session_id.to_string(),
+        user_id: owner_user_id.to_string(),
+        artifact_kind: "evaluation_coding_evidence".into(),
+        source: Some("evaluation_edge_finalize".into()),
+        turn: None,
+        round: None,
+        content: content.clone(),
+        metadata: Some(json!({"content_hash": artifact_hash})),
+        references: Vec::new(),
+    };
+    use astra_services::SessionArtifactJsonStore as _;
+    let persisted = match store.persist_json_artifact(record).await {
+        Ok(_) => true,
+        Err(_) => store
+            .load_json_artifact(owner_user_id, session_id, &artifact_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|existing| existing.content == content),
+    };
+    if !persisted {
+        return Some(event(
+            "unavailable",
+            json!({"reason":"artifact_persistence_failed"}),
+        ));
+    }
+    Some(event(
+        if verifier_passed { "pass" } else { "fail" },
+        json!({"artifact_id":artifact_id,"content_hash":artifact_hash}),
+    ))
+}
+
 impl AgenticRunLifecycleService {
     async fn launch_owned_background_execution(&self, execution: OwnedBackgroundExecution) {
         let OwnedBackgroundExecution {
@@ -13986,6 +17328,7 @@ impl AgenticRunLifecycleService {
             pause_flag,
             llm_cancel_token,
             execution_lease_lost,
+            evaluation_workspace_lease,
         } = execution;
         // Keep the same session-owned descendant authority that was wired
         // into the runtime tool executor. Non-streaming settlement must not
@@ -14013,6 +17356,7 @@ impl AgenticRunLifecycleService {
         let bg_shared_pool = self.shared_pool.clone();
         let bg_trace_ingestion = self.trace_ingestion.clone();
         let bg_explain = request.explain;
+        let bg_eval_admission = request.evaluation_admission.clone();
         let bg_metrics_registry = self.metrics_registry.clone();
         let bg_cancel_flag = cancel_flag.clone();
         let bg_pause_flag = pause_flag.clone();
@@ -14043,7 +17387,8 @@ impl AgenticRunLifecycleService {
             model_name: request.model.clone(),
             user_message: request.message.clone(),
             hook_db_writer: self.hook_db_writer.clone(),
-            observer_worker: self.observer_worker.clone(),
+            observer_worker: RuntimeProductionStatePolicy::for_request(&request)
+                .select(self.observer_worker.clone()),
             metrics_registry: self.metrics_registry.clone(),
             csl_manager: csl_manager.map(tokio::sync::Mutex::new),
         };
@@ -14066,6 +17411,7 @@ impl AgenticRunLifecycleService {
                     }
                 }
                 let _guard = TaskCountGuard(bg_task_count_1);
+                let _evaluation_workspace_lease = evaluation_workspace_lease;
                 // Start fencing as soon as the durable owner enters its task,
                 // before queueing for shared execution capacity. A queued run
                 // must not let its lease expire and later begin side effects
@@ -14234,6 +17580,75 @@ impl AgenticRunLifecycleService {
                     bg_llm_cancel_token.clone(),
                 );
 
+                // Capacity admission can queue for longer than a receipt's
+                // frozen lifetime. Re-prove the exact owner generation and
+                // receipt set immediately before entering the agentic loop,
+                // so an expired or recovered evaluation never reaches the
+                // provider boundary.
+                let evaluation_provider_preflight_error =
+                    if let Some(admission) = bg_eval_admission.as_ref() {
+                        match revalidate_evaluation_before_provider(
+                            &run_engine,
+                            bg_shared_pool.as_ref(),
+                            &bg_user_id,
+                            &bg_session_id,
+                            &bg_run_id,
+                            execution_owner_generation,
+                            admission,
+                            request.admitted_execution_deadline,
+                        )
+                        .await
+                        {
+                            Ok(()) => admit_evaluation_context_before_provider(
+                                &run_engine,
+                                &bg_user_id,
+                                &bg_session_id,
+                                &bg_run_id,
+                                execution_owner_generation,
+                                admission,
+                            )
+                            .await
+                            .err(),
+                            Err(error) => Some(error),
+                        }
+                    } else {
+                        None
+                    };
+                if let Some(error) = evaluation_provider_preflight_error {
+                    drop(execution_permit);
+                    park_server_root_mailbox(&mut loop_state).await;
+                    let committed = Self::fail_started_run_before_spawn_with_handles(
+                        &run_engine,
+                        &runs,
+                        &bg_user_id,
+                        &bg_session_id,
+                        &bg_run_id,
+                        execution_owner_generation,
+                        &error,
+                        PreSpawnFailureCode::PreSpawnFailure,
+                    )
+                    .await;
+                    bg_approval_channels.lock().await.remove(&bg_run_id);
+                    bg_user_prompt_channels.lock().await.remove(&bg_run_id);
+                    bg_progress_channels.lock().await.remove(&bg_run_id);
+                    if committed {
+                        Self::schedule_run_eviction(&runs, bg_run_id.clone());
+                        if let Some(record) = bg_cloud_workspace_record.as_ref() {
+                            Self::cleanup_cloud_workspace_with_debt(
+                                bg_workspace_record_store.clone(),
+                                &bg_user_id,
+                                &bg_session_id,
+                                &bg_run_id,
+                                record,
+                                RuntimeCleanupReason::Failed,
+                                error,
+                            )
+                            .await;
+                        }
+                    }
+                    return;
+                }
+
                 let outcome =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut loop_state).await;
                 if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
@@ -14334,6 +17749,41 @@ impl AgenticRunLifecycleService {
                 let (mut events, final_status, error_msg) =
                     Self::finalize_run_events(outcome, events, &loop_state);
                 Self::stamp_run_finished_owner_generation(&mut events, execution_owner_generation);
+                if let Some(event) = evaluation_skill_invocation_event(
+                    bg_eval_admission.as_ref(),
+                    &loop_state,
+                    &bg_run_id,
+                    execution_owner_generation,
+                ) {
+                    events.push(event);
+                }
+                let judgment_outcome = host.take_skill_auto_route_judgment_outcome();
+                let judgment_evidence = host.take_skill_auto_route_judgment_evidence();
+                if let Some(event) = evaluation_judgment_event(
+                    bg_eval_admission.as_ref(),
+                    judgment_outcome,
+                    judgment_evidence,
+                    &bg_run_id,
+                    execution_owner_generation,
+                ) {
+                    events.push(event);
+                }
+                if final_status == RunStatus::Completed
+                    && let Some(event) = finalize_evaluation_coding_evidence(
+                        bg_shared_pool.as_ref(),
+                        &bg_user_id,
+                        &bg_session_id,
+                        &bg_run_id,
+                        execution_owner_generation,
+                        bg_eval_admission.as_ref(),
+                        _evaluation_workspace_lease.as_ref(),
+                        request.admitted_execution_deadline,
+                        bg_llm_cancel_token.as_ref(),
+                    )
+                    .await
+                {
+                    events.push(event);
+                }
                 let mut user_cancellation = false;
                 if matches!(&final_status, RunStatus::Cancelled) {
                     let cancellation_origin = resolve_cancellation_origin(&mut loop_state).await;
@@ -14808,12 +18258,34 @@ impl AgenticRunLifecycleService {
                     } else {
                         None
                     };
+                let terminal_accounting_committed =
+                    if control_terminal_settlement_committed.is_some() {
+                        control_terminal_settlement_committed
+                    } else if atomic_terminal_committed {
+                        Some(true)
+                    } else if durable_status_committed {
+                        Some(
+                            Self::persist_finalized_accounting_after_terminal(
+                                &run_engine,
+                                &bg_user_id,
+                                &bg_session_id,
+                                &bg_run_id,
+                                persisted_status,
+                                execution_owner_generation,
+                                &loop_state,
+                            )
+                            .await,
+                        )
+                    } else {
+                        None
+                    };
                 let all_settlement_facts_committed = settlement_facts_committed(
                     control_terminal_settlement_committed,
                     durable_status_committed,
                     terminal_events.len(),
                     terminal_events_committed,
-                );
+                ) && terminal_accounting_committed
+                    .unwrap_or(true);
                 let settlement_closed = all_settlement_facts_committed
                     && Self::persist_settlement_finished(
                         &run_engine,
@@ -14847,6 +18319,28 @@ impl AgenticRunLifecycleService {
                     bg_trace_ingestion.as_ref(),
                     Some(execution_owner_generation),
                 );
+                // Evaluation observations are derived from the same fenced
+                // terminal Run. A takeover may race this write; the
+                // observation store rechecks owner/session/generation and
+                // rejects stale writers instead of creating a second result.
+                if let Err(error) = persist_evaluation_observation_after_settlement(
+                    &run_engine,
+                    bg_shared_pool.as_ref(),
+                    &bg_user_id,
+                    &bg_session_id,
+                    &bg_run_id,
+                    execution_owner_generation,
+                    execution_owner_generation,
+                    None,
+                    bg_eval_admission.as_ref(),
+                    persisted_status,
+                    durable_fence_closed,
+                )
+                .await
+                {
+                    tracing::warn!(run_id = %bg_run_id, %error, "evaluation observation settlement deferred");
+                }
+
                 if owner_terminal_committed && persist_terminal_events {
                     persist_turn_evaluation_journal(
                         &bg_user_id,
@@ -14953,6 +18447,18 @@ impl AgenticRunLifecycleService {
 
 #[async_trait]
 impl RunLifecycleService for AgenticRunLifecycleService {
+    async fn repair_evaluation_observation(
+        &self,
+        owner_user_id: &str,
+        trial_id: &str,
+        run_id: &str,
+        session_id: &str,
+    ) -> Result<EvaluationObservationRepairOutcome, (StatusCode, Json<ErrorResponse>)> {
+        self.repair_evaluation_observation_inner(owner_user_id, trial_id, run_id, session_id)
+            .await
+            .map_err(EvaluationObservationRepairError::into_http)
+    }
+
     fn execution_owner_pod_id(&self) -> Option<&str> {
         self.run_engine.execution_owner_pod_id()
     }
@@ -14964,7 +18470,40 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         request: ChatRequestData,
     ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
         self.require_invocation_composition()?;
-        let request = self.prepare_chat_request(&user_id, request).await?;
+        // Background `create_run` historically ignores ProviderTask/WorkTurn
+        // identities; those callers use the streaming lifecycle below. Only
+        // the server-owned evaluation bootstrap opts into this durable claim.
+        let start_identity = request
+            .run_start_idempotency
+            .as_ref()
+            .filter(|identity| identity.kind() == RunStartIdempotencyKind::EvaluationTrial)
+            .cloned();
+        let (request, execution_inputs) = if let Some(identity) = start_identity.as_ref() {
+            let requested_session_id = request.session_id.clone();
+            if let Some(durable) = self
+                .load_durable_run_for_user(identity.run_id(), &user_id)
+                .await?
+            {
+                Self::validate_start_request_session(
+                    identity,
+                    requested_session_id.as_deref(),
+                    &durable.session_id,
+                )?;
+                Self::validate_start_request_fingerprint(
+                    identity,
+                    durable.start_request_fingerprint.as_deref(),
+                )?;
+                return Ok(ChatRunRecord {
+                    session_id: durable.session_id,
+                    run_id: durable.run_id,
+                    status: durable.status,
+                    explain: None,
+                });
+            }
+            self.prepare_chat_request(&user_id, request).await?
+        } else {
+            self.prepare_chat_request(&user_id, request).await?
+        };
         let request_constraints = self
             .validate_request_constraints(&user_id, &request)
             .await?;
@@ -14980,37 +18519,81 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
         }
 
-        let run_id = request
+        let idempotent_start = start_identity.is_some();
+        let authority_run_id = request
             .conversation_authority
             .as_ref()
-            .map(|authority| authority.run_id.clone())
+            .map(|authority| authority.run_id.as_str());
+        Self::validate_start_request_authority(start_identity.as_ref(), authority_run_id)?;
+        let run_id = authority_run_id
+            .map(str::to_owned)
+            .or_else(|| {
+                start_identity
+                    .as_ref()
+                    .map(|identity| identity.run_id().to_string())
+            })
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         let session_id = request
             .session_id
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let evaluation_mode = request.evaluation_admission.is_some();
+        // The trial owns one stable clone identity. Exact retries and concurrent
+        // starts therefore converge on the same prepared workspace, while the
+        // durable Run claim decides which request may keep and later release it.
+        let evaluation_workspace_key = evaluation_mode.then(|| format!("trial-{run_id}"));
+        if evaluation_mode {
+            self.ensure_evaluation_session_clean(&user_id, &session_id, &run_id)
+                .await?;
+        }
         let active_personal_skills =
             load_active_personal_skills(self.shared_pool.as_ref(), &user_id, &session_id).await?;
-        let work_runtime_binding = self
-            .validate_work_runtime_binding(&user_id, &session_id, &request)
+        if evaluation_mode && !active_personal_skills.is_empty() {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_session_not_clean",
+                "evaluation cannot run in a session with active personal skills",
+            ));
+        }
+        let work_runtime_binding = if evaluation_mode {
+            if request.work_binding.is_some() {
+                return Err(evaluation_preflight_error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "evaluation_execution_surface_unsupported",
+                    "evaluation cannot inherit a Work session context",
+                ));
+            }
+            // Do not discover the session's implicit Work binding here. The
+            // evaluation path has already required a clean canonical session;
+            // looking up and installing Work context would add un-fingerprinted
+            // prompt state before the canonical turn fence.
+            None
+        } else {
+            self.validate_work_runtime_binding(&user_id, &session_id, &request)
+                .await?
+        };
+        let evaluation_workspace_lease = self
+            .bind_execution_selection(
+                &user_id,
+                &session_id,
+                &mut request,
+                evaluation_workspace_key.as_deref(),
+                work_runtime_binding.as_ref(),
+            )
             .await?;
-        self.bind_execution_selection(
-            &user_id,
-            &session_id,
-            &mut request,
-            work_runtime_binding.as_ref(),
-        )
-        .await?;
 
         let agent_binding_mode = request.has_agent_binding_runtime();
         let edge_context = Self::extract_edge_context(&request)?;
         let edge_tools = edge_context.edge_tools.clone();
-        let server_service_tool_catalog_enabled =
+        let server_service_tool_catalog_enabled = if evaluation_mode {
+            false
+        } else {
             Self::server_service_tool_catalog_enabled_for_request(
                 agent_binding_mode,
                 edge_context.has_tools(),
-            );
-        let runtime_capabilities = self
+            )
+        };
+        let mut runtime_capabilities = self
             .prepare_runtime_capabilities(&request, &request_constraints)
             .await?;
         let mut edge_profile =
@@ -15029,14 +18612,117 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             );
         }
 
-        // Guard: reject if this session already has a blocking run.
-        // Hold write lock across check+insert to prevent TOCTOU race.
         let (run_state, cancel_flag, pause_flag, llm_cancel_token, execution_lease_lost) =
             Self::build_tracked_run_state(run_id.clone(), session_id.clone(), user_id.clone());
+        let mut execution_owner_generation = None;
+        let mut owner_lease_heartbeat = None;
+        if idempotent_start {
+            let identity = start_identity
+                .as_ref()
+                .expect("idempotent start has a durable identity");
+            match self
+                .persist_run_start(
+                    &run_id,
+                    &user_id,
+                    &session_id,
+                    &request,
+                    None,
+                    runtime_capabilities.agent_binding.as_ref(),
+                    work_runtime_binding.as_ref(),
+                    Some(identity.request_fingerprint()),
+                    RunStartPersistenceMode::ClaimOrReplay,
+                )
+                .await?
+            {
+                DurableRunStartClaim::Started { owner_generation } => {
+                    execution_owner_generation = Some(owner_generation);
+                    if evaluation_mode && let Some(lease) = evaluation_workspace_lease.as_ref() {
+                        lease.activate_after_run_claim();
+                    }
+                    let confirmed = self
+                        .run_engine
+                        .confirm_execution_authority(
+                            &user_id,
+                            &session_id,
+                            &run_id,
+                            owner_generation,
+                            llm_cancel_token.as_ref(),
+                        )
+                        .await;
+                    match confirmed {
+                        Ok(ExecutionAuthorityConfirmation::Confirmed(authority)) => {
+                            owner_lease_heartbeat = self.run_engine.start_owner_lease_heartbeat(
+                                user_id.clone(),
+                                session_id.clone(),
+                                run_id.clone(),
+                                owner_generation,
+                                authority,
+                                execution_lease_lost.clone(),
+                                llm_cancel_token.clone(),
+                            );
+                        }
+                        failed => {
+                            self.fail_claimed_idempotent_run_before_spawn(
+                                execution_owner_generation,
+                                &user_id,
+                                &session_id,
+                                &run_id,
+                                "durable evaluation authority could not be confirmed before activation",
+                            )
+                            .await;
+                            return match failed {
+                                Ok(ExecutionAuthorityConfirmation::Superseded) => {
+                                    Err(error_response(
+                                        StatusCode::CONFLICT,
+                                        "durable evaluation authority expired before activation",
+                                    ))
+                                }
+                                Err(error) => Err(error_response(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    format!(
+                                        "failed to confirm durable evaluation authority: {error}"
+                                    ),
+                                )),
+                                Ok(ExecutionAuthorityConfirmation::Confirmed(_)) => {
+                                    unreachable!("matched above")
+                                }
+                            };
+                        }
+                    }
+                }
+                DurableRunStartClaim::Existing {
+                    start_request_fingerprint,
+                    ..
+                } => {
+                    Self::validate_start_request_fingerprint(
+                        identity,
+                        start_request_fingerprint.as_deref(),
+                    )?;
+                    let durable = self.require_durable_run_for_user(&run_id, &user_id).await?;
+                    return Ok(ChatRunRecord {
+                        session_id: durable.session_id,
+                        run_id: durable.run_id,
+                        status: durable.status,
+                        explain: None,
+                    });
+                }
+                DurableRunStartClaim::SessionMismatch { bound_session_id } => {
+                    Self::validate_start_request_session(
+                        identity,
+                        request.session_id.as_deref(),
+                        &bound_session_id,
+                    )?;
+                    unreachable!("evaluation bootstrap identity must keep one session");
+                }
+            }
+        }
+
+        // Guard ordinary starts locally. Evaluation starts already hold the
+        // durable claim above, so a second process cannot pass this boundary
+        // for the same identity.
         {
             let mut runs = self.runs.write().await;
-            let has_active = Self::session_has_blocking_run(&runs, &user_id, &session_id);
-            if has_active {
+            if !idempotent_start && Self::session_has_blocking_run(&runs, &user_id, &session_id) {
                 return Err(error_response(
                     StatusCode::CONFLICT,
                     "session already has an active run".to_string(),
@@ -15054,6 +18740,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         {
             Ok(record) => record,
             Err(error) => {
+                self.fail_claimed_idempotent_run_before_spawn(
+                    execution_owner_generation,
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    "cloud workspace provisioning failed after evaluation Run claim",
+                )
+                .await;
                 self.runs.write().await.remove(&run_id);
                 return Err(error);
             }
@@ -15073,6 +18767,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 {
                     Ok(workspace) => Some(workspace),
                     Err(error) => {
+                        self.fail_claimed_idempotent_run_before_spawn(
+                            execution_owner_generation,
+                            &user_id,
+                            &session_id,
+                            &run_id,
+                            "server workspace provisioning failed after evaluation Run claim",
+                        )
+                        .await;
                         self.runs.write().await.remove(&run_id);
                         return Err(error);
                     }
@@ -15096,6 +18798,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             });
         if let Some(generation) = request.execution_binding_generation {
             let Some(snapshot) = execution_bindings.as_mut() else {
+                self.fail_claimed_idempotent_run_before_spawn(
+                    execution_owner_generation,
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    "Work execution provider could not be materialized after evaluation Run claim",
+                )
+                .await;
                 self.runs.write().await.remove(&run_id);
                 return Err(error_response_coded(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -15113,6 +18823,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             )
             .await
         {
+            self.fail_claimed_idempotent_run_before_spawn(
+                execution_owner_generation,
+                &user_id,
+                &session_id,
+                &run_id,
+                "optional tool validation failed after evaluation Run claim",
+            )
+            .await;
             self.runs.write().await.remove(&run_id);
             if let Some(record) = cloud_workspace_record.as_ref() {
                 self.cleanup_cloud_workspace_after_failed_start(
@@ -15132,6 +18850,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             && let Err(error) =
                 Self::invalidate_work_subject_before_execution(pool, binding, &run_id).await
         {
+            self.fail_claimed_idempotent_run_before_spawn(
+                execution_owner_generation,
+                &user_id,
+                &session_id,
+                &run_id,
+                "Work subject invalidation failed after evaluation Run claim",
+            )
+            .await;
             self.runs.write().await.remove(&run_id);
             return Err(work_subject_invalidation_response(error));
         }
@@ -15146,44 +18872,62 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             match self.provision_server_workspace(&session_id) {
                 Ok(workspace) => Some(workspace),
                 Err(error) => {
+                    self.fail_claimed_idempotent_run_before_spawn(
+                        execution_owner_generation,
+                        &user_id,
+                        &session_id,
+                        &run_id,
+                        "tool executor workspace provisioning failed after evaluation Run claim",
+                    )
+                    .await;
                     self.runs.write().await.remove(&run_id);
                     return Err(error);
                 }
             }
         };
 
-        let execution_owner_generation = match self
-            .persist_run_start(
-                &run_id,
-                &user_id,
-                &session_id,
-                &request,
-                execution_bindings.as_ref(),
-                runtime_capabilities.agent_binding.as_ref(),
-                work_runtime_binding.as_ref(),
-                None,
-                RunStartPersistenceMode::Insert,
-            )
-            .await
+        let execution_owner_generation = if let Some(owner_generation) = execution_owner_generation
         {
-            Ok(DurableRunStartClaim::Started { owner_generation }) => owner_generation,
-            Ok(other) => unreachable!("insert-only run start returned {other:?}"),
-            Err(error) => {
-                self.runs.write().await.remove(&run_id);
-                if let Some(record) = cloud_workspace_record.as_ref() {
-                    self.cleanup_cloud_workspace_after_failed_start(
-                        &user_id,
-                        &session_id,
-                        &run_id,
-                        record,
-                        format!(
-                            "durable run start failed after cloud workspace provisioning: {}",
-                            error.1.0.detail
-                        ),
-                    )
-                    .await;
+            owner_generation
+        } else {
+            match self
+                .persist_run_start(
+                    &run_id,
+                    &user_id,
+                    &session_id,
+                    &request,
+                    execution_bindings.as_ref(),
+                    runtime_capabilities.agent_binding.as_ref(),
+                    work_runtime_binding.as_ref(),
+                    None,
+                    RunStartPersistenceMode::Insert,
+                )
+                .await
+            {
+                Ok(DurableRunStartClaim::Started { owner_generation }) => {
+                    if evaluation_mode && let Some(lease) = evaluation_workspace_lease.as_ref() {
+                        lease.activate_after_run_claim();
+                    }
+                    owner_generation
                 }
-                return Err(error);
+                Ok(other) => unreachable!("insert-only run start returned {other:?}"),
+                Err(error) => {
+                    self.runs.write().await.remove(&run_id);
+                    if let Some(record) = cloud_workspace_record.as_ref() {
+                        self.cleanup_cloud_workspace_after_failed_start(
+                            &user_id,
+                            &session_id,
+                            &run_id,
+                            record,
+                            format!(
+                                "durable run start failed after cloud workspace provisioning: {}",
+                                error.1.0.detail
+                            ),
+                        )
+                        .await;
+                    }
+                    return Err(error);
+                }
             }
         };
         let execution_authority_confirmation = self
@@ -15196,46 +18940,57 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 llm_cancel_token.as_ref(),
             )
             .await;
-        let confirmed_authority = match execution_authority_confirmation {
-            Ok(ExecutionAuthorityConfirmation::Confirmed(confirmed)) => confirmed,
-            failed => {
-                self.runs.write().await.remove(&run_id);
-                if let Some(record) = cloud_workspace_record.as_ref() {
-                    self.cleanup_cloud_workspace_after_failed_start(
-                        &user_id,
-                        &session_id,
-                        &run_id,
-                        record,
-                        "durable execution authority could not be confirmed before activation"
-                            .to_string(),
-                    )
-                    .await;
-                }
-                return match failed {
-                    Ok(ExecutionAuthorityConfirmation::Superseded) => Err(error_response(
-                        StatusCode::CONFLICT,
-                        "durable execution authority expired before activation".to_string(),
-                    )),
-                    Err(error) => Err(error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("failed to confirm durable execution authority: {error}"),
-                    )),
-                    Ok(ExecutionAuthorityConfirmation::Confirmed(_)) => {
-                        unreachable!("matched above")
+        if owner_lease_heartbeat.is_none() {
+            let confirmed_authority = match execution_authority_confirmation {
+                Ok(ExecutionAuthorityConfirmation::Confirmed(confirmed)) => confirmed,
+                failed => {
+                    if idempotent_start {
+                        self.fail_evaluation_run_before_spawn(
+                            &user_id,
+                            &session_id,
+                            &run_id,
+                            execution_owner_generation,
+                            "durable evaluation authority could not be confirmed before activation",
+                        )
+                        .await;
                     }
-                };
-            }
-        };
-        let owner_lease_heartbeat = self.run_engine.start_owner_lease_heartbeat(
-            user_id.clone(),
-            session_id.clone(),
-            run_id.clone(),
-            execution_owner_generation,
-            confirmed_authority,
-            execution_lease_lost.clone(),
-            llm_cancel_token.clone(),
-        );
-
+                    self.runs.write().await.remove(&run_id);
+                    if let Some(record) = cloud_workspace_record.as_ref() {
+                        self.cleanup_cloud_workspace_after_failed_start(
+                            &user_id,
+                            &session_id,
+                            &run_id,
+                            record,
+                            "durable execution authority could not be confirmed before activation"
+                                .to_string(),
+                        )
+                        .await;
+                    }
+                    return match failed {
+                        Ok(ExecutionAuthorityConfirmation::Superseded) => Err(error_response(
+                            StatusCode::CONFLICT,
+                            "durable execution authority expired before activation".to_string(),
+                        )),
+                        Err(error) => Err(error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("failed to confirm durable execution authority: {error}"),
+                        )),
+                        Ok(ExecutionAuthorityConfirmation::Confirmed(_)) => {
+                            unreachable!("matched above")
+                        }
+                    };
+                }
+            };
+            owner_lease_heartbeat = self.run_engine.start_owner_lease_heartbeat(
+                user_id.clone(),
+                session_id.clone(),
+                run_id.clone(),
+                execution_owner_generation,
+                confirmed_authority,
+                execution_lease_lost.clone(),
+                llm_cancel_token.clone(),
+            );
+        }
         // Spawn background agentic loop.
         // Load plan state as structured data: prompt hint for context, plus
         // an independent authoring flag for the tool gate. Ordinary session
@@ -15254,11 +19009,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             edge_tools,
             edge_profile.clone(),
             server_service_tool_catalog_enabled,
-            !agent_binding_mode,
+            !agent_binding_mode && !evaluation_mode,
             execution_bindings.as_ref(),
             plan_resume_hint,
             plan_authoring_active,
             work_runtime_binding.as_ref(),
+            &execution_inputs,
         );
         let interaction_sink: Arc<dyn server_loop_host::HostInteractionSink> =
             Arc::new(DurableHostInteractionSink {
@@ -15305,15 +19061,26 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         {
             Ok(admission) => admission,
             Err(error) => {
-                self.fail_started_run_before_spawn(
-                    &user_id,
-                    &session_id,
-                    &run_id,
-                    execution_owner_generation,
-                    "canonical turn admission failed",
-                    PreSpawnFailureCode::PreSpawnFailure,
-                )
-                .await;
+                if evaluation_mode {
+                    self.fail_evaluation_run_before_spawn(
+                        &user_id,
+                        &session_id,
+                        &run_id,
+                        execution_owner_generation,
+                        "canonical turn admission failed",
+                    )
+                    .await;
+                } else {
+                    self.fail_started_run_before_spawn(
+                        &user_id,
+                        &session_id,
+                        &run_id,
+                        execution_owner_generation,
+                        "canonical turn admission failed",
+                        PreSpawnFailureCode::PreSpawnFailure,
+                    )
+                    .await;
+                }
                 if let Some(record) = cloud_workspace_record.as_ref() {
                     self.cleanup_cloud_workspace_after_failed_start(
                         &user_id,
@@ -15327,6 +19094,175 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 return Err(error);
             }
         };
+        if evaluation_mode
+            && canonical_turn.as_ref().is_some_and(|admission| {
+                admission.had_canonical_head || !admission.prior_messages.is_empty()
+            })
+        {
+            // The coordinator's writer/turn reservation is the atomic
+            // session boundary. A preflight SELECT cannot protect this
+            // decision from a concurrent Edge or server turn, so reject as
+            // soon as the canonical reservation proves the session is no
+            // longer empty and release the reservation before returning.
+            drop(canonical_turn);
+            self.fail_evaluation_run_before_spawn(
+                &user_id,
+                &session_id,
+                &run_id,
+                execution_owner_generation,
+                "evaluation requires an empty canonical session",
+            )
+            .await;
+            if let Some(record) = cloud_workspace_record.as_ref() {
+                self.cleanup_cloud_workspace_after_failed_start(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    record,
+                    "evaluation requires an empty canonical session".to_string(),
+                )
+                .await;
+            }
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_session_not_clean",
+                "evaluation requires an empty canonical session",
+            ));
+        }
+        let mut evaluation_workspace = None;
+        // Admit the frozen trial only after the canonical coordinator has
+        // reserved the session boundary. The reservation is the atomic
+        // empty-session check; doing trial admission before it could leave a
+        // generation-bound trial behind when another session writer wins the
+        // race.
+        if let Some(admission) = request.evaluation_admission.clone() {
+            match self
+                .admit_evaluation_trial(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    execution_owner_generation,
+                    evaluation_workspace_lease
+                        .as_ref()
+                        .and_then(EvaluationWorkspaceLease::connection_generation),
+                    evaluation_workspace_lease
+                        .as_ref()
+                        .map(|lease| &lease.allocation),
+                    &request,
+                    &admission,
+                )
+                .await
+            {
+                Ok(admitted) => {
+                    evaluation_workspace = admitted.workspace;
+                    if let Some(skill_resolver) = admitted.skill_resolver {
+                        runtime_capabilities.request_scoped_skill_resolver = Some(skill_resolver);
+                    }
+                    let admitted_event = json!({
+                        "event_type": "evaluation_admitted",
+                        "run_generation": execution_owner_generation,
+                        "idempotency_key": format!(
+                            "evaluation-admitted:{run_id}:{execution_owner_generation}"
+                        ),
+                        "data": {
+                            "schema_version": astra_services::evaluation::EVALUATION_EXECUTION_SCHEMA_VERSION,
+                            "admission": admitted.admission.clone(),
+                        },
+                    });
+                    match self
+                        .run_engine
+                        .append_events_if_current_generation_and_status(
+                            &user_id,
+                            &session_id,
+                            &run_id,
+                            execution_owner_generation,
+                            &[STATUS_RUNNING],
+                            std::slice::from_ref(&admitted_event),
+                        )
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            drop(canonical_turn);
+                            self.fail_evaluation_run_before_spawn(
+                                &user_id,
+                                &session_id,
+                                &run_id,
+                                execution_owner_generation,
+                                "evaluation admission lost its canonical execution generation",
+                            )
+                            .await;
+                            if let Some(record) = cloud_workspace_record.as_ref() {
+                                self.cleanup_cloud_workspace_after_failed_start(
+                                    &user_id,
+                                    &session_id,
+                                    &run_id,
+                                    record,
+                                    "evaluation admission lost its canonical execution generation"
+                                        .to_string(),
+                                )
+                                .await;
+                            }
+                            return Err(evaluation_preflight_error(
+                                StatusCode::CONFLICT,
+                                "evaluation_admission_generation_lost",
+                                "the canonical execution owner changed before evaluation admission was recorded",
+                            ));
+                        }
+                        Err(persist_error) => {
+                            drop(canonical_turn);
+                            self.fail_evaluation_run_before_spawn(
+                                &user_id,
+                                &session_id,
+                                &run_id,
+                                execution_owner_generation,
+                                "evaluation admission evidence could not be persisted",
+                            )
+                            .await;
+                            if let Some(record) = cloud_workspace_record.as_ref() {
+                                self.cleanup_cloud_workspace_after_failed_start(
+                                    &user_id,
+                                    &session_id,
+                                    &run_id,
+                                    record,
+                                    "evaluation admission evidence could not be persisted"
+                                        .to_string(),
+                                )
+                                .await;
+                            }
+                            return Err(evaluation_preflight_error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "evaluation_admission_persistence_failed",
+                                persist_error,
+                            ));
+                        }
+                    }
+                    request.evaluation_admission = Some(admitted.admission)
+                }
+                Err(error) => {
+                    drop(canonical_turn);
+                    self.fail_evaluation_run_before_spawn(
+                        &user_id,
+                        &session_id,
+                        &run_id,
+                        execution_owner_generation,
+                        "evaluation trial admission failed before execution",
+                    )
+                    .await;
+                    if let Some(record) = cloud_workspace_record.as_ref() {
+                        self.cleanup_cloud_workspace_after_failed_start(
+                            &user_id,
+                            &session_id,
+                            &run_id,
+                            record,
+                            "evaluation trial admission failed before execution".to_string(),
+                        )
+                        .await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
         let restore_prior_prompt_history = should_restore_prior_prompt_history(
             request.session_id.is_some(),
             match canonical_turn.as_ref() {
@@ -15355,6 +19291,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             runtime_capabilities.request_scoped_skill_resolver.clone(),
             runtime_capabilities.agent_binding.as_ref(),
             Some(execution_owner_generation),
+            &execution_inputs,
         )?;
         install_active_personal_skills(&mut loop_state, active_personal_skills);
         loop_state.context_manifest_user_id = Some(user_id.clone());
@@ -15417,7 +19354,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // compaction, and context-window counters. Without this, server-side
         // session resume starts cold even though finalization persisted the
         // state needed for long-running sessions.
-        if restore_prior_prompt_history {
+        if restore_prior_prompt_history && !evaluation_mode {
             if let Ok(Some(restored)) =
                 astra_pipeline::step_restore::restore_session(&user_id, &session_id)
             {
@@ -15431,6 +19368,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // ── CSL: Load conversation history from the log ─────────────
         let csl_manager = if restore_prior_prompt_history
+            && !evaluation_mode
             && canonical_turn
                 .as_ref()
                 .is_none_or(|admission| !admission.had_canonical_head)
@@ -15472,6 +19410,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &user_id,
             &session_id,
             self.trace_ingestion.clone(),
+            RuntimeProductionStatePolicy::for_request(&request),
         )
         .await;
         // The RuntimeToolExecutor is the owner for server-side runtime tools
@@ -15498,10 +19437,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 Self::runtime_edge_dispatch_authorization_context(&request)
                     .expect("runtime executor authorization was validated before run start"),
             )
+            .with_evaluation_workspace(evaluation_workspace)
             .with_admitted_execution_deadline(request.admitted_execution_deadline);
-            if let Some(memoria_port) = self
-                .memory_extraction_service
-                .as_ref()
+            if let Some(service) = self.skill_creator_service.clone() {
+                executor = executor.with_skill_creator_service(service);
+            }
+            if let Some(memoria_port) = RuntimeProductionStatePolicy::for_request(&request)
+                .select(self.memory_extraction_service.as_ref())
                 .and_then(|service| service.memoria_client_for_owner(&user_id).ok())
             {
                 executor = executor.with_memoria_port(memoria_port);
@@ -15771,6 +19713,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             pause_flag,
             llm_cancel_token,
             execution_lease_lost,
+            evaluation_workspace_lease,
         })
         .await;
 
@@ -15796,7 +19739,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
         self.require_invocation_composition()?;
         let start_identity = self.run_start_idempotency(&user_id, &request)?;
-        let request = if let Some(identity) = start_identity.as_ref() {
+        let (request, execution_inputs) = if let Some(identity) = start_identity.as_ref() {
             // Idempotent retries may omit runtime context needed only for a
             // new execution. The durable lookup stays authoritative while
             // independent request preparation overlaps its read latency.
@@ -15823,6 +19766,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         } else {
             self.prepare_chat_request(&user_id, request).await?
         };
+        if request.evaluation_admission.is_some() {
+            return Err(evaluation_preflight_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "evaluation_streaming_unsupported",
+                "evaluation currently requires the durable background Run entrypoint",
+            ));
+        }
         let request_constraints = self
             .validate_request_constraints(&user_id, &request)
             .await?;
@@ -15843,16 +19793,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .conversation_authority
             .as_ref()
             .map(|authority| authority.run_id.as_str());
-        if let (Some(identity), Some(authority_run_id)) =
-            (start_identity.as_ref(), authority_run_id)
-            && identity.run_id() != authority_run_id
-        {
-            return Err(error_response_coded(
-                StatusCode::CONFLICT,
-                "request idempotency and conversation authority identify different runs",
-                "conversation_authority_run_conflict",
-            ));
-        }
+        Self::validate_start_request_authority(start_identity.as_ref(), authority_run_id)?;
         let run_id = authority_run_id
             .map(str::to_owned)
             .or_else(|| {
@@ -15874,6 +19815,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &user_id,
             &session_id,
             &mut request,
+            None,
             work_runtime_binding.as_ref(),
         )
         .await?;
@@ -16531,6 +20473,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             runtime_capabilities.request_scoped_skill_resolver.clone(),
             runtime_capabilities.agent_binding.as_ref(),
             execution_owner_generation,
+            &execution_inputs,
         )?;
         install_active_personal_skills(&mut state, active_personal_skills);
         state.context_manifest_user_id = Some(user_id.clone());
@@ -16659,6 +20602,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             plan_resume_hint,
             plan_authoring_active,
             work_runtime_binding.as_ref(),
+            &execution_inputs,
         );
         if let Some(admission) = canonical_turn.as_ref() {
             host.bind_execution_handoff(
@@ -16974,6 +20918,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &user_id,
             &session_id,
             self.trace_ingestion.clone(),
+            RuntimeProductionStatePolicy::for_request(&request),
         );
         tokio::join!(persist_user_transcript, configure_controllers);
 
@@ -17003,9 +20948,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 ),
             )
             .with_admitted_execution_deadline(request.admitted_execution_deadline);
-            if let Some(memoria_port) = self
-                .memory_extraction_service
-                .as_ref()
+            if let Some(service) = self.skill_creator_service.clone() {
+                executor = executor.with_skill_creator_service(service);
+            }
+            if let Some(memoria_port) = RuntimeProductionStatePolicy::for_request(&request)
+                .select(self.memory_extraction_service.as_ref())
                 .and_then(|service| service.memoria_client_for_owner(&user_id).ok())
             {
                 executor = executor.with_memoria_port(memoria_port);
@@ -17286,7 +21233,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             model_name: request.model.clone(),
             user_message: request.message.clone(),
             hook_db_writer: self.hook_db_writer.clone(),
-            observer_worker: self.observer_worker.clone(),
+            observer_worker: RuntimeProductionStatePolicy::for_request(&request)
+                .select(self.observer_worker.clone()),
             metrics_registry: self.metrics_registry.clone(),
             csl_manager: csl_manager.map(tokio::sync::Mutex::new),
         };
@@ -18302,12 +22250,34 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     } else {
                         None
                     };
+                let terminal_accounting_committed =
+                    if control_terminal_settlement_committed.is_some() {
+                        control_terminal_settlement_committed
+                    } else if atomic_terminal_committed {
+                        Some(true)
+                    } else if durable_status_committed {
+                        Some(
+                            Self::persist_finalized_accounting_after_terminal(
+                                &run_engine,
+                                &bg_user_id,
+                                &bg_session_id,
+                                &bg_run_id,
+                                persisted_status,
+                                execution_owner_generation,
+                                &state,
+                            )
+                            .await,
+                        )
+                    } else {
+                        None
+                    };
                 let all_settlement_facts_committed = settlement_facts_committed(
                     control_terminal_settlement_committed,
                     durable_status_committed,
                     streaming_events_for_durable.len(),
                     streaming_events_committed,
-                );
+                ) && terminal_accounting_committed
+                    .unwrap_or(true);
                 let settlement_closed = all_settlement_facts_committed
                     && Self::persist_settlement_finished(
                         &run_engine,
@@ -18540,9 +22510,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
                 Self::durable_persist_error("status snapshot", error)
             })?;
-        let mut status = snapshot
-            .map(Self::durable_status_snapshot_record)
-            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
+        let Some(snapshot) = snapshot else {
+            return Err(error_response(StatusCode::NOT_FOUND, "Run not found"));
+        };
+        let mut status = Self::durable_status_snapshot_record(snapshot.clone());
+        if durable_run_status_is_terminal(&snapshot.status) {
+            self.reconcile_evaluation_observation_for_run(
+                &user_id,
+                &run_id,
+                &snapshot.session_id,
+                snapshot.run_generation,
+                &snapshot.status,
+            )
+            .await;
+        }
         // This optional field can retain an unrecorded local observation. The
         // canonical cross-pod/history source remains the run's replay stream.
         status.artifact_publication = local_publication;
@@ -18576,6 +22557,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         recent_limit: u32,
     ) -> Result<RunProjectionRecord, (StatusCode, Json<ErrorResponse>)> {
         let run = self.require_durable_run_for_user(&run_id, &user_id).await?;
+        if durable_run_status_is_terminal(&run.status) {
+            self.reconcile_evaluation_observation_for_run(
+                &user_id,
+                &run_id,
+                &run.session_id,
+                run.run_generation,
+                &run.status,
+            )
+            .await;
+        }
         let projection = self
             .run_engine
             .load_run_projection(&user_id, &run_id)
@@ -19250,6 +23241,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 (event_index, false, true)
             }
             AtomicRunGuidanceAdmission::Duplicate { event_index } => (event_index, true, false),
+            AtomicRunGuidanceAdmission::EvaluationFrozen => {
+                return Err(error_response_coded(
+                    StatusCode::CONFLICT,
+                    "Evaluation inputs are frozen. Cancel this trial and prepare a new experiment to change its input.",
+                    "evaluation_input_frozen",
+                ));
+            }
             AtomicRunGuidanceAdmission::IdentityConflict => {
                 return Err(error_response_coded(
                     StatusCode::CONFLICT,
@@ -19911,6 +23909,7 @@ pub struct ServerSpawnAgentExecutor {
     edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
     skill_service: Option<Arc<dyn SkillService>>,
+    server_skill_registry_cache: ServerSkillRegistryCache,
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
     reflect_service: Arc<dyn astra_services::ReflectService>,
     auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
@@ -20007,6 +24006,7 @@ impl ServerSpawnAgentExecutor {
             edge_dispatch_service: None,
             edge_registry_service: None,
             skill_service: None,
+            server_skill_registry_cache: Arc::new(StdMutex::new(HashMap::new())),
             memory_extraction_service: None,
             reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
             auxiliary_event_writer: None,
@@ -20041,6 +24041,11 @@ impl ServerSpawnAgentExecutor {
         pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     ) -> Self {
         self.edge_connection_pool = pool;
+        self
+    }
+
+    fn with_server_skill_registry_cache(mut self, cache: ServerSkillRegistryCache) -> Self {
+        self.server_skill_registry_cache = cache;
         self
     }
 
@@ -20528,7 +24533,8 @@ impl ServerSpawnAgentExecutor {
             self.matrixone.clone(),
             Arc::clone(&self.encryptor),
             Arc::clone(&self.edge_callback_ledger),
-        );
+        )
+        .with_server_skill_registry_cache(Arc::clone(&self.server_skill_registry_cache));
         if let Some(run_engine) = self.run_engine.clone() {
             executor = executor.with_run_engine(run_engine);
         }
@@ -21695,6 +25701,7 @@ pub struct ServerSubRunExecutor {
     edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
     skill_service: Option<Arc<dyn SkillService>>,
+    server_skill_registry_cache: ServerSkillRegistryCache,
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
     reflect_service: Arc<dyn astra_services::ReflectService>,
     auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
@@ -21759,6 +25766,7 @@ impl ServerSubRunExecutor {
             edge_dispatch_service: None,
             edge_registry_service: None,
             skill_service: None,
+            server_skill_registry_cache: Arc::new(StdMutex::new(HashMap::new())),
             memory_extraction_service: None,
             reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
             auxiliary_event_writer: None,
@@ -21788,6 +25796,11 @@ impl ServerSubRunExecutor {
 
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.shared_pool = Some(pool);
+        self
+    }
+
+    fn with_server_skill_registry_cache(mut self, cache: ServerSkillRegistryCache) -> Self {
+        self.server_skill_registry_cache = cache;
         self
     }
 
@@ -21897,6 +25910,14 @@ struct DurableSubrunAdmission {
 }
 
 impl ServerSubRunExecutor {
+    fn cached_server_skill_resolver(&self, user_id: &str) -> ServerSkillResolverBundle {
+        build_server_skill_resolver_from_registry(cached_server_skill_registry_for(
+            &self.server_skill_registry_cache,
+            self.skill_service.clone(),
+            user_id,
+        ))
+    }
+
     fn durable_run_engine(&self) -> Option<RunEngine> {
         self.run_engine.clone()
     }
@@ -23228,7 +27249,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             .unwrap_or_default();
 
         let (skill_registry, raw_skill_resolver) =
-            build_server_skill_resolver(self.skill_service.clone(), &config.user_id);
+            self.cached_server_skill_resolver(&config.user_id);
         let skill_resolver =
             apply_normalized_skill_allowlist(raw_skill_resolver, &config.request_constraints)?;
 
@@ -23305,7 +27326,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 resolver: skill_resolver,
                 request_constraints: config.request_constraints.clone(),
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
                 tool_event_hooks,
                 session_event_hooks,
                 ..Default::default()
@@ -23605,6 +27625,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             &config.user_id,
             &config.session_id,
             self.trace_ingestion.clone(),
+            RuntimeProductionStatePolicy::Enabled,
         )
         .await;
 
@@ -24289,3 +28310,180 @@ impl SubRunExecutor for ServerSubRunExecutor {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod production_state_isolation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn evaluation_controllers_remove_quality_sink_but_keep_observability() {
+        let settings = MatrixOneSettings::mock();
+        let quality = EvaluationPersistenceContext {
+            user_id: "isolation-user".into(),
+            evaluation_service: DatabaseEvaluationService::new(settings.clone()),
+        };
+        let trace = ContextTracePersistenceContext {
+            user_id: "isolation-user".into(),
+            event_service: DatabaseEventService::new(settings.clone()),
+            artifact_store: astra_services::DatabaseSessionArtifactStore::new(settings),
+            agent_id: RUNTIME_CONTEXT_TRACE_AGENT_ID.into(),
+        };
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        initialize_runtime_controllers(
+            &mut state,
+            "isolation-user",
+            "isolation-session",
+            Some(quality.clone()),
+            Some(trace.clone()),
+            RuntimeProductionStatePolicy::Enabled,
+        )
+        .await;
+        assert!(state.telemetry.evaluation_persistence.is_some());
+        // Isolation must also remove a previously attached production sink.
+        initialize_runtime_controllers(
+            &mut state,
+            "isolation-user",
+            "isolation-session",
+            Some(quality),
+            Some(trace),
+            RuntimeProductionStatePolicy::Disabled,
+        )
+        .await;
+        assert!(state.telemetry.evaluation_persistence.is_none());
+        assert!(state.telemetry.context_trace_persistence.is_some());
+        assert!(state.telemetry.observability_hub.is_some());
+        assert!(state.telemetry.observability_session.is_some());
+    }
+}
+
+#[cfg(test)]
+mod observation_repair_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_proof_reader_results_preserve_http_classification() {
+        use astra_services::runs::RunProofReadError;
+
+        assert_eq!(terminal_proof_for_repair::<()>(Ok(None)).unwrap(), None);
+        assert_eq!(terminal_proof_for_repair(Ok(Some(17))).unwrap(), Some(17));
+        let integrity = terminal_proof_for_repair::<()>(Err(RunProofReadError::Integrity(
+            "atomic batch fingerprint mismatch".into(),
+        )))
+        .unwrap_err()
+        .into_http();
+        assert_eq!(integrity.0, StatusCode::CONFLICT);
+        assert_eq!(
+            integrity.1.0.error_code.as_deref(),
+            Some("evaluation_repair_integrity")
+        );
+        let storage = terminal_proof_for_repair::<()>(Err(RunProofReadError::Database(
+            sqlx::Error::PoolTimedOut,
+        )))
+        .unwrap_err()
+        .into_http();
+        assert_eq!(storage.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            storage.1.0.error_code.as_deref(),
+            Some("evaluation_repair_store_unavailable")
+        );
+    }
+
+    #[test]
+    fn explicit_repair_preserves_integrity_and_retryable_storage_statuses() {
+        assert_eq!(
+            EvaluationObservationRepairError::BindingMismatch
+                .into_http()
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            EvaluationObservationRepairError::StorageUnavailable
+                .into_http()
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            EvaluationObservationRepairError::Execution(
+                astra_services::evaluation::EvaluationExecutionError::Persistence(
+                    astra_services::evaluation::EvaluationPersistenceError::Conflict(
+                        "binding changed".into()
+                    ),
+                ),
+            )
+            .into_http()
+            .0,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn observation_repair_distinguishes_pending_non_eval_and_storage_failure() {
+        let engine = RunEngine::new(Arc::new(astra_services::runs::InMemoryRunStateStore::new()));
+        let admission = EvaluationRunAdmission {
+            experiment_id: "experiment".into(),
+            trial_id: "trial".into(),
+            input_content_hash: "input".into(),
+            revision_content_hash: "revision".into(),
+            skill_revision: None,
+            judgment_policy: None,
+            receipt_ids: Vec::new(),
+            snapshot_envelope: None,
+        };
+        for (status, admission, evidence_ready, expected) in [
+            (
+                RunStatus::Completed,
+                None,
+                true,
+                EvaluationObservationRepairOutcome::NotEvaluation,
+            ),
+            (
+                RunStatus::Running,
+                Some(&admission),
+                true,
+                EvaluationObservationRepairOutcome::NotReady,
+            ),
+            (
+                RunStatus::Completed,
+                Some(&admission),
+                false,
+                EvaluationObservationRepairOutcome::NotReady,
+            ),
+        ] {
+            let result = persist_evaluation_observation_after_settlement(
+                &engine,
+                None,
+                "owner",
+                "session",
+                "run",
+                0,
+                0,
+                None,
+                admission,
+                status,
+                evidence_ready,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, expected);
+        }
+        let error = persist_evaluation_observation_after_settlement(
+            &engine,
+            None,
+            "owner",
+            "session",
+            "run",
+            0,
+            0,
+            None,
+            Some(&admission),
+            RunStatus::Completed,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            EvaluationObservationRepairError::StorageUnavailable
+        ));
+    }
+}

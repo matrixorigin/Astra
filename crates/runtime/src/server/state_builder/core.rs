@@ -159,9 +159,6 @@ pub(super) fn build_core_state(
     .with_skill_service(Arc::new(
         DatabaseSkillService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))
-    .with_skill_config_service(Arc::new(
-        DatabaseSkillConfigService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
     .with_mcp_registry_service(Arc::new(
         DatabaseMcpRegistryService::new(settings.matrixone.clone(), Arc::clone(shared_encryptor))
             .with_pool(shared_pool.clone()),
@@ -430,6 +427,7 @@ mod tests {
                 ExecutorStatus::Online,
             ),
             workspace_record: None,
+            evaluation_workspace: None,
             runtime: None,
             runtime_process_authorization: None,
             runtime_process_authorization_required: false,

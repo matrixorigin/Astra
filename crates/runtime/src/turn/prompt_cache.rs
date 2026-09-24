@@ -146,8 +146,19 @@ impl PromptCacheConfig {
         cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
         provider: &str,
     ) -> Self {
-        let cache_enabled = !std::env::var("ASTRA_TEST_PROMPT_CACHE_DISABLED")
-            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        Self::from_captured_enablement(cache_capability, provider, Self::capture_enablement())
+    }
+
+    pub(crate) fn capture_enablement() -> bool {
+        !std::env::var("ASTRA_TEST_PROMPT_CACHE_DISABLED")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    }
+
+    pub(crate) fn from_captured_enablement(
+        cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+        provider: &str,
+        cache_enabled: bool,
+    ) -> Self {
         let capability =
             astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider(
                 cache_capability,
@@ -505,16 +516,20 @@ pub(crate) fn assemble_ephemeral_pipeline_outcome_with_messages(
         provider,
     );
     let provider_strategy = ProviderCacheStrategy::from_cache_capability(capability);
+    let context_budget = crate::turn::execution_config::resolve_context_budget(
+        &astra_config::RuntimeConfig::default(),
+        context_window,
+        Some(pre_reserved_output_tokens),
+        crate::prompts::CompactConfig::default(),
+    );
     let session_ctx = SessionContext {
+        compaction_thresholds: context_budget.compaction_thresholds(),
         session_id: session_id.to_string(),
         run_id: String::new(),
         model_id: model_id.to_string(),
         provider_name: provider.to_string(),
         pre_reserved_output_tokens,
-        model_limit: saturating_usize_to_u32(
-            crate::prompts::budget_for_model_with_override(Some(model_id), context_window)
-                .model_limit,
-        ),
+        model_limit: saturating_usize_to_u32(context_budget.model_limit()),
         provider_policy: provider_policy.clone(),
         provider_strategy,
         project_context: project_context.unwrap_or("").to_string(),

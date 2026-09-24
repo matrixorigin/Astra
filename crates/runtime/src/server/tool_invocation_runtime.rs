@@ -838,14 +838,20 @@ impl RuntimeToolInvocationLedger {
             ToolInvocationPrepareOutcome::Prepared(record)
             | ToolInvocationPrepareOutcome::Existing(record) => record,
         };
-        match record.state {
-            ToolInvocationState::Prepared => {
-                validate_decision(&record.decision)
-                    .map_err(RuntimeInvocationLedgerError::InvalidDecision)?;
-                Ok(InvocationPrepareDisposition::Prepared {
-                    decision: record.decision,
-                })
+        // Replay must validate immutable execution identity too. A terminal
+        // result cannot bypass allocation/decision binding merely because it
+        // no longer needs a dispatch lease.
+        validate_decision(&record.decision).map_err(|reason| {
+            RuntimeInvocationLedgerError::InvalidDecision {
+                reason,
+                state: record.state,
+                dispatch_certainty: record.dispatch_certainty,
             }
+        })?;
+        match record.state {
+            ToolInvocationState::Prepared => Ok(InvocationPrepareDisposition::Prepared {
+                decision: record.decision,
+            }),
             ToolInvocationState::Dispatched => {
                 let authoritative = self.reconcile_expired_dispatch(identity).await?;
                 let superseding_event_index = guidance_completion_event_index(&authoritative);
@@ -919,6 +925,12 @@ impl RuntimeToolInvocationLedger {
                 owner_id,
             }),
             Err(dispatch_error) => {
+                if is_action_already_started_error(&dispatch_error)
+                    && let Some(authoritative) = self.get(identity).await?
+                    && is_semantic_cache_terminal(&authoritative)
+                {
+                    return disposition_for_existing_record(authoritative)?.ok_or(dispatch_error);
+                }
                 if dispatch_error.is_action_authority_failure() {
                     return Err(dispatch_error);
                 }
@@ -938,6 +950,7 @@ impl RuntimeToolInvocationLedger {
         identity: &ToolInvocationIdentity,
         expected_key: &SemanticReadCacheKey,
         observation: &SemanticReadObservation,
+        admission: Option<DurableDispatchAdmission>,
     ) -> Result<Option<FinishedToolInvocation>, RuntimeInvocationLedgerError> {
         expected_key
             .validate()
@@ -972,15 +985,119 @@ impl RuntimeToolInvocationLedger {
         )
         .map_err(|error| RuntimeInvocationLedgerError::InvalidRecord(error.to_string()))?;
         let completed = match self {
-            Self::Database { ledger, .. } => ledger
-                .complete_from_semantic_read_cache(
-                    identity,
-                    &observation.result,
-                    &completion_source,
-                )
-                .await
-                .map_err(RuntimeInvocationLedgerError::from),
-            Self::InMemory { ledger, .. } => ledger
+            Self::Database {
+                ledger,
+                expected_owner_pod_id,
+            } => {
+                let admission = admission
+                    .ok_or(RuntimeInvocationLedgerError::MissingDurableDispatchAdmission)?;
+                let expected_owner_pod_id = expected_owner_pod_id
+                    .as_deref()
+                    .ok_or(RuntimeInvocationLedgerError::MissingDurableOwnerCapability)?;
+                ledger
+                    .complete_from_semantic_read_cache(
+                        identity,
+                        &observation.result,
+                        &completion_source,
+                        astra_services::tool_invocation_ledger::ToolInvocationDispatchAdmission {
+                            expected_control_epoch: admission.expected_control_epoch,
+                            expected_owner_generation: admission.expected_owner_generation,
+                            expected_owner_pod_id: expected_owner_pod_id.to_string(),
+                            expected_execution_binding_generation: admission
+                                .expected_execution_binding_generation,
+                        },
+                    )
+                    .await
+                    .map_err(RuntimeInvocationLedgerError::from)
+            }
+            Self::InMemory {
+                ledger,
+                run_engine: Some(run_engine),
+                ..
+            } => {
+                let admission = admission
+                    .ok_or(RuntimeInvocationLedgerError::MissingDurableDispatchAdmission)?;
+                let action_fence = run_engine
+                    .process_local_action_fence(&identity.user_id, &identity.run_id)
+                    .ok_or(RuntimeInvocationLedgerError::UnsupportedAtomicAdmission)?;
+                // Keep cache completion under the same action-fence -> ledger
+                // lock order as provider dispatch. A semantic hit is still a
+                // logical external action and must be visible to Run control
+                // before its terminal ledger row is published.
+                let _action_guard = action_fence.lock_owned().await;
+                let run_ledger = ledger.run_ledger(identity);
+                let mut authoritative_ledger = run_ledger.lock().await;
+                let action_id = format!("tool_invocation:{}", identity.storage_key());
+                let outcome = run_engine
+                    .begin_action_while_process_local_fence_held(
+                        &identity.user_id,
+                        &identity.run_id,
+                        crate::turn::run_control::ActionAdmissionRequest {
+                            action_id,
+                            expected_session_id: identity.session_id.clone(),
+                            expected_control_epoch: admission.expected_control_epoch,
+                            expected_owner_generation: Some(admission.expected_owner_generation),
+                        },
+                    )
+                    .await
+                    .map_err(RuntimeInvocationLedgerError::ProcessLocalActionAdmission)?;
+                match outcome {
+                    astra_services::runs::AtomicRunActionAdmission::Started { .. } => {
+                        let record = authoritative_ledger
+                            .complete_from_semantic_read_cache(
+                                identity,
+                                observation.result.clone(),
+                                completion_source,
+                            )
+                            .map_err(RuntimeInvocationLedgerError::from)?;
+                        ledger.note_terminal(identity);
+                        Ok(record)
+                    }
+                    astra_services::runs::AtomicRunActionAdmission::AlreadyStarted {
+                        event_index,
+                    }
+                    | astra_services::runs::AtomicRunActionAdmission::AckRecoveredStarted {
+                        event_index,
+                    } => Err(
+                        RuntimeInvocationLedgerError::ProcessLocalActionAlreadyStarted {
+                            event_index,
+                        },
+                    ),
+                    astra_services::runs::AtomicRunActionAdmission::Superseded {
+                        user_intent_event_index,
+                    } => Err(RuntimeInvocationLedgerError::ProcessLocalActionSuperseded {
+                        user_intent_event_index,
+                    }),
+                    astra_services::runs::AtomicRunActionAdmission::Inactive { status } => {
+                        if astra_services::runs::durable_run_status_is_terminal(&status) {
+                            ledger.defer_terminal_run((
+                                identity.user_id.clone(),
+                                identity.run_id.clone(),
+                            ));
+                        }
+                        Err(RuntimeInvocationLedgerError::ProcessLocalActionInactive { status })
+                    }
+                    astra_services::runs::AtomicRunActionAdmission::OwnerGenerationMismatch {
+                        actual_owner_generation,
+                    } => Err(
+                        RuntimeInvocationLedgerError::ProcessLocalOwnerGenerationMismatch {
+                            actual_owner_generation,
+                        },
+                    ),
+                    astra_services::runs::AtomicRunActionAdmission::Missing => {
+                        ledger.defer_terminal_run((
+                            identity.user_id.clone(),
+                            identity.run_id.clone(),
+                        ));
+                        Err(RuntimeInvocationLedgerError::ProcessLocalRunMissing)
+                    }
+                }
+            }
+            Self::InMemory {
+                ledger,
+                run_engine: None,
+                ..
+            } => ledger
                 .run_ledger(identity)
                 .lock()
                 .await
@@ -1210,6 +1327,25 @@ fn disposition_for_existing_record(
             record: Some(Box::new(record)),
         },
     )))
+}
+
+fn is_action_already_started_error(error: &RuntimeInvocationLedgerError) -> bool {
+    match error {
+        RuntimeInvocationLedgerError::Database(error) => matches!(
+            error.as_ref(),
+            astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::ActionAlreadyStarted { .. }
+        ),
+        RuntimeInvocationLedgerError::ProcessLocalActionAlreadyStarted { .. } => true,
+        _ => false,
+    }
+}
+
+fn is_semantic_cache_terminal(record: &ToolInvocationRecord) -> bool {
+    record.state == ToolInvocationState::Succeeded
+        && matches!(
+            record.completion_source.as_ref(),
+            Some(ToolInvocationCompletionSource::SemanticReadCache { .. })
+        )
 }
 
 pub(crate) fn terminal_outcome_from_result(
@@ -1519,6 +1655,27 @@ fn durability_error_result(
     )
 }
 
+pub(crate) fn ledger_error_result(
+    identity: &ToolInvocationIdentity,
+    error: &RuntimeInvocationLedgerError,
+) -> astra_tools::ToolResult {
+    if let RuntimeInvocationLedgerError::InvalidDecision {
+        state,
+        dispatch_certainty,
+        ..
+    } = error
+    {
+        return invocation_state_result(
+            identity,
+            *state,
+            "tool_invocation_decision",
+            *dispatch_certainty != DispatchCertainty::NotDispatched,
+            &error.to_string(),
+        );
+    }
+    ledger_unavailable_result(identity, error)
+}
+
 pub(crate) fn ledger_unavailable_result(
     identity: &ToolInvocationIdentity,
     detail: impl std::fmt::Display,
@@ -1586,8 +1743,12 @@ pub(crate) enum RuntimeInvocationLedgerError {
     InMemory(Box<InvocationLedgerError>),
     #[error("invalid durable invocation record: {0}")]
     InvalidRecord(String),
-    #[error("invalid frozen tool invocation decision: {0}")]
-    InvalidDecision(String),
+    #[error("invalid frozen tool invocation decision: {reason}")]
+    InvalidDecision {
+        reason: String,
+        state: ToolInvocationState,
+        dispatch_certainty: DispatchCertainty,
+    },
     #[error("tool invocation dispatch clock error: {0}")]
     Clock(String),
     #[error("durable tool dispatch is missing its applied control boundary")]
@@ -2546,7 +2707,7 @@ mod tests {
         let observation = semantic_observation(&arguments, &decision, "cached result");
 
         let completed = ledger
-            .complete_from_semantic_read_cache(&identity, &observation.key, &observation)
+            .complete_from_semantic_read_cache(&identity, &observation.key, &observation, None)
             .await
             .unwrap()
             .expect("cache completion should return the terminal result");
@@ -2592,6 +2753,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_local_cache_hit_requires_and_records_run_action_admission() {
+        let run_engine = crate::server::run::engine::RunEngine::new(Arc::new(
+            astra_services::runs::InMemoryRunStateStore::new(),
+        ));
+        run_engine
+            .start_run("local-cache", "user", "session")
+            .await
+            .unwrap();
+        let ledger = RuntimeToolInvocationLedger::new_process_local(run_engine.clone()).unwrap();
+        let identity = identity_for("local-cache", "call-cache");
+        let arguments = json!({"command": "read"});
+        let decision = decision("decision-v1");
+        let fingerprint = fingerprint_for(&arguments, &decision);
+        ledger
+            .prepare(&identity, &fingerprint, &decision)
+            .await
+            .unwrap();
+        let observation = semantic_observation(&arguments, &decision, "cached result");
+
+        let completed = ledger
+            .complete_from_semantic_read_cache(
+                &identity,
+                &observation.key,
+                &observation,
+                Some(DurableDispatchAdmission {
+                    expected_control_epoch: -1,
+                    expected_owner_generation: 0,
+                    expected_execution_binding_generation: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .expect("process-local cache completion should return the terminal result");
+        assert_eq!(completed.result.output, "cached result");
+        let run = run_engine
+            .load_run("user", "local-cache")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(|event| {
+                    event.get("event_type").and_then(Value::as_str)
+                        == Some("action_admission_granted")
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            run.events
+                .iter()
+                .find(|event| {
+                    event.get("event_type").and_then(Value::as_str)
+                        == Some("action_admission_granted")
+                })
+                .and_then(|event| event.pointer("/data/action_id"))
+                .and_then(Value::as_str),
+            Some(format!("tool_invocation:{}", identity.storage_key()).as_str())
+        );
+    }
+
+    #[tokio::test]
     async fn cache_completion_rejects_observation_for_different_arguments() {
         let ledger = RuntimeToolInvocationLedger::new(None);
         let identity = identity("call-cache-mismatch");
@@ -2611,7 +2835,7 @@ mod tests {
 
         assert!(matches!(
             ledger
-                .complete_from_semantic_read_cache(&identity, &expected_key, &wrong)
+                .complete_from_semantic_read_cache(&identity, &expected_key, &wrong, None)
                 .await,
             Err(RuntimeInvocationLedgerError::InvalidRecord(message))
                 if message.contains("does not match")
@@ -2656,7 +2880,7 @@ mod tests {
 
         assert!(matches!(
             ledger
-                .complete_from_semantic_read_cache(&identity, &current.key, &stale)
+                .complete_from_semantic_read_cache(&identity, &current.key, &stale, None)
                 .await,
             Err(RuntimeInvocationLedgerError::InvalidRecord(message))
                 if message.contains("currently resolved freshness key")
@@ -2693,7 +2917,7 @@ mod tests {
         let observation = semantic_observation(&arguments, &decision, "cached result");
 
         let pending = ledger
-            .complete_from_semantic_read_cache(&identity, &observation.key, &observation)
+            .complete_from_semantic_read_cache(&identity, &observation.key, &observation, None)
             .await
             .unwrap()
             .expect("dispatch winner should project its authoritative state");
@@ -2876,10 +3100,35 @@ mod tests {
             .await;
         assert_eq!(retried.result.output, "original evidence");
         assert_eq!(retried.record, original.record);
-        let prepared = ledger
+        let rejected = ledger
             .prepare_for_execution(&identity, &fingerprint, &decision("decision-v1"), |_| {
-                panic!("terminal replay must not reauthorize")
+                Err("allocation mismatch".to_string())
             })
+            .await;
+        assert!(matches!(
+            rejected,
+            Err(RuntimeInvocationLedgerError::InvalidDecision { ref reason, .. })
+                if reason == "allocation mismatch"
+        ));
+        let result = ledger_error_result(&identity, &rejected.err().unwrap());
+        let metadata = result.metadata.unwrap();
+        assert_eq!(metadata["side_effects_maybe"], true);
+        assert_eq!(metadata["retryable"], false);
+        assert_eq!(metadata["durable_invocation_state"], "succeeded");
+        assert_eq!(
+            ledger.get(&identity).await.unwrap().as_ref(),
+            original.record.as_deref()
+        );
+        let prepared = ledger
+            .prepare_for_execution(
+                &identity,
+                &fingerprint,
+                &decision("decision-v1"),
+                |stored| {
+                    assert_eq!(stored, &decision("decision-v1"));
+                    Ok(())
+                },
+            )
             .await
             .unwrap();
         let InvocationPrepareDisposition::Return(replay) = prepared else {

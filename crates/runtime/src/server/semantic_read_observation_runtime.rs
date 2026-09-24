@@ -320,6 +320,7 @@ pub(crate) async fn before_dispatch(
     ledger: &crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger,
     identity: &ToolInvocationIdentity,
     key: Option<&SemanticReadCacheKey>,
+    admission: Option<crate::server::tool_invocation_runtime::DurableDispatchAdmission>,
     cancel_token: Option<&tokio_util::sync::CancellationToken>,
 ) -> SemanticReadBeforeDispatch {
     let Some(key) = key else {
@@ -345,7 +346,7 @@ pub(crate) async fn before_dispatch(
     match lookup_or_wait_for_fill(store, identity, key, &fill_owner, cancel_token).await {
         Ok(SemanticReadCacheLookup::Hit(observation)) => {
             match ledger
-                .complete_from_semantic_read_cache(identity, key, &observation)
+                .complete_from_semantic_read_cache(identity, key, &observation, admission)
                 .await
             {
                 Ok(Some(result)) => {
@@ -835,8 +836,15 @@ mod tests {
     async fn disabled_store_returns_bounded_explainable_bypass_evidence() {
         let key = key();
         let ledger = crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new(None);
-        let decision =
-            before_dispatch(None, &ledger, &identity("call-disabled"), Some(&key), None).await;
+        let decision = before_dispatch(
+            None,
+            &ledger,
+            &identity("call-disabled"),
+            Some(&key),
+            None,
+            None,
+        )
+        .await;
         let SemanticReadBeforeDispatch::Proceed {
             fill: None,
             evidence: Some(evidence),

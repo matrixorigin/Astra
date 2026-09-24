@@ -155,6 +155,7 @@ pub(crate) async fn load_skill_record_from_registry(
 
 fn skill_list_item_from_manifest(manifest: astra_skills::SkillManifest) -> SkillListItem {
     SkillListItem {
+        is_owned: false,
         skill_id: manifest.name.clone(),
         skill_name: manifest.name,
         version: manifest.version.to_string(),

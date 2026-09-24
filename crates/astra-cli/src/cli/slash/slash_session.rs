@@ -32,7 +32,6 @@ use crate::cli::{
     stream::stream_render,
     theme,
 };
-use astra_runtime::prompts;
 use crossterm::style::Stylize;
 
 /// `/home/foo/bar` → `~/bar` when under the user home dir (readability).
@@ -5570,12 +5569,12 @@ async fn apply_restored_session(
             let base = astra_turn_core::thinking_config::resolve_model_thinking(m).0;
             state.cached_pricing = slash_stats::fallback_pricing(base);
             state.context_budget =
-                prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(base));
+                session_runtime::resolve_session_context_budget(&state.runtime_config, None, None);
         }
         None => {
             state.model = None;
             state.context_budget =
-                prompts::ContextBudget::from_runtime_config(&state.runtime_config, None);
+                session_runtime::resolve_session_context_budget(&state.runtime_config, None, None);
         }
     }
     crate::cli::slash::slash_config::set_active_model_for_display(state.model.clone());

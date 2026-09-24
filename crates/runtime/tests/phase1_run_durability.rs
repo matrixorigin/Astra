@@ -1050,6 +1050,15 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
         .await
         .unwrap()
         .unwrap();
+    let custody = loaded.events.iter()
+        .filter(|event| event["event_type"] == "run_recovery_claimed")
+        .collect::<Vec<_>>();
+    assert_eq!(custody.len(), 1, "one durable recovery claim after restart");
+    assert_eq!(custody[0]["data"]["user_id"], user_id);
+    assert_eq!(custody[0]["data"]["session_id"], session_id);
+    assert_eq!(custody[0]["data"]["run_id"], run_id);
+    assert_eq!(custody[0]["data"]["from_generation"], 1);
+    assert_eq!(custody[0]["data"]["to_generation"], 2);
     let indexes = loaded
         .events
         .iter()
@@ -1075,11 +1084,12 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
         client_indexes, client_visible_indexes,
         "client-side HTTP SSE replay should receive every externally visible event exactly once"
     );
-    // One run_started + 17 streamed fragments + one restart resume, then two
+    // One run_started + 17 streamed fragments + one restart resume and its
+    // durable recovery custody receipt, then two
     // cycles of pause, approval_required, and one typed guidance intent.
     // Guidance intentionally no longer synthesizes the old user_input +
     // run_resumed pair.
-    const EXPECTED_EVENT_COUNT: i64 = 1 + 17 + 1 + (2 * 3);
+    const EXPECTED_EVENT_COUNT: i64 = 1 + 17 + 2 + (2 * 3);
     assert_eq!(
         indexes,
         (0..EXPECTED_EVENT_COUNT).collect::<Vec<_>>(),

@@ -294,6 +294,7 @@ dependencies = [
  "astra-credentials",
  "astra-logging",
  "astra-runtime-env",
+ "astra-sandbox",
  "astra-server-types",
  "astra-tools",
  "astra-turn-types",
@@ -309,6 +310,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "tempfile",
  "thiserror 1.0.69",
@@ -535,6 +537,7 @@ name = "astra-sandbox"
 version = "0.2.8"
 dependencies = [
  "astra-core",
+ "astra-runtime-env",
  "astra-skills",
  "libc",
  "nix 0.31.3",
@@ -556,6 +559,7 @@ name = "astra-server-types"
 version = "0.2.8"
 dependencies = [
  "astra-core",
+ "astra-runtime-env",
  "astra-services",
  "astra-tools",
  "astra-turn-types",
@@ -735,6 +739,7 @@ dependencies = [
  "astra-core",
  "astra-memoria",
  "astra-prompts",
+ "astra-runtime-env",
  "astra-sandbox",
  "astra-services",
  "astra-turn-types",

@@ -676,6 +676,36 @@ pub fn submit_task_resolution_schema() -> Value {
     })
 }
 
+fn skill_creator_schema() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "skill_creator",
+            "description": "Create or improve a reusable Skill from the user's natural-language goal and the current authorized context. Return a private candidate and an evaluation plan or evidence status when a server-owned replay case exists. Do not publish or activate the candidate.",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "create_new": { "type": "boolean", "description": "True when the user requests a new Skill rather than improving an existing one." },
+                    "target_skill": {
+                        "type": "object", "additionalProperties": false,
+                        "properties": { "skill_name": { "type": "string" }, "version_id": { "type": "string" } },
+                        "required": ["skill_name", "version_id"],
+                        "description": "Exact existing Skill version to improve. Resolve from authorized context; ask the user when multiple targets are plausible."
+                    },
+                    "goal": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 16384,
+                        "description": "The user's request in their own words, including the capability they want created or improved."
+                    }
+                },
+                "required": ["goal"]
+            }
+        }
+    })
+}
+
 fn start_work_schema() -> Value {
     json!({
         "type": "function",
@@ -1295,6 +1325,7 @@ macro_rules! heap_schema_vec {
 
 fn all_tool_schemas_core() -> Vec<Value> {
     heap_schema_vec![
+        skill_creator_schema(),
         submit_task_resolution_schema(),
         start_work_schema(),
         run_next_work_item_schema(),
@@ -1633,6 +1664,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "properties": {
                         "action": {"type": "string", "enum": ["enter", "exit"]},
                         "branch": {"type": "string", "description": "New branch name; required for enter."},
+                        "source_commit": {"type": "string", "description": "Commit reference to start from; defaults to HEAD. Resolved once to a full commit ID before creation."},
                         "exit_action": {"type": "string", "enum": ["keep", "remove"], "description": "Keep or remove the worktree on exit; defaults to keep."},
                         "discard_changes": {"type": "boolean", "description": "Allow discarding changes when exiting with remove; defaults to false."}
                     },
@@ -2414,6 +2446,7 @@ mod tests {
             .expect("fresh schema construction must fit a default Tokio worker stack");
         assert!(find_schema(&schemas, "tool_search").is_some());
         assert!(find_schema(&schemas, "agent").is_some());
+        assert!(find_schema(&schemas, "skill_creator").is_some());
     }
 
     fn schema_names(schemas: &[Value]) -> Vec<&str> {

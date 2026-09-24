@@ -112,6 +112,13 @@ pub(super) async fn completions_handler(
     } else {
         astra_core::model_wire::purpose::ModelRequestPurpose::Chat
     };
+    let transport = crate::turn::llm::client::shared_llm_transport().map_err(|error| {
+        crate::error_response_coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error,
+            "llm_transport_unavailable",
+        )
+    })?;
 
     // 2. Admit one Offering. Explicit selections use the same catalog boundary
     // as durable chat runs; omission invokes the Server-owned default policy.
@@ -233,9 +240,9 @@ pub(super) async fn completions_handler(
     let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
     let parsed = durable_ledger
         .execute_nonstream(
-            &state.http_client,
             invocation_scope,
             crate::turn::llm::client::LlmCall {
+                transport: &transport,
                 purpose,
                 messages: &messages,
                 tools: &[],
@@ -504,6 +511,7 @@ mod tests {
                     } else {
                         4_096
                     }),
+                    pricing: None,
                     request_headers: (self.provider != "typesafe").then(|| {
                         serde_json::Map::from_iter([(
                             "x-offering-route".into(),

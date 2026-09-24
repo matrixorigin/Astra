@@ -1,6 +1,7 @@
 use astra_server_types::edge_ws_protocol::RuntimeProcessAuthorizationContext;
 use astra_tools::ToolResult;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 const MOI_RUNTIME_AUTHORIZATION_ENV: &str = "MOI_RUNTIME_AUTHORIZATION";
 
@@ -8,7 +9,7 @@ pub(crate) async fn execute_bash(
     executor: &astra_tools::executor::DefaultToolExecutor,
     args: &Value,
     context: &RuntimeProcessAuthorizationContext,
-    cancel: &tokio_util::sync::CancellationToken,
+    cancel: &CancellationToken,
 ) -> ToolResult {
     let environment = vec![(
         MOI_RUNTIME_AUTHORIZATION_ENV.to_string(),
@@ -45,7 +46,7 @@ mod tests {
             &executor,
             &json!({"command": "printf %s \"$MOI_RUNTIME_AUTHORIZATION\""}),
             &context,
-            &tokio_util::sync::CancellationToken::new(),
+            &CancellationToken::new(),
         )
         .await;
 

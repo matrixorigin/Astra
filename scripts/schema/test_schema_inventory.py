@@ -608,12 +608,8 @@ fn char_literal() { let slash = '/'; }
             "skill_metrics",
             "skill_selection_events",
             "skill_installations",
-            "skill_settings",
-            "skill_resource_bindings",
-            "skill_user_credentials",
             "user_skill_sources",
             "user_skill_versions",
-            "user_skill_evaluations",
             "agent_agents",
             "agent_bindings",
         }
@@ -654,28 +650,12 @@ fn char_literal() { let slash = '/'; }
             self.tables["skill_installations"]["merge_guidance"],
         )
         self.assertIn(
-            "different secrecy and lookup semantics",
-            self.tables["skill_settings"]["merge_guidance"],
-        )
-        self.assertIn(
-            "external resources",
-            self.tables["skill_resource_bindings"]["merge_guidance"],
-        )
-        self.assertIn(
-            "encrypted user secrets",
-            self.tables["skill_user_credentials"]["merge_guidance"],
-        )
-        self.assertIn(
             "source owns authoring identity",
             self.tables["user_skill_sources"]["merge_guidance"],
         )
         self.assertIn(
             "authoring/version content",
             self.tables["user_skill_versions"]["merge_guidance"],
-        )
-        self.assertIn(
-            "run-linked review facts",
-            self.tables["user_skill_evaluations"]["merge_guidance"],
         )
         self.assertIn(
             "user-owned agent definitions",
@@ -778,7 +758,6 @@ fn char_literal() { let slash = '/'; }
             "ctx_decision_audits",
             "ctx_snapshots",
             "eval_calibration_assessments",
-            "eval_gate_results",
             "eval_quality_assessments",
             "eval_training_datasets",
             "eval_user_feedback",
@@ -842,10 +821,7 @@ fn char_literal() { let slash = '/'; }
             "capture model/routing decisions",
             self.tables["ctx_decision_audits"]["merge_guidance"],
         )
-        self.assertIn(
-            "change-level release decisions",
-            self.tables["eval_gate_results"]["merge_guidance"],
-        )
+        self.assertNotIn("eval_gate_results", self.tables)
         self.assertIn(
             "target-level assessment state",
             self.tables["eval_quality_assessments"]["merge_guidance"],

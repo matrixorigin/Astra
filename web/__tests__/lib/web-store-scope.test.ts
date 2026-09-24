@@ -2,6 +2,8 @@ vi.mock("@/lib/runtime-config", () => ({
   getRuntimeConfig: vi.fn(),
 }));
 
+import { NextRequest } from "next/server";
+import { POST as createEmptySession } from "@/app/api/sessions/route";
 import {
   createChatWithMessage,
   getChatHydrated,
@@ -118,6 +120,33 @@ describe("web store user scoping", () => {
         201,
       ),
     );
+  });
+
+  it("hydrates a new Skill session through the ordinary Web chat route after process state is lost", async () => {
+    let persisted: ReturnType<typeof runtimeSession> | undefined;
+    globalThis.fetch = vi.fn().mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      if (init?.method === "POST" && url.pathname.endsWith("/sessions")) {
+        const body = JSON.parse(init.body);
+        persisted = { ...runtimeSession("skill-session", "user-a", body.title), metadata: body.metadata };
+        return jsonResponse(persisted, 201);
+      }
+      if (url.pathname.endsWith("/sessions")) return jsonResponse(runtimeSessionList(persisted ? [persisted] : []));
+      if (url.pathname.endsWith("/runs")) return jsonResponse(runtimeRunList([]));
+      if (url.pathname.endsWith("/transcript")) return jsonResponse(runtimeTranscript());
+      throw new Error(`Unexpected request: ${url.pathname}`);
+    });
+    const response = await createEmptySession(new NextRequest("http://web.test/api/sessions", {
+      method: "POST", body: JSON.stringify({ title: "Use review" }),
+    }));
+    expect(response.status).toBe(201);
+    expect(persisted?.metadata.source).toBe("web_v1");
+    globalThis.__astraWebStores = undefined;
+    const chat = await getChatHydrated("user-a", "skill-session");
+    expect(chat?.chat.id).toBe("skill-session");
+    expect(chat?.session?.backendSessionId).toBe("skill-session");
+    expect(chat?.messages).toEqual([]);
+    expect(chat?.pendingTurn).toBeUndefined();
   });
 
   it("keeps transcript and chat ordering unchanged when replay repairs graph facts", () => {

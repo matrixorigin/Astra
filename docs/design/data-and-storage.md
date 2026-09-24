@@ -38,7 +38,7 @@ published only after schema validation succeeds.
 
 ## Transcript persistence
 
-Fresh schema contract `2026-09-22-v89` stores transcript items and their
+Fresh schema contract `2026-09-22-v91` stores transcript items and their
 committed projection head. Physical page metadata and the unused source event
 position column are removed. The run lookup index is `(user_id, run_id)`.
 There is no migration, replacement table, page cache, or rebuild job.
@@ -51,8 +51,8 @@ no SQL; all-replay append does not allocate a sequence. New identities use one
 lazy `MAX(item_seq)` under the owner/session lock. Membership and insert batches
 are limited by bind count and payload bytes; an indivisible oversized item is
 sent alone. Database column equality determines duplicate identities within
-and across batches. First occurrence wins; equal content under distinct IDs
-remains distinct. All chunks and enclosing event capture roll back together.
+and across batches. Identical replays reuse the first occurrence; a changed run, role, or content
+for the same identity is rejected. Equal content under distinct IDs remains distinct. All chunks and enclosing event capture roll back together.
 
 Item content hashes, per-item canonical commitment fields, contiguous committed
 projection heads, and authoritative terminal replay verification remain

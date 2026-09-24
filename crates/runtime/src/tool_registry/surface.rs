@@ -472,6 +472,10 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
             &["skill_name", "task"][..],
             "Run a listed skill before substantive work.",
         ),
+        "skill_creator" => (
+            &["goal"][..],
+            "Create or improve a private Skill candidate and report its evaluation status.",
+        ),
         "tool_search" => (
             &["query"][..],
             "Select deferred tools explicitly with select:NAME or select:NAME1,NAME2.",

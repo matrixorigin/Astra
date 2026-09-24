@@ -1251,7 +1251,12 @@ mod tests {
     #[test]
     fn scenario_full_pipeline_bounds_context() {
         let msgs = build_long_conversation(30, 2500);
-        let budget = crate::prompts::budget_for_model(Some("gpt-4o"));
+        let budget = crate::turn::execution_config::resolve_context_budget(
+            &astra_config::RuntimeConfig::default(),
+            Some(200_000),
+            Some(32_000),
+            crate::prompts::CompactConfig::default(),
+        );
         let budget_chars = budget.effective_input_limit() * 4;
 
         // Step 1: micro-compact

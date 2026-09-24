@@ -33,9 +33,8 @@ pub use astra_skills::{
     activation, arguments, composition, hooks, loader, manifest, pack, quality, traits, version,
 };
 
-// Re-export providers - note: BundledSkillProvider comes from both places,
-// but we populate it with dynamic_skills here in runtime.
-pub use astra_skills::providers::{bundled, local, mcp};
+// Re-export the provider implementations used by runtime composition.
+pub use astra_skills::providers::{local, mcp};
 
 // Runtime-specific modules that depend on astra-services or other runtime types.
 pub mod catalog;
@@ -49,12 +48,11 @@ pub use handlers::*;
 // Re-export key framework types for convenience.
 pub use astra_skills::composition::{CompositionContext, CompositionError};
 pub use astra_skills::manifest::{ExecutionContext, LoadedSkill, SkillManifest, SkillSourceKind};
-pub use astra_skills::providers::{BundledSkillProvider, LocalSkillProvider, McpSkillProvider};
+pub use astra_skills::providers::{LocalSkillProvider, McpSkillProvider};
 pub use astra_skills::quality::{SkillOutcome, SkillQualityEntry, SkillQualityTracker};
 pub use astra_skills::traits::{SkillError, SkillExecutor, SkillProvider, SkillResolver};
 pub use astra_skills::version::{Dependency, Version, VersionConstraint};
 
-pub use astra_skills::improvement::{ImprovementProposal, ImprovementTracker, SkillImprovement};
 pub use astra_skills::providers::DatabaseSkillProvider;
 pub use astra_skills::verify::SkillVerifier;
 pub use registry::{
@@ -71,7 +69,7 @@ pub fn empty_unified_registry() -> &'static std::sync::Arc<UnifiedSkillRegistry>
 }
 
 /// Returns a shared reference to a default `UnifiedSkillRegistry` populated
-/// with Local and Bundled providers. Eagerly discovers skills on first call.
+/// with the local filesystem provider. Eagerly discovers skills on first call.
 ///
 /// Use this for all CLI entry points (one-shot message, exec, /review, etc.)
 /// so they see the same skills as the interactive REPL.
@@ -81,7 +79,6 @@ pub fn default_unified_registry() -> &'static std::sync::Arc<UnifiedSkillRegistr
     DEFAULT.get_or_init(|| {
         let mut registry = UnifiedSkillRegistry::new();
         registry.add_provider(Box::new(LocalSkillProvider::standard()));
-        registry.add_provider(Box::new(BundledSkillProvider::with_defaults()));
         let registry = std::sync::Arc::new(registry);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let r = registry.clone();

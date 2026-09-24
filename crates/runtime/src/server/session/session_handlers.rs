@@ -1818,6 +1818,19 @@ pub(crate) async fn close_session_handler(
 ) -> Result<Json<SessionResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let owner_id = user.user_id.clone();
+    let evaluation_session = match state.shared_pool.as_ref() {
+        Some(pool) => astra_services::evaluation::DatabaseEvaluationPlanStore::new(pool.clone())
+            .session_has_bound_trial(&owner_id, &session_id)
+            .await
+            .map_err(|error| {
+                internal_error(format!(
+                    "check evaluation session retention failed: {error}"
+                ))
+            })?,
+        // A missing durable pool cannot prove that this is an ordinary
+        // session, so do not launch destructive close governance.
+        None => true,
+    };
     let session = state
         .session_service
         .update_session(
@@ -1832,7 +1845,9 @@ pub(crate) async fn close_session_handler(
         )
         .await?;
     astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
-    schedule_session_end_governance(&state, owner_id, session_id);
+    if !evaluation_session {
+        schedule_session_end_governance(&state, owner_id, session_id);
+    }
     Ok(Json(SessionResponse::from(session)))
 }
 

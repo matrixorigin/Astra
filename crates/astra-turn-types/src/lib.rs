@@ -7,18 +7,20 @@ mod agent_communication;
 mod agent_transcript_evidence;
 mod agent_transcript_location;
 mod artifact_publication;
+pub mod auxiliary_execution;
 pub use artifact_publication::{ArtifactPublicationResult, ArtifactPublicationV1};
 mod judgment;
 pub use judgment::{
     JudgmentAnswer, JudgmentCodecError, JudgmentQuestion, JudgmentRequest, JudgmentResponse,
-    JudgmentResponseProvenance, NormalizedJudgmentResponse, NoulCriteria, judgment_messages,
-    judgment_request_from_messages, normalize_judgment_response,
-    output_budget_exceeds_completion_cap,
+    JudgmentResponseProvenance, NormalizedJudgmentResponse, NoulCriteria,
+    TYPED_JUDGMENT_SYSTEM_PROMPT, judgment_messages, judgment_request_from_messages,
+    normalize_judgment_response, output_budget_exceeds_completion_cap,
 };
 mod canonical_tool_pairing;
 mod completion_settlement;
 #[doc(hidden)]
 pub use completion_settlement::deserialize_required_option;
+pub mod context_execution;
 mod context_identity;
 mod context_window;
 mod deferred_tool;
@@ -29,10 +31,13 @@ mod explain_analyze_projection;
 mod explain_wire;
 pub use explain_wire::decode_explain_analyze_wire;
 mod inference;
+mod llm_transport;
+pub use llm_transport::{LLM_TRANSPORT_POLICY_VERSION, LlmTransportConfig};
 mod memory_ranking;
 mod memory_structure;
 mod permission_mode;
 pub use permission_mode::{ChildPermissionMode, ManualApprovalPolicy, PermissionMode};
+pub mod prompt_sections;
 mod provider_canonical_transition;
 mod provider_contract;
 mod recovery_point;
@@ -48,7 +53,10 @@ pub mod session_facts;
 mod session_fork;
 mod session_handoff;
 mod stop_hooks;
+pub mod summary_prompts;
 pub mod task_resolution;
+mod thinking_config;
+pub use thinking_config::{ThinkingConfig, ThinkingEffort, TurnComplexitySignals};
 pub mod token_estimate;
 mod tool_idempotency;
 mod tool_invocation;

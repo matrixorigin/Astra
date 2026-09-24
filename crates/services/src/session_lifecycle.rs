@@ -54,16 +54,6 @@ const COMPLETE_SESSION_DELETE_FENCE_SQL: &str = "UPDATE agent_session_lifecycle_
      WHERE session_id = ? AND user_id = ?
        AND delete_requested_at IS NOT NULL";
 
-const SESSION_DELETE_DERIVED_FROM_AGENT_RUNS: &[SessionDeleteStatement] =
-    &[SessionDeleteStatement {
-        label: "user_skill_evaluations",
-        sql: "DELETE FROM user_skill_evaluations
-             WHERE (owner_user_id, run_id) IN (
-                 SELECT user_id, run_id FROM agent_runs
-                 WHERE session_id = ? AND user_id = ?
-             )",
-    }];
-
 const SESSION_DELETE_AGENT_EVENT_EDGES_SQL: &str = "DELETE FROM agent_event_edges
          WHERE session_id = ? AND user_id = ?
          ORDER BY child_event_id ASC, parent_event_id ASC, relation_kind ASC
@@ -984,6 +974,7 @@ pub(crate) async fn hard_delete_session_rows(
         })?;
 
     ensure_no_live_work_recovery_points(tx, session_id, user_id).await?;
+    ensure_evaluation_evidence_retained(tx, session_id, user_id).await?;
 
     // Inference settlement takes locks in invocation -> child-row order.
     // Acquire every invocation lock before deleting settlement debts or
@@ -1009,18 +1000,6 @@ pub(crate) async fn hard_delete_session_rows(
         .fetch_all(&mut **tx)
         .await
         .map_err(|source| format!("delete_session.lock_agent_runs: {source}"))?;
-
-    for statement in SESSION_DELETE_DERIVED_FROM_AGENT_RUNS {
-        let rows_deleted = delete_session_rows_session_user(
-            tx,
-            statement.label,
-            statement.sql,
-            session_id,
-            user_id,
-        )
-        .await?;
-        record_table_delete(&mut outcome, statement.label, rows_deleted)?;
-    }
 
     let rows_deleted = delete_session_rows_session_user_batched(
         tx,
@@ -1349,6 +1328,7 @@ async fn mark_session_deleting(
     .map_err(|source| format!("delete_session.mark_deleting.lock_fence: {source}"))?;
 
     ensure_no_live_work_recovery_points(&mut tx, session_id, user_id).await?;
+    ensure_evaluation_evidence_retained(&mut tx, session_id, user_id).await?;
 
     let result = query(MARK_SESSION_DELETING_SQL)
         .bind(session_id)
@@ -1444,6 +1424,31 @@ async fn ensure_no_live_work_recovery_points(
             "delete_session.recovery_point_retained: Work {work_id} has saved progress {recovery_point_id} on alternative branch {branch_id}; open Work {work_id} and delete that branch to release the saved progress, then retry deleting this Session"
         ))
     }
+}
+
+async fn ensure_evaluation_evidence_retained(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    session_id: &str,
+    user_id: &str,
+) -> Result<(), String> {
+    // The caller holds the same Session fence used by atomic Run/trial start.
+    // A locking read observes a binding committed while waiting for that fence.
+    let retained: Option<String> = query_scalar(
+        "SELECT experiment_id FROM evaluation_trial_bindings
+         WHERE owner_user_id = ? AND session_id = ? AND binding_status = 'bound'
+         LIMIT 1 FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|source| format!("delete_session.check_evaluation_evidence: {source}"))?;
+    if let Some(experiment_id) = retained {
+        return Err(format!(
+            "delete_session.evaluation_evidence_retained: session retains evaluation experiment {experiment_id}; cancel active trials, then DELETE /evaluation/experiments/{experiment_id} before deleting the Session"
+        ));
+    }
+    Ok(())
 }
 
 async fn lock_session_artifact_content_rows(
@@ -1975,7 +1980,6 @@ mod tests {
     #[test]
     fn session_delete_statements_are_owner_scoped() {
         for group in [
-            SESSION_DELETE_DERIVED_FROM_AGENT_RUNS,
             SESSION_DELETE_SESSION_ORIGIN_TABLES,
             SESSION_DELETE_DERIVED_PARENT_TABLES,
             SESSION_DELETE_DIRECT_TABLES,

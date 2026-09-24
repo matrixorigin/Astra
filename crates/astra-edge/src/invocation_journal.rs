@@ -125,6 +125,12 @@ impl DurableEdgeResult {
     }
 }
 
+pub(crate) struct InvocationPayload<'a> {
+    pub tool: &'a str,
+    pub args: &'a Value,
+    pub allocation: Option<&'a astra_runtime_env::EvaluationAllocationReceipt>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DurableInvocationRecord {
     identity: ToolInvocationIdentity,
@@ -138,17 +144,19 @@ struct DurableInvocationRecord {
     execution_generation: Option<u64>,
     tool: String,
     canonical_arguments_hash: String,
+    evaluation_allocation: Option<astra_runtime_env::EvaluationAllocationReceipt>,
     state: DurableState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     result: Option<DurableEdgeResult>,
 }
 
 impl DurableInvocationRecord {
-    fn matches(&self, identity: &ToolInvocationIdentity, tool: &str, args: &Value) -> bool {
+    fn matches(&self, identity: &ToolInvocationIdentity, payload: &InvocationPayload<'_>) -> bool {
         self.identity == *identity
-            && self.tool == tool
+            && self.tool == payload.tool
+            && self.evaluation_allocation.as_ref() == payload.allocation
             && self.canonical_arguments_hash
-                == astra_turn_types::canonical_public_arguments_hash(args)
+                == astra_turn_types::canonical_public_arguments_hash(payload.args)
     }
 }
 
@@ -404,8 +412,7 @@ impl EdgeInvocationJournal {
         request_id: &str,
         identity: &ToolInvocationIdentity,
         delivery_generation: u64,
-        tool: &str,
-        args: &Value,
+        payload: InvocationPayload<'_>,
         execution_capacity_available: bool,
     ) -> Result<PrepareOutcome, JournalError> {
         if request_id != identity.storage_key() {
@@ -422,7 +429,7 @@ impl EdgeInvocationJournal {
             return Err(JournalError::TooLarge);
         }
         if let Some(mut record) = self.state.records.get(request_id).cloned() {
-            if !record.matches(identity, tool, args) {
+            if !record.matches(identity, &payload) {
                 return Err(JournalError::IdentityConflict {
                     request_id: request_id.to_string(),
                 });
@@ -446,8 +453,11 @@ impl EdgeInvocationJournal {
             identity: identity.clone(),
             delivery_generation,
             execution_generation: execution_capacity_available.then_some(delivery_generation),
-            tool: tool.to_string(),
-            canonical_arguments_hash: astra_turn_types::canonical_public_arguments_hash(args),
+            tool: payload.tool.to_string(),
+            canonical_arguments_hash: astra_turn_types::canonical_public_arguments_hash(
+                payload.args,
+            ),
+            evaluation_allocation: payload.allocation.cloned(),
             state: if execution_capacity_available {
                 DurableState::Running
             } else {
@@ -934,6 +944,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn allocation_binding_survives_restart_and_rejects_cross_workspace_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.json");
+        let identity = identity("allocated-call");
+        let request_id = identity.storage_key();
+        let args = json!({"path":"a"});
+        let allocation = astra_runtime_env::EvaluationAllocationReceipt {
+            schema_version: 1,
+            allocation_id: "allocation-a".into(),
+            owner_user_id: "user".into(),
+            session_id: "session".into(),
+            run_id: "run".into(),
+            deployment_id: "deployment".into(),
+            materialization_id: "materialization".into(),
+            workspace_dir: "/workspace".into(),
+            source_commit: "a".repeat(40),
+            source_tree: "b".repeat(40),
+            confinement_fingerprint: format!("sha256:{}", "c".repeat(64)),
+        };
+        allocation.validate().unwrap();
+        let mut replacement = allocation.clone();
+        replacement.allocation_id = "allocation-b".into();
+        let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
+        assert!(matches!(
+            journal
+                .prepare(
+                    &request_id,
+                    &identity,
+                    1,
+                    InvocationPayload {
+                        tool: "read_file",
+                        args: &args,
+                        allocation: Some(&allocation)
+                    },
+                    true
+                )
+                .await
+                .unwrap(),
+            PrepareOutcome::Execute
+        ));
+        for expected in [None, Some(&replacement)] {
+            assert!(
+                journal
+                    .prepare(
+                        &request_id,
+                        &identity,
+                        2,
+                        InvocationPayload {
+                            tool: "read_file",
+                            args: &args,
+                            allocation: expected
+                        },
+                        true
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        journal
+            .complete(
+                &request_id,
+                1,
+                DurableEdgeResult {
+                    output: "original workspace".into(),
+                    is_error: false,
+                    duration_ms: 1,
+                    tool_result_fields: None,
+                },
+            )
+            .await
+            .unwrap();
+        drop(journal);
+        let mut restored = EdgeInvocationJournal::open(path).await.unwrap();
+        for expected in [None, Some(&replacement)] {
+            assert!(
+                restored
+                    .prepare(
+                        &request_id,
+                        &identity,
+                        2,
+                        InvocationPayload {
+                            tool: "read_file",
+                            args: &args,
+                            allocation: expected
+                        },
+                        true
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(matches!(
+            restored
+                .prepare(
+                    &request_id,
+                    &identity,
+                    2,
+                    InvocationPayload {
+                        tool: "read_file",
+                        args: &args,
+                        allocation: Some(&allocation)
+                    },
+                    true
+                )
+                .await
+                .unwrap(),
+            PrepareOutcome::Replay(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn full_wire_budget_bounds_results_and_replays_until_ack() {
         for output in [
             "x".repeat(262_000),
@@ -946,7 +1067,17 @@ mod tests {
             let id = identity.storage_key();
             let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
             journal
-                .prepare(&id, &identity, 1, "bash", &json!({}), true)
+                .prepare(
+                    &id,
+                    &identity,
+                    1,
+                    InvocationPayload {
+                        tool: "bash",
+                        args: &json!({}),
+                        allocation: None,
+                    },
+                    true,
+                )
                 .await
                 .unwrap();
             let result = journal
@@ -974,7 +1105,17 @@ mod tests {
             let mut restored = EdgeInvocationJournal::open(path).await.unwrap();
             assert!(matches!(
                 restored
-                    .prepare(&id, &identity, u64::MAX, "bash", &json!({}), true)
+                    .prepare(
+                        &id,
+                        &identity,
+                        u64::MAX,
+                        InvocationPayload {
+                            tool: "bash",
+                            args: &json!({}),
+                            allocation: None
+                        },
+                        true
+                    )
                     .await
                     .unwrap(),
                 PrepareOutcome::Replay(_)
@@ -1013,7 +1154,17 @@ mod tests {
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         assert!(matches!(
             journal
-                .prepare(&id, &identity, 1, "bash", &args, true)
+                .prepare(
+                    &id,
+                    &identity,
+                    1,
+                    InvocationPayload {
+                        tool: "bash",
+                        args: &args,
+                        allocation: None
+                    },
+                    true
+                )
                 .await
                 .unwrap(),
             PrepareOutcome::Execute
@@ -1033,7 +1184,17 @@ mod tests {
         // Increasing the generation expands the envelope even when the result
         // body is unchanged. Bound and persist the new envelope before replay.
         let PrepareOutcome::Replay(bounded) = journal
-            .prepare(&id, &identity, u64::MAX, "bash", &args, true)
+            .prepare(
+                &id,
+                &identity,
+                u64::MAX,
+                InvocationPayload {
+                    tool: "bash",
+                    args: &args,
+                    allocation: None,
+                },
+                true,
+            )
             .await
             .unwrap()
         else {
@@ -1080,6 +1241,7 @@ mod tests {
             execution_generation: Some(1),
             tool: "bash".into(),
             canonical_arguments_hash: astra_turn_types::canonical_public_arguments_hash(&json!({})),
+            evaluation_allocation: None,
             state: DurableState::CompletedAwaitingAck,
             result: Some(result),
         };
@@ -1110,8 +1272,11 @@ mod tests {
                     &identity.storage_key(),
                     &identity,
                     1,
-                    "bash",
-                    &json!({}),
+                    InvocationPayload {
+                        tool: "bash",
+                        args: &json!({}),
+                        allocation: None
+                    },
                     true
                 )
                 .await,
@@ -1133,9 +1298,12 @@ mod tests {
                     &request_id,
                     &identity,
                     7,
-                    "read_file",
-                    &json!({"path":"a"}),
-                    true,
+                    InvocationPayload {
+                        tool: "read_file",
+                        args: &json!({"path":"a"}),
+                        allocation: None
+                    },
+                    true
                 )
                 .await
                 .unwrap(),
@@ -1177,14 +1345,34 @@ mod tests {
             .unwrap();
         assert!(matches!(
             journal
-                .prepare(&request_id, &identity, 4, "bash", &args, true)
+                .prepare(
+                    &request_id,
+                    &identity,
+                    4,
+                    InvocationPayload {
+                        tool: "bash",
+                        args: &args,
+                        allocation: None
+                    },
+                    true
+                )
                 .await
                 .unwrap(),
             PrepareOutcome::Execute
         ));
         assert!(matches!(
             journal
-                .prepare(&request_id, &identity, 5, "bash", &args, true)
+                .prepare(
+                    &request_id,
+                    &identity,
+                    5,
+                    InvocationPayload {
+                        tool: "bash",
+                        args: &args,
+                        allocation: None
+                    },
+                    true
+                )
                 .await
                 .unwrap(),
             PrepareOutcome::Active
@@ -1222,7 +1410,17 @@ mod tests {
         let args = json!({"command":"effect"});
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         journal
-            .prepare(&request_id, &identity, 4, "bash", &args, true)
+            .prepare(
+                &request_id,
+                &identity,
+                4,
+                InvocationPayload {
+                    tool: "bash",
+                    args: &args,
+                    allocation: None,
+                },
+                true,
+            )
             .await
             .unwrap();
         drop(journal);
@@ -1237,7 +1435,17 @@ mod tests {
         );
         assert!(matches!(
             restored
-                .prepare(&request_id, &identity, 5, "bash", &args, true)
+                .prepare(
+                    &request_id,
+                    &identity,
+                    5,
+                    InvocationPayload {
+                        tool: "bash",
+                        args: &args,
+                        allocation: None
+                    },
+                    true
+                )
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
@@ -1254,7 +1462,17 @@ mod tests {
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         assert!(matches!(
             journal
-                .prepare(&request_id, &identity, 4, "bash", &args, false)
+                .prepare(
+                    &request_id,
+                    &identity,
+                    4,
+                    InvocationPayload {
+                        tool: "bash",
+                        args: &args,
+                        allocation: None
+                    },
+                    false
+                )
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
@@ -1270,7 +1488,17 @@ mod tests {
         );
         assert!(matches!(
             restored
-                .prepare(&request_id, &identity, 5, "bash", &args, true)
+                .prepare(
+                    &request_id,
+                    &identity,
+                    5,
+                    InvocationPayload {
+                        tool: "bash",
+                        args: &args,
+                        allocation: None
+                    },
+                    true
+                )
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
@@ -1287,7 +1515,17 @@ mod tests {
         let args = json!({"path":"a"});
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         journal
-            .prepare(&request_id, &identity, 1, "read_file", &args, false)
+            .prepare(
+                &request_id,
+                &identity,
+                1,
+                InvocationPayload {
+                    tool: "read_file",
+                    args: &args,
+                    allocation: None,
+                },
+                false,
+            )
             .await
             .unwrap();
         drop(journal);
@@ -1308,7 +1546,17 @@ mod tests {
         );
         assert!(matches!(
             restored
-                .prepare(&request_id, &identity, 2, "read_file", &args, true)
+                .prepare(
+                    &request_id,
+                    &identity,
+                    2,
+                    InvocationPayload {
+                        tool: "read_file",
+                        args: &args,
+                        allocation: None
+                    },
+                    true
+                )
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
@@ -1328,8 +1576,11 @@ mod tests {
                 &request_id,
                 &identity,
                 1,
-                "read_file",
-                &json!({"path":"a"}),
+                InvocationPayload {
+                    tool: "read_file",
+                    args: &json!({"path":"a"}),
+                    allocation: None,
+                },
                 true,
             )
             .await
@@ -1369,8 +1620,11 @@ mod tests {
                 &request_id,
                 &identity,
                 1,
-                "bash",
-                &json!({"command":"a"}),
+                InvocationPayload {
+                    tool: "bash",
+                    args: &json!({"command":"a"}),
+                    allocation: None,
+                },
                 true,
             )
             .await
@@ -1380,8 +1634,11 @@ mod tests {
                 &request_id,
                 &identity,
                 2,
-                "bash",
-                &json!({"command":"b"}),
+                InvocationPayload {
+                    tool: "bash",
+                    args: &json!({"command":"b"}),
+                    allocation: None,
+                },
                 true,
             )
             .await

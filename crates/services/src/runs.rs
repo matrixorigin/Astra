@@ -1,4 +1,9 @@
+mod action_history;
 mod permission_control;
+pub use action_history::{
+    RunActionHistoryError, VerifiedRunActionGrant, VerifiedRunActionHistory,
+    load_verified_run_action_history_in_transaction,
+};
 use astra_core::{
     ErrorResponse, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_FAILED,
     STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING, SharedPool, SubRunState, error_response,
@@ -54,8 +59,29 @@ pub fn is_run_lifecycle_unconfigured_error(status: StatusCode, error: &ErrorResp
         && error.error_code.as_deref() == Some(RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvaluationObservationRepairOutcome {
+    Ready,
+    NotReady,
+    NotEvaluation,
+}
+
 #[async_trait]
 pub trait RunLifecycleService: Send + Sync {
+    /// Repair terminal Evaluation evidence without starting or resuming a Run.
+    async fn repair_evaluation_observation(
+        &self,
+        _owner_user_id: &str,
+        _trial_id: &str,
+        _run_id: &str,
+        _session_id: &str,
+    ) -> Result<EvaluationObservationRepairOutcome, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Evaluation observation repair is unavailable",
+        ))
+    }
+
     async fn request_permission_mode(
         &self,
         _user_id: String,
@@ -872,6 +898,7 @@ pub struct WorkItemRuntimeBindingRequest {
 pub enum RunStartIdempotencyKind {
     ProviderTask,
     WorkTurn,
+    EvaluationTrial,
 }
 
 /// Selects who owns model choice for one internal run-start request.
@@ -977,6 +1004,10 @@ pub struct ChatRequestData {
     pub session_admission_facts: Option<SessionAdmissionFacts>,
     pub work_binding: Option<WorkRuntimeBindingRequest>,
     pub run_start_idempotency: Option<RunStartIdempotency>,
+    /// Trusted metadata for a generic evaluation trial.  It is injected by
+    /// the evaluation entrypoint and never deserialized from ordinary chat
+    /// transports or added to the model prompt.
+    pub evaluation_admission: Option<crate::evaluation::EvaluationRunAdmission>,
     pub full_llm_capture: bool,
     pub agent_id: Option<String>,
     pub model: Option<String>,
@@ -1007,6 +1038,10 @@ pub struct ChatRequestData {
     pub runtime_mcp_bindings: Vec<RuntimeMcpBindingRequest>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
     pub edge_executor_id: Option<String>,
+    /// Server-generated base root used to prove that a per-trial evaluation
+    /// clone belongs to the selected native Edge materialization. It is
+    /// never accepted from HTTP or serialized as user input.
+    pub evaluation_workspace_base_root: Option<String>,
     pub capabilities: Vec<String>,
     pub forward_headers: std::collections::HashMap<String, String>,
     pub provider_run_owner: Option<ProviderRunOwner>,
@@ -1068,6 +1103,13 @@ impl std::fmt::Debug for ChatRequestData {
             )
             .field("work_binding", &self.work_binding)
             .field("run_start_idempotency", &self.run_start_idempotency)
+            .field(
+                "evaluation_admission",
+                &self
+                    .evaluation_admission
+                    .as_ref()
+                    .map(|admission| (&admission.experiment_id, &admission.trial_id)),
+            )
             .field("agent_id", &self.agent_id)
             .field("model", &self.model)
             .field("model_selection_mode", &self.model_selection_mode)
@@ -1096,6 +1138,10 @@ impl std::fmt::Debug for ChatRequestData {
             .field("runtime_mcp_bindings", &self.runtime_mcp_bindings)
             .field("context", &self.context)
             .field("edge_executor_id", &self.edge_executor_id)
+            .field(
+                "evaluation_workspace_base_root",
+                &self.evaluation_workspace_base_root,
+            )
             .field("capabilities", &self.capabilities)
             .field("provider_run_owner", &self.provider_run_owner)
             .field(
@@ -1613,6 +1659,91 @@ pub struct ExecutionHandoffRecovery {
     pub producer_generation: u64,
     pub claimed_from_generation: u64,
     pub recovered_generation: u64,
+}
+
+/// Ownership transfer committed by the canonical recovery claim, independent
+/// of whether this Run has an execution-handoff checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunRecoveryCustody {
+    user_id: String,
+    session_id: String,
+    run_id: String,
+    from_generation: u64,
+    to_generation: u64,
+}
+
+impl RunRecoveryCustody {
+    fn for_claim(run: &DurableRunRecord, from_generation: u64) -> Self {
+        Self {
+            user_id: run.user_id.clone(),
+            session_id: run.session_id.clone(),
+            run_id: run.run_id.clone(),
+            from_generation,
+            to_generation: from_generation + 1,
+        }
+    }
+
+    fn event(&self) -> serde_json::Value {
+        serde_json::json!({
+            "event_type": "run_recovery_claimed",
+            "idempotency_key": format!("run-recovery-claimed:{}", self.to_generation),
+            "data": self,
+        })
+    }
+}
+
+/// Recovery can prove failure or cancellation, never successful execution or
+/// complete usage. The event remains part of the ordinary status transaction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RunRecoveryTerminalOutcome {
+    Failed,
+    Cancelled {
+        cancellation_origin: DurableCancellationOrigin,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunRecoveryTerminal {
+    pub user_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub owner_generation: u64,
+    #[serde(flatten)]
+    pub outcome: RunRecoveryTerminalOutcome,
+}
+
+impl RunRecoveryTerminal {
+    pub fn event(&self) -> serde_json::Value {
+        let mut data = serde_json::to_value(self).expect("recovery terminal is serializable");
+        data["source"] = serde_json::json!("crash_recovery");
+        match self.outcome {
+            RunRecoveryTerminalOutcome::Failed => {
+                data["error"] = serde_json::json!("recovered from crash");
+                data["error_code"] = serde_json::json!("crash_recovery");
+                data["error_kind"] = serde_json::json!("crash_recovery");
+            }
+            RunRecoveryTerminalOutcome::Cancelled { .. } => {
+                data["cancelled"] = serde_json::json!(true);
+                data["reason"] = serde_json::json!("recovered durable cancellation control");
+            }
+        }
+        serde_json::json!({
+            "event_type": "run_finished",
+            "idempotency_key": format!("run-recovery-terminal:{}", self.owner_generation),
+            "data": data,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunRecoveryTerminalProof {
+    pub terminal_event_idx: i64,
+    pub terminal_event_id: String,
+    pub terminal_event_hash: String,
+    pub status: String,
+    pub generation: u64,
 }
 
 /// Checkpoint custody inherited atomically with a recovery ownership claim.
@@ -2563,7 +2694,8 @@ pub enum ExecutionOwnerCancellationOrigin {
 /// This type intentionally lives in the durable store layer so lineage
 /// control reads do not need to hydrate a run's complete event history or
 /// depend on runtime orchestration types.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DurableCancellationOrigin {
     User,
     Runtime,
@@ -2728,6 +2860,7 @@ pub enum AtomicRunGuidanceAdmission {
     Duplicate {
         event_index: i64,
     },
+    EvaluationFrozen,
     IdentityConflict,
     Inactive {
         status: String,
@@ -4515,6 +4648,51 @@ enum AtomicTerminalReturnPrefixResolution {
     Conflict(String),
 }
 
+fn decode_atomic_terminal_event_row(
+    row: sqlx::mysql::MySqlRow,
+    run_id: &str,
+) -> Result<AtomicTerminalEventRow, String> {
+    let event_idx = row.try_get::<i64, _>("event_idx").map_err(|source| {
+        db_error("decode_atomic_terminal_event_idx", run_id, source).to_string()
+    })?;
+    let event_type = row.try_get::<String, _>("event_type").map_err(|source| {
+        db_error("decode_atomic_terminal_event_type", run_id, source).to_string()
+    })?;
+    let event_id = row.try_get::<String, _>("event_id").map_err(|source| {
+        db_error("decode_atomic_terminal_event_id", run_id, source).to_string()
+    })?;
+    let idempotency_key = row
+        .try_get::<Option<String>, _>("idempotency_key")
+        .map_err(|source| {
+            db_error("decode_atomic_terminal_event_idempotency", run_id, source).to_string()
+        })?;
+    let event_hash = row.try_get::<String, _>("event_hash").map_err(|source| {
+        db_error("decode_atomic_terminal_event_hash", run_id, source).to_string()
+    })?;
+    let settlement_batch_id = row
+        .try_get::<Option<String>, _>("request_id")
+        .map_err(|source| {
+            db_error("decode_atomic_terminal_settlement_batch", run_id, source).to_string()
+        })?;
+    let payload_json = row.try_get::<String, _>("payload_json").map_err(|source| {
+        db_error("decode_atomic_terminal_event_payload", run_id, source).to_string()
+    })?;
+    let payload = serde_json::from_str(&payload_json).map_err(|error| {
+        format!("decode atomic terminal event payload for run {run_id}: {error}")
+    })?;
+    Ok((
+        AtomicRunTerminalEventReceipt {
+            event_idx,
+            event_type,
+            event_id,
+            idempotency_key,
+            event_hash,
+            settlement_batch_id,
+        },
+        payload,
+    ))
+}
+
 fn atomic_terminal_event_hash_is_valid(
     receipt: &AtomicRunTerminalEventReceipt,
     payload: &serde_json::Value,
@@ -4529,10 +4707,10 @@ fn atomic_terminal_settlement_batch_id(
     committed_events: &[serde_json::Value],
 ) -> Result<String, String> {
     let identity = serde_json::json!({
-        "contract": "astra.atomic_run_terminal_settlement.v1",
+        "contract": "astra.atomic_run_terminal_settlement.v2",
         "user_id": request.user_id,
         "run_id": request.run_id,
-        "expected_statuses": request.expected_statuses,
+        "session_id": request.expected_session_id,
         "owner_generation": request.expected_owner_generation,
         "status": request.status,
         "waiting_for": request.waiting_for,
@@ -4541,7 +4719,6 @@ fn atomic_terminal_settlement_batch_id(
         "completion_tokens": request.completion_tokens,
         "tool_calls": request.tool_calls,
         "first_event_idx": first_event_idx,
-        "request_event_count": request.events.len(),
         "committed_events": committed_events,
     });
     serde_json::to_vec(&identity)
@@ -4571,6 +4748,8 @@ fn validate_atomic_terminal_batch_identity(
     if rows.iter().enumerate().all(|(offset, (receipt, payload))| {
         receipt.event_idx == first_event_idx + offset as i64
             && receipt.settlement_batch_id.as_deref() == Some(expected_batch_id.as_str())
+            && receipt.event_type == extract_event_type(payload)
+            && receipt.idempotency_key == extract_optional_string(payload, "idempotency_key")
             && atomic_terminal_event_hash_is_valid(receipt, payload)
     }) {
         Ok(())
@@ -4631,6 +4810,9 @@ fn classify_atomic_run_terminal_facts(
     run: &DurableRunRecord,
     request: AtomicRunTerminalSettlementRequest<'_>,
 ) -> AtomicRunTerminalFactMatch {
+    if run.user_id != request.user_id || run.session_id != request.expected_session_id {
+        return AtomicRunTerminalFactMatch::Conflict("run owner or session mismatch");
+    }
     if run.run_generation != request.expected_owner_generation {
         return AtomicRunTerminalFactMatch::Conflict("run generation mismatch");
     }
@@ -4652,6 +4834,620 @@ fn classify_atomic_run_terminal_facts(
         return AtomicRunTerminalFactMatch::Conflict("terminal error code mismatch");
     }
     AtomicRunTerminalFactMatch::Exact
+}
+
+fn initial_evaluation_admission(
+    events: &[serde_json::Value],
+) -> Result<Option<crate::evaluation::EvaluationRunAdmission>, String> {
+    let mut admission = None;
+    for event in events {
+        let Some(value) = event.pointer("/data/evaluation_admission") else {
+            continue;
+        };
+        if extract_event_type(event) != "run_started" || admission.is_some() {
+            return Err(
+                "evaluation_trial_admission_invalid: expected one run_started admission".into(),
+            );
+        }
+        let parsed: crate::evaluation::EvaluationRunAdmission =
+            serde_json::from_value(value.clone())
+                .map_err(|error| format!("evaluation_trial_admission_invalid: {error}"))?;
+        parsed
+            .validate_shape()
+            .map_err(|error| format!("evaluation_trial_admission_invalid: {error}"))?;
+        admission = Some(parsed);
+    }
+    Ok(admission)
+}
+
+fn evaluation_run_admission_error(error: crate::evaluation::EvaluationPersistenceError) -> String {
+    use crate::evaluation::durable::{EvaluationPersistenceError, EvaluationProtocolBlock};
+    match error {
+        EvaluationPersistenceError::ProtocolBlocked(block) => match block {
+            EvaluationProtocolBlock::PrecedingTrialsUnbound =>
+                "evaluation_trial_order_blocked: preceding trials must be admitted first".into(),
+            EvaluationProtocolBlock::PairedPredecessorUnobserved { trial_id } =>
+                format!("evaluation_trial_order_blocked: paired first arm {trial_id} awaits terminal observation"),
+            EvaluationProtocolBlock::ConcurrencyLimit { .. } =>
+                "evaluation_trial_capacity_exhausted: experiment has no available admission capacity".into(),
+        },
+        EvaluationPersistenceError::Conflict(detail) => format!("evaluation_trial_binding_conflict: {detail}"),
+        EvaluationPersistenceError::InvalidInput(detail) | EvaluationPersistenceError::NotFound(detail) =>
+            format!("evaluation_trial_admission_invalid: {detail}"),
+        other => other.to_string(),
+    }
+}
+
+/// Validate recovery lineage and its failure/cancellation terminal cut while
+/// the caller owns the canonical observation transaction. The caller obtains
+/// the admission generation/index from its verified admission marker. No
+/// accounting is implied, and custody cannot authorize execution success.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn validate_run_recovery_terminal_in_transaction(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    admission_generation: u64,
+    terminal_generation: u64,
+    admission_event_idx: i64,
+) -> Result<Option<RunRecoveryTerminalProof>, RunProofReadError> {
+    let sql = format!(
+        "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
+        WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE"
+    );
+    let run = sqlx::query(&sql)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(RunProofReadError::Database)?
+        .map(run_record_from_row)
+        .transpose()
+        .map_err(|error| RunProofReadError::Integrity(error.to_string()))?;
+    let Some(run) = run else { return Ok(None) };
+    if run.run_generation != terminal_generation
+        || !matches!(run.status.as_str(), STATUS_FAILED | STATUS_CANCELLED)
+    {
+        return Ok(None);
+    }
+    if admission_generation >= terminal_generation || admission_event_idx < 0 {
+        return Err(RunProofReadError::Integrity(
+            "recovery proof requires an earlier admission generation and event".into(),
+        ));
+    }
+    let terminal_key = format!("run-recovery-terminal:{terminal_generation}");
+    let rows = sqlx::query(
+        "SELECT user_id, session_id, run_id, event_idx, event_type, event_id,
+                idempotency_key, event_hash, request_id, payload_json
+         FROM agent_run_events WHERE user_id = ? AND run_id = ?
+           AND event_idx > ? AND event_idx <= ?
+           AND (event_type = 'run_recovery_claimed'
+                OR idempotency_key LIKE 'run-recovery-claimed:%'
+                OR idempotency_key = ?)
+         ORDER BY event_idx ASC FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(run_id)
+    .bind(admission_event_idx)
+    .bind(run.last_event_idx)
+    .bind(terminal_key)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(RunProofReadError::Database)?;
+    let rows = rows
+        .into_iter()
+        .map(|row| {
+            if row
+                .try_get::<String, _>("user_id")
+                .map_err(|error| error.to_string())?
+                != user_id
+                || row
+                    .try_get::<String, _>("session_id")
+                    .map_err(|error| error.to_string())?
+                    != session_id
+                || row
+                    .try_get::<String, _>("run_id")
+                    .map_err(|error| error.to_string())?
+                    != run_id
+            {
+                return Err("recovery event does not belong to the canonical Run identity".into());
+            }
+            decode_atomic_terminal_event_row(row, run_id)
+        })
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(RunProofReadError::Integrity)?;
+    validate_run_recovery_terminal_rows(&run, admission_generation, admission_event_idx, &rows)
+        .map_err(RunProofReadError::Integrity)
+}
+
+fn validate_run_recovery_terminal_rows(
+    run: &DurableRunRecord,
+    admission_generation: u64,
+    admission_event_idx: i64,
+    rows: &[AtomicTerminalEventRow],
+) -> Result<Option<RunRecoveryTerminalProof>, String> {
+    let terminal_key = format!("run-recovery-terminal:{}", run.run_generation);
+    let Some((terminal_receipt, terminal_event)) = rows
+        .iter()
+        .find(|(receipt, _)| receipt.idempotency_key.as_deref() == Some(terminal_key.as_str()))
+    else {
+        return Ok(None);
+    };
+    let mut generation = admission_generation;
+    let mut previous_idx = admission_event_idx;
+    for (receipt, event) in rows {
+        if receipt.event_idx <= previous_idx
+            || receipt.event_idx > run.last_event_idx
+            || receipt.event_type != extract_event_type(event)
+            || receipt.idempotency_key != extract_optional_string(event, "idempotency_key")
+            || !atomic_terminal_event_hash_is_valid(receipt, event)
+        {
+            return Err("recovery event identity, order or hash mismatch".into());
+        }
+        if receipt.idempotency_key.as_deref() == Some(terminal_key.as_str()) {
+            if receipt.event_idx != terminal_receipt.event_idx || generation != run.run_generation {
+                return Err("recovery terminal has no complete preceding custody chain".into());
+            }
+        } else {
+            let custody: RunRecoveryCustody = serde_json::from_value(event["data"].clone())
+                .map_err(|error| format!("invalid recovery custody: {error}"))?;
+            if custody.user_id != run.user_id
+                || custody.session_id != run.session_id
+                || custody.run_id != run.run_id
+                || custody.from_generation != generation
+                || generation.checked_add(1) != Some(custody.to_generation)
+                || receipt.event_idx >= terminal_receipt.event_idx
+                || custody.event() != *event
+            {
+                return Err("recovery custody identity or generation chain mismatch".into());
+            }
+            generation = custody.to_generation;
+        }
+        previous_idx = receipt.event_idx;
+    }
+    let terminal: RunRecoveryTerminal = serde_json::from_value(terminal_event["data"].clone())
+        .map_err(|error| format!("invalid recovery terminal: {error}"))?;
+    if terminal.user_id != run.user_id
+        || terminal.session_id != run.session_id
+        || terminal.run_id != run.run_id
+        || terminal.owner_generation != run.run_generation
+        || terminal.event() != *terminal_event
+        || terminal_event
+            .pointer("/data/status")
+            .and_then(serde_json::Value::as_str)
+            != Some(run.status.as_str())
+        || run.waiting_for.is_some()
+        || terminal_event
+            .pointer("/data/error")
+            .and_then(serde_json::Value::as_str)
+            != run.error_message.as_deref()
+        || terminal_error_code_from_transition(
+            &run.status,
+            run.error_message.as_deref(),
+            std::slice::from_ref(terminal_event),
+        ) != run.error_code
+    {
+        return Err("recovery terminal does not match canonical Run facts".into());
+    }
+    Ok(Some(RunRecoveryTerminalProof {
+        terminal_event_idx: terminal_receipt.event_idx,
+        terminal_event_id: terminal_receipt.event_id.clone(),
+        terminal_event_hash: terminal_receipt.event_hash.clone(),
+        status: run.status.clone(),
+        generation: run.run_generation,
+    }))
+}
+
+/// Historical committed facts; never authorization to execute a Run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommittedTerminalProof {
+    pub settlement_batch_id: String,
+    pub terminal_event_idx: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunOutputProof {
+    pub receipt_event_idx: i64,
+    pub source_event_id: String,
+    pub content_hash: String,
+    pub content_bytes: u64,
+}
+
+/// A proof may be absent, but a failed read must retain its failure class.
+#[derive(Debug, Error)]
+pub enum RunProofReadError {
+    #[error("run proof database read failed: {0}")]
+    Database(#[source] sqlx::Error),
+    #[error("run proof integrity conflict: {0}")]
+    Integrity(String),
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum TerminalOutputReadError {
+    #[error("terminal output evidence is not yet available")]
+    Pending,
+    #[error(transparent)]
+    Proof(#[from] RunProofReadError),
+}
+
+pub(crate) struct TerminalOutputIdentity<'a> {
+    pub owner_user_id: &'a str,
+    pub session_id: &'a str,
+    pub run_id: &'a str,
+    pub generation: u64,
+}
+
+pub(crate) struct TerminalOutputEvidence {
+    pub terminal: CommittedTerminalProof,
+    pub output: Option<RunOutputProof>,
+    pub content: Option<String>,
+}
+
+/// Read the immutable atomic cut and its exact transcript content in the caller's
+/// snapshot. No lease, model settings, materialization expiry or current tail check.
+pub(crate) async fn load_verified_terminal_output_in_transaction(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    identity: &TerminalOutputIdentity<'_>,
+    max_content_bytes: usize,
+) -> Result<TerminalOutputEvidence, TerminalOutputReadError> {
+    let integrity = |detail| TerminalOutputReadError::Proof(RunProofReadError::Integrity(detail));
+    let commit = load_committed_atomic_terminal_in_transaction(
+        tx,
+        identity.owner_user_id,
+        identity.session_id,
+        identity.run_id,
+        identity.generation,
+        Some(STATUS_COMPLETED),
+    )
+    .await?
+    .ok_or(TerminalOutputReadError::Pending)?;
+    let tail = commit
+        .event_receipts
+        .last()
+        .ok_or_else(|| integrity("empty terminal proof".into()))?;
+    let terminal = CommittedTerminalProof {
+        settlement_batch_id: tail
+            .settlement_batch_id
+            .clone()
+            .ok_or_else(|| integrity("terminal proof has no batch identity".into()))?,
+        terminal_event_idx: commit.last_event_idx,
+    };
+    let key = format!("run-output-recorded:{}", identity.generation);
+    let matches = commit
+        .event_receipts
+        .iter()
+        .zip(&commit.committed_events)
+        .filter(|(receipt, _)| {
+            receipt.event_type == "run_output_recorded"
+                || receipt.idempotency_key.as_deref() == Some(key.as_str())
+        })
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return Ok(TerminalOutputEvidence {
+            terminal,
+            output: None,
+            content: None,
+        });
+    }
+    if matches.len() != 1 {
+        return Err(integrity(
+            "terminal batch has ambiguous output receipts".into(),
+        ));
+    }
+    let (receipt, event) = matches[0];
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct OutputData {
+        schema_version: u32,
+        owner_user_id: String,
+        session_id: String,
+        run_id: String,
+        run_generation: u64,
+        source_event_id: String,
+        content_hash: String,
+        content_bytes: u64,
+    }
+    let data: OutputData = serde_json::from_value(
+        event
+            .get("data")
+            .cloned()
+            .ok_or_else(|| integrity("output receipt has no data".into()))?,
+    )
+    .map_err(|error| integrity(error.to_string()))?;
+    if receipt.event_type != "run_output_recorded"
+        || receipt.idempotency_key.as_deref() != Some(key.as_str())
+        || data.schema_version != 1
+        || data.owner_user_id != identity.owner_user_id
+        || data.session_id != identity.session_id
+        || data.run_id != identity.run_id
+        || data.run_generation != identity.generation
+        || data.source_event_id.trim().is_empty()
+        || data.content_hash.trim().is_empty()
+        || data.content_bytes == 0
+    {
+        return Err(integrity("output receipt identity mismatch".into()));
+    }
+    let output = RunOutputProof {
+        receipt_event_idx: receipt.event_idx,
+        source_event_id: data.source_event_id,
+        content_hash: data.content_hash,
+        content_bytes: data.content_bytes,
+    };
+    // Bound allocation independently of the receipt's claimed length. Oversize
+    // output retains its trusted receipt but cannot be passed to this verifier.
+    let rows = sqlx::query("SELECT item_seq, run_id, role, OCTET_LENGTH(content) AS content_bytes,
+        CASE WHEN OCTET_LENGTH(content) <= ? THEN content ELSE NULL END AS content
+        FROM session_transcript_items WHERE user_id = ? AND session_id = ? AND source_event_id = ? LIMIT 2 FOR UPDATE")
+        .bind(max_content_bytes as u64).bind(identity.owner_user_id).bind(identity.session_id).bind(&output.source_event_id)
+        .fetch_all(&mut **tx).await.map_err(RunProofReadError::Database)?;
+    if rows.len() > 1 {
+        return Err(integrity(
+            "output source resolves to multiple transcript rows".into(),
+        ));
+    }
+    if rows.is_empty() {
+        return Err(TerminalOutputReadError::Pending);
+    }
+    let content = if let Some(row) = rows.first() {
+        let run_id: Option<String> = row
+            .try_get("run_id")
+            .map_err(|e| integrity(e.to_string()))?;
+        let role: String = row.try_get("role").map_err(|e| integrity(e.to_string()))?;
+        let bytes: i64 = row
+            .try_get("content_bytes")
+            .map_err(|e| integrity(e.to_string()))?;
+        let content: Option<String> = row
+            .try_get("content")
+            .map_err(|e| integrity(e.to_string()))?;
+        if run_id.as_deref() != Some(identity.run_id)
+            || role != "assistant"
+            || u64::try_from(bytes).ok() != Some(output.content_bytes)
+        {
+            return Err(integrity(
+                "output transcript identity or byte length mismatch".into(),
+            ));
+        }
+        let mut hasher = Sha256::new();
+        let mut hashed_bytes = 0_u64;
+        if let Some(text) = &content {
+            hasher.update(text.as_bytes());
+            hashed_bytes = text.len() as u64;
+        } else {
+            let item_seq: i64 = row
+                .try_get("item_seq")
+                .map_err(|e| integrity(e.to_string()))?;
+            // MatrixOne SUBSTRING is character-based even after CAST AS BINARY.
+            // Bound each UTF-8 chunk to at most 65,536 Unicode characters
+            // (256 KiB), and advance by the actual returned character count.
+            // Hash in Rust: the database SHA2 implementation is not authoritative.
+            const CHUNK_CHARS: u64 = 65_536;
+            let mut offset_chars = 0_u64;
+            while hashed_bytes < output.content_bytes {
+                let chunk = sqlx::query_scalar::<_, String>(
+                    "SELECT SUBSTRING(content, ?, ?) FROM session_transcript_items
+                     WHERE user_id = ? AND session_id = ? AND item_seq = ? FOR UPDATE",
+                )
+                .bind(offset_chars + 1)
+                .bind(CHUNK_CHARS)
+                .bind(identity.owner_user_id)
+                .bind(identity.session_id)
+                .bind(item_seq)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(RunProofReadError::Database)?
+                .ok_or_else(|| {
+                    integrity("locked output transcript disappeared during hashing".into())
+                })?;
+                let chars = chunk.chars().count() as u64;
+                if chars == 0 || chars > CHUNK_CHARS {
+                    return Err(integrity(
+                        "output transcript chunk did not make bounded progress".into(),
+                    ));
+                }
+                offset_chars += chars;
+                hashed_bytes += chunk.len() as u64;
+                if hashed_bytes > output.content_bytes {
+                    return Err(integrity(
+                        "output transcript chunks exceed receipt byte length".into(),
+                    ));
+                }
+                hasher.update(chunk.as_bytes());
+            }
+        }
+        if hashed_bytes != output.content_bytes
+            || format!("sha256:{:x}", hasher.finalize()) != output.content_hash
+        {
+            return Err(integrity("output transcript content hash mismatch".into()));
+        }
+        content
+    } else {
+        None
+    };
+    Ok(TerminalOutputEvidence {
+        terminal,
+        output: Some(output),
+        content,
+    })
+}
+
+pub(crate) async fn load_committed_atomic_terminal_in_transaction(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    generation: u64,
+    expected_status: Option<&str>,
+) -> Result<Option<AtomicRunTerminalSettlementCommit>, RunProofReadError> {
+    let lock = if expected_status.is_some() {
+        " FOR UPDATE"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
+             WHERE user_id = ? AND session_id = ? AND run_id = ?{lock}"
+    );
+    let row = sqlx::query(&sql)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(RunProofReadError::Database)?;
+    let Some(run) = row
+        .map(run_record_from_row)
+        .transpose()
+        .map_err(|error| RunProofReadError::Integrity(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    if expected_status.is_some_and(|status| status != run.status)
+        || (expected_status.is_some() && run.run_generation != generation)
+    {
+        return Err(RunProofReadError::Integrity(
+            "historical completed run identity differs from observation".into(),
+        ));
+    }
+    if run.run_generation != generation
+        || !matches!(
+            run.status.as_str(),
+            STATUS_COMPLETED | STATUS_FAILED | STATUS_CANCELLED | STATUS_DELEGATED
+        )
+    {
+        return Ok(None);
+    }
+    let anchor_sql = format!(
+            "SELECT event_idx, event_type, event_id, idempotency_key, event_hash, request_id, payload_json
+             FROM agent_run_events
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND idempotency_key = ?{lock}",
+        );
+    let anchor = sqlx::query(&anchor_sql)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .bind(format!("run-accounting-finalized:{generation}"))
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(RunProofReadError::Database)?;
+    let Some(anchor) = anchor
+        .map(|row| decode_atomic_terminal_event_row(row, run_id))
+        .transpose()
+        .map_err(RunProofReadError::Integrity)?
+    else {
+        return Ok(None);
+    };
+    if anchor.0.event_type != "run_accounting_finalized" {
+        return Err(RunProofReadError::Integrity(
+            "settlement accounting anchor has the wrong event type".into(),
+        ));
+    }
+    let Some(batch_id) = anchor.0.settlement_batch_id.as_deref() else {
+        return Ok(None);
+    };
+    let batch_sql = format!(
+            "SELECT event_idx, event_type, event_id, idempotency_key, event_hash, request_id, payload_json
+             FROM agent_run_events
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND request_id = ?
+             ORDER BY event_idx ASC{lock}",
+        );
+    let rows = sqlx::query(&batch_sql)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .bind(batch_id)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(RunProofReadError::Database)?
+        .into_iter()
+        .map(|row| decode_atomic_terminal_event_row(row, run_id))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(RunProofReadError::Integrity)?;
+    if rows.last() != Some(&anchor) {
+        return Err(RunProofReadError::Integrity(
+            "settlement accounting anchor is not the batch tail".into(),
+        ));
+    }
+    let commit =
+        committed_atomic_terminal_from_rows(&run, &rows).map_err(RunProofReadError::Integrity)?;
+    Ok(Some(commit))
+}
+
+/// Validate restart-readable facts without inventing the original CAS preconditions.
+fn committed_atomic_terminal_from_rows(
+    run: &DurableRunRecord,
+    rows: &[AtomicTerminalEventRow],
+) -> Result<AtomicRunTerminalSettlementCommit, String> {
+    let Some((last, accounting)) = rows.last() else {
+        return Err("empty atomic terminal batch is not settlement evidence".into());
+    };
+    let accounting_key = format!("run-accounting-finalized:{}", run.run_generation);
+    if last.event_type != "run_accounting_finalized"
+        || last.idempotency_key.as_deref() != Some(accounting_key.as_str())
+        || last.event_idx > run.last_event_idx
+        || rows[0].0.event_idx < 0
+    {
+        return Err("atomic terminal batch must end with exact-generation accounting".into());
+    }
+    if !matches!(
+        run.status.as_str(),
+        STATUS_COMPLETED | STATUS_FAILED | STATUS_CANCELLED | STATUS_DELEGATED
+    ) {
+        return Err("atomic settlement run is not terminal".into());
+    }
+    let usage = accounting
+        .get("data")
+        .ok_or("accounting payload has no data")?;
+    let count = |name: &str| {
+        usage
+            .get(name)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("accounting {name} is missing or invalid"))
+    };
+    // These are recorded totals, not proof of usage coverage across all requests.
+    let cache_creation_tokens = count("cache_creation_tokens")?;
+    let prompt_tokens = count("prompt_tokens")?
+        .checked_add(count("cache_read_tokens")?)
+        .and_then(|total| total.checked_add(cache_creation_tokens))
+        .ok_or("accounting input token total is invalid or overflows")?;
+    if prompt_tokens != run.total_prompt_tokens
+        || count("completion_tokens")? != run.total_completion_tokens
+        || count("tool_call_count")? != u64::from(run.total_tool_calls)
+        || usage.get("usage_scope").and_then(serde_json::Value::as_str) != Some("run_total")
+    {
+        return Err("atomic accounting totals do not match the terminal run".into());
+    }
+    let committed_events = rows
+        .iter()
+        .map(|(_, payload)| payload.clone())
+        .collect::<Vec<_>>();
+    let request = AtomicRunTerminalSettlementRequest {
+        user_id: &run.user_id,
+        expected_session_id: &run.session_id,
+        run_id: &run.run_id,
+        expected_owner_generation: run.run_generation,
+        expected_statuses: &[],
+        status: &run.status,
+        waiting_for: run.waiting_for.as_deref(),
+        error_message: run.error_message.as_deref(),
+        prompt_tokens: run.total_prompt_tokens,
+        completion_tokens: run.total_completion_tokens,
+        tool_calls: run.total_tool_calls,
+        events: &committed_events,
+    };
+    if classify_atomic_run_terminal_facts(run, request) != AtomicRunTerminalFactMatch::Exact {
+        return Err("atomic terminal error identity does not match the run".into());
+    }
+    validate_atomic_terminal_batch_identity(request, rows)?;
+    Ok(AtomicRunTerminalSettlementCommit {
+        last_event_idx: last.event_idx,
+        latest_event_type: Some(last.event_type.clone()),
+        event_receipts: rows.iter().map(|(receipt, _)| receipt.clone()).collect(),
+        committed_events,
+    })
 }
 
 pub fn run_requested_explain_analyze(run: &DurableRunRecord) -> bool {
@@ -5881,6 +6677,9 @@ impl InMemoryRunStateStore {
                 existing.start_request_fingerprint.as_deref(),
                 requested_session_id,
             ));
+        }
+        if initial_evaluation_admission(&record.events)?.is_some() {
+            return Err("evaluation trial admission requires the canonical database store".into());
         }
         reconcile_in_memory_execution_slot_for_session(
             &mut slots,
@@ -9942,11 +10741,11 @@ impl RunStateStore for InMemoryRunStateStore {
                 && let Some(event) =
                     execution_handoff_claim_event(run, checkpoint, run.events.last(), None)?
             {
-                run.last_event_idx
-                    .checked_add(1)
-                    .ok_or_else(|| "run recovery event sequence exhausted".to_string())?;
                 claim_events.insert(run_id.clone(), event);
             }
+            run.last_event_idx
+                .checked_add(1 + i64::from(claim_events.contains_key(run_id)))
+                .ok_or("run recovery event sequence exhausted")?;
         }
         let mut claimed = Vec::with_capacity(candidates.len());
         for (_, user_id, run_id, generation) in candidates {
@@ -9956,11 +10755,11 @@ impl RunStateStore for InMemoryRunStateStore {
                 && (matches!(run.status.as_str(), STATUS_WAITING | STATUS_RUNNING)
                     || (run.status == STATUS_PAUSED && run.waiting_for.is_some()))
             {
+                let mut events = vec![RunRecoveryCustody::for_claim(run, generation).event()];
+                events.extend(claim_events.remove(&run_id));
                 run.run_generation = generation + 1;
-                if let Some(event) = claim_events.remove(&run_id) {
-                    run.events.push(event);
-                    run.last_event_idx += 1;
-                }
+                run.last_event_idx += events.len() as i64;
+                run.events.extend(events);
                 run.updated_at = chrono::Utc::now().to_rfc3339();
                 let has_graceful_resume_checkpoint = checkpoints
                     .get(&run_id)
@@ -11369,13 +12168,68 @@ impl DatabaseRunStateStore {
         }))
     }
 
+    /// Discover a stable recovery terminal cut. Observation writers must
+    /// repeat the same validation in their own transaction before authorizing it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn load_verified_recovery_terminal(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        admission_generation: u64,
+        terminal_generation: u64,
+        admission_event_idx: i64,
+    ) -> Result<Option<RunRecoveryTerminalProof>, RunProofReadError> {
+        let mut tx = self
+            .pool
+            .get()
+            .begin()
+            .await
+            .map_err(RunProofReadError::Database)?;
+        let proof = validate_run_recovery_terminal_in_transaction(
+            &mut tx,
+            user_id,
+            session_id,
+            run_id,
+            admission_generation,
+            terminal_generation,
+            admission_event_idx,
+        )
+        .await?;
+        tx.commit().await.map_err(RunProofReadError::Database)?;
+        Ok(proof)
+    }
+
+    /// Read a completed atomic batch in one database snapshot. A plain terminal
+    /// row or non-atomic accounting event is not proof of atomic settlement.
+    pub async fn load_committed_atomic_terminal_settlement(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        generation: u64,
+    ) -> Result<Option<AtomicRunTerminalSettlementCommit>, RunProofReadError> {
+        let mut tx = self
+            .pool
+            .get()
+            .begin()
+            .await
+            .map_err(RunProofReadError::Database)?;
+        let commit = load_committed_atomic_terminal_in_transaction(
+            &mut tx, user_id, session_id, run_id, generation, None,
+        )
+        .await?;
+        tx.commit().await.map_err(RunProofReadError::Database)?;
+        Ok(commit)
+    }
+
     /// Resolve an uncertain atomic terminal settlement from committed facts.
     ///
     /// This method never mutates state and never treats a merely-terminal run
     /// as success. The exact owner generation, terminal state, semantic usage,
     /// and event identities/hashes must agree. `expected_receipts` is supplied
     /// after a lost commit acknowledgement; without it, exact replay is
-    /// recognized from the caller's event payload hashes at the durable tail.
+    /// recognized from the caller's event payload hashes within its committed batch.
     pub async fn resolve_atomic_terminal_settlement(
         &self,
         request: AtomicRunTerminalSettlementRequest<'_>,
@@ -11401,49 +12255,64 @@ impl DatabaseRunStateStore {
             }
             AtomicRunTerminalFactMatch::Exact => {}
         }
-        let (receipts, committed_events) = if let Some(expected) = expected_receipts {
-            if expected.last().map(|receipt| receipt.event_idx) != Some(run.last_event_idx)
-                && !expected.is_empty()
-            {
-                return Ok(AtomicRunTerminalSettlementResolution::Conflict(format!(
-                    "terminal event watermark mismatch for run {}",
-                    request.run_id
-                )));
-            }
-            let rows = self
-                .load_atomic_terminal_event_rows(
-                    request.user_id,
-                    request.run_id,
-                    expected.first().map(|receipt| receipt.event_idx),
-                    expected.len(),
-                )
-                .await?;
-            if rows.len() != expected.len()
-                || !rows.iter().zip(expected).all(|(row, expected)| {
-                    &row.0 == expected && atomic_terminal_event_hash_is_valid(&row.0, &row.1)
-                })
-            {
-                return Ok(AtomicRunTerminalSettlementResolution::Conflict(format!(
-                    "terminal event receipt mismatch for run {}",
-                    request.run_id
-                )));
-            }
-            if let Err(reason) = validate_atomic_terminal_batch_identity(request, &rows) {
-                return Ok(AtomicRunTerminalSettlementResolution::Conflict(format!(
-                    "{reason} for run {}",
-                    request.run_id
-                )));
-            }
-            (
-                rows.iter().map(|(receipt, _)| receipt.clone()).collect(),
-                rows.into_iter().map(|(_, payload)| payload).collect(),
+        let batch_end_idx = if let Some(receipt) = expected_receipts.and_then(|rows| rows.last()) {
+            receipt.event_idx
+        } else if let Some(last_event) = request.events.last() {
+            let event_hash = sha256_hex(
+                serde_json::to_string(last_event)
+                    .map_err(|error| error.to_string())?
+                    .as_bytes(),
+            );
+            let Some(index) = sqlx::query_scalar::<_, i64>(
+                "SELECT event_idx FROM agent_run_events
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?
+                   AND event_hash = ? AND event_type = ? AND request_id IS NOT NULL
+                   AND event_idx <= ? ORDER BY event_idx DESC LIMIT 1",
             )
-        } else if request.events.is_empty() {
-            let last_row = if run.last_event_idx >= 0 {
+            .bind(request.user_id)
+            .bind(request.expected_session_id)
+            .bind(request.run_id)
+            .bind(event_hash)
+            .bind(extract_event_type(last_event))
+            .bind(run.last_event_idx)
+            .fetch_optional(self.pool.get())
+            .await
+            .map_err(|error| error.to_string())?
+            else {
+                return Ok(AtomicRunTerminalSettlementResolution::Conflict(
+                    "terminal replay batch not found".into(),
+                ));
+            };
+            index
+        } else {
+            sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT MAX(event_idx) FROM agent_run_events
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?
+                   AND request_id IS NOT NULL AND event_idx <= ?",
+            )
+            .bind(request.user_id)
+            .bind(request.expected_session_id)
+            .bind(request.run_id)
+            .bind(run.last_event_idx)
+            .fetch_one(self.pool.get())
+            .await
+            .map_err(|error| error.to_string())?
+            .unwrap_or(run.last_event_idx)
+        };
+        if batch_end_idx > run.last_event_idx {
+            return Ok(AtomicRunTerminalSettlementResolution::Conflict(
+                "terminal batch exceeds the run watermark".into(),
+            ));
+        }
+        let (receipts, committed_events): (
+            Vec<AtomicRunTerminalEventReceipt>,
+            Vec<serde_json::Value>,
+        ) = if request.events.is_empty() {
+            let last_row = if batch_end_idx >= 0 {
                 self.load_atomic_terminal_event_rows(
                     request.user_id,
                     request.run_id,
-                    Some(run.last_event_idx),
+                    Some(batch_end_idx),
                     1,
                 )
                 .await?
@@ -11458,7 +12327,7 @@ impl DatabaseRunStateStore {
                     .load_and_validate_atomic_terminal_return_prefix(
                         request.user_id,
                         request.run_id,
-                        run.last_event_idx + 1,
+                        batch_end_idx + 1,
                         batch_id,
                     )
                     .await?
@@ -11486,7 +12355,7 @@ impl DatabaseRunStateStore {
                     .load_atomic_terminal_intent_history_through(
                         request.user_id,
                         request.run_id,
-                        run.last_event_idx,
+                        batch_end_idx,
                     )
                     .await?;
                 if !terminal_user_intent_return_events(&durable_intent_history, true).is_empty() {
@@ -11517,8 +12386,7 @@ impl DatabaseRunStateStore {
                     ))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            let start_idx = run
-                .last_event_idx
+            let start_idx = batch_end_idx
                 .checked_sub(i64::try_from(expected_rows.len()).unwrap_or(i64::MAX) - 1)
                 .ok_or_else(|| {
                     format!("terminal event index underflow for run {}", request.run_id)
@@ -11603,12 +12471,19 @@ impl DatabaseRunStateStore {
             )
         };
 
+        if expected_receipts.is_some_and(|expected| receipts.as_slice() != expected) {
+            return Ok(AtomicRunTerminalSettlementResolution::Conflict(format!(
+                "terminal event receipt mismatch for run {}",
+                request.run_id
+            )));
+        }
+
         Ok(AtomicRunTerminalSettlementResolution::Exact(
             AtomicRunTerminalSettlementCommit {
                 latest_event_type: receipts.last().map(|receipt| receipt.event_type.clone()),
                 committed_events,
                 event_receipts: receipts,
-                last_event_idx: run.last_event_idx,
+                last_event_idx: batch_end_idx,
             },
         ))
     }
@@ -11735,49 +12610,7 @@ impl DatabaseRunStateStore {
             db_error("resolve_atomic_terminal_settlement_events", run_id, source).to_string()
         })?;
         rows.into_iter()
-            .map(|row| {
-                let event_idx = row.try_get::<i64, _>("event_idx").map_err(|source| {
-                    db_error("decode_atomic_terminal_event_idx", run_id, source).to_string()
-                })?;
-                let event_type = row.try_get::<String, _>("event_type").map_err(|source| {
-                    db_error("decode_atomic_terminal_event_type", run_id, source).to_string()
-                })?;
-                let event_id = row.try_get::<String, _>("event_id").map_err(|source| {
-                    db_error("decode_atomic_terminal_event_id", run_id, source).to_string()
-                })?;
-                let idempotency_key = row
-                    .try_get::<Option<String>, _>("idempotency_key")
-                    .map_err(|source| {
-                        db_error("decode_atomic_terminal_event_idempotency", run_id, source)
-                            .to_string()
-                    })?;
-                let event_hash = row.try_get::<String, _>("event_hash").map_err(|source| {
-                    db_error("decode_atomic_terminal_event_hash", run_id, source).to_string()
-                })?;
-                let settlement_batch_id =
-                    row.try_get::<Option<String>, _>("request_id")
-                        .map_err(|source| {
-                            db_error("decode_atomic_terminal_settlement_batch", run_id, source)
-                                .to_string()
-                        })?;
-                let payload_json = row.try_get::<String, _>("payload_json").map_err(|source| {
-                    db_error("decode_atomic_terminal_event_payload", run_id, source).to_string()
-                })?;
-                let payload = serde_json::from_str(&payload_json).map_err(|error| {
-                    format!("decode atomic terminal event payload for run {run_id}: {error}")
-                })?;
-                Ok((
-                    AtomicRunTerminalEventReceipt {
-                        event_idx,
-                        event_type,
-                        event_id,
-                        idempotency_key,
-                        event_hash,
-                        settlement_batch_id,
-                    },
-                    payload,
-                ))
-            })
+            .map(|row| decode_atomic_terminal_event_row(row, run_id))
             .collect()
     }
 
@@ -13355,6 +14188,7 @@ impl DatabaseRunStateStore {
                 &record.session_id,
             ));
         }
+        let evaluation_admission = initial_evaluation_admission(&events)?;
         let initial_event_rows = events
             .iter()
             .enumerate()
@@ -13382,6 +14216,20 @@ impl DatabaseRunStateStore {
             .begin()
             .await
             .map_err(|source| db_error("insert_run_begin", &record.run_id, source).to_string())?;
+        let evaluation_experiment = if let Some(admission) = evaluation_admission.as_ref() {
+            // First database lock: experiment -> Session -> Run -> Trial.
+            Some(
+                crate::evaluation::DatabaseEvaluationPlanStore::lock_experiment_for_run_start(
+                    &mut tx,
+                    &record.user_id,
+                    admission,
+                )
+                .await
+                .map_err(evaluation_run_admission_error)?,
+            )
+        } else {
+            None
+        };
         let execution_admission_facts = crate::storage::admit_session_execution_write_with_facts(
             &mut tx,
             &record.session_id,
@@ -13429,6 +14277,25 @@ impl DatabaseRunStateStore {
                 "run identity {} is already bound to session {existing_session}",
                 record.run_id
             ));
+        }
+
+        if let (Some(admission), Some(experiment)) = (&evaluation_admission, &evaluation_experiment)
+        {
+            let binding = crate::evaluation::DatabaseEvaluationPlanStore::admit_trial_run_start(
+                &mut tx,
+                experiment,
+                admission,
+                &record.session_id,
+                &record.run_id,
+            )
+            .await
+            .map_err(evaluation_run_admission_error)?;
+            if binding.binding_status != "planned" {
+                return Err(
+                    "evaluation_trial_binding_conflict: binding exists without its canonical Run"
+                        .into(),
+                );
+            }
         }
 
         if !run_requires_session_execution_slot(&record) {
@@ -13534,6 +14401,18 @@ impl DatabaseRunStateStore {
             "insert_initial_run_events",
         )
         .await?;
+        if let Some(admission) = &evaluation_admission {
+            crate::evaluation::DatabaseEvaluationPlanStore::bind_locked_trial(
+                &mut tx,
+                &record.user_id,
+                &admission.trial_id,
+                &record.session_id,
+                &record.run_id,
+                record.run_generation,
+            )
+            .await
+            .map_err(evaluation_run_admission_error)?;
+        }
         let commit_error = match tx.commit().await {
             Ok(()) => {
                 connection.release();
@@ -13879,83 +14758,88 @@ impl DatabaseRunStateStore {
         attach_graceful_resume_checkpoint_flags(&mut tx, &mut records).await?;
         for receipt in &mut records {
             let run = &mut receipt.run;
-            let Some(identity) = execution_handoff_checkpoint_identity(run)? else {
-                continue;
-            };
-            let row = sqlx::query(
-                "SELECT checkpoint_id, run_id, user_id, session_id, node_seq,
-                 checkpoint_kind, checkpoint_version, idempotency_key, checkpoint_json,
-                 DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
-                 FROM run_checkpoints WHERE user_id = ? AND run_id = ?
-                 AND checkpoint_kind = 'execution_handoff' AND idempotency_key = ? FOR UPDATE",
-            )
-            .bind(&run.user_id)
-            .bind(&run.run_id)
-            .bind(identity)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|error| error.to_string())?;
-            let Some(row) = row else { continue };
-            let checkpoint =
-                decode_run_checkpoint_record_from_row(&row).map_err(|error| error.to_string())?;
-            let payload: Option<String> = sqlx::query_scalar(
-                "SELECT payload_json FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = ? FOR UPDATE",
-            ).bind(&run.user_id).bind(&run.run_id).bind(run.last_event_idx)
-                .fetch_optional(&mut *tx).await.map_err(|error| error.to_string())?;
-            let tail = payload.and_then(|payload| match serde_json::from_str::<serde_json::Value>(&payload) {
-                Ok(event) => Some(event),
-                Err(_) => {
-                    tracing::warn!(run_id = %run.run_id, "invalid event tail cannot establish recovery custody");
-                    None
-                }
-            });
-            let predecessor = candidates
-                .binary_search_by(|previous| compare_recovery_candidate_order(previous, run))
-                .map_err(|_| "recovery predecessor disappeared")?;
-            let previous = &candidates[predecessor];
-            let adoption = tail.as_ref().and_then(ExecutionHandoffAdoption::from_event);
-            let verified_adoption = if let Some(adoption) = adoption.as_ref() {
-                if crate::session_context_coordinator::execution_adoption_receipt_matches_tx(
-                    &mut tx, previous, adoption,
+            let handoff = async {
+                let Some(identity) = execution_handoff_checkpoint_identity(run)? else {
+                    return Ok::<_, String>(None);
+                };
+                let row = sqlx::query(
+                    "SELECT checkpoint_id, run_id, user_id, session_id, node_seq,
+                     checkpoint_kind, checkpoint_version, idempotency_key, checkpoint_json,
+                     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
+                     FROM run_checkpoints WHERE user_id = ? AND run_id = ?
+                     AND checkpoint_kind = 'execution_handoff' AND idempotency_key = ? FOR UPDATE",
                 )
+                .bind(&run.user_id)
+                .bind(&run.run_id)
+                .bind(identity)
+                .fetch_optional(&mut *tx)
                 .await
-                .map_err(|error| error.to_string())?
-                {
-                    Some(adoption)
+                .map_err(|error| error.to_string())?;
+                let Some(row) = row else { return Ok(None) };
+                let checkpoint =
+                    decode_run_checkpoint_record_from_row(&row).map_err(|error| error.to_string())?;
+                let payload: Option<String> = sqlx::query_scalar(
+                    "SELECT payload_json FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = ? FOR UPDATE",
+                ).bind(&run.user_id).bind(&run.run_id).bind(run.last_event_idx)
+                    .fetch_optional(&mut *tx).await.map_err(|error| error.to_string())?;
+                let tail = payload.and_then(|payload| match serde_json::from_str::<serde_json::Value>(&payload) {
+                    Ok(event) => Some(event),
+                    Err(_) => {
+                        tracing::warn!(run_id = %run.run_id, "invalid event tail cannot establish recovery custody");
+                        None
+                    }
+                });
+                let predecessor = candidates
+                    .binary_search_by(|previous| compare_recovery_candidate_order(previous, run))
+                    .map_err(|_| "recovery predecessor disappeared")?;
+                let previous = &candidates[predecessor];
+                let adoption = tail.as_ref().and_then(ExecutionHandoffAdoption::from_event);
+                let verified_adoption = if let Some(adoption) = adoption.as_ref() {
+                    if crate::session_context_coordinator::execution_adoption_receipt_matches_tx(
+                        &mut tx, previous, adoption,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+                    {
+                        Some(adoption)
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
-            let Some(event) = execution_handoff_claim_event(
-                previous,
-                &checkpoint,
-                tail.as_ref(),
-                verified_adoption,
-            )?
-            else {
-                continue;
-            };
+                };
+                execution_handoff_claim_event(
+                    previous, &checkpoint, tail.as_ref(), verified_adoption,
+                )
+            }.await?;
+            let mut events =
+                vec![RunRecoveryCustody::for_claim(run, receipt.claimed_from_generation).event()];
+            events.extend(handoff);
             let next_idx = run
                 .last_event_idx
-                .checked_add(1)
+                .checked_add(events.len() as i64)
                 .ok_or("run recovery event sequence exhausted")?;
-            let event_row = build_run_event_insert_row(
-                &run.user_id,
-                &run.run_id,
-                &run.session_id,
-                run.agent_id.as_deref(),
-                next_idx,
-                &self.owner_pod_id,
-                &event,
-            )
-            .map_err(|error| error.to_string())?;
+            let event_rows = events
+                .iter()
+                .enumerate()
+                .map(|(offset, event)| {
+                    build_run_event_insert_row(
+                        &run.user_id,
+                        &run.run_id,
+                        &run.session_id,
+                        run.agent_id.as_deref(),
+                        run.last_event_idx + 1 + offset as i64,
+                        &self.owner_pod_id,
+                        event,
+                    )
+                    .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             Self::insert_run_event_rows_tx(
                 &mut tx,
                 &run.run_id,
-                &[event_row],
-                "insert_recovery_claim_event",
+                &event_rows,
+                "insert_recovery_claim_events",
             )
             .await?;
             let updated = sqlx::query(
@@ -15611,6 +16495,29 @@ impl RunStateStore for DatabaseRunStateStore {
             connection.release();
             return Ok(AtomicRunGuidanceAdmission::Missing);
         };
+
+        let evaluation_bound = sqlx::query_scalar::<_, String>(
+            "SELECT trial_id FROM evaluation_trial_bindings
+             WHERE owner_user_id = ? AND session_id = ? AND run_id = ?
+               AND binding_status = 'bound' LIMIT 1 FOR UPDATE",
+        )
+        .bind(request.user_id)
+        .bind(request.expected_session_id)
+        .bind(request.run_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| {
+            db_error(
+                "admit_run_guidance_evaluation_binding",
+                request.run_id,
+                source,
+            )
+            .to_string()
+        })?;
+        if evaluation_bound.is_some() {
+            tx.rollback().await.map_err(|source| source.to_string())?;
+            return Ok(AtomicRunGuidanceAdmission::EvaluationFrozen);
+        }
 
         // Retry identity is authoritative before status/liveness. A client
         // must be able to reconcile a lost successful response after the run
@@ -26495,6 +27402,226 @@ mod tests {
     }
 
     #[test]
+    fn recovery_terminal_proof_requires_exact_custody_and_terminal_facts() {
+        let mut run = durable_run_record("recovery-proof");
+        run.status = STATUS_FAILED.into();
+        run.error_message = Some("recovered from crash".into());
+        run.error_code = Some("crash_recovery".into());
+        run.run_generation = 2;
+        run.last_event_idx = 12;
+        let terminal = RunRecoveryTerminal {
+            user_id: run.user_id.clone(),
+            session_id: run.session_id.clone(),
+            run_id: run.run_id.clone(),
+            owner_generation: 2,
+            outcome: RunRecoveryTerminalOutcome::Failed,
+        };
+        let rows = vec![
+            atomic_terminal_test_row(2, RunRecoveryCustody::for_claim(&run, 0).event(), ""),
+            atomic_terminal_test_row(5, RunRecoveryCustody::for_claim(&run, 1).event(), ""),
+            atomic_terminal_test_row(9, terminal.event(), ""),
+        ];
+        let proof = validate_run_recovery_terminal_rows(&run, 0, 0, &rows)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            proof.terminal_event_idx, 9,
+            "later events do not move the terminal cut"
+        );
+        assert_eq!(proof.generation, 2);
+        assert_eq!(proof.status, STATUS_FAILED);
+        assert!(
+            validate_run_recovery_terminal_rows(&run, 0, 0, &rows[..2])
+                .unwrap()
+                .is_none()
+        );
+        assert!(validate_run_recovery_terminal_rows(&run, 0, 0, &rows[1..]).is_err());
+        assert!(validate_run_recovery_terminal_rows(&run, 0, 3, &rows).is_err());
+        for field in [
+            "user_id",
+            "session_id",
+            "run_id",
+            "from_generation",
+            "to_generation",
+        ] {
+            let mut wrong = rows.clone();
+            let mut payload = wrong[1].1.clone();
+            payload["data"][field] = if field.ends_with("generation") {
+                json!(8)
+            } else {
+                json!("other")
+            };
+            wrong[1] = atomic_terminal_test_row(5, payload, "");
+            assert!(
+                validate_run_recovery_terminal_rows(&run, 0, 0, &wrong).is_err(),
+                "{field}"
+            );
+        }
+        for field in ["hash", "key", "type", "after_terminal"] {
+            let mut wrong = rows.clone();
+            match field {
+                "hash" => wrong[1].0.event_hash = "bad".into(),
+                "key" => wrong[1].0.idempotency_key = Some("wrong".into()),
+                "type" => wrong[2].0.event_type = "other".into(),
+                _ => {
+                    wrong[1].0.event_idx = 10;
+                    wrong.swap(1, 2);
+                }
+            }
+            assert!(
+                validate_run_recovery_terminal_rows(&run, 0, 0, &wrong).is_err(),
+                "{field}"
+            );
+        }
+        for field in ["status", "generation", "error", "error_code"] {
+            let mut wrong = run.clone();
+            match field {
+                "status" => wrong.status = STATUS_COMPLETED.into(),
+                "generation" => wrong.run_generation = 3,
+                "error" => wrong.error_message = None,
+                _ => wrong.error_code = None,
+            }
+            assert!(
+                !matches!(
+                    validate_run_recovery_terminal_rows(&wrong, 0, 0, &rows),
+                    Ok(Some(_))
+                ),
+                "{field}"
+            );
+        }
+        for origin in [
+            DurableCancellationOrigin::User,
+            DurableCancellationOrigin::Runtime,
+            DurableCancellationOrigin::Unverified,
+        ] {
+            let mut cancelled = run.clone();
+            cancelled.status = STATUS_CANCELLED.into();
+            cancelled.error_message = None;
+            cancelled.error_code = None;
+            let mut rows = rows.clone();
+            rows[2] = atomic_terminal_test_row(
+                9,
+                RunRecoveryTerminal {
+                    outcome: RunRecoveryTerminalOutcome::Cancelled {
+                        cancellation_origin: origin,
+                    },
+                    ..terminal.clone()
+                }
+                .event(),
+                "",
+            );
+            assert_eq!(
+                validate_run_recovery_terminal_rows(&cancelled, 0, 0, &rows)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                STATUS_CANCELLED
+            );
+            assert_eq!(
+                DurableCancellationOrigin::from_terminal_event(&rows[2].1),
+                Some(origin)
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_terminal_restart_proof_binds_durable_facts_and_accounting() {
+        let events = [
+            json!({"event_type": "run_finished", "data": {"status": STATUS_COMPLETED}}),
+            json!({"event_type": "run_accounting_finalized",
+                "idempotency_key": "run-accounting-finalized:3",
+                "data": {"usage_scope": "run_total", "usage_available": false, "prompt_tokens": 7,
+                    "cache_read_tokens": 4, "cache_creation_tokens": 2,
+                    "completion_tokens": 5, "tool_call_count": 2}}),
+        ];
+        let request = AtomicRunTerminalSettlementRequest {
+            user_id: "u1",
+            run_id: "run-1",
+            expected_session_id: "s1",
+            expected_statuses: &[STATUS_RUNNING],
+            expected_owner_generation: 3,
+            status: STATUS_COMPLETED,
+            waiting_for: None,
+            error_message: None,
+            events: &events,
+            prompt_tokens: 13,
+            completion_tokens: 5,
+            tool_calls: 2,
+        };
+        let batch = atomic_terminal_settlement_batch_id(request, 10, &events).unwrap();
+        assert_eq!(
+            batch,
+            atomic_terminal_settlement_batch_id(
+                AtomicRunTerminalSettlementRequest {
+                    expected_statuses: &[],
+                    events: &events[1..],
+                    ..request
+                },
+                10,
+                &events
+            )
+            .unwrap(),
+            "CAS preconditions and input partition are not committed facts"
+        );
+        assert_ne!(
+            batch,
+            atomic_terminal_settlement_batch_id(
+                AtomicRunTerminalSettlementRequest {
+                    expected_session_id: "other",
+                    ..request
+                },
+                10,
+                &events
+            )
+            .unwrap()
+        );
+        let rows = events
+            .iter()
+            .enumerate()
+            .map(|(i, event)| atomic_terminal_test_row(10 + i as i64, event.clone(), &batch))
+            .collect::<Vec<_>>();
+        let mut run = durable_run_record("run-1");
+        run.status = STATUS_COMPLETED.into();
+        run.run_generation = 3;
+        run.last_event_idx = 20; // Later observations do not move the settlement cut.
+        run.total_prompt_tokens = 13;
+        run.total_completion_tokens = 5;
+        run.total_tool_calls = 2;
+        let commit = committed_atomic_terminal_from_rows(&run, &rows).unwrap();
+        assert_eq!(commit.last_event_idx, 11);
+        assert_eq!(commit.committed_events, events);
+        assert!(committed_atomic_terminal_from_rows(&run, &[]).is_err());
+        assert!(committed_atomic_terminal_from_rows(&run, &rows[..1]).is_err());
+        for field in ["generation", "session", "usage", "error_code"] {
+            let mut wrong = run.clone();
+            match field {
+                "generation" => wrong.run_generation += 1,
+                "session" => wrong.session_id = "other".into(),
+                "usage" => wrong.total_prompt_tokens = 7,
+                _ => wrong.error_code = Some("unexpected".into()),
+            }
+            assert!(
+                committed_atomic_terminal_from_rows(&wrong, &rows).is_err(),
+                "{field}"
+            );
+        }
+        for field in ["hash", "gap", "type", "batch", "accounting"] {
+            let mut wrong = rows.clone();
+            match field {
+                "hash" => wrong[0].0.event_hash = "bad".into(),
+                "gap" => wrong[0].0.event_idx -= 1,
+                "type" => wrong[1].0.event_type = "other".into(),
+                "batch" => wrong[1].0.settlement_batch_id = None,
+                _ => wrong[1].1["data"]["cache_creation_tokens"] = json!(0),
+            }
+            assert!(
+                committed_atomic_terminal_from_rows(&run, &wrong).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
     fn atomic_terminal_replay_restores_return_prefix_before_terminal_tail() {
         let terminal_events = [json!({
             "event_type": "run_finished",
@@ -27648,70 +28775,204 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn database_run_start_claim_is_atomic_for_concurrent_exact_retries() {
-        let (store, pool) = setup_database_run_state_store_it().await;
-        let user_id = format!("runs-it-claim-user-{}", Uuid::new_v4());
-        let session_id = format!("runs-it-claim-session-{}", Uuid::new_v4());
-        let run_id = format!("runs-it-claim-run-{}", Uuid::new_v4());
-        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query(
-            "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&session_id)
-        .execute(pool.get())
-        .await
-        .expect("clean run-start claim slot");
-        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
-
-        let claim = |store: DatabaseRunStateStore| {
-            let user_id = user_id.clone();
-            let session_id = session_id.clone();
-            let run_id = run_id.clone();
-            async move {
-                let mut record = durable_run_record(&run_id);
-                record.user_id = user_id;
-                record.session_id = session_id.clone();
-                store.claim_run_start(record, Some(&session_id)).await
-            }
-        };
-        let (first, second) = tokio::join!(claim(store.clone()), claim(store.clone()));
-        let outcomes = [first.expect("first claim"), second.expect("second claim")];
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|outcome| matches!(outcome, DurableRunStartClaim::Started { .. }))
-                .count(),
-            1
-        );
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|outcome| {
-                    **outcome
-                        == DurableRunStartClaim::Existing {
-                            session_id: session_id.clone(),
-                            start_request_fingerprint: None,
-                        }
-                })
-                .count(),
-            1
-        );
-
-        sqlx::query(
-            "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&session_id)
-        .execute(pool.get())
-        .await
-        .expect("remove run-start claim slot");
-        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+        for evaluation in [false, true] {
+            let (store, pool) = setup_database_run_state_store_it().await;
+            let user_id = format!("runs-it-claim-user-{}", Uuid::new_v4());
+            let session_id = format!("runs-it-claim-session-{}", Uuid::new_v4());
+            let run_id = format!("runs-it-claim-run-{}", Uuid::new_v4());
+            cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+            sqlx::query(
+                "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
+            )
             .bind(&user_id)
             .bind(&session_id)
             .execute(pool.get())
             .await
-            .expect("remove run-start claim session");
+            .expect("clean run-start claim slot");
+            insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+
+            let evaluation = if evaluation {
+                use crate::evaluation::{
+                    DatabaseEvaluationPlanStore, build_prepared_experiment_spec,
+                };
+                let request = serde_json::from_value(json!({
+                    "submission_idempotency_key": "atomic-start",
+                    "target": {"kind": "prompt", "baseline": {"revision_id": "base", "content": "base prompt"},
+                        "candidate": {"revision_id": "candidate", "content": "candidate prompt"}},
+                    "case": {"case_id": "case", "message": "fixed input", "verifier_config": {"kind":"json_value_equals", "expected":{"ok":true}}, "holdout": false},
+                    "model_offering_id": "model", "max_concurrency": 1, "max_wall_time_secs": 30,
+                })).unwrap();
+                let spec = build_prepared_experiment_spec(
+                    None,
+                    &format!("experiment-{}", Uuid::new_v4()),
+                    &request,
+                    &crate::evaluation::test_support::execution_config("model", "openai", "case"),
+                    None,
+                    crate::evaluation::EvaluationJudgmentPolicy::Disabled,
+                )
+                .unwrap();
+                let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
+                let experiment = plan_store
+                    .register_experiment(&user_id, &spec, "atomic-start")
+                    .await
+                    .unwrap();
+                let trials = plan_store
+                    .list_trials(&user_id, &experiment.experiment_id)
+                    .await
+                    .unwrap();
+                Some((experiment, trials))
+            } else {
+                None
+            };
+            let admission = evaluation.as_ref().map(|(experiment, trials)| {
+                crate::evaluation::EvaluationRunAdmission {
+                    experiment_id: experiment.experiment_id.clone(),
+                    trial_id: trials[0].trial_id.clone(),
+                    input_content_hash: experiment.spec.cases[0].input_content_hash.clone(),
+                    revision_content_hash: experiment.spec.target.baseline.content_hash.clone(),
+                    skill_revision: None,
+                    judgment_policy: None,
+                    receipt_ids: vec![],
+                    snapshot_envelope: None,
+                }
+            });
+            let claim = |store: DatabaseRunStateStore| {
+                let user_id = user_id.clone();
+                let session_id = session_id.clone();
+                let run_id = run_id.clone();
+                let admission = admission.clone();
+                async move {
+                    let mut record = durable_run_record(&run_id);
+                    record.user_id = user_id;
+                    record.session_id = session_id.clone();
+                    if let Some(admission) = admission {
+                        record.events = vec![
+                            json!({"event_type": "run_started", "data": {"owner_generation": 0, "evaluation_admission": admission}}),
+                        ];
+                    }
+                    store.claim_run_start(record, Some(&session_id)).await
+                }
+            };
+            let (first, second) = tokio::join!(claim(store.clone()), claim(store.clone()));
+            let outcomes = [first.expect("first claim"), second.expect("second claim")];
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|outcome| matches!(outcome, DurableRunStartClaim::Started { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|outcome| {
+                        **outcome
+                            == DurableRunStartClaim::Existing {
+                                session_id: session_id.clone(),
+                                start_request_fingerprint: None,
+                            }
+                    })
+                    .count(),
+                1
+            );
+
+            if let Some((experiment, trials)) = evaluation.as_ref() {
+                let plan_store = crate::evaluation::DatabaseEvaluationPlanStore::new(pool.clone());
+                let bound = plan_store
+                    .load_trial(&user_id, &trials[0].trial_id)
+                    .await
+                    .unwrap();
+                assert_eq!(bound.run_id.as_deref(), Some(run_id.as_str()));
+                assert_eq!(bound.run_generation, Some(0));
+                assert_eq!(bound.binding_status, "bound");
+                // The experiment is full, but exact replay is still the same Run.
+                assert!(matches!(
+                    claim(store.clone()).await.unwrap(),
+                    DurableRunStartClaim::Existing { .. }
+                ));
+                let next_session = format!("next-s-{}", Uuid::new_v4());
+                let next_run = format!("next-r-{}", Uuid::new_v4());
+                insert_active_database_session_fixture(&pool, &user_id, &next_session).await;
+                let mut next = durable_run_record(&next_run);
+                next.user_id = user_id.clone();
+                next.session_id = next_session.clone();
+                let mut next_admission = admission.clone().unwrap();
+                next_admission.trial_id = trials[1].trial_id.clone();
+                next_admission.revision_content_hash =
+                    experiment.spec.target.candidate.content_hash.clone();
+                next.events = vec![
+                    json!({"event_type": "run_started", "data": {"owner_generation": 0, "evaluation_admission": next_admission}}),
+                ];
+                assert!(
+                    store
+                        .claim_run_start(next, Some(&next_session))
+                        .await
+                        .unwrap_err()
+                        .starts_with("evaluation_trial_order_blocked:")
+                );
+                assert!(store.load_run(&user_id, &next_run).await.unwrap().is_none());
+                assert_eq!(
+                    plan_store
+                        .load_trial(&user_id, &trials[1].trial_id)
+                        .await
+                        .unwrap()
+                        .binding_status,
+                    "planned"
+                );
+                sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+                    .bind(&user_id)
+                    .bind(&next_session)
+                    .execute(pool.get())
+                    .await
+                    .unwrap();
+                sqlx::query("DELETE FROM evaluation_trial_bindings WHERE owner_user_id = ? AND experiment_id = ?")
+                    .bind(&user_id).bind(&experiment.experiment_id).execute(pool.get()).await.unwrap();
+                sqlx::query("DELETE FROM evaluation_experiments WHERE owner_user_id = ? AND experiment_id = ?")
+                    .bind(&user_id).bind(&experiment.experiment_id).execute(pool.get()).await.unwrap();
+            }
+
+            sqlx::query(
+                "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool.get())
+            .await
+            .expect("remove run-start claim slot");
+            cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+            sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+                .bind(&user_id)
+                .bind(&session_id)
+                .execute(pool.get())
+                .await
+                .expect("remove run-start claim session");
+        }
+    }
+
+    #[test]
+    fn evaluation_run_admission_preserves_retryable_protocol_error_codes() {
+        use crate::evaluation::durable::{EvaluationPersistenceError, EvaluationProtocolBlock};
+        for (error, prefix) in [
+            (
+                EvaluationProtocolBlock::PrecedingTrialsUnbound,
+                "evaluation_trial_order_blocked:",
+            ),
+            (
+                EvaluationProtocolBlock::PairedPredecessorUnobserved {
+                    trial_id: "first".into(),
+                },
+                "evaluation_trial_order_blocked:",
+            ),
+            (
+                EvaluationProtocolBlock::ConcurrencyLimit { max_concurrency: 1 },
+                "evaluation_trial_capacity_exhausted:",
+            ),
+        ] {
+            assert!(
+                evaluation_run_admission_error(EvaluationPersistenceError::ProtocolBlocked(error))
+                    .starts_with(prefix)
+            );
+        }
     }
 
     #[test]
@@ -29957,6 +31218,25 @@ mod tests {
                 .chain(&right)
                 .all(|claim| claim.run.run_generation == 1 && claim.claimed_from_generation == 0)
         );
+        for claim in left.iter().chain(&right) {
+            let durable = store
+                .load_run(&user_id, &claim.run.run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(durable.last_event_idx, claim.run.last_event_idx);
+            assert_eq!(
+                durable
+                    .events
+                    .iter()
+                    .filter(|event| event["event_type"] == "run_recovery_claimed")
+                    .count(),
+                1
+            );
+            let mut custody = RunRecoveryCustody::for_claim(&durable, 0).event();
+            custody["index"] = serde_json::json!(durable.last_event_idx);
+            assert_eq!(durable.events.last(), Some(&custody));
+        }
         let refreshed = left
             .iter()
             .chain(&right)
@@ -30057,10 +31337,17 @@ mod tests {
             assert_eq!(claim.run.session_id, *session_id);
             assert_eq!(claim.claimed_from_generation, 0);
             assert_eq!(claim.run.run_generation, 1);
-            assert_eq!(claim.run.last_event_idx, 1);
+            assert_eq!(claim.run.last_event_idx, 2);
+            let mut custody = RunRecoveryCustody::for_claim(&claim.run, 0).event();
+            custody["index"] = json!(1);
+            let persisted = store.load_run(&user_id, run_id).await.unwrap().unwrap();
+            assert_eq!(
+                persisted.events.iter().find(|event| event["index"] == 1),
+                Some(&custody)
+            );
             let event_type: String = sqlx::query_scalar(
                 "SELECT event_type FROM agent_run_events
-                 WHERE user_id = ? AND run_id = ? AND event_idx = 1",
+                 WHERE user_id = ? AND run_id = ? AND event_idx = 2",
             )
             .bind(&user_id)
             .bind(run_id)
@@ -31060,6 +32347,14 @@ mod tests {
             assert_eq!(proof.checkpoint_id, receipt.checkpoint_id);
             assert_eq!(proof.producer_generation, 0);
             assert_eq!(proof.claimed_generation, generation);
+            let custody: String = sqlx::query_scalar(
+                "SELECT payload_json FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = ?",
+            ).bind(&user_id).bind(&run_id).bind(claim.run.last_event_idx - 1)
+                .fetch_one(pool.get()).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&custody).unwrap(),
+                RunRecoveryCustody::for_claim(&claim.run, generation - 1).event()
+            );
             last_claim = Some(claim);
         }
         let claim = last_claim.unwrap();
@@ -31122,6 +32417,89 @@ mod tests {
             store.load_run(&user_id, &run_id).await.unwrap().unwrap(),
             before
         );
+        let terminal = RunRecoveryTerminal {
+            user_id: user_id.clone(),
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            owner_generation: 3,
+            outcome: RunRecoveryTerminalOutcome::Failed,
+        }
+        .event();
+        assert!(
+            store
+                .update_run_status_with_events_if_current(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    &[STATUS_PAUSED],
+                    Some(3),
+                    STATUS_FAILED,
+                    None,
+                    Some("recovered from crash"),
+                    &[terminal],
+                )
+                .await
+                .unwrap()
+        );
+        let proof = store
+            .load_verified_recovery_terminal(&user_id, &session_id, &run_id, 0, 3, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(proof.status, STATUS_FAILED);
+        store
+            .append_event(
+                &user_id,
+                &session_id,
+                &run_id,
+                json!({"event_type": "agent_progress", "data": {"later": true}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_verified_recovery_terminal(&user_id, &session_id, &run_id, 0, 3, 0)
+                .await
+                .unwrap(),
+            Some(proof.clone())
+        );
+        let mut tx = pool.get().begin().await.unwrap();
+        assert_eq!(
+            validate_run_recovery_terminal_in_transaction(
+                &mut tx,
+                &user_id,
+                &session_id,
+                &run_id,
+                0,
+                3,
+                0
+            )
+            .await
+            .unwrap(),
+            Some(proof)
+        );
+        tx.rollback().await.unwrap();
+        for (owner, session, generation) in [
+            ("other", session_id.as_str(), 3),
+            (user_id.as_str(), "other", 3),
+            (user_id.as_str(), session_id.as_str(), 2),
+        ] {
+            assert!(
+                store
+                    .load_verified_recovery_terminal(owner, session, &run_id, 0, generation, 0)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        sqlx::query("UPDATE agent_run_events SET event_hash = 'corrupted' WHERE user_id = ? AND run_id = ? AND idempotency_key = 'run-recovery-claimed:2'")
+            .bind(&user_id).bind(&run_id).execute(pool.get()).await.unwrap();
+        assert!(matches!(
+            store
+                .load_verified_recovery_terminal(&user_id, &session_id, &run_id, 0, 3, 0)
+                .await,
+            Err(RunProofReadError::Integrity(_))
+        ));
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
         sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
             .bind(&user_id)
@@ -32279,6 +33657,153 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_task_output_proof_requires_atomic_receipt_and_exact_transcript() {
+        async fn read(
+            pool: &SharedPool,
+            identity: &TerminalOutputIdentity<'_>,
+        ) -> Result<TerminalOutputEvidence, TerminalOutputReadError> {
+            let mut tx = pool
+                .get()
+                .begin()
+                .await
+                .map_err(RunProofReadError::Database)?;
+            let result =
+                load_verified_terminal_output_in_transaction(&mut tx, identity, 1_048_576).await;
+            tx.rollback().await.map_err(RunProofReadError::Database)?;
+            result
+        }
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let suffix = Uuid::new_v4();
+        let owner = format!("output-u-{suffix}");
+        let session = format!("output-s-{suffix}");
+        let run_id = format!("output-r-{suffix}");
+        insert_active_database_session_fixture(&pool, &owner, &session).await;
+        let mut run = durable_run_record(&run_id);
+        run.user_id = owner.clone();
+        run.session_id = session.clone();
+        store.insert_run(run).await.unwrap();
+        let identity = TerminalOutputIdentity {
+            owner_user_id: &owner,
+            session_id: &session,
+            run_id: &run_id,
+            generation: 0,
+        };
+        let content = "{\"ok\":true}";
+        let hash = format!("sha256:{:x}", Sha256::digest(content.as_bytes()));
+        let events = [
+            json!({"event_type":"run_output_recorded","idempotency_key":"run-output-recorded:0",
+                "data":{"schema_version":1,"owner_user_id":owner,"session_id":session,"run_id":run_id,"run_generation":0,
+                    "source_event_id":"output-source","content_hash":hash,"content_bytes":content.len()}}),
+            json!({"event_type":"run_finished","data":{"status":STATUS_COMPLETED}}),
+            json!({"event_type":"run_accounting_finalized","idempotency_key":"run-accounting-finalized:0",
+                "data":{"usage_scope":"run_total","prompt_tokens":7,"cache_read_tokens":4,"cache_creation_tokens":2,"completion_tokens":5,"tool_call_count":2}}),
+        ];
+        let mut tx = pool.get().begin().await.unwrap();
+        sqlx::query("INSERT INTO session_transcript_items (user_id,session_id,item_seq,run_id,role,content,source_event_id,content_hash) VALUES (?,?,1,?,'assistant',?,'output-source','transcript-envelope-hash')")
+            .bind(&owner).bind(&session).bind(&run_id).bind(content).execute(&mut *tx).await.unwrap();
+        store
+            .settle_terminal_in_existing_transaction(
+                &mut tx,
+                AtomicRunTerminalSettlementRequest {
+                    user_id: &owner,
+                    expected_session_id: &session,
+                    run_id: &run_id,
+                    expected_owner_generation: 0,
+                    expected_statuses: &[STATUS_RUNNING],
+                    status: STATUS_COMPLETED,
+                    waiting_for: None,
+                    error_message: None,
+                    events: &events,
+                    prompt_tokens: 13,
+                    completion_tokens: 5,
+                    tool_calls: 2,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        tx.commit().await.unwrap();
+        let evidence = read(&pool, &identity).await.unwrap();
+        assert_eq!(evidence.content.as_deref(), Some(content));
+        assert_eq!(evidence.output.as_ref().unwrap().content_hash, hash);
+        store
+            .append_events_batch(
+                &owner,
+                &session,
+                &run_id,
+                &[json!({"event_type":"run_settlement_finished","data":{}})],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            read(&pool, &identity).await.unwrap().terminal,
+            evidence.terminal
+        );
+        sqlx::query(
+            "UPDATE session_transcript_items SET content = ? WHERE user_id = ? AND session_id = ?",
+        )
+        .bind("{\"ok\":null}")
+        .bind(&owner)
+        .bind(&session)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        assert!(matches!(
+            read(&pool, &identity).await,
+            Err(TerminalOutputReadError::Proof(
+                RunProofReadError::Integrity(_)
+            ))
+        ));
+        sqlx::query("DELETE FROM session_transcript_items WHERE user_id = ? AND session_id = ?")
+            .bind(&owner)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        assert!(matches!(
+            read(&pool, &identity).await,
+            Err(TerminalOutputReadError::Pending)
+        ));
+        sqlx::query("INSERT INTO session_transcript_items (user_id,session_id,item_seq,run_id,role,content,source_event_id,content_hash) VALUES (?,?,1,?,'assistant',?,'output-source','transcript-envelope-hash')")
+            .bind(&owner).bind(&session).bind(&run_id).bind(content).execute(pool.get()).await.unwrap();
+        assert_eq!(
+            read(&pool, &identity).await.unwrap().content.as_deref(),
+            Some(content)
+        );
+        let wrong_generation = TerminalOutputIdentity {
+            generation: 1,
+            ..identity
+        };
+        assert!(matches!(
+            read(&pool, &wrong_generation).await,
+            Err(TerminalOutputReadError::Proof(
+                RunProofReadError::Integrity(_)
+            ))
+        ));
+        sqlx::query("DELETE FROM session_transcript_items WHERE user_id = ? AND session_id = ?")
+            .bind(&owner)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        cleanup_database_run_fixture(&pool, &owner, &run_id).await;
+        pool.get().close().await;
+        assert!(matches!(
+            store
+                .load_committed_atomic_terminal_settlement(&owner, &session, &run_id, 0)
+                .await,
+            Err(RunProofReadError::Database(sqlx::Error::PoolClosed))
+        ));
+        assert!(matches!(
+            store
+                .load_verified_recovery_terminal(&owner, &session, &run_id, 0, 1, 0)
+                .await,
+            Err(RunProofReadError::Database(sqlx::Error::PoolClosed))
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn database_atomic_terminal_settlement_closes_pending_approval_before_terminal_on_matrixone()
      {
         let (store, pool) = setup_database_run_state_store_it().await;
@@ -32325,34 +33850,48 @@ mod tests {
         let closure_event_idx = pre_terminal.last_event_idx + 1;
         let terminal_event_idx = closure_event_idx + 1;
 
-        let terminal_events = [json!({
-            "event_type": "run_finished",
-            "idempotency_key": format!("atomic-terminal-finished:{run_id}"),
-            "data": {"status": STATUS_COMPLETED},
-        })];
+        let terminal_events = [
+            json!({
+                "event_type": "run_finished",
+                "idempotency_key": format!("atomic-terminal-finished:{run_id}"),
+                "data": {"status": STATUS_COMPLETED},
+            }),
+            json!({
+                "event_type": "run_accounting_finalized",
+                "idempotency_key": "run-accounting-finalized:0",
+                "data": {"usage_scope": "run_total", "prompt_tokens": 7,
+                    "cache_read_tokens": 4, "cache_creation_tokens": 2,
+                    "completion_tokens": 5, "tool_call_count": 2},
+            }),
+        ];
+        assert!(
+            store
+                .load_committed_atomic_terminal_settlement(&user_id, &session_id, &run_id, 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let request = AtomicRunTerminalSettlementRequest {
+            user_id: &user_id,
+            run_id: &run_id,
+            expected_session_id: &session_id,
+            expected_statuses: &[STATUS_RUNNING],
+            expected_owner_generation: 0,
+            status: STATUS_COMPLETED,
+            waiting_for: None,
+            error_message: None,
+            events: &terminal_events,
+            prompt_tokens: 13,
+            completion_tokens: 5,
+            tool_calls: 2,
+        };
         let mut tx = pool
             .get()
             .begin()
             .await
             .expect("begin direct terminal settlement transaction");
         let commit = store
-            .settle_terminal_in_existing_transaction(
-                &mut tx,
-                AtomicRunTerminalSettlementRequest {
-                    user_id: &user_id,
-                    run_id: &run_id,
-                    expected_session_id: &session_id,
-                    expected_statuses: &[STATUS_RUNNING],
-                    expected_owner_generation: 0,
-                    status: STATUS_COMPLETED,
-                    waiting_for: None,
-                    error_message: None,
-                    events: &terminal_events,
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    tool_calls: 0,
-                },
-            )
+            .settle_terminal_in_existing_transaction(&mut tx, request)
             .await
             .expect("settle terminal in existing transaction")
             .expect("exact terminal authority");
@@ -32360,9 +33899,27 @@ mod tests {
             .await
             .expect("commit direct terminal settlement transaction");
 
-        assert_eq!(commit.event_receipts.len(), 1);
+        let mut proof_tx = pool.get().begin().await.unwrap();
+        let no_output = load_verified_terminal_output_in_transaction(
+            &mut proof_tx,
+            &TerminalOutputIdentity {
+                owner_user_id: &user_id,
+                session_id: &session_id,
+                run_id: &run_id,
+                generation: 0,
+            },
+            1_048_576,
+        )
+        .await
+        .unwrap();
+        assert!(no_output.output.is_none());
+        assert!(no_output.content.is_none());
+        assert_eq!(no_output.terminal.terminal_event_idx, commit.last_event_idx);
+        proof_tx.rollback().await.unwrap();
+
+        assert_eq!(commit.event_receipts.len(), 2);
         assert_eq!(commit.event_receipts[0].event_idx, terminal_event_idx);
-        assert_eq!(commit.last_event_idx, terminal_event_idx);
+        assert_eq!(commit.last_event_idx, terminal_event_idx + 1);
         let rows = sqlx::query(
             "SELECT event_idx, event_type FROM agent_run_events
              WHERE user_id = ? AND session_id = ? AND run_id = ?
@@ -32394,16 +33951,20 @@ mod tests {
             "the durable event stream must remain contiguous and unique"
         );
         assert_eq!(
-            &facts[facts.len() - 2..],
+            &facts[facts.len() - 3..],
             &[
                 (closure_event_idx, "approval_resolved".to_string()),
                 (terminal_event_idx, "run_finished".to_string()),
+                (
+                    terminal_event_idx + 1,
+                    "run_accounting_finalized".to_string()
+                ),
             ],
             "the same transaction must append closure immediately before terminal truth"
         );
         let durable = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
         assert_eq!(durable.status, STATUS_COMPLETED);
-        assert_eq!(durable.last_event_idx, terminal_event_idx);
+        assert_eq!(durable.last_event_idx, terminal_event_idx + 1);
         let closure = durable
             .events
             .iter()
@@ -32414,6 +33975,161 @@ mod tests {
                 .pointer("/data/_durable_resolution/actual_status")
                 .and_then(serde_json::Value::as_str),
             Some(STATUS_COMPLETED)
+        );
+
+        store
+            .append_events_batch(
+                &user_id,
+                &session_id,
+                &run_id,
+                &[json!({"event_type": "run_settlement_finished", "data": {}})],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_committed_atomic_terminal_settlement(&user_id, &session_id, &run_id, 0)
+                .await
+                .unwrap(),
+            Some(commit.clone())
+        );
+        for receipts in [None, Some(commit.event_receipts.as_slice())] {
+            assert_eq!(
+                store
+                    .resolve_atomic_terminal_settlement(request, receipts)
+                    .await
+                    .unwrap(),
+                AtomicRunTerminalSettlementResolution::Exact(commit.clone())
+            );
+        }
+        assert!(
+            matches!(
+                store
+                    .resolve_atomic_terminal_settlement(
+                        AtomicRunTerminalSettlementRequest {
+                            events: &terminal_events[1..],
+                            ..request
+                        },
+                        Some(&commit.event_receipts),
+                    )
+                    .await
+                    .unwrap(),
+                AtomicRunTerminalSettlementResolution::Conflict(_)
+            ),
+            "a receipt cannot turn a terminal event into a permitted return prefix"
+        );
+        for (owner, session, generation) in [
+            ("other", session_id.as_str(), 0),
+            (user_id.as_str(), "other", 0),
+            (user_id.as_str(), session_id.as_str(), 1),
+        ] {
+            assert!(
+                store
+                    .load_committed_atomic_terminal_settlement(owner, session, &run_id, generation)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let accounting_receipt = commit.event_receipts.last().unwrap();
+        for (column, original) in [
+            ("event_type", accounting_receipt.event_type.as_str()),
+            ("event_hash", accounting_receipt.event_hash.as_str()),
+        ] {
+            let sql = format!(
+                "UPDATE agent_run_events SET {column} = ? WHERE user_id = ? AND run_id = ? AND event_idx = ?"
+            );
+            sqlx::query(&sql)
+                .bind("corrupted")
+                .bind(&user_id)
+                .bind(&run_id)
+                .bind(accounting_receipt.event_idx)
+                .execute(pool.get())
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    store
+                        .load_committed_atomic_terminal_settlement(
+                            &user_id,
+                            &session_id,
+                            &run_id,
+                            0
+                        )
+                        .await,
+                    Err(RunProofReadError::Integrity(_))
+                ),
+                "{column}"
+            );
+            sqlx::query(&sql)
+                .bind(original)
+                .bind(&user_id)
+                .bind(&run_id)
+                .bind(accounting_receipt.event_idx)
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "UPDATE agent_runs SET total_prompt_tokens = 7 WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        assert!(
+            store
+                .load_committed_atomic_terminal_settlement(&user_id, &session_id, &run_id, 0)
+                .await
+                .is_err(),
+            "raw prompt alone does not match the row total"
+        );
+        sqlx::query(
+            "UPDATE agent_runs SET total_prompt_tokens = 13 WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE agent_run_events SET request_id = ? WHERE user_id = ? AND run_id = ? AND event_idx = ?")
+            .bind(accounting_receipt.settlement_batch_id.as_deref()).bind(&user_id).bind(&run_id)
+            .bind(commit.last_event_idx + 1).execute(pool.get()).await.unwrap();
+        assert!(
+            store
+                .load_committed_atomic_terminal_settlement(&user_id, &session_id, &run_id, 0)
+                .await
+                .is_err(),
+            "accounting must be the last event in its batch"
+        );
+        sqlx::query("UPDATE agent_run_events SET request_id = NULL WHERE user_id = ? AND run_id = ? AND event_idx = ?")
+            .bind(&user_id).bind(&run_id).bind(commit.last_event_idx + 1)
+            .execute(pool.get()).await.unwrap();
+        sqlx::query("UPDATE agent_run_events SET idempotency_key = NULL WHERE user_id = ? AND run_id = ? AND event_idx = ?")
+            .bind(&user_id).bind(&run_id).bind(accounting_receipt.event_idx)
+            .execute(pool.get()).await.unwrap();
+        assert!(
+            store
+                .load_committed_atomic_terminal_settlement(&user_id, &session_id, &run_id, 0)
+                .await
+                .unwrap()
+                .is_none(),
+            "terminal status without an accounting anchor is not proof"
+        );
+        sqlx::query("UPDATE agent_run_events SET idempotency_key = ? WHERE user_id = ? AND run_id = ? AND event_idx = ?")
+            .bind("run-accounting-finalized:0").bind(&user_id).bind(&run_id)
+            .bind(accounting_receipt.event_idx).execute(pool.get()).await.unwrap();
+        // Removing the batch identity models ordinary, non-atomic accounting.
+        sqlx::query("UPDATE agent_run_events SET request_id = NULL WHERE user_id = ? AND run_id = ? AND idempotency_key = ?")
+            .bind(&user_id).bind(&run_id).bind("run-accounting-finalized:0")
+            .execute(pool.get()).await.unwrap();
+        assert!(
+            store
+                .load_committed_atomic_terminal_settlement(&user_id, &session_id, &run_id, 0)
+                .await
+                .unwrap()
+                .is_none()
         );
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
@@ -34955,7 +36671,11 @@ mod tests {
             .pop()
             .unwrap();
         assert_eq!(latest.run.run_generation, 2);
-        assert_eq!(latest.run.events.last(), Some(&activity));
+        assert_eq!(latest.run.events[latest.run.events.len() - 2], activity);
+        assert_eq!(
+            latest.run.events.last(),
+            Some(&RunRecoveryCustody::for_claim(&latest.run, 1).event())
+        );
         let before = store.load_run("u1", run_id).await.unwrap().unwrap();
         for claim in [&original, &latest] {
             assert!(
@@ -35001,6 +36721,15 @@ mod tests {
                 .pop()
                 .unwrap();
             assert_eq!(abandoned.run.run_generation, generation);
+            let events = &abandoned.run.events;
+            assert_eq!(
+                extract_event_type(events.last().unwrap()),
+                "execution_handoff_claimed"
+            );
+            assert_eq!(
+                events[events.len() - 2],
+                RunRecoveryCustody::for_claim(&abandoned.run, generation - 1).event()
+            );
             // The process dies here: no reconciliation and no in-process receipt survives.
         }
         let claim = store
@@ -36473,6 +38202,7 @@ mod tests {
             session_admission_facts: None,
             work_binding: None,
             run_start_idempotency: None,
+            evaluation_admission: None,
             agent_id: None,
             model: None,
             model_selection_mode: ModelSelectionMode::ExplicitOffering,
@@ -36487,6 +38217,7 @@ mod tests {
                 api_key: "provider-api-secret".to_string(),
                 base_url: "https://models.example.com/v1".to_string(),
                 provider: "openai".to_string(),
+                pricing: None,
                 cache_capability: None,
                 thinking_capability: None,
                 fixed_temperature: None,
@@ -36516,6 +38247,7 @@ mod tests {
             runtime_mcp_bindings: Vec::new(),
             context: None,
             edge_executor_id: None,
+            evaluation_workspace_base_root: None,
             capabilities: Vec::new(),
             forward_headers,
             execution_budget: Some(ExecutionBudget {
@@ -36570,6 +38302,7 @@ mod tests {
             session_admission_facts: None,
             work_binding: None,
             run_start_idempotency: None,
+            evaluation_admission: None,
             agent_id: None,
             model: Some("gpt-4".to_string()),
             model_selection_mode: ModelSelectionMode::ExplicitOffering,
@@ -36601,6 +38334,7 @@ mod tests {
             runtime_mcp_bindings: Vec::new(),
             context: None,
             edge_executor_id: None,
+            evaluation_workspace_base_root: None,
             capabilities: Vec::new(),
             forward_headers: std::collections::HashMap::new(),
             execution_budget: None,
@@ -36690,6 +38424,7 @@ mod tests {
                     session_admission_facts: None,
                     work_binding: None,
                     run_start_idempotency: None,
+                    evaluation_admission: None,
                     agent_id: None,
                     model: None,
                     model_selection_mode: ModelSelectionMode::ExplicitOffering,
@@ -36714,6 +38449,7 @@ mod tests {
                     runtime_mcp_bindings: Vec::new(),
                     context: None,
                     edge_executor_id: None,
+                    evaluation_workspace_base_root: None,
                     capabilities: Vec::new(),
                     forward_headers: std::collections::HashMap::new(),
                     execution_budget: Some(ExecutionBudget {
@@ -39862,6 +41598,19 @@ mod tests {
         let first = first.unwrap();
         let second = second.unwrap();
         assert_eq!(first.len() + second.len(), 1);
+        let durable = store
+            .load_run("u1", "overlapping-recovery")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            durable
+                .events
+                .iter()
+                .filter(|event| event["event_type"] == "run_recovery_claimed")
+                .count(),
+            1
+        );
         assert_eq!(
             store
                 .load_run("u1", "overlapping-recovery")
@@ -39922,7 +41671,11 @@ mod tests {
             .unwrap();
         assert_eq!(run.status, STATUS_RUNNING);
         assert_eq!(run.run_generation, 1);
-        assert!(run.events.is_empty());
+        assert_eq!(
+            run.events,
+            vec![RunRecoveryCustody::for_claim(&run, 0).event()],
+            "the winning claim records custody; stale cancellation adds no terminal event"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

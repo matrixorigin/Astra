@@ -341,6 +341,7 @@ mod tests {
                     thinking_capability: None,
                     context_window: Some(1000),
                     max_completion_tokens: None,
+                    pricing: None,
                     request_headers: None,
                 },
             })

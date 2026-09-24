@@ -28,7 +28,7 @@ use astra_skills::traits::{SkillError, SkillProvider};
 use astra_turn_core::section_types::estimate_text_tokens;
 use astra_turn_core::tool::schema::tool_schema_name;
 
-use crate::skills::{BundledSkillProvider, LocalSkillProvider, UnifiedSkillRegistry};
+use crate::skills::{LocalSkillProvider, UnifiedSkillRegistry};
 
 const REMOTE_SKILL_PAGE_SIZE: u32 = 500;
 const REMOTE_SKILL_MAX_ROWS: u32 = 5_000;
@@ -44,8 +44,6 @@ pub enum SkillCapabilitySource {
     ServerDatabaseVisible,
     /// Skills discovered by the local CLI from cwd walk-up and HOME paths.
     CliFilesystem,
-    /// Skills compiled into the CLI/runtime binary.
-    CliBundled,
 }
 
 /// Full capability set for tests that need the complete catalog. Production
@@ -283,7 +281,6 @@ pub fn skill_sources_for_surface(surface: CapabilitySurface) -> &'static [SkillC
         ],
         CapabilitySurface::CliLocal => &[
             SkillCapabilitySource::CliFilesystem,
-            SkillCapabilitySource::CliBundled,
             SkillCapabilitySource::ServerHome,
             SkillCapabilitySource::ServerDatabaseVisible,
         ],
@@ -311,8 +308,7 @@ pub fn build_server_skill_registry(
 ///
 /// Provider order is intentional:
 /// 1. Project/home filesystem skills from the CLI process.
-/// 2. Bundled dynamic skills compiled into the CLI.
-/// 3. Authenticated remote server catalog, which adds DB skills and API-server
+/// 2. Authenticated remote server catalog, which adds DB skills and API-server
 ///    HOME skills without overriding project-local skills of the same name.
 ///
 /// `project_root` anchors the project-local filesystem provider. When `None`,
@@ -349,7 +345,6 @@ fn cli_local_skill_registry(
         Some(root) => registry.add_provider(Box::new(LocalSkillProvider::with_project_root(root))),
         None => registry.add_provider(Box::new(LocalSkillProvider::standard())),
     }
-    registry.add_provider(Box::new(BundledSkillProvider::with_defaults()));
     if let Some(provider) = remote_catalog {
         registry.add_provider(Box::new(provider));
     }
@@ -779,7 +774,6 @@ mod tests {
             skill_sources_for_surface(CapabilitySurface::CliLocal),
             &[
                 SkillCapabilitySource::CliFilesystem,
-                SkillCapabilitySource::CliBundled,
                 SkillCapabilitySource::ServerHome,
                 SkillCapabilitySource::ServerDatabaseVisible,
             ],

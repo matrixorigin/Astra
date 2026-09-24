@@ -1055,7 +1055,7 @@ mod tests {
                 .mount(&server)
                 .await;
             let name = format!("private-{generation}");
-            let record = json!({"skill_id": name, "skill_name": name, "version": "1.0.0",
+            let record = json!({"skill_id": name, "skill_name": name, "version": "1.0.0", "is_owned": true,
                 "metadata": {"instructions": format!("Private instructions for {generation}")}});
             Mock::given(method("GET"))
                 .and(path("/skills"))

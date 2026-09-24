@@ -25,6 +25,9 @@ const MAX_CAUSAL_CHAIN_EVENTS: i64 = 500;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventIngestionSource {
     Client,
+    /// Internal server evidence. Public event routes never select this
+    /// source; it marks records that may participate in server-owned replay.
+    Server,
     SyncOutbox,
 }
 
@@ -193,7 +196,7 @@ fn verified_sync_outbox_payload_hash_for_source(
     metadata: Option<&serde_json::Value>,
 ) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
     match source {
-        EventIngestionSource::Client => {
+        EventIngestionSource::Client | EventIngestionSource::Server => {
             if metadata.and_then(sync_outbox_payload_hash).is_some() {
                 return Err(error_response(
                     StatusCode::BAD_REQUEST,
@@ -589,6 +592,33 @@ impl EventService for DatabaseEventService {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let session_id = normalize_required_event_field("session_id", session_id)?;
         let event_type = normalize_required_event_field("event_type", event_type)?;
+        if ingestion_source == EventIngestionSource::Client
+            && metadata
+                .as_ref()
+                .and_then(|value| value.get("astra_ingestion_source"))
+                .is_some()
+        {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "astra_ingestion_source is reserved for server-owned events",
+            ));
+        }
+        let metadata = if ingestion_source == EventIngestionSource::Server {
+            let mut value = metadata.unwrap_or_else(|| serde_json::json!({}));
+            let object = value.as_object_mut().ok_or_else(|| {
+                error_response(
+                    StatusCode::BAD_REQUEST,
+                    "server-owned event metadata must be a JSON object",
+                )
+            })?;
+            object.insert(
+                "astra_ingestion_source".to_string(),
+                serde_json::Value::String("server".to_string()),
+            );
+            Some(value)
+        } else {
+            metadata
+        };
 
         // Start transaction for atomicity of INSERT event + UPDATE session
         let mut connection = CancellationSafePoolConnection::acquire(&pool)

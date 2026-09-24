@@ -125,8 +125,6 @@ pub struct UserRoleArgs {
 #[derive(Subcommand, Debug)]
 pub enum ModelCmd {
     List,
-    /// Compare batched judgments using two Offerings and your existing login; deployment settings are unchanged.
-    Compare(ModelCompareArgs),
     Add(ModelAddArgs),
     Show(ModelShowArgs),
     Delete(ModelDeleteArgs),
@@ -137,23 +135,6 @@ pub enum ModelCmd {
     Load(ModelLoadArgs),
     /// Update model fields (api-key, base-url, quirks, active status).
     Update(ModelUpdateArgs),
-}
-
-#[derive(Args, Debug)]
-pub struct ModelCompareArgs {
-    /// Baseline Offering ID from `astra admin model list`.
-    pub baseline: String,
-    /// Candidate Offering ID (e.g. your registered Jev Offering).
-    pub candidate: String,
-    /// JSON case file. Omit to compare the built-in memory judgment cases.
-    #[arg(long)]
-    pub cases: Option<std::path::PathBuf>,
-    /// Repetitions; backend order alternates between repetitions.
-    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..))]
-    pub repeat: u32,
-    /// New report directory. Defaults to a unique directory under /tmp.
-    #[arg(long)]
-    pub output: Option<std::path::PathBuf>,
 }
 
 #[derive(Args, Debug)]

@@ -30,6 +30,11 @@ pub(crate) async fn approval_preflight_result(
                     "rejection_code".to_string(),
                     Value::String("approval_denied".to_string()),
                 ),
+                (
+                    "disposition".to_string(),
+                    Value::String("rejected".to_string()),
+                ),
+                ("execution_started".to_string(), Value::Bool(false)),
                 ("blocked".to_string(), Value::Bool(true)),
                 ("retryable".to_string(), Value::Bool(false)),
             ]));
@@ -80,6 +85,8 @@ mod tests {
         let metadata = result.metadata.expect("denial must be machine-readable");
         assert_eq!(metadata["error_kind"], "approval_denied");
         assert_eq!(metadata["rejection_code"], "approval_denied");
+        assert_eq!(metadata["disposition"], "rejected");
+        assert_eq!(metadata["execution_started"], false);
         assert_eq!(metadata["retryable"], false);
     }
 

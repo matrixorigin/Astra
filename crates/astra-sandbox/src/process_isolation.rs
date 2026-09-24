@@ -257,6 +257,24 @@ pub struct BashInvocationOwner {
 }
 
 impl BashInvocationOwner {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prepare_supervised(
+        target_program: &str,
+        target_args: &[String],
+    ) -> std::io::Result<(std::process::Command, Self)> {
+        let (command, supervisor) = InvocationSupervisor::prepare(target_program, target_args)?;
+        Ok((
+            command,
+            Self {
+                process_scope: CgroupGuard {
+                    cg_path: None,
+                    procs_path: None,
+                },
+                supervisor: Some(supervisor),
+            },
+        ))
+    }
+
     /// Prepare the actual child command and its ownership boundary. Call
     /// [`Self::install`] after the caller has completed environment/sandbox
     /// filtering and immediately before spawn.
@@ -1120,6 +1138,7 @@ fn mount_namespace_available() -> bool {
                 "astra-mount-probe",
                 "true",
                 "/",
+                ".",
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1149,6 +1168,7 @@ fn network_namespace_available() -> bool {
     })
 }
 
+#[cfg(test)]
 fn requested_namespaces_available(config: &IsolationConfig) -> bool {
     unshare_available()
         && (!config.mount_namespace || mount_namespace_available())
@@ -2022,21 +2042,18 @@ pub async fn execute_isolated(
 }
 
 async fn settle_isolated_owner_after_exit(
-    owner: BashInvocationOwner,
-    leader_pid: Option<u32>,
+    mut guard: IsolatedScopeAbortGuard,
 ) -> Option<ScopeSettlement> {
-    tokio::task::spawn_blocking(move || {
-        let mut owner = owner;
-        owner.settle_after_exit_detailed(leader_pid)
-    })
-    .await
-    .ok()
-    .flatten()
+    tokio::task::spawn_blocking(move || guard.settle_and_cleanup())
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Synchronous abort boundary for an in-flight isolated invocation.
 ///
-/// Explicit completion paths disarm this after awaiting a full settlement.
+/// Every blocking handoff moves this guard, including its resource cgroup.
+/// Explicit completion paths settle and clean up before disarming it.
 /// If the enclosing future is instead dropped (task abort, shutdown, outer
 /// timeout), this guard runs before the child local is dropped. Supervised
 /// invocations receive a control-plane cancellation and are deliberately not
@@ -2063,12 +2080,27 @@ impl IsolatedScopeAbortGuard {
         }
     }
 
-    fn take_owner(&mut self) -> Option<BashInvocationOwner> {
-        self.owner.take()
+    fn is_supervised(&self) -> bool {
+        self.owner
+            .as_ref()
+            .is_some_and(BashInvocationOwner::is_supervised)
     }
 
-    fn disarm(&mut self) {
+    fn settle_and_cleanup(&mut self) -> Option<ScopeSettlement> {
+        let settlement = if let Some(owner) = self.owner.as_mut() {
+            owner.settle_after_exit_detailed(self.leader_pid)
+        } else {
+            settle_process_scope_detailed(self.cg_path.as_deref(), self.leader_pid)
+        };
+        if let Some(path) = self.cg_path.as_deref() {
+            // A supervisor receipt proves ECHILD; the helper may still be
+            // exiting. Never kill it through the resource-only cgroup.
+            if let Err(error) = remove_cgroup_after_exit(path, Duration::from_secs(3)) {
+                tracing::warn!(path = %path.display(), %error, "invocation resource cgroup cleanup failed");
+            }
+        }
         self.armed = false;
+        settlement
     }
 }
 
@@ -2077,17 +2109,90 @@ impl Drop for IsolatedScopeAbortGuard {
         if !self.armed {
             return;
         }
-        if let Some(owner) = self.owner.as_mut() {
-            if owner.is_supervised() {
+        if self.is_supervised() {
+            if let Some(owner) = self.owner.as_mut() {
                 let _ = owner.request_supervised_termination();
-            } else {
-                let _ = owner.settle_after_exit_detailed(self.leader_pid);
             }
-        } else {
-            let _ = settle_process_scope_detailed(self.cg_path.as_deref(), self.leader_pid);
+            if self.cg_path.is_some() {
+                let mut guard = Self::new(self.owner.take(), self.cg_path.take(), self.leader_pid);
+                dispatch_abort_cleanup(
+                    move || {
+                        if guard.settle_and_cleanup().is_none() {
+                            tracing::warn!(
+                                leader_pid = ?guard.leader_pid,
+                                "dropped invocation supervisor did not provide settlement receipt"
+                            );
+                        }
+                    },
+                    |work| {
+                        std::thread::Builder::new()
+                            .name("astra-scope-cleanup".into())
+                            .spawn(work)
+                            .map(|_| ())
+                    },
+                );
+            }
+            // With no resource cgroup, closing the control pipe is sufficient.
+            return;
         }
-        if let Some(cg_path) = self.cg_path.as_deref() {
-            cleanup_cgroup(cg_path);
+        let _ = self.settle_and_cleanup();
+    }
+}
+
+/// Keep the job locally until a worker exists. Thread creation failure must
+/// not discard the only cleanup owner; the exceptional fallback is bounded
+/// synchronous cleanup, independent of the Tokio runtime's lifetime.
+fn dispatch_abort_cleanup<F, S>(work: F, spawn: S)
+where
+    F: FnOnce() + Send + 'static,
+    S: FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+{
+    let (sender, receiver) = std::sync::mpsc::channel::<F>();
+    match spawn(Box::new(move || {
+        if let Ok(work) = receiver.recv() {
+            work();
+        }
+    })) {
+        Ok(()) => {
+            if let Err(error) = sender.send(work) {
+                tracing::warn!(
+                    "resource cgroup cleanup worker exited before handoff; cleaning synchronously"
+                );
+                (error.0)();
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "cannot spawn resource cgroup cleanup worker; cleaning synchronously");
+            work();
+        }
+    }
+}
+
+async fn start_isolated_owner(
+    guard: IsolatedScopeAbortGuard,
+    pid: u32,
+) -> Result<(IsolatedScopeAbortGuard, std::io::Result<()>), tokio::sync::oneshot::error::RecvError>
+{
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        let mut guard = guard;
+        if sender.is_closed() {
+            return;
+        }
+        let result = guard.owner.as_mut().unwrap().started(pid);
+        let _ = sender.send((guard, result));
+    });
+    receiver.await
+}
+
+fn remove_cgroup_after_exit(path: &Path, timeout: Duration) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match std::fs::remove_dir(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if std::time::Instant::now() >= deadline => return Err(error),
+            Err(_) => std::thread::sleep(PROCESS_POLL_INTERVAL),
         }
     }
 }
@@ -2097,53 +2202,38 @@ impl Drop for IsolatedScopeAbortGuard {
 /// release exactly the processes this boundary exists to contain.
 async fn terminate_isolated_child(
     child: &mut tokio::process::Child,
-    owner: Option<BashInvocationOwner>,
-    cg_path: Option<&Path>,
-    leader_pid: Option<u32>,
+    mut guard: IsolatedScopeAbortGuard,
 ) -> Option<ScopeSettlement> {
-    let Some(mut owner) = owner else {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        return settle_process_scope_detailed(cg_path, leader_pid);
-    };
-
-    if owner.is_supervised() {
-        let owner_result = tokio::task::spawn_blocking(move || {
-            let requested = owner.request_supervised_termination();
-            (owner, requested)
+    if guard.is_supervised() {
+        let guard_result = tokio::task::spawn_blocking(move || {
+            let _ = guard
+                .owner
+                .as_mut()
+                .unwrap()
+                .request_supervised_termination();
+            guard
         })
         .await;
-        let Ok((returned_owner, requested)) = owner_result else {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+        let Ok(returned_guard) = guard_result else {
+            // The worker drops the owning guard on failure. Do not race its
+            // cleanup by killing the subreaper before its descendants settle.
+            let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
             return None;
         };
-        owner = returned_owner;
-        if !requested {
-            // The helper may already be finishing naturally. Give it the same
-            // bounded settlement opportunity, but never promote a forced
-            // helper kill into an authoritative receipt.
-            if tokio::time::timeout(Duration::from_secs(3), child.wait())
-                .await
-                .is_err()
-            {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return None;
-            }
-        } else if tokio::time::timeout(Duration::from_secs(3), child.wait())
+        guard = returned_guard;
+        if tokio::time::timeout(Duration::from_secs(3), child.wait())
             .await
             .is_err()
         {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            // Retain cleanup in the guard's drop path if the helper has not
+            // finished. A forced helper kill cannot establish settlement.
             return None;
         }
     } else {
         let _ = child.kill().await;
         let _ = child.wait().await;
     }
-    settle_isolated_owner_after_exit(owner, leader_pid).await
+    settle_isolated_owner_after_exit(guard).await
 }
 
 /// Execute a command while retaining process ownership through cancellation.
@@ -2155,16 +2245,143 @@ pub async fn execute_isolated_with_cancel(
     config: &IsolationConfig,
     cancel_token: Option<&CancellationToken>,
 ) -> IsolatedOutput {
-    execute_isolated_with_cancel_impl(command, env, config, cancel_token, None).await
+    execute_isolated_with_cancel_impl(command.into(), env, config, cancel_token, false, None).await
 }
 
-async fn execute_isolated_with_cancel_impl(
+/// Execute with the invocation-private supervisor as the required process
+/// owner. Callers use this when a durable receipt must not depend on delegated
+/// cgroup settlement behavior.
+pub async fn execute_isolated_with_cancel_supervised(
     command: &str,
     env: &std::collections::HashMap<String, String>,
     config: &IsolationConfig,
     cancel_token: Option<&CancellationToken>,
+) -> IsolatedOutput {
+    execute_isolated_with_cancel_impl(command.into(), env, config, cancel_token, true, None).await
+}
+
+/// Versioned proof from the private launcher channel, independent of process
+/// settlement. `Ok(code)` proves setup/exec and a matching launcher exit;
+/// `Err` includes interrupted execution and setup/exec failure. Consumers must
+/// also require authoritative settlement in `ConfinedOutput::process`.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellConfinementEvidence {
+    LinuxRestrictedRootV1 { receipt: Result<i32, String> },
+}
+
+/// Confined execution keeps the existing process result and its ownership facts.
+/// Only a verified confinement receipt may supply a verifier exit result.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct ConfinedOutput {
+    pub process: IsolatedOutput,
+    pub confinement: ShellConfinementEvidence,
+}
+
+#[cfg(target_os = "linux")]
+impl ConfinedOutput {
+    /// Portable projection shared by model tools and evaluator-owned verifiers.
+    pub fn execution_evidence(&self) -> astra_runtime_env::ShellExecutionEvidence {
+        use astra_runtime_env::{
+            ShellExecutionEvidence, ShellScopeOwnership, ShellSettlementEvidence,
+            ShellSetupEvidence,
+        };
+        let ShellConfinementEvidence::LinuxRestrictedRootV1 { receipt } = &self.confinement;
+        let process = &self.process;
+        ShellExecutionEvidence {
+            schema_version: 1,
+            profile: crate::ShellLaunchPlan::PROFILE_ID.into(),
+            execution_started: process.execution_started,
+            setup: match receipt {
+                Ok(code) => ShellSetupEvidence::Verified { exit_code: *code },
+                Err(_) => ShellSetupEvidence::Unverified {
+                    reason_code: "setup_or_exec_unverified".into(),
+                },
+            },
+            settlement: ShellSettlementEvidence {
+                scope_settled: process.scope_settled,
+                ownership: process.scope_ownership.map(|owner| match owner {
+                    ScopeOwnership::InvocationCgroup => ShellScopeOwnership::InvocationCgroup,
+                    ScopeOwnership::InvocationSupervisor => {
+                        ShellScopeOwnership::InvocationSupervisor
+                    }
+                    ScopeOwnership::ForegroundProcessGroup => {
+                        ShellScopeOwnership::ForegroundProcessGroup
+                    }
+                }),
+                descendants_terminated: process.descendants_terminated,
+            },
+            timed_out: process.timed_out,
+            cancelled: process.cancelled,
+        }
+    }
+}
+
+/// Execute a single-use plan prepared by `ShellProcessBoundary`. The plan fixes
+/// the trusted toolchain manifest, protected direct workspace children, guest
+/// cwd and environment. Only resource limits, timeout and output limits are read
+/// from `config`; its namespace, host paths and pinned cwd fields are ignored.
+/// The executable must dispatch `run_invocation_supervisor_if_requested`.
+/// No legacy namespace probe or fallback is used.
+#[cfg(target_os = "linux")]
+pub async fn execute_confined_with_cancel(
+    plan: crate::ShellLaunchPlan,
+    config: &IsolationConfig,
+    cancel_token: Option<&CancellationToken>,
+) -> ConfinedOutput {
+    let mut receipt = Err("confinement setup/exec was not verified".to_string());
+    let process = execute_isolated_with_cancel_impl(
+        ExecutionInput::Confined {
+            plan,
+            receipt: &mut receipt,
+        },
+        &std::collections::HashMap::new(),
+        config,
+        cancel_token,
+        true,
+        None,
+    )
+    .await;
+    ConfinedOutput {
+        process,
+        confinement: ShellConfinementEvidence::LinuxRestrictedRootV1 { receipt },
+    }
+}
+
+enum ExecutionInput<'a> {
+    Shell(&'a str),
+    #[cfg(target_os = "linux")]
+    Confined {
+        plan: crate::ShellLaunchPlan,
+        receipt: &'a mut Result<i32, String>,
+    },
+}
+
+impl<'a> From<&'a str> for ExecutionInput<'a> {
+    fn from(command: &'a str) -> Self {
+        Self::Shell(command)
+    }
+}
+
+async fn execute_isolated_with_cancel_impl(
+    input: ExecutionInput<'_>,
+    env: &std::collections::HashMap<String, String>,
+    config: &IsolationConfig,
+    cancel_token: Option<&CancellationToken>,
+    force_supervisor: bool,
     supervisor_helper: Option<(PathBuf, Vec<String>)>,
 ) -> IsolatedOutput {
+    let confined = !matches!(&input, ExecutionInput::Shell(_));
+    #[cfg(target_os = "linux")]
+    let (command, plan, mut confinement_result) = match input {
+        ExecutionInput::Shell(command) => (command, None, None),
+        ExecutionInput::Confined { plan, receipt } => ("", Some(plan), Some(receipt)),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let ExecutionInput::Shell(command) = input;
+    #[cfg(target_os = "linux")]
+    let mut launch_receipt = None;
     let preflight_error = |stderr: String| IsolatedOutput {
         stdout: String::new(),
         stderr,
@@ -2180,7 +2397,7 @@ async fn execute_isolated_with_cancel_impl(
         scope_ownership: None,
         descendants_terminated: false,
     };
-    if config.mount_namespace {
+    if !confined && config.mount_namespace {
         #[cfg(unix)]
         let working_dir_is_root = match (
             config.pinned_workspace_root.as_ref(),
@@ -2213,8 +2430,17 @@ async fn execute_isolated_with_cancel_impl(
             );
         }
     }
-    let wants_ns = config.pid_namespace || config.mount_namespace || config.net_namespace;
-    let ns_available = wants_ns && requested_namespaces_available(config);
+    let wants_ns =
+        !confined && (config.pid_namespace || config.mount_namespace || config.net_namespace);
+    let user_pid_namespace_available = !confined && unshare_available();
+    let mount_namespace_available =
+        !confined && (!config.mount_namespace || mount_namespace_available());
+    let network_namespace_available =
+        !confined && (!config.net_namespace || network_namespace_available());
+    let ns_available = wants_ns
+        && user_pid_namespace_available
+        && mount_namespace_available
+        && network_namespace_available;
 
     // Warn operators when namespace isolation was requested but is unavailable.
     // In Strict mode, this is a hard failure — security guarantees are NOT met.
@@ -2227,9 +2453,9 @@ async fn execute_isolated_with_cancel_impl(
         );
         return IsolatedOutput {
             stdout: String::new(),
-            stderr: "Error: namespace isolation unavailable — strict-mode requires \
-                     PID/mount/network namespace isolation (unshare not found or not permitted)"
-                .to_string(),
+            stderr: format!(
+                "Error: namespace isolation unavailable — strict-mode requires PID/mount/network namespace isolation (user_pid={user_pid_namespace_available}, mount={mount_namespace_available}, network={network_namespace_available})"
+            ),
             exit_code: None,
             timed_out: false,
             cancelled: false,
@@ -2243,7 +2469,7 @@ async fn execute_isolated_with_cancel_impl(
             descendants_terminated: false,
         };
     }
-    let mount_projection = if config.mount_namespace {
+    let mount_projection = if !confined && config.mount_namespace {
         let workspace_root = match config.workspace_root.canonicalize() {
             Ok(path) => path,
             Err(error) => {
@@ -2374,7 +2600,32 @@ async fn execute_isolated_with_cancel_impl(
     // Resource-limit cgroups remain preferred. If the host cannot create
     // one, use the same invocation owner as Edge/shared Bash so a setsid or
     // double-fork cannot escape the server-local execution boundary.
-    let (mut std_cmd, mut invocation_owner) = if cg_path.is_some() {
+    #[cfg(target_os = "linux")]
+    let prepared_confined = if let Some(plan) = plan {
+        #[cfg(test)]
+        let prepared = plan.into_supervised_test_command();
+        #[cfg(not(test))]
+        let prepared = plan.into_supervised_command();
+        match prepared {
+            Ok((command, owner, receipt)) => {
+                launch_receipt = Some(receipt);
+                Some((command, Some(owner)))
+            }
+            Err(error) => {
+                if let Some(ref cg) = cg_path {
+                    cleanup_cgroup(cg);
+                }
+                return preflight_error(format!("Failed to prepare confined ownership: {error}"));
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let prepared_confined = None;
+    let (mut std_cmd, mut invocation_owner) = if let Some(prepared) = prepared_confined {
+        prepared
+    } else if cg_path.is_some() && !force_supervisor {
         let mut command = std::process::Command::new(&program);
         command.args(&args);
         (command, None)
@@ -2387,6 +2638,8 @@ async fn execute_isolated_with_cancel_impl(
                 &program,
                 &args,
             )
+        } else if force_supervisor {
+            BashInvocationOwner::prepare_supervised(&program, &args)
         } else {
             BashInvocationOwner::prepare(&program, &args)
         };
@@ -2416,71 +2669,72 @@ async fn execute_isolated_with_cancel_impl(
             }
         }
     };
-    #[cfg(unix)]
-    let pinned_working_dir = config
-        .pinned_working_dir
-        .as_ref()
-        .map(|directory| directory.try_clone())
-        .transpose();
-    #[cfg(unix)]
-    let pinned_working_dir = match pinned_working_dir {
-        Ok(directory) => directory,
-        Err(error) => {
-            return preflight_error(format!(
-                "Error: cannot clone pinned working directory: {error}"
-            ));
+    if !confined {
+        #[cfg(unix)]
+        let pinned_working_dir = config
+            .pinned_working_dir
+            .as_ref()
+            .map(|directory| directory.try_clone())
+            .transpose();
+        #[cfg(unix)]
+        let pinned_working_dir = match pinned_working_dir {
+            Ok(directory) => directory,
+            Err(error) => {
+                return preflight_error(format!(
+                    "Error: cannot clone pinned working directory: {error}"
+                ));
+            }
+        };
+        #[cfg(unix)]
+        if let Some(directory) = pinned_working_dir {
+            use std::os::fd::AsRawFd;
+            unsafe {
+                std_cmd.pre_exec(move || {
+                    if libc::fchdir(directory.as_raw_fd()) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            std_cmd.current_dir(&config.workspace_root);
+        } else {
+            std_cmd.current_dir(&config.working_dir);
         }
-    };
-    #[cfg(unix)]
-    if let Some(directory) = pinned_working_dir {
-        use std::os::fd::AsRawFd;
-        unsafe {
-            std_cmd.pre_exec(move || {
-                if libc::fchdir(directory.as_raw_fd()) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        std_cmd.current_dir(&config.workspace_root);
-    } else {
+        #[cfg(not(unix))]
         std_cmd.current_dir(&config.working_dir);
-    }
-    #[cfg(not(unix))]
-    std_cmd.current_dir(&config.working_dir);
-    std_cmd
-        .env_clear()
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    std_cmd.process_group(0);
+        std_cmd
+            .env_clear()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        std_cmd.process_group(0);
 
-    // Apply filtered environment first (untrusted).
-    for (k, v) in env {
-        std_cmd.env(k, v);
+        // Apply filtered environment first (untrusted).
+        for (k, v) in env {
+            std_cmd.env(k, v);
+        }
     }
     let cgroup_procs_path = cg_path.as_ref().map(|path| path.join("cgroup.procs"));
-    if let Some(owner) = invocation_owner.as_ref() {
-        if let Err(error) = owner.install(&mut std_cmd) {
-            return IsolatedOutput {
-                stdout: String::new(),
-                stderr: format!("Failed to install process ownership: {error}"),
-                exit_code: None,
-                timed_out: false,
-                cancelled: false,
-                execution_started: false,
-                stdout_capped: false,
-                stderr_capped: false,
-                namespace_active: false,
-                cgroup_active: false,
-                scope_settled: false,
-                scope_ownership: None,
-                descendants_terminated: false,
-            };
-        }
-    } else {
-        attach_std_child_to_cgroup(&mut std_cmd, cgroup_procs_path.as_deref());
+    if let Some(owner) = invocation_owner.as_ref()
+        && let Err(error) = owner.install(&mut std_cmd)
+    {
+        return IsolatedOutput {
+            stdout: String::new(),
+            stderr: format!("Failed to install process ownership: {error}"),
+            exit_code: None,
+            timed_out: false,
+            cancelled: false,
+            execution_started: false,
+            stdout_capped: false,
+            stderr_capped: false,
+            namespace_active: false,
+            cgroup_active: false,
+            scope_settled: false,
+            scope_ownership: None,
+            descendants_terminated: false,
+        };
     }
+    attach_std_child_to_cgroup(&mut std_cmd, cgroup_procs_path.as_deref());
     let supervised_invocation = invocation_owner
         .as_ref()
         .is_some_and(BashInvocationOwner::is_supervised);
@@ -2514,7 +2768,14 @@ async fn execute_isolated_with_cancel_impl(
         }
     };
 
-    if let Some(owner) = invocation_owner.take() {
+    // Release launch descriptors retained by pre_exec closures after spawn.
+    drop(cmd);
+
+    // Retain resource cleanup even if dropped during the ownership handshake.
+    let mut scope_abort_guard =
+        IsolatedScopeAbortGuard::new(invocation_owner.take(), cg_path.clone(), child.id());
+
+    if scope_abort_guard.owner.is_some() {
         let child_pid = child.id();
         let Some(started_pid) = child_pid else {
             let _ = child.kill().await;
@@ -2535,22 +2796,13 @@ async fn execute_isolated_with_cancel_impl(
                 descendants_terminated: false,
             };
         };
-        let started = tokio::task::spawn_blocking(move || {
-            let mut owner = owner;
-            let result = owner.started(started_pid);
-            (owner, result)
-        })
-        .await;
-        match started {
-            Ok((owner, Ok(()))) => invocation_owner = Some(owner),
-            Ok((owner, Err(error))) => {
-                let settlement = terminate_isolated_child(
-                    &mut child,
-                    Some(owner),
-                    cg_path.as_deref(),
-                    child_pid,
-                )
-                .await;
+        // Transfer cleanup with the owner, including while the blocking job
+        // is queued. A dropped receiver must not lose the resource cgroup or
+        // start a target whose caller already abandoned the handshake.
+        scope_abort_guard = match start_isolated_owner(scope_abort_guard, started_pid).await {
+            Ok((guard, Ok(()))) => guard,
+            Ok((guard, Err(error))) => {
+                let settlement = terminate_isolated_child(&mut child, guard).await;
                 return IsolatedOutput {
                     stdout: String::new(),
                     stderr: format!("Process ownership handshake failed: {error}"),
@@ -2594,29 +2846,13 @@ async fn execute_isolated_with_cancel_impl(
                     descendants_terminated: false,
                 };
             }
-        }
+        };
     }
-
-    // Declared after `child`, so this guard is dropped first on every abrupt
-    // future teardown. Normal paths explicitly take/disarm it.
-    let mut scope_abort_guard =
-        IsolatedScopeAbortGuard::new(invocation_owner.take(), cg_path.clone(), child.id());
 
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            let leader_pid = child.id();
-            let settlement = terminate_isolated_child(
-                &mut child,
-                scope_abort_guard.take_owner(),
-                cg_path.as_deref(),
-                leader_pid,
-            )
-            .await;
-            scope_abort_guard.disarm();
-            if let Some(ref cg) = cg_path {
-                cleanup_cgroup(cg);
-            }
+            let settlement = terminate_isolated_child(&mut child, scope_abort_guard).await;
             return IsolatedOutput {
                 stdout: String::new(),
                 stderr: "Failed to capture stdout pipe".to_string(),
@@ -2638,18 +2874,7 @@ async fn execute_isolated_with_cancel_impl(
     let stderr = match child.stderr.take() {
         Some(stderr) => stderr,
         None => {
-            let leader_pid = child.id();
-            let settlement = terminate_isolated_child(
-                &mut child,
-                scope_abort_guard.take_owner(),
-                cg_path.as_deref(),
-                leader_pid,
-            )
-            .await;
-            scope_abort_guard.disarm();
-            if let Some(ref cg) = cg_path {
-                cleanup_cgroup(cg);
-            }
+            let settlement = terminate_isolated_child(&mut child, scope_abort_guard).await;
             return IsolatedOutput {
                 stdout: String::new(),
                 stderr: "Failed to capture stderr pipe".to_string(),
@@ -2684,33 +2909,27 @@ async fn execute_isolated_with_cancel_impl(
     loop {
         drain_stream_chunks(&mut rx, &mut capture);
 
-        let leader_pid = child.id();
         match child.try_wait() {
             Ok(Some(status)) => {
-                scope_settlement = if let Some(owner) = scope_abort_guard.take_owner() {
-                    settle_isolated_owner_after_exit(owner, leader_pid).await
-                } else {
-                    settle_process_scope_detailed(cg_path.as_deref(), leader_pid)
-                };
+                scope_settlement = settle_isolated_owner_after_exit(scope_abort_guard).await;
                 exit_code = status.code();
+                #[cfg(target_os = "linux")]
+                if let Some(receipt) = launch_receipt.take() {
+                    let proof = receipt.verify(status).map_err(|error| error.to_string());
+                    exit_code = proof.as_ref().ok().copied();
+                    if let Some(result) = confinement_result.as_mut() {
+                        **result = proof;
+                    }
+                }
                 break;
             }
             Ok(None) => {}
             Err(e) => {
-                let scope_settlement = terminate_isolated_child(
-                    &mut child,
-                    scope_abort_guard.take_owner(),
-                    cg_path.as_deref(),
-                    leader_pid,
-                )
-                .await;
-                scope_abort_guard.disarm();
+                let scope_settlement =
+                    terminate_isolated_child(&mut child, scope_abort_guard).await;
                 let scope_ownership = scope_settlement.map(|settlement| settlement.ownership);
                 let _ = stdout_task.await;
                 let _ = stderr_task.await;
-                if let Some(ref cg) = cg_path {
-                    cleanup_cgroup(cg);
-                }
                 return IsolatedOutput {
                     stdout: String::new(),
                     stderr: format!("Failed to execute: {e}"),
@@ -2733,13 +2952,7 @@ async fn execute_isolated_with_cancel_impl(
         let now = tokio::time::Instant::now();
         if now >= deadline {
             timed_out = true;
-            scope_settlement = terminate_isolated_child(
-                &mut child,
-                scope_abort_guard.take_owner(),
-                cg_path.as_deref(),
-                leader_pid,
-            )
-            .await;
+            scope_settlement = terminate_isolated_child(&mut child, scope_abort_guard).await;
             // Abort I/O reader tasks immediately — grandchild processes may
             // still hold the pipes open (e.g. `sleep` surviving shell kill).
             abort_stream_pumps = true;
@@ -2755,12 +2968,7 @@ async fn execute_isolated_with_cancel_impl(
             tokio::select! {
                 _ = token.cancelled() => {
                     cancelled = true;
-                    scope_settlement = terminate_isolated_child(
-                        &mut child,
-                        scope_abort_guard.take_owner(),
-                        cg_path.as_deref(),
-                        leader_pid,
-                    ).await;
+                    scope_settlement = terminate_isolated_child(&mut child, scope_abort_guard).await;
                     abort_stream_pumps = true;
                     break;
                 }
@@ -2777,13 +2985,6 @@ async fn execute_isolated_with_cancel_impl(
     }
     drain_stream_pumps_after_exit(stdout_task, stderr_task, &mut rx, &mut capture).await;
 
-    scope_abort_guard.disarm();
-
-    // ── Cleanup cgroup ───────────────────────────────────────────────
-    if let Some(ref cg) = cg_path {
-        cleanup_cgroup(cg);
-    }
-
     let StreamOutputCapture {
         stdout,
         stderr,
@@ -2799,6 +3000,12 @@ async fn execute_isolated_with_cancel_impl(
     if timed_out || stderr_capped {
         trim_incomplete_trailing_line(&mut stderr);
     }
+
+    #[cfg(target_os = "linux")]
+    let ns_available = ns_available
+        || confinement_result
+            .as_ref()
+            .is_some_and(|result| result.is_ok());
 
     IsolatedOutput {
         stdout,
@@ -3184,8 +3391,15 @@ mod tests {
                 "--nocapture".to_string(),
             ],
         );
-        let out =
-            execute_isolated_with_cancel_impl(&command, &env, &config, None, Some(helper)).await;
+        let out = execute_isolated_with_cancel_impl(
+            command.as_str().into(),
+            &env,
+            &config,
+            None,
+            false,
+            Some(helper),
+        )
+        .await;
 
         assert_eq!(out.exit_code, Some(0), "{out:?}");
         assert!(out.scope_settled, "{out:?}");
@@ -3204,14 +3418,16 @@ mod tests {
     async fn execute_isolated_cancel_stops_supervised_setsid_descendant_before_helper() {
         let temp = tempfile::tempdir().expect("tempdir");
         let marker = temp.path().join("cancel-late-marker");
+        let ready = temp.path().join("cancel-ready");
         let mut config = IsolationConfig::disabled(temp.path().to_path_buf());
         config.memory_limit_bytes = 0;
         config.cpu_quota = 0.0;
         let env =
             std::collections::HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
         let command = format!(
-            "setsid sh -c 'sleep 0.35; echo escaped > \"{}\"' >/dev/null 2>&1 & \
-             echo ready; sleep 60",
+            "setsid sh -c 'echo ready > \"{}\"; sleep 0.35; echo escaped > \"{}\"' >/dev/null 2>&1 & \
+             sleep 60",
+            ready.display(),
             marker.display()
         );
         let helper = (
@@ -3223,13 +3439,30 @@ mod tests {
             ],
         );
         let cancel = CancellationToken::new();
-        let run =
-            execute_isolated_with_cancel_impl(&command, &env, &config, Some(&cancel), Some(helper));
+        let run = execute_isolated_with_cancel_impl(
+            command.as_str().into(),
+            &env,
+            &config,
+            Some(&cancel),
+            false,
+            Some(helper),
+        );
         tokio::pin!(run);
-        tokio::select! {
-            output = &mut run => panic!("command exited before cancellation: {output:?}"),
-            _ = tokio::time::sleep(Duration::from_millis(80)) => cancel.cancel(),
-        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    output = &mut run => panic!("command exited before cancellation: {output:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                        if ready.exists() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("supervised command ready");
+        cancel.cancel();
         let out = run.await;
 
         assert!(out.cancelled, "{out:?}");
@@ -3247,19 +3480,39 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn dropping_execute_future_still_settles_supervised_setsid_descendant() {
+        assert_dropped_supervised_future_cleanup(false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "system: requires delegated cgroup v2 memory and CPU controllers"]
+    async fn dropping_execute_future_removes_resource_cgroup() {
+        let probe = apply_cgroup(1024 * 1024 * 1024, 2.0);
+        if !probe.active() {
+            eprintln!("skipping: delegated resource cgroups unavailable");
+            return;
+        }
+        drop(probe);
+        assert_dropped_supervised_future_cleanup(true).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_dropped_supervised_future_cleanup(resources: bool) {
         let temp = tempfile::tempdir().expect("tempdir");
         let ready = temp.path().join("ready");
         let marker = temp.path().join("abort-late-marker");
         let mut config = IsolationConfig::disabled(temp.path().to_path_buf());
-        config.memory_limit_bytes = 0;
-        config.cpu_quota = 0.0;
+        if !resources {
+            config.memory_limit_bytes = 0;
+            config.cpu_quota = 0.0;
+        }
         let env =
             std::collections::HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
         let command = format!(
             "setsid sh -c 'sleep 0.35; echo escaped > \"{}\"' >/dev/null 2>&1 & \
-             echo ready > \"{}\"; sleep 60",
+             cat /proc/self/cgroup > \"{ready}.tmp\"; mv \"{ready}.tmp\" \"{ready}\"; sleep 60",
             marker.display(),
-            ready.display()
+            ready = ready.display()
         );
         let helper = (
             std::env::current_exe().expect("test executable"),
@@ -3270,7 +3523,15 @@ mod tests {
             ],
         );
         let run = tokio::spawn(async move {
-            execute_isolated_with_cancel_impl(&command, &env, &config, None, Some(helper)).await
+            execute_isolated_with_cancel_impl(
+                command.as_str().into(),
+                &env,
+                &config,
+                None,
+                false,
+                Some(helper),
+            )
+            .await
         });
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -3281,14 +3542,262 @@ mod tests {
             ready.exists(),
             "target never reached the post-daemon checkpoint"
         );
+        let resource_cgroup = resources.then(|| {
+            let membership = std::fs::read_to_string(&ready).unwrap();
+            let relative = membership.trim().strip_prefix("0::").unwrap();
+            let path = Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
+            assert!(
+                path.file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("astra-tool-")
+            );
+            assert!(path.exists());
+            path
+        });
         run.abort();
         assert!(run.await.unwrap_err().is_cancelled());
+
+        if let Some(path) = resource_cgroup {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+            while path.exists() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(PROCESS_POLL_INTERVAL).await;
+            }
+            assert!(!path.exists(), "resource cgroup leaked: {}", path.display());
+        }
 
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(
             !marker.exists(),
             "abrupt future drop released a daemonized descendant"
         );
+    }
+
+    #[test]
+    fn abort_cleanup_retains_job_when_worker_spawn_fails() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        dispatch_abort_cleanup(
+            move || sender.send(()).unwrap(),
+            |_| Err(std::io::Error::other("injected spawn failure")),
+        );
+        receiver.try_recv().unwrap();
+    }
+
+    #[test]
+    fn resource_cgroup_cleanup_failure_is_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("occupied"), "").unwrap();
+        assert!(remove_cgroup_after_exit(temp.path(), Duration::ZERO).is_err());
+        assert!(temp.path().exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn abandoned_queued_handshake_retains_cleanup_until_worker_runs() {
+        assert_abandoned_owner_handoff("startup", false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn abandoned_queued_termination_retains_cleanup_until_worker_runs() {
+        assert_abandoned_owner_handoff("termination", false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn abandoned_queued_normal_settlement_retains_cleanup_until_worker_runs() {
+        assert_abandoned_owner_handoff("settlement", false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn queued_owner_handoffs_retain_cleanup_through_runtime_shutdown() {
+        for phase in ["startup", "termination", "settlement"] {
+            assert_abandoned_owner_handoff(phase, true);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_abandoned_owner_handoff(phase: &str, shutdown: bool) {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("resource-cgroup");
+        std::fs::create_dir(&path).unwrap();
+        // Model a populated resource cgroup without requiring delegation.
+        // Cleanup must neither remove it early nor write cgroup.kill.
+        let occupied = path.join("cgroup.kill");
+        std::fs::write(&occupied, "untouched").unwrap();
+        let marker = temp.path().join("started");
+        let target = format!(
+            "echo started > '{}'; {}",
+            marker.display(),
+            if phase == "settlement" {
+                "exit 0"
+            } else {
+                "sleep 60"
+            }
+        );
+        let (mut command, mut owner) = BashInvocationOwner::prepare_with_supervisor_helper(
+            std::env::current_exe().unwrap(),
+            [
+                "--exact".to_string(),
+                SUPERVISOR_HELPER_TEST.to_string(),
+                "--nocapture".to_string(),
+            ],
+            "/bin/sh",
+            &["-c".to_string(), target],
+        )
+        .unwrap();
+        command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        owner.install(&mut command).unwrap();
+        let mut command = tokio::process::Command::from(command);
+        let mut child = {
+            let _entered = runtime.enter();
+            command.spawn().unwrap()
+        };
+        drop(command);
+        let pid = child.id().unwrap();
+        // Close helper-only copies even when START is deliberately queued.
+        owner.supervisor.as_mut().unwrap().spawned();
+        if phase != "startup" {
+            owner.started(pid).unwrap();
+        }
+        if phase == "settlement" {
+            let status = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), child.wait())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            });
+            assert!(status.success());
+            assert!(marker.exists());
+        }
+        let guard = IsolatedScopeAbortGuard::new(Some(owner), Some(path.clone()), Some(pid));
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (entered, ready) = std::sync::mpsc::channel();
+        let blocker = runtime.spawn_blocking(move || {
+            entered.send(()).unwrap();
+            blocked.recv().unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(3)).unwrap();
+        runtime.block_on(async {
+            let mut handoff: std::pin::Pin<Box<dyn Future<Output = ()>>> = match phase {
+                "startup" => Box::pin(async {
+                    let _ = start_isolated_owner(guard, pid).await;
+                }),
+                "termination" => Box::pin(async {
+                    let _ = terminate_isolated_child(&mut child, guard).await;
+                }),
+                "settlement" => Box::pin(async {
+                    let _ = settle_isolated_owner_after_exit(guard).await;
+                }),
+                _ => unreachable!(),
+            };
+            // Poll exactly through the blocking handoff; no scheduler timing
+            // assumption decides whether the job was actually enqueued.
+            std::future::poll_fn(|cx| {
+                assert!(handoff.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            drop(handoff);
+        });
+        std::thread::sleep(Duration::from_millis(3_100));
+        assert!(path.exists(), "cleanup was detached from the queued owner");
+        assert_eq!(std::fs::read_to_string(&occupied).unwrap(), "untouched");
+        std::fs::remove_file(&occupied).unwrap();
+        // Shutdown may discard queued closures or run them after the worker
+        // is released. Both cases must retain the same RAII cleanup owner.
+        let runtime = if shutdown {
+            runtime.shutdown_background();
+            None
+        } else {
+            Some(runtime)
+        };
+        release.send(()).unwrap();
+        drop(blocker);
+        wait_for_handoff_cleanup(&path);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "supervisor did not exit"
+            );
+            std::thread::sleep(PROCESS_POLL_INTERVAL);
+        }
+        if phase == "startup" {
+            assert!(
+                !marker.exists(),
+                "abandoned queued startup executed its target"
+            );
+        }
+        drop(runtime);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_handoff_cleanup(path: &Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(PROCESS_POLL_INTERVAL);
+        }
+        assert!(!path.exists(), "queued resource cleanup authority was lost");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn abort_cleanup_waits_for_supervisor_receipt_before_removing_cgroup() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("resource-cgroup");
+        std::fs::create_dir(&path).unwrap();
+        let (_, mut owner) = BashInvocationOwner::prepare_with_supervisor_helper(
+            std::env::current_exe().unwrap(),
+            Vec::<String>::new(),
+            "/bin/true",
+            &[],
+        )
+        .unwrap();
+        let supervisor = owner.supervisor.as_mut().unwrap();
+        let mut control = File::from(supervisor.child_control_read.take().unwrap());
+        let mut receipt = File::from(supervisor.child_receipt_write.take().unwrap());
+        supervisor.ready = true;
+        supervisor.started = true;
+        let nonce = supervisor.nonce.clone();
+        drop(IsolatedScopeAbortGuard::new(
+            Some(owner),
+            Some(path.clone()),
+            Some(123),
+        ));
+        let mut instruction = [0];
+        control.read_exact(&mut instruction).unwrap();
+        assert_eq!(instruction, [b'C']);
+        assert!(path.exists(), "removed before owner settlement");
+        // Receipt alone is insufficient: the supervisor still owns its pipe.
+        writeln!(
+            receipt,
+            "ASTRA_PROCESS_SUPERVISOR {SUPERVISOR_PROTOCOL_VERSION} SETTLED_ECHILD {nonce} 123 1"
+        )
+        .unwrap();
+        assert!(path.exists(), "removed before supervisor EOF");
+        drop(receipt);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(PROCESS_POLL_INTERVAL);
+        }
+        assert!(!path.exists(), "resource cleanup did not complete");
     }
 
     #[cfg(unix)]

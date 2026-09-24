@@ -23,6 +23,7 @@ pub mod diagnostic_log;
 pub mod diff_presenter;
 pub mod edge_lifecycle;
 pub mod effects;
+pub(crate) mod evaluation;
 pub mod execution_state_summary;
 pub(crate) mod exit_code;
 pub mod followup_suggestion;

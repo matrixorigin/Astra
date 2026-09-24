@@ -1153,13 +1153,6 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             let perm = ctx.state.perm_manager.mode().chip_text().to_owned();
             let skills = ctx.state.unified_skill_registry.len();
             let version = env!("CARGO_PKG_VERSION");
-            let pending = ctx
-                .state
-                .skill_improvement_tracker
-                .pending_proposal
-                .as_ref()
-                .map(|p| p.skill_name.clone())
-                .unwrap_or_else(|| "<none>".into());
             let recent_tools = if ctx.state.recent_tools.is_empty() {
                 "<none>".to_string()
             } else {
@@ -1179,7 +1172,6 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 ("permission", perm),
                 ("skills loaded", skills.to_string()),
                 ("turn", ctx.state.turn.to_string()),
-                ("pending improve", pending),
                 ("recent tools", recent_tools),
                 ("context width", format!("{} cols", ctx.width)),
             ];

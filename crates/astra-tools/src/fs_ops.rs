@@ -3,6 +3,10 @@
 //! All operations are sandboxed to a workspace root directory. Path traversal
 //! via `..` is normalized before the boundary check to prevent escapes.
 
+#[path = "native_fs.rs"]
+mod native_fs;
+pub(crate) use native_fs::{FileAccess, FileAuthority};
+
 use std::io::Read;
 #[cfg(test)]
 use std::io::{Seek, SeekFrom};
@@ -535,10 +539,11 @@ fn should_skip_path_identity_dir(path: &Path) -> bool {
 }
 
 pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
-    read_file_inner(workspace_root, args).with_native_recovery_model_projection()
+    read_file_inner(workspace_root, args, &FileAccess::default())
+        .with_native_recovery_model_projection()
 }
 
-fn read_file_inner(workspace_root: &Path, args: &Value) -> ToolResult {
+fn read_file_inner(workspace_root: &Path, args: &Value, access: &FileAccess) -> ToolResult {
     if let Err(error) = validate_read_file_args(args) {
         return ToolResult::error(error);
     }
@@ -556,7 +561,7 @@ fn read_file_inner(workspace_root: &Path, args: &Value) -> ToolResult {
     {
         return ToolResult::error(error);
     }
-    let path = match resolve_existing_path_for_tool(workspace_root, path_str, "read_file") {
+    let path = match access.resolve_existing(workspace_root, path_str, "read_file") {
         Ok(p) => p,
         Err(e) => return e,
     };
@@ -574,7 +579,7 @@ fn read_file_inner(workspace_root: &Path, args: &Value) -> ToolResult {
         .unwrap_or(false);
     let has_range = start_line.is_some() || end_line.is_some();
 
-    let metadata = match std::fs::metadata(&path) {
+    let metadata = match access.metadata(&path) {
         Ok(meta) => meta,
         Err(e) => return ToolResult::error(format!("Error: Cannot read file: {e}")),
     };
@@ -600,7 +605,7 @@ fn read_file_inner(workspace_root: &Path, args: &Value) -> ToolResult {
                     format_file_size_mb(metadata.len())
                 ));
             }
-            let bytes = match std::fs::read(&path) {
+            let bytes = match access.read(&path) {
                 Ok(bytes) => bytes,
                 Err(e) => return ToolResult::error(format!("Error reading image: {e}")),
             };
@@ -659,7 +664,7 @@ fn read_file_inner(workspace_root: &Path, args: &Value) -> ToolResult {
         const HEAD_LINES: usize = 50;
         const TAIL_LINES: usize = 20;
         let file_size = metadata.len();
-        let raw_preview = match read_to_string_lossy(&path) {
+        let raw_preview = match access.read_lossy(&path) {
             Ok(content) => content,
             Err(e) => return ToolResult::error(format!("Error: Cannot read file: {e}")),
         };
@@ -751,7 +756,7 @@ fn read_file_inner(workspace_root: &Path, args: &Value) -> ToolResult {
         return ToolResult::text(preview);
     }
 
-    let raw_content = match read_to_string_lossy(&path) {
+    let raw_content = match access.read_lossy(&path) {
         Ok(content) => content,
         Err(e) => return ToolResult::error(format!("Error: Cannot read file: {e}")),
     };
@@ -977,8 +982,60 @@ fn fallback_outline(content: &str) -> Vec<(usize, String)> {
         .collect()
 }
 
+/// Managed dispatch shares the ordinary preparation and commit owners. All IO
+/// is explicit; these entrypoints cannot enable implicit formatter processes.
+pub(crate) fn read_file_with_access(root: &Path, args: &Value, access: &FileAccess) -> ToolResult {
+    read_file_inner(root, args, access).with_native_recovery_model_projection()
+}
+pub(crate) fn write_file_with_access(root: &Path, args: &Value, access: &FileAccess) -> ToolResult {
+    if args.get("delete").and_then(Value::as_bool) == Some(true) {
+        return delete_file_with_access(root, args, access);
+    }
+    match prepare_write_file_with_access(root, args, access) {
+        Ok(prepared) => prepared.apply_with_formatting(false),
+        Err(error) => error,
+    }
+}
+pub(crate) fn delete_file_with_access(
+    root: &Path,
+    args: &Value,
+    access: &FileAccess,
+) -> ToolResult {
+    match prepare_delete_file_with_access(root, args, access) {
+        Ok(prepared) => prepared.apply(),
+        Err(error) => error,
+    }
+}
+pub(crate) fn multi_edit_with_access(root: &Path, args: &Value, access: &FileAccess) -> ToolResult {
+    match prepare_multi_edit_with_access(root, args, access) {
+        Ok(prepared) => prepared.apply_with_formatting(false),
+        Err(error) => error,
+    }
+}
+pub(crate) fn str_replace_with_access(
+    root: &Path,
+    args: &Value,
+    access: &FileAccess,
+) -> ToolResult {
+    let args = match normalize_str_replace_args(args) {
+        Ok(args) => args,
+        Err(error) => return ToolResult::error(error),
+    };
+    if args.get("edits").and_then(Value::as_array).is_some() {
+        return match prepare_multi_path_edit_with_access(root, &args, access) {
+            Ok(prepared) => prepared.apply_with_formatting(false),
+            Err(error) => error,
+        };
+    }
+    match prepare_str_replace_with_access(root, &args, access) {
+        Ok(prepared) => prepared.apply_with_formatting(false),
+        Err(error) => error,
+    }
+}
+
 #[derive(Debug)]
 pub struct PreparedWriteFile {
+    access: FileAccess,
     path: PathBuf,
     path_str: String,
     content: String,
@@ -1013,8 +1070,9 @@ impl PreparedWriteFile {
 
     fn apply_with_formatting(&self, format_staging: bool) -> ToolResult {
         if self.already_desired {
-            if let Err(error) =
-                verify_expected_original_hash(&self.path, self.original_content_hash.as_deref())
+            if let Err(error) = self
+                .access
+                .verify(&self.path, self.original_content_hash.as_deref())
             {
                 return ToolResult::error(error);
             }
@@ -1031,12 +1089,13 @@ impl PreparedWriteFile {
             );
         }
         if let Some(parent) = self.path.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
+            && let Err(e) = self.access.create_dir_all(parent)
         {
             return ToolResult::error(format!("Error: Cannot create directories: {e}"));
         }
 
-        match write_file_atomic_with_format(
+        match write_file_atomic_with_access(
+            &self.access,
             &self.path,
             self.content.as_bytes(),
             false,
@@ -1062,6 +1121,14 @@ impl PreparedWriteFile {
 pub fn prepare_write_file(
     workspace_root: &Path,
     args: &Value,
+) -> Result<PreparedWriteFile, ToolResult> {
+    prepare_write_file_with_access(workspace_root, args, &FileAccess::default())
+}
+
+fn prepare_write_file_with_access(
+    workspace_root: &Path,
+    args: &Value,
+    access: &FileAccess,
 ) -> Result<PreparedWriteFile, ToolResult> {
     let Some(input) = args.as_object() else {
         return Err(ToolResult::error(
@@ -1091,7 +1158,7 @@ pub fn prepare_write_file(
             ));
         }
     };
-    let path = resolve_write_target_path(workspace_root, path_str, "write_file")?;
+    let path = access.resolve_write(workspace_root, path_str, "write_file")?;
     let requested_content_state =
         crate::workspace_observation::workspace_file_state_identity(content.as_bytes());
     // Content normalization is part of the invocation contract.  Base it on
@@ -1101,13 +1168,26 @@ pub fn prepare_write_file(
     // (for example for an explicitly allowed absolute path).
     let content = normalize_content_before_write(Path::new(path_str), content);
 
-    let existing_bytes = std::fs::read(&path).ok();
+    let existing_bytes = if !access.is_restricted() {
+        std::fs::read(&path).ok()
+    } else {
+        match access.read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(ToolResult::error(format!(
+                    "Error: Cannot read preimage: {error}"
+                )));
+            }
+        }
+    };
     let already_desired = existing_bytes.as_deref() == Some(content.as_bytes());
     let original_content_hash = existing_bytes
         .as_deref()
         .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
 
     Ok(PreparedWriteFile {
+        access: access.clone(),
         path,
         path_str: path_str.to_string(),
         content,
@@ -1124,15 +1204,9 @@ pub fn write_file(workspace_root: &Path, args: &Value) -> ToolResult {
     }
 }
 
-pub(crate) fn write_file_without_formatter(workspace_root: &Path, args: &Value) -> ToolResult {
-    match prepare_write_file(workspace_root, args) {
-        Ok(prepared) => prepared.apply_with_formatting(false),
-        Err(error) => error,
-    }
-}
-
 #[derive(Debug)]
 pub struct PreparedStrReplace {
+    access: FileAccess,
     path: PathBuf,
     new_content: String,
     dry_run: bool,
@@ -1164,7 +1238,8 @@ impl PreparedStrReplace {
         if self.dry_run {
             return ToolResult::text(self.success_message);
         }
-        match write_file_atomic_with_format(
+        match write_file_atomic_with_access(
+            &self.access,
             &self.path,
             self.new_content.as_bytes(),
             self.allow_structural_change,
@@ -1186,6 +1261,14 @@ impl PreparedStrReplace {
 pub fn prepare_str_replace(
     workspace_root: &Path,
     args: &Value,
+) -> Result<PreparedStrReplace, ToolResult> {
+    prepare_str_replace_with_access(workspace_root, args, &FileAccess::default())
+}
+
+fn prepare_str_replace_with_access(
+    workspace_root: &Path,
+    args: &Value,
+    access: &FileAccess,
 ) -> Result<PreparedStrReplace, ToolResult> {
     let args = normalize_str_replace_args(args).map_err(ToolResult::error)?;
     let args = &args;
@@ -1241,9 +1324,9 @@ pub fn prepare_str_replace(
         return Err(ToolResult::error(err));
     }
 
-    let path = resolve_existing_path_for_tool(workspace_root, path_str, "str_replace")?;
+    let path = access.resolve_existing(workspace_root, path_str, "str_replace")?;
 
-    let content = match std::fs::read_to_string(&path) {
+    let content = match access.read_to_string(&path) {
         Ok(c) => c,
         Err(e) => return Err(ToolResult::error(format!("Error: Cannot read file: {e}"))),
     };
@@ -1329,6 +1412,7 @@ pub fn prepare_str_replace(
                 )
             };
             return Ok(PreparedStrReplace {
+                access: access.clone(),
                 path,
                 new_content,
                 dry_run,
@@ -1397,6 +1481,7 @@ pub fn prepare_str_replace(
         format!("Successfully replaced text in {}", path_str)
     };
     Ok(PreparedStrReplace {
+        access: access.clone(),
         path,
         new_content,
         dry_run,
@@ -1410,7 +1495,7 @@ pub fn str_replace(workspace_root: &Path, args: &Value) -> ToolResult {
     str_replace_with_formatting(workspace_root, args, true)
 }
 
-pub(crate) fn str_replace_without_formatter(workspace_root: &Path, args: &Value) -> ToolResult {
+pub fn str_replace_without_formatter(workspace_root: &Path, args: &Value) -> ToolResult {
     str_replace_with_formatting(workspace_root, args, false)
 }
 
@@ -1434,6 +1519,7 @@ fn str_replace_with_formatting(
 
 #[derive(Debug, Clone)]
 pub struct PreparedMultiEdit {
+    access: FileAccess,
     path: PathBuf,
     path_str: String,
     new_content: String,
@@ -1469,7 +1555,8 @@ impl PreparedMultiEdit {
             ));
         }
 
-        match write_file_atomic_with_format(
+        match write_file_atomic_with_access(
+            &self.access,
             &self.path,
             self.new_content.as_bytes(),
             self.allow_structural_change,
@@ -1495,17 +1582,26 @@ pub fn prepare_multi_edit(
     workspace_root: &Path,
     args: &Value,
 ) -> Result<PreparedMultiEdit, ToolResult> {
+    prepare_multi_edit_with_access(workspace_root, args, &FileAccess::default())
+}
+
+fn prepare_multi_edit_with_access(
+    workspace_root: &Path,
+    args: &Value,
+    access: &FileAccess,
+) -> Result<PreparedMultiEdit, ToolResult> {
     // This phase only resolves and validates inputs and reads preimages. It
     // cannot mutate the workspace; its boundary is therefore the source of
     // the no-effect fact for every preparation failure, including failures
     // that do not have a caller-recovery classification.
-    prepare_multi_edit_inner(workspace_root, args)
+    prepare_multi_edit_inner(workspace_root, args, access)
         .map_err(ToolResult::with_workspace_mutation_not_applied)
 }
 
 fn prepare_multi_edit_inner(
     workspace_root: &Path,
     args: &Value,
+    access: &FileAccess,
 ) -> Result<PreparedMultiEdit, ToolResult> {
     let args = normalize_str_replace_args(args).map_err(ToolResult::error)?;
     let args = &args;
@@ -1533,8 +1629,8 @@ fn prepare_multi_edit_inner(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let path = resolve_existing_path_for_tool(workspace_root, path_str, "multi_edit")?;
-    let content = match std::fs::read_to_string(&path) {
+    let path = access.resolve_existing(workspace_root, path_str, "multi_edit")?;
+    let content = match access.read_to_string(&path) {
         Ok(c) => c,
         Err(e) => return Err(ToolResult::error(format!("Error: Cannot read file: {e}"))),
     };
@@ -1618,9 +1714,10 @@ fn prepare_multi_edit_inner(
         ));
     }
 
-    let original_content_hash = sha256_digest_of_existing_file(&path);
+    let original_content_hash = Some(format!("{:x}", Sha256::digest(original_content.as_bytes())));
 
     Ok(PreparedMultiEdit {
+        access: access.clone(),
         path,
         path_str: path_str.to_string(),
         new_content: working,
@@ -1634,6 +1731,7 @@ fn prepare_multi_edit_inner(
 
 #[derive(Debug)]
 pub struct PreparedDeleteFile {
+    access: FileAccess,
     path: PathBuf,
     path_str: String,
     before_content: Vec<u8>,
@@ -1657,12 +1755,13 @@ impl PreparedDeleteFile {
         // a silent data-loss hazard. Re-verify the hash before removing, so a
         // concurrent write between prepare→apply aborts instead of destroying
         // new content. This mirrors write_file / str_replace pre-commit checks.
-        if let Err(e) =
-            verify_expected_original_hash(&self.path, self.before_content_hash.as_deref())
+        if let Err(e) = self
+            .access
+            .verify(&self.path, self.before_content_hash.as_deref())
         {
             return ToolResult::error(e);
         }
-        match std::fs::remove_file(&self.path) {
+        match self.access.remove_file(&self.path) {
             Ok(()) => ToolResult::text(format!("Successfully deleted {}", self.path_str))
                 .with_workspace_mutation_applied(),
             Err(e) => ToolResult::error(format!("Error: Cannot delete file: {e}")),
@@ -1678,19 +1777,27 @@ pub fn prepare_delete_file(
     workspace_root: &Path,
     args: &Value,
 ) -> Result<PreparedDeleteFile, ToolResult> {
+    prepare_delete_file_with_access(workspace_root, args, &FileAccess::default())
+}
+
+fn prepare_delete_file_with_access(
+    workspace_root: &Path,
+    args: &Value,
+    access: &FileAccess,
+) -> Result<PreparedDeleteFile, ToolResult> {
     let path_str = match args.get("path").and_then(|v| v.as_str()) {
         Some(p) => p,
         None => return Err(ToolResult::error("Error: Missing 'path' parameter".into())),
     };
-    let path = resolve_existing_path_for_tool(workspace_root, path_str, "delete_file")?;
+    let path = access.resolve_existing(workspace_root, path_str, "delete_file")?;
 
-    if !path.exists() {
+    if access.metadata(&path).is_err() {
         return Err(ToolResult::error(format!(
             "Error: File not found: {path_str}"
         )));
     }
 
-    let before_content = match std::fs::read(&path) {
+    let before_content = match access.read(&path) {
         Ok(content) => content,
         Err(e) => {
             return Err(ToolResult::error(format!(
@@ -1699,9 +1806,10 @@ pub fn prepare_delete_file(
         }
     };
 
-    let before_content_hash = sha256_digest_of_existing_file(&path);
+    let before_content_hash = Some(format!("{:x}", Sha256::digest(&before_content)));
 
     Ok(PreparedDeleteFile {
+        access: access.clone(),
         path,
         path_str: path_str.to_string(),
         before_content,
@@ -1806,13 +1914,6 @@ pub fn multi_edit(workspace_root: &Path, args: &Value) -> ToolResult {
     }
 }
 
-pub(crate) fn multi_edit_without_formatter(workspace_root: &Path, args: &Value) -> ToolResult {
-    match prepare_multi_edit(workspace_root, args) {
-        Ok(prepared) => prepared.apply_with_formatting(false),
-        Err(error) => error,
-    }
-}
-
 #[derive(Debug)]
 pub struct PreparedMultiPathEdit {
     prepared: Vec<PreparedMultiEdit>,
@@ -1851,10 +1952,10 @@ impl PreparedMultiPathEdit {
         }
 
         for prepared in &self.prepared {
-            if let Err(error) = verify_expected_original_hash(
-                &prepared.path,
-                prepared.original_content_hash.as_deref(),
-            ) {
+            if let Err(error) = prepared
+                .access
+                .verify(&prepared.path, prepared.original_content_hash.as_deref())
+            {
                 return ToolResult::error(error);
             }
         }
@@ -1881,14 +1982,19 @@ impl PreparedMultiPathEdit {
             }
             let staging_path = staging_tmp_path(&prepared.path);
             // Best-effort cleanup of a stale staging file from a prior crash.
-            let _ = std::fs::remove_file(&staging_path);
+            if !prepared.access.is_restricted() {
+                let _ = prepared.access.cleanup_stage(&staging_path);
+            }
 
-            if let Err(e) = std::fs::write(&staging_path, &prepared.new_content) {
+            if let Err(e) = prepared
+                .access
+                .stage(&staging_path, prepared.new_content.as_bytes())
+            {
                 // Clean up any already-staged files before returning.
-                for (_, staging, _) in &staging_entries {
-                    let _ = std::fs::remove_file(staging);
+                for (_, staging, staged) in &staging_entries {
+                    let _ = staged.access.cleanup_stage(staging);
                 }
-                let _ = std::fs::remove_file(&staging_path);
+                let _ = prepared.access.cleanup_stage(&staging_path);
                 return ToolResult::error(format!(
                     "Error: Cannot stage write for {}: {e}",
                     prepared.path_str
@@ -1896,7 +2002,7 @@ impl PreparedMultiPathEdit {
             }
 
             // Format the staging file (best-effort, same as single-file path).
-            let formatter_outcome = if format_staging {
+            let formatter_outcome = if format_staging && !prepared.access.is_restricted() {
                 format_file_in_place_best_effort(&staging_path)
             } else {
                 FormatterOutcome::NotFound
@@ -1909,10 +2015,10 @@ impl PreparedMultiPathEdit {
                         Some(error)
                     } else {
                         // Clean up all staged files.
-                        for (_, staging, _) in &staging_entries {
-                            let _ = std::fs::remove_file(staging);
+                        for (_, staging, staged) in &staging_entries {
+                            let _ = staged.access.cleanup_stage(staging);
                         }
-                        let _ = std::fs::remove_file(&staging_path);
+                        let _ = prepared.access.cleanup_stage(&staging_path);
                         return ToolResult::error(error);
                     }
                 }
@@ -1932,12 +2038,12 @@ impl PreparedMultiPathEdit {
         // catches edits made while staging/formatting without leaving a partial
         // multi-file commit behind.
         for (_, _, prepared) in &staging_entries {
-            if let Err(error) = verify_expected_original_hash(
-                &prepared.path,
-                prepared.original_content_hash.as_deref(),
-            ) {
-                for (_, staging, _) in &staging_entries {
-                    let _ = std::fs::remove_file(staging);
+            if let Err(error) = prepared
+                .access
+                .verify(&prepared.path, prepared.original_content_hash.as_deref())
+            {
+                for (_, staging, staged) in &staging_entries {
+                    let _ = staged.access.cleanup_stage(staging);
                 }
                 return ToolResult::error(error);
             }
@@ -1962,16 +2068,16 @@ impl PreparedMultiPathEdit {
                     error.with_workspace_mutation_partial(committed_paths)
                 };
             }
-            if let Err(e) = std::fs::rename(staging, target) {
+            if let Err(e) = prepared.access.rename(staging, target) {
                 // Rename failed — files already renamed before this point
                 // are committed (same-fs rename is atomic per-file).  Files
                 // not yet renamed have their staging artifacts still on disk;
                 // attempt cleanup but don't fail the overall result — the
                 // model already has error context.
-                for (_, remaining_staging, _) in
+                for (_, remaining_staging, remaining) in
                     staging_entries.iter().skip_while(|(t, _, _)| t != target)
                 {
-                    let _ = std::fs::remove_file(remaining_staging);
+                    let _ = remaining.access.cleanup_stage(remaining_staging);
                 }
                 let error = ToolResult::error(format!(
                     "Error: Cannot commit write for {} (rename failed): {e}",
@@ -2058,6 +2164,14 @@ pub fn prepare_multi_path_edit(
     workspace_root: &Path,
     args: &Value,
 ) -> Result<PreparedMultiPathEdit, ToolResult> {
+    prepare_multi_path_edit_with_access(workspace_root, args, &FileAccess::default())
+}
+
+fn prepare_multi_path_edit_with_access(
+    workspace_root: &Path,
+    args: &Value,
+    access: &FileAccess,
+) -> Result<PreparedMultiPathEdit, ToolResult> {
     let args = normalize_str_replace_args(args).map_err(ToolResult::error)?;
     let top_path = args.get("path").and_then(Value::as_str);
     let edits = match args.get("edits").and_then(Value::as_array) {
@@ -2090,7 +2204,11 @@ pub fn prepare_multi_path_edit(
         if allow_structural_change {
             scoped.insert("allow_structural_change".to_string(), Value::Bool(true));
         }
-        prepared.push(prepare_multi_edit(workspace_root, &Value::Object(scoped))?);
+        prepared.push(prepare_multi_edit_with_access(
+            workspace_root,
+            &Value::Object(scoped),
+            access,
+        )?);
     }
 
     Ok(PreparedMultiPathEdit { prepared })
@@ -2382,6 +2500,7 @@ fn verify_expected_original_hash(
     Ok(())
 }
 
+#[cfg(test)]
 fn write_file_atomic_with_format(
     path: &Path,
     content: &[u8],
@@ -2389,23 +2508,42 @@ fn write_file_atomic_with_format(
     expected_original_hash: Option<&str>,
     format_staging: bool,
 ) -> Result<Option<String>, String> {
-    // Verify the file hasn't been modified since we read it.
-    verify_expected_original_hash(path, expected_original_hash)?;
+    write_file_atomic_with_access(
+        &FileAccess::default(),
+        path,
+        content,
+        allow_formatter_syntax_error,
+        expected_original_hash,
+        format_staging,
+    )
+}
 
-    // Staging file lives next to the target — POSIX rename() is
-    // only atomic within the same filesystem. Using a /tmp staging
-    // file would break across mount points.
+fn write_file_atomic_with_access(
+    access: &FileAccess,
+    path: &Path,
+    content: &[u8],
+    allow_formatter_syntax_error: bool,
+    expected_original_hash: Option<&str>,
+    format_staging: bool,
+) -> Result<Option<String>, String> {
+    // Verify the file hasn't been modified since we read it.
+    access.verify(path, expected_original_hash)?;
+
+    // Ordinary staging lives beside the target for atomic rename. Restricted
+    // access treats this path only as a logical key into private host staging.
     let tmp = staging_tmp_path(path);
 
     // Best-effort cleanup of a stale tmp from a prior crashed write.
-    let _ = std::fs::remove_file(&tmp);
+    if !access.is_restricted() {
+        let _ = access.cleanup_stage(&tmp);
+    }
 
-    if let Err(e) = std::fs::write(&tmp, content) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = access.stage(&tmp, content) {
+        let _ = access.cleanup_stage(&tmp);
         return Err(format!("Error: Cannot stage write: {e}"));
     }
 
-    let formatter_outcome = if format_staging {
+    let formatter_outcome = if format_staging && !access.is_restricted() {
         format_file_in_place_best_effort(&tmp)
     } else {
         FormatterOutcome::NotFound
@@ -2417,7 +2555,7 @@ fn write_file_atomic_with_format(
             if allow_formatter_syntax_error {
                 Some(error)
             } else {
-                let _ = std::fs::remove_file(&tmp);
+                let _ = access.cleanup_stage(&tmp);
                 return Err(error);
             }
         }
@@ -2427,20 +2565,20 @@ fn write_file_atomic_with_format(
     // staged candidate back to the exact bytes already on disk; do not rename
     // such a candidate or report a mutation merely because the pre-format
     // string differed.
-    match (std::fs::read(&tmp), std::fs::read(path)) {
+    match (access.read_stage(&tmp), access.read(path)) {
         (Ok(staged), Ok(current)) if staged == current => {
-            let _ = std::fs::remove_file(&tmp);
+            let _ = access.cleanup_stage(&tmp);
             return Err(
                 "Error: the final formatted content is unchanged; no bytes were written."
                     .to_string(),
             );
         }
         (Err(error), _) => {
-            let _ = std::fs::remove_file(&tmp);
+            let _ = access.cleanup_stage(&tmp);
             return Err(format!("Error: Cannot verify staged write: {error}"));
         }
         (_, Err(error)) if error.kind() != std::io::ErrorKind::NotFound => {
-            let _ = std::fs::remove_file(&tmp);
+            let _ = access.cleanup_stage(&tmp);
             return Err(format!(
                 "Error: Cannot verify existing content before commit: {error}"
             ));
@@ -2448,10 +2586,17 @@ fn write_file_atomic_with_format(
         _ => {}
     }
 
+    if access.is_restricted()
+        && let Err(error) = access.verify(path, expected_original_hash)
+    {
+        let _ = access.cleanup_stage(&tmp);
+        return Err(error);
+    }
+
     // Atomic rename commits the final state. Only here does the
     // target path change.
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = access.rename(&tmp, path) {
+        let _ = access.cleanup_stage(&tmp);
         return Err(format!("Error: Cannot commit write (rename failed): {e}"));
     }
 
@@ -5380,6 +5525,373 @@ mod tests {
             !result.is_error,
             "shebang removal should succeed (not a doc comment): {}",
             result.output
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod confined_native_tests {
+    use super::*;
+    use serde_json::json;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn confined_native_success_and_preimage_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let access = FileAccess::restricted(root.path(), &[]).unwrap();
+        let result = write_file_with_access(
+            root.path(),
+            &json!({"path":"nested/a.txt", "content":"alpha beta\n"}),
+            &access,
+        );
+        assert!(!result.is_error, "{}", result.output);
+        let result = read_file_with_access(root.path(), &json!({"path":"nested/a.txt"}), &access);
+        assert!(
+            !result.is_error && result.output.contains("alpha beta"),
+            "{}",
+            result.output
+        );
+        let result = str_replace_with_access(
+            root.path(),
+            &json!({"path":"nested/a.txt", "old_str":"alpha", "new_str":"ALPHA"}),
+            &access,
+        );
+        assert!(!result.is_error, "{}", result.output);
+        fs::write(root.path().join("b.txt"), "one two\n").unwrap();
+        let result = str_replace_with_access(
+            root.path(),
+            &json!({"edits":[
+                {"path":"nested/a.txt", "old_str":"beta", "new_str":"BETA"},
+                {"path":"b.txt", "old_str":"one", "new_str":"ONE"}
+            ]}),
+            &access,
+        );
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(
+            fs::read_to_string(root.path().join("nested/a.txt")).unwrap(),
+            "ALPHA BETA\n"
+        );
+        let prepared =
+            prepare_delete_file_with_access(root.path(), &json!({"path":"b.txt"}), &access)
+                .unwrap();
+        fs::write(root.path().join("b.txt"), "concurrent edit\n").unwrap();
+        assert!(prepared.apply().is_error);
+        assert!(!delete_file_with_access(root.path(), &json!({"path":"b.txt"}), &access).is_error);
+        assert!(!root.path().join("b.txt").exists());
+    }
+
+    #[test]
+    fn confined_native_prepared_apply_never_formats_implicitly() {
+        let root = tempfile::tempdir().unwrap();
+        let access = FileAccess::restricted(root.path(), &[]).unwrap();
+        let prepared = prepare_write_file_with_access(
+            root.path(),
+            &json!({
+                "path":"main.rs", "content":"fn main( ){let x=1;}"
+            }),
+            &access,
+        )
+        .unwrap();
+        // Public apply normally enables formatters. The retained authority
+        // must still prohibit subprocesses, independent of the call site.
+        let result = prepared.apply();
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(
+            fs::read_to_string(root.path().join("main.rs")).unwrap(),
+            "fn main( ){let x=1;}\n"
+        );
+        let batch = prepare_multi_path_edit_with_access(
+            root.path(),
+            &json!({
+                "path":"main.rs", "edits":[{"old_str":"x=1", "new_str":"x=2"}]
+            }),
+            &access,
+        )
+        .unwrap();
+        let result = batch.apply();
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(
+            fs::read_to_string(root.path().join("main.rs")).unwrap(),
+            "fn main( ){let x=2;}\n"
+        );
+    }
+
+    #[test]
+    fn confined_native_denies_host_tmp_protected_and_batch_preimages() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let host = outside.path().join("synthetic.txt");
+        fs::write(&host, "synthetic host sentinel\n").unwrap();
+        fs::create_dir(root.path().join("protected")).unwrap();
+        fs::write(root.path().join("protected/owned.txt"), "owned\n").unwrap();
+        fs::write(root.path().join("ordinary.txt"), "alpha\n").unwrap();
+        symlink(outside.path(), root.path().join("escape")).unwrap();
+        symlink(root.path().join("protected"), root.path().join("alias")).unwrap();
+        let access = FileAccess::restricted(root.path(), &[root.path().join("protected")]).unwrap();
+        for path in [
+            host.to_str().unwrap(),
+            "escape/synthetic.txt",
+            "alias/owned.txt",
+            "protected/owned.txt",
+        ] {
+            let result = read_file_with_access(root.path(), &json!({"path":path}), &access);
+            assert!(
+                result.is_error && !result.output.contains("synthetic host sentinel"),
+                "{}",
+                result.output
+            );
+            assert!(
+                write_file_with_access(
+                    root.path(),
+                    &json!({"path":path,"content":"changed"}),
+                    &access
+                )
+                .is_error
+            );
+            assert!(delete_file_with_access(root.path(), &json!({"path":path}), &access).is_error);
+            assert!(
+                str_replace_with_access(
+                    root.path(),
+                    &json!({"edits":[
+                        {"path":"ordinary.txt", "old_str":"alpha", "new_str":"ALPHA"},
+                        {"path":path,"old_str":"owned", "new_str":"changed"}
+                    ]}),
+                    &access
+                )
+                .is_error
+            );
+            assert_eq!(
+                fs::read_to_string(root.path().join("ordinary.txt")).unwrap(),
+                "alpha\n"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(host).unwrap(),
+            "synthetic host sentinel\n"
+        );
+    }
+
+    #[test]
+    fn confined_native_retarget_after_prepare_cannot_write_or_delete_host_files() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("dir")).unwrap();
+        fs::write(root.path().join("dir/a.txt"), "alpha\n").unwrap();
+        fs::write(outside.path().join("a.txt"), "alpha\n").unwrap();
+        let access = FileAccess::restricted(root.path(), &[]).unwrap();
+        let write = prepare_write_file_with_access(
+            root.path(),
+            &json!({"path":"dir/a.txt","content":"new"}),
+            &access,
+        )
+        .unwrap();
+        let delete =
+            prepare_delete_file_with_access(root.path(), &json!({"path":"dir/a.txt"}), &access)
+                .unwrap();
+        let replace = prepare_str_replace_with_access(
+            root.path(),
+            &json!({"path":"dir/a.txt","old_str":"alpha","new_str":"ALPHA"}),
+            &access,
+        )
+        .unwrap();
+        let batch = prepare_multi_path_edit_with_access(
+            root.path(),
+            &json!({"path":"dir/a.txt","edits":[{"old_str":"alpha","new_str":"ALPHA"}]}),
+            &access,
+        )
+        .unwrap();
+        fs::rename(root.path().join("dir"), root.path().join("retained")).unwrap();
+        symlink(outside.path(), root.path().join("dir")).unwrap();
+        assert!(write.apply().is_error);
+        assert!(delete.apply().is_error);
+        assert!(replace.apply().is_error);
+        assert!(batch.apply().is_error);
+        assert_eq!(
+            fs::read_to_string(outside.path().join("a.txt")).unwrap(),
+            "alpha\n"
+        );
+    }
+
+    #[test]
+    fn confined_native_noop_and_descriptor_snapshot_use_canonical_convergence() {
+        use crate::workspace_observation as observation;
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("answer.txt"), b"stable\n").unwrap();
+        let access = FileAccess::restricted(&workspace, &[]).unwrap();
+        let args = json!({"path":"answer.txt", "content":"stable\n"});
+        let mut result = write_file_with_access(&workspace, &args, &access);
+        assert!(!result.is_error, "{result:?}");
+        let desired = observation::consume_workspace_desired_state_convergence_marker(
+            &mut result.metadata,
+            &args,
+            &workspace,
+        )
+        .unwrap()
+        .unwrap();
+        let tracker = observation::DesiredStateConvergenceTracker::default();
+        let projection = observation::project_typed_workspace_convergence_with_access(
+            &tracker,
+            Some("test-turn"),
+            "write_file",
+            &args,
+            &workspace,
+            false,
+            Some(&desired),
+            true,
+            false,
+            true,
+            Some(&access),
+        )
+        .unwrap();
+        assert!(projection.convergence_receipt.is_some());
+        let read_args = json!({"path":"answer.txt"});
+        assert!(tracker.requires_snapshot_lease_with_access(
+            "test-turn",
+            "read_file",
+            &read_args,
+            &workspace,
+            Some(&access)
+        ));
+        // The source must remain descriptor based even when its display label
+        // names different bytes. Public executors separately revoke a replaced
+        // binding; this tests only the canonical evidence reader's authority.
+        fs::rename(&workspace, root.path().join("retained")).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("answer.txt"), b"unchecked\n").unwrap();
+        let projection = observation::project_typed_workspace_convergence_with_access(
+            &tracker,
+            Some("test-turn"),
+            "read_file",
+            &read_args,
+            &workspace,
+            false,
+            None,
+            true,
+            true,
+            true,
+            Some(&access),
+        )
+        .unwrap();
+        let receipt = projection.observation_receipt.unwrap();
+        let evidence = observation::typed_workspace_observation_evidence(
+            &receipt[observation::OBSERVATION_RECEIPT_FIELD],
+        )
+        .unwrap();
+        assert_eq!(evidence.observed_state, desired);
+        assert!(!tracker.requires_snapshot_lease_with_access(
+            "test-turn",
+            "read_file",
+            &read_args,
+            &workspace,
+            Some(&access)
+        ));
+    }
+
+    #[test]
+    fn confined_native_prepared_operations_reject_same_bytes_in_replacement_directory() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("dir")).unwrap();
+        fs::write(root.path().join("dir/a.txt"), "alpha\n").unwrap();
+        let access = FileAccess::restricted(root.path(), &[]).unwrap();
+        let write = prepare_write_file_with_access(
+            root.path(),
+            &json!({"path":"dir/a.txt", "content":"new"}),
+            &access,
+        )
+        .unwrap();
+        let delete =
+            prepare_delete_file_with_access(root.path(), &json!({"path":"dir/a.txt"}), &access)
+                .unwrap();
+        let replace = prepare_str_replace_with_access(
+            root.path(),
+            &json!({"path":"dir/a.txt", "old_str":"alpha", "new_str":"new"}),
+            &access,
+        )
+        .unwrap();
+        let batch = prepare_multi_path_edit_with_access(
+            root.path(),
+            &json!({"path":"dir/a.txt", "edits":[{"old_str":"alpha", "new_str":"new"}]}),
+            &access,
+        )
+        .unwrap();
+        fs::rename(root.path().join("dir"), root.path().join("retained")).unwrap();
+        fs::create_dir(root.path().join("dir")).unwrap();
+        fs::write(root.path().join("dir/a.txt"), "alpha\n").unwrap();
+        assert!(write.apply().is_error);
+        assert!(delete.apply().is_error);
+        assert!(replace.apply().is_error);
+        assert!(batch.apply().is_error);
+        assert_eq!(
+            fs::read_to_string(root.path().join("dir/a.txt")).unwrap(),
+            "alpha\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("retained/a.txt")).unwrap(),
+            "alpha\n"
+        );
+    }
+
+    #[test]
+    fn confined_native_rejects_final_symlinks_and_hardlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let host = outside.path().join("sentinel.txt");
+        fs::write(&host, "synthetic outside bytes\n").unwrap();
+        symlink(&host, root.path().join("link.txt")).unwrap();
+        fs::hard_link(&host, root.path().join("hard.txt")).unwrap();
+        let access = FileAccess::restricted(root.path(), &[]).unwrap();
+        for path in ["link.txt", "hard.txt"] {
+            assert!(read_file_with_access(root.path(), &json!({"path":path}), &access).is_error);
+            assert!(
+                write_file_with_access(
+                    root.path(),
+                    &json!({"path":path,"content":"changed"}),
+                    &access
+                )
+                .is_error
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(host).unwrap(),
+            "synthetic outside bytes\n"
+        );
+    }
+
+    #[test]
+    fn confined_native_symlink_race_never_reads_or_writes_host_sentinel() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let host = outside.path().join("sentinel.txt");
+        fs::write(&host, "synthetic outside bytes\n").unwrap();
+        let access = FileAccess::restricted(root.path(), &[]).unwrap();
+        let target = root.path().join("race.txt");
+        std::thread::scope(|scope| {
+            let target = &target;
+            let host = &host;
+            scope.spawn(move || {
+                for _ in 0..500 {
+                    let _ = fs::remove_file(target);
+                    let _ = symlink(host, target);
+                    let _ = fs::remove_file(target);
+                }
+            });
+            for _ in 0..100 {
+                let _ = write_file_with_access(
+                    root.path(),
+                    &json!({"path":"race.txt","content":"workspace bytes\n"}),
+                    &access,
+                );
+                let result =
+                    read_file_with_access(root.path(), &json!({"path":"race.txt"}), &access);
+                assert!(!result.output.contains("synthetic outside bytes"));
+            }
+        });
+        assert_eq!(
+            fs::read_to_string(host).unwrap(),
+            "synthetic outside bytes\n"
         );
     }
 }

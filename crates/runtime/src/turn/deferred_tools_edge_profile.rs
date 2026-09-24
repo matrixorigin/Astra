@@ -214,7 +214,7 @@ mod tests {
     fn deferred_profile(
         declared_names: &[&str],
         rendered_names: &[&str],
-        model: &str,
+        context_window: u32,
     ) -> Map<String, Value> {
         let mut edge_profile = Map::new();
         let tools_list = rendered_names
@@ -231,9 +231,14 @@ mod tests {
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW
                 .to_string(),
             Value::Number(
-                crate::prompts::budget_for_model(Some(model))
-                    .model_limit
-                    .into(),
+                crate::turn::execution_config::resolve_context_budget(
+                    &astra_config::RuntimeConfig::default(),
+                    Some(context_window),
+                    Some(32_000),
+                    crate::prompts::CompactConfig::default(),
+                )
+                .model_limit()
+                .into(),
             ),
         );
         edge_profile.insert(
@@ -246,7 +251,7 @@ mod tests {
 
     #[test]
     fn names_and_block_for_model_accept_cli_rendered_manifest() {
-        let edge_profile = deferred_profile(&["agent_fanout", " "], &["agent_fanout"], "gpt-4o");
+        let edge_profile = deferred_profile(&["agent_fanout", " "], &["agent_fanout"], 200_000);
 
         let names = names_for_model(&edge_profile, Some("gpt-4o"), None);
 
@@ -261,7 +266,7 @@ mod tests {
 
     #[test]
     fn omitted_names_are_observable_but_not_activatable() {
-        let mut edge_profile = deferred_profile(&["agent_fanout"], &["agent_fanout"], "gpt-4o");
+        let mut edge_profile = deferred_profile(&["agent_fanout"], &["agent_fanout"], 200_000);
         edge_profile.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES
                 .to_string(),
@@ -278,7 +283,7 @@ mod tests {
 
     #[test]
     fn manifest_uses_explicit_resolved_context_window() {
-        let mut edge_profile = deferred_profile(&["github"], &["github"], "gpt-4o");
+        let mut edge_profile = deferred_profile(&["github"], &["github"], 200_000);
         edge_profile.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW
                 .to_string(),
@@ -301,7 +306,7 @@ mod tests {
     #[test]
     fn names_and_block_for_model_reject_declared_names_not_shown_to_model() {
         let edge_profile =
-            deferred_profile(&["agent_fanout", "web_fetch"], &["agent_fanout"], "gpt-4o");
+            deferred_profile(&["agent_fanout", "web_fetch"], &["agent_fanout"], 200_000);
 
         assert!(
             names_for_model(&edge_profile, Some("gpt-4o"), None).is_empty(),
@@ -316,7 +321,7 @@ mod tests {
     #[test]
     fn names_and_block_for_model_reject_rendered_names_missing_from_metadata() {
         let edge_profile =
-            deferred_profile(&["agent_fanout"], &["agent_fanout", "web_fetch"], "gpt-4o");
+            deferred_profile(&["agent_fanout"], &["agent_fanout", "web_fetch"], 200_000);
 
         assert!(
             names_for_model(&edge_profile, Some("gpt-4o"), None).is_empty(),
@@ -330,7 +335,7 @@ mod tests {
 
     #[test]
     fn names_and_block_for_model_reject_legacy_schema_like_xml_manifest() {
-        let mut edge_profile = deferred_profile(&["github"], &["github"], "gpt-4o");
+        let mut edge_profile = deferred_profile(&["github"], &["github"], 200_000);
         edge_profile.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT
                 .to_string(),

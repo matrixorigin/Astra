@@ -70,7 +70,7 @@ pub struct AutoInvokeRequest {
 // ── Session signals ──────────────────────────────────────────────────────────
 
 /// Live signals the gate inspects. All three are already tracked elsewhere in
-/// the runtime (ReflectStage stalls, budget pressure, ImprovementTracker user
+/// the runtime (ReflectStage stalls, budget pressure, and other user
 /// corrections) — this struct is just the minimal view the gate needs.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SessionSignals {

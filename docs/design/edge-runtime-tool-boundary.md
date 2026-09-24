@@ -139,6 +139,39 @@ checks the workspace binding and opens targets relative to retained directories.
 Working-directory names are verified display labels, not IO authority; an
 unavailable label is reported as unknown rather than silently as the root.
 
+### Restricted Linux shell launch
+
+`ShellProcessBoundary` prepares a single-use `ShellLaunchPlan` for the
+`linux_restricted_root_x86_64_v1` profile. It pins the selected workspace and
+explicit read-only system/toolchain roots, uses a restricted filesystem root
+with private HOME/TMP and mandatory namespaces, and applies a native x86-64
+seccomp policy that denies host IPC. Protected directories must be direct
+workspace children; nested protection is rejected because a writable ancestor
+could be renamed. Unsupported platforms and launch setup fail closed.
+
+`execute_confined_with_cancel` consumes the plan in the canonical isolated
+execution loop. The plan supplies cwd and environment; resource limits and
+timeouts remain in `IsolationConfig`. Launcher receipt verification is separate
+from `BashInvocationOwner` settlement. A missing or invalid launcher receipt
+cannot supply a verifier exit code, even if the launcher process exits normally.
+Cancellation and timeout retain settlement facts without claiming verifier success.
+
+`DefaultToolExecutor::with_shell_process_boundary` selects this launcher while
+retaining canonical tool admission, native file authority, source observation,
+and cancellation. This mode disables Bash read caching and refuses environment
+overlays, stdin, detach/background execution, unsupported helper tools, and
+non-root workdirs. A refused or failed launch never falls back to ordinary Bash.
+Tool metadata carries `shell_confinement`, the shared `ShellExecutionEvidence`
+projection of actual setup and process-settlement facts. Its verified exit-code
+accessor rejects missing setup, weak process-group ownership, incomplete
+settlement, timeout, cancellation, and unknown profiles or schema versions.
+
+This primitive requires trusted, exclusive allocation and immutable toolchain
+inputs from its provider. It does not itself establish those properties, persist
+an Evaluation receipt, or upgrade existing namespace-only callers. Evaluation
+admission must bind and verify the actual profile and input identities before
+advertising complete isolation.
+
 ## Result boundary
 
 Tool output crossing runtime boundaries must be enveloped:

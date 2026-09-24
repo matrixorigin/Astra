@@ -1,5 +1,6 @@
 //! Shell operations: bash execution, grep, glob.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, ExitStatus, Stdio};
 use std::sync::OnceLock;
@@ -1139,6 +1140,22 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
     environment: &[(String, String)],
     workdir: &PreparedBashWorkdir,
 ) -> ToolResult {
+    execute_bash_with_observation(ctx, args, workdir, || async {
+        execute_bash_inner(ctx, args, environment, workdir).await
+    })
+    .await
+}
+
+async fn execute_bash_with_observation<F, Fut>(
+    ctx: &crate::ToolContext,
+    args: &Value,
+    workdir: &PreparedBashWorkdir,
+    execute: F,
+) -> ToolResult
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ToolResult>,
+{
     let explicit_verification =
         crate::workspace_observation::is_explicit_workspace_verification_request("bash", args);
     let needs_observation = args
@@ -1213,7 +1230,7 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
         return crate::cancelled_tool_result("bash", false);
     }
 
-    let mut result = execute_bash_inner(ctx, args, environment, workdir).await;
+    let mut result = execute().await;
     attach_bash_workdir_evidence(&mut result, &ctx.workspace_root, workdir, args);
     let scope_settled = result
         .metadata
@@ -1915,11 +1932,67 @@ pub(crate) async fn execute_bash_with_filesystem_boundary_at_workdir(
     read_only_paths: &[PathBuf],
     workdir: &PreparedBashWorkdir,
 ) -> ToolResult {
+    execute_bash_with_observation(ctx, args, workdir, || async {
+        execute_bash_with_filesystem_boundary_inner(ctx, args, read_only_paths, workdir, None).await
+    })
+    .await
+}
+
+struct RestrictedShellInvocation<'a> {
+    boundary: &'a astra_sandbox::ShellProcessBoundary,
+    launch_attempted: &'a mut bool,
+}
+
+pub(crate) async fn execute_bash_with_process_boundary_at_workdir(
+    ctx: &crate::ToolContext,
+    args: &Value,
+    boundary: &astra_sandbox::ShellProcessBoundary,
+    launch_attempted: &mut bool,
+    protected_paths: &[PathBuf],
+    workdir: &PreparedBashWorkdir,
+) -> ToolResult {
+    execute_bash_with_observation(ctx, args, workdir, || async {
+        execute_bash_with_filesystem_boundary_inner(
+            ctx,
+            args,
+            protected_paths,
+            workdir,
+            Some(RestrictedShellInvocation {
+                boundary,
+                launch_attempted,
+            }),
+        )
+        .await
+    })
+    .await
+}
+
+async fn execute_bash_with_filesystem_boundary_inner(
+    ctx: &crate::ToolContext,
+    args: &Value,
+    read_only_paths: &[PathBuf],
+    workdir: &PreparedBashWorkdir,
+    boundary: Option<RestrictedShellInvocation<'_>>,
+) -> ToolResult {
+    if boundary.is_some()
+        && (ctx.detach_shell_handle.is_some()
+            || [
+                "env",
+                "environment",
+                "detach",
+                "run_in_background",
+                "ready_check",
+                "background_ttl",
+                "stdin",
+            ]
+            .iter()
+            .any(|field| args.get(*field).is_some()))
+    {
+        return ToolResult::error(
+            "SANDBOX_DENIED: restricted shell does not support environment overlays, detach, background service routes, or stdin".into(),
+        );
+    }
     let workspace_root = ctx.workspace_root.as_path();
-    let with_workdir_evidence = |mut result: ToolResult| {
-        attach_bash_workdir_evidence(&mut result, workspace_root, workdir, args);
-        result
-    };
     let command = match args.get("command").and_then(Value::as_str) {
         Some(command) if !command.trim().is_empty() => command,
         _ => {
@@ -1933,13 +2006,64 @@ pub(crate) async fn execute_bash_with_filesystem_boundary_at_workdir(
         return ToolResult::error(reason);
     }
 
+    let explicit_source_artifacts = args
+        .get(crate::source_preimage::SOURCE_ARTIFACTS_FIELD)
+        .is_some();
+    let mut source_preimages = match crate::source_preimage::prepare_with_inspection(
+        workspace_root,
+        args,
+        &format!("{}:{}", ctx.user_id, ctx.session_id),
+        #[cfg(unix)]
+        workdir.inspection(),
+    ) {
+        Ok(plan) => plan,
+        Err(reason) => return ToolResult::error(format!("Error: {reason}")),
+    };
+    if source_preimages.is_none() && !explicit_source_artifacts {
+        #[cfg(unix)]
+        {
+            source_preimages = crate::source_preimage::prepare_inferred_with_inspection(
+                workspace_root,
+                workdir.inspection(),
+                command,
+                &format!("{}:{}", ctx.user_id, ctx.session_id),
+            )
+            .unwrap_or(None);
+        }
+        #[cfg(not(unix))]
+        {
+            source_preimages = crate::source_preimage::prepare_inferred(
+                workspace_root,
+                workdir.path(),
+                command,
+                &format!("{}:{}", ctx.user_id, ctx.session_id),
+            )
+            .unwrap_or(None);
+        }
+    }
+
     let timeout_secs = parse_bash_timeout_secs_for(args, command);
+    if let Some(boundary) = boundary {
+        return execute_restricted_bash(
+            ctx,
+            command,
+            timeout_secs,
+            boundary,
+            read_only_paths,
+            workdir,
+            source_preimages,
+        )
+        .await;
+    }
     let boundary_root = match workspace_root.canonicalize() {
         Ok(root) => root,
         Err(error) => {
-            return ToolResult::error(format!(
-                "Error: cannot resolve managed workspace boundary: {error}; no command was run"
-            ));
+            return attach_source_preimage(
+                ToolResult::error(format!(
+                    "Error: cannot resolve managed workspace boundary: {error}; no command was run"
+                )),
+                source_preimages,
+            );
         }
     };
     let mut canonical_read_only_paths = Vec::with_capacity(read_only_paths.len());
@@ -1947,37 +2071,102 @@ pub(crate) async fn execute_bash_with_filesystem_boundary_at_workdir(
         match path.canonicalize() {
             Ok(path) => canonical_read_only_paths.push(path),
             Err(error) => {
-                return ToolResult::error(format!(
-                    "Error: cannot resolve managed read-only path '{}': {error}; no command was run",
-                    path.display()
-                ));
+                return attach_source_preimage(
+                    ToolResult::error(format!(
+                        "Error: cannot resolve managed read-only path '{}': {error}; no command was run",
+                        path.display()
+                    )),
+                    source_preimages,
+                );
             }
         }
     }
+    let isolated_home = boundary_root.join(".git").to_string_lossy().into_owned();
     let mut config = astra_sandbox::IsolationConfig::filesystem_boundary(
         boundary_root,
         canonical_read_only_paths,
     );
+    config.net_namespace = !ctx.sandbox.network_allowed;
     workdir.install_on_isolation_config(&mut config);
     config.timeout = Duration::from_secs_f64(timeout_secs);
     config.max_output_bytes = per_tool_output_limit("bash");
-    let mut environment = std::env::vars().collect::<std::collections::HashMap<_, _>>();
+    let mut environment = if ctx.sandbox.network_allowed {
+        std::env::vars().collect::<std::collections::HashMap<_, _>>()
+    } else {
+        std::collections::HashMap::from([
+            ("HOME".to_string(), isolated_home),
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+            ("LC_ALL".to_string(), "C.UTF-8".to_string()),
+            (
+                "PATH".to_string(),
+                "/usr/local/bin:/usr/bin:/bin".to_string(),
+            ),
+            ("TZ".to_string(), "UTC".to_string()),
+        ])
+    };
     astra_sandbox::scrub_secrets_from_env(&mut environment);
-    let output = astra_sandbox::execute_isolated(command, &environment, &config).await;
+    let output = astra_sandbox::execute_isolated_with_cancel(
+        command,
+        &environment,
+        &config,
+        ctx.cancel_token.as_deref(),
+    )
+    .await;
     let rendered = output.combined_output();
     if !output.namespace_active {
-        return with_workdir_evidence(ToolResult::error(if rendered.is_empty() {
-            "Error: managed filesystem write isolation is unavailable".to_string()
-        } else {
-            rendered
-        }));
+        return attach_source_preimage(
+            ToolResult::error(if rendered.is_empty() {
+                "Error: managed filesystem write isolation is unavailable".to_string()
+            } else {
+                rendered
+            }),
+            source_preimages,
+        );
     }
+    map_isolated_bash_output(command, output, source_preimages)
+}
+
+fn map_isolated_bash_output(
+    command: &str,
+    output: astra_sandbox::IsolatedOutput,
+    source_preimages: Option<crate::source_preimage::PreparedSourcePreimages>,
+) -> ToolResult {
+    let rendered = output.combined_output();
+    let scope_settled = output.scope_settled;
+    let scope_ownership = output.scope_ownership;
+    let descendants_terminated = output.descendants_terminated;
     let exit_code = output.exit_code.unwrap_or(-1);
     if output.timed_out {
-        return with_workdir_evidence(
-            ToolResult::error(rendered)
-                .with_exit_semantics(ExitSemantics::TimedOut)
+        return attach_scope_settled(
+            attach_source_preimage(
+                ToolResult::error(rendered)
+                    .with_exit_semantics(ExitSemantics::TimedOut)
+                    .with_exit_code(exit_code),
+                source_preimages,
+            ),
+            scope_settled,
+            scope_ownership,
+            false,
+            descendants_terminated,
+        );
+    }
+    if output.cancelled {
+        return attach_scope_settled(
+            attach_source_preimage(
+                ToolResult::error(if rendered.is_empty() {
+                    "Error: managed filesystem write isolation was cancelled before output was captured"
+                        .to_string()
+                } else {
+                    rendered
+                })
+                .with_exit_semantics(ExitSemantics::Cancelled)
                 .with_exit_code(exit_code),
+                source_preimages,
+            ),
+            scope_settled,
+            scope_ownership,
+            false,
+            descendants_terminated,
         );
     }
     let exit_semantics = classify_exit(command, exit_code);
@@ -1989,23 +2178,167 @@ pub(crate) async fn execute_bash_with_filesystem_boundary_at_workdir(
         } else {
             ToolResult::text(rendered)
         };
-        return with_workdir_evidence(
-            result
-                .with_exit_semantics(exit_semantics)
-                .with_result_class(result_class)
-                .with_exit_code(exit_code),
+        return attach_scope_settled(
+            attach_source_preimage(
+                result
+                    .with_exit_semantics(exit_semantics)
+                    .with_result_class(result_class)
+                    .with_exit_code(exit_code),
+                source_preimages,
+            ),
+            scope_settled,
+            scope_ownership,
+            false,
+            descendants_terminated,
         );
     }
-    with_workdir_evidence(
-        ToolResult::text(if rendered.is_empty() {
-            "(command completed with no output)".to_string()
-        } else {
-            rendered
-        })
-        .with_exit_semantics(ExitSemantics::Success)
-        .with_result_class(result_class)
-        .with_exit_code(exit_code),
+    attach_scope_settled(
+        attach_source_preimage(
+            ToolResult::text(if rendered.is_empty() {
+                "(command completed with no output)".to_string()
+            } else {
+                rendered
+            })
+            .with_exit_semantics(ExitSemantics::Success)
+            .with_result_class(result_class)
+            .with_exit_code(exit_code),
+            source_preimages,
+        ),
+        scope_settled,
+        scope_ownership,
+        false,
+        descendants_terminated,
     )
+}
+
+// Setup verification is deliberately independent of the process owner's facts.
+// This metadata is plumbing evidence, not an Evaluation admission receipt.
+async fn execute_restricted_bash(
+    ctx: &crate::ToolContext,
+    command: &str,
+    timeout_secs: f64,
+    invocation: RestrictedShellInvocation<'_>,
+    protected_paths: &[PathBuf],
+    workdir: &PreparedBashWorkdir,
+    source_preimages: Option<crate::source_preimage::PreparedSourcePreimages>,
+) -> ToolResult {
+    let RestrictedShellInvocation {
+        boundary,
+        launch_attempted,
+    } = invocation;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            ctx,
+            command,
+            timeout_secs,
+            boundary,
+            protected_paths,
+            workdir,
+            launch_attempted,
+        );
+        attach_source_preimage(
+            ToolResult::error("SANDBOX_DENIED: restricted shell requires Linux".into()),
+            source_preimages,
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Recheck the prepared directory after observation acquisition. The
+        // provider must still own the allocation exclusively through launch.
+        let current = resolve_bash_workdir(&boundary.workspace, &serde_json::json!({}));
+        if !current
+            .as_ref()
+            .is_ok_and(|root| root.identity() == workdir.identity())
+        {
+            return attach_source_preimage(
+                ToolResult::error(
+                    "SANDBOX_DENIED: restricted shell requires the pinned workspace-root workdir"
+                        .into(),
+                ),
+                source_preimages,
+            );
+        }
+        let mut argv = Vec::new();
+        if should_enable_pipefail(command) {
+            argv.extend(["-o".to_string(), "pipefail".to_string()]);
+        }
+        argv.extend(["-c".to_string(), command.to_string()]);
+        let plan = boundary.launch_plan_with_protected_paths(
+            workdir.path(),
+            "/bin/bash",
+            &argv,
+            protected_paths,
+        );
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(error) => {
+                return attach_source_preimage(
+                    ToolResult::error(format!(
+                        "SANDBOX_DENIED: restricted shell preparation failed: {error}"
+                    )),
+                    source_preimages,
+                );
+            }
+        };
+        let mut config = astra_sandbox::IsolationConfig::filesystem_boundary(
+            ctx.workspace_root.clone(),
+            Vec::new(),
+        );
+        config.timeout = Duration::from_secs_f64(timeout_secs);
+        config.max_output_bytes = per_tool_output_limit("bash");
+        *launch_attempted = true;
+        let output =
+            astra_sandbox::execute_confined_with_cancel(plan, &config, ctx.cancel_token.as_deref())
+                .await;
+        map_confined_bash_output(command, output, source_preimages)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn map_confined_bash_output(
+    command: &str,
+    output: astra_sandbox::ConfinedOutput,
+    source_preimages: Option<crate::source_preimage::PreparedSourcePreimages>,
+) -> ToolResult {
+    let receipt = output.execution_evidence();
+    let verified = matches!(
+        receipt.setup,
+        astra_runtime_env::ShellSetupEvidence::Verified { .. }
+    );
+    let authoritative = receipt.settlement.scope_settled
+        && matches!(
+            receipt.settlement.ownership,
+            Some(
+                astra_runtime_env::ShellScopeOwnership::InvocationCgroup
+                    | astra_runtime_env::ShellScopeOwnership::InvocationSupervisor
+            )
+        );
+    let started = receipt.execution_started;
+    let interrupted = receipt.timed_out || receipt.cancelled;
+    let evidence = serde_json::to_value(receipt).expect("shell evidence serializes");
+    let process = output.process;
+    let mut result = map_isolated_bash_output(command, process, source_preimages);
+    if !verified || !authoritative {
+        result.is_error = true;
+        if !interrupted {
+            result = result.with_exit_semantics(ExitSemantics::ExecutionError);
+        }
+        result = result.with_result_class(crate::exit_semantics::CommandResultClass::Inconclusive);
+        result.output.push_str(
+            "\nRestricted shell setup/exec verification or authoritative settlement is incomplete.",
+        );
+    }
+    let fields = result.metadata.get_or_insert_with(serde_json::Map::new);
+    if !verified {
+        fields.remove("exit_code");
+    }
+    fields.insert(
+        INTERNAL_EXECUTION_STARTED_FIELD.to_string(),
+        Value::Bool(started),
+    );
+    fields.insert("shell_confinement".to_string(), evidence);
+    result
 }
 
 fn attach_scope_settled(
@@ -8924,5 +9257,88 @@ mod workdir_tests {
             "pinned"
         );
         assert!(!outside.path().join("marker").exists());
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod restricted_evidence_tests {
+    use super::*;
+
+    fn output(
+        receipt: Result<i32, String>,
+        started: bool,
+        settled: bool,
+    ) -> astra_sandbox::ConfinedOutput {
+        astra_sandbox::ConfinedOutput {
+            process: astra_sandbox::IsolatedOutput {
+                stdout: "captured".into(),
+                stderr: String::new(),
+                exit_code: Some(0),
+                timed_out: false,
+                cancelled: false,
+                execution_started: started,
+                stdout_capped: false,
+                stderr_capped: false,
+                namespace_active: true,
+                cgroup_active: false,
+                scope_settled: settled,
+                scope_ownership: Some(astra_sandbox::ScopeOwnership::InvocationSupervisor),
+                descendants_terminated: true,
+            },
+            confinement: astra_sandbox::ShellConfinementEvidence::LinuxRestrictedRootV1 { receipt },
+        }
+    }
+
+    #[test]
+    fn setup_and_settlement_are_independent() {
+        for (receipt, started, settled, error) in [
+            (Ok(0), true, true, false),
+            (Ok(0), true, false, true),
+            (Err("missing receipt".into()), true, true, true),
+            (Err("spawn refused".into()), false, false, true),
+        ] {
+            let verified = receipt.is_ok();
+            let result = map_confined_bash_output("true", output(receipt, started, settled), None);
+            assert_eq!(result.is_error, error);
+            let fields = result.metadata.unwrap();
+            assert_eq!(fields.contains_key("exit_code"), verified);
+            assert_eq!(fields[INTERNAL_EXECUTION_STARTED_FIELD], started);
+            assert_eq!(
+                fields["shell_confinement"]["settlement"]["scope_settled"],
+                settled
+            );
+            assert_eq!(
+                fields["shell_confinement"]["setup"]["status"],
+                if verified { "verified" } else { "unverified" }
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_and_timeout_keep_settlement_without_verifier_exit() {
+        for cancelled in [false, true] {
+            let mut raw = output(Err("interrupted".into()), true, true);
+            raw.process.cancelled = cancelled;
+            raw.process.timed_out = !cancelled;
+            let result = map_confined_bash_output("true", raw, None);
+            assert!(result.is_error);
+            assert_eq!(
+                result.exit_semantics,
+                Some(if cancelled {
+                    ExitSemantics::Cancelled
+                } else {
+                    ExitSemantics::TimedOut
+                })
+            );
+            let fields = result.metadata.unwrap();
+            assert!(!fields.contains_key("exit_code"));
+            assert_eq!(
+                fields["shell_confinement"]["settlement"]["ownership"],
+                "invocation_supervisor"
+            );
+        }
+        let mut raw = output(Ok(0), true, true);
+        raw.process.scope_ownership = Some(astra_sandbox::ScopeOwnership::ForegroundProcessGroup);
+        assert!(map_confined_bash_output("true", raw, None).is_error);
     }
 }

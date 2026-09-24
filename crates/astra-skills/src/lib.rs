@@ -50,7 +50,6 @@ pub use traits::{SkillError, SkillExecutor, SkillProvider, SkillResolver};
 
 // Runtime skill execution and management
 pub mod executor;
-pub mod improvement;
 pub mod verify;
 
 // Re-export key types
@@ -58,7 +57,6 @@ pub use executor::{
     InlineSkillExecutor, IsolatedSkillExecutor, SkillExecutionRouter, SkillSubRunExecutor,
     SubRunResult,
 };
-pub use improvement::{ImprovementProposal, ImprovementTracker, SkillImprovement, TURN_BATCH_SIZE};
 pub use verify::SkillVerifier;
 
 /// Detect inline shell command lines in skill instructions.

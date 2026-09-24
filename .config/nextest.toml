@@ -21,8 +21,9 @@ slow-timeout = { period = "15s", terminate-after = 1 }
 # because the live MatrixOne database is a shared external bottleneck.
 test-threads = 2
 
-# CI and strict profiles use a 30s per-test-case hard budget. TIMEOUT = FAIL;
-# no per-test/per-binary carve-outs. The default local profile stays at 15s.
+# CI and strict profiles default to a 30s per-test-case hard budget. TIMEOUT = FAIL.
+# The sequential live adoption journey has an explicit bounded override below;
+# the default local profile stays at 15s.
 # Tighten later when known contention such as the `session_sync_log` prune hot
 # path is fixed — ideally back toward 1–2s per case.
 [profile.ci]
@@ -149,4 +150,16 @@ package(astra-plan) and binary(plan_repository_db_it)
  or package(astra-runtime) and binary(e2e_joint)
  or test(/migration_dedupe_removes_duplicate_attempt_tuples/)
 """
+test-group = "integration_e2e"
+
+# Ten sequential public chat executions exercise adoption, continuation,
+# replacement, rollback, and pre-provider rejection through a live database.
+[[profile.strict-online.overrides]]
+filter = "test(adopted_skill_reaches_primary_provider_in_both_chat_entries)"
+slow-timeout = { period = "120s", terminate-after = 1 }
+test-group = "integration_e2e"
+
+[[profile.strict-online-ci.overrides]]
+filter = "test(adopted_skill_reaches_primary_provider_in_both_chat_entries)"
+slow-timeout = { period = "120s", terminate-after = 1 }
 test-group = "integration_e2e"

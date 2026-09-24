@@ -579,7 +579,6 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             skills: SkillState {
                 resolver: self.skill_resolver.clone(),
                 quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
                 tool_event_hooks: astra_skills::hooks::load_tool_event_hooks(&effective_root),
                 session_event_hooks: astra_skills::hooks::load_session_event_hooks(&effective_root),
                 ..Default::default()

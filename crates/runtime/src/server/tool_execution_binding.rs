@@ -275,6 +275,8 @@ pub struct ToolExecutionRequest {
     pub tool_name: String,
     pub args: Value,
     pub workspace: WorkspaceBinding,
+    pub evaluation_workspace:
+        Option<astra_services::evaluation::workspace_evidence::EvaluationWorkspaceMaterialization>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_record: Option<astra_runtime_env::WorkspaceRecord>,
     pub executor: ExecutorBinding,
@@ -571,6 +573,7 @@ impl ExecutionBindingState {
             tool_name: name.to_string(),
             args: args.clone(),
             workspace: self.workspace.clone(),
+            evaluation_workspace: None,
             workspace_record: self.workspace_record.clone(),
             executor: self.executor.clone(),
             runtime: self.runtime.clone(),

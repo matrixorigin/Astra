@@ -1,4 +1,4 @@
-//! Evaluation **read** routes that use `x-user-id` (evaluation service) plus a few JWT-only probes.
+//! Evaluation read routes require authenticated owner identity, not caller-supplied user IDs.
 //!
 //! Seeds a minimal `/agents` row because `trust-report` and observability routes require `agent_id`.
 
@@ -36,7 +36,6 @@ pub async fn run_evaluation_read_http_smoke() {
     let agent_id = ag_j["agent_id"].as_str().expect("agent_id");
 
     let endpoints: &[&str] = &[
-        "/evaluation/gates?limit=10",
         "/evaluation/calibration?days=7",
         "/evaluation/sessions/scores?limit=10&min_score=0",
         "/evaluation/quality/trend?days=7",
@@ -46,8 +45,14 @@ pub async fn run_evaluation_read_http_smoke() {
         "/evaluation/drift",
     ];
 
+    let (unauthenticated, _) = get_json(&ctx.app, endpoints[0], None, xuid).await;
+    assert_eq!(
+        unauthenticated,
+        StatusCode::UNAUTHORIZED,
+        "x-user-id cannot authenticate evaluation reads"
+    );
     for path in endpoints {
-        let (st, j) = get_json(&ctx.app, path, None, xuid).await;
+        let (st, j) = get_json(&ctx.app, path, Some(auth), &[]).await;
         assert_eq!(st, StatusCode::OK, "{path}: {j}");
         assert!(
             j.as_object().is_some(),
@@ -56,15 +61,15 @@ pub async fn run_evaluation_read_http_smoke() {
     }
 
     let trust_path = format!("/evaluation/trust-report?agent_id={agent_id}&days=7");
-    let (st_trust, trust_j) = get_json(&ctx.app, &trust_path, None, xuid).await;
+    let (st_trust, trust_j) = get_json(&ctx.app, &trust_path, Some(auth), &[]).await;
     assert_eq!(st_trust, StatusCode::OK, "trust-report: {trust_j}");
 
     let slo_hist = format!("/evaluation/slo/{agent_id}/history?days=7");
-    let (st_slo_h, slo_h_j) = get_json(&ctx.app, &slo_hist, None, xuid).await;
+    let (st_slo_h, slo_h_j) = get_json(&ctx.app, &slo_hist, Some(auth), &[]).await;
     assert_eq!(st_slo_h, StatusCode::OK, "slo history: {slo_h_j}");
 
     let obs_path = format!("/evaluation/observability/metrics?agent_id={agent_id}&days=7");
-    let (st_obs, obs_j) = get_json(&ctx.app, &obs_path, None, xuid).await;
+    let (st_obs, obs_j) = get_json(&ctx.app, &obs_path, Some(auth), &[]).await;
     assert_eq!(st_obs, StatusCode::OK, "observability: {obs_j}");
 
     b.ctx.close().await;

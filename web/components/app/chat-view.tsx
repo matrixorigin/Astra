@@ -5,6 +5,7 @@ import {
   Bot,
   ClipboardList,
   MoreVertical,
+  Sparkles,
   Wrench,
   type LucideIcon,
 } from "lucide-react";
@@ -393,6 +394,15 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
             <span className="rounded-full bg-surface-muted px-2 py-1 text-xs font-medium text-text-muted">
               Archived
             </span>
+          ) : null}
+          {detail.session?.backendSessionId ? (
+            <Link
+              href={`/authoring?sessionId=${encodeURIComponent(detail.session.backendSessionId)}`}
+              className="inline-flex items-center gap-1.5 rounded-control border border-border bg-surface px-3 py-1.5 text-xs font-medium text-text-secondary transition-colors hover:bg-surface-muted hover:text-text"
+            >
+              <Sparkles className="size-3.5" />
+              Create or improve
+            </Link>
           ) : null}
           <ChatActionsMenu
             chatId={detail.chat.id}

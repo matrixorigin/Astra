@@ -808,6 +808,7 @@ impl StreamResult {
             reused: classes.reused,
             suppressed: classes.suppressed,
             deferred: 0,
+            policy_denied: None,
         };
         outcomes.is_consistent().then_some(outcomes)
     }

@@ -15,6 +15,19 @@ Context window management defines how Astra uses finite model context without lo
 
 ## Budget zones
 
+The shared `ContextBudget` resolves the catalog window, completion reserve,
+summary reserve, and configured compaction threshold once for its consumers.
+Planning, wire-budget checks, and semantic compaction consume that resolved
+policy. A net input limit must not be interpreted as a raw model window and
+have reserves deducted again.
+
+The planner uses the resolved compaction thresholds for both raw and predicted
+pressure. Prediction and context-length recovery may escalate the selected
+tier, but cannot lower it below the raw-pressure tier. Summary retries consume
+the supplied compaction retry limit. These shared types do not by themselves
+freeze an Evaluation experiment: admission must also bind and deliver the
+exact execution configuration to the trial.
+
 | Zone | Purpose |
 | --- | --- |
 | Stable contract | System rules, tool protocol, provider decision schema. |

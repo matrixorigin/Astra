@@ -13,6 +13,11 @@ use serde_json::json;
 use tokio::net::TcpListener;
 use tower::util::ServiceExt;
 
+mod execution_fixture {
+    use astra_services as services;
+    include!("../../services/tests/fixtures/evaluation_execution_config.rs");
+}
+
 #[derive(Clone)]
 struct StubHealthChecker;
 
@@ -151,6 +156,90 @@ fn build_memoria_backed_app(memoria_base_url: String) -> axum::Router {
     build_app(state)
 }
 
+fn generic_experiment_create_value() -> serde_json::Value {
+    let hash = |letter: char| format!("sha256:{}", letter.to_string().repeat(64));
+    json!({
+        "submission_idempotency_key": "contract-submission",
+        "spec": {
+            "schema_version": 1,
+            "experiment_id": "contract-experiment",
+            "measurement_profile": "instruction-only.v1",
+            "target": {
+                "kind": "prompt",
+                "baseline": {"revision_id": "base", "content_hash": hash('a')},
+                "candidate": {"revision_id": "candidate", "content_hash": hash('b')},
+                "judgment_policy": {"kind": "disabled"}
+            },
+            "cases": [{
+                "case_id": "case-1",
+                "input_snapshot_ref": "input://case-1",
+                "input_content_hash": hash('c'),
+                "task_verifier": astra_services::evaluation::task_verifier::TaskVerifierSpec::freeze(
+                    astra_services::evaluation::task_verifier::JsonValueEqualsConfig { expected: json!({"ok": true}) },
+                ).expect("freeze contract task verifier"),
+                "holdout": false
+            }],
+            "repetitions": 1,
+            "order": {"kind": "baseline_first"},
+            "conditions": {
+                "execution_config": execution_fixture::execution_config("model", "provider", "case-1"),
+                "isolation_profile": "prompt_only_private",
+                "model_binding": "model",
+                "provider_binding": "provider",
+                "context_snapshot_hash": hash('d'),
+                "tool_policy_hash": hash('e'),
+                "cache_policy": "provider_default_recorded",
+                "memory_isolation": {"kind": "disabled"},
+                "data_isolation": {"kind": "disabled"}
+            },
+            "budget": {
+                "max_trials": 2,
+                "max_concurrency": 1,
+                "max_wall_time_secs": 60
+            }
+        }
+    })
+}
+
+fn generic_experiment_create_body() -> body::Body {
+    body::Body::from(
+        serde_json::to_vec(&generic_experiment_create_value())
+            .expect("serialize generic experiment request"),
+    )
+}
+
+fn generic_experiment_create_with_prepare_marker_body() -> body::Body {
+    let mut value = generic_experiment_create_value();
+    value["spec"]["adapter_profile_version"] =
+        json!(astra_services::evaluation::EVALUATION_ADAPTER_PROFILE_VERSION);
+    body::Body::from(
+        serde_json::to_vec(&value).expect("serialize marked generic experiment request"),
+    )
+}
+
+fn prepared_experiment_body() -> body::Body {
+    body::Body::from(
+        serde_json::to_vec(&json!({
+            "submission_idempotency_key": "prepare-contract-submission",
+            "target": {
+                "kind": "prompt",
+                "baseline": {"revision_id": "base", "content": "baseline instructions"},
+                "candidate": {"revision_id": "candidate", "content": "candidate instructions"}
+            },
+            "case": {
+                "case_id": "case-1",
+                "message": "fixed input",
+                "verifier_config": {"kind":"json_value_equals", "expected": {"ok": true}},
+                "holdout": false
+            },
+            "model_offering_id": "model",
+            "max_concurrency": 1,
+            "max_wall_time_secs": 60
+        }))
+        .expect("serialize prepared evaluation request"),
+    )
+}
+
 /// `json_ct`: send `content-type: application/json` (only for POST bodies that had it originally).
 async fn oneshot_eval(
     app: axum::Router,
@@ -170,12 +259,26 @@ async fn oneshot_eval(
 }
 
 #[tokio::test]
-async fn unconfigured_evaluation_routes_return_503() {
+async fn unconfigured_evaluation_routes_return_errors() {
     let app = build_unconfigured_app();
+    let generic_get_uris = [
+        "/evaluation/experiments/exp-1",
+        "/evaluation/experiments/exp-1/report",
+    ];
+    for uri in generic_get_uris {
+        let resp = oneshot_eval(app.clone(), "GET", uri, body::Body::empty(), false).await;
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "GET {uri}");
+    }
+
+    // Reach the unconfigured Evaluation service rather than failing at auth.
+    let app = build_app(
+        AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_auth_service(Arc::new(StubAuthService)),
+    );
+
     let get_uris = [
         "/evaluation/quality/trend",
         "/evaluation/drift",
-        "/evaluation/gates",
         "/evaluation/calibration",
         "/evaluation/sessions/scores",
         "/evaluation/trust-report?agent_id=agent-1",
@@ -195,20 +298,23 @@ async fn unconfigured_evaluation_routes_return_503() {
         );
     }
 
-    let post_cases: [(&str, body::Body, bool); 4] = [
-        (
-            "/evaluation/gate/validate",
-            body::Body::from(r#"{"change_type":"prompt","change_id":"c1","change_content":{}}"#),
-            true,
-        ),
-        ("/evaluation/drift/run", body::Body::empty(), false),
-        ("/evaluation/loop", body::Body::empty(), false),
-        (
-            "/evaluation/training-data/extract",
-            body::Body::from(r#"{}"#),
-            true,
-        ),
-    ];
+    let post_cases: [(&str, body::Body, bool); 1] = [(
+        "/evaluation/training-data/extract",
+        body::Body::from(r#"{}"#),
+        true,
+    )];
+    let generic_create = oneshot_eval(
+        build_unconfigured_app(),
+        "POST",
+        "/evaluation/experiments",
+        generic_experiment_create_body(),
+        true,
+    )
+    .await;
+    // Authentication is unconfigured here; the authenticated fixture below
+    // separately exercises the database-availability boundary.
+    assert_eq!(generic_create.status(), StatusCode::NOT_IMPLEMENTED);
+
     for (uri, b, json_ct) in post_cases {
         let resp = oneshot_eval(app.clone(), "POST", uri, b, json_ct).await;
         assert_eq!(
@@ -217,6 +323,69 @@ async fn unconfigured_evaluation_routes_return_503() {
             "POST {uri}"
         );
     }
+}
+
+#[tokio::test]
+async fn obsolete_evaluation_authority_routes_are_absent() {
+    let app = build_unconfigured_app();
+    for (method, uri) in [
+        ("GET", "/evaluation/gates"),
+        ("POST", "/evaluation/gate/validate"),
+        ("POST", "/evaluation/loop"),
+        ("POST", "/evaluation/drift/run"),
+    ] {
+        let response = oneshot_eval(app.clone(), method, uri, body::Body::from("{}"), true).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+    }
+}
+
+#[tokio::test]
+async fn generic_evaluation_control_plane_requires_database() {
+    let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+        .with_auth_service(Arc::new(StubAuthService));
+    let app = build_app(state);
+
+    let projection = oneshot_eval(
+        app.clone(),
+        "GET",
+        "/evaluation/experiments/exp-1",
+        body::Body::empty(),
+        false,
+    )
+    .await;
+    assert_eq!(projection.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let create = oneshot_eval(
+        app.clone(),
+        "POST",
+        "/evaluation/experiments",
+        generic_experiment_create_body(),
+        true,
+    )
+    .await;
+    assert_eq!(create.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let marked_create = oneshot_eval(
+        app,
+        "POST",
+        "/evaluation/experiments",
+        generic_experiment_create_with_prepare_marker_body(),
+        true,
+    )
+    .await;
+    assert_eq!(marked_create.status(), StatusCode::BAD_REQUEST);
+
+    let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+        .with_auth_service(Arc::new(StubAuthService));
+    let prepare = oneshot_eval(
+        build_app(state),
+        "POST",
+        "/evaluation/experiments/prepare",
+        prepared_experiment_body(),
+        true,
+    )
+    .await;
+    assert_eq!(prepare.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
@@ -258,35 +427,4 @@ async fn memory_health_and_metrics_use_mock_memoria() {
     assert_eq!(json["avg_confidence"], 0.6666666666666666);
     assert_eq!(json["noise_filtered_avg_confidence"], 0.6666666666666666);
     assert_eq!(json["noise_filtered_confidence_samples"], 12);
-}
-
-// Drift/quality/slo routes require a DB and are not backed by Memoria.
-// Verify they return 500 using the unconfigured stub (no TCP attempt).
-#[tokio::test]
-async fn db_dependent_evaluation_routes_return_error_without_db() {
-    let app = build_unconfigured_app();
-
-    let cases = [
-        ("GET", "/evaluation/drift", body::Body::empty(), false),
-        (
-            "GET",
-            "/evaluation/quality/trend?model=gpt-4",
-            body::Body::empty(),
-            false,
-        ),
-        (
-            "GET",
-            "/evaluation/slo/dashboard",
-            body::Body::empty(),
-            false,
-        ),
-    ];
-    for (method, uri, b, json_ct) in cases {
-        let resp = oneshot_eval(app.clone(), method, uri, b, json_ct).await;
-        assert_eq!(
-            resp.status(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "{method} {uri}"
-        );
-    }
 }

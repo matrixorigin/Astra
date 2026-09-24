@@ -36,6 +36,7 @@ vi.mock("@/hooks/use-keyboard-shortcut", () => ({
 vi.mock("lucide-react", () => {
   const Icon = () => null;
   return {
+    FlaskConical: Icon,
     FolderKanban: Icon,
     Home: Icon,
     ListTodo: Icon,

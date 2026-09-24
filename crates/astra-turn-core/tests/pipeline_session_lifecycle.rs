@@ -21,6 +21,7 @@ use astra_turn_core::token_accounting::TokenAccounting;
 
 fn make_session_context() -> SessionContext {
     SessionContext {
+        compaction_thresholds: Default::default(),
         session_id: "integration-test-session".into(),
         run_id: "run-1".into(),
         model_id: "claude-sonnet-4-6".into(),

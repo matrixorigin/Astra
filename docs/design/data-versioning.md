@@ -36,6 +36,28 @@ Track versions or stable references for:
 | Artifact manifest | Which external or large objects were referenced. |
 | Policy snapshot | Permissions, plan mode, and safety policy. |
 
+## Unified snapshot identity
+
+A snapshot is an immutable manifest, not a timestamp. Astra addresses the
+manifest with a UUIDv7 `snapshot_id`, which is useful for ordering, idempotent
+requests, and cross-edge observation. The manifest also records the immutable
+component references that make the state reproducible:
+
+```text
+workspace: git commit/tree hash
+memory:    owner/trial Memoria branch + base revision
+data:      MatrixOne snapshot/branch + base revision
+context:   canonical input hash
+policy:    model/provider/tool-policy hashes
+```
+
+The canonical manifest has a separate `snapshot_fingerprint` content hash for
+equality and tamper detection. A `trial_id` identifies a case/arm/repetition
+execution and points to the snapshot it actually used; it is not an alias for
+the snapshot. Mutable components are branched or copy-on-write within the
+owner/trial namespace. A timestamp remains metadata for ordering and
+retention, never the sole identity or evidence of isolation.
+
 ## Branching and experimentation
 
 Versioning enables safe experiments:

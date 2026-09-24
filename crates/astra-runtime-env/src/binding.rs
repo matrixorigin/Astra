@@ -681,10 +681,31 @@ fn apply_policy_tool_allowlist(policy: &PolicyIntent, tool_surface: &mut Availab
         .dedup_by(|a, b| a.tool_name == b.tool_name);
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceSourceIdentity {
+    pub commit: String,
+    pub tree: String,
+    /// Whether the checkout had no tracked, untracked, or ignored working
+    /// tree changes when the identity was captured.
+    #[serde(default)]
+    pub clean: bool,
+}
+
+impl WorkspaceSourceIdentity {
+    pub fn is_valid(&self) -> bool {
+        is_git_object_id(&self.commit) && is_git_object_id(&self.tree)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeEnvironmentAdvertisement {
     pub schema_version: u32,
     pub binding: RunBinding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_source: Option<WorkspaceSourceIdentity>,
+    /// Actual provider capability; ordinary workspace providers make no claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_confinement: Option<crate::WorkspaceConfinementContract>,
 }
 
 impl RuntimeEnvironmentAdvertisement {
@@ -694,8 +715,14 @@ impl RuntimeEnvironmentAdvertisement {
         Self {
             schema_version: Self::SCHEMA_VERSION,
             binding,
+            workspace_source: None,
+            workspace_confinement: None,
         }
     }
+}
+
+fn is_git_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -721,6 +748,7 @@ mod tests {
             value["binding"]["capabilities"]["runtime"]["runtime_has_shell"],
             true
         );
+        assert!(value.get("workspace_confinement").is_none());
         assert!(value["binding"]["tool_surface"]["tool_names"].is_array());
         assert!(
             value["binding"]["tool_surface"].get("admissions").is_none(),

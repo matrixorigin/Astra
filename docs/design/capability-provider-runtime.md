@@ -564,6 +564,25 @@ not silently extend or rewrite the artifact's retention policy. Forward and
 reverse edge queries must expose exactly which durable owner keeps an artifact
 reachable.
 
+Complete invocation evidence requires an independent admission witness. The
+Run owner verifies every journal event through `last_event_idx`, including
+payload hashes and canonical action identities. The invocation owner reads
+that history and all hot/archive records in one consistent transaction, then
+requires every admitted tool identity to resolve exactly once. Archive replay
+and coverage share checks for artifact provenance, content hash, size, record
+count, scope, and indexed identity bounds. Missing journal prefixes or suffixes,
+wholesale ledger/index loss, and unresolved dispatches cannot produce complete
+evidence. A verified empty admission set proves no admitted calls, not task
+success. Never-dispatched prepared/rejected rows remain diagnostics; their
+survival is not independently witnessed by a dispatch grant.
+
+Semantic-cache completions also require an atomic Run grant while retaining
+`NotDispatched` and zero provider attempts. The Evaluation assessment
+transaction re-enumerates this verified coverage before running the task
+verifier and persists its exact grant/completion proof. Historical reports
+validate that immutable proof; row enumeration alone still cannot enable
+workspace Evaluation capability.
+
 Introspect and reflect project, but never control, these durable facts. The
 runtime introspect evidence includes hot state counts, non-dispatched closure
 rejections, outcome-unknown rows, archive chunks, artifact-reference counts,

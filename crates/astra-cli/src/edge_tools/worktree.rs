@@ -61,6 +61,8 @@ pub struct WorktreeSession {
     pub original_root: PathBuf,
     /// Git commit SHA at the time the worktree was created.
     pub original_head_commit: Option<String>,
+    /// Tree identity of the pinned creation commit.
+    pub source_tree: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -553,10 +555,14 @@ impl ToolExecutor {
     /// Enter a worktree session. Creates the worktree and updates internal state.
     /// Returns the new WorktreeSession on success.
     pub fn enter_worktree(&self, branch: &str) -> Result<WorktreeSession, String> {
-        self.enter_worktree_result(branch)
+        self.enter_worktree_result(branch, None)
             .map_err(|error| error.to_string())
     }
-    fn enter_worktree_result(&self, branch: &str) -> Result<WorktreeSession, WorktreeError> {
+    fn enter_worktree_result(
+        &self,
+        branch: &str,
+        source_commit: Option<&str>,
+    ) -> Result<WorktreeSession, WorktreeError> {
         // Check if already in a worktree session
         if self.in_worktree_session() {
             return Err(
@@ -576,8 +582,23 @@ impl ToolExecutor {
             return Err(("Invalid branch name".to_string()).into());
         }
 
-        // Get current HEAD commit for later diffing
-        let original_head = astra_tools::git_gix::head_short(&self.project_root);
+        // Resolve once and pass the immutable identity to creation, even when
+        // the caller selected HEAD. A moving branch cannot change the baseline.
+        let revision = format!("{}^{{commit}}", source_commit.unwrap_or("HEAD"));
+        let resolved = astra_tools::git_gix::prepare_bound_git_command(&self.project_root)
+            .map_err(astra_tools::git_gix::GitProcessError::RepositoryBinding)?
+            .args(["rev-parse", "--verify", "--end-of-options", &revision])
+            .output()
+            .map_err(astra_tools::git_gix::GitProcessError::Execution)?;
+        if !resolved.status.success() {
+            return Err("source_commit must resolve to an existing commit".into());
+        }
+        let original_head = String::from_utf8_lossy(&resolved.stdout).trim().to_string();
+        if !matches!(original_head.len(), 40 | 64)
+            || !original_head.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("Git returned an invalid source commit identity".into());
+        }
 
         // Generate worktree path as sibling directory
         let repo_name = self
@@ -603,6 +624,7 @@ impl ToolExecutor {
             .map_err(astra_tools::git_gix::GitProcessError::RepositoryBinding)?
             .args(["worktree", "add", "-b", branch])
             .arg(&worktree_path)
+            .arg(&original_head)
             .output()
             .map_err(astra_tools::git_gix::GitProcessError::Execution)?;
 
@@ -615,15 +637,37 @@ impl ToolExecutor {
             .into());
         }
 
+        let verification_error = |error: String| {
+            WorktreeError::Domain(format!(
+                "Worktree source verification failed: {error}. Created workspace preserved at {} on branch {branch}. Session was not switched.",
+                worktree_path.display()
+            ))
+        };
+        let identity = astra_tools::git_gix::prepare_bound_git_command(&worktree_path)
+            .map_err(|error| verification_error(error.to_string()))?
+            .args(["rev-parse", "HEAD", "HEAD^{tree}"])
+            .output()
+            .map_err(|error| verification_error(error.to_string()))?;
+        let identity_text = String::from_utf8_lossy(&identity.stdout);
+        let mut identities = identity_text.lines();
+        let head = identities.next().unwrap_or_default();
+        let source_tree = identities.next().unwrap_or_default();
+        if !identity.status.success()
+            || head != original_head
+            || source_tree.len() != original_head.len()
+            || !source_tree.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(verification_error(
+                "created HEAD/tree did not match the pinned source".to_string(),
+            ));
+        }
+
         let session = WorktreeSession {
             worktree_path: worktree_path.clone(),
             branch_name: branch.to_string(),
+            source_tree: source_tree.to_string(),
             original_root: self.project_root.clone(),
-            original_head_commit: if original_head.is_empty() {
-                None
-            } else {
-                Some(original_head)
-            },
+            original_head_commit: Some(original_head),
         };
 
         // Update session state
@@ -764,7 +808,16 @@ impl ToolExecutor {
                         );
                     }
                 };
-                match self.enter_worktree_result(branch) {
+                let source_commit = match args.get("source_commit") {
+                    None => None,
+                    Some(Value::String(value)) if !value.trim().is_empty() => Some(value.as_str()),
+                    Some(_) => {
+                        return super::ToolExecutionOutcome::error(
+                            "Error: source_commit must be a non-empty commit reference".to_string(),
+                        );
+                    }
+                };
+                match self.enter_worktree_result(branch, source_commit) {
                     Ok(session) => {
                         self.record_git_worktree_rollback(
                             session.worktree_path.clone(),
@@ -783,10 +836,18 @@ impl ToolExecutor {
                                 "branch".to_string(),
                                 Value::String(session.branch_name.clone()),
                             ),
+                            (
+                                "source_tree".to_string(),
+                                Value::String(session.source_tree.clone()),
+                            ),
                             ("delete_branch_on_rollback".to_string(), Value::Bool(true)),
                             ("session_scoped".to_string(), Value::Bool(true)),
                         ]);
                         if let Some(original_head_commit) = session.original_head_commit.as_ref() {
+                            tool_result_fields.insert(
+                                "source_commit".to_string(),
+                                Value::String(original_head_commit.clone()),
+                            );
                             tool_result_fields.insert(
                                 "original_head_commit".to_string(),
                                 Value::String(original_head_commit.clone()),

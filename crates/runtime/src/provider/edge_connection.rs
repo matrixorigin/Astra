@@ -170,6 +170,7 @@ impl CapabilityProvider for EdgeConnectionProvider {
             args: request.parameters.clone(),
             workspace: WorkspaceBinding::edge_workspace("edge", "/", WorkspaceAuthority::None),
             workspace_record,
+            evaluation_workspace: None,
             executor: ExecutorBinding::edge_agent(
                 "edge-agent",
                 "Edge Agent",

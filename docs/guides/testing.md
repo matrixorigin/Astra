@@ -246,6 +246,24 @@ ASTRA_TEST_DB_IT=1 cargo test -p astra-runtime --lib \
   --ignored --nocapture
 ```
 
+The coding Evaluation journey executes a real dedicated Edge deployment. It
+requires a prepared deployment image/configuration and a clean source mount;
+the ordinary Edge binary is intentionally not accepted as a substitute. Set
+`ASTRA_EVALUATION_EDGE_CONFIG` to the image-backed `/etc/astra/evaluation.json`
+and `ASTRA_EVALUATION_EDGE_WORKSPACE_DIR` to its direct child source mount
+under the configured allocation root. To run that journey directly:
+
+```bash
+cargo build -p astra-edge --bin astra-edge
+ASTRA_TEST_DB_IT=1 \
+ASTRA_EVALUATION_EDGE_BIN="$(pwd)/target/debug/astra-edge" \
+ASTRA_EVALUATION_EDGE_CONFIG=/etc/astra/evaluation.json \
+ASTRA_EVALUATION_EDGE_WORKSPACE_DIR=/var/lib/astra-eval/allocations/source \
+cargo test -p astra-runtime --features e2e-hooks \
+  --test system_matrix_http_e2e \
+  e2e_matrix_evaluation_coding_real_edge -- --ignored --nocapture
+```
+
 This is an execution isolation and lifecycle contract. Its bounded timeouts do
 not claim deployment-scale throughput; use the Work pressure and multi-server
 capacity probes for many readers, multiple server processes, provider quotas,

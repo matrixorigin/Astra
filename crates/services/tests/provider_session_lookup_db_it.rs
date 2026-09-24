@@ -135,3 +135,97 @@ async fn provider_lookup_distinguishes_absence_without_exposing_foreign_sessions
         .await
         .expect("delete test session");
 }
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn evaluation_session_bootstrap_is_cross_instance_idempotent_and_owner_scoped() {
+    use astra_services::resource_governor::{LimitCheck, ResourceLimitKind};
+
+    let (pool, settings) = common::setup_pool_and_settings().await;
+    let first = DatabaseSessionService::new(settings.clone()).with_pool(pool.clone());
+    let second = DatabaseSessionService::new(settings).with_pool(pool);
+    let owner = format!("evaluation-bootstrap-{}", Uuid::new_v4().simple());
+    let other_owner = format!("evaluation-bootstrap-other-{}", Uuid::new_v4().simple());
+    let session_id = format!("evs_{}", Uuid::new_v4().simple());
+    let request = SessionCreateRequestData {
+        agent_id: None,
+        title: Some("Eval trial".to_string()),
+        metadata: None,
+    };
+    let hash = "a".repeat(64);
+
+    let (a, b) = tokio::join!(
+        first.create_idempotent_session(
+            owner.clone(),
+            session_id.clone(),
+            request.clone(),
+            hash.clone(),
+            LimitCheck::Allowed,
+        ),
+        second.create_idempotent_session(
+            owner.clone(),
+            session_id.clone(),
+            request.clone(),
+            hash.clone(),
+            LimitCheck::Allowed,
+        ),
+    );
+    let a = a.expect("first evaluation bootstrap");
+    let b = b.expect("second evaluation bootstrap");
+    assert_eq!(a.session.session_id, session_id);
+    assert_eq!(a.session.session_id, b.session.session_id);
+    assert_ne!(
+        a.created, b.created,
+        "exactly one replica inserts the session"
+    );
+
+    let replay = second
+        .create_idempotent_session(
+            owner.clone(),
+            session_id.clone(),
+            request.clone(),
+            hash.clone(),
+            LimitCheck::Denied {
+                limit: ResourceLimitKind::DailySessions,
+                reason: "quota reached".to_string(),
+            },
+        )
+        .await
+        .expect("exact replay must not consume a second session quota");
+    assert!(!replay.created);
+
+    let conflict = second
+        .create_idempotent_session(
+            owner.clone(),
+            session_id.clone(),
+            request.clone(),
+            "b".repeat(64),
+            LimitCheck::Allowed,
+        )
+        .await
+        .expect_err("changed evaluation intent must conflict");
+    assert_eq!(conflict.0, StatusCode::CONFLICT);
+
+    let other = first
+        .create_idempotent_session(
+            other_owner.clone(),
+            session_id.clone(),
+            request,
+            hash,
+            LimitCheck::Allowed,
+        )
+        .await
+        .expect("same physical id is isolated by owner");
+    assert!(other.created);
+    assert_eq!(other.session.session_id, session_id);
+
+    first
+        .delete_session(session_id.clone(), owner)
+        .await
+        .expect("delete first owner session");
+    first
+        .delete_session(session_id, other_owner)
+        .await
+        .expect("delete second owner session");
+}

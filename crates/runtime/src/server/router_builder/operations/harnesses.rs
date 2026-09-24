@@ -15,6 +15,17 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             post(crate::server::product_harness_handlers::create_skillify_harness_run_handler),
         )
         .route(
+            "/harnesses/authoring/{session_id}",
+            get(crate::server::product_harness_handlers::list_authoring_targets_handler)
+                .post(crate::server::product_harness_handlers::create_authoring_intent_handler),
+        )
+        .route(
+            "/harnesses/authoring",
+            post(
+                crate::server::product_harness_handlers::create_standalone_authoring_intent_handler,
+            ),
+        )
+        .route(
             "/harnesses/runs/{harness_run_id}",
             get(crate::server::product_harness_handlers::get_harness_run_handler),
         )
@@ -45,9 +56,5 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/harnesses/runs/{harness_run_id}/skill-drafts/{skill_draft_id}/publish",
             post(crate::server::product_harness_handlers::publish_skill_draft_handler),
-        )
-        .route(
-            "/harnesses/runs/{harness_run_id}/skillify/draft",
-            post(crate::server::product_harness_handlers::create_skillify_draft_handler),
         )
 }

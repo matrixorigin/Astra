@@ -9,7 +9,6 @@ import {
   Workflow,
   type LucideIcon,
 } from 'lucide-react';
-import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useState } from 'react';
 import { Composer } from '@/components/app/composer';
@@ -23,9 +22,18 @@ type Journey = {
   title: string;
   description: string;
   prompt: string;
+  route?: string;
 };
 
 const journeys: Journey[] = [
+  {
+    icon: Workflow,
+    title: 'Create or improve a capability',
+    description: 'Describe the outcome. Astra chooses the authoring flow and shows the result with evidence.',
+    prompt:
+      'Help me create or improve the reusable capability behind this work. Generate a candidate, evaluate it with available evidence, and show me the result: ',
+    route: '/authoring',
+  },
   {
     icon: Network,
     title: 'Multi-agent review',
@@ -46,13 +54,6 @@ const journeys: Journey[] = [
     description: 'Inspect decisions, context pressure, evidence, and next actions.',
     prompt:
       'Introspect this session and reflect on progress, important decisions, risks, context usage, and the highest-value next action.',
-  },
-  {
-    icon: Workflow,
-    title: 'Build a harness',
-    description: 'Turn a proven workflow into a reusable, reviewed system.',
-    prompt:
-      'Help me design a practical reusable harness for this workflow, including sources, agent roles, review gates, outputs, and failure recovery: ',
   },
 ];
 
@@ -116,8 +117,8 @@ export function HomeScreen() {
               <span className="text-text-muted"> move forward?</span>
             </h1>
             <p className="mt-4 max-w-2xl text-sm leading-6 text-text-secondary sm:text-base">
-              Describe the outcome. Choose the runtime, skills, or connectors
-              only when the work needs them.
+              Describe the outcome in your own words. Astra resolves the
+              execution details and returns the result with evidence.
             </p>
           </section>
 
@@ -167,13 +168,9 @@ export function HomeScreen() {
               <p className="text-xs font-semibold uppercase tracking-[0.1em] text-text-muted">
                 Starting points
               </p>
-              <Link
-                href="/harnesses"
-                className="inline-flex items-center gap-1 text-xs font-medium text-text-muted hover:text-text"
-              >
-                Browse harnesses
-                <ArrowRight className="size-3.5" />
-              </Link>
+              <span className="text-[11px] text-text-muted">
+                Describe the goal; internal controls stay behind the result.
+              </span>
             </div>
 
             <div className="mt-3 grid gap-2 sm:grid-cols-2">
@@ -181,7 +178,13 @@ export function HomeScreen() {
                 <button
                   key={journey.title}
                   type="button"
-                  onClick={() => setInitialValue(journey.prompt)}
+                  onClick={() => {
+                    if (journey.route) {
+                      router.push(journey.route);
+                      return;
+                    }
+                    setInitialValue(journey.prompt);
+                  }}
                   className="group flex min-h-[88px] items-start gap-3 rounded-card border border-border/80 bg-surface px-4 py-3.5 text-left shadow-[0_1px_2px_rgba(15,23,42,0.025)] transition hover:border-border-strong hover:bg-surface-raised hover:shadow-[0_8px_22px_rgba(15,23,42,0.055)]"
                 >
                   <span className="mt-0.5 inline-flex size-8 shrink-0 items-center justify-center rounded-control bg-accent/10 text-accent">

@@ -34,6 +34,46 @@ pub const PROVIDER_INTERACTION_RESPOND: &str = "/provider-interactions/respond";
 /// `GET` — list durable runs.
 pub const RUNS: &str = "/runs";
 
+/// Owner-scoped controlled Evaluation plan and evidence endpoints.
+pub const EVALUATION_EXPERIMENTS: &str = "/evaluation/experiments";
+pub const EVALUATION_PREPARE: &str = "/evaluation/experiments/prepare";
+
+#[inline]
+pub fn evaluation_experiment(experiment_id: &str) -> Option<String> {
+    is_safe_path_segment(experiment_id).then(|| format!("{EVALUATION_EXPERIMENTS}/{experiment_id}"))
+}
+
+#[inline]
+pub fn evaluation_experiment_by_submission(submission_idempotency_key: &str) -> Option<String> {
+    is_safe_path_segment(submission_idempotency_key)
+        .then(|| format!("{EVALUATION_EXPERIMENTS}/by-submission/{submission_idempotency_key}"))
+}
+
+#[inline]
+pub fn evaluation_report(experiment_id: &str) -> Option<String> {
+    evaluation_experiment(experiment_id).map(|path| format!("{path}/report"))
+}
+
+#[inline]
+pub fn evaluation_trial_start(experiment_id: &str, trial_id: &str) -> Option<String> {
+    if !is_safe_path_segment(experiment_id) || !is_safe_path_segment(trial_id) {
+        return None;
+    }
+    Some(format!(
+        "{EVALUATION_EXPERIMENTS}/{experiment_id}/trials/{trial_id}/start"
+    ))
+}
+
+#[inline]
+pub fn evaluation_trial_assess(experiment_id: &str, trial_id: &str) -> Option<String> {
+    if !is_safe_path_segment(experiment_id) || !is_safe_path_segment(trial_id) {
+        return None;
+    }
+    Some(format!(
+        "{EVALUATION_EXPERIMENTS}/{experiment_id}/trials/{trial_id}/assess"
+    ))
+}
+
 /// Canonical Work catalog and Start Work boundary.
 pub const WORKS: &str = "/v1/works";
 

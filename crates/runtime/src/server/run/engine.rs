@@ -252,45 +252,44 @@ fn delegation_terminal_events(
     events
 }
 
-fn crash_recovery_terminal_events() -> [serde_json::Value; 2] {
+fn crash_recovery_terminal_events(run: &DurableRunRecord) -> [serde_json::Value; 2] {
+    let terminal = astra_services::runs::RunRecoveryTerminal {
+        user_id: run.user_id.clone(),
+        session_id: run.session_id.clone(),
+        run_id: run.run_id.clone(),
+        owner_generation: run.run_generation,
+        outcome: astra_services::runs::RunRecoveryTerminalOutcome::Failed,
+    }
+    .event();
     [
-        serde_json::json!({
-            "event_type": "run_error",
-            "data": {
-                "error": "recovered from crash",
-                "error_code": "crash_recovery",
-                "error_kind": "crash_recovery",
-                "source": "crash_recovery",
-            },
-        }),
-        serde_json::json!({
-            "event_type": "run_finished",
-            "data": {
-                "status": STATUS_FAILED,
-                "error": "recovered from crash",
-                "error_code": "crash_recovery",
-                "error_kind": "crash_recovery",
-                "source": "crash_recovery",
-            },
-        }),
+        serde_json::json!({"event_type": "run_error", "data": {
+            "error": "recovered from crash", "error_code": "crash_recovery",
+            "error_kind": "crash_recovery", "source": "crash_recovery",
+            "owner_generation": run.run_generation,
+        }}),
+        terminal,
     ]
 }
 
-fn crash_recovery_cancellation_event(
-    run_id: &str,
+fn crash_recovery_cancellation_event_for_generation(
+    run: &DurableRunRecord,
     origin: astra_turn_core::orchestration_types::CancellationOrigin,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "event_type": "run_finished",
-        "data": {
-            "run_id": run_id,
-            "status": STATUS_CANCELLED,
-            "cancelled": true,
-            "reason": "recovered durable cancellation control",
-            "source": "crash_recovery",
-            "cancellation_origin": origin,
-        }
-    })
+    use astra_turn_core::orchestration_types::CancellationOrigin;
+    astra_services::runs::RunRecoveryTerminal {
+        user_id: run.user_id.clone(),
+        session_id: run.session_id.clone(),
+        run_id: run.run_id.clone(),
+        owner_generation: run.run_generation,
+        outcome: astra_services::runs::RunRecoveryTerminalOutcome::Cancelled {
+            cancellation_origin: match origin {
+                CancellationOrigin::User => DurableCancellationOrigin::User,
+                CancellationOrigin::Runtime => DurableCancellationOrigin::Runtime,
+                CancellationOrigin::Unverified => DurableCancellationOrigin::Unverified,
+            },
+        },
+    }
+    .event()
 }
 
 fn turn_cancellation_origin(
@@ -1584,7 +1583,12 @@ impl RunEngine {
             .runtime_profile
             .map(runtime_profile_label)
             .map(str::to_string);
-        let run_started_data = run_started_event_data(&context);
+        let mut run_started_data = run_started_event_data(&context);
+        // A new root Run always starts at generation zero. Persisting the
+        // generation beside server-owned evaluation intent lets recovery
+        // distinguish this admission from a later owner generation instead
+        // of treating any historical run_started payload as current proof.
+        run_started_data["owner_generation"] = serde_json::Value::from(0_u64);
         let record = DurableRunRecord {
             run_id: run_id.to_string(),
             user_id: user_id.to_string(),
@@ -3512,7 +3516,7 @@ impl RunEngine {
                     return None;
                 }
             };
-            let event = crash_recovery_cancellation_event(&run.run_id, cancellation_origin);
+            let event = crash_recovery_cancellation_event_for_generation(run, cancellation_origin);
             return match self
                 .store
                 .update_run_status_with_events_if_current(
@@ -3644,7 +3648,7 @@ impl RunEngine {
                 }
             }
         } else {
-            let events = crash_recovery_terminal_events();
+            let events = crash_recovery_terminal_events(&run);
             match self
                 .store
                 .update_run_status_with_events_if_current(
@@ -4777,7 +4781,10 @@ mod tests {
                 STATUS_CANCELLED,
                 None,
                 None,
-                &[crash_recovery_cancellation_event(run_id, origin)],
+                &[crash_recovery_cancellation_event_for_generation(
+                    &engine.load_run(user_id, run_id).await.unwrap().unwrap(),
+                    origin,
+                )],
             )
             .await
             .expect("persist typed cancellation terminal")
@@ -7470,6 +7477,7 @@ mod tests {
             session_admission_facts: None,
             work_binding: None,
             run_start_idempotency: None,
+            evaluation_admission: None,
             full_llm_capture: false,
             agent_id: None,
             model: None,
@@ -7497,6 +7505,7 @@ mod tests {
             runtime_mcp_bindings: Vec::new(),
             context: None,
             edge_executor_id: None,
+            evaluation_workspace_base_root: None,
             capabilities: Vec::new(),
             forward_headers: std::collections::HashMap::new(),
             execution_budget: None,
@@ -10037,6 +10046,25 @@ mod tests {
             child.events.last().unwrap()["data"]["cancellation_origin"],
             "user"
         );
+        let durable = engine
+            .load_run("user-1", "recovery-child")
+            .await
+            .unwrap()
+            .unwrap();
+        let terminal = durable.events.last().unwrap();
+        assert_eq!(
+            terminal["idempotency_key"],
+            format!("run-recovery-terminal:{}", durable.run_generation)
+        );
+        assert_eq!(terminal["data"]["user_id"], durable.user_id);
+        assert_eq!(terminal["data"]["session_id"], durable.session_id);
+        assert_eq!(terminal["data"]["owner_generation"], durable.run_generation);
+        assert!(
+            durable
+                .events
+                .iter()
+                .any(|event| event["event_type"] == "run_recovery_claimed")
+        );
     }
 
     #[tokio::test]
@@ -10584,9 +10612,17 @@ mod tests {
             .iter()
             .filter_map(|event| event.get("event_type").and_then(serde_json::Value::as_str))
             .collect::<Vec<_>>();
-        assert!(
-            crashed_event_types.ends_with(&["user_intent_returned", "run_error", "run_finished"]),
-            "crash recovery must return input ownership before its terminal event pair"
+        assert_eq!(
+            crashed_event_types,
+            [
+                "run_started",
+                "user_intent",
+                "run_recovery_claimed",
+                "user_intent_returned",
+                "run_error",
+                "run_finished"
+            ],
+            "claim custody precedes the atomic input-return and terminal event pair"
         );
         let returned = &crashed.events[crashed.events.len() - 3];
         let run_error = &crashed.events[crashed.events.len() - 2];
@@ -10597,6 +10633,18 @@ mod tests {
             "crash recovery run_finished must be self-describing across replay boundaries"
         );
         assert_eq!(run_finished["data"]["error_code"], "crash_recovery");
+        assert_eq!(
+            run_finished["idempotency_key"],
+            format!("run-recovery-terminal:{}", crashed.run_generation)
+        );
+        assert_eq!(run_finished["data"]["user_id"], crashed.user_id);
+        assert_eq!(run_finished["data"]["session_id"], crashed.session_id);
+        assert_eq!(run_finished["data"]["run_id"], crashed.run_id);
+        assert_eq!(
+            run_finished["data"]["owner_generation"],
+            crashed.run_generation
+        );
+
         assert_eq!(returned["data"]["intent_id"], "orphaned-guidance");
         assert_eq!(returned["data"]["status"], "returned");
 
@@ -10613,9 +10661,16 @@ mod tests {
             .iter()
             .filter_map(|event| event.get("event_type").and_then(serde_json::Value::as_str))
             .collect::<Vec<_>>();
-        assert!(
-            waiting_types.ends_with(&["user_intent_returned", "run_interrupted_after_restart"]),
-            "executor handoff must return guidance before advertising session continuation: {waiting_types:?}"
+        assert_eq!(
+            waiting_types,
+            [
+                "run_started",
+                "user_intent",
+                "run_recovery_claimed",
+                "user_intent_returned",
+                "run_interrupted_after_restart"
+            ],
+            "custody and input return must precede session continuation"
         );
         assert_eq!(
             waiting.events.last().unwrap()["data"]["resume_strategy"],

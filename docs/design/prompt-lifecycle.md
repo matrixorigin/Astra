@@ -44,6 +44,27 @@ Stable prefix should contain:
 
 It should not contain volatile provider health, long task lists, raw tool output, or sync counters.
 
+## Captured execution inputs
+
+Server root Run preparation captures the effective static sections, including
+cache scope, token bucket and trace metadata, together with the session date and
+summary prompt templates. The host supplies these sections to new and restored
+pipeline sessions before context assembly. Ordinary checkpoint restoration keeps
+its stored session date; capturing prompts does not rewrite checkpoint history.
+
+Standalone and inline summaries receive explicit templates. Prompt-too-long
+retries reuse those exact templates. Their renderer version also binds history
+rendering and structured-summary validation; an unsupported version does not
+invoke the summary provider.
+
+Evaluation persists these inputs in its required execution configuration.
+Trial start uses the stored date, exact sections, templates and cache enablement;
+it does not read current override files or replace the experiment date with the
+trial date. Work admission and optional auxiliary-call gates are captured
+separately because they have different semantics. Ordinary child hosts still
+capture their own inputs; the instruction-only Evaluation profile does not
+permit a delegated execution tree.
+
 ## Dynamic blocks
 
 Dynamic blocks should have stable keys and compact values:

@@ -16,18 +16,22 @@
 //! integration tests; what remains here exercises the pure-function
 //! `ContextBudget::compaction_tier` that the planner itself consults.
 
-use astra_runtime::prompts::{CompactionTier, ContextBudget, budget_for_model};
+use astra_runtime::prompts::{CompactConfig, CompactionTier, ContextBudget};
 
-fn default_budget() -> ContextBudget {
-    let mut b = budget_for_model(Some("claude-sonnet-4"));
-    // Pin the threshold so the assertions below don't drift with config.
-    b.compact_threshold = 0.75;
-    b
+fn budget_with_threshold(threshold: f64) -> ContextBudget {
+    ContextBudget::resolve(
+        Some(200_000),
+        Some(32_000),
+        threshold,
+        6,
+        8_000,
+        CompactConfig::default(),
+    )
 }
 
 #[test]
 fn tier_progression_walks_all_four_stages_as_usage_grows() {
-    let budget = default_budget();
+    let budget = budget_with_threshold(0.75);
     let limit = budget.effective_input_limit() as f64;
 
     // 20-turn simulation: each turn adds roughly 5% of effective limit.
@@ -75,10 +79,8 @@ fn tier_progression_walks_all_four_stages_as_usage_grows() {
 
 #[test]
 fn tight_threshold_escalates_sooner_than_default() {
-    let mut default_b = default_budget();
-    default_b.compact_threshold = 0.75;
-    let mut tight_b = default_budget();
-    tight_b.compact_threshold = 0.60;
+    let default_b = budget_with_threshold(0.75);
+    let tight_b = budget_with_threshold(0.60);
 
     let limit = default_b.effective_input_limit();
     // Half the effective limit: default stays Normal, tight already in TrimSchemas.
@@ -98,8 +100,7 @@ fn budget_pressure_scalar_matches_documented_contract() {
 #[test]
 fn zero_tokens_classifies_as_normal_regardless_of_budget_shape() {
     for threshold in [0.50, 0.60, 0.75, 0.85] {
-        let mut b = default_budget();
-        b.compact_threshold = threshold;
+        let b = budget_with_threshold(threshold);
         assert_eq!(
             b.compaction_tier(0),
             CompactionTier::Normal,

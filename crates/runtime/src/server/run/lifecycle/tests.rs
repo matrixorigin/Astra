@@ -1,3 +1,6 @@
+#[path = "personal_skill_delivery_tests.rs"]
+mod personal_skill_delivery_tests;
+
 use super::*;
 
 #[path = "trace_ingestion_tests.rs"]
@@ -6,6 +9,67 @@ use astra_services::runs::{RunStatusCasRequest, RunUsageOwnerUpdateRequest};
 
 #[path = "cancellation_db_tests.rs"]
 mod cancellation_db_tests;
+
+#[derive(Clone)]
+struct EvalHttpHealth;
+
+#[async_trait::async_trait]
+impl crate::HealthChecker for EvalHttpHealth {
+    async fn database_healthy(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Clone)]
+struct EvalHttpAuth;
+
+#[async_trait::async_trait]
+impl crate::AuthService for EvalHttpAuth {
+    async fn register(
+        &self,
+        _request: crate::AuthRegisterRequestData,
+    ) -> Result<crate::AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+        unreachable!("evaluation HTTP test does not register users")
+    }
+
+    async fn login(
+        &self,
+        _request: crate::AuthLoginRequestData,
+    ) -> Result<crate::AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+        unreachable!("evaluation HTTP test does not log in users")
+    }
+
+    async fn refresh(
+        &self,
+        _request: crate::AuthRefreshRequestData,
+    ) -> Result<crate::AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+        unreachable!("evaluation HTTP test does not refresh users")
+    }
+
+    async fn logout(
+        &self,
+        _request: crate::AuthRefreshRequestData,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        unreachable!("evaluation HTTP test does not log out users")
+    }
+
+    async fn current_user(
+        &self,
+        headers: &axum::http::HeaderMap,
+    ) -> Result<crate::AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+        let user_id = headers
+            .get("x-user-id")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("eval-http-owner");
+        Ok(crate::AuthUserRecord {
+            user_id: user_id.to_string(),
+            username: user_id.to_string(),
+            email: format!("{user_id}@example.test"),
+            display_name: None,
+        })
+    }
+}
 
 #[test]
 fn session_writer_conflict_tells_the_caller_to_wait_or_cancel() {
@@ -47,6 +111,159 @@ fn explain_artifact_publication_requires_a_durable_terminal_status() {
     assert!(!explain_artifact_publishable_status(RunStatus::Running));
     assert!(!explain_artifact_publishable_status(RunStatus::Waiting));
     assert!(!explain_artifact_publishable_status(RunStatus::Paused));
+}
+
+#[test]
+fn evaluation_trial_status_keeps_terminal_run_meanings_distinct() {
+    assert_eq!(
+        evaluation_trial_status(RunStatus::Completed),
+        Some(astra_services::evaluation::TrialStatus::Completed)
+    );
+    assert_eq!(
+        evaluation_trial_status(RunStatus::Failed),
+        Some(astra_services::evaluation::TrialStatus::Failed)
+    );
+    assert_eq!(
+        evaluation_trial_status(RunStatus::Cancelled),
+        Some(astra_services::evaluation::TrialStatus::Cancelled)
+    );
+    assert_eq!(
+        evaluation_trial_status(RunStatus::Delegated),
+        Some(astra_services::evaluation::TrialStatus::Unavailable)
+    );
+    for status in [RunStatus::Running, RunStatus::Paused, RunStatus::Waiting] {
+        assert_eq!(evaluation_trial_status(status), None);
+    }
+}
+
+#[test]
+fn evaluation_skill_invocation_evidence_requires_the_admitted_revision() {
+    let svc = test_service();
+    let request = test_request("invoke the pinned skill");
+    let mut state =
+        svc.build_initial_state("owner-a", &request, "session-a", "run-a", None, None, None);
+    let revision = astra_services::evaluation::EvaluationSkillRevision {
+        skill_name: "review-skill".to_string(),
+        revision_id: "skill-version-1".to_string(),
+        content_hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .to_string(),
+    };
+    let admission = EvaluationRunAdmission {
+        experiment_id: "experiment-a".to_string(),
+        trial_id: "trial-a".to_string(),
+        input_content_hash: revision.content_hash.clone(),
+        revision_content_hash: revision.content_hash.clone(),
+        skill_revision: Some(revision.clone()),
+        judgment_policy: None,
+        receipt_ids: Vec::new(),
+        snapshot_envelope: None,
+    };
+    assert!(evaluation_skill_invocation_event(Some(&admission), &state, "run-a", 1).is_none());
+
+    state.skills.execution.invoked.insert(
+        "other-skill".to_string(),
+        crate::turn::skill_tool::InvokedSkill {
+            name: "other-skill".to_string(),
+            content: "wrong revision".to_string(),
+            invoked_at_turn: 1,
+            reentry_count: 0,
+            execution_topology: None,
+        },
+    );
+    assert!(evaluation_skill_invocation_event(Some(&admission), &state, "run-a", 1).is_none());
+
+    state.skills.execution.invoked.insert(
+        "review".to_string(),
+        crate::turn::skill_tool::InvokedSkill {
+            name: "review".to_string(),
+            content: "pinned instructions".to_string(),
+            invoked_at_turn: 2,
+            reentry_count: 1,
+            execution_topology: None,
+        },
+    );
+    let pinned_revision = astra_services::UserSkillVersionRecord {
+        version_id: "skill-version-1".to_string(),
+        source_id: "skill-source-1".to_string(),
+        owner_user_id: "owner-a".to_string(),
+        skill_name: "review-skill".to_string(),
+        version: "1.0.0".to_string(),
+        manifest_json: json!({
+            "name": "review-skill",
+            "execution_context": "inline",
+            "aliases": ["review"],
+        }),
+        content_markdown: "pinned instructions".to_string(),
+        content_hash: revision.content_hash.clone(),
+        normalize_version: "v1".to_string(),
+        token_estimate: 2,
+        status: "published".to_string(),
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        updated_at: "2026-01-01T00:00:00Z".to_string(),
+    };
+    let pinned =
+        crate::turn::skill_tool::PinnedSkillResolver::from_user_skill_revision(&pinned_revision)
+            .expect("pinned resolver");
+    state.skills.resolver = Some(Arc::new(pinned));
+    let event = evaluation_skill_invocation_event(Some(&admission), &state, "run-a", 1)
+        .expect("alias invocation should still identify the admitted revision");
+    assert_eq!(event["event_type"], "evaluation_skill_invoked");
+    assert_eq!(event["data"]["skill_name"], "review-skill");
+    assert_eq!(event["data"]["invoked_name"], "review");
+    assert_eq!(event["data"]["revision_id"], "skill-version-1");
+}
+
+#[test]
+fn evaluation_skill_revision_matching_recomputes_stored_content_identity() {
+    let manifest = json!({
+        "name": "review-skill",
+        "execution_context": "inline",
+    });
+    let content = "pinned instructions";
+    let content_hash = astra_services::skill_md_content_hash(&manifest, content);
+    let expected = astra_services::evaluation::EvaluationSkillRevision {
+        skill_name: "review-skill".to_string(),
+        revision_id: "skill-version-1".to_string(),
+        content_hash: content_hash.clone(),
+    };
+    let revision = astra_services::UserSkillVersionRecord {
+        version_id: expected.revision_id.clone(),
+        source_id: "skill-source-1".to_string(),
+        owner_user_id: "owner-a".to_string(),
+        skill_name: expected.skill_name.clone(),
+        version: "1.0.0".to_string(),
+        manifest_json: manifest,
+        content_markdown: content.to_string(),
+        content_hash: content_hash.clone(),
+        normalize_version: "v1".to_string(),
+        token_estimate: 2,
+        status: "published".to_string(),
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        updated_at: "2026-01-01T00:00:00Z".to_string(),
+    };
+    assert!(evaluation_skill_revision_matches(
+        &revision,
+        "owner-a",
+        &expected,
+        &content_hash,
+    ));
+
+    let mut tampered_content = revision.clone();
+    tampered_content.content_markdown.push_str(" changed");
+    assert!(!evaluation_skill_revision_matches(
+        &tampered_content,
+        "owner-a",
+        &expected,
+        &content_hash,
+    ));
+    let mut tampered_manifest = revision;
+    tampered_manifest.manifest_json["description"] = json!("changed");
+    assert!(!evaluation_skill_revision_matches(
+        &tampered_manifest,
+        "owner-a",
+        &expected,
+        &content_hash,
+    ));
 }
 
 fn complete_tool_ledger_receipt(
@@ -189,32 +406,6 @@ fn completed_run_with_closed_empty_ledger_remains_completed() {
 }
 
 #[test]
-fn active_personal_skill_is_installed_as_exact_runtime_content() {
-    let svc = test_service();
-    let request = test_request("use the active skill");
-    let mut state =
-        svc.build_initial_state("owner-a", &request, "session-a", "run-a", None, None, None);
-    install_active_personal_skills(
-        &mut state,
-        vec![astra_services::ActivePersonalSkillRecord {
-            skill_name: "review-exact".to_string(),
-            version_id: "version-exact".to_string(),
-            version: "1.0.0".to_string(),
-            content_markdown: "EXACT PERSONAL SKILL CONTENT".to_string(),
-        }],
-    );
-
-    let invoked = state
-        .skills
-        .execution
-        .invoked
-        .get("review-exact")
-        .expect("active personal skill must be in runtime prompt attachments");
-    assert_eq!(invoked.content, "EXACT PERSONAL SKILL CONTENT");
-    assert!(state.skills.execution.pinned.contains("review-exact"));
-}
-
-#[test]
 fn typed_subrun_workspace_intent_and_completion_profile_cannot_contradict() {
     use astra_config::user_profile::WorkspaceMutationIntent;
 
@@ -282,7 +473,7 @@ async fn run_admission_preserves_execution_restrictions_for_reconstruction() {
         request.model = None;
         request.resolved_model_selection = None;
         request.admitted_model_execution = None;
-        let mut request = service
+        let (mut request, _runtime_config) = service
             .prepare_chat_request("user-1", request)
             .await
             .unwrap();
@@ -467,7 +658,7 @@ async fn run_admission_records_trusted_catalog_source_without_execution_material
     request.model = None;
     request.resolved_model_selection = None;
     request.admitted_model_execution = None;
-    let request = service.prepare_chat_request("u1", request).await.unwrap();
+    let (request, _runtime_config) = service.prepare_chat_request("u1", request).await.unwrap();
     let offering = request
         .admitted_model_execution
         .as_ref()
@@ -611,7 +802,8 @@ async fn run_admission_preserves_mixed_capabilities_and_resolved_executor() {
         request.model = None;
         request.resolved_model_selection = None;
         request.admitted_model_execution = None;
-        let mut request = service.prepare_chat_request("u1", request).await.unwrap();
+        let (mut request, _runtime_config) =
+            service.prepare_chat_request("u1", request).await.unwrap();
         request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
             kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
             executor_id: Some("edge-original".into()),
@@ -2399,12 +2591,24 @@ impl UserIntentProvider for StaticRunControlProvider {
 
 struct ActiveTestModelService {
     base_url: String,
+    offering_id: String,
+    model_name: String,
 }
 
 impl ActiveTestModelService {
     fn new(base_url: impl Into<String>) -> Self {
+        Self::with_model(base_url, "model-test-model", "test-model")
+    }
+
+    fn with_model(
+        base_url: impl Into<String>,
+        offering_id: impl Into<String>,
+        model_name: impl Into<String>,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
+            offering_id: offering_id.into(),
+            model_name: model_name.into(),
         }
     }
 }
@@ -2420,10 +2624,18 @@ fn test_resolved_model_offering() -> astra_services::ResolvedModelOffering {
 }
 
 fn test_resolved_model_offering_at(base_url: &str) -> astra_services::ResolvedModelOffering {
+    test_resolved_model_offering_for("model-test-model", "test-model", base_url)
+}
+
+fn test_resolved_model_offering_for(
+    offering_id: &str,
+    model_name: &str,
+    base_url: &str,
+) -> astra_services::ResolvedModelOffering {
     astra_services::ResolvedModelOffering {
-        offering_id: "model-test-model".to_string(),
+        offering_id: offering_id.to_string(),
         model: astra_services::ResolvedActiveLlmModel {
-            model_name: "test-model".to_string(),
+            model_name: model_name.to_string(),
             wire_model_name: None,
             api_key: "test-provider-secret".to_string(),
             base_url: base_url.to_string(),
@@ -2437,6 +2649,7 @@ fn test_resolved_model_offering_at(base_url: &str) -> astra_services::ResolvedMo
             thinking_capability: None,
             context_window: Some(128_000),
             max_completion_tokens: Some(16_384),
+            pricing: None,
             request_headers: None,
         },
     }
@@ -2447,9 +2660,13 @@ fn test_admitted_model_execution() -> astra_services::AdmittedModelExecution {
         .expect("valid test model execution")
 }
 
-fn test_model_record_at(name: String, base_url: &str) -> astra_services::ModelRecord {
+fn test_model_record_with_id(
+    model_id: String,
+    name: String,
+    base_url: &str,
+) -> astra_services::ModelRecord {
     astra_services::ModelRecord {
-        model_id: format!("model-{name}"),
+        model_id,
         name,
         provider: "openai".to_string(),
         base_url: Some(base_url.to_string()),
@@ -2486,12 +2703,12 @@ impl astra_services::ModelService for ActiveTestModelService {
         _is_admin: bool,
     ) -> Result<Vec<astra_services::ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
         Ok(vec![astra_services::ModelListItem {
-            offering_id: "model-test-model".to_string(),
+            offering_id: self.offering_id.clone(),
             access_id: "self-hosted".to_string(),
             access_kind: astra_services::ModelAccessKind::SelfHosted,
             access_label: "Self-hosted".to_string(),
             execution_placement: astra_services::ModelExecutionPlacement::Server,
-            name: "test-model".to_string(),
+            name: self.model_name.clone(),
             provider: "openai".to_string(),
             description: None,
             is_active: true,
@@ -2506,8 +2723,12 @@ impl astra_services::ModelService for ActiveTestModelService {
         &self,
         model_name: String,
     ) -> Result<astra_services::ModelRecord, (StatusCode, Json<ErrorResponse>)> {
-        if model_name == "test-model" {
-            return Ok(test_model_record_at(model_name, &self.base_url));
+        if model_name == self.model_name {
+            return Ok(test_model_record_with_id(
+                self.offering_id.clone(),
+                model_name,
+                &self.base_url,
+            ));
         }
         Err(error_response_coded(
             StatusCode::NOT_FOUND,
@@ -2520,14 +2741,18 @@ impl astra_services::ModelService for ActiveTestModelService {
         &self,
         offering_id: String,
     ) -> Result<astra_services::ResolvedModelOffering, (StatusCode, Json<ErrorResponse>)> {
-        if offering_id != "model-test-model" {
+        if offering_id != self.offering_id {
             return Err(error_response_coded(
                 StatusCode::NOT_FOUND,
                 "offering not found",
                 "offering_not_found",
             ));
         }
-        Ok(test_resolved_model_offering_at(&self.base_url))
+        Ok(test_resolved_model_offering_for(
+            &self.offering_id,
+            &self.model_name,
+            &self.base_url,
+        ))
     }
 
     async fn update_model(
@@ -8555,6 +8780,131 @@ fn test_service() -> AgenticRunLifecycleService {
     .with_model_service(Arc::new(ActiveTestModelService::default()))
 }
 
+#[derive(Clone)]
+struct EvaluationEdgeRegistryFixture {
+    owner_id: String,
+    record: astra_services::multi_agent::EdgeAgentRecord,
+}
+
+#[async_trait::async_trait]
+impl astra_services::multi_agent::EdgeRegistryService for EvaluationEdgeRegistryFixture {
+    async fn register_or_update(
+        &self,
+        _user_id: &str,
+        _edge_agent_id: &str,
+        _edge_id_header: &str,
+        _hostname: Option<&str>,
+        _worktree_path: Option<&str>,
+        _capabilities: Option<serde_json::Value>,
+        _workspace_id: Option<&str>,
+    ) -> Result<astra_services::multi_agent::EdgeAgentRecord, String> {
+        Err("registration is not part of this fixture".to_string())
+    }
+
+    async fn heartbeat(
+        &self,
+        _user_id: &str,
+        _edge_agent_id: &str,
+        _edge_id_header: &str,
+        _registration_claim_id: Option<&str>,
+    ) -> Result<(), astra_services::multi_agent::HeartbeatError> {
+        Ok(())
+    }
+
+    async fn list_by_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<astra_services::multi_agent::EdgeAgentRecord>, String> {
+        if user_id == self.owner_id {
+            Ok(vec![self.record.clone()])
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    async fn unregister_generation(
+        &self,
+        _user_id: &str,
+        _edge_agent_id: &str,
+        _edge_id_header: &str,
+    ) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    async fn find_by_agent_id_and_workspace(
+        &self,
+        edge_agent_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Option<astra_services::multi_agent::EdgeAgentRecord>, String> {
+        if workspace_id.is_none() && edge_agent_id == self.record.edge_agent_id {
+            Ok(Some(self.record.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[tokio::test]
+async fn evaluation_edge_start_intent_is_resolved_only_at_canonical_binding() {
+    let service =
+        test_service().with_edge_registry_service(Arc::new(EvaluationEdgeRegistryFixture {
+            owner_id: "eval-owner".to_string(),
+            record: astra_services::multi_agent::EdgeAgentRecord {
+                registry_id: "registry-eval-edge".to_string(),
+                user_id: "eval-owner".to_string(),
+                edge_agent_id: "edge-eval".to_string(),
+                edge_id: "connection-eval".to_string(),
+                hostname: Some("eval-edge".to_string()),
+                worktree_path: Some("/workspace/eval".to_string()),
+                capabilities: None,
+                workspace_id: None,
+                materialization_id: Some("materialization-eval".to_string()),
+                registered_at: "2026-09-19T00:00:00Z".to_string(),
+                last_heartbeat_at: "2026-09-19T00:00:00Z".to_string(),
+            },
+        }));
+    let mut request = test_request("evaluate this");
+    request.edge_executor_id = Some("edge-eval".to_string());
+    request.evaluation_admission = Some(astra_services::evaluation::EvaluationRunAdmission {
+        experiment_id: "experiment-eval".to_string(),
+        trial_id: "trial-eval".to_string(),
+        input_content_hash: "sha256:input".to_string(),
+        revision_content_hash: "sha256:revision".to_string(),
+        skill_revision: None,
+        judgment_policy: None,
+        receipt_ids: Vec::new(),
+        snapshot_envelope: None,
+    });
+
+    let error = service
+        .bind_execution_selection(
+            "eval-owner",
+            "session-eval",
+            &mut request,
+            Some("trial-attempt-test"),
+            None,
+        )
+        .await
+        .expect_err("native evaluation Edge still requires the durable Session binding");
+    assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        error.1.error_code.as_deref(),
+        Some("evaluation_execution_target_unavailable")
+    );
+    let workspace = request
+        .workspace_binding
+        .as_ref()
+        .expect("canonical binding should populate the typed workspace intent");
+    assert_eq!(workspace.root.as_deref(), Some("/workspace/eval"));
+    assert_eq!(
+        request
+            .executor_binding
+            .as_ref()
+            .and_then(|binding| binding.executor_id.as_deref()),
+        Some("edge-eval")
+    );
+}
+
 struct TerminalTestLlm {
     base_url: String,
     requests: Arc<AtomicUsize>,
@@ -8604,6 +8954,153 @@ async fn spawn_terminal_test_llm() -> TerminalTestLlm {
         axum::serve(listener, app)
             .await
             .expect("serve terminal test LLM");
+    });
+    TerminalTestLlm {
+        base_url: format!("http://{addr}/v1"),
+        requests,
+        server,
+    }
+}
+
+/// Real HTTP provider fixture for the Skill evaluation harness. The first
+/// request emits an OpenAI-compatible `skill` tool call and the next request
+/// returns the final answer, proving that the resolver crossed the ordinary
+/// agentic loop rather than only being present in admission metadata.
+async fn spawn_skill_invoking_test_llm(skill_name: &str) -> TerminalTestLlm {
+    use axum::{Router, extract::State, response::IntoResponse, routing::post};
+
+    let skill_name = skill_name.to_string();
+    #[allow(clippy::needless_return)]
+    async fn chat_completions(
+        State((skill_name, requests)): State<(String, Arc<AtomicUsize>)>,
+        Json(request): Json<Value>,
+    ) -> axum::response::Response {
+        requests.fetch_add(1, Ordering::SeqCst);
+        let stream = request.get("stream").and_then(Value::as_bool) == Some(true);
+        let messages = request.get("messages").and_then(Value::as_array);
+        let has_tool_result = messages.is_some_and(|messages| {
+            messages
+                .iter()
+                .any(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+        });
+        let has_skill_tool = request
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| {
+                tools.iter().any(|tool| {
+                    tool.pointer("/function/name").and_then(Value::as_str) == Some("skill")
+                })
+            });
+        if has_tool_result {
+            let skill_result = messages
+                .and_then(|messages| {
+                    messages.iter().rev().find_map(|message| {
+                        (message.get("role").and_then(Value::as_str) == Some("tool"))
+                            .then(|| message.get("content").and_then(Value::as_str))
+                            .flatten()
+                    })
+                })
+                .unwrap_or_default();
+            let answer = if skill_result.contains("SKILL_NEXT") {
+                r#"{"ok":true}"#
+            } else if skill_result.contains("SKILL_OK") {
+                r#"{"ok":false}"#
+            } else {
+                "skill-result-unknown"
+            };
+            if stream {
+                let delta = json!({"choices":[{"delta":{"content":answer}}]});
+                let terminal = json!({
+                    "choices":[{"delta":{},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":9,"completion_tokens":3}
+                });
+                return (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    format!("data: {delta}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"),
+                )
+                    .into_response();
+            }
+            return Json(json!({
+                "choices": [{"message": {"content": answer}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 9, "completion_tokens": 3}
+            }))
+            .into_response();
+        }
+        if !has_skill_tool {
+            let content = r#"{"communicative_act":"task","objective_relation":"replace","work_lifecycle":"not_required","workspace_mutation":"read_only"}"#;
+            if stream {
+                let delta = json!({"choices":[{"delta":{"content":content}}]});
+                let terminal = json!({
+                    "choices":[{"delta":{},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":3,"completion_tokens":1}
+                });
+                return (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    format!("data: {delta}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"),
+                )
+                    .into_response();
+            }
+            return Json(json!({
+                "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1}
+            }))
+            .into_response();
+        }
+        {
+            let arguments = json!({
+                "skill_name": skill_name,
+            })
+            .to_string();
+            if stream {
+                let delta = json!({
+                    "choices": [{"delta": {"role": "assistant", "tool_calls": [{
+                        "index": 0,
+                        "id": "skill-eval-call",
+                        "type": "function",
+                        "function": {"name": "skill", "arguments": arguments}
+                    }]}, "finish_reason": "tool_calls"}]
+                });
+                return (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    format!("data: {delta}\n\ndata: [DONE]\n\n"),
+                )
+                    .into_response();
+            }
+            return Json(json!({
+                "choices": [{
+                    "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "skill-eval-call",
+                            "type": "function",
+                            "function": {
+                                "name": "skill",
+                                "arguments": arguments
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 2}
+            }))
+            .into_response();
+        }
+    }
+
+    let requests = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(chat_completions))
+        .with_state((skill_name, requests.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind Skill evaluation test LLM");
+    let addr = listener
+        .local_addr()
+        .expect("Skill evaluation test LLM address");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve Skill evaluation test LLM");
     });
     TerminalTestLlm {
         base_url: format!("http://{addr}/v1"),
@@ -10052,6 +10549,1906 @@ fn db_backed_test_service(
     .with_model_service(Arc::new(ActiveTestModelService::default()))
 }
 
+#[derive(Clone, Default)]
+struct EvaluationMemorySpy {
+    bindings: Arc<AtomicUsize>,
+    operations: Arc<AtomicUsize>,
+    observations: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl crate::turn::cloud::memoria_compact::MemoriaPort for EvaluationMemorySpy {
+    fn bind_owner(
+        &self,
+        _: &str,
+    ) -> Result<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>, String> {
+        self.bindings.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(self.clone()))
+    }
+
+    async fn retrieve_ext(
+        &self,
+        _: &str,
+        _: Option<&str>,
+        _: usize,
+        _: bool,
+    ) -> Result<
+        Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>,
+        astra_memoria::MemoriaOperationError,
+    > {
+        self.operations.fetch_add(1, Ordering::SeqCst);
+        Ok(Vec::new())
+    }
+
+    async fn store(
+        &self,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+        _: Option<&str>,
+    ) -> Result<String, String> {
+        self.operations.fetch_add(1, Ordering::SeqCst);
+        Ok("unexpected-production-memory".into())
+    }
+
+    async fn purge_working(&self, _: &str) -> Result<u64, String> {
+        self.operations.fetch_add(1, Ordering::SeqCst);
+        Ok(0)
+    }
+}
+
+#[async_trait::async_trait]
+impl TurnObserverWorker for EvaluationMemorySpy {
+    async fn run(&self, _: astra_turn_core::contracts::TurnObserverRequest) -> Result<(), String> {
+        self.observations.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl EvaluationMemorySpy {
+    fn extraction_service(&self) -> Arc<crate::session_memory::MemoryExtractionService> {
+        let (ingestion, _receiver) =
+            astra_services::event_ingestion::IngestionSender::for_tests(16);
+        Arc::new(
+            crate::session_memory::MemoryExtractionService::new_owner_scoped_template(
+                Arc::new(crate::session_memory::ConstMemoryInferenceResolver(None)),
+                Arc::new(self.clone()),
+                ingestion,
+                Arc::new(crate::session_memory::BackgroundActivityBroker::new()),
+            ),
+        )
+    }
+}
+
+#[tokio::test]
+async fn evaluation_memory_isolation_preserves_ordinary_request_dependencies() {
+    let memory = EvaluationMemorySpy::default();
+    let service = test_service().with_memory_extraction_service(memory.extraction_service());
+    let ordinary = test_request("ordinary request");
+    let ordinary_state =
+        service.build_initial_state("owner", &ordinary, "session", "run", None, None, None);
+    assert!(ordinary_state.memory_extraction_service.is_some());
+    let bindings_before_host = memory.bindings.load(Ordering::SeqCst);
+    let _host = service.build_host(
+        "owner",
+        "session",
+        "run",
+        &ordinary,
+        Vec::new(),
+        Map::new(),
+        false,
+        false,
+        None,
+        None,
+        false,
+        None,
+        &crate::turn::execution_config::PreparedExecutionInputs::capture(
+            astra_config::runtime_config::RuntimeConfig::load(),
+            "owner",
+            "session",
+        ),
+    );
+    assert!(
+        memory.bindings.load(Ordering::SeqCst) > bindings_before_host,
+        "ordinary hosts must retain owner-scoped recall"
+    );
+
+    let mut evaluation = ordinary;
+    evaluation.evaluation_admission = Some(EvaluationRunAdmission {
+        experiment_id: "experiment".into(),
+        trial_id: "trial".into(),
+        input_content_hash: content_fingerprint("input"),
+        revision_content_hash: content_fingerprint("revision"),
+        skill_revision: None,
+        judgment_policy: None,
+        receipt_ids: Vec::new(),
+        snapshot_envelope: None,
+    });
+    let bindings_before_eval = memory.bindings.load(Ordering::SeqCst);
+    let state = service.build_initial_state(
+        "owner",
+        &evaluation,
+        "eval-session",
+        "eval-run",
+        None,
+        None,
+        None,
+    );
+    let _host = service.build_host(
+        "owner",
+        "eval-session",
+        "eval-run",
+        &evaluation,
+        Vec::new(),
+        Map::new(),
+        false,
+        false,
+        None,
+        None,
+        false,
+        None,
+        &crate::turn::execution_config::PreparedExecutionInputs::capture(
+            astra_config::runtime_config::RuntimeConfig::load(),
+            "owner",
+            "eval-session",
+        ),
+    );
+    assert!(state.memory_extraction_service.is_none());
+    assert_eq!(
+        memory.bindings.load(Ordering::SeqCst),
+        bindings_before_eval,
+        "Eval must not bind production memory through either state or host construction"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_scoped() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let owner = format!("eval-runtime-owner-{}", Uuid::new_v4());
+    let session_id = format!("eval-runtime-session-{}", Uuid::new_v4());
+    let offering_id = format!("eval-runtime-model-{}", Uuid::new_v4());
+    let model_name = format!("eval-runtime-model-{}", Uuid::new_v4());
+    crate::server::run::insert_active_run_session_fixture(&pool, &owner, &session_id).await;
+    let llm = spawn_terminal_test_llm().await;
+    sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+        .bind(&offering_id)
+        .execute(pool.get())
+        .await
+        .expect("clear runtime evaluation model fixture");
+    sqlx::query("INSERT INTO infra_llm_models (model_id, model_name, provider, api_key_encrypted, base_url, is_active, context_window, input_modalities, output_modalities, supported_parameters, pricing, tags, quirks) VALUES (?, ?, 'openai', ?, ?, 1, 128000, ?, ?, ?, ?, ?, ?)")
+        .bind(&offering_id)
+        .bind(&model_name)
+        .bind(test_encryptor().encrypt("test-key").expect("encrypt test key"))
+        .bind(&llm.base_url)
+        .bind(r#"["text"]"#)
+        .bind(r#"["text"]"#)
+        .bind("[]")
+        .bind("{}")
+        .bind("[]")
+        .bind("{}")
+        .execute(pool.get())
+        .await
+        .expect("seed runtime evaluation model fixture");
+    let memory = Arc::new(EvaluationMemorySpy::default());
+    let metrics = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+    let service = db_backed_test_service(&pool, &format!("eval-runtime-pod-{}", Uuid::new_v4()))
+        .with_model_service(Arc::new(ActiveTestModelService::with_model(
+            llm.base_url.clone(),
+            offering_id.clone(),
+            model_name.clone(),
+        )))
+        .with_memory_extraction_service(memory.extraction_service())
+        .with_observer_worker(memory.clone())
+        .with_metrics_registry(metrics.clone())
+        .with_run_concurrency_limit(1);
+
+    let mut request = test_request("evaluate this fixed input");
+    request.session_id = Some(session_id.clone());
+    request.model = Some(model_name.clone());
+    request.model_selection = Some(astra_turn_types::ModelSelection {
+        offering_id: offering_id.clone(),
+    });
+    request.stable_runtime_system_prompt = Some("Frozen revision text".to_string());
+    request.execution_time_budget = Some(astra_services::runs::ExecutionTimeBudget {
+        remaining_seconds: 60,
+    });
+    let input_hash = prompt_context_fingerprint(
+        &request.message,
+        &request.parts,
+        &request.attachments,
+        request.context.as_ref(),
+    );
+    let revision_hash = content_fingerprint("Frozen revision text");
+    let admitted_model = crate::server::model_execution_admission::admit_model_execution(
+        &service.model_service,
+        astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
+        &owner,
+        &astra_turn_types::ModelSelection {
+            offering_id: offering_id.clone(),
+        },
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("admit the fixture model service route");
+    let resolved_model = astra_services::runs::ResolvedModelSelection {
+        offering_id: admitted_model.offering_id.clone(),
+        model_name: admitted_model.model_name.clone(),
+    };
+    let policy_hash = astra_services::evaluation::evaluation_policy_fingerprint(
+        &astra_services::evaluation::EvaluationPolicyFingerprintInput {
+            model_binding: &offering_id,
+            provider_binding: "openai",
+            cache_policy: "provider_default_recorded",
+            resolved_model_selection: Some(&resolved_model),
+            admitted_provider: &admitted_model.provider,
+            admitted_cache_capability: admitted_model.cache_capability.as_ref(),
+            execution_policy: &request.execution_policy,
+            allow_skills: request.allow_skills.as_deref(),
+            allow_skill_sources: request.allow_skill_sources.as_deref(),
+            allow_tools: request.allow_tools.as_deref(),
+            enabled_tools: request.enabled_tools.as_deref(),
+            runtime_profile: request.runtime_profile.as_ref(),
+            workspace_execution: None,
+        },
+    )
+    .unwrap();
+    let experiment_id = format!("eval-runtime-exp-{}", Uuid::new_v4());
+    let spec = astra_services::evaluation::ExperimentSpec {
+        schema_version: 1,
+        experiment_id: experiment_id.clone(),
+        target: astra_services::evaluation::EvaluationTarget {
+            kind: astra_services::evaluation::EvaluationTargetKind::Prompt,
+            baseline: astra_services::evaluation::RevisionRef {
+                revision_id: "revision-baseline".to_string(),
+                content_hash: revision_hash.clone(),
+                content: None,
+            },
+            candidate: astra_services::evaluation::RevisionRef {
+                revision_id: "revision-candidate".to_string(),
+                content_hash: content_fingerprint("Candidate revision text"),
+                content: None,
+            },
+            skill_name: None,
+            judgment_policy: astra_services::evaluation::EvaluationJudgmentPolicy::Disabled,
+        },
+        cases: vec![astra_services::evaluation::EvaluationCase {
+            case_id: "case-runtime".to_string(),
+            input_snapshot_ref: "input://runtime".to_string(),
+            input_content_hash: input_hash.clone(),
+            holdout: false,
+            task_verifier: astra_services::evaluation::task_verifier::TaskVerifierSpec::freeze(
+                astra_services::evaluation::task_verifier::JsonValueEqualsConfig {
+                    expected: json!({"ok": true}),
+                },
+            )
+            .expect("freeze required runtime task verifier"),
+            input_content: None,
+        }],
+        repetitions: 1,
+        order: astra_services::evaluation::TrialOrder::BaselineFirst,
+        conditions: astra_services::evaluation::FrozenConditions {
+            execution_config:
+                crate::turn::execution_config::PreparedExecutionInputs::freeze_for_prepare(
+                    &admitted_model,
+                    &service.encryptor,
+                    "case-runtime",
+                    &request.message,
+                )
+                .expect("freeze the actual admitted fixture execution"),
+            isolation_profile: "prompt_only_private".to_string(),
+            model_binding: offering_id.clone(),
+            provider_binding: "openai".to_string(),
+            context_snapshot_hash: input_hash,
+            tool_policy_hash: policy_hash,
+            cache_policy: "provider_default_recorded".to_string(),
+            memory_isolation: astra_services::evaluation::MemoryIsolation::Disabled,
+            data_isolation: astra_services::evaluation::DataIsolation::Disabled,
+            workspace_execution: None,
+        },
+        budget: astra_services::evaluation::EvaluationBudget {
+            max_trials: 2,
+            max_concurrency: 1,
+            max_wall_time_secs: 60,
+        },
+        adapter_profile_version: None,
+        measurement_profile:
+            astra_services::evaluation::measurement_profile::MeasurementProfile::InstructionOnlyV1,
+    };
+    let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
+    let experiment = plan_store
+        .register_experiment(&owner, &spec, "runtime-eval-submit")
+        .await
+        .expect("register runtime evaluation");
+    let trial = plan_store
+        .list_trials(&owner, &experiment.experiment_id)
+        .await
+        .expect("load runtime evaluation trials")
+        .into_iter()
+        .find(|trial| trial.trial.arm == astra_services::evaluation::ComparisonArm::Baseline)
+        .expect("baseline runtime trial");
+    request.evaluation_admission = Some(EvaluationRunAdmission {
+        experiment_id: experiment.experiment_id.clone(),
+        trial_id: trial.trial_id.clone(),
+        input_content_hash: trial.trial.input_content_hash.clone(),
+        revision_content_hash: revision_hash,
+        skill_revision: None,
+        judgment_policy: None,
+        receipt_ids: Vec::new(),
+        snapshot_envelope: None,
+    });
+
+    let run = service
+        .create_run(owner.clone(), request)
+        .await
+        .expect("evaluation must use the ordinary durable Run entrypoint");
+    let durable = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let durable = service
+                .run_engine
+                .load_run(&owner, &run.run_id)
+                .await
+                .expect("load runtime evaluation run")
+                .expect("runtime evaluation run exists");
+            if matches!(
+                durable.status.as_str(),
+                STATUS_COMPLETED | STATUS_FAILED | STATUS_CANCELLED | STATUS_DELEGATED
+            ) {
+                break durable;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("runtime evaluation should settle");
+    assert_eq!(durable.status, STATUS_COMPLETED, "{durable:?}");
+    let marker = durable
+        .events
+        .iter()
+        .find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("evaluation_admitted")
+        })
+        .expect("evaluation admission marker");
+    assert_eq!(
+        marker.get("run_generation").and_then(Value::as_u64),
+        Some(durable.run_generation)
+    );
+    let observation = tokio::time::timeout(Duration::from_secs(10), async {
+        let store = DatabaseEvaluationObservationStore::new(pool.clone());
+        loop {
+            if let Some(observation) = store
+                .load_by_trial(&owner, &trial.trial_id)
+                .await
+                .expect("load runtime evaluation observation")
+            {
+                break observation;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("runtime evaluation observation should settle");
+    assert_eq!(observation.observation.status, TrialStatus::Completed);
+    assert_eq!(observation.execution_run_id, run.run_id);
+    assert_eq!(observation.execution_run_generation, durable.run_generation);
+    assert_eq!(observation.materialization_receipt_ids.len(), 2);
+    assert!(
+        observation
+            .observation
+            .evidence
+            .iter()
+            .all(|evidence| evidence.availability == EvidenceAvailability::Available)
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while service.background_task_count() != 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("post-loop dependency consumers should finish before checking isolation");
+    assert_eq!(
+        memory.operations.load(Ordering::SeqCst),
+        0,
+        "Eval must not read, store, or purge production memory"
+    );
+    assert_eq!(memory.observations.load(Ordering::SeqCst), 0);
+    assert!(
+        !metrics
+            .render_prometheus()
+            .contains("astra_turn_observer_dispatches_total"),
+        "Eval must not dispatch a production observer, even asynchronously"
+    );
+
+    // Model a restart after atomic terminal COMMIT but before the later
+    // settlement marker and derived observation. Retain the committed batch.
+    sqlx::query(
+        "DELETE FROM evaluation_trial_observations WHERE owner_user_id = ? AND trial_id = ?",
+    )
+    .bind(&owner)
+    .bind(&trial.trial_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_type = 'run_settlement_finished'")
+        .bind(&owner).bind(&run.run_id).execute(pool.get()).await.unwrap();
+    let last_event_idx: i64 = sqlx::query_scalar(
+        "SELECT MAX(event_idx) FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&owner)
+    .bind(&run.run_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE agent_runs SET last_event_idx = ? WHERE user_id = ? AND run_id = ?")
+        .bind(last_event_idx)
+        .bind(&owner)
+        .bind(&run.run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    service
+        .run_engine
+        .append_events_batch(
+            &owner,
+            &session_id,
+            &run.run_id,
+            &[json!({"event_type": "projection_checked", "data": {}})],
+        )
+        .await
+        .expect("later event must not hide the committed terminal batch");
+    let restarted = db_backed_test_service(&pool, "eval-restarted-pod");
+    let provider_calls_before_repair = llm.requests.load(Ordering::SeqCst);
+    restarted
+        .get_run_status(run.run_id.clone(), owner.clone())
+        .await
+        .expect("status read repairs the missing observation without a finished marker");
+    let observation_store = DatabaseEvaluationObservationStore::new(pool.clone());
+    let repaired = observation_store
+        .load_by_trial(&owner, &trial.trial_id)
+        .await
+        .unwrap()
+        .expect("restart must derive the observation from the atomic batch");
+    assert_eq!(
+        repaired.request_fingerprint,
+        observation.request_fingerprint
+    );
+    restarted
+        .get_run_status(run.run_id.clone(), owner.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        observation_store
+            .load_by_trial(&owner, &trial.trial_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .observation_id,
+        repaired.observation_id,
+    );
+    assert_eq!(
+        llm.requests.load(Ordering::SeqCst),
+        provider_calls_before_repair
+    );
+
+    // A queued Eval cancelled before semaphore admission must still settle a
+    // terminal observation from the same canonical transaction, without ever
+    // reaching the provider.
+    let cancel_session_id = format!("eval-runtime-cancel-session-{}", Uuid::new_v4());
+    crate::server::run::insert_active_run_session_fixture(&pool, &owner, &cancel_session_id).await;
+    let cancel_trial = plan_store
+        .list_trials(&owner, &experiment.experiment_id)
+        .await
+        .expect("reload runtime evaluation trials")
+        .into_iter()
+        .find(|trial| trial.trial.arm == astra_services::evaluation::ComparisonArm::Candidate)
+        .expect("candidate runtime trial");
+    let held_permit = service
+        .test_run_semaphore()
+        .acquire_owned()
+        .await
+        .expect("hold the only runtime evaluation slot");
+    let mut cancel_request = test_request("evaluate this fixed input");
+    cancel_request.session_id = Some(cancel_session_id.clone());
+    cancel_request.model = Some(model_name.clone());
+    cancel_request.model_selection = Some(astra_turn_types::ModelSelection {
+        offering_id: offering_id.clone(),
+    });
+    cancel_request.stable_runtime_system_prompt = Some("Candidate revision text".to_string());
+    cancel_request.execution_time_budget = Some(astra_services::runs::ExecutionTimeBudget {
+        remaining_seconds: 60,
+    });
+    cancel_request.evaluation_admission = Some(EvaluationRunAdmission {
+        experiment_id: experiment.experiment_id.clone(),
+        trial_id: cancel_trial.trial_id.clone(),
+        input_content_hash: cancel_trial.trial.input_content_hash.clone(),
+        revision_content_hash: content_fingerprint("Candidate revision text"),
+        skill_revision: None,
+        judgment_policy: None,
+        receipt_ids: Vec::new(),
+        snapshot_envelope: None,
+    });
+    let provider_calls_before_cancel = llm.requests.load(Ordering::SeqCst);
+    let cancel_run = service
+        .create_run(owner.clone(), cancel_request)
+        .await
+        .expect("queued evaluation must be accepted before cancellation");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let durable = service
+                .run_engine
+                .load_run(&owner, &cancel_run.run_id)
+                .await
+                .expect("load queued evaluation run")
+                .expect("queued evaluation run exists");
+            if durable.events.iter().any(|event| {
+                event.get("event_type").and_then(Value::as_str) == Some("evaluation_admitted")
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("queued evaluation must persist admission before cancellation");
+    service
+        .cancel_run(cancel_run.run_id.clone(), owner.clone())
+        .await
+        .expect("cancel queued evaluation");
+    let cancelled = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let durable = service
+                .run_engine
+                .load_run(&owner, &cancel_run.run_id)
+                .await
+                .expect("load cancelled evaluation run")
+                .expect("cancelled evaluation run exists");
+            if durable.status == STATUS_CANCELLED {
+                break durable;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("queued cancellation must settle without provider admission");
+    drop(held_permit);
+    assert_eq!(
+        llm.requests.load(Ordering::SeqCst),
+        provider_calls_before_cancel,
+        "queued cancellation must not call the provider"
+    );
+    assert!(cancelled.events.iter().any(|event| {
+        event.get("event_type").and_then(Value::as_str) == Some("run_accounting_finalized")
+            && event.get("idempotency_key").and_then(Value::as_str)
+                == Some(format!("run-accounting-finalized:{}", cancelled.run_generation).as_str())
+    }));
+    assert!(cancelled.events.iter().any(|event| {
+        event.get("event_type").and_then(Value::as_str) == Some("run_settlement_finished")
+            && event.get("idempotency_key").and_then(Value::as_str)
+                == Some(format!("run-settlement-finished:{}", cancelled.run_generation).as_str())
+    }));
+    service
+        .get_run_status(cancel_run.run_id.clone(), owner.clone())
+        .await
+        .expect("status recovery should project the cancelled evaluation");
+    let cancelled_observation = tokio::time::timeout(Duration::from_secs(10), async {
+        let store = DatabaseEvaluationObservationStore::new(pool.clone());
+        loop {
+            if let Some(observation) = store
+                .load_by_trial(&owner, &cancel_trial.trial_id)
+                .await
+                .expect("load cancelled evaluation observation")
+            {
+                break observation;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("cancelled evaluation observation should settle");
+    assert_eq!(
+        cancelled_observation.observation.status,
+        TrialStatus::Cancelled
+    );
+    assert_eq!(cancelled_observation.execution_run_id, cancel_run.run_id);
+    let _ = service
+        .get_run_status(cancel_run.run_id.clone(), owner.clone())
+        .await
+        .expect("repeated status repair remains idempotent");
+
+    // Crash after atomic Run creation and trial binding, before materialization.
+    // A claim itself can also crash: two real claims must preserve the original
+    // admission identity and settle one observation without invoking a model.
+    let mut recovery_spec = spec.clone();
+    recovery_spec.experiment_id = format!("eval-recovery-exp-{}", Uuid::new_v4());
+    let recovery_experiment = plan_store
+        .register_experiment(&owner, &recovery_spec, "runtime-eval-recovery-submit")
+        .await
+        .unwrap();
+    let recovery_trial = plan_store
+        .list_trials(&owner, &recovery_experiment.experiment_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|trial| trial.trial.arm == astra_services::evaluation::ComparisonArm::Baseline)
+        .unwrap();
+    let recovery_session = format!("eval-recovery-session-{}", Uuid::new_v4());
+    let recovery_run_id = format!("eval-recovery-run-{}", Uuid::new_v4());
+    crate::server::run::insert_active_run_session_fixture(&pool, &owner, &recovery_session).await;
+    let recovery_store =
+        Arc::new(DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("eval-recovery-pod"));
+    let recovery_engine = RunEngine::new(recovery_store.clone());
+    let mut metadata = Map::new();
+    metadata.insert(
+        "evaluation_admission".into(),
+        serde_json::to_value(EvaluationRunAdmission {
+            experiment_id: recovery_experiment.experiment_id.clone(),
+            trial_id: recovery_trial.trial_id.clone(),
+            input_content_hash: recovery_trial.trial.input_content_hash.clone(),
+            revision_content_hash: recovery_spec.target.baseline.content_hash.clone(),
+            skill_revision: None,
+            judgment_policy: None,
+            receipt_ids: Vec::new(),
+            snapshot_envelope: None,
+        })
+        .unwrap(),
+    );
+    let authority = recovery_engine
+        .start_run_with_context(
+            &recovery_run_id,
+            &owner,
+            &recovery_session,
+            crate::server::run::engine::RunStartContext {
+                execution_metadata: Some(metadata),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let claims = recovery_store
+        .claim_recoverable_active_runs(100)
+        .await
+        .unwrap();
+    let first_claim = claims
+        .iter()
+        .find(|claim| claim.run.run_id == recovery_run_id)
+        .unwrap();
+    assert_eq!(
+        first_claim.claimed_from_generation,
+        authority.owner_generation
+    );
+    let recovered = recovery_engine.recover_active_runs().await.unwrap();
+    let recovered = recovered
+        .iter()
+        .find(|run| run.run_id == recovery_run_id)
+        .unwrap();
+    assert_eq!(recovered.run_generation, authority.owner_generation + 2);
+    assert_eq!(recovered.status, STATUS_FAILED);
+    assert_eq!(
+        plan_store
+            .load_trial(&owner, &recovery_trial.trial_id)
+            .await
+            .unwrap()
+            .binding_status,
+        "bound"
+    );
+    let provider_calls_before_recovery = llm.requests.load(Ordering::SeqCst);
+    restarted
+        .get_run_status(recovery_run_id.clone(), owner.clone())
+        .await
+        .unwrap();
+    let recovered_observation = observation_store
+        .load_by_trial(&owner, &recovery_trial.trial_id)
+        .await
+        .unwrap()
+        .expect("pre-materialization crash must settle through verified recovery custody");
+    assert_eq!(
+        recovered_observation.admission_run_generation,
+        authority.owner_generation
+    );
+    assert_eq!(
+        recovered_observation.execution_run_generation,
+        recovered.run_generation
+    );
+    assert_eq!(
+        recovered_observation.observation.status,
+        TrialStatus::Failed
+    );
+    assert!(recovered_observation.materialization_receipt_ids.is_empty());
+    let measurements = &recovered_observation.observation.measurements;
+    assert!(measurements.iter().any(|measurement| {
+        measurement.name == "run_completed"
+            && measurement.value == Some(0.0)
+            && measurement.status == astra_services::evaluation::MeasurementStatus::Observed
+    }));
+    assert!(
+        measurements
+            .iter()
+            .filter(|measurement| measurement.name != "run_completed")
+            .all(|measurement| {
+                measurement.value.is_none()
+                    && measurement.status == astra_services::evaluation::MeasurementStatus::Missing
+            })
+    );
+    assert!(
+        recovered_observation
+            .observation
+            .evidence
+            .iter()
+            .any(|evidence| {
+                evidence.kind == EvidenceKind::Trace
+                    && evidence.availability == EvidenceAvailability::Available
+            })
+    );
+    let projection =
+        astra_services::evaluation::DatabaseEvaluationProjectionStore::new(pool.clone())
+            .load_experiment(&owner, &recovery_experiment.experiment_id)
+            .await
+            .expect("projection accepts original admission and verified terminal generations");
+    assert_eq!(projection.observed_trial_count, 1);
+    let projected = projection
+        .trials
+        .iter()
+        .find(|trial| trial.binding.trial_id == recovery_trial.trial_id)
+        .unwrap();
+    assert_eq!(
+        projected.binding.run_generation,
+        Some(authority.owner_generation)
+    );
+    assert_eq!(projected.run_status.as_deref(), Some(STATUS_FAILED));
+    recovery_engine
+        .append_events_batch(
+            &owner,
+            &recovery_session,
+            &recovery_run_id,
+            &[json!({"event_type": "projection_checked", "data": {}})],
+        )
+        .await
+        .unwrap();
+    // Rebuild again after a later event to exercise the terminal evidence cut,
+    // rather than only taking the existing-observation fast path.
+    sqlx::query(
+        "DELETE FROM evaluation_trial_observations WHERE owner_user_id = ? AND trial_id = ?",
+    )
+    .bind(&owner)
+    .bind(&recovery_trial.trial_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    restarted
+        .get_run_status(recovery_run_id.clone(), owner.clone())
+        .await
+        .unwrap();
+    let repaired_recovery = observation_store
+        .load_by_trial(&owner, &recovery_trial.trial_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        repaired_recovery.request_fingerprint,
+        recovered_observation.request_fingerprint
+    );
+    restarted
+        .get_run_status(recovery_run_id.clone(), owner.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        observation_store
+            .load_by_trial(&owner, &recovery_trial.trial_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .observation_id,
+        repaired_recovery.observation_id
+    );
+    assert_eq!(
+        llm.requests.load(Ordering::SeqCst),
+        provider_calls_before_recovery
+    );
+    cleanup_lifecycle_run_fixture(&pool, &owner, &recovery_run_id).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &owner, &recovery_session).await;
+
+    for (table, column) in [
+        ("evaluation_trial_observations", "owner_user_id"),
+        ("evaluation_materialization_receipts", "owner_user_id"),
+        ("evaluation_trial_bindings", "owner_user_id"),
+        ("evaluation_experiments", "owner_user_id"),
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE {column} = ?"))
+            .bind(&owner)
+            .execute(pool.get())
+            .await
+            .expect("clean runtime evaluation plan");
+    }
+    cleanup_lifecycle_run_fixture(&pool, &owner, &run.run_id).await;
+    cleanup_lifecycle_run_fixture(&pool, &owner, &cancel_run.run_id).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &owner, &session_id).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &owner, &cancel_session_id).await;
+    sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+        .bind(&offering_id)
+        .execute(pool.get())
+        .await
+        .expect("clean runtime evaluation model fixture");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn evaluation_http_prepare_start_replays_and_reports() {
+    use axum::{body, body::Body, http::Request};
+    use tower::ServiceExt;
+
+    let pool = setup_lifecycle_run_db_it().await;
+    let llm = spawn_terminal_test_llm().await;
+    let offering_id = format!("model-eval-http-{}", Uuid::new_v4());
+    let model_name = format!("test-model-{}", Uuid::new_v4());
+    sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+        .bind(&offering_id)
+        .execute(pool.get())
+        .await
+        .expect("clear HTTP evaluation model fixture");
+    sqlx::query("INSERT INTO infra_llm_models (model_id, model_name, provider, api_key_encrypted, base_url, is_active, context_window, input_modalities, output_modalities, supported_parameters, pricing, tags, quirks) VALUES (?, ?, 'openai', ?, ?, 1, 128000, ?, ?, ?, ?, ?, ?)")
+        .bind(&offering_id)
+        .bind(&model_name)
+        .bind(test_encryptor().encrypt("test-key").expect("encrypt test key"))
+        .bind(&llm.base_url)
+        .bind(r#"["text"]"#)
+        .bind(r#"["text"]"#)
+        .bind("[]")
+        .bind("{}")
+        .bind("[]")
+        .bind("{}")
+        .execute(pool.get())
+        .await
+        .expect("seed HTTP evaluation model fixture");
+    let lifecycle = db_backed_test_service(&pool, &format!("eval-http-pod-{}", Uuid::new_v4()))
+        .with_model_service(Arc::new(ActiveTestModelService::with_model(
+            llm.base_url.clone(),
+            offering_id.clone(),
+            model_name.clone(),
+        )))
+        .with_run_concurrency_limit(1);
+    let owner = format!("eval-http-owner-{}", Uuid::new_v4());
+    let submission_key = format!("eval-http-{}", Uuid::new_v4());
+    let state = crate::AppState::new(crate::ServiceInfo::default(), Arc::new(EvalHttpHealth))
+        .with_fernet_encryptor(test_encryptor().as_ref().clone())
+        .with_auth_service(Arc::new(EvalHttpAuth))
+        .with_session_service(Arc::new(
+            astra_services::DatabaseSessionService::new(pool.settings().clone())
+                .with_pool(pool.clone()),
+        ))
+        .with_shared_pool(pool.clone())
+        .with_model_service(Arc::new(ActiveTestModelService::with_model(
+            llm.base_url.clone(),
+            offering_id.clone(),
+            model_name.clone(),
+        )))
+        .with_run_lifecycle_service(Arc::new(lifecycle));
+    let app = crate::build_app(state);
+
+    async fn request_json(
+        app: &axum::Router,
+        owner: &str,
+        method: &str,
+        uri: &str,
+        payload: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("x-user-id", owner)
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .expect("evaluation HTTP request");
+        let response = app
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("evaluation response");
+        let status = response.status();
+        let bytes = body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("evaluation response body");
+        let json = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!(
+                "evaluation response must be JSON (status {status}): {error}; body={}",
+                String::from_utf8_lossy(&bytes)
+            )
+        });
+        (status, json)
+    }
+
+    let prepare_body = json!({
+        "submission_idempotency_key": submission_key,
+        "target": {
+            "kind": "prompt",
+            "baseline": {
+                "revision_id": "http-baseline",
+                "content": "Answer briefly."
+            },
+            "candidate": {
+                "revision_id": "http-candidate",
+                "content": "Answer briefly and state assumptions."
+            }
+        },
+        "case": {
+            "case_id": "http-case",
+            "message": "Explain the frozen evaluation input.",
+            "verifier_config": {"kind":"json_value_equals", "expected": {"ok": true}},
+            "holdout": false
+        },
+        "model_offering_id": offering_id.clone(),
+        "max_concurrency": 1,
+        "max_wall_time_secs": 60
+    });
+    let (status, prepared) = request_json(
+        &app,
+        &owner,
+        "POST",
+        "/evaluation/experiments/prepare",
+        prepare_body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "prepare response: {prepared}");
+    let experiment_id = prepared["experiment"]["experiment_id"]
+        .as_str()
+        .expect("prepared experiment id")
+        .to_string();
+    let trial_id = prepared["trials"][0]["trial_id"]
+        .as_str()
+        .expect("prepared trial id")
+        .to_string();
+
+    let (retry_status, retry_prepared) = request_json(
+        &app,
+        &owner,
+        "POST",
+        "/evaluation/experiments/prepare",
+        prepare_body,
+    )
+    .await;
+    assert_eq!(
+        retry_status,
+        StatusCode::OK,
+        "prepare replay: {retry_prepared}"
+    );
+    assert_eq!(retry_prepared["experiment"]["experiment_id"], experiment_id);
+    assert_eq!(retry_prepared["trials"][0]["trial_id"], trial_id);
+
+    let start_uri = format!("/evaluation/experiments/{experiment_id}/trials/{trial_id}/start");
+    let foreign_owner = format!("eval-http-foreign-{}", Uuid::new_v4());
+    let (foreign_status, _) = request_json(
+        &app,
+        &foreign_owner,
+        "GET",
+        &format!("/evaluation/experiments/{experiment_id}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(foreign_status, StatusCode::NOT_FOUND);
+    let (foreign_start_status, _) =
+        request_json(&app, &foreign_owner, "POST", &start_uri, json!({})).await;
+    assert_eq!(foreign_start_status, StatusCode::NOT_FOUND);
+
+    let second_trial_id = prepared["trials"][1]["trial_id"]
+        .as_str()
+        .expect("paired second trial id");
+    let second_start_uri =
+        format!("/evaluation/experiments/{experiment_id}/trials/{second_trial_id}/start");
+    let calls_before_premature_start = llm.requests.load(Ordering::SeqCst);
+    let (premature_status, premature) =
+        request_json(&app, &owner, "POST", &second_start_uri, json!({})).await;
+    assert_eq!(
+        premature_status,
+        StatusCode::CONFLICT,
+        "paired second arm must wait for its predecessor: {premature}"
+    );
+    assert_eq!(
+        premature["error_code"], "evaluation_trial_order_blocked",
+        "premature start response: {premature}"
+    );
+    assert_eq!(
+        llm.requests.load(Ordering::SeqCst),
+        calls_before_premature_start
+    );
+    let (status, after_rejection) = request_json(
+        &app,
+        &owner,
+        "GET",
+        &format!("/evaluation/experiments/{experiment_id}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(after_rejection["trials"][1]["binding"]["run_id"].is_null());
+
+    let (start_status, started) = request_json(&app, &owner, "POST", &start_uri, json!({})).await;
+    assert_eq!(
+        start_status,
+        StatusCode::ACCEPTED,
+        "start response: {started}"
+    );
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("started session id")
+        .to_string();
+    let run_id = started["run_id"]
+        .as_str()
+        .expect("started run id")
+        .to_string();
+
+    let projection_uri = format!("/evaluation/experiments/{experiment_id}");
+    let projection = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let (status, value) =
+                request_json(&app, &owner, "GET", &projection_uri, json!({})).await;
+            assert_eq!(status, StatusCode::OK, "projection response: {value}");
+            if value["observed_trial_count"].as_u64() == Some(1) {
+                break value;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("HTTP evaluation projection should observe the terminal trial");
+    assert_eq!(projection["trials"][0]["binding"]["session_id"], session_id);
+    assert_eq!(projection["trials"][0]["binding"]["run_id"], run_id);
+    assert!(projection["trials"][0]["observation"].is_object());
+    assert_eq!(
+        projection["trials"][0]["run_status"], "completed",
+        "HTTP evaluation run did not complete: {projection}"
+    );
+    assert_eq!(
+        projection["trials"][0]["observation"]["observation"]["status"],
+        "completed"
+    );
+    assert!(
+        llm.requests.load(Ordering::SeqCst) > 0,
+        "the HTTP start must cross the canonical provider boundary"
+    );
+
+    let requests_before_replay = llm.requests.load(Ordering::SeqCst);
+    // Simulate a lost first-arm observation while its durable Run is terminal
+    // and the experiment is still incomplete. Reads must leave it missing.
+    let deleted = sqlx::query(
+        "DELETE FROM evaluation_trial_observations WHERE owner_user_id = ? AND trial_id = ?",
+    )
+    .bind(&owner)
+    .bind(&trial_id)
+    .execute(pool.get())
+    .await
+    .expect("remove first-arm observation before explicit repair");
+    assert_eq!(deleted.rows_affected(), 1);
+    let (accounting_event_idx, accounting_event_hash): (i64, String) = sqlx::query_as(
+        "SELECT event_idx, event_hash FROM agent_run_events WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = 'run_accounting_finalized'",
+    )
+    .bind(&owner)
+    .bind(&session_id)
+    .bind(&run_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("load committed accounting anchor");
+    let (status, missing) = request_json(&app, &owner, "GET", &projection_uri, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "missing projection: {missing}");
+    assert_eq!(missing["observed_trial_count"], 0);
+    assert!(missing["trials"][0]["observation"].is_null());
+    let (status, missing_report) = request_json(
+        &app,
+        &owner,
+        "GET",
+        &format!("{projection_uri}/report"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "missing report: {missing_report}");
+    assert!(
+        DatabaseEvaluationObservationStore::new(pool.clone())
+            .load_by_trial(&owner, &trial_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let assess_uri = format!("{projection_uri}/trials/{trial_id}/assess");
+    let (status, _) = request_json(&app, &foreign_owner, "POST", &assess_uri, json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        DatabaseEvaluationObservationStore::new(pool.clone())
+            .load_by_trial(&owner, &trial_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let corrupted = sqlx::query(
+        "UPDATE agent_run_events SET event_hash = ? WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_idx = ?",
+    )
+    .bind("corrupted-accounting-proof")
+    .bind(&owner)
+    .bind(&session_id)
+    .bind(&run_id)
+    .bind(accounting_event_idx)
+    .execute(pool.get())
+    .await
+    .expect("corrupt only this fixture's accounting anchor hash");
+    assert_eq!(corrupted.rows_affected(), 1);
+    let (corrupt_status, corrupt_response) =
+        request_json(&app, &owner, "POST", &assess_uri, json!({})).await;
+    // Restore the persisted hash even when the HTTP status is unexpected, so
+    // the negative assertion never leaves a corrupted shared test database.
+    let restored = sqlx::query(
+        "UPDATE agent_run_events SET event_hash = ? WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_idx = ?",
+    )
+    .bind(&accounting_event_hash)
+    .bind(&owner)
+    .bind(&session_id)
+    .bind(&run_id)
+    .bind(accounting_event_idx)
+    .execute(pool.get())
+    .await
+    .expect("restore original accounting anchor hash");
+    assert_eq!(restored.rows_affected(), 1);
+    assert_eq!(
+        corrupt_status,
+        StatusCode::CONFLICT,
+        "corrupted canonical proof must surface as HTTP 409: {corrupt_response}"
+    );
+    assert_eq!(llm.requests.load(Ordering::SeqCst), requests_before_replay);
+    assert!(
+        DatabaseEvaluationObservationStore::new(pool.clone())
+            .load_by_trial(&owner, &trial_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "projection repair may commit independently, but corrupted evidence must not create an assessment"
+    );
+    let assessment_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM evaluation_task_assessments WHERE owner_user_id = ? AND experiment_id = ? AND trial_id = ?",
+    )
+    .bind(&owner)
+    .bind(&experiment_id)
+    .bind(&trial_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("check corrupt proof did not persist an assessment");
+    assert_eq!(assessment_count, 0);
+    let (status, assessed) = request_json(&app, &owner, "POST", &assess_uri, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "repair and assess: {assessed}");
+    assert_eq!(assessed["status"], "recorded");
+    assert_eq!(assessed["assessment"]["trial_id"], trial_id);
+    assert_eq!(
+        assessed["assessment"]["outcome"]["status"], "fail",
+        "the provider's plain-text done is not the required JSON value"
+    );
+    let repaired = DatabaseEvaluationObservationStore::new(pool.clone())
+        .load_by_trial(&owner, &trial_id)
+        .await
+        .unwrap()
+        .expect("POST repairs first arm");
+    assert_eq!(
+        serde_json::to_value(&repaired).unwrap()["request_fingerprint"],
+        projection["trials"][0]["observation"]["request_fingerprint"]
+    );
+    let (status, replay_assessed) =
+        request_json(&app, &owner, "POST", &assess_uri, json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replay_assessed, assessed, "assessment replay is immutable");
+    let (status, repaired_projection) =
+        request_json(&app, &owner, "GET", &projection_uri, json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(repaired_projection["observed_trial_count"], 1);
+    assert_eq!(
+        repaired_projection["trials"][0]["task_assessment"],
+        assessed["assessment"]
+    );
+    assert!(repaired_projection["trials"][1]["binding"]["run_id"].is_null());
+    assert_eq!(
+        llm.requests.load(Ordering::SeqCst),
+        requests_before_replay,
+        "repair, assessment and reads must not reexecute either arm"
+    );
+    let (replay_status, replay_started) =
+        request_json(&app, &owner, "POST", &start_uri, json!({})).await;
+    assert_eq!(
+        replay_status,
+        StatusCode::ACCEPTED,
+        "start replay: {replay_started}"
+    );
+    assert_eq!(replay_started["session_id"], session_id);
+    assert_eq!(replay_started["run_id"], run_id);
+
+    let (foreign_report_status, _) = request_json(
+        &app,
+        &foreign_owner,
+        "GET",
+        &format!("{projection_uri}/report"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(foreign_report_status, StatusCode::NOT_FOUND);
+
+    let (report_status, report) = request_json(
+        &app,
+        &owner,
+        "GET",
+        &format!("{projection_uri}/report"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(report_status, StatusCode::OK, "report response: {report}");
+    assert_eq!(report["manifest"]["experiment_id"], experiment_id);
+    assert_eq!(report["manifest"]["coverage"]["planned_trial_count"], 2);
+    assert_eq!(report["manifest"]["coverage"]["observed_trial_count"], 1);
+    assert_eq!(
+        report["manifest"]["assessment_refs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        report["manifest"]["assessment_refs"][0]["assessment_id"],
+        assessed["assessment"]["assessment_id"]
+    );
+    assert_eq!(
+        report["manifest"]["coverage"]["missing_trial_ids"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(report["manifest"]["coverage"]["evidence_incomplete"], true);
+    assert!(
+        report["report"]["conclusion"]
+            .as_str()
+            .is_some_and(|value| value.contains("partial") && value.contains("do not claim"))
+    );
+    assert!(!report["markdown"].as_str().unwrap_or_default().is_empty());
+    assert_eq!(
+        llm.requests.load(Ordering::SeqCst),
+        requests_before_replay,
+        "replaying the same trial must not invoke the provider again"
+    );
+
+    let (second_status, second_started) =
+        request_json(&app, &owner, "POST", &second_start_uri, json!({})).await;
+    assert_eq!(
+        second_status,
+        StatusCode::ACCEPTED,
+        "the rejected second arm can retry after its predecessor settles: {second_started}"
+    );
+    let second_run_id = second_started["run_id"].as_str().expect("second run id");
+    let second_session_id = second_started["session_id"]
+        .as_str()
+        .expect("second session id");
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let (status, value) =
+                request_json(&app, &owner, "GET", &projection_uri, json!({})).await;
+            assert_eq!(status, StatusCode::OK, "paired projection: {value}");
+            if value["observed_trial_count"].as_u64() == Some(2) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("retried second arm must settle through the canonical lifecycle");
+
+    sqlx::query("DELETE FROM evaluation_task_assessments WHERE owner_user_id = ?")
+        .bind(&owner)
+        .execute(pool.get())
+        .await
+        .expect("clean HTTP evaluation assessments");
+    sqlx::query("DELETE FROM evaluation_trial_observations WHERE owner_user_id = ?")
+        .bind(&owner)
+        .execute(pool.get())
+        .await
+        .expect("clean HTTP evaluation observations");
+    sqlx::query("DELETE FROM evaluation_materialization_receipts WHERE owner_user_id = ?")
+        .bind(&owner)
+        .execute(pool.get())
+        .await
+        .expect("clean HTTP evaluation receipts");
+    sqlx::query("DELETE FROM evaluation_trial_bindings WHERE owner_user_id = ?")
+        .bind(&owner)
+        .execute(pool.get())
+        .await
+        .expect("clean HTTP evaluation bindings");
+    sqlx::query("DELETE FROM evaluation_experiments WHERE owner_user_id = ?")
+        .bind(&owner)
+        .execute(pool.get())
+        .await
+        .expect("clean HTTP evaluation experiments");
+    cleanup_lifecycle_run_fixture(&pool, &owner, second_run_id).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &owner, second_session_id).await;
+    cleanup_lifecycle_run_fixture(&pool, &owner, &run_id).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &owner, &session_id).await;
+    sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+        .bind(&offering_id)
+        .execute(pool.get())
+        .await
+        .expect("clean HTTP evaluation model fixture");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evidence() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let owner = format!("eval-skill-owner-{}", Uuid::new_v4());
+    let session_id = format!("eval-skill-session-{}", Uuid::new_v4());
+    let skill_name = format!("eval-skill-{}", Uuid::new_v4());
+    let offering_id = format!("eval-skill-model-{}", Uuid::new_v4());
+    let model_name = format!("eval-skill-model-{}", Uuid::new_v4());
+    crate::server::run::insert_active_run_session_fixture(&pool, &owner, &session_id).await;
+    let llm = spawn_skill_invoking_test_llm(&skill_name).await;
+    sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+        .bind(&offering_id)
+        .execute(pool.get())
+        .await
+        .expect("clear Skill evaluation model fixture");
+    sqlx::query("INSERT INTO infra_llm_models (model_id, model_name, provider, api_key_encrypted, base_url, is_active, context_window, input_modalities, output_modalities, supported_parameters, pricing, tags, quirks) VALUES (?, ?, 'openai', ?, ?, 1, 128000, ?, ?, ?, ?, ?, ?)")
+        .bind(&offering_id)
+        .bind(&model_name)
+        .bind(test_encryptor().encrypt("test-key").expect("encrypt test key"))
+        .bind(&llm.base_url)
+        .bind(r#"["text"]"#)
+        .bind(r#"["text"]"#)
+        .bind("[]")
+        .bind("{}")
+        .bind("[]")
+        .bind("{}")
+        .execute(pool.get())
+        .await
+        .expect("seed Skill evaluation model fixture");
+    let service = db_backed_test_service(&pool, &format!("eval-skill-pod-{}", Uuid::new_v4()))
+        .with_model_service(Arc::new(ActiveTestModelService::with_model(
+            llm.base_url.clone(),
+            offering_id.clone(),
+            model_name.clone(),
+        )))
+        .with_run_concurrency_limit(1);
+    let skill_store = astra_services::DatabasePersonalSkillStore::new(pool.clone());
+    let manifest = json!({
+        "name": skill_name,
+        "description": "A deterministic evaluation Skill",
+        "execution_context": "inline",
+        "allowed_tools": [],
+        "required_capabilities": []
+    });
+    let baseline_skill = skill_store
+        .submit_version(
+            &owner,
+            &skill_name,
+            astra_services::SubmitUserSkillVersion {
+                version: "1.0.0".to_string(),
+                manifest_json: manifest.clone(),
+                content_markdown: "Always produce the exact result marker SKILL_OK.".to_string(),
+                status: Some("published".to_string()),
+            },
+        )
+        .await
+        .expect("publish baseline evaluation Skill");
+    let candidate_skill = skill_store
+        .submit_version(
+            &owner,
+            &skill_name,
+            astra_services::SubmitUserSkillVersion {
+                version: "2.0.0".to_string(),
+                manifest_json: manifest,
+                content_markdown: "Always produce the exact result marker SKILL_NEXT.".to_string(),
+                status: Some("published".to_string()),
+            },
+        )
+        .await
+        .expect("publish candidate evaluation Skill");
+    let mut request = test_request("evaluate the pinned Skill");
+    request.session_id = Some(session_id.clone());
+    request.model = Some(model_name.clone());
+    request.model_selection = Some(astra_turn_types::ModelSelection {
+        offering_id: offering_id.clone(),
+    });
+    request.execution_policy.turn_intent =
+        astra_services::runs::TurnIntentExecutionPolicy::FixedDefault;
+    request.execution_policy.skill_auto_route =
+        astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled;
+    request.execution_time_budget = Some(astra_services::runs::ExecutionTimeBudget {
+        remaining_seconds: 60,
+    });
+    let input_hash = prompt_context_fingerprint(
+        &request.message,
+        &request.parts,
+        &request.attachments,
+        request.context.as_ref(),
+    );
+    let skill_revision = astra_services::evaluation::EvaluationSkillRevision {
+        skill_name: skill_name.clone(),
+        revision_id: baseline_skill.version_id.clone(),
+        content_hash: baseline_skill.content_hash.clone(),
+    };
+    let admitted_model = crate::server::model_execution_admission::admit_model_execution(
+        &service.model_service,
+        astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
+        &owner,
+        &astra_turn_types::ModelSelection {
+            offering_id: offering_id.clone(),
+        },
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("admit the fixture model service route");
+    let resolved_model = astra_services::runs::ResolvedModelSelection {
+        offering_id: admitted_model.offering_id.clone(),
+        model_name: admitted_model.model_name.clone(),
+    };
+    let policy_hash = astra_services::evaluation::evaluation_policy_fingerprint(
+        &astra_services::evaluation::EvaluationPolicyFingerprintInput {
+            model_binding: &offering_id,
+            provider_binding: "openai",
+            cache_policy: "provider_default_recorded",
+            resolved_model_selection: Some(&resolved_model),
+            admitted_provider: &admitted_model.provider,
+            admitted_cache_capability: admitted_model.cache_capability.as_ref(),
+            execution_policy: &request.execution_policy,
+            allow_skills: request.allow_skills.as_deref(),
+            allow_skill_sources: request.allow_skill_sources.as_deref(),
+            allow_tools: request.allow_tools.as_deref(),
+            enabled_tools: request.enabled_tools.as_deref(),
+            runtime_profile: request.runtime_profile.as_ref(),
+            workspace_execution: None,
+        },
+    )
+    .unwrap();
+    let experiment_id = format!("eval-skill-exp-{}", Uuid::new_v4());
+    let spec = astra_services::evaluation::ExperimentSpec {
+        schema_version: 1,
+        experiment_id: experiment_id.clone(),
+        target: astra_services::evaluation::EvaluationTarget {
+            kind: astra_services::evaluation::EvaluationTargetKind::Skill,
+            baseline: astra_services::evaluation::RevisionRef {
+                revision_id: baseline_skill.version_id.clone(),
+                content_hash: baseline_skill.content_hash.clone(),
+                content: None,
+            },
+            candidate: astra_services::evaluation::RevisionRef {
+                revision_id: candidate_skill.version_id.clone(),
+                content_hash: candidate_skill.content_hash.clone(),
+                content: None,
+            },
+            skill_name: Some(skill_name.clone()),
+            judgment_policy: astra_services::evaluation::EvaluationJudgmentPolicy::Disabled,
+        },
+        cases: vec![astra_services::evaluation::EvaluationCase {
+            case_id: "case-skill-runtime".to_string(),
+            input_snapshot_ref: "input://skill-runtime".to_string(),
+            input_content_hash: input_hash.clone(),
+            holdout: false,
+            task_verifier: astra_services::evaluation::task_verifier::TaskVerifierSpec::freeze(
+                astra_services::evaluation::task_verifier::JsonValueEqualsConfig {
+                    expected: json!({"ok": true}),
+                },
+            )
+            .expect("freeze required runtime task verifier"),
+            input_content: None,
+        }],
+        repetitions: 1,
+        order: astra_services::evaluation::TrialOrder::BaselineFirst,
+        conditions: astra_services::evaluation::FrozenConditions {
+            execution_config:
+                crate::turn::execution_config::PreparedExecutionInputs::freeze_for_prepare(
+                    &admitted_model,
+                    &service.encryptor,
+                    "case-skill-runtime",
+                    &request.message,
+                )
+                .expect("freeze the actual admitted fixture execution"),
+            isolation_profile: "skill_inline_private".to_string(),
+            model_binding: offering_id.clone(),
+            provider_binding: "openai".to_string(),
+            context_snapshot_hash: input_hash,
+            tool_policy_hash: policy_hash,
+            cache_policy: "provider_default_recorded".to_string(),
+            memory_isolation: astra_services::evaluation::MemoryIsolation::Disabled,
+            data_isolation: astra_services::evaluation::DataIsolation::Disabled,
+            workspace_execution: None,
+        },
+        budget: astra_services::evaluation::EvaluationBudget {
+            max_trials: 2,
+            max_concurrency: 1,
+            max_wall_time_secs: 60,
+        },
+        adapter_profile_version: None,
+        measurement_profile:
+            astra_services::evaluation::measurement_profile::MeasurementProfile::InstructionOnlyV1,
+    };
+    let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
+    let experiment = plan_store
+        .register_experiment(&owner, &spec, "runtime-skill-eval-submit")
+        .await
+        .expect("register Skill evaluation");
+    let trial = plan_store
+        .list_trials(&owner, &experiment.experiment_id)
+        .await
+        .expect("load Skill evaluation trials")
+        .into_iter()
+        .find(|trial| trial.trial.arm == astra_services::evaluation::ComparisonArm::Baseline)
+        .expect("baseline Skill trial");
+    request.evaluation_admission = Some(EvaluationRunAdmission {
+        experiment_id: experiment.experiment_id.clone(),
+        trial_id: trial.trial_id.clone(),
+        input_content_hash: trial.trial.input_content_hash.clone(),
+        revision_content_hash: baseline_skill.content_hash.clone(),
+        skill_revision: Some(skill_revision.clone()),
+        judgment_policy: None,
+        receipt_ids: Vec::new(),
+        snapshot_envelope: None,
+    });
+
+    let baseline_request = request.clone();
+    let run = service
+        .create_run(owner.clone(), request)
+        .await
+        .expect("Skill evaluation must use the ordinary durable Run entrypoint");
+    let durable = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let durable = service
+                .run_engine
+                .load_run(&owner, &run.run_id)
+                .await
+                .expect("load Skill evaluation run")
+                .expect("Skill evaluation run exists");
+            if matches!(
+                durable.status.as_str(),
+                STATUS_COMPLETED | STATUS_FAILED | STATUS_CANCELLED | STATUS_DELEGATED
+            ) {
+                break durable;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("Skill evaluation should settle");
+    assert_eq!(durable.status, STATUS_COMPLETED, "{durable:?}");
+    let invocation_event = durable
+        .events
+        .iter()
+        .find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("evaluation_skill_invoked")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "successful Skill invocation evidence event; events={:?}",
+                durable.events
+            )
+        });
+    assert_eq!(invocation_event["data"]["skill_name"], skill_name);
+    assert_eq!(
+        invocation_event["data"]["revision_id"],
+        baseline_skill.version_id
+    );
+    assert_eq!(
+        invocation_event["data"]["content_hash"],
+        baseline_skill.content_hash
+    );
+    assert!(durable.events.iter().any(|event| {
+        event.pointer("/data/full_text").and_then(Value::as_str) == Some(r#"{"ok":false}"#)
+    }));
+    assert_eq!(llm.requests.load(Ordering::SeqCst), 2);
+
+    let observation = tokio::time::timeout(Duration::from_secs(10), async {
+        let store = DatabaseEvaluationObservationStore::new(pool.clone());
+        loop {
+            if let Some(observation) = store
+                .load_by_trial(&owner, &trial.trial_id)
+                .await
+                .expect("load Skill evaluation observation")
+            {
+                break observation;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("Skill evaluation observation should settle");
+    let skill_evidence = observation
+        .observation
+        .evidence
+        .iter()
+        .find(|evidence| evidence.evidence_id.starts_with("skill-invocation:"))
+        .expect("Skill invocation evidence reference");
+    assert_eq!(skill_evidence.availability, EvidenceAvailability::Available);
+    assert!(skill_evidence.content_hash.is_some());
+
+    use astra_services::evaluation::task_assessment::{
+        TaskAssessmentOutcome, TaskAssessmentResult,
+    };
+    let assessment_store = DatabaseEvaluationObservationStore::new(pool.clone());
+    let TaskAssessmentResult::Recorded(baseline_assessment) = assessment_store
+        .assess_trial(&owner, &experiment.experiment_id, &trial.trial_id)
+        .await
+        .expect("assess baseline before the experiment completes")
+    else {
+        panic!("terminal baseline output must produce a durable assessment");
+    };
+    assert_eq!(baseline_assessment.outcome, TaskAssessmentOutcome::Fail);
+    assert_eq!(
+        baseline_assessment.observation_id,
+        observation.observation_id
+    );
+    assert!(baseline_assessment.terminal.is_some());
+    assert!(baseline_assessment.output.is_some());
+    assert_eq!(llm.requests.load(Ordering::SeqCst), 2);
+
+    let candidate_session_id = format!("eval-skill-cand-{}", Uuid::new_v4());
+    crate::server::run::insert_active_run_session_fixture(&pool, &owner, &candidate_session_id)
+        .await;
+    let candidate_trial = plan_store
+        .list_trials(&owner, &experiment.experiment_id)
+        .await
+        .expect("reload Skill evaluation trials")
+        .into_iter()
+        .find(|trial| trial.trial.arm == astra_services::evaluation::ComparisonArm::Candidate)
+        .expect("candidate Skill trial");
+    let candidate_skill_revision = astra_services::evaluation::EvaluationSkillRevision {
+        skill_name: skill_name.clone(),
+        revision_id: candidate_skill.version_id.clone(),
+        content_hash: candidate_skill.content_hash.clone(),
+    };
+    let mut candidate_request = baseline_request.clone();
+    candidate_request.session_id = Some(candidate_session_id.clone());
+    candidate_request.evaluation_admission = Some(EvaluationRunAdmission {
+        experiment_id: experiment.experiment_id.clone(),
+        trial_id: candidate_trial.trial_id.clone(),
+        input_content_hash: candidate_trial.trial.input_content_hash.clone(),
+        revision_content_hash: candidate_skill.content_hash.clone(),
+        skill_revision: Some(candidate_skill_revision.clone()),
+        judgment_policy: None,
+        receipt_ids: Vec::new(),
+        snapshot_envelope: None,
+    });
+    let candidate_run = service
+        .create_run(owner.clone(), candidate_request)
+        .await
+        .expect("candidate Skill arm should share the frozen policy hash");
+    let candidate_durable = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let durable = service
+                .run_engine
+                .load_run(&owner, &candidate_run.run_id)
+                .await
+                .expect("load candidate Skill evaluation run")
+                .expect("candidate Skill evaluation run exists");
+            if matches!(
+                durable.status.as_str(),
+                STATUS_COMPLETED | STATUS_FAILED | STATUS_CANCELLED | STATUS_DELEGATED
+            ) {
+                break durable;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("candidate Skill evaluation should settle");
+    assert_eq!(
+        candidate_durable.status, STATUS_COMPLETED,
+        "{candidate_durable:?}"
+    );
+    let candidate_invocation = candidate_durable
+        .events
+        .iter()
+        .find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("evaluation_skill_invoked")
+        })
+        .expect("candidate Skill invocation evidence event");
+    assert_eq!(
+        candidate_invocation["data"]["revision_id"],
+        candidate_skill.version_id
+    );
+    assert_eq!(
+        candidate_invocation["data"]["content_hash"],
+        candidate_skill.content_hash
+    );
+    assert!(candidate_durable.events.iter().any(|event| {
+        event.pointer("/data/full_text").and_then(Value::as_str) == Some(r#"{"ok":true}"#)
+    }));
+    assert_eq!(llm.requests.load(Ordering::SeqCst), 4);
+    let candidate_observation = tokio::time::timeout(Duration::from_secs(10), async {
+        let store = DatabaseEvaluationObservationStore::new(pool.clone());
+        loop {
+            if let Some(observation) = store
+                .load_by_trial(&owner, &candidate_trial.trial_id)
+                .await
+                .expect("load candidate Skill evaluation observation")
+            {
+                break observation;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("candidate Skill evaluation observation should settle");
+    assert_eq!(
+        candidate_observation
+            .observation
+            .evidence
+            .iter()
+            .find(|evidence| evidence.evidence_id.starts_with("skill-invocation:"))
+            .expect("candidate Skill invocation evidence reference")
+            .availability,
+        EvidenceAvailability::Available
+    );
+
+    let TaskAssessmentResult::Recorded(candidate_assessment) = assessment_store
+        .assess_trial(&owner, &experiment.experiment_id, &candidate_trial.trial_id)
+        .await
+        .expect("assess candidate from its committed output")
+    else {
+        panic!("terminal candidate output must produce a durable assessment");
+    };
+    assert_eq!(candidate_assessment.outcome, TaskAssessmentOutcome::Pass);
+    assert_eq!(
+        candidate_assessment.observation_id,
+        candidate_observation.observation_id
+    );
+    assert!(candidate_assessment.terminal.is_some());
+    assert!(candidate_assessment.output.is_some());
+    for assessment in [&baseline_assessment, &candidate_assessment] {
+        assert_eq!(
+            assessment_store
+                .assess_trial(&owner, &experiment.experiment_id, &assessment.trial_id)
+                .await
+                .expect("replay immutable task assessment"),
+            TaskAssessmentResult::Recorded(assessment.clone())
+        );
+    }
+    let projected =
+        astra_services::evaluation::DatabaseEvaluationProjectionStore::new(pool.clone())
+            .load_experiment(&owner, &experiment.experiment_id)
+            .await
+            .expect("project assessed Skill arms");
+    for assessment in [&baseline_assessment, &candidate_assessment] {
+        assert_eq!(
+            projected
+                .trials
+                .iter()
+                .find(|projected| projected.binding.trial_id == assessment.trial_id)
+                .expect("projected assessed trial")
+                .task_assessment
+                .as_ref(),
+            Some(assessment.as_ref())
+        );
+    }
+    let artifact = astra_services::evaluation::report::build_report_artifact(
+        &owner,
+        &projected.experiment,
+        &projected
+            .trials
+            .iter()
+            .filter_map(|trial| trial.observation.clone())
+            .collect::<Vec<_>>(),
+        &projected
+            .trials
+            .iter()
+            .filter_map(|trial| trial.task_assessment.clone())
+            .collect::<Vec<_>>(),
+        &projected.unavailable_trial_ids,
+        "baseline",
+        "candidate",
+    )
+    .expect("report real Skill task assessments");
+    assert_eq!(artifact.manifest.assessment_refs.len(), 2);
+    for (trial_id, expected) in [(&trial.trial_id, 0.0), (&candidate_trial.trial_id, 1.0)] {
+        let observed = artifact
+            .report
+            .observations
+            .iter()
+            .find(|observed| &observed.trial_id == trial_id)
+            .expect("reported Skill arm");
+        assert_eq!(
+            observed.status,
+            astra_services::evaluation::assessment::TrialStatus::Completed
+        );
+        let success = observed
+            .measurements
+            .iter()
+            .find(|metric| metric.name == "task_success")
+            .expect("report task success from persisted assessment");
+        assert_eq!(success.value, Some(expected));
+    }
+    for assessment in [&baseline_assessment, &candidate_assessment] {
+        assert!(
+            artifact
+                .manifest
+                .assessment_refs
+                .iter()
+                .any(|reference| reference.assessment_id == assessment.assessment_id)
+        );
+    }
+    assert_eq!(
+        llm.requests.load(Ordering::SeqCst),
+        4,
+        "assessments, replay, projection and report use durable evidence only"
+    );
+
+    let rejected_session_id = format!("eval-skill-rej-{}", Uuid::new_v4());
+    crate::server::run::insert_active_run_session_fixture(&pool, &owner, &rejected_session_id)
+        .await;
+    // Use an unbound trial so the prompt boundary, rather than an attempted
+    // rebind of the completed baseline, owns this rejection.
+    let mut rejected_spec = spec.clone();
+    rejected_spec.experiment_id = format!("eval-skill-rejected-{}", Uuid::new_v4());
+    let rejected_experiment = plan_store
+        .register_experiment(&owner, &rejected_spec, "runtime-skill-eval-rejected")
+        .await
+        .unwrap();
+    let rejected_trial = plan_store
+        .list_trials(&owner, &rejected_experiment.experiment_id)
+        .await
+        .unwrap()
+        .remove(0);
+    let mut unstable_prompt_request = baseline_request.clone();
+    let rejected_admission = unstable_prompt_request
+        .evaluation_admission
+        .as_mut()
+        .unwrap();
+    rejected_admission.experiment_id = rejected_experiment.experiment_id;
+    rejected_admission.trial_id = rejected_trial.trial_id.clone();
+    unstable_prompt_request.session_id = Some(rejected_session_id.clone());
+    unstable_prompt_request.stable_runtime_system_prompt = Some("unfrozen prompt".to_string());
+    let rejected = service
+        .create_run(owner.clone(), unstable_prompt_request)
+        .await
+        .expect_err("Skill evaluation must reject an unfrozen system prompt");
+    assert_eq!(
+        rejected.1.error_code.as_deref(),
+        Some("evaluation_skill_system_prompt_unsupported")
+    );
+    assert_eq!(llm.requests.load(Ordering::SeqCst), 4);
+    let rejected_binding = plan_store
+        .load_trial(&owner, &rejected_trial.trial_id)
+        .await
+        .unwrap();
+    let rejected_run_id = rejected_binding
+        .run_id
+        .as_deref()
+        .expect("atomic trial binding");
+    let rejected_run = service
+        .run_engine
+        .load_run(&owner, rejected_run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rejected_run.status, STATUS_FAILED);
+
+    for table in [
+        "evaluation_task_assessments",
+        "evaluation_trial_observations",
+        "evaluation_materialization_receipts",
+        "evaluation_trial_bindings",
+        "evaluation_experiments",
+        "user_skill_versions",
+        "user_skill_sources",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE owner_user_id = ?"))
+            .bind(&owner)
+            .execute(pool.get())
+            .await
+            .expect("clean Skill evaluation fixture");
+    }
+    cleanup_lifecycle_run_fixture(&pool, &owner, &run.run_id).await;
+    cleanup_lifecycle_run_fixture(&pool, &owner, &candidate_run.run_id).await;
+    cleanup_lifecycle_run_fixture(&pool, &owner, rejected_run_id).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &owner, &session_id).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &owner, &candidate_session_id).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &owner, &rejected_session_id).await;
+    sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+        .bind(&offering_id)
+        .execute(pool.get())
+        .await
+        .expect("clean Skill evaluation model fixture");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
 async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
@@ -10827,6 +13224,7 @@ fn test_request(message: &str) -> ChatRequestData {
         session_admission_facts: None,
         work_binding: None,
         run_start_idempotency: None,
+        evaluation_admission: None,
         full_llm_capture: false,
         agent_id: None,
         model: Some("test-model".to_string()),
@@ -10854,6 +13252,7 @@ fn test_request(message: &str) -> ChatRequestData {
         runtime_mcp_bindings: Vec::new(),
         context: None,
         edge_executor_id: None,
+        evaluation_workspace_base_root: None,
         capabilities: Vec::new(),
         forward_headers: HashMap::new(),
         execution_budget: None,
@@ -14109,7 +16508,13 @@ async fn native_edge_without_durable_coordinator_fails_closed_but_edge_ledger_is
         status: Some(astra_services::runs::ExecutorStatusRequest::Online),
     });
     let denied = service
-        .bind_execution_selection("owner-1", "session-no-coordinator", &mut request, None)
+        .bind_execution_selection(
+            "owner-1",
+            "session-no-coordinator",
+            &mut request,
+            None,
+            None,
+        )
         .await
         .expect_err("native Edge must not bypass durable binding admission");
     assert_eq!(denied.0, StatusCode::SERVICE_UNAVAILABLE);
@@ -14121,7 +16526,13 @@ async fn native_edge_without_durable_coordinator_fails_closed_but_edge_ledger_is
     request.executor_binding.as_mut().unwrap().transport =
         Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger);
     service
-        .bind_execution_selection("owner-1", "session-no-coordinator", &mut request, None)
+        .bind_execution_selection(
+            "owner-1",
+            "session-no-coordinator",
+            &mut request,
+            None,
+            None,
+        )
         .await
         .expect("request-scoped EdgeLedger does not need native coordinator state");
     assert_eq!(request.execution_binding_generation, None);
@@ -14575,7 +16986,7 @@ async fn server_default_model_mode_uses_existing_model_access_default() {
     request.model_selection = None;
     request.resolved_model_selection = None;
 
-    let prepared = service
+    let (prepared, _runtime_config) = service
         .prepare_chat_request("u1", request)
         .await
         .expect("Model Access default is admitted once by the runtime");
@@ -14606,7 +17017,7 @@ async fn prepare_chat_request_accepts_structured_user_intent_when_prompt_message
     request.resolved_model_selection = None;
     request.admitted_model_execution = None;
 
-    let prepared = service
+    let (prepared, _runtime_config) = service
         .prepare_chat_request("u1", request)
         .await
         .expect("non-empty user_intent is valid effective input");
@@ -14966,7 +17377,7 @@ async fn prepare_chat_request_normalizes_provider_descriptor_without_registered_
             discovery_snapshot: None,
         });
 
-    let prepared = service
+    let (prepared, _runtime_config) = service
         .prepare_chat_request("u1", request)
         .await
         .expect("provider descriptor should become admitted_model_execution");
@@ -15176,6 +17587,7 @@ async fn build_initial_state_includes_database_skill_provider_when_wired() {
             }
             Ok(SkillListRecord {
                 skills: vec![SkillListItem {
+                    is_owned: false,
                     skill_id: "remote-db@1.0.0".to_string(),
                     skill_name: "remote-db".to_string(),
                     version: "1.0.0".to_string(),
@@ -15314,6 +17726,58 @@ async fn build_initial_state_includes_database_skill_provider_when_wired() {
     assert!(
         default_state.skills.registry_for_activation.is_some(),
         "unfiltered server catalog should be available for conditional activation"
+    );
+
+    let catalog_reads = skill_service.list_calls.load(Ordering::SeqCst);
+    assert!(
+        catalog_reads > 0,
+        "ordinary requests must load the production catalog"
+    );
+    let second_default_state = svc.build_initial_state(
+        "test-user",
+        &default_request,
+        "session-2",
+        "run-2",
+        None,
+        None,
+        None,
+    );
+    assert!(second_default_state.skills.resolver.is_some());
+    assert_eq!(
+        skill_service.list_calls.load(Ordering::SeqCst),
+        catalog_reads,
+        "a warm server catalog must be reused across turns for the same user"
+    );
+    let mut evaluation = prepared_test_request("evaluate a prompt without Skills");
+    evaluation.evaluation_admission = Some(EvaluationRunAdmission {
+        experiment_id: "experiment".into(),
+        trial_id: "trial".into(),
+        input_content_hash: content_fingerprint(&evaluation.message),
+        revision_content_hash: content_fingerprint("revision"),
+        skill_revision: None,
+        judgment_policy: None,
+        receipt_ids: Vec::new(),
+        snapshot_envelope: None,
+    });
+    svc.validate_request_constraints("test-user", &evaluation)
+        .await
+        .expect("Eval constraints must not discover the production catalog");
+    let eval_state = svc.build_initial_state(
+        "test-user",
+        &evaluation,
+        "eval-session",
+        "eval-run",
+        None,
+        None,
+        None,
+    );
+    assert!(eval_state.skills.resolver.is_none());
+    assert!(eval_state.skills.registry_for_activation.is_none());
+    assert!(eval_state.skills.listing_message.is_none());
+    assert_eq!(
+        skill_service.list_calls.load(Ordering::SeqCst),
+        catalog_reads,
+        "Prompt Eval must not even load the populated production catalog"
     );
 
     let mut request = test_request("hello");
@@ -17252,10 +19716,20 @@ fn terminal_events_for_persistence_keeps_only_terminal_lifecycle_events() {
         json!({"event_type": "text_done", "data": {"full_text": "final answer"}}),
         json!({"event_type": "run_error", "data": {"error": "boom"}}),
         json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}),
+        json!({
+            "event_type": "evaluation_coding_evidence",
+            "idempotency_key": "evaluation-coding-evidence:run-1:1",
+            "data": {"status": "unavailable", "detail": {"reason": "fixture"}}
+        }),
+        json!({
+            "event_type": "evaluation_judgment",
+            "idempotency_key": "evaluation-judgment:run-1:1",
+            "data": {"operation_id": "skill_auto_route", "status": "negative"}
+        }),
     ];
 
     let persisted = terminal_events_for_persistence(&events);
-    assert_eq!(persisted.len(), 7);
+    assert_eq!(persisted.len(), 9);
     assert_eq!(persisted[0]["type"], "reasoning_done");
     assert_eq!(persisted[1]["type"], "thinking_done");
     assert_eq!(persisted[2]["type"], "runtime.control.handoff.requested");
@@ -17263,6 +19737,8 @@ fn terminal_events_for_persistence_keeps_only_terminal_lifecycle_events() {
     assert_eq!(persisted[4]["event_type"], "text_done");
     assert_eq!(persisted[5]["event_type"], "run_error");
     assert_eq!(persisted[6]["event_type"], "run_finished");
+    assert_eq!(persisted[7]["event_type"], "evaluation_coding_evidence");
+    assert_eq!(persisted[8]["event_type"], "evaluation_judgment");
 }
 
 #[tokio::test]
@@ -17717,6 +20193,45 @@ async fn work_turn_exact_retry_attaches_and_changed_payload_fails_closed() {
         mismatch.1.0.error_code.as_deref(),
         Some("idempotency_mismatch")
     );
+}
+
+#[test]
+fn evaluation_start_rejects_mismatched_authority_and_session() {
+    let identity = RunStartIdempotency::new(
+        RunStartIdempotencyKind::EvaluationTrial,
+        "evaluation-run-1",
+        "1".repeat(64),
+    )
+    .expect("evaluation identity");
+
+    let authority_error = AgenticRunLifecycleService::validate_start_request_authority(
+        Some(&identity),
+        Some("different-run"),
+    )
+    .expect_err("conversation authority must not override the stable evaluation Run");
+    assert_eq!(authority_error.0, StatusCode::CONFLICT);
+    assert_eq!(
+        authority_error.1.0.error_code.as_deref(),
+        Some("conversation_authority_run_conflict")
+    );
+
+    let session_error = AgenticRunLifecycleService::validate_start_request_session(
+        &identity,
+        Some("different-session"),
+        "evaluation-session-1",
+    )
+    .expect_err("evaluation identity must stay in one stable session");
+    assert_eq!(session_error.0, StatusCode::CONFLICT);
+    assert_eq!(
+        session_error.1.0.error_code.as_deref(),
+        Some("evaluation_trial_start_mismatch")
+    );
+}
+
+#[test]
+fn ordinary_start_without_evaluation_authority_remains_unconstrained() {
+    AgenticRunLifecycleService::validate_start_request_authority(None, Some("ordinary-run"))
+        .expect("ordinary starts have no evaluation identity to conflict with");
 }
 
 #[tokio::test]
@@ -21891,6 +24406,7 @@ fn extract_edge_tools_from_context() {
         session_admission_facts: None,
         work_binding: None,
         run_start_idempotency: None,
+        evaluation_admission: None,
         full_llm_capture: false,
         agent_id: None,
         model: None,
@@ -21916,6 +24432,7 @@ fn extract_edge_tools_from_context() {
         runtime_mcp_bindings: Vec::new(),
         context: Some(ctx),
         edge_executor_id: None,
+        evaluation_workspace_base_root: None,
         capabilities: Vec::new(),
         forward_headers: HashMap::new(),
         execution_budget: None,
@@ -21980,6 +24497,7 @@ fn extract_edge_profile_from_context() {
         session_admission_facts: None,
         work_binding: None,
         run_start_idempotency: None,
+        evaluation_admission: None,
         full_llm_capture: false,
         agent_id: None,
         model: None,
@@ -22005,6 +24523,7 @@ fn extract_edge_profile_from_context() {
         runtime_mcp_bindings: Vec::new(),
         context: Some(ctx),
         edge_executor_id: None,
+        evaluation_workspace_base_root: None,
         capabilities: Vec::new(),
         forward_headers: HashMap::new(),
         execution_budget: None,
@@ -22048,6 +24567,121 @@ fn build_initial_state_sets_user_message() {
 }
 
 #[test]
+#[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+fn shared_assembly_consumes_frozen_execution_policy_without_resolving_defaults() {
+    use crate::turn::execution_config::PreparedExecutionInputs;
+    use astra_turn_core::chat_turn_heuristics::AgenticTurnBudget;
+    use astra_turn_types::ThinkingConfig;
+
+    let svc = test_service();
+    let request = test_request("review the current implementation");
+    assert!(request.execution_budget.is_none());
+    let admitted = test_admitted_model_execution();
+    let encryptor = test_encryptor();
+    let mut frozen = PreparedExecutionInputs::freeze_for_prepare(
+        &admitted,
+        &encryptor,
+        "frozen-case",
+        &request.message,
+    )
+    .expect("freeze actual admitted inputs");
+    // Persist deliberately different values from normal profile resolution.
+    let ordinary_budget = frozen.runtime.round_budget_by_case["frozen-case"].clone();
+    let budget = frozen
+        .runtime
+        .round_budget_by_case
+        .get_mut("frozen-case")
+        .unwrap();
+    budget.initial_turns = ordinary_budget.initial_turns + 1;
+    budget.extension_turns = ordinary_budget.extension_turns + 3;
+    budget.hard_turn_limit = std::num::NonZeroUsize::new(budget.initial_turns + 11);
+    let expected_budget = AgenticTurnBudget::new(
+        budget.initial_turns,
+        budget.hard_turn_limit,
+        budget.extension_turns,
+    );
+    frozen.primary_thinking = ThinkingConfig::Enabled {
+        budget_tokens: 1777,
+    };
+    frozen.runtime.max_turn_input_tokens = 12345;
+    frozen.runtime.max_identical_tool_calls += 1;
+    frozen.runtime.max_tools_per_turn += 2;
+    frozen.runtime.repeated_cache_hit_suppression += 3;
+    frozen.runtime.max_consecutive_empty_name += 4;
+    frozen.session_current_date = "1999-12-31".into();
+    let inputs =
+        PreparedExecutionInputs::from_frozen(&frozen, &admitted, &encryptor, "frozen-case", None)
+            .expect("rebind exact frozen inputs");
+    let edge = AgenticRunLifecycleService::extract_edge_context(&request).unwrap();
+    let constraints = RequestConstraints::default();
+    let facts = svc
+        .prepare_initial_execution_facts(
+            "test-user",
+            &request,
+            "frozen-session",
+            "frozen-run",
+            None,
+            &edge,
+            &inputs,
+        )
+        .unwrap();
+    let environment = svc.assemble_loop_environment(
+        "test-user",
+        &request,
+        "frozen-session",
+        "frozen-run",
+        None,
+        None,
+        None,
+        None,
+        &constraints,
+        &edge,
+        None,
+        None,
+        None,
+        Some(3),
+    );
+    let state = svc.assemble_loop_state(
+        &request,
+        "frozen-session",
+        "frozen-run",
+        constraints,
+        &edge,
+        None,
+        environment,
+        facts,
+        &inputs,
+    );
+    assert_eq!(state.agentic_turn_budget, expected_budget);
+    assert_eq!(state.max_turns, expected_budget.initial_turns);
+    assert_eq!(state.remaining_turns, expected_budget.initial_turns);
+    assert!(
+        state.budget_is_explicit,
+        "frozen budgets must not be promoted as fallback slices"
+    );
+    assert_eq!(state.thinking, frozen.primary_thinking);
+    assert_eq!(state.max_turn_input_tokens, 12345);
+    assert_eq!(
+        (
+            state.max_identical_tool_calls,
+            state.max_tools_per_turn,
+            state.repeated_cache_hit_suppression,
+            state.max_consecutive_empty_name
+        ),
+        (
+            frozen.runtime.max_identical_tool_calls,
+            frozen.runtime.max_tools_per_turn,
+            frozen.runtime.repeated_cache_hit_suppression,
+            frozen.runtime.max_consecutive_empty_name
+        ),
+    );
+    assert_eq!(
+        state.pipeline_session.as_ref().unwrap().current_date(),
+        "1999-12-31"
+    );
+}
+
+#[test]
 fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     let svc = test_service();
     let request = test_request("current authorization, not a new user turn");
@@ -22061,6 +24695,11 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
             "same-run",
             None,
             &edge,
+            &crate::turn::execution_config::PreparedExecutionInputs::capture(
+                astra_config::runtime_config::RuntimeConfig::load(),
+                "test-user",
+                "same-session",
+            ),
         )
         .unwrap();
     let messages = vec![
@@ -22130,6 +24769,14 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
             execution_topology: None,
         },
     );
+    facts.original.skill_execution.adopted.insert(
+        "personal-review".into(),
+        crate::turn::agentic_loop::host::AdoptedSkillRevision {
+            version_id: "original-v1".into(),
+            content_hash: "original-hash".into(),
+            content_markdown: "Original adopted instructions, frozen before retry.".into(),
+        },
+    );
     let expected_skills = serde_json::to_value(&facts.original.skill_execution).unwrap();
     facts
         .original
@@ -22177,8 +24824,9 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
         None,
         Some(3),
     );
+    let mut runtime_config = astra_config::runtime_config::RuntimeConfig::default();
+    runtime_config.tool_selection.max_identical_tool_calls = 7;
     let state = svc.assemble_loop_state(
-        "test-user",
         &request,
         "same-session",
         "same-run",
@@ -22187,7 +24835,13 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
         None,
         environment,
         facts,
+        &crate::turn::execution_config::PreparedExecutionInputs::capture(
+            runtime_config,
+            "test-user",
+            "same-session",
+        ),
     );
+    assert_eq!(state.max_identical_tool_calls, 7);
     assert_eq!(state.messages, messages);
     assert_eq!(state.message, "original task");
     assert_eq!(state.user_intent, "original structured intent");
@@ -22293,7 +24947,19 @@ fn build_initial_state_shared_assembly_preserves_restored_workspace_evidence() {
     let edge = AgenticRunLifecycleService::extract_edge_context(&request).unwrap();
     let constraints = RequestConstraints::default();
     let mut facts = svc
-        .prepare_initial_execution_facts("user", &request, "session", "run", None, &edge)
+        .prepare_initial_execution_facts(
+            "user",
+            &request,
+            "session",
+            "run",
+            None,
+            &edge,
+            &crate::turn::execution_config::PreparedExecutionInputs::capture(
+                astra_config::runtime_config::RuntimeConfig::load(),
+                "user",
+                "session",
+            ),
+        )
         .unwrap();
     facts.hooks.workspace_root_hint = Some("/app".into());
     facts.original.canonical_turn_chain_id = Some("chain".into());
@@ -22317,7 +24983,6 @@ fn build_initial_state_shared_assembly_preserves_restored_workspace_evidence() {
         Some(3),
     );
     let state = svc.assemble_loop_state(
-        "user",
         &request,
         "session",
         "run",
@@ -22326,6 +24991,11 @@ fn build_initial_state_shared_assembly_preserves_restored_workspace_evidence() {
         None,
         environment,
         facts,
+        &crate::turn::execution_config::PreparedExecutionInputs::capture(
+            astra_config::runtime_config::RuntimeConfig::load(),
+            "user",
+            "session",
+        ),
     );
     assert!(state.stall.tool_call_records.is_empty());
     assert_eq!(state.hooks.workspace_root_hint.as_deref(), Some("/app"));
@@ -22505,6 +25175,11 @@ fn build_initial_state_rejects_zero_execution_budget_cap() {
         None,
         None,
         None,
+        &crate::turn::execution_config::PreparedExecutionInputs::capture(
+            astra_config::runtime_config::RuntimeConfig::load(),
+            "test-user",
+            "s",
+        ),
     );
     let (status, error) = result.err().expect("zero cap must be rejected");
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -23070,6 +25745,11 @@ fn late_streaming_start_binds_owner_generation_into_action_state() {
             None,
             None,
             None,
+            &crate::turn::execution_config::PreparedExecutionInputs::capture(
+                astra_config::runtime_config::RuntimeConfig::load(),
+                "test-user",
+                "session-late-authority",
+            ),
         )
         .expect("valid test execution configuration");
     assert_eq!(state.current_run_owner_generation, None);
@@ -23118,6 +25798,11 @@ fn build_initial_state_agent_binding_uses_binding_skills_and_request_budget() {
             None,
             Some(&binding_context),
             None,
+            &crate::turn::execution_config::PreparedExecutionInputs::capture(
+                astra_config::runtime_config::RuntimeConfig::load(),
+                "test-user",
+                "s",
+            ),
         )
         .expect("valid test execution configuration");
 
@@ -23260,6 +25945,11 @@ async fn request_scoped_runtime_skill_resolver_is_installed_from_provider_capabi
             capabilities.request_scoped_skill_resolver.clone(),
             capabilities.agent_binding.as_ref(),
             None,
+            &crate::turn::execution_config::PreparedExecutionInputs::capture(
+                astra_config::runtime_config::RuntimeConfig::load(),
+                "external-user",
+                "session-1",
+            ),
         )
         .expect("valid test execution configuration");
 

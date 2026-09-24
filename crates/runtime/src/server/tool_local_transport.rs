@@ -199,6 +199,7 @@ mod tests {
             args: serde_json::json!({}),
             workspace: WorkspaceBinding::server_sandbox(workspace_root),
             workspace_record: None,
+            evaluation_workspace: None,
             executor: ExecutorBinding::server_local(),
             runtime: None,
             selected_offer: None,

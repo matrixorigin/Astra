@@ -17,7 +17,7 @@ impl ToolExecutor {
             }
         };
 
-        let file_path = match self.resolve_checked(notebook_path) {
+        let file_path = match self.resolve_checked_for_write(notebook_path) {
             Ok(path) => path,
             Err(e) => return json!({ "error": e }).to_string(),
         };

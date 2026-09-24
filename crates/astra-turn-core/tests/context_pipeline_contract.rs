@@ -34,6 +34,7 @@ fn build_sources() -> (
         AgentContext::default(),
         SessionLatches::default(),
         SessionContext {
+            compaction_thresholds: Default::default(),
             session_id: "contract-session".into(),
             run_id: "contract-run".into(),
             model_id: "claude-sonnet-4-6".into(),
@@ -88,6 +89,7 @@ fn bind_outputs_typed_artifacts_not_raw_string_only() {
         stats: &stats,
     };
     let plan_input = PlanInput {
+        compaction_thresholds: Default::default(),
         tokens: &turn.tokens,
         model_limit: session.model_limit,
         pre_reserved_output_tokens: 0,

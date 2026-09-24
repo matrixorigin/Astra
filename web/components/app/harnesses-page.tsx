@@ -18,10 +18,12 @@ import {
   UploadCloud,
   X,
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useSearchParams } from 'next/navigation';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { listChats } from '@/lib/api/chats';
 import {
   createSkillifyRun,
+  getHarnessRun,
   decideSkillDraft,
   decideSkillRule,
   listHarnessNodeCatalog,
@@ -33,18 +35,20 @@ import type {
   ChatSummary,
   HarnessNodeCatalogItem,
   HarnessRun,
-  HarnessCitation,
   HarnessSkillDraft,
   HarnessSkillRule,
   HarnessTemplate,
   SkillifyPublishRecord,
+  SkillifyRunRequest,
 } from '@/lib/api/types';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { PageHeader } from '@/components/ui/page-header';
 import { Textarea } from '@/components/ui/textarea';
+import { RuleEvidence, SkillContentComparison, frozenSkillSources } from '@/components/app/skill-evidence';
 import { cn } from '@/lib/utils/cn';
+import { SkillUseAction } from '@/components/app/skill-use-action';
 
 type HarnessView = 'catalog' | 'skillify' | 'custom';
 type SkillifySourceFileInput = {
@@ -55,6 +59,8 @@ type SkillifySourceFileInput = {
 type RuleEditState = {
   statement: string;
   rationale: string;
+  content_markdown: string;
+  decision: 'edit' | 'reject';
 };
 
 function statusClass(status: string) {
@@ -93,27 +99,24 @@ function defaultCustomWorkflow() {
   ].join('\n');
 }
 
-function stringFromUnknown(value: unknown) {
-  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
-}
-
-function citationSourceLabel(citation: HarnessCitation) {
-  const locator = citation.source_locator_json ?? {};
-  return (
-    stringFromUnknown(locator.title) ??
-    stringFromUnknown(locator.file_name) ??
-    stringFromUnknown(locator.session_id) ??
-    stringFromUnknown(locator.source_id) ??
-    citation.source_id ??
-    'Unknown source'
-  );
-}
-
 function sourceCitationLabel(count: number) {
   return `${count} source citation${count === 1 ? '' : 's'}`;
 }
 
-export function HarnessesPage() {
+export function HarnessesPage({ ownerId, runtimeKey }: { ownerId: string; runtimeKey: string }) {
+  const params = useSearchParams();
+  const storageKey = `astra:harness:v1:${encodeURIComponent(ownerId)}:${encodeURIComponent(runtimeKey)}:${encodeURIComponent(params.get('runId') ?? '')}`;
+  return <HarnessSession key={storageKey} storageKey={storageKey} />;
+}
+
+function HarnessSession({ storageKey }: { storageKey: string }) {
+  const searchParams = useSearchParams();
+  const requestedRunId = searchParams.get('runId');
+  const requestedDraftId = searchParams.get('draftId');
+  const mounted = useRef(true);
+  const recoveryKey = useRef(storageKey);
+  const [pending, setPending] = useState<SkillifyRunRequest | null>(null);
+  const [recovering, setRecovering] = useState(true);
   const [view, setView] = useState<HarnessView>('catalog');
   const [templates, setTemplates] = useState<HarnessTemplate[]>([]);
   const [nodeCatalog, setNodeCatalog] = useState<HarnessNodeCatalogItem[]>([]);
@@ -167,6 +170,42 @@ export function HarnessesPage() {
     void loadInitial();
   }, [loadInitial]);
 
+  useEffect(() => {
+    let cancelled = false;
+    mounted.current = true;
+    let recovery: { pending?: SkillifyRunRequest; runId?: string } = {};
+    try {
+      recovery = JSON.parse(window.localStorage.getItem(storageKey) ?? '{}');
+    } catch { /* An explicit authorized result link remains usable without storage. */ }
+    if (recovery.pending) {
+      setPending(recovery.pending); setView('skillify'); setRecovering(false);
+      return () => { mounted.current = false; };
+    }
+    const reference = requestedRunId ?? recovery.runId;
+    if (!reference) {
+      setRecovering(false);
+      return () => { mounted.current = false; };
+    }
+    setView('skillify');
+    setBusy(true);
+    setError(null);
+    setRun(null);
+    setSkillDrafts([]);
+    setPublished([]);
+    void Promise.all([getHarnessRun(reference), listSkillDrafts(reference)])
+      .then(([existingRun, drafts]) => {
+        if (cancelled) return;
+        setRun(existingRun);
+        setSkillDrafts(drafts);
+        setActiveDraftId(drafts.find((draft) => draft.skill_draft_id === requestedDraftId)?.skill_draft_id ?? drafts[0]?.skill_draft_id ?? null);
+      })
+      .catch((reason) => {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : 'Failed to load the candidate.');
+      })
+      .finally(() => { if (!cancelled) { setBusy(false); setRecovering(false); } });
+    return () => { cancelled = true; mounted.current = false; };
+  }, [requestedRunId, requestedDraftId, storageKey]);
+
   const refreshDrafts = useCallback(async (runId: string) => {
     const drafts = await listSkillDrafts(runId);
     setSkillDrafts(drafts);
@@ -195,27 +234,46 @@ export function HarnessesPage() {
   const startSkillify = useCallback(async () => {
     setError(null);
     setPublished([]);
-    if (selected.length === 0 && sourceFiles.length === 0) {
+    if (!pending && selected.length === 0 && sourceFiles.length === 0) {
       setError('Select at least one session or text file.');
       return;
     }
     setBusy(true);
     try {
-      const created = await createSkillifyRun({
+      const request = pending ?? {
+        idempotency_key: crypto.randomUUID(),
         session_ids: selected,
         source_files: sourceFiles,
         skill_name: skillName.trim() || null,
         topic: topic.trim() || null,
-        target_scope: 'personal',
-      });
+        target_scope: 'personal' as const,
+      };
+      window.localStorage.setItem(recoveryKey.current, JSON.stringify({ pending: request }));
+      setPending(request);
+      const created = await createSkillifyRun(request);
+      if (!mounted.current) return;
       setRun(created);
+      if (created.status === 'running') {
+        setError('原生成任务仍在执行；稍后恢复同一任务以读取结果。');
+        return;
+      }
+      const reference = JSON.stringify({ runId: created.harness_run_id });
+      const nextKey = `${storageKey.slice(0, storageKey.lastIndexOf(':') + 1)}${encodeURIComponent(created.harness_run_id)}`;
+      window.localStorage.setItem(recoveryKey.current, reference);
+      window.localStorage.setItem(nextKey, reference);
+      recoveryKey.current = nextKey;
+      setPending(null);
+      const url = new URL(window.location.href);
+      url.searchParams.set('runId', created.harness_run_id);
+      url.searchParams.delete('draftId');
+      window.history.replaceState(null, '', url);
       await refreshDrafts(created.harness_run_id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to start Skillify.');
+      if (mounted.current) setError(err instanceof Error ? err.message : 'Failed to start Skillify.');
     } finally {
       setBusy(false);
     }
-  }, [refreshDrafts, selected, skillName, sourceFiles, topic]);
+  }, [refreshDrafts, selected, skillName, sourceFiles, topic, pending, storageKey]);
 
   const decideRule = useCallback(async (
     draft: HarnessSkillDraft,
@@ -229,6 +287,7 @@ export function HarnessesPage() {
     setError(null);
     try {
       const updated = await decideSkillRule(run.harness_run_id, draft.skill_draft_id, rule.skill_rule_id, {
+        expected_revision: draft.revision,
         decision,
         reason: decision === 'approve' ? 'Approved rule from Skillify review UI.' : 'Rejected rule from Skillify review UI.',
       });
@@ -258,8 +317,9 @@ export function HarnessesPage() {
     setError(null);
     try {
       const updated = await decideSkillRule(run.harness_run_id, draft.skill_draft_id, rule.skill_rule_id, {
-        decision: 'edit',
-        after_json: { statement, rationale },
+        expected_revision: draft.revision,
+        decision: edit.decision,
+        after_json: { statement, rationale, content_markdown: edit.content_markdown },
         reason: 'Edited rule from Skillify review UI.',
       });
       setSkillDrafts((current) => current.map((entry) => (entry.skill_draft_id === updated.skill_draft_id ? updated : entry)));
@@ -280,6 +340,7 @@ export function HarnessesPage() {
     setError(null);
     try {
       const updated = await decideSkillDraft(run.harness_run_id, draft.skill_draft_id, {
+        expected_revision: draft.revision,
         decision,
         reason: decision === 'approve' ? 'Approved skill from Skillify review UI.' : 'Rejected skill from Skillify review UI.',
       });
@@ -304,6 +365,7 @@ export function HarnessesPage() {
     setError(null);
     try {
       const updated = await decideSkillDraft(run.harness_run_id, draft.skill_draft_id, {
+        expected_revision: draft.revision,
         decision: 'edit',
         after_json: { content_markdown },
         reason: 'Edited skill content from Skillify review UI.',
@@ -326,8 +388,8 @@ export function HarnessesPage() {
     setError(null);
     try {
       const record = await publishSkillDraft(run.harness_run_id, draft.skill_draft_id, {
+        expected_revision: draft.revision,
         visibility,
-        version: '0.1.0',
       });
       setPublished((current) => [...current, record]);
       await refreshDrafts(run.harness_run_id);
@@ -392,13 +454,21 @@ export function HarnessesPage() {
           </div>
         ) : null}
 
+        {pending ? <div role="status" className="rounded-card border p-4">
+          已保留原始生成请求。重试会恢复同一次生成，不会使用下面修改后的来源。
+          <Button disabled={busy} onClick={startSkillify}>恢复原生成任务</Button>
+          <Button disabled={busy} onClick={() => {
+            try { window.localStorage.removeItem(recoveryKey.current); setPending(null); }
+            catch { setError('无法清除浏览器恢复记录'); }
+          }}>放弃恢复并新建任务</Button>
+        </div> : null}
         {view === 'catalog' ? (
           <CatalogView templates={templates} onOpenTemplate={openTemplate} onOpenCustom={() => setView('custom')} />
         ) : null}
 
         {view === 'skillify' ? (
           <SkillifyView
-            busy={busy}
+            busy={busy || recovering || !!pending}
             sessions={sessions}
             selected={selected}
             sourceFiles={sourceFiles}
@@ -605,6 +675,7 @@ function SkillifyView({
   const [ruleEdits, setRuleEdits] = useState<Record<string, RuleEditState>>({});
   const activeDraftKey = activeDraft?.skill_draft_id ?? null;
   const isEditingDraft = activeDraftKey !== null && editingDraftId === activeDraftKey;
+  const evaluatedRevision = (run?.output_json?.authoring as { evaluated_draft_revision?: number } | undefined)?.evaluated_draft_revision;
   const readyDrafts = skillDrafts.filter((draft) => draft.status === 'ready_to_publish');
 
   useEffect(() => {
@@ -632,21 +703,23 @@ function SkillifyView({
     }
   }, [activeDraft, draftMarkdown, onEditDraft]);
 
-  const startRuleEdit = useCallback((rule: HarnessSkillRule) => {
+  const startRuleEdit = useCallback((rule: HarnessSkillRule, decision: 'edit' | 'reject' = 'edit') => {
     setRuleEdits((current) => ({
       ...current,
       [rule.skill_rule_id]: {
         statement: rule.statement,
         rationale: rule.rationale,
+        content_markdown: activeDraft?.content_markdown ?? '',
+        decision,
       },
     }));
-  }, []);
+  }, [activeDraft]);
 
-  const updateRuleEdit = useCallback((ruleId: string, field: keyof RuleEditState, value: string) => {
+  const updateRuleEdit = useCallback((ruleId: string, field: 'statement' | 'rationale' | 'content_markdown', value: string) => {
     setRuleEdits((current) => ({
       ...current,
       [ruleId]: {
-        ...(current[ruleId] ?? { statement: '', rationale: '' }),
+        ...(current[ruleId] ?? { statement: '', rationale: '', content_markdown: '', decision: 'edit' as const }),
         [field]: value,
       },
     }));
@@ -874,11 +947,14 @@ function SkillifyView({
                 </div>
               ) : null}
 	              {isEditingDraft ? (
+                <>
 	                <Textarea
 	                  value={draftMarkdown}
 	                  onChange={(event) => setDraftMarkdown(event.target.value)}
 	                  className="mt-4 min-h-[620px] font-mono text-xs"
 	                />
+                  <SkillContentComparison before={activeDraft?.content_markdown ?? ''} after={draftMarkdown} />
+                </>
 	              ) : (
 	                <pre className="mt-4 max-h-[620px] overflow-auto whitespace-pre-wrap rounded-control border border-border bg-bg p-4 text-xs text-text-secondary">
 	                  {activeDraft?.content_markdown ?? ''}
@@ -911,7 +987,9 @@ function SkillifyView({
                       </Button>
                     </div>
                   </div>
-	                  <div className="mt-3 space-y-3">
+	                  {evaluatedRevision !== undefined && activeDraft.revision !== evaluatedRevision ?
+                    <p className="my-3 text-sm text-warning">正文已修改。先前评估仅适用于生成时的版本，不代表当前发布内容。</p> : null}
+                  <div className="mt-3 space-y-3">
 	                    {activeDraft.rules.map((rule) => {
 	                      const ruleEdit = ruleEdits[rule.skill_rule_id];
 	                      return (
@@ -923,11 +1001,7 @@ function SkillifyView({
 	                          <span className="rounded-full border border-border bg-surface px-2 py-0.5 text-xs text-text-secondary">
 	                            {rule.rule_type}
 	                          </span>
-                          {rule.confidence !== null ? (
-                            <span className="text-xs text-text-muted">
-                              confidence {Math.round(rule.confidence * 100)}%
-                            </span>
-	                            ) : null}
+
 	                          </div>
 	                          {ruleEdit ? (
 	                            <div className="mt-3 space-y-2">
@@ -943,6 +1017,10 @@ function SkillifyView({
 	                                className="min-h-20 text-xs"
 	                                aria-label="Rule rationale"
 	                              />
+                              <p className="text-xs text-warning">请同时审阅完整正文；系统不会根据规则重写其他内容。</p>
+                              <Textarea aria-label="Revised skill content" value={ruleEdit.content_markdown}
+                                onChange={(event) => updateRuleEdit(rule.skill_rule_id, 'content_markdown', event.target.value)} rows={10} />
+                              <SkillContentComparison before={activeDraft.content_markdown} after={ruleEdit.content_markdown} />
 	                            </div>
 	                          ) : (
 	                            <>
@@ -956,21 +1034,7 @@ function SkillifyView({
 	                            </div>
                           {rule.citations.length ? (
                             <div className="space-y-2">
-                              {rule.citations.map((citation) => (
-                                <div
-                                  key={citation.citation_id}
-                                  className="rounded-control border border-border bg-surface px-2.5 py-2"
-                                >
-                                  <div className="text-xs font-medium text-text-secondary">
-                                    {citationSourceLabel(citation)}
-                                  </div>
-                                  {citation.evidence_text_preview ? (
-                                    <p className="mt-1 text-xs leading-relaxed text-text-muted">
-                                      {citation.evidence_text_preview}
-                                    </p>
-                                  ) : null}
-                                </div>
-                              ))}
+                              <RuleEvidence citations={rule.citations} sources={run ? frozenSkillSources(run) : []} />
                             </div>
 	                          ) : (
 	                            <p className="text-xs text-text-muted">No citation details returned.</p>
@@ -1011,7 +1075,7 @@ function SkillifyView({
 	                                size="sm"
 	                                variant="ghost"
 	                                leadingIcon={X}
-	                                onClick={() => onDecideRule(activeDraft, rule, 'reject')}
+	                                onClick={() => startRuleEdit(rule, 'reject')}
 	                                disabled={busy || rule.status === 'rejected' || activeDraft.status === 'published'}
 	                              >
 	                                Reject
@@ -1035,11 +1099,15 @@ function SkillifyView({
                 </Card>
               ) : null}
 
+                  {activeDraft?.published_version_id && run ? <Card>
+                    <p>{activeDraft.candidate_name} 已保存为个人 Skill</p>
+                    <SkillUseAction key={activeDraft.published_version_id} run={run} skillName={activeDraft.candidate_name} versionId={activeDraft.published_version_id} />
+                  </Card> : null}
 	              {activeDraft ? (
 	                <Card>
 	                  <div>
-	                    <h2 className="text-base font-semibold">Publish Queue</h2>
-	                    <p className="mt-1 text-sm text-text-secondary">Approved skills can be published privately or publicly.</p>
+	                    <h2 className="text-base font-semibold">保存已审核的 Skill</h2>
+	                    <p className="mt-1 text-sm text-text-secondary">保存后可在来源会话中明确启用新版本。</p>
 	                  </div>
 	                  {readyDrafts.length ? (
 	                    <div className="mt-3 space-y-2">
@@ -1061,15 +1129,7 @@ function SkillifyView({
 	                            >
 	                              Private
 	                            </Button>
-	                            <Button
-	                              size="sm"
-	                              variant="ghost"
-	                              leadingIcon={UploadCloud}
-	                              onClick={() => onPublishDraft(draft, 'public')}
-	                              disabled={busy}
-	                            >
-	                              Public
-	                            </Button>
+
 	                          </div>
 	                        </div>
 	                      ))}

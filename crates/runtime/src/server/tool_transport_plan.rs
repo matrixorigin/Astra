@@ -24,6 +24,7 @@ pub(crate) struct EdgeBoundExecutionPlan {
     identity: astra_turn_types::ToolInvocationIdentity,
     tool_name: String,
     args: Value,
+    evaluation_allocation: Option<astra_runtime_env::EvaluationAllocationReceipt>,
     timeout_secs: u64,
     workspace: WorkspaceBinding,
     executor: ExecutorBinding,
@@ -60,12 +61,29 @@ impl EdgeBoundExecutionPlan {
             &request.turn_chain_id,
             &request.tool_call_id,
         )?;
+        let mut args = request.args.clone();
+        if let Some(workspace_dir) = request.workspace.cwd.as_deref()
+            && let Some(object) = args.as_object_mut()
+        {
+            // The workspace root is server-authored binding state, not a
+            // model argument. It travels inside the durable Edge envelope so
+            // replayed invocations execute in the exact trial clone selected
+            // by canonical admission; the Edge strips it before tool code.
+            object.insert(
+                "__astra_workspace_dir".to_string(),
+                Value::String(workspace_dir.to_string()),
+            );
+        }
         Ok(Self {
             selected_executor_id: edge_executor_id(request).map(ToString::to_string),
             dispatch_request_id: identity.storage_key(),
             identity,
             tool_name: request.tool_name.clone(),
-            args: request.args.clone(),
+            args,
+            evaluation_allocation: request
+                .evaluation_workspace
+                .as_ref()
+                .map(|workspace| workspace.allocation.clone()),
             timeout_secs: Self::DEFAULT_TIMEOUT_SECS,
             workspace: request.workspace.clone(),
             executor: request.executor.clone(),
@@ -87,8 +105,18 @@ impl EdgeBoundExecutionPlan {
         &self.dispatch_request_id
     }
 
+    pub(crate) fn args(&self) -> &Value {
+        &self.args
+    }
+
     pub(crate) fn identity(&self) -> &astra_turn_types::ToolInvocationIdentity {
         &self.identity
+    }
+
+    pub(crate) fn evaluation_allocation(
+        &self,
+    ) -> Option<&astra_runtime_env::EvaluationAllocationReceipt> {
+        self.evaluation_allocation.as_ref()
     }
 
     pub(crate) fn runtime_process_authorization(
@@ -123,6 +151,7 @@ impl EdgeBoundExecutionPlan {
 
     fn dispatch_message(&self) -> astra_server_types::edge_ws_protocol::EdgeServerMessage {
         astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
+            evaluation_allocation: self.evaluation_allocation.clone().map(Box::new),
             request_id: self.dispatch_request_id.clone(),
             identity: Box::new(self.identity.clone()),
             delivery_generation: 1,

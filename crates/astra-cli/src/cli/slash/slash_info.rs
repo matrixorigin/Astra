@@ -1719,7 +1719,7 @@ pub(crate) async fn handle_info_command(
                 .collect();
             let history_tokens = prompts::estimate_tokens(&est_messages, 0, 0);
             let budget = &state.context_budget;
-            let limit = budget.model_limit;
+            let limit = budget.model_limit();
             let usage_pct = if limit > 0 {
                 (history_tokens as f64 / limit as f64 * 100.0).min(100.0)
             } else {
@@ -2428,11 +2428,6 @@ pub(crate) fn render_whoami(state: &SessionState) -> String {
     let session = state.session_id.as_deref().unwrap_or("<none>");
     let model = state.model.as_deref().unwrap_or("<unset>");
     let skills = state.unified_skill_registry.len();
-    let pending = state
-        .skill_improvement_tracker
-        .pending_proposal
-        .as_ref()
-        .map(|p| p.skill_name.as_str());
     let recent_tools = if state.recent_tools.is_empty() {
         "<none>".to_string()
     } else {
@@ -2451,14 +2446,6 @@ pub(crate) fn render_whoami(state: &SessionState) -> String {
     let _ = writeln!(out, "  turn           : {}", state.turn);
     let _ = writeln!(out, "  exchanges      : {}", state.history.len());
     let _ = writeln!(out, "  skills_loaded  : {skills}");
-    match pending {
-        Some(name) => {
-            let _ = writeln!(out, "  pending_improve: {name}");
-        }
-        None => {
-            let _ = writeln!(out, "  pending_improve: <none>");
-        }
-    }
     let _ = writeln!(out, "  recent_tools   : {recent_tools}");
     out
 }
@@ -2485,22 +2472,7 @@ pub(crate) fn render_cognition(state: &SessionState) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let pending = state
-        .skill_improvement_tracker
-        .pending_proposal
-        .as_ref()
-        .map(|p| {
-            format!(
-                "{} ({} change{})",
-                p.skill_name,
-                p.improvements.len(),
-                if p.improvements.len() == 1 { "" } else { "s" }
-            )
-        })
-        .unwrap_or_else(|| "<none>".to_string());
-
     let _ = writeln!(out, "  recent_tools     : {recent_tools}");
-    let _ = writeln!(out, "  pending_proposal : {pending}");
     let _ = writeln!(
         out,
         "  skills_registered: {}",
@@ -2743,22 +2715,6 @@ mod tests {
         assert!(out.contains("turn           : 3"), "got: {out}");
         assert!(out.contains("exchanges      : 1"), "got: {out}");
         assert!(out.contains("skills_loaded"), "got: {out}");
-        assert!(out.contains("pending_improve: <none>"), "got: {out}");
-    }
-
-    #[test]
-    fn render_whoami_surfaces_pending_improvement_proposal() {
-        let mut state = SessionState::default();
-        state.set_session_id("s");
-        state
-            .skill_improvement_tracker
-            .propose(astra_skills::improvement::ImprovementProposal {
-                skill_name: "git-flow".into(),
-                skill_path: std::path::PathBuf::from("/tmp/git-flow"),
-                improvements: vec![],
-            });
-        let out = render_whoami(&state);
-        assert!(out.contains("pending_improve: git-flow"), "got: {out}");
     }
 
     #[test]
@@ -2770,7 +2726,6 @@ mod tests {
             out.contains("recent_tools     : bash, read_file"),
             "got: {out}"
         );
-        assert!(out.contains("pending_proposal : <none>"), "got: {out}");
         assert!(out.contains("skills_registered"), "got: {out}");
     }
 

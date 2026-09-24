@@ -168,6 +168,7 @@ mod tests {
                     thinking_capability: None,
                     context_window: Some(128_000),
                     max_completion_tokens: Some(16_384),
+                    pricing: None,
                     request_headers: Some(serde_json::Map::from_iter([(
                         "x-model-mode".into(),
                         Value::String("coding".into()),

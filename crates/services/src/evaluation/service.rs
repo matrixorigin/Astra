@@ -12,11 +12,6 @@ pub trait EvaluationService: Send + Sync {
         model: Option<&str>,
     ) -> ServiceResult<QualityTrendResponse>;
     async fn detect_drift(&self, user_id: &str) -> ServiceResult<DriftDetectResponse>;
-    async fn get_gate_history(
-        &self,
-        user_id: &str,
-        limit: i32,
-    ) -> ServiceResult<GateHistoryResponse>;
     async fn get_calibration(
         &self,
         user_id: &str,
@@ -34,18 +29,6 @@ pub trait EvaluationService: Send + Sync {
         user_id: &str,
         request: SessionQualityAssessmentRequest,
     ) -> ServiceResult<()>;
-    async fn validate_gate(
-        &self,
-        user_id: &str,
-        request: GateValidateRequest,
-    ) -> ServiceResult<GateValidateResponse>;
-    async fn run_drift_pipeline(&self, user_id: &str) -> ServiceResult<DriftPipelineResponse>;
-    async fn run_closed_loop(
-        &self,
-        user_id: &str,
-        days: i32,
-        dry_run: bool,
-    ) -> ServiceResult<ClosedLoopResponse>;
     async fn trust_report(
         &self,
         user_id: &str,

@@ -716,7 +716,7 @@ impl IntrospectionService for DatabaseIntrospectionService {
              FROM skill_installations i \
              LEFT JOIN skills_registry r \
                  ON r.skill_name = i.skill_name AND r.version = i.skill_version AND r.is_active = 1 \
-             WHERE i.user_id = ? AND i.status = 'installed' LIMIT 50",
+             WHERE i.user_id = ? LIMIT 50",
         )
         .bind(user_id)
         .fetch_all(&pool)

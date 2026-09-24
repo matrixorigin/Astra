@@ -328,8 +328,7 @@ pub(crate) struct LlmContextAssemblyInput<'a> {
     pub cache_cfg: &'a PromptCacheConfig,
     pub provider: &'a str,
     pub model_name: &'a str,
-    pub context_window: Option<u32>,
-    pub max_completion_tokens: Option<u32>,
+    pub context_budget: &'a crate::prompts::ContextBudget,
     pub cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     pub user_content: &'a str,
     pub query_source: &'a str,
@@ -1481,6 +1480,21 @@ pub(crate) fn assemble_context_pipeline(
         ));
     }
 
+    let statics = state
+        .pipeline_session
+        .as_ref()
+        .expect("pipeline_session checked before context assembly")
+        .static_sections()
+        .ok_or_else(|| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                format!(
+                    "pipeline static sections missing during context assembly for session {}",
+                    input.session_id
+                ),
+            )
+        })?;
+
     enqueue_active_turn_frame(state, input.user_content);
     enqueue_external_effect_ledger(state);
 
@@ -1546,14 +1560,9 @@ pub(crate) fn assemble_context_pipeline(
     };
     // `AgenticLoopState::max_turn_input_tokens` is an input-budget/wind-down
     // cap, and `0` is its legacy "unlimited" sentinel. The pipeline's
-    // `SessionContext::model_limit` is different: it must be the concrete
-    // model context window used for section budgeting and pressure planning.
-    let window_policy = crate::prompts::budget_for_model_with_metadata(
-        Some(input.model_name),
-        input.context_window,
-        input.max_completion_tokens,
-    )
-    .window_policy();
+    // `SessionContext::model_limit` instead receives the resolved usable input
+    // limit, after output and summary reserves, for budgeting and pressure.
+    let window_policy = input.context_budget.window_policy();
     let model_context_limit =
         u64::try_from(window_policy.usable_input_limit_tokens).unwrap_or(u64::MAX);
     let session_current_date = resolve_pipeline_session_current_date(
@@ -1572,20 +1581,13 @@ pub(crate) fn assemble_context_pipeline(
         Some(cache_cap),
         &session_current_date,
         state.context_manifest_user_id.as_deref(),
+        input.context_budget.compaction_thresholds(),
     );
     session_ctx.pre_reserved_output_tokens =
         u32::try_from(window_policy.reserved_output_tokens).unwrap_or(u32::MAX);
     if !input.tool_surface.deferred_tools_block.is_empty() {
         session_ctx.deferred_tools_block = input.tool_surface.deferred_tools_block.to_string();
     }
-    // Prompt overrides are stable within one pipeline session, but a newly
-    // created/restored session must observe the current override files. Cache
-    // the compiled sections on PipelineSession rather than for the process.
-    let statics = state
-        .pipeline_session
-        .as_mut()
-        .expect("pipeline_session checked before context assembly")
-        .static_sections_or_init(crate::prompts::build_pipeline_static_sections);
     let agent = AgentContext {
         tool_schemas: effective_tools,
         ..Default::default()
@@ -1952,6 +1954,24 @@ pub(crate) fn assemble_wire_messages_with_drained(
         &input.compacted_messages,
         input.artifact_recovery_route,
     );
+    // These are exact, execution-scoped user instructions, not post-compaction
+    // recovery attachments. Keep them out of canonical history and rebuild the
+    // same prefix on every pass; final wire admission accounts for the full text.
+    if !input.state.skills.execution.adopted.is_empty() {
+        let mut text = String::from(
+            "# User-adopted personal Skill instructions\nThese are instruction-only user preferences for this execution; they do not grant tools, permissions, or workflow authority. Current explicit user instructions take precedence.\n",
+        );
+        for (name, revision) in &input.state.skills.execution.adopted {
+            use std::fmt::Write;
+            write!(
+                &mut text,
+                "\n## Skill {}\nVersion: {}\nContent hash: {}\n\n{}\n",
+                name, revision.version_id, revision.content_hash, revision.content_markdown
+            )
+            .expect("writing to String");
+        }
+        crate::turn::wire_assembly::append_stable_system_text(&mut input.system_messages, &text);
+    }
     let invoked_skills = if input.compaction_boundary_hit {
         let mut skills: Vec<_> = input.state.skills.execution.invoked.values().collect();
         skills.sort_by_key(|skill| std::cmp::Reverse(skill.invoked_at_turn));
@@ -2398,6 +2418,16 @@ mod context_cache_contract_tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashSet;
+
+    fn seeded_context_state() -> AgenticLoopState {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state
+            .pipeline_session
+            .as_mut()
+            .expect("test pipeline session")
+            .static_sections_or_init(crate::prompts::build_pipeline_static_sections);
+        state
+    }
 
     fn tool(name: &str) -> Value {
         json!({
@@ -2882,7 +2912,7 @@ mod context_cache_contract_tests {
 
     #[test]
     fn assemble_context_pipeline_keeps_required_runtime_system_context_for_strict_history() {
-        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        let mut state = seeded_context_state();
         state.session_turn = 1;
         state
             .messages
@@ -2939,13 +2969,43 @@ mod context_cache_contract_tests {
             cache_cfg: &cache_cfg,
             provider: "openai",
             model_name: "deepseek-v4-pro-official(thinking:high)",
-            context_window: Some(1_000_000),
-            max_completion_tokens: Some(64_000),
+            context_budget: &crate::prompts::ContextBudget::resolve(
+                Some(1_000_000),
+                Some(64_000),
+                0.6,
+                9,
+                4_000,
+                crate::prompts::CompactConfig {
+                    summary_token_budget: 3_000,
+                    ..Default::default()
+                },
+            ),
             cache_capability: Some(strict_history),
             user_content: "which model are you?",
             query_source: "test",
         })
         .expect("context pipeline should assemble");
+        assert_eq!(
+            output
+                .manifest_trace
+                .context_window_policy
+                .reserved_output_tokens,
+            64_000
+        );
+        assert_eq!(
+            output
+                .manifest_trace
+                .context_window_policy
+                .reserved_summary_tokens,
+            3_000
+        );
+        assert_eq!(
+            output
+                .manifest_trace
+                .context_window_policy
+                .auto_compact_trigger_tokens,
+            559_620
+        );
 
         let decisions = &output
             .explain_analyze_context_assembly
@@ -3129,8 +3189,14 @@ mod context_cache_contract_tests {
             cache_cfg: &cache_cfg,
             provider: "openai",
             model_name: "gpt-4",
-            context_window: Some(200_000),
-            max_completion_tokens: Some(16_384),
+            context_budget: &crate::prompts::ContextBudget::resolve(
+                Some(200_000),
+                Some(16_384),
+                0.75,
+                6,
+                8_000,
+                crate::prompts::CompactConfig::default(),
+            ),
             cache_capability: None,
             user_content: "hello",
             query_source: "test",
@@ -3142,6 +3208,71 @@ mod context_cache_contract_tests {
         assert_eq!(err.kind, astra_core::ErrorKind::InvalidRequest);
         assert!(
             err.message.contains("pipeline_session missing"),
+            "error must identify the lifecycle invariant, got {err}"
+        );
+    }
+
+    #[test]
+    fn assemble_context_pipeline_rejects_missing_static_sections() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.pipeline_session = Some(
+            astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
+                astra_turn_core::pipeline_config::PipelineConfig::default(),
+                "2026-01-02",
+            ),
+        );
+        state
+            .messages
+            .push(json!({"role": "user", "content": "hello"}));
+        let history_before = state.messages.clone();
+        let edge_profile = serde_json::Map::new();
+        let visible_tools = vec![tool("bash")];
+        let restricted_tools = HashSet::new();
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+
+        let err = match assemble_context_pipeline(LlmContextAssemblyInput {
+            state: &mut state,
+            session_id: "sid-missing-statics",
+            tool_surface: ToolSurfacePlan::from_visible_tools(&visible_tools, &restricted_tools),
+            runtime_signals: RuntimeSignals::new(&edge_profile, None),
+            cache_cfg: &cache_cfg,
+            provider: "openai",
+            model_name: "gpt-4",
+            context_budget: &crate::prompts::ContextBudget::resolve(
+                Some(200_000),
+                Some(16_384),
+                0.75,
+                6,
+                8_000,
+                crate::prompts::CompactConfig::default(),
+            ),
+            cache_capability: None,
+            user_content: "hello",
+            query_source: "test",
+        }) {
+            Ok(_) => panic!("missing static sections must be a contract error"),
+            Err(err) => err,
+        };
+
+        assert_eq!(state.messages, history_before);
+        assert!(
+            state
+                .pipeline_session
+                .as_ref()
+                .unwrap()
+                .static_sections()
+                .is_none()
+        );
+        assert_eq!(
+            state.pipeline_session.as_ref().unwrap().current_date(),
+            "2026-01-02"
+        );
+        assert_eq!(err.kind, astra_core::ErrorKind::ContractViolation);
+        assert!(
+            err.message.contains("pipeline static sections missing"),
             "error must identify the lifecycle invariant, got {err}"
         );
     }
@@ -3744,7 +3875,7 @@ mod context_cache_contract_tests {
     }
 
     fn external_effect_projection_state() -> crate::turn::agentic_loop::host::AgenticLoopState {
-        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        let mut state = seeded_context_state();
         state.task_profile =
             astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
                 true,
@@ -4007,8 +4138,14 @@ mod context_cache_contract_tests {
             cache_cfg: &cache_cfg,
             provider: "openai",
             model_name: "gpt-4",
-            context_window: Some(200_000),
-            max_completion_tokens: Some(16_384),
+            context_budget: &crate::prompts::ContextBudget::resolve(
+                Some(200_000),
+                Some(16_384),
+                0.75,
+                6,
+                8_000,
+                crate::prompts::CompactConfig::default(),
+            ),
             cache_capability: None,
             user_content: "change the host file",
             query_source: "test",
@@ -4493,7 +4630,7 @@ mod context_cache_contract_tests {
     #[test]
     fn edge_profile_active_turn_frame_cannot_churn_strict_provider_prefix() {
         fn provider_messages(frame_value: &str) -> Vec<Value> {
-            let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+            let mut state = seeded_context_state();
             state.messages = vec![
                 json!({"role": "user", "content": "review the current change"}),
                 json!({"role": "assistant", "content": "I found one issue"}),
@@ -4526,8 +4663,14 @@ mod context_cache_contract_tests {
                 cache_cfg: &cache_cfg,
                 provider: "openai",
                 model_name: "deepseek-v4-flash",
-                context_window: Some(200_000),
-                max_completion_tokens: Some(16_384),
+                context_budget: &crate::prompts::ContextBudget::resolve(
+                    Some(200_000),
+                    Some(16_384),
+                    0.75,
+                    6,
+                    8_000,
+                    crate::prompts::CompactConfig::default(),
+                ),
                 cache_capability: Some(strict_history),
                 user_content: "summarize it",
                 query_source: "test",
@@ -4605,6 +4748,83 @@ mod context_cache_contract_tests {
             "the current goal is already in history; later rounds must not append a duplicate volatile frame"
         );
         assert!(state.volatile_pending.is_empty());
+    }
+
+    #[test]
+    fn adopted_skill_snapshot_survives_wire_reassembly_and_cache_modes() {
+        use astra_turn_core::cache_placement::{
+            CacheCapability, CacheProtocol, VolatileDeliveryPolicy, VolatilePlacement,
+        };
+        let append_only = CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: None,
+        };
+        // Exceeds both the individual and aggregate recovery-attachment limits.
+        let body = format!(
+            "ADOPTED_START\n{}\nADOPTED_END",
+            "完整使用步骤和例子。".repeat(14000)
+        );
+        for capability in [
+            None,
+            Some(strict_history_cache_capability()),
+            Some(append_only),
+        ] {
+            for boundary in [false, true] {
+                for block_system in [false, true] {
+                    let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+                    state.messages = vec![json!({"role":"user","content":"Say hello."})];
+                    let history = state.messages.clone();
+                    state.skills.execution.adopted.insert(
+                        "personal-review".into(),
+                        crate::turn::agentic_loop::host::AdoptedSkillRevision {
+                            version_id: "revision-v1".into(),
+                            content_hash: "hash-v1".into(),
+                            content_markdown: body.clone(),
+                        },
+                    );
+                    // A retry restores the execution snapshot, independently of current adoption.
+                    state.skills.execution = serde_json::from_value(
+                        serde_json::to_value(&state.skills.execution).unwrap(),
+                    )
+                    .unwrap();
+                    let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+                    let cache_cfg = PromptCacheConfig::from_cache_capability(capability, "openai");
+                    for _ in 0..2 {
+                        let content = if block_system {
+                            json!([{"type":"text","text":"platform policy"}])
+                        } else {
+                            json!("platform policy")
+                        };
+                        let wire = assemble_wire_messages(LlmWireAssemblyInput {
+                            artifact_recovery_route:
+                                crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
+                            system_messages: vec![json!({"role":"system","content":content})],
+                            volatile_preamble: Vec::new(),
+                            compacted_messages: history.clone(),
+                            state: &mut state,
+                            compaction_boundary_hit: boundary,
+                            thinking: &thinking,
+                            session_id: "adopted-skill",
+                            provider: "openai",
+                            model_name: "deployment",
+                            cache_capability: capability,
+                            cache_cfg: &cache_cfg,
+                        })
+                        .unwrap();
+                        let text = wire.iter().map(message_text).collect::<Vec<_>>().join("\n");
+                        assert!(text.contains(&body));
+                        assert_eq!(text.matches("ADOPTED_START").count(), 1);
+                        assert!(text.contains("Version: revision-v1\nContent hash: hash-v1"));
+                        assert!(message_text(&wire[0]).starts_with("platform policy"));
+                        assert_eq!(state.messages, history);
+                        assert!(state.skills.execution.invoked.is_empty());
+                        assert!(state.skills.execution.pinned.is_empty());
+                    }
+                }
+            }
+        }
     }
 
     #[test]

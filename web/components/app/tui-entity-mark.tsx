@@ -1,6 +1,6 @@
 import { cn } from '@/lib/utils/cn';
 
-type TuiEntityMarkKind = 'chat' | 'now' | 'work' | 'project' | 'search' | 'harness' | 'new';
+type TuiEntityMarkKind = 'chat' | 'now' | 'work' | 'project' | 'search' | 'harness' | 'evaluation' | 'new';
 
 const MARKS: Record<TuiEntityMarkKind, string> = {
   chat: 'C',
@@ -9,6 +9,7 @@ const MARKS: Record<TuiEntityMarkKind, string> = {
   project: 'P',
   search: 'S',
   harness: 'H',
+  evaluation: 'E',
   new: '+',
 };
 

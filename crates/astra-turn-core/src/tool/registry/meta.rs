@@ -746,6 +746,27 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         schema_tokens: 30,
     },
     ToolMeta {
+        name: "skill_creator",
+        description: "Create or improve a private Skill candidate from a natural-language goal.",
+        triggers: &[
+            "create skill",
+            "improve skill",
+            "skill creator",
+            "生成技能",
+            "优化技能",
+        ],
+        intents: &[IntentType::CodeEdit],
+        scope: Scope::External,
+        requires: &[Capability::SkillsCatalog],
+        // Let an unconfigured CLI reach its transport adapter so it can return
+        // the actionable authentication/session error. The adapter still
+        // refuses to perform any authoring operation without the server
+        // binding, and the public schema remains hidden until that binding is
+        // ready.
+        binding_validation: RuntimeBindingValidation::ActionAllowlist(&[""]),
+        schema_tokens: 45,
+    },
+    ToolMeta {
         name: "enter_plan_mode",
         description: "Switch the runtime into plan-authoring mode. Server-owned state machine.",
         triggers: &["plan", "enter plan mode"],

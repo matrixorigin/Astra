@@ -17,7 +17,7 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::prompts::{CompactConfig, CompactionTier};
+use crate::prompts::CompactionTier;
 use crate::turn::cloud::compaction::CompactResult;
 use crate::turn::cloud::memoria_compact::{
     MemoriaCompactConfig, MemoriaCompactParams, MemoriaPort, compact_with_memoria,
@@ -332,12 +332,10 @@ pub(crate) fn set_manifest_wire_budget(trace: &mut Value, status: WireBudgetStat
     trace["wire"]["budget"] = status.to_json();
 }
 
-pub(crate) fn wire_budget_status_with_metadata(
+pub(crate) fn wire_budget_status(
     messages: &[Value],
     tools: &[Value],
-    model_name: &str,
-    context_window: Option<u32>,
-    max_completion_tokens: Option<u32>,
+    budget: &crate::prompts::ContextBudget,
     requested_output_tokens: usize,
 ) -> WireBudgetStatus {
     let tool_tokens = tools
@@ -351,11 +349,6 @@ pub(crate) fn wire_budget_status_with_metadata(
         .map(|tokens| tokens.saturating_add(crate::prompts::PER_MESSAGE_OVERHEAD))
         .sum();
     let estimated_input_tokens = crate::prompts::estimate_wire_input_tokens(messages, tool_tokens);
-    let budget = crate::prompts::budget_for_model_with_metadata(
-        Some(model_name),
-        context_window,
-        max_completion_tokens,
-    );
     let policy = budget.window_policy();
     WireBudgetStatus {
         estimated_input_tokens,
@@ -364,27 +357,18 @@ pub(crate) fn wire_budget_status_with_metadata(
         requested_output_tokens,
         reserved_protocol_tokens: policy.reserved_protocol_tokens,
         effective_input_limit: budget.effective_input_limit(),
-        model_limit: budget.model_limit,
+        model_limit: budget.model_limit(),
     }
 }
 
-pub(crate) fn augment_manifest_trace_with_wire_budget_and_metadata(
+pub(crate) fn augment_manifest_trace_with_wire_budget(
     trace: &mut Value,
     messages: &[Value],
     tools: &[Value],
-    model_name: &str,
-    context_window: Option<u32>,
-    max_completion_tokens: Option<u32>,
+    budget: &crate::prompts::ContextBudget,
     requested_output_tokens: usize,
 ) -> WireBudgetStatus {
-    let status = wire_budget_status_with_metadata(
-        messages,
-        tools,
-        model_name,
-        context_window,
-        max_completion_tokens,
-        requested_output_tokens,
-    );
+    let status = wire_budget_status(messages, tools, budget, requested_output_tokens);
     set_manifest_wire_budget(trace, status);
     status
 }
@@ -832,8 +816,8 @@ pub(crate) fn strip_required_runtime_preamble_marker(message: &mut Value) {
     }
 }
 
-fn append_stable_system_policy(system_messages: &mut Vec<Value>, policy: &str) {
-    // This is stable policy, not a runtime tail. Fold it into the leading
+pub(crate) fn append_stable_system_text(system_messages: &mut Vec<Value>, policy: &str) {
+    // This is execution-stable content, not a runtime tail. Fold it into the leading
     // system value before any runtime-control message is placed. The operation
     // is deterministic for both string and structured system content.
     let Some(primary) = system_messages.first_mut() else {
@@ -868,7 +852,7 @@ fn append_stable_system_policy(system_messages: &mut Vec<Value>, policy: &str) {
 
 fn append_focus_policy(system_messages: &mut Vec<Value>) {
     let policy = focus_policy_text();
-    append_stable_system_policy(system_messages, &policy);
+    append_stable_system_text(system_messages, &policy);
 }
 
 pub(crate) fn ensure_append_only_runtime_authority_policy(system_messages: &mut Vec<Value>) {
@@ -878,7 +862,7 @@ pub(crate) fn ensure_append_only_runtime_authority_policy(system_messages: &mut 
     if already_present {
         return;
     }
-    append_stable_system_policy(
+    append_stable_system_text(
         system_messages,
         astra_turn_types::APPEND_ONLY_RUNTIME_AUTHORITY_POLICY,
     );
@@ -1219,14 +1203,10 @@ pub(crate) fn rerun_with_compaction_memory_for_user_turn<T>(
 pub(crate) struct MemoriaContext<'a> {
     /// Session id used for Memoria storage scope + cache-edit pin key.
     pub session_id: &'a str,
-    /// Model the main turn is calling — used to size char budgets. Auth
-    /// (api_key / base_url / provider / headers) is not plumbed here because
-    /// the summary client is constructed by the caller and injected below;
-    /// this module stays decoupled from HTTP credentials.
-    pub model_name: &'a str,
-    /// Registry/model-config context window. `None` means use the generic
-    /// 200K default; never infer this from the model name.
-    pub context_window: Option<u32>,
+    /// Exact context/compaction settings checked at execution admission.
+    pub context_budget: &'a crate::prompts::ContextBudget,
+    pub memoria_config: &'a MemoriaCompactConfig,
+    pub summary_prompt_templates: &'a astra_turn_types::summary_prompts::SummaryPromptTemplates,
     /// Optional HTTP client for Memoria retrieval. `None` = skip retrieval,
     /// fall back to pure truncation.
     pub memoria_client: Option<&'a dyn MemoriaPort>,
@@ -1241,7 +1221,7 @@ pub(crate) struct MemoriaContext<'a> {
 
 /// Caller-side overrides for Memoria budget knobs that the context-window
 /// recovery path needs. The main turn path leaves every field `None` — the
-/// `MemoriaContext` then derives sensible defaults from the model budget and
+/// `MemoriaContext` then derives invocation budgets from the admitted policy and
 /// the `tier` on `MemoriaContext` itself. The emergency retry path (triggered
 /// by a prompt-too-long response) fills these in with tighter values.
 #[derive(Default)]
@@ -1254,7 +1234,7 @@ pub(crate) struct BudgetOverrides {
 }
 
 /// Fully resolved budget values that Memoria needs. Produced either by
-/// deriving from the model or by applying caller overrides on top of the
+/// measuring against the admitted policy or applying recovery overrides to the
 /// derived defaults.
 struct ResolvedBudget {
     budget_chars: usize,
@@ -1336,10 +1316,6 @@ impl BudgetOverrides {
 }
 
 impl<'a> MemoriaContext<'a> {
-    fn context_budget(&self) -> crate::prompts::ContextBudget {
-        crate::prompts::budget_for_model_with_override(Some(self.model_name), self.context_window)
-    }
-
     /// Run Memoria-based history compaction. Returns the full `CompactResult`
     /// so callers can react to `boundary.is_some()` (e.g. for the P2
     /// compaction context note).
@@ -1360,7 +1336,7 @@ impl<'a> MemoriaContext<'a> {
 
     /// Same as [`Self::compact`] but accepts budget overrides for emergency
     /// retry after a context-window error. Main-turn callers should prefer
-    /// [`Self::compact`] which uses model-derived defaults.
+    /// [`Self::compact`] which uses the admitted settings.
     pub async fn compact_with_overrides(
         &self,
         messages: &[Value],
@@ -1369,7 +1345,7 @@ impl<'a> MemoriaContext<'a> {
         overrides: BudgetOverrides,
     ) -> CompactResult {
         let uses_derived_history_budget = overrides.budget_chars.is_none();
-        let budget = self.context_budget();
+        let budget = self.context_budget;
         // `current_tokens` is a pressure signal for Memoria retrieval; the
         // authoritative compaction tier is `self.tier` (or the override). The
         // cache-aware estimate just tunes retrieval aggressiveness, so we
@@ -1390,7 +1366,7 @@ impl<'a> MemoriaContext<'a> {
             // window, so reserve their concrete cost before deriving the
             // history budget.
             budget_chars: history_budget_chars(
-                &budget,
+                budget,
                 cache_est.cache_eligible_tokens,
                 messages,
                 cache_est.volatile_tokens,
@@ -1401,7 +1377,6 @@ impl<'a> MemoriaContext<'a> {
             tier: self.tier,
         });
 
-        let memoria_config = MemoriaCompactConfig::default();
         let memoria_params = MemoriaCompactParams {
             budget_chars: resolved.budget_chars,
             keep_chars: resolved.keep_chars,
@@ -1411,16 +1386,15 @@ impl<'a> MemoriaContext<'a> {
             session_facts: self.session_facts.clone(),
         };
 
-        let compact_config = CompactConfig::from_env();
-
         let mut result = compact_with_memoria(
             messages,
             Some(self.session_id),
-            &memoria_config,
+            self.memoria_config,
             &memoria_params,
             self.memoria_client,
-            Some(&compact_config),
+            &budget.compact_config,
             self.summary_client,
+            self.summary_prompt_templates,
         )
         .await;
 
@@ -1439,7 +1413,7 @@ impl<'a> MemoriaContext<'a> {
                     tool_schema_tokens,
                 );
                 let refined_budget_chars = history_budget_chars(
-                    &budget,
+                    budget,
                     refined_estimate.cache_eligible_tokens,
                     &result.messages,
                     refined_estimate.volatile_tokens,
@@ -1842,6 +1816,20 @@ fn render_drained_volatile_messages(
 
 #[cfg(test)]
 mod tests {
+    fn test_context_budget(
+        window: Option<u32>,
+        completion: Option<u32>,
+    ) -> crate::prompts::ContextBudget {
+        crate::prompts::ContextBudget::resolve(
+            window,
+            completion,
+            0.75,
+            6,
+            8_000,
+            crate::prompts::CompactConfig::default(),
+        )
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -3034,14 +3022,7 @@ mod tests {
             &result,
             &[json!({"role": "system", "content": "fixed"})],
             &[json!({"type": "function", "function": {"name": "lookup"}})],
-            Some(
-                crate::prompts::budget_for_model_with_metadata(
-                    Some("model"),
-                    Some(10_000),
-                    Some(1_000),
-                )
-                .window_policy(),
-            ),
+            Some(test_context_budget(Some(10_000), Some(1_000)).window_policy()),
         )
         .expect("a shrinking boundary is observable");
 
@@ -3125,23 +3106,47 @@ mod tests {
     }
 
     #[test]
-    fn memoria_context_budget_uses_configured_context_window() {
+    fn memoria_and_wire_use_the_same_resolved_completion_and_summary_reserves() {
+        let budget = crate::prompts::ContextBudget::resolve(
+            Some(1_000_000),
+            Some(64_000),
+            0.6,
+            9,
+            4_000,
+            crate::prompts::CompactConfig {
+                summary_token_budget: 3_000,
+                ..Default::default()
+            },
+        );
         let ctx = MemoriaContext {
             session_id: "sid-1m",
-            model_name: "deepseek-v4-pro-official",
-            context_window: Some(1_000_000),
+            context_budget: &budget,
+            memoria_config: &MemoriaCompactConfig::default(),
             memoria_client: None,
             summary_client: None,
+            summary_prompt_templates:
+                &astra_turn_core::cloud_summary::canonical_summary_prompt_templates(),
             tier: CompactionTier::Normal,
             session_facts: None,
         };
-
-        assert_eq!(ctx.context_budget().model_limit, 1_000_000);
+        let wire = wire_budget_status(&[], &[], &budget, budget.capped_output_tokens());
+        assert_eq!(wire.model_limit, 1_000_000);
+        assert_eq!(wire.requested_output_tokens, 64_000);
+        assert_eq!(wire.effective_input_limit, 932_700);
+        assert_eq!(
+            ctx.context_budget.effective_input_limit(),
+            wire.effective_input_limit
+        );
+        assert_eq!(ctx.context_budget.keep_recent_turns, 9);
+        assert_eq!(
+            ctx.context_budget.compact_config.summary_token_budget,
+            3_000
+        );
     }
 
     #[test]
     fn history_budget_reserves_system_and_tool_tokens_once() {
-        let budget = crate::prompts::budget_for_model_with_override(Some("model"), Some(10_000));
+        let budget = test_context_budget(Some(10_000), None);
         let ascii_history = vec![json!({"role": "user", "content": "a".repeat(39_970)})];
         let policy = budget.window_policy();
         assert_eq!(policy.reserved_output_tokens, 2_500);
@@ -3162,7 +3167,7 @@ mod tests {
 
     #[test]
     fn history_budget_uses_observed_token_density_without_language_special_cases() {
-        let budget = crate::prompts::budget_for_model_with_override(Some("model"), Some(10_000));
+        let budget = test_context_budget(Some(10_000), None);
         let dense_history = vec![json!({"role": "user", "content": "界".repeat(9_970)})];
 
         let available = history_budget_chars(&budget, 1_500, &dense_history, 15_000);
@@ -3217,13 +3222,11 @@ mod tests {
             "content": [{"type": "text", "text": "你好世界".repeat(400)}]
         })];
         let mut trace = json!({"wire": {"message_count": 1}});
-        let status = augment_manifest_trace_with_wire_budget_and_metadata(
+        let status = augment_manifest_trace_with_wire_budget(
             &mut trace,
             &messages,
             &[],
-            "model",
-            Some(1_000),
-            None,
+            &test_context_budget(Some(1_000), None),
             100,
         );
 
@@ -3319,8 +3322,12 @@ mod tests {
             }
         })];
 
-        let status =
-            wire_budget_status_with_metadata(&messages, &tools, "model", Some(32_000), None, 1_000);
+        let status = wire_budget_status(
+            &messages,
+            &tools,
+            &test_context_budget(Some(32_000), None),
+            1_000,
+        );
         let expected = crate::prompts::estimate_wire_input_tokens(
             &messages,
             tools
@@ -3384,12 +3391,27 @@ mod tests {
                 }
             }
         })];
+        // Exercise actual compaction with non-default completion and summary
+        // reserves, rather than only inspecting the admitted configuration.
+        let budget = crate::prompts::ContextBudget::resolve(
+            Some(8_000),
+            Some(3_500),
+            0.6,
+            3,
+            4_000,
+            crate::prompts::CompactConfig {
+                summary_token_budget: 500,
+                ..Default::default()
+            },
+        );
         let ctx = MemoriaContext {
             session_id: "sid-long-running",
-            model_name: "model-with-explicit-window",
-            context_window: Some(8_000),
+            context_budget: &budget,
+            memoria_config: &MemoriaCompactConfig::default(),
             memoria_client: None,
             summary_client: None,
+            summary_prompt_templates:
+                &astra_turn_core::cloud_summary::canonical_summary_prompt_templates(),
             tier: CompactionTier::AggressivePrune,
             session_facts: None,
         };
@@ -3444,10 +3466,10 @@ mod tests {
             tool_tokens,
         );
         assert!(
-            estimate.total_tokens <= ctx.context_budget().effective_input_limit(),
+            estimate.total_tokens <= ctx.context_budget.effective_input_limit(),
             "bounded wire estimate {} exceeds effective input limit {}",
             estimate.total_tokens,
-            ctx.context_budget().effective_input_limit()
+            ctx.context_budget.effective_input_limit()
         );
     }
 
@@ -3493,10 +3515,12 @@ mod tests {
         })];
         let ctx = MemoriaContext {
             session_id: "sid-long-running-cjk",
-            model_name: "model-with-explicit-window",
-            context_window: Some(8_000),
+            context_budget: &test_context_budget(Some(8_000), None),
+            memoria_config: &MemoriaCompactConfig::default(),
             memoria_client: None,
             summary_client: None,
+            summary_prompt_templates:
+                &astra_turn_core::cloud_summary::canonical_summary_prompt_templates(),
             tier: CompactionTier::AggressivePrune,
             session_facts: None,
         };
@@ -3513,10 +3537,10 @@ mod tests {
         );
 
         assert!(
-            estimate.total_tokens <= ctx.context_budget().effective_input_limit(),
+            estimate.total_tokens <= ctx.context_budget.effective_input_limit(),
             "multilingual bounded wire estimate {} exceeds effective input limit {}",
             estimate.total_tokens,
-            ctx.context_budget().effective_input_limit()
+            ctx.context_budget.effective_input_limit()
         );
     }
 

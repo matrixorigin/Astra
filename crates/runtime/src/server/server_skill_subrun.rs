@@ -1096,7 +1096,6 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 resolver: self.skill_resolver.clone(),
                 request_constraints: self.request_constraints.clone(),
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
                 tool_event_hooks,
                 session_event_hooks,
                 // Skill-level effort/agent_type from manifest

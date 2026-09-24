@@ -234,23 +234,7 @@ fn split_clearable(tool_results: Vec<(String, usize)>, keep_recent: usize) -> (V
     (ids, total_tokens)
 }
 
-/// Configuration for turn-count-based microcompaction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TurnCountCompactConfig {
-    pub enabled: bool,
-    pub trigger_threshold: usize,
-    pub keep_recent: usize,
-}
-
-impl Default for TurnCountCompactConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            trigger_threshold: 8,
-            keep_recent: 3,
-        }
-    }
-}
+pub use astra_turn_types::context_execution::TurnCountCompactConfig;
 
 /// Trigger data for turn-count-based compaction.
 #[derive(Debug, Clone)]

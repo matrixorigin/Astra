@@ -1312,6 +1312,8 @@ pub struct ToolExecutor {
     /// Wrapped in `RwLock` so the policy can be swapped per-turn (e.g. skill
     /// sandbox activation) while the executor is shared via `Arc<ToolExecutor>`.
     pub sandbox_policy: std::sync::RwLock<Option<SandboxPolicy>>,
+    /// Immutable host boundary; permission and Skill policies cannot remove it.
+    shell_process_boundary: Option<astra_sandbox::ShellProcessBoundary>,
     pub(crate) permission_sandbox_basis: std::sync::Mutex<Option<PermissionSandboxBasis>>,
 
     /// Per-turn budget pressure (0.0 = normal, 1.0 = critical).
@@ -1503,6 +1505,16 @@ pub struct ToolExecutor {
 }
 
 impl ToolExecutor {
+    /// Install a trusted host constraint before sharing this executor.
+    /// This confines shell processes only, not every local tool/helper.
+    pub fn with_shell_process_boundary(
+        mut self,
+        boundary: astra_sandbox::ShellProcessBoundary,
+    ) -> Result<Self, String> {
+        self.shell_process_boundary = Some(boundary.validate(&self.effective_project_root())?);
+        Ok(self)
+    }
+
     pub(crate) fn apply_runtime_permission_sandbox(
         &self,
         mode: crate::cli::permission_manager::PermissionMode,
@@ -1535,6 +1547,7 @@ impl ToolExecutor {
             cli_local_provider_schemas: std::sync::RwLock::new(Vec::new()),
             current_tool_surface: std::sync::RwLock::new(ToolSurfaceNames::default()),
             sandbox_policy: std::sync::RwLock::new(Some(sandbox)),
+            shell_process_boundary: None,
             permission_sandbox_basis: std::sync::Mutex::new(None),
 
             budget_pressure: std::sync::Mutex::new(0.0),
@@ -1935,11 +1948,26 @@ impl ToolExecutor {
         self.cli_local_provider_schema_has_name(name) && self.tool_has_runtime_binding(name)
     }
 
+    fn authenticated_server_service_ready(&self) -> bool {
+        self.cloud_base
+            .as_deref()
+            .is_some_and(|base| !base.trim().is_empty())
+            && self
+                .cloud_token()
+                .is_some_and(|token| !token.trim().is_empty())
+            && self
+                .active_session_id()
+                .is_some_and(|session_id| !session_id.trim().is_empty())
+    }
+
     fn tool_has_runtime_binding(&self, name: &str) -> bool {
         self.tool_has_runtime_binding_for_call(name, &Value::Null)
     }
 
     fn tool_has_runtime_binding_for_call(&self, name: &str, args: &Value) -> bool {
+        if name == "skill_creator" && !self.authenticated_server_service_ready() {
+            return false;
+        }
         if self.runtime_environment_tool_denial(name, args).is_some() {
             return false;
         }
@@ -4277,6 +4305,9 @@ impl ToolExecutor {
         project_root: &Path,
         tool_results_nonempty: bool,
     ) -> Vec<Value> {
+        if self.shell_process_boundary.is_some() {
+            return Vec::new();
+        }
         let mut out = self
             .passive_lsp
             .take_diagnostic_messages(tool_results_nonempty)
@@ -4821,6 +4852,66 @@ impl ToolExecutor {
         .with_tool_result_fields(tool_result_fields)
     }
 
+    async fn skill_creator_via_server(
+        &self,
+        args: &Value,
+        source_is_error: &mut Option<bool>,
+    ) -> String {
+        let Some(_) = args
+            .get("goal")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|goal| !goal.is_empty())
+        else {
+            *source_is_error = Some(true);
+            return "Error: skill_creator requires a non-empty goal".to_string();
+        };
+        let Some(cloud_base) = self.cloud_base.as_deref() else {
+            *source_is_error = Some(true);
+            return "Error: skill_creator requires an authenticated Astra server connection"
+                .to_string();
+        };
+        let Some(token) = self.cloud_token().filter(|token| !token.trim().is_empty()) else {
+            *source_is_error = Some(true);
+            return "Error: skill_creator requires an authenticated Astra server connection"
+                .to_string();
+        };
+        let Some(session_id) = self.active_session_id().filter(|id| !id.trim().is_empty()) else {
+            *source_is_error = Some(true);
+            return "Error: skill_creator requires an active session".to_string();
+        };
+        let api = match astra_thin_client::ThinClient::new(cloud_base, None) {
+            Ok(api) => api,
+            Err(error) => {
+                *source_is_error = Some(true);
+                return format!("Error: skill_creator server client setup failed: {error}");
+            }
+        };
+        let response = api
+            .post_bearer_path_json_text(&token, &format!("/harnesses/authoring/{session_id}"), args)
+            .await;
+        match response {
+            Ok(body) => {
+                match serde_json::from_str::<astra_services::AuthoringIntentRecord>(&body) {
+                    Ok(record) => {
+                        *source_is_error = Some(false);
+                        record.tool_output().to_string()
+                    }
+                    Err(error) => {
+                        *source_is_error = Some(true);
+                        format!(
+                            "Error: skill_creator server returned invalid result metadata: {error}"
+                        )
+                    }
+                }
+            }
+            Err(error) => {
+                *source_is_error = Some(true);
+                format!("Error: skill_creator server request failed: {error}")
+            }
+        }
+    }
+
     async fn execute_raw(
         &self,
         name: &str,
@@ -4986,6 +5077,11 @@ impl ToolExecutor {
                 "run_build_test" => self.run_build_test(args),
                 "symbols" => self.symbols(args),
                 "mo_query" => self.mo_query(args),
+
+                // The canonical authoring service lives on the authenticated
+                // server. The CLI is only a transport adapter here; it does
+                // not create a second authoring lifecycle.
+                "skill_creator" => self.skill_creator_via_server(args, source_is_error).await,
 
                 "web_fetch" => {
                     let cache_scope = self
@@ -6071,6 +6167,49 @@ mod tests {
             );
         }
         assert!(!dir.path().join(".git").exists());
+    }
+
+    #[tokio::test]
+    async fn skill_creator_has_an_explicit_server_route_when_unconfigured() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        let result = astra_tools::ToolExecutor::execute_with_metadata(
+            &executor,
+            "skill_creator",
+            &serde_json::json!({"goal": "create a skill"}),
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .contains("authenticated Astra server connection")
+        );
+        assert!(!result.output.contains("not implemented"));
+    }
+
+    #[test]
+    fn skill_creator_is_projected_only_when_server_binding_is_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        let schema = function_schema("skill_creator");
+
+        assert!(
+            executor
+                .runtime_bound_tool_schemas(vec![schema.clone()])
+                .is_empty(),
+            "an unauthenticated CLI must not advertise skill_creator"
+        );
+
+        let configured = ToolExecutor::new(dir.path())
+            .with_cloud("https://cloud.example", "token")
+            .with_active_session_id("session-1");
+        assert_eq!(
+            astra_turn_core::tool::schema::tool_names_from_schemas(
+                &configured.runtime_bound_tool_schemas(vec![schema])
+            ),
+            HashSet::from(["skill_creator".to_string()])
+        );
     }
 
     use super::{

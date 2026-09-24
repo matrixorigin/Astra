@@ -2,6 +2,7 @@
 
 import {
   FolderKanban,
+  FlaskConical,
   Home,
   ListTodo,
   MessageSquare,
@@ -100,7 +101,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             {children}
           </main>
           <nav
-            className="grid h-14 shrink-0 grid-cols-5 border-t border-border bg-surface px-1 md:hidden"
+            className="grid h-14 shrink-0 grid-cols-6 border-t border-border bg-surface px-1 md:hidden"
             aria-label="Mobile primary navigation"
           >
             <MobileNavItem
@@ -132,6 +133,12 @@ export function AppShell({ children }: { children: ReactNode }) {
               label="Harnesses"
               icon={Workflow}
               active={pathname === "/harnesses"}
+            />
+            <MobileNavItem
+              href="/evaluations"
+              label="Eval"
+              icon={FlaskConical}
+              active={pathname === "/evaluations"}
             />
           </nav>
         </div>

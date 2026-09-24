@@ -16,7 +16,6 @@ pub use astra_prompts::skills::{
 pub use context::{
     CacheAwareEstimate, CompactConfig, CompactionTier, ContextBudget, ContextWindowPolicy,
     ContextWindowPolicySource, DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_SYSTEM_PROMPT_TOKENS,
-    budget_for_model, budget_for_model_with_metadata, budget_for_model_with_override,
     capped_output_tokens, estimate_json_value_tokens, estimate_str_tokens, estimate_tokens,
     estimate_tokens_cache_aware, estimate_tokens_cache_aware_split,
 };
@@ -193,45 +192,6 @@ mod tests {
         let short = vec![serde_json::json!({"role": "user", "content": "hi"})];
         let long = vec![serde_json::json!({"role": "user", "content": "a".repeat(4000)})];
         assert!(estimate_tokens(&long, 0, 0) > estimate_tokens(&short, 0, 0) + 500);
-    }
-
-    #[test]
-    fn context_budget_default_values() {
-        let b = ContextBudget::default();
-        assert_eq!(b.model_limit, 200_000);
-        assert!((b.compact_threshold - 0.75).abs() < 0.01);
-        assert_eq!(b.keep_recent_turns, 6);
-    }
-
-    #[test]
-    fn context_budget_should_compact() {
-        let b = ContextBudget::default();
-        assert!(!b.should_compact(134_999));
-        assert!(b.should_compact(135_001));
-    }
-
-    #[test]
-    fn budget_for_model_claude() {
-        let b = budget_for_model(Some("claude-3.5-sonnet"));
-        assert_eq!(b.model_limit, 200_000);
-    }
-
-    #[test]
-    fn budget_for_model_gpt35() {
-        let b = budget_for_model(Some("gpt-3.5-turbo"));
-        assert_eq!(b.model_limit, 200_000);
-    }
-
-    #[test]
-    fn budget_for_model_unknown_uses_default() {
-        let b = budget_for_model(Some("some-unknown-model"));
-        assert_eq!(b.model_limit, 200_000);
-    }
-
-    #[test]
-    fn budget_for_model_none_uses_default() {
-        let b = budget_for_model(None);
-        assert_eq!(b.model_limit, 200_000);
     }
 
     #[test]

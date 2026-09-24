@@ -134,9 +134,68 @@ pub enum EdgeClientMessage {
         tool_result_fields: Option<Map<String, Value>>,
     },
 
+    /// Result of creating an isolated evaluation workspace clone.
+    #[serde(rename = "edge_workspace_prepared")]
+    WorkspacePrepared {
+        request_id: String,
+        connection_generation: u64,
+        workspace_dir: String,
+        allocation: Option<astra_runtime_env::EvaluationAllocationReceipt>,
+        source_commit: Option<String>,
+        source_tree: Option<String>,
+        #[serde(default)]
+        error: Option<String>,
+    },
+
+    /// Fresh source proof for an already prepared evaluation workspace.
+    #[serde(rename = "edge_workspace_snapshot")]
+    WorkspaceSnapshot {
+        request_id: String,
+        connection_generation: u64,
+        workspace_dir: String,
+        allocation: Option<astra_runtime_env::EvaluationAllocationReceipt>,
+        source_commit: Option<String>,
+        source_tree: Option<String>,
+        clean: bool,
+        #[serde(default)]
+        error: Option<String>,
+    },
+
+    /// Durable coding evidence captured after agent execution and before the
+    /// per-trial workspace lease may be released.
+    #[serde(rename = "edge_workspace_finalized")]
+    WorkspaceFinalized {
+        request_id: String,
+        connection_generation: u64,
+        workspace_dir: String,
+        allocation: Option<astra_runtime_env::EvaluationAllocationReceipt>,
+        source_commit: Option<String>,
+        source_tree: Option<String>,
+        base_revision: Option<String>,
+        result_revision: Option<String>,
+        patch: Option<String>,
+        verifier_exit_code: Option<i32>,
+        verifier_output: Option<String>,
+        namespace_active: bool,
+        scope_settled: bool,
+        timed_out: bool,
+        #[serde(default)]
+        error: Option<String>,
+    },
+
     /// Edge heartbeat.
     #[serde(rename = "edge_ping")]
     Ping {},
+}
+
+/// Server-frozen inputs for provisioning one Evaluation allocation.
+#[derive(Debug, Clone, Copy)]
+pub struct EdgeWorkspacePreparationRequest<'a> {
+    pub connection_generation: u64,
+    pub workspace_key: &'a str,
+    pub session_id: &'a str,
+    pub source_commit: &'a str,
+    pub confinement: &'a astra_runtime_env::WorkspaceConfinementContract,
 }
 
 /// Messages sent from server to edge agent.
@@ -164,6 +223,7 @@ pub enum EdgeServerMessage {
         delivery_generation: u64,
         tool: String,
         args: Value,
+        evaluation_allocation: Option<Box<astra_runtime_env::EvaluationAllocationReceipt>>,
         /// Opaque provider authorization injected only for this bash call.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         runtime_process_authorization: Option<Box<RuntimeProcessAuthorizationContext>>,
@@ -174,6 +234,51 @@ pub enum EdgeServerMessage {
         /// Maximum execution time in seconds.
         #[serde(default = "default_tool_timeout_secs")]
         timeout_secs: u64,
+    },
+
+    /// Create a per-trial clone from the requested immutable source commit.
+    #[serde(rename = "edge_workspace_prepare")]
+    WorkspacePrepare {
+        request_id: String,
+        connection_generation: u64,
+        workspace_key: String,
+        session_id: String,
+        source_commit: String,
+        confinement: astra_runtime_env::WorkspaceConfinementContract,
+    },
+
+    /// Ask the Edge to prove the current source identity of a prepared clone.
+    #[serde(rename = "edge_workspace_snapshot_request")]
+    WorkspaceSnapshotRequest {
+        request_id: String,
+        connection_generation: u64,
+        allocation: astra_runtime_env::EvaluationAllocationReceipt,
+    },
+
+    /// Capture the final patch and execute the server-frozen verifier in the
+    /// exact trial workspace. This operation is independent from model tools.
+    #[serde(rename = "edge_workspace_finalize")]
+    WorkspaceFinalize {
+        request_id: String,
+        connection_generation: u64,
+        allocation: astra_runtime_env::EvaluationAllocationReceipt,
+        verifier_command: String,
+        verifier_timeout_secs: u64,
+        finalization_deadline_unix_ms: u64,
+    },
+
+    /// Cancel an in-flight workspace finalization owned by this connection.
+    #[serde(rename = "edge_workspace_finalize_cancel")]
+    WorkspaceFinalizeCancel {
+        request_id: String,
+        connection_generation: u64,
+    },
+
+    /// Release a clean per-trial clone after the Run has settled.
+    #[serde(rename = "edge_workspace_release")]
+    WorkspaceRelease {
+        connection_generation: u64,
+        allocation: astra_runtime_env::EvaluationAllocationReceipt,
     },
 
     /// Server heartbeat response.
@@ -210,6 +315,11 @@ impl EdgeServerMessage {
             EdgeServerMessage::AuthOk { .. } => "auth_ok",
             EdgeServerMessage::AuthError { .. } => "auth_error",
             EdgeServerMessage::ToolRequest { .. } => "tool_request",
+            EdgeServerMessage::WorkspacePrepare { .. } => "workspace_prepare",
+            EdgeServerMessage::WorkspaceSnapshotRequest { .. } => "workspace_snapshot_request",
+            EdgeServerMessage::WorkspaceFinalize { .. } => "workspace_finalize",
+            EdgeServerMessage::WorkspaceFinalizeCancel { .. } => "workspace_finalize_cancel",
+            EdgeServerMessage::WorkspaceRelease { .. } => "workspace_release",
             EdgeServerMessage::Pong {} => "pong",
             EdgeServerMessage::Closing { .. } => "closing",
             EdgeServerMessage::ToolCancel { .. } => "tool_cancel",
@@ -220,6 +330,23 @@ impl EdgeServerMessage {
 
 fn default_tool_timeout_secs() -> u64 {
     EDGE_TOOL_TIMEOUT_SECS
+}
+
+#[cfg(test)]
+pub(crate) fn test_allocation_receipt() -> astra_runtime_env::EvaluationAllocationReceipt {
+    astra_runtime_env::EvaluationAllocationReceipt {
+        schema_version: 1,
+        allocation_id: "allocation".into(),
+        owner_user_id: "owner".into(),
+        session_id: "session".into(),
+        run_id: "run".into(),
+        deployment_id: "deployment".into(),
+        materialization_id: "materialization".into(),
+        workspace_dir: "/workspace/trial".into(),
+        source_commit: "a".repeat(40),
+        source_tree: "b".repeat(40),
+        confinement_fingerprint: format!("sha256:{}", "c".repeat(64)),
+    }
 }
 
 #[cfg(test)]
@@ -333,6 +460,7 @@ mod tests {
     #[test]
     fn edge_tool_request_serializes() {
         let msg = EdgeServerMessage::ToolRequest {
+            evaluation_allocation: None,
             request_id: "req-456".into(),
             identity: Box::new(identity()),
             delivery_generation: 1,
@@ -351,6 +479,7 @@ mod tests {
     #[test]
     fn edge_tool_request_round_trips_hidden_process_authorization() {
         let msg = EdgeServerMessage::ToolRequest {
+            evaluation_allocation: None,
             request_id: "req-process-auth".into(),
             identity: Box::new(identity()),
             delivery_generation: 1,
@@ -519,6 +648,95 @@ mod tests {
             "args": {}
         }));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn edge_workspace_operations_round_trip() {
+        let prepare = EdgeServerMessage::WorkspacePrepare {
+            request_id: "workspace-request".to_string(),
+            connection_generation: 4,
+            workspace_key: "trial-1".to_string(),
+            session_id: "session".to_string(),
+            source_commit: "a".repeat(40),
+            confinement: serde_json::from_value(serde_json::json!({
+                "profile_id": astra_runtime_env::WORKSPACE_CONFINEMENT_PROFILE,
+                "toolchain_manifest": {
+                    "schema_version": 1,
+                    "inputs": [{"guest_mount_path": "/usr/bin", "content_digest": format!("sha256:{}", "a".repeat(64))}],
+                    "launcher_digest": format!("sha256:{}", "b".repeat(64)),
+                    "supervisor_digest": format!("sha256:{}", "c".repeat(64))
+                }
+            })).unwrap(),
+        };
+        let decoded: EdgeServerMessage =
+            serde_json::from_value(serde_json::to_value(&prepare).unwrap()).unwrap();
+        assert!(matches!(
+            decoded,
+            EdgeServerMessage::WorkspacePrepare { .. }
+        ));
+
+        let snapshot = EdgeClientMessage::WorkspaceSnapshot {
+            request_id: "workspace-request".to_string(),
+            connection_generation: 4,
+            workspace_dir: "/workspace/.astra-evaluation-trial-1".to_string(),
+            allocation: Some(test_allocation_receipt()),
+            source_commit: Some("a".repeat(40)),
+            source_tree: Some("b".repeat(40)),
+            clean: true,
+            error: None,
+        };
+        let decoded: EdgeClientMessage =
+            serde_json::from_value(serde_json::to_value(&snapshot).unwrap()).unwrap();
+        assert!(matches!(
+            decoded,
+            EdgeClientMessage::WorkspaceSnapshot { clean: true, .. }
+        ));
+
+        let finalize = EdgeServerMessage::WorkspaceFinalize {
+            request_id: "finalize-request".to_string(),
+            connection_generation: 4,
+            allocation: test_allocation_receipt(),
+            verifier_command: "make check".to_string(),
+            verifier_timeout_secs: 120,
+            finalization_deadline_unix_ms: 1_900_000_000_000,
+        };
+        let decoded: EdgeServerMessage =
+            serde_json::from_value(serde_json::to_value(&finalize).unwrap()).unwrap();
+        assert!(matches!(
+            decoded,
+            EdgeServerMessage::WorkspaceFinalize {
+                verifier_timeout_secs: 120,
+                ..
+            }
+        ));
+
+        let finalized = EdgeClientMessage::WorkspaceFinalized {
+            request_id: "finalize-request".to_string(),
+            connection_generation: 4,
+            workspace_dir: "/workspace/.astra-evaluation-trial-1".to_string(),
+            allocation: Some(test_allocation_receipt()),
+            source_commit: Some("a".repeat(40)),
+            source_tree: Some("b".repeat(40)),
+            base_revision: Some(format!("sha256:{}", "c".repeat(64))),
+            result_revision: Some(format!("sha256:{}", "d".repeat(64))),
+            patch: Some("diff --git a/a b/a".to_string()),
+            verifier_exit_code: Some(0),
+            verifier_output: Some("ok".to_string()),
+            namespace_active: true,
+            scope_settled: true,
+            timed_out: false,
+            error: None,
+        };
+        let decoded: EdgeClientMessage =
+            serde_json::from_value(serde_json::to_value(&finalized).unwrap()).unwrap();
+        assert!(matches!(
+            decoded,
+            EdgeClientMessage::WorkspaceFinalized {
+                verifier_exit_code: Some(0),
+                namespace_active: true,
+                ..
+            }
+        ));
     }
 
     #[test]

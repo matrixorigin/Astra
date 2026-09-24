@@ -405,8 +405,6 @@ pub(crate) struct SessionState {
     pub unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     /// Session-scoped skill quality tracker for learning loop.
     pub skill_quality_tracker: astra_skills::quality::SkillQualityTracker,
-    /// Skill auto-improvement tracker — detects user corrections and proposes SKILL.md rewrites.
-    pub skill_improvement_tracker: astra_skills::improvement::ImprovementTracker,
     /// Skills surfaced by `discover_skills` during this CLI session.
     pub discovered_skills: std::collections::HashSet<String>,
     pub mcp_manager: std::sync::Arc<tokio::sync::RwLock<mcp_client::McpClientManager>>,
@@ -590,6 +588,9 @@ pub(crate) struct SessionState {
 
 impl Default for SessionState {
     fn default() -> Self {
+        let runtime_config = astra_config::runtime_config::RuntimeConfig::load();
+        let context_budget =
+            super::session_runtime::resolve_session_context_budget(&runtime_config, None, None);
         Self {
             session_id: None,
             pending_recovery: None,
@@ -638,7 +639,7 @@ impl Default for SessionState {
             active_system_skills: Vec::new(),
             // Load RuntimeConfig from config files + env vars, then create
             // ContextBudget using the loaded config (M3 wiring).
-            runtime_config: { astra_config::runtime_config::RuntimeConfig::load() },
+            runtime_config,
             // Startup id is resolved after SessionState is constructed so
             // `adopt_session_id` can stamp the pointer with the actual
             // session id as PutMetadata.source_session. See
@@ -646,8 +647,8 @@ impl Default for SessionState {
             // then, legacy code paths treat None as "unknown".
             config_version_id: None,
             explain_report_format_override: None,
-            // Temporary: will be replaced with from_runtime_config when model is known
-            context_budget: prompts::ContextBudget::default(),
+            // Model selection replaces the generic policy with catalog metadata.
+            context_budget,
             journal: None,
             recent_tools: Vec::new(),
             deferred_tool_activations: Vec::new(),
@@ -670,7 +671,6 @@ impl Default for SessionState {
             workspace_observation_quarantine: None,
             unified_skill_registry: astra_runtime::skills::default_unified_registry().clone(),
             skill_quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
-            skill_improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
             discovered_skills: std::collections::HashSet::new(),
             mcp_manager: std::sync::Arc::new(tokio::sync::RwLock::new(
                 mcp_client::McpClientManager::new(),

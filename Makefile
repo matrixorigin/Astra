@@ -190,6 +190,12 @@ NEXTEST_CLEANUP_PRESSURE_EXCLUSION := not test(/(db_cleanup_expired|db_truncate_
 # ASTRA_PHASE0_BASELINE_EXCLUSIVE guard. They are owned by
 # scripts/phase0-production-baseline.sh, not the generic ignored-test lane.
 NEXTEST_PHASE0_BASELINE_EXCLUSION := not test(/e2e_matrix_phase0_(server_only_production_baseline|external_(production_topologies|edge_server_m1))/)
+# The coding Evaluation journey needs a real dedicated deployment.  Generic
+# online CI has MatrixOne and a built Edge binary, but no SquashFS provider
+# image or source mount, so keep that journey out unless both deployment paths
+# are explicitly supplied.  The direct test command remains available for the
+# dedicated deployment lane.
+NEXTEST_EVALUATION_EXCLUSION ?= $(if $(and $(ASTRA_EVALUATION_EDGE_CONFIG),$(ASTRA_EVALUATION_EDGE_WORKSPACE_DIR)),,and not test(/e2e_matrix_evaluation_coding_real_edge/))
 
 # ============================================================================
 # Environment Setup
@@ -1231,6 +1237,11 @@ test-ignored-integration:
 	fi
 	@if [ "$${ASTRA_TEST_DB_IT:-}" = "1" ]; then \
 		FAILED=""; \
+		EVALUATION_EDGE_BIN="$${ASTRA_EVALUATION_EDGE_BIN:-$${CARGO_TARGET_DIR:-target}/debug/astra-edge}"; \
+		case "$$EVALUATION_EDGE_BIN" in /*) ;; *) EVALUATION_EDGE_BIN="$$(pwd)/$$EVALUATION_EDGE_BIN" ;; esac; \
+		if [ -z "$${ASTRA_EVALUATION_EDGE_BIN:-}" ]; then \
+			CARGO_INCREMENTAL=0 $(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-edge --bin astra-edge || exit 1; \
+		fi; \
 		JOBS_FLAG=""; \
 		if [ "$${ASTRA_TEST_DB_IT_TEST_THREADS:-}" = "1" ]; then \
 			JOBS_FLAG="-j 1"; \
@@ -1241,20 +1252,20 @@ test-ignored-integration:
 		PERF_FAILED=""; \
 		if [ "$$JOBS_FLAG" = "-j 1" ] && [ "$${ASTRA_STRICT_ONLINE_PERF:-1}" != "0" ]; then \
 			echo "Running runtime/plan integration and performance tests in one serial build..."; \
-			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_RUNTIME_ROOT_SECRET=$${ASTRA_RUNTIME_ROOT_SECRET:-test-runtime-root-secret} ASTRA_TEST_E2E_SECRET=$${ASTRA_TEST_E2E_SECRET:-system-matrix-e2e-secret} ASTRA_BACKEND_SERVICE_KEY=$${ASTRA_BACKEND_SERVICE_KEY:-test-service-key-e2e} ASTRA_LLM_RETRY_BASE_MS=$${ASTRA_LLM_RETRY_BASE_MS:-10} ASTRA_DEFAULT_RETRY_AFTER_MS=$${ASTRA_DEFAULT_RETRY_AFTER_MS:-10} ASTRA_BCRYPT_COST=$${ASTRA_BCRYPT_COST:-4} CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
+			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_RUNTIME_ROOT_SECRET=$${ASTRA_RUNTIME_ROOT_SECRET:-test-runtime-root-secret} ASTRA_TEST_E2E_SECRET=$${ASTRA_TEST_E2E_SECRET:-system-matrix-e2e-secret} ASTRA_BACKEND_SERVICE_KEY=$${ASTRA_BACKEND_SERVICE_KEY:-test-service-key-e2e} ASTRA_EVALUATION_EDGE_BIN="$$EVALUATION_EDGE_BIN" ASTRA_LLM_RETRY_BASE_MS=$${ASTRA_LLM_RETRY_BASE_MS:-10} ASTRA_DEFAULT_RETRY_AFTER_MS=$${ASTRA_DEFAULT_RETRY_AFTER_MS:-10} ASTRA_BCRYPT_COST=$${ASTRA_BCRYPT_COST:-4} CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
 				-p astra-runtime -p astra-plan \
 				--features astra-runtime/e2e-hooks \
 				--tests --run-ignored only \
 				$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
-				-E '$(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
+				-E '$(NEXTEST_PHASE0_BASELINE_EXCLUSION) $(NEXTEST_EVALUATION_EXCLUSION)' \
 					|| FAILED="$$FAILED runtime-plan-perf"; \
 		else \
-			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_RUNTIME_ROOT_SECRET=$${ASTRA_RUNTIME_ROOT_SECRET:-test-runtime-root-secret} ASTRA_TEST_E2E_SECRET=$${ASTRA_TEST_E2E_SECRET:-system-matrix-e2e-secret} ASTRA_BACKEND_SERVICE_KEY=$${ASTRA_BACKEND_SERVICE_KEY:-test-service-key-e2e} ASTRA_LLM_RETRY_BASE_MS=$${ASTRA_LLM_RETRY_BASE_MS:-10} ASTRA_DEFAULT_RETRY_AFTER_MS=$${ASTRA_DEFAULT_RETRY_AFTER_MS:-10} ASTRA_BCRYPT_COST=$${ASTRA_BCRYPT_COST:-4} CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
+			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_RUNTIME_ROOT_SECRET=$${ASTRA_RUNTIME_ROOT_SECRET:-test-runtime-root-secret} ASTRA_TEST_E2E_SECRET=$${ASTRA_TEST_E2E_SECRET:-system-matrix-e2e-secret} ASTRA_BACKEND_SERVICE_KEY=$${ASTRA_BACKEND_SERVICE_KEY:-test-service-key-e2e} ASTRA_EVALUATION_EDGE_BIN="$$EVALUATION_EDGE_BIN" ASTRA_LLM_RETRY_BASE_MS=$${ASTRA_LLM_RETRY_BASE_MS:-10} ASTRA_DEFAULT_RETRY_AFTER_MS=$${ASTRA_DEFAULT_RETRY_AFTER_MS:-10} ASTRA_BCRYPT_COST=$${ASTRA_BCRYPT_COST:-4} CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
 				-p astra-runtime -p astra-plan \
 				--features astra-runtime/e2e-hooks \
 				--tests --run-ignored only \
 				$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
-				-E 'not binary(perf_benchmarks) and $(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
+				-E 'not binary(perf_benchmarks) and $(NEXTEST_PHASE0_BASELINE_EXCLUSION) $(NEXTEST_EVALUATION_EXCLUSION)' \
 					|| FAILED="$$FAILED integration"; \
 			echo "Running online performance benchmarks in an isolated serial lane (blocking unless ASTRA_STRICT_ONLINE_PERF=0)..."; \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \

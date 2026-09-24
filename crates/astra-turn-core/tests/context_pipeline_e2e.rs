@@ -36,6 +36,7 @@ fn build_sources() -> (
         AgentContext::default(),
         SessionLatches::default(),
         SessionContext {
+            compaction_thresholds: Default::default(),
             session_id: "test-session".into(),
             run_id: "test-run".into(),
             model_id: "test-model".into(),
@@ -97,6 +98,7 @@ fn pipeline_single_turn_produces_valid_output() {
     };
 
     let plan_input = PlanInput {
+        compaction_thresholds: Default::default(),
         tokens: &turn.tokens,
         model_limit: session.model_limit,
         pre_reserved_output_tokens: 0,
@@ -174,6 +176,7 @@ fn pipeline_compaction_under_pressure() {
     };
 
     let plan_input = PlanInput {
+        compaction_thresholds: Default::default(),
         tokens: &turn.tokens,
         model_limit: session.model_limit,
         pre_reserved_output_tokens: 0,
@@ -215,6 +218,7 @@ fn pipeline_ptl_recovery_escalates() {
     };
 
     let plan_input = PlanInput {
+        compaction_thresholds: Default::default(),
         tokens: &turn.tokens,
         model_limit: session.model_limit,
         pre_reserved_output_tokens: 0,
@@ -264,6 +268,7 @@ fn pipeline_emergent_context_flows() {
     };
 
     let plan_input = PlanInput {
+        compaction_thresholds: Default::default(),
         tokens: &turn.tokens,
         model_limit: session.model_limit,
         pre_reserved_output_tokens: 0,

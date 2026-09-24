@@ -86,6 +86,7 @@ pub(crate) async fn collect_bedrock_stream(
 pub(crate) async fn collect_bedrock_stream_for_wire(
     response: reqwest::Response,
     model_name: &str,
+    transport_config: &astra_turn_types::LlmTransportConfig,
     started: Instant,
     provider_work_budget: std::time::Duration,
     cancel: LlmCancel<'_>,
@@ -100,7 +101,7 @@ pub(crate) async fn collect_bedrock_stream_for_wire(
         provider_work_budget,
         cancel,
         idle_timeout,
-        crate::turn::llm::client::llm_semantic_progress_timeout(),
+        std::time::Duration::from_millis(transport_config.semantic_progress_ms),
         Some(authorized_tool_names),
         stream_callback,
     )
@@ -856,15 +857,17 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn reasoning_then_silence_still_hits_bedrock_activity_deadline() {
         let response = reasoning_then_stalled_body_response().await;
-        let error = collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
+        let mut config = crate::turn::llm::client::capture_transport_config();
+        config.semantic_progress_ms = 10;
+        let error = collect_bedrock_stream_for_wire(
             response,
             "bedrock-test-model",
+            &config,
             Instant::now(),
             std::time::Duration::from_secs(30),
             LlmCancel::None,
             std::time::Duration::from_millis(20),
-            std::time::Duration::from_millis(10),
-            None,
+            &HashSet::new(),
             None,
         )
         .await

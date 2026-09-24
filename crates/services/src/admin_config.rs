@@ -307,6 +307,7 @@ mod tests {
                     api_key: api_key.into(),
                     base_url: "https://judgment.example.invalid".into(),
                     provider: provider.into(),
+                    pricing: None,
                     cache_capability: None,
                     thinking_capability: None,
                     fixed_temperature: None,

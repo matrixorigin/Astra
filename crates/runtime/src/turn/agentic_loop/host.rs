@@ -191,6 +191,31 @@ pub struct SkillAutoRouteDecision {
     pub skill_name: String,
 }
 
+/// Durable classification of the one optional Skill auto-route boundary.
+///
+/// The loop records this separately from the selected Skill so a report can
+/// distinguish a deliberate negative decision, an unavailable judge, and a
+/// judge that was never dispatched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillAutoRouteJudgmentOutcome {
+    Disabled,
+    NotDispatched { reason: String },
+    Negative,
+    Uncertain,
+    Selected { skill_name: String },
+    Failed { reason: String },
+}
+
+/// Exact durable evidence for the optional routing judgment. The lifecycle
+/// only marks a judgment available when this identity can be matched to the
+/// persisted inference ledger and the frozen request contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillAutoRouteJudgmentEvidence {
+    pub invocation_id: String,
+    pub logical_attempt: u32,
+    pub request_fingerprint: String,
+}
+
 pub struct SkillAutoRouteJudgeContext<'a> {
     pub query: &'a str,
     pub visible_skills: &'a [crate::turn::skill_tool::SkillToolInfo],
@@ -800,6 +825,14 @@ pub trait AgenticLoopHost: Send {
         false
     }
 
+    /// Evaluation's fixed Skill adapter has already admitted the query and
+    /// one owner-scoped catalog entry. It may run its frozen judgment without
+    /// fabricating a mutable Work/TurnIntent decision. Ordinary hosts keep the
+    /// stricter producer-owned intent requirement.
+    fn allows_skill_auto_route_without_turn_intent(&self) -> bool {
+        false
+    }
+
     /// Optional semantic judge for pre-routing directly into one skill.
     ///
     /// Hosts may override this only when they have an explicit structured
@@ -810,6 +843,21 @@ pub trait AgenticLoopHost: Send {
         _state: &AgenticLoopState,
         _ctx: SkillAutoRouteJudgeContext<'_>,
     ) -> Option<SkillAutoRouteDecision> {
+        None
+    }
+
+    /// Drain the durable outcome of the optional Skill auto-route judgment.
+    /// The lifecycle owner turns it into a canonical run event before
+    /// settlement. Hosts without this boundary return no outcome.
+    fn take_skill_auto_route_judgment_outcome(&mut self) -> Option<SkillAutoRouteJudgmentOutcome> {
+        None
+    }
+
+    /// Drain the durable identity of the routing judgment inference, when a
+    /// host dispatched one through the canonical auxiliary path.
+    fn take_skill_auto_route_judgment_evidence(
+        &mut self,
+    ) -> Option<SkillAutoRouteJudgmentEvidence> {
         None
     }
 
@@ -838,6 +886,12 @@ pub trait AgenticLoopHost: Send {
     /// own user-message guidance injection to avoid double injection.
     fn injects_round_guidance(&self) -> bool {
         false
+    }
+
+    /// Return the exact mid-loop guard thresholds frozen at Evaluation
+    /// admission. Ordinary hosts resolve their live runtime policy per round.
+    fn evaluation_midloop_guard_thresholds(&self) -> Option<(usize, usize)> {
+        None
     }
 
     /// Apply typed intent context needed by the next local model boundary.
@@ -1613,8 +1667,6 @@ pub struct SkillState {
     /// against this baseline so historical outcomes are not re-attributed to
     /// every later turn.
     pub quality_tracker_baseline: crate::skills::quality::SkillQualityTracker,
-    /// Skill auto-improvement tracker — detects user corrections and proposes SKILL.md rewrites.
-    pub improvement_tracker: astra_skills::improvement::ImprovementTracker,
     /// Skill listing message (available skill names + descriptions).
     /// Stored here instead of in `messages` so hosts can inject it ephemerally
     /// into each LLM request without bloating the persistent conversation history.
@@ -1639,7 +1691,6 @@ impl Default for SkillState {
             request_constraints: Default::default(),
             quality_tracker: Default::default(),
             quality_tracker_baseline: Default::default(),
-            improvement_tracker: Default::default(),
             listing_message: None,
             tool_event_hooks: Default::default(),
             session_event_hooks: Default::default(),
@@ -1671,9 +1722,20 @@ pub struct SkillExecutionState {
     /// Original delivered instructions and re-entry counters, not reloaded content.
     #[serde(serialize_with = "serialize_invoked_skills")]
     pub invoked: HashMap<String, crate::turn::skill_tool::InvokedSkill>,
+    /// User-adopted instruction snapshots, fixed for this execution. They are
+    /// projected into each provider request, not recorded as tool invocations.
+    pub adopted: BTreeMap<String, AdoptedSkillRevision>,
     /// Failed/invalid auto-route attempts must not restart after recovery.
     #[serde(serialize_with = "serialize_skill_set")]
     pub auto_route_attempts: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AdoptedSkillRevision {
+    pub version_id: String,
+    pub content_hash: String,
+    pub content_markdown: String,
 }
 
 impl SkillExecutionState {
@@ -5379,7 +5441,6 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         telemetry: Default::default(),
         skills: SkillState {
             quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-            improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
             ..Default::default()
         },
         hooks: Default::default(),
@@ -7231,7 +7292,6 @@ pub(crate) mod tests {
             telemetry: Default::default(),
             skills: SkillState {
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
                 ..Default::default()
             },
             hooks: Default::default(),
@@ -11024,6 +11084,15 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let original = state.skills.execution.invoked["test-skill"].clone();
+        state.skills.execution.adopted.insert(
+            "test-skill".to_string(),
+            AdoptedSkillRevision {
+                version_id: "v1".to_string(),
+                content_hash: "sha256:test".to_string(),
+                content_markdown: "User-adopted preference remains independent of tool invocation."
+                    .into(),
+            },
+        );
         let wire =
             serde_json::to_value(OriginalLoopExecutionFacts::capture(&state).unwrap()).unwrap();
         let restored: OriginalLoopExecutionFacts = serde_json::from_value(wire.clone()).unwrap();

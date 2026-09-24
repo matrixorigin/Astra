@@ -20,8 +20,6 @@ const DEFAULT_DRIFT_WINDOW_DAYS: i32 = 30;
 const DRIFT_INFO_DELTA: f64 = 0.05;
 const DRIFT_WARNING_DELTA: f64 = 0.10;
 const DRIFT_CRITICAL_DELTA: f64 = 0.20;
-const LOOP_QUALITY_THRESHOLD: f64 = 0.70;
-const LOOP_DRIFT_DELTA_THRESHOLD: f64 = 0.10;
 const TRUST_SLO_TARGET: f64 = 0.95;
 const ZERO_IQR_NOISE_BAND: f64 = 0.05;
 const SESSION_QUALITY_LEVEL: &str = "session";
@@ -43,7 +41,6 @@ trait EvaluationRow {
     fn string_column(&self, column: &str) -> Result<String, sqlx::Error>;
     fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error>;
     fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error>;
-    fn i8_column(&self, column: &str) -> Result<i8, sqlx::Error>;
     fn f64_column(&self, column: &str) -> Result<f64, sqlx::Error>;
     fn optional_f64_column(&self, column: &str) -> Result<Option<f64>, sqlx::Error>;
 }
@@ -58,10 +55,6 @@ impl EvaluationRow for sqlx::mysql::MySqlRow {
     }
 
     fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
-        self.try_get(column)
-    }
-
-    fn i8_column(&self, column: &str) -> Result<i8, sqlx::Error> {
         self.try_get(column)
     }
 
@@ -146,25 +139,6 @@ fn evaluation_row_non_negative_i64(
         ));
     }
     Ok(value)
-}
-
-fn evaluation_row_bool_i8(
-    row: &impl EvaluationRow,
-    context: &str,
-    column: &str,
-) -> ServiceResult<bool> {
-    let value = row
-        .i8_column(column)
-        .map_err(|error| evaluation_decode_error(context, column, error))?;
-    match value {
-        0 => Ok(false),
-        1 => Ok(true),
-        _ => Err(evaluation_decode_error(
-            context,
-            column,
-            format!("expected boolean 0 or 1, got {value}"),
-        )),
-    }
 }
 
 fn evaluation_row_f64(row: &impl EvaluationRow, context: &str, column: &str) -> ServiceResult<f64> {
@@ -273,25 +247,6 @@ fn drift_score_from_row(row: &impl EvaluationRow) -> ServiceResult<(String, Stri
     Ok((level, window_bucket, score))
 }
 
-fn gate_result_from_row(row: &impl EvaluationRow) -> ServiceResult<GateResultResponse> {
-    let context = "gate_result_row";
-    let sessions_tested = evaluation_row_non_negative_i64(row, context, "sessions_tested")?;
-    let error_rate = evaluation_score(row, context, "error_rate")?;
-    let score_delta = evaluation_finite_f64(row, context, "score_delta")?;
-    Ok(GateResultResponse {
-        gate_id: evaluation_required_non_empty_string(row, context, "gate_id")?,
-        change_type: evaluation_required_non_empty_string(row, context, "change_type")?,
-        change_id: evaluation_required_non_empty_string(row, context, "change_id")?,
-        sessions_tested,
-        error_rate,
-        error_rate_interval: sampled_confidence_interval(error_rate, sessions_tested),
-        score_delta,
-        score_delta_interval: sampled_value_interval(score_delta, sessions_tested),
-        passed: evaluation_row_bool_i8(row, context, "passed")?,
-        created_at: evaluation_optional_non_empty_string(row, context, "created_at")?,
-    })
-}
-
 fn calibration_sample_from_row(row: &impl EvaluationRow) -> ServiceResult<(f64, f64)> {
     let context = "calibration_sample_row";
     Ok((
@@ -309,10 +264,6 @@ fn session_score_from_row(row: &impl EvaluationRow) -> ServiceResult<SessionScor
         score_interval: ConfidenceInterval::exact(score),
         chain_count: evaluation_row_non_negative_i64(row, context, "chain_count")?,
     })
-}
-
-fn gate_validation_score_from_row(row: &impl EvaluationRow) -> ServiceResult<f64> {
-    evaluation_score(row, "gate_validation_score_row", "score")
 }
 
 fn trust_count_pair_from_row(row: &impl EvaluationRow, context: &str) -> ServiceResult<(i64, i64)> {
@@ -508,35 +459,6 @@ fn build_drift_signal(
     })
 }
 
-fn build_loop_actions(diagnoses: &[LoopDiagnosisItem], dry_run: bool) -> Vec<String> {
-    diagnoses
-        .iter()
-        .filter_map(|diagnosis| match diagnosis.action {
-            LoopAction::NoOp => None,
-            LoopAction::Retune => Some(format!(
-                "{}retune:{}",
-                if dry_run { "dry_run:" } else { "" },
-                diagnosis.metric
-            )),
-            LoopAction::Alert => Some(format!(
-                "{}alert:{}",
-                if dry_run { "dry_run:" } else { "" },
-                diagnosis.metric
-            )),
-        })
-        .collect()
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct GateValidationSummary {
-    sessions_tested: i64,
-    error_rate: f64,
-    score_delta: f64,
-    score_delta_interval: ValueInterval,
-    passed: bool,
-    details: String,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 struct CalibrationSummary {
     mean_confidence: f64,
@@ -607,20 +529,6 @@ fn sampled_value_interval(point: f64, sample_count: i64) -> ValueInterval {
     }
     let margin = (0.5 / (sample_count as f64).sqrt()).clamp(0.05, 0.25);
     ValueInterval::new(point, point - margin, point + margin)
-}
-
-fn confidence_to_value_interval(interval: ConfidenceInterval) -> ValueInterval {
-    ValueInterval::new(interval.point, interval.lower, interval.upper)
-}
-
-fn absolute_value_interval(interval: ValueInterval) -> ValueInterval {
-    let lower = if interval.lower <= 0.0 && interval.upper >= 0.0 {
-        0.0
-    } else {
-        interval.lower.abs().min(interval.upper.abs())
-    };
-    let upper = interval.lower.abs().max(interval.upper.abs());
-    ValueInterval::new(interval.point.abs(), lower, upper)
 }
 
 fn adjustment_multiplier_interval(
@@ -722,17 +630,6 @@ fn complement_interval(interval: ConfidenceInterval) -> ConfidenceInterval {
         1.0 - interval.upper,
         1.0 - interval.lower,
     )
-}
-
-fn change_type_label(change_type: &ChangeType) -> &'static str {
-    match change_type {
-        ChangeType::Prompt => "prompt",
-        ChangeType::Skill => "skill",
-        ChangeType::Config => "config",
-        ChangeType::ToolSurface => "tool_surface",
-        ChangeType::ContextBudget => "context_budget",
-        ChangeType::Knowledge => "knowledge",
-    }
 }
 
 fn summarize_calibration(
@@ -1151,146 +1048,6 @@ fn quality_trend_scores_query(model: Option<&str>) -> &'static str {
     }
 }
 
-fn summarize_gate_validation(
-    scores_desc: &[f64],
-    golden_session_count: i32,
-    error_rate_threshold: f64,
-    score_regression_threshold: f64,
-) -> GateValidationSummary {
-    let window = clamp_eval_limit(golden_session_count) as usize;
-    let error_rate_threshold = error_rate_threshold.clamp(0.0, 1.0);
-    let recent_end = scores_desc.len().min(window);
-    let recent = &scores_desc[..recent_end];
-    if recent.is_empty() {
-        return GateValidationSummary {
-            sessions_tested: 0,
-            error_rate: 0.0,
-            score_delta: 0.0,
-            score_delta_interval: ValueInterval::ZERO,
-            passed: false,
-            details: "No session quality scores available for gate validation.".into(),
-        };
-    }
-
-    let baseline_end = scores_desc.len().min(window * 2);
-    let baseline = &scores_desc[recent_end..baseline_end];
-    let recent_filtered = noise_filtered_average(recent);
-    let baseline_filtered = noise_filtered_average(baseline);
-    let recent_avg = recent_filtered.average;
-    let baseline_avg = baseline_filtered.average;
-    let error_count = recent
-        .iter()
-        .filter(|score| **score < LOOP_QUALITY_THRESHOLD)
-        .count();
-    let error_rate = error_count as f64 / recent.len() as f64;
-    let score_delta = if baseline.is_empty() {
-        0.0
-    } else {
-        recent_avg - baseline_avg
-    };
-    let score_delta_interval = if baseline.is_empty() {
-        ValueInterval::ZERO
-    } else {
-        sampled_value_interval(
-            score_delta,
-            recent_filtered
-                .sample_count
-                .min(baseline_filtered.sample_count),
-        )
-    };
-
-    let error_ok = error_rate <= error_rate_threshold;
-    let score_ok = baseline.is_empty() || score_delta >= score_regression_threshold;
-    let passed = error_ok && score_ok;
-
-    let mut reasons = Vec::new();
-    if !error_ok {
-        reasons.push(format!(
-            "error rate {:.1}% exceeded {:.1}%",
-            error_rate * 100.0,
-            error_rate_threshold * 100.0
-        ));
-    }
-    if !score_ok {
-        reasons.push(format!(
-            "score delta {:.3} below {:.3}",
-            score_delta, score_regression_threshold
-        ));
-    }
-
-    let filtering_note = if baseline.is_empty() {
-        if recent_filtered.sample_count < recent.len() as i64 {
-            format!(
-                " Noise filter kept {} of {} recent scores.",
-                recent_filtered.sample_count,
-                recent.len()
-            )
-        } else {
-            String::new()
-        }
-    } else if recent_filtered.sample_count < recent.len() as i64
-        || baseline_filtered.sample_count < baseline.len() as i64
-    {
-        format!(
-            " Noise filter kept {} of {} recent and {} of {} baseline scores.",
-            recent_filtered.sample_count,
-            recent.len(),
-            baseline_filtered.sample_count,
-            baseline.len()
-        )
-    } else {
-        String::new()
-    };
-
-    let details = if baseline.is_empty() {
-        format!(
-            "{} Validated {} recent session scores with no baseline window; recent avg {:.3}, error rate {:.1}% (threshold {:.1}%).{}",
-            if passed {
-                "Gate passed."
-            } else {
-                "Gate failed."
-            },
-            recent.len(),
-            recent_avg,
-            error_rate * 100.0,
-            error_rate_threshold * 100.0,
-            filtering_note
-        )
-    } else {
-        format!(
-            "{} Validated {} recent vs {} baseline session scores; recent avg {:.3}, baseline avg {:.3}, delta {:.3} (threshold {:.3}), error rate {:.1}% (threshold {:.1}%).{}{}",
-            if passed {
-                "Gate passed."
-            } else {
-                "Gate failed."
-            },
-            recent.len(),
-            baseline.len(),
-            recent_avg,
-            baseline_avg,
-            score_delta,
-            score_regression_threshold,
-            error_rate * 100.0,
-            error_rate_threshold * 100.0,
-            filtering_note,
-            if reasons.is_empty() {
-                String::new()
-            } else {
-                format!(" Reasons: {}.", reasons.join("; "))
-            }
-        )
-    };
-
-    GateValidationSummary {
-        sessions_tested: recent.len() as i64,
-        error_rate,
-        score_delta,
-        score_delta_interval,
-        passed,
-        details,
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct DatabaseEvaluationService {
     matrixone: MatrixOneSettings,
@@ -1474,36 +1231,6 @@ impl EvaluationService for DatabaseEvaluationService {
         })
     }
 
-    async fn get_gate_history(
-        &self,
-        user_id: &str,
-        limit: i32,
-    ) -> ServiceResult<GateHistoryResponse> {
-        let pool = self.get_pool().await.map_err(internal_error)?;
-        let limit = clamp_eval_limit(limit);
-
-        let rows = query(
-            "SELECT gate_id, change_type, change_id, sessions_tested, \
-             error_rate, score_delta, passed, \
-             DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-             FROM eval_gate_results \
-             WHERE user_id = ? \
-             ORDER BY created_at DESC LIMIT ?",
-        )
-        .bind(user_id)
-        .bind(limit)
-        .fetch_all(&pool)
-        .await
-        .map_err(internal_error)?;
-
-        let gates: Vec<GateResultResponse> = rows
-            .iter()
-            .map(gate_result_from_row)
-            .collect::<ServiceResult<_>>()?;
-        let total = gates.len();
-        Ok(GateHistoryResponse { gates, total })
-    }
-
     async fn get_calibration(
         &self,
         user_id: &str,
@@ -1640,183 +1367,6 @@ impl EvaluationService for DatabaseEvaluationService {
             .map_err(internal_error)?;
 
         Ok(())
-    }
-
-    async fn validate_gate(
-        &self,
-        user_id: &str,
-        request: GateValidateRequest,
-    ) -> ServiceResult<GateValidateResponse> {
-        let pool = self.get_pool().await.map_err(internal_error)?;
-        let sample_limit = clamp_eval_limit(request.golden_session_count) * 2;
-        let rows = query(
-            "SELECT score \
-             FROM eval_quality_assessments \
-             WHERE user_id = ? \
-               AND level = 'session' \
-             ORDER BY updated_at DESC LIMIT ?",
-        )
-        .bind(user_id)
-        .bind(sample_limit)
-        .fetch_all(&pool)
-        .await
-        .map_err(internal_error)?;
-
-        let scores = rows
-            .iter()
-            .map(gate_validation_score_from_row)
-            .collect::<ServiceResult<Vec<_>>>()?;
-        let summary = summarize_gate_validation(
-            &scores,
-            request.golden_session_count,
-            request.error_rate_threshold,
-            request.score_regression_threshold,
-        );
-        let gate_id = uuid::Uuid::now_v7().to_string();
-        let change_type = request.change_type.clone();
-
-        query(
-            "INSERT INTO eval_gate_results \
-             (gate_id, user_id, change_type, change_id, sessions_tested, error_rate, score_delta, passed) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&gate_id)
-        .bind(user_id)
-        .bind(change_type_label(&change_type))
-        .bind(&request.change_id)
-        .bind(summary.sessions_tested)
-        .bind(summary.error_rate)
-        .bind(summary.score_delta)
-        .bind(if summary.passed { 1_i8 } else { 0_i8 })
-        .execute(&pool)
-        .await
-        .map_err(internal_error)?;
-
-        Ok(GateValidateResponse {
-            gate_id,
-            change_type,
-            change_id: request.change_id,
-            sessions_tested: summary.sessions_tested,
-            error_rate: summary.error_rate,
-            error_rate_interval: sampled_confidence_interval(
-                summary.error_rate,
-                summary.sessions_tested,
-            ),
-            score_delta: summary.score_delta,
-            score_delta_interval: summary.score_delta_interval,
-            passed: summary.passed,
-            details: summary.details,
-        })
-    }
-
-    async fn run_drift_pipeline(&self, user_id: &str) -> ServiceResult<DriftPipelineResponse> {
-        let drift = self.detect_drift(user_id).await?;
-        let started_at = drift.checked_at.clone();
-        let run_id = format!("drift-{}", started_at.replace(['-', 'T', ':'], ""));
-        Ok(DriftPipelineResponse {
-            run_id,
-            signals_detected: drift.signals.len(),
-            signals: drift.signals,
-            started_at,
-        })
-    }
-
-    async fn run_closed_loop(
-        &self,
-        user_id: &str,
-        days: i32,
-        dry_run: bool,
-    ) -> ServiceResult<ClosedLoopResponse> {
-        let days = clamp_eval_days(days);
-        let quality = self.get_quality_trend(user_id, days, None).await?;
-        let drift = self.detect_drift(user_id).await?;
-
-        let (max_drift_delta, max_drift_delta_interval) =
-            drift
-                .signals
-                .iter()
-                .fold((0.0_f64, ValueInterval::ZERO), |best, signal| {
-                    let candidate = signal.noise_filtered_delta.abs();
-                    if candidate > best.0 {
-                        (
-                            candidate,
-                            absolute_value_interval(signal.noise_filtered_delta_interval),
-                        )
-                    } else {
-                        best
-                    }
-                });
-
-        let quality_signal = if quality.noise_filtered_total_events > 0 {
-            quality.noise_filtered_overall_avg
-        } else {
-            quality.overall_avg
-        };
-        let quality_signal_interval = if quality.noise_filtered_total_events > 0 {
-            confidence_to_value_interval(quality.noise_filtered_overall_avg_interval)
-        } else {
-            confidence_to_value_interval(quality.overall_avg_interval)
-        };
-
-        let quality_action =
-            if quality.noise_filtered_total_events > 0 && quality_signal < LOOP_QUALITY_THRESHOLD {
-                LoopAction::Retune
-            } else {
-                LoopAction::NoOp
-            };
-        let drift_count_action = if drift.signals.iter().any(|signal| {
-            matches!(
-                signal.severity,
-                DriftSeverity::Critical | DriftSeverity::Warning
-            )
-        }) {
-            LoopAction::Alert
-        } else if !drift.signals.is_empty() {
-            LoopAction::Retune
-        } else {
-            LoopAction::NoOp
-        };
-        let drift_delta_action = if max_drift_delta >= DRIFT_CRITICAL_DELTA {
-            LoopAction::Alert
-        } else if max_drift_delta >= LOOP_DRIFT_DELTA_THRESHOLD {
-            LoopAction::Retune
-        } else {
-            LoopAction::NoOp
-        };
-
-        let diagnoses = vec![
-            LoopDiagnosisItem {
-                metric: "quality_overall_avg".into(),
-                value: quality_signal,
-                value_interval: quality_signal_interval,
-                threshold: LOOP_QUALITY_THRESHOLD,
-                action: quality_action,
-            },
-            LoopDiagnosisItem {
-                metric: "drift_signal_count".into(),
-                value: drift.signals.len() as f64,
-                value_interval: ValueInterval::exact(drift.signals.len() as f64),
-                threshold: 0.0,
-                action: drift_count_action,
-            },
-            LoopDiagnosisItem {
-                metric: "drift_max_delta".into(),
-                value: max_drift_delta,
-                value_interval: max_drift_delta_interval,
-                threshold: LOOP_DRIFT_DELTA_THRESHOLD,
-                action: drift_delta_action,
-            },
-        ];
-
-        let loop_id = format!("loop-{}", now_iso().replace(['-', 'T', ':'], ""));
-        let actions_taken = build_loop_actions(&diagnoses, dry_run);
-
-        Ok(ClosedLoopResponse {
-            loop_id,
-            dry_run,
-            diagnoses,
-            actions_taken,
-        })
     }
 
     async fn trust_report(
@@ -2382,11 +1932,6 @@ mod tests {
             }
         }
 
-        fn i8_column(&self, column: &str) -> Result<i8, sqlx::Error> {
-            self.maybe_fail(column)?;
-            Err(sqlx::Error::ColumnNotFound(column.to_string()))
-        }
-
         fn f64_column(&self, column: &str) -> Result<f64, sqlx::Error> {
             self.maybe_fail(column)?;
             match column {
@@ -2411,7 +1956,6 @@ mod tests {
         failed_column: Option<&'static str>,
         strings: std::collections::BTreeMap<&'static str, Option<String>>,
         i64s: std::collections::BTreeMap<&'static str, i64>,
-        i8s: std::collections::BTreeMap<&'static str, i8>,
         f64s: std::collections::BTreeMap<&'static str, f64>,
         optional_f64s: std::collections::BTreeMap<&'static str, Option<f64>>,
     }
@@ -2436,11 +1980,6 @@ mod tests {
 
         fn i64(mut self, column: &'static str, value: i64) -> Self {
             self.i64s.insert(column, value);
-            self
-        }
-
-        fn i8(mut self, column: &'static str, value: i8) -> Self {
-            self.i8s.insert(column, value);
             self
         }
 
@@ -2479,14 +2018,6 @@ mod tests {
         fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
             self.maybe_fail(column)?;
             self.i64s
-                .get(column)
-                .copied()
-                .ok_or_else(|| sqlx::Error::ColumnNotFound(column.to_string()))
-        }
-
-        fn i8_column(&self, column: &str) -> Result<i8, sqlx::Error> {
-            self.maybe_fail(column)?;
-            self.i8s
                 .get(column)
                 .copied()
                 .ok_or_else(|| sqlx::Error::ColumnNotFound(column.to_string()))
@@ -2585,22 +2116,6 @@ mod tests {
             ("session".to_string(), "current".to_string(), 0.77)
         );
 
-        let gate_row = FakeEvaluationRow::default()
-            .string("gate_id", "gate-1")
-            .string("change_type", "tool_surface")
-            .string("change_id", "change-1")
-            .string("created_at", "2026-06-26T12:00:00")
-            .i64("sessions_tested", 5)
-            .f64("error_rate", 0.2)
-            .f64("score_delta", -0.08)
-            .i8("passed", 1);
-        let gate = gate_result_from_row(&gate_row).unwrap();
-        assert_eq!(gate.gate_id, "gate-1");
-        assert_eq!(gate.sessions_tested, 5);
-        assert_eq!(gate.score_delta, -0.08);
-        assert!(gate.passed);
-        assert_eq!(gate.created_at.as_deref(), Some("2026-06-26T12:00:00"));
-
         let calibration_row = FakeEvaluationRow::default()
             .f64("confidence", 0.62)
             .f64("quality_score", 0.71);
@@ -2690,20 +2205,6 @@ mod tests {
                     .f64("score", 0.7),
             ),
             "window_bucket",
-        );
-        assert_evaluation_internal_error_mentions(
-            gate_result_from_row(
-                &FakeEvaluationRow::default()
-                    .string("gate_id", "gate-1")
-                    .string("change_type", "tool_surface")
-                    .string("change_id", "change-1")
-                    .string("created_at", "2026-06-26T12:00:00")
-                    .i64("sessions_tested", 5)
-                    .f64("error_rate", 0.2)
-                    .f64("score_delta", -0.08)
-                    .i8("passed", 2),
-            ),
-            "passed",
         );
         assert_evaluation_internal_error_mentions(
             calibration_sample_from_row(
@@ -2862,48 +2363,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_loop_actions_honors_dry_run_prefix() {
-        let diagnoses = vec![
-            LoopDiagnosisItem {
-                metric: "quality_overall_avg".into(),
-                value: 0.5,
-                value_interval: ValueInterval::exact(0.5),
-                threshold: 0.7,
-                action: LoopAction::Retune,
-            },
-            LoopDiagnosisItem {
-                metric: "drift_signal_count".into(),
-                value: 2.0,
-                value_interval: ValueInterval::exact(2.0),
-                threshold: 0.0,
-                action: LoopAction::Alert,
-            },
-            LoopDiagnosisItem {
-                metric: "noop_metric".into(),
-                value: 1.0,
-                value_interval: ValueInterval::exact(1.0),
-                threshold: 1.0,
-                action: LoopAction::NoOp,
-            },
-        ];
-
-        assert_eq!(
-            build_loop_actions(&diagnoses, true),
-            vec![
-                "dry_run:retune:quality_overall_avg".to_string(),
-                "dry_run:alert:drift_signal_count".to_string(),
-            ]
-        );
-        assert_eq!(
-            build_loop_actions(&diagnoses, false),
-            vec![
-                "retune:quality_overall_avg".to_string(),
-                "alert:drift_signal_count".to_string(),
-            ]
-        );
-    }
-
     // ── DatabaseEvaluationService builder ───────────────────────────────
 
     #[test]
@@ -3040,7 +2499,6 @@ mod tests {
 
         assert!(svc.get_quality_trend("u", 30, None).await.is_err());
         assert!(svc.detect_drift("u").await.is_err());
-        assert!(svc.get_gate_history("u", 50).await.is_err());
         assert!(svc.get_calibration("u", None, 30).await.is_err());
         assert!(svc.get_session_scores("u", 50, 0.0).await.is_err());
         assert!(svc.trust_report("u", "a", 30).await.is_err());
@@ -3125,14 +2583,6 @@ mod tests {
         assert!((interval.point + 0.2).abs() < 0.0001);
         assert!(interval.lower < 0.0);
         assert!(interval.upper > interval.point);
-    }
-
-    #[test]
-    fn absolute_value_interval_clamps_crossing_zero_lower_bound() {
-        let interval = absolute_value_interval(ValueInterval::new(-0.1, -0.3, 0.2));
-        assert!((interval.point - 0.1).abs() < 0.0001);
-        assert_eq!(interval.lower, 0.0);
-        assert!((interval.upper - 0.3).abs() < 0.0001);
     }
 
     #[test]
@@ -3522,20 +2972,6 @@ mod tests {
     }
 
     #[test]
-    fn change_type_serde() {
-        use super::super::types::ChangeType;
-        let json = serde_json::to_string(&ChangeType::ContextBudget).unwrap();
-        assert_eq!(json, r#""context_budget""#);
-    }
-
-    #[test]
-    fn loop_action_serde() {
-        use super::super::types::LoopAction;
-        let json = serde_json::to_string(&LoopAction::NoOp).unwrap();
-        assert_eq!(json, r#""no_op""#);
-    }
-
-    #[test]
     fn export_format_serde() {
         use super::super::types::ExportFormat;
         let json = serde_json::to_string(&ExportFormat::Parquet).unwrap();
@@ -3548,66 +2984,6 @@ mod tests {
         let q: QualityTrendQuery = serde_json::from_str("{}").unwrap();
         assert_eq!(q.days, 30);
         assert!(q.model.is_none());
-    }
-
-    #[test]
-    fn gate_validate_request_defaults() {
-        use super::super::types::GateValidateRequest;
-        let json = r#"{"change_type":"prompt","change_id":"c1","change_content":{}}"#;
-        let req: GateValidateRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.golden_session_count, 50);
-        assert!((req.error_rate_threshold - 0.05).abs() < 0.001);
-        assert!((req.score_regression_threshold - (-0.1)).abs() < 0.001);
-    }
-
-    #[test]
-    fn summarize_gate_validation_rejects_missing_scores() {
-        let summary = summarize_gate_validation(&[], 50, 0.05, -0.1);
-        assert_eq!(summary.sessions_tested, 0);
-        assert!(!summary.passed);
-        assert!(summary.details.contains("No session quality scores"));
-    }
-
-    #[test]
-    fn summarize_gate_validation_passes_stable_recent_window() {
-        let summary = summarize_gate_validation(&[0.91, 0.88, 0.85, 0.84], 2, 0.2, -0.1);
-        assert_eq!(summary.sessions_tested, 2);
-        assert!(summary.passed);
-        assert!((summary.error_rate - 0.0).abs() < 1e-9);
-        assert!((summary.score_delta - 0.05).abs() < 1e-9);
-    }
-
-    #[test]
-    fn summarize_gate_validation_uses_noise_filtered_score_delta() {
-        let summary = summarize_gate_validation(
-            &[0.83, 0.82, 0.81, 0.80, 0.20, 0.82, 0.81, 0.80, 0.79, 0.80],
-            5,
-            0.25,
-            -0.05,
-        );
-        assert_eq!(summary.sessions_tested, 5);
-        assert!(summary.passed);
-        assert!(summary.score_delta > 0.0);
-        assert!((summary.score_delta_interval.point - summary.score_delta).abs() < 0.0001);
-        assert!(summary.details.contains("Noise filter kept 4 of 5 recent"));
-    }
-
-    #[test]
-    fn summarize_gate_validation_fails_on_error_rate() {
-        let summary = summarize_gate_validation(&[0.65, 0.60, 0.91, 0.90], 2, 0.25, -0.5);
-        assert_eq!(summary.sessions_tested, 2);
-        assert!(!summary.passed);
-        assert!((summary.error_rate - 1.0).abs() < 1e-9);
-        assert!(summary.details.contains("error rate"));
-    }
-
-    #[test]
-    fn summarize_gate_validation_fails_on_score_regression() {
-        let summary = summarize_gate_validation(&[0.72, 0.70, 0.95, 0.92], 2, 1.0, -0.1);
-        assert_eq!(summary.sessions_tested, 2);
-        assert!(!summary.passed);
-        assert!(summary.score_delta < -0.2);
-        assert!(summary.details.contains("score delta"));
     }
 
     #[test]

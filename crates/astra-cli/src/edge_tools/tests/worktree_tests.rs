@@ -160,3 +160,98 @@ async fn session_worktree_tool_enters_and_exits_through_public_dispatch() {
         .await;
     assert!(invalid.is_error);
 }
+
+#[test]
+fn worktree_enter_pins_requested_commit_and_reports_tree() {
+    let repo = init_temp_git_repo();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .current_dir(repo.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    let original = git(&["rev-parse", "HEAD"]);
+    let tree = git(&["rev-parse", "HEAD^{tree}"]);
+    std::fs::write(repo.path().join("tracked.txt"), "newer\n").unwrap();
+    git(&["commit", "-am", "new head"]);
+    let exe = ToolExecutor::new(repo.path());
+    let result = exe.worktree_with_metadata(&json!({
+        "action": "enter", "branch": "pinned-source", "source_commit": original
+    }));
+    assert!(!result.is_error, "{}", result.output);
+    let fields = result.tool_result_fields.unwrap();
+    assert_eq!(fields["source_commit"], original);
+    assert_eq!(fields["source_tree"], tree);
+    assert_eq!(
+        std::fs::read_to_string(exe.effective_project_root().join("tracked.txt")).unwrap(),
+        "committed\n"
+    );
+    exe.exit_worktree("remove", false).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+        "newer\n"
+    );
+}
+
+#[test]
+fn worktree_invalid_source_does_not_switch_session() {
+    let repo = init_temp_git_repo();
+    let exe = ToolExecutor::new(repo.path());
+    for source in [
+        json!("missing-ref"),
+        json!("HEAD^{tree}"),
+        json!("--help"),
+        json!(""),
+        json!(42),
+    ] {
+        let result = exe.worktree_with_metadata(&json!({
+            "action": "enter", "branch": "invalid-source", "source_commit": source
+        }));
+        assert!(result.is_error, "{}", result.output);
+        assert!(!exe.in_worktree_session());
+    }
+}
+
+#[test]
+fn pinned_worktrees_keep_trial_file_changes_separate() {
+    let repo = init_temp_git_repo();
+    let baseline = ToolExecutor::new(repo.path());
+    let candidate = ToolExecutor::new(repo.path());
+    let first = baseline.worktree_with_metadata(&json!({
+        "action": "enter", "branch": "eval-baseline"
+    }));
+    assert!(!first.is_error, "{}", first.output);
+    let first_fields = first.tool_result_fields.unwrap();
+    let second = candidate.worktree_with_metadata(&json!({
+        "action": "enter", "branch": "eval-candidate",
+        "source_commit": first_fields["source_commit"]
+    }));
+    assert!(!second.is_error, "{}", second.output);
+    let second_fields = second.tool_result_fields.unwrap();
+    assert_eq!(
+        first_fields["source_commit"],
+        second_fields["source_commit"]
+    );
+    assert_eq!(first_fields["source_tree"], second_fields["source_tree"]);
+    assert_ne!(
+        baseline.effective_project_root(),
+        candidate.effective_project_root()
+    );
+    std::fs::write(
+        candidate.effective_project_root().join("tracked.txt"),
+        "candidate\n",
+    )
+    .unwrap();
+    for root in [baseline.effective_project_root(), repo.path().to_path_buf()] {
+        assert_eq!(
+            std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
+            "committed\n"
+        );
+    }
+    // This proves file separation only; linked worktrees still share Git metadata.
+    candidate.exit_worktree("remove", true).unwrap();
+    baseline.exit_worktree("remove", false).unwrap();
+}

@@ -50,6 +50,18 @@ use async_trait::async_trait;
 
 const TOOL_RESULT_ARTIFACT_MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROVIDER_INTERACTION_ROUNDS_PER_TOOL_CALL: usize = 16;
+const SKILL_CREATOR_CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[async_trait]
+pub trait SkillCreatorToolService: Send + Sync {
+    async fn create_skill(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        request: astra_services::AuthoringIntentRequest,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<astra_services::AuthoringIntentRecord, String>;
+}
 
 /// Normalize authenticated, durable Edge evidence without inferring execution
 /// from output text. Interrupted dispatches need affirmative execution evidence.
@@ -785,6 +797,10 @@ pub struct RuntimeToolExecutor {
     pub(super) default_executor: DefaultToolExecutor,
     /// Canonical handler registry for server-local tools.
     tool_engine: ToolEngine<RuntimeToolExecutor>,
+    /// Product-owned Skill Creator orchestration. The tool engine remains the
+    /// only model-facing route; this service supplies the application use
+    /// case without granting any additional tool or workspace authority.
+    skill_creator_service: Option<Arc<dyn SkillCreatorToolService>>,
     /// Cooperative cancellation for server-owned runtime/control-plane tool awaits.
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     /// Immutable request-admission deadline for durable tool-result writes.
@@ -798,6 +814,8 @@ pub struct RuntimeToolExecutor {
     /// Explicit workspace, executor, runtime, and provisioned workspace record
     /// used for routing, tool visibility, and runtime preparation.
     execution_binding: ExecutionBindingState,
+    evaluation_workspace:
+        Option<astra_services::evaluation::workspace_evidence::EvaluationWorkspaceMaterialization>,
     capabilities: astra_turn_core::capability::CapabilitySet,
 
     // ── Locking (journals and dedup) ──────────────────────────────────────────
@@ -1013,6 +1031,7 @@ impl RuntimeToolExecutor {
             sandbox_policy,
             default_executor,
             tool_engine,
+            skill_creator_service: None,
             file_journal: Arc::new(Mutex::new(FileEditJournal::new(500))),
             convergence_tracker: Default::default(),
             database_snapshot_journal: Arc::new(Mutex::new(
@@ -1060,6 +1079,7 @@ impl RuntimeToolExecutor {
             work_surface_events: WorkSurfaceEventEmitter::new(session_id.clone()),
             tool_route_observer: Arc::new(std::sync::RwLock::new(None)),
             execution_binding: ExecutionBindingState::none(),
+            evaluation_workspace: None,
             capabilities,
             enforce_server_tool_capabilities: false,
             server_service_tools_enabled: true,
@@ -1126,6 +1146,105 @@ impl RuntimeToolExecutor {
     ) -> Self {
         self.reflect_service = service;
         self
+    }
+
+    pub fn with_skill_creator_service(mut self, service: Arc<dyn SkillCreatorToolService>) -> Self {
+        self.skill_creator_service = Some(service);
+        self
+    }
+
+    pub(super) async fn execute_skill_creator(
+        &self,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return astra_tools::cancelled_tool_result("skill_creator", false);
+        }
+        let Some(_) = args
+            .get("goal")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|goal| !goal.is_empty())
+        else {
+            return astra_tools::ToolResult::error(
+                "skill_creator requires a non-empty goal".to_string(),
+            );
+        };
+        let Some(service) = self.skill_creator_service.as_ref() else {
+            return astra_tools::ToolResult::error(
+                "Skill Creator is unavailable because its server service is not configured"
+                    .to_string(),
+            );
+        };
+        let service = Arc::clone(service);
+        let user_id = self.user_id.clone();
+        let session_id = self.session_id.clone();
+        let mut request =
+            match serde_json::from_value::<astra_services::AuthoringIntentRequest>(args.clone()) {
+                Ok(request) => request,
+                Err(error) => {
+                    return astra_tools::ToolResult::error(format!(
+                        "invalid authoring request: {error}"
+                    ));
+                }
+            };
+        request
+            .idempotency_key
+            .get_or_insert_with(|| uuid::Uuid::new_v4().to_string());
+        let harness_run_id = request.harness_run_id(&user_id, &session_id);
+        let cancelled_result = |candidate| {
+            let mut result = astra_tools::cancelled_tool_result("skill_creator", true);
+            result.output = serde_json::json!({
+                "status": "cancelled",
+                "harness_run_id": harness_run_id,
+                "review_url": harness_run_id.as_ref().map(|id| format!("/harnesses?runId={id}")),
+                "candidate": candidate,
+                "message": "No further generation phases will start; dispatched inference is settling. Open the saved run to inspect its outcome.",
+            }).to_string();
+            result
+        };
+        let operation_cancel = cancel_token.cloned();
+        // Drain dispatched inference durably, while cancellation prevents new phases.
+        let mut operation = tokio::spawn(async move {
+            service
+                .create_skill(&user_id, &session_id, request, operation_cancel)
+                .await
+        });
+        let joined = if let Some(cancel_token) = cancel_token {
+            tokio::select! {
+                biased;
+                result = &mut operation => result,
+                _ = cancel_token.cancelled() => {
+                    let settled = tokio::time::timeout(SKILL_CREATOR_CANCEL_SETTLE_TIMEOUT, &mut operation).await;
+                    return cancelled_result(match settled { Ok(Ok(Ok(record))) => Some(record.tool_output()), _ => None });
+                }
+            }
+        } else {
+            operation.await
+        };
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return cancelled_result(match joined {
+                Ok(Ok(record)) => Some(record.tool_output()),
+                _ => None,
+            });
+        }
+        let failed_result = |error: String| {
+            astra_tools::ToolResult::error(serde_json::json!({
+                "status": "failed", "error": error, "harness_run_id": harness_run_id,
+                "result_url": harness_run_id.as_ref().map(|id| format!("/authoring?runId={id}")),
+            }).to_string())
+        };
+        let record = match joined {
+            Ok(Ok(record)) => record,
+            Ok(Err(error)) => return failed_result(error),
+            Err(error) => {
+                return failed_result(format!(
+                    "Skill Creator operation terminated unexpectedly: {error}"
+                ));
+            }
+        };
+        astra_tools::ToolResult::text(record.tool_output().to_string())
     }
 
     /// Configure semantic read reuse from exact provider capabilities.
@@ -2283,6 +2402,9 @@ impl RuntimeToolExecutor {
     }
 
     fn executor_tool_readiness_for_call(&self, name: &str, args: &Value) -> ExecutorToolReadiness {
+        if name == "skill_creator" && self.skill_creator_service.is_none() {
+            return ExecutorToolReadiness::MissingService(Capability::SkillsCatalog);
+        }
         if self.current_edge_provider_binding() && self.current_edge_provider_schema_contains(name)
         {
             // The websocket handshake still advertises and authorizes only
@@ -2774,6 +2896,16 @@ impl RuntimeToolExecutor {
         self
     }
 
+    pub(crate) fn with_evaluation_workspace(
+        mut self,
+        workspace: Option<
+            astra_services::evaluation::workspace_evidence::EvaluationWorkspaceMaterialization,
+        >,
+    ) -> Self {
+        self.evaluation_workspace = workspace;
+        self
+    }
+
     pub fn with_admitted_execution_deadline(
         mut self,
         deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
@@ -3050,6 +3182,7 @@ impl RuntimeToolExecutor {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
         }
+        request.evaluation_workspace = self.evaluation_workspace.clone();
         request.runtime_process_authorization =
             astra_server_types::edge_ws_protocol::runtime_process_authorization_applies_to_tool(
                 name,
@@ -3081,6 +3214,7 @@ impl RuntimeToolExecutor {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
         }
+        request.evaluation_workspace = self.evaluation_workspace.clone();
         request.runtime_process_authorization =
             astra_server_types::edge_ws_protocol::runtime_process_authorization_applies_to_tool(
                 name,
@@ -3524,7 +3658,7 @@ impl RuntimeToolExecutor {
             let frozen_decision = match ledger
                 .prepare_for_execution(&identity, &fingerprint, &durable_decision, |decision| {
                     crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::from_durable(decision)
-                        .map(|_| ())
+                        .and_then(|snapshot| snapshot.validate_evaluation_binding(&request))
                         .map_err(|error| error.to_string())
                 })
                 .await
@@ -3552,8 +3686,8 @@ impl RuntimeToolExecutor {
                 Err(error) => {
                     let dispatch_control = dispatch_control_for_invocation_error(&error);
                     return GovernableRuntimeToolResult::completed_with_dispatch_control(
-                        crate::server::tool_invocation_runtime::ledger_unavailable_result(
-                            &identity, error,
+                        crate::server::tool_invocation_runtime::ledger_error_result(
+                            &identity, &error,
                         ),
                         dispatch_control,
                     );
@@ -3608,11 +3742,17 @@ impl RuntimeToolExecutor {
                 semantic_read_cache_key_id = semantic_cache_key.as_ref().map(|key| key.key_id.as_str()),
                 "resolved frozen tool invocation decision"
             );
+            let durable_dispatch_admission = durable_dispatch_admission.map(|mut admission| {
+                admission.expected_execution_binding_generation =
+                    request.policy.execution_binding_generation;
+                admission
+            });
             let (cache_fill, mut cache_evidence) = match crate::server::semantic_read_observation_runtime::before_dispatch(
                 self.semantic_read_observation_store.as_ref(),
                 ledger,
                 &identity,
                 semantic_cache_key.as_ref(),
+                durable_dispatch_admission,
                 cancel_token.as_deref(),
             )
             .await
@@ -3640,11 +3780,6 @@ impl RuntimeToolExecutor {
                         provider_confirmed: false,
                     }
                 })
-            });
-            let durable_dispatch_admission = durable_dispatch_admission.map(|mut admission| {
-                admission.expected_execution_binding_generation =
-                    request.policy.execution_binding_generation;
-                admission
             });
             let admitted_control_epoch = durable_dispatch_admission
                 .as_ref()
@@ -3710,8 +3845,8 @@ impl RuntimeToolExecutor {
                     }
                     let dispatch_control = dispatch_control_for_invocation_error(&error);
                     return GovernableRuntimeToolResult::completed_with_dispatch_control(
-                        crate::server::tool_invocation_runtime::ledger_unavailable_result(
-                            &identity, error,
+                        crate::server::tool_invocation_runtime::ledger_error_result(
+                            &identity, &error,
                         ),
                         dispatch_control,
                     );
@@ -7720,6 +7855,9 @@ mod tests {
             if work_service_unavailable {
                 continue;
             }
+            if handler_name == "skill_creator" && exec.skill_creator_service.is_none() {
+                continue;
+            }
             if (handler_name == "run_script"
                 && (cfg!(not(unix)) || !astra_sandbox::process_scope_available()))
                 || runtime_spec.requires_explicit_user_enablement()
@@ -7805,6 +7943,9 @@ mod tests {
                         })
                     }) && !exec.work_service_available();
                 if work_service_unavailable {
+                    return false;
+                }
+                if *n == "skill_creator" && exec.skill_creator_service.is_none() {
                     return false;
                 }
                 !schema_names.contains(*n)
@@ -8731,6 +8872,39 @@ esac
         );
     }
 
+    #[tokio::test]
+    async fn skill_creator_cancelled_join_keeps_the_recovery_reference() {
+        struct CancelDuringCreation;
+        #[async_trait]
+        impl SkillCreatorToolService for CancelDuringCreation {
+            async fn create_skill(
+                &self,
+                _: &str,
+                _: &str,
+                _: astra_services::AuthoringIntentRequest,
+                token: Option<CancellationToken>,
+            ) -> Result<astra_services::AuthoringIntentRecord, String> {
+                token.expect("cancellation must reach the service").cancel();
+                Err("generation stopped".into())
+            }
+        }
+        let (executor, _dir) = test_executor();
+        let executor = executor.with_skill_creator_service(Arc::new(CancelDuringCreation));
+        let request = json!({"goal":"Create review skill", "idempotency_key":"cancel-race"});
+        let expected =
+            serde_json::from_value::<astra_services::AuthoringIntentRequest>(request.clone())
+                .unwrap()
+                .harness_run_id(&executor.user_id, &executor.session_id)
+                .unwrap();
+        let result = executor
+            .execute_skill_creator(&request, Some(&CancellationToken::new()))
+            .await;
+        assert!(result.is_error);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["status"], "cancelled");
+        assert_eq!(output["harness_run_id"], expected);
+    }
+
     fn test_executor_with_agent_context() -> (RuntimeToolExecutor, TempDir) {
         let (mut exec, dir) = test_executor();
         exec.set_agent_tool_context(test_agent_tool_context(dir.path()));
@@ -8945,6 +9119,7 @@ esac
             &first_identity,
             Some(&key),
             None,
+            None,
         )
         .await
         {
@@ -8983,6 +9158,7 @@ esac
             &ledger,
             &second_identity,
             Some(&key),
+            None,
             None,
         )
         .await
@@ -9026,6 +9202,7 @@ esac
             &identity,
             Some(&key),
             None,
+            None,
         )
         .await
         {
@@ -9062,6 +9239,7 @@ esac
             &ledger,
             &next_identity,
             Some(&key),
+            None,
             None,
         )
         .await;
@@ -9100,6 +9278,7 @@ esac
             &ledger,
             &first_identity,
             Some(&key),
+            None,
             None,
         )
         .await
@@ -9149,6 +9328,7 @@ esac
             &ledger,
             &second_identity,
             Some(&key),
+            None,
             None,
         )
         .await;

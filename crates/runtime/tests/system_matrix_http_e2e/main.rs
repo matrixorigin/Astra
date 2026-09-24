@@ -28,6 +28,7 @@ mod journey_admin_smoke_matrix;
 mod journey_branches_matrix;
 mod journey_context_decision_chain_matrix;
 mod journey_delegate_http_matrix;
+mod journey_evaluation_coding_matrix;
 mod journey_evaluation_reads_matrix;
 mod journey_extended;
 mod journey_full;
@@ -326,6 +327,11 @@ matrix_test! {
     e2e_matrix_evaluation_reads, 2,
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
     journey_evaluation_reads_matrix::run_evaluation_read_http_smoke
+}
+matrix_test! {
+    e2e_matrix_evaluation_coding_real_edge, 4,
+    "live MatrixOne + dedicated astra-edge; ASTRA_TEST_DB_IT=1, ASTRA_EVALUATION_EDGE_BIN, ASTRA_EVALUATION_EDGE_CONFIG, and ASTRA_EVALUATION_EDGE_WORKSPACE_DIR required",
+    journey_evaluation_coding_matrix::run_evaluation_coding_real_edge
 }
 matrix_test! {
     e2e_matrix_context_decision_chain, 2,

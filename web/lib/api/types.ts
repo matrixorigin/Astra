@@ -394,6 +394,7 @@ export type HarnessCitation = {
   skill_rule_id: string | null;
   source_id: string | null;
   source_locator_json: Record<string, unknown>;
+  source_metadata_json?: Record<string, unknown>;
   artifact_id: string | null;
   quote_hash: string | null;
   evidence_text_preview: string | null;
@@ -438,6 +439,7 @@ export type HarnessSkillDraft = {
 };
 
 export type SkillifyRunRequest = {
+  idempotency_key?: string;
   session_ids: string[];
   source_files?: Array<{
     file_name: string;
@@ -449,28 +451,84 @@ export type SkillifyRunRequest = {
   target_scope?: 'personal' | 'project';
 };
 
+export type AuthoringIntentRequest = {
+  goal: string;
+  create_new?: boolean;
+  target_skill?: { skill_name: string; version_id: string };
+  validation_task?: { source_id: string; expected_result: unknown };
+  idempotency_key?: string;
+};
+
+export type AuthoringEvaluationSummary = {
+  status: string;
+  reason: string;
+  experiment_id: string | null;
+};
+
+export type AuthoringEvaluationPlan = {
+  experiment: {
+    experiment_id: string;
+    spec_fingerprint: string;
+  };
+  trials: Array<{
+    trial_id: string;
+    binding_status: string;
+    session_id: string | null;
+    run_id: string | null;
+    trial: {
+      sequence: number;
+      case_id: string;
+      arm: string;
+      repetition: number;
+    };
+  }>;
+  adapter_profile_version: string;
+};
+
+export type AuthoringInferenceEvidence = {
+  schema_version: number;
+  invocation_count: number;
+  physical_attempt_count: number;
+  priced_attempt_count: number;
+  exact_usage_attempt_count: number;
+  complete: boolean;
+  settlement_pending: boolean;
+  usage_status: string;
+  providers: string[];
+  models: string[];
+  offering_ids: string[];
+  operations: string[];
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_creation_tokens: number | null;
+  estimated_cost_usd: number | null;
+  completeness_reasons: string[];
+  evidence_fingerprint: string;
+};
+
+export type AuthoringIntentRecord = {
+  target: string;
+  operation: string;
+  resolution_source: string;
+  goal: string;
+  harness_run: HarnessRun;
+  skill_drafts: HarnessSkillDraft[];
+  evaluation: AuthoringEvaluationSummary;
+  evaluation_plan?: AuthoringEvaluationPlan | null;
+  inference: AuthoringInferenceEvidence;
+};
+
 export type HarnessDecisionRequest = {
+  expected_revision?: number;
   decision: 'approve' | 'reject' | 'edit' | 'request_revision';
   after_json?: Record<string, unknown>;
   reason?: string;
   idempotency_key?: string;
 };
 
-export type SkillifyDraftRequest = {
-  skill_name?: string | null;
-  version?: string | null;
-  description?: string | null;
-};
-
-export type SkillifyDraft = {
-  harness_run_id: string;
-  skill_name: string;
-  version_id: string;
-  content_markdown: string;
-  approved_item_count: number;
-};
-
 export type SkillifyPublishRequest = {
+  expected_revision: number;
   visibility?: 'private' | 'public';
   version?: string | null;
   description?: string | null;

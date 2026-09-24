@@ -135,6 +135,9 @@ pub(super) async fn build_runtime_wiring(
     .with_workspace_record_store(workspace_record_store)
     .with_resource_governor(resource_governor.clone())
     .with_skill_service(state.skill_service.clone())
+    .with_skill_creator_service(Arc::new(
+        crate::server::product_harness_handlers::AppStateSkillCreatorToolService::new(state),
+    ))
     .with_model_service(state.model_service.clone())
     .with_mcp_registry_service(state.mcp_registry_service.clone())
     .with_agent_binding_service(state.agent_binding_service.clone())
@@ -147,6 +150,33 @@ pub(super) async fn build_runtime_wiring(
     .with_tool_execution_service(state.tool_execution_service.clone());
     if let Some(svc) = memory_extraction_service.as_ref() {
         run_lifecycle = run_lifecycle.with_memory_extraction_service(Arc::clone(svc));
+    }
+
+    // A process can die after the canonical evaluation Run claim but before
+    // the trial binding/admission marker is written. Reconcile those bounded
+    // recovery results through the same lifecycle owner before serving new
+    // requests, so a planned trial cannot remain invisible forever.
+    for run in &recovered_runs {
+        if run.status == astra_core::STATUS_FAILED
+            || run.status == astra_core::STATUS_CANCELLED
+            || run.status == astra_core::STATUS_COMPLETED
+        {
+            let has_evaluation_intent = run.events.iter().any(|event| {
+                event.get("event_type").and_then(serde_json::Value::as_str) == Some("run_started")
+                    && event.pointer("/data/evaluation_admission").is_some()
+            });
+            if has_evaluation_intent {
+                run_lifecycle
+                    .reconcile_evaluation_observation_for_run(
+                        &run.user_id,
+                        &run.run_id,
+                        &run.session_id,
+                        run.run_generation,
+                        &run.status,
+                    )
+                    .await;
+            }
+        }
     }
 
     #[cfg(feature = "harness")]

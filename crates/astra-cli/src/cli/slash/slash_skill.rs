@@ -1,14 +1,205 @@
 use crate::cli::surface::skill_install_status_surface::skill_install_status_surface;
-use crate::cli::{
-    cli_config::{
-        cli_output,
-        cli_utils::{prefix_chars, truncate_str},
-    },
-    session::session_state::SessionState,
-    theme,
-};
+use crate::cli::{cli_config::cli_output, session::session_state::SessionState, theme};
 use astra_runtime::prompts;
 use crossterm::style::Stylize;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedAuthoringRequest {
+    api_origin: String,
+    session_id: String,
+    request: serde_json::Value,
+}
+
+fn save_authoring_request(
+    directory: &std::path::Path,
+    saved: &SavedAuthoringRequest,
+) -> Result<std::path::PathBuf, String> {
+    use std::io::Write;
+    std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    let path = directory.join(format!("{}.json", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec(saved).map_err(|error| error.to_string())?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+async fn resume_authoring_request(
+    path: &std::path::Path,
+    api: &astra_thin_client::ThinClient,
+    token: Option<&str>,
+) -> Result<(), String> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("Cannot read saved authoring request: {error}"))?;
+    let saved: SavedAuthoringRequest =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if saved
+        .request
+        .get("idempotency_key")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|key| key.trim().is_empty())
+    {
+        return Err("Saved authoring request has no recoverable attempt identity.".into());
+    }
+    if saved.api_origin != api.api_origin() {
+        return Err(
+            "Saved authoring request belongs to a different server; select its original profile."
+                .into(),
+        );
+    }
+    eprintln!("  Resume this attempt: /skill resume {}", path.display());
+    dispatch_authoring_request(&saved, api, token)
+        .await
+        .map_err(|error| {
+            format!(
+                "{error}; resume the same attempt with /skill resume {}",
+                path.display()
+            )
+        })
+}
+
+async fn start_authoring_from_session(
+    arg: &str,
+    create_new: bool,
+    api: &astra_thin_client::ThinClient,
+    token: Option<&str>,
+    state: &SessionState,
+) -> Result<(), String> {
+    let (target_name, goal) = if !create_new && arg.trim().starts_with("--skill ") {
+        let (name, goal) = arg.trim()[8..].split_once(' ').unwrap_or(("", ""));
+        (Some(name), goal.trim())
+    } else {
+        (None, arg.trim())
+    };
+    if goal.is_empty() {
+        return Err(
+            "Usage: /skill create <goal> or /skill improve [--skill <name>] <goal>".to_string(),
+        );
+    }
+    let session_id = state
+        .session_id
+        .as_deref()
+        .ok_or_else(|| "no active session is available for authoring".to_string())?;
+    let target = if create_new {
+        None
+    } else {
+        let targets: Vec<astra_services::harness::AuthoringSkillTarget> = api
+            .get_bearer_path_query_json(
+                token.unwrap_or(""),
+                &format!("/harnesses/authoring/{session_id}"),
+                &[],
+            )
+            .await
+            .map_err(|error| format!("Cannot read active Skills: {error}"))?;
+        match target_name {
+            Some(name) => Some(
+                targets
+                    .iter()
+                    .find(|target| target.skill_name == name)
+                    .cloned()
+                    .ok_or_else(|| format!("No active Skill named {name}."))?,
+            ),
+            None if targets.len() == 1 => targets.into_iter().next(),
+            None if targets.is_empty() => {
+                return Err("No active Skill to improve. Use /skill create <goal>.".into());
+            }
+            None => {
+                return Err(format!(
+                    "Choose a Skill: /skill improve --skill <name> <goal>. Active Skills: {}",
+                    targets
+                        .iter()
+                        .map(|target| target.skill_name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+    };
+    let saved = SavedAuthoringRequest {
+        api_origin: api.api_origin(),
+        session_id: session_id.to_string(),
+        request: serde_json::json!({"goal": goal, "create_new": create_new, "target_skill": target,
+            "idempotency_key": uuid::Uuid::new_v4().to_string()}),
+    };
+    let directory = crate::cli::cli_config::cli_utils::credentials_path()
+        .parent()
+        .ok_or("credentials directory unavailable")?
+        .join("authoring");
+    let path = save_authoring_request(&directory, &saved)?;
+    resume_authoring_request(&path, api, token).await
+}
+
+async fn dispatch_authoring_request(
+    saved: &SavedAuthoringRequest,
+    api: &astra_thin_client::ThinClient,
+    token: Option<&str>,
+) -> Result<(), String> {
+    let session_id = &saved.session_id;
+    let response = api
+        .post_bearer_path_json_text(
+            token.unwrap_or(""),
+            &format!("/harnesses/authoring/{session_id}"),
+            &saved.request,
+        )
+        .await
+        .map_err(|error| format!("Authoring request failed: {error}"))?;
+    let record: astra_services::AuthoringIntentRecord = serde_json::from_str(&response)
+        .map_err(|error| format!("Authoring returned invalid result metadata: {error}"))?;
+    eprintln!(
+        "  {} {} {} via {} ({})",
+        theme::icon_ok(),
+        record.operation,
+        record.target,
+        record.resolution_source,
+        record.harness_run.status,
+    );
+    eprintln!(
+        "  Evaluation: {} — {}",
+        record.evaluation.status, record.evaluation.reason
+    );
+    eprintln!(
+        "  {} Skill candidate(s): /authoring?runId={}",
+        record.skill_drafts.len(),
+        record.harness_run.harness_run_id
+    );
+    for draft in &record.skill_drafts {
+        eprintln!("\n{}\n", draft.content_markdown);
+    }
+    if let Some(prepared) = record.evaluation_plan {
+        let wait_secs = 300u64
+            .checked_mul(prepared.trials.len() as u64)
+            .and_then(|seconds| seconds.checked_add(60))
+            .ok_or_else(|| "evaluation wait budget overflows".to_string())?;
+        let report = crate::cli::evaluation::run_prepared_evaluation(
+            api,
+            token.unwrap_or(""),
+            prepared,
+            wait_secs,
+            500,
+        )
+        .await?;
+        eprintln!("  Evaluation report:");
+        let report: astra_services::evaluation::EvaluationReportArtifact =
+            serde_json::from_str(&report)
+                .map_err(|error| format!("Invalid evaluation report: {error}"))?;
+        let width = crossterm::terminal::size()
+            .ok()
+            .map(|(width, _)| width as usize);
+        for line in crate::tui::render_markdown_text_with_width(&report.markdown, width).lines {
+            eprintln!("{line}");
+        }
+    }
+    eprintln!("  Nothing was activated; publishing/adoption remains an explicit reviewed action.");
+    Ok(())
+}
 
 pub(crate) fn default_skill_category(category: Option<&str>) -> String {
     category
@@ -101,8 +292,13 @@ pub(crate) async fn handle_skill_command(
             );
             eprintln!(
                 "    {}  {}",
-                "/skill create".magenta(),
-                "Auto-generate from session".dim()
+                "/skill create <goal>".magenta(),
+                "Create a capability from this session".dim()
+            );
+            eprintln!(
+                "    {}  {}",
+                "/skill resume <saved-request-file>".magenta(),
+                "Recover the same generation after interruption".dim()
             );
             eprintln!(
                 "    {}  {}",
@@ -1214,9 +1410,11 @@ Follow these steps:
             rollback_skill(sub_arg.trim(), api, token, state).await;
         }
 
-        "create" => {
-            // Auto-generate a skill from the current session transcript
-            create_skill_from_session(sub_arg, state).await?;
+        "resume" => {
+            resume_authoring_request(std::path::Path::new(sub_arg), api, token).await?;
+        }
+        "create" | "improve" => {
+            start_authoring_from_session(sub_arg, sub == "create", api, token, state).await?;
         }
 
         "feedback" => {
@@ -1515,267 +1713,6 @@ fn skill_relevance_score(m: &astra_skills::SkillManifest, query: &str) -> u32 {
     }
 
     score
-}
-
-// ═══════════════════════════════════════════════ Skill Auto-Generation ════
-
-/// Analyze the current session and generate a SKILL.md from observed patterns.
-async fn create_skill_from_session(arg: &str, state: &mut SessionState) -> Result<(), String> {
-    use astra_services::session_journal;
-    use std::collections::HashMap;
-
-    let name = arg.split_whitespace().next().unwrap_or("").trim();
-    if name.is_empty() {
-        eprintln!("{}", "  Usage: /skill create <name>".yellow());
-        eprintln!(
-            "{}",
-            "  Analyzes the current session and generates a skill from it.".dim()
-        );
-        return Ok(());
-    }
-
-    // Validate name (kebab-case)
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        eprintln!(
-            "  {} Skill name must be alphanumeric, hyphens, or underscores.",
-            theme::icon_err()
-        );
-        return Ok(());
-    }
-
-    // Check not duplicate
-    let skills_base = std::env::current_dir()
-        .map_err(|e| e.to_string())?
-        .join(".astra/skills");
-    let skill_dir = skills_base.join(name);
-    if skill_dir.exists() {
-        eprintln!(
-            "  {} Skill '{}' already exists at {}",
-            theme::icon_err(),
-            name,
-            skill_dir.display()
-        );
-        return Ok(());
-    }
-
-    // Read session journal
-    let session_id = match &state.session_id {
-        Some(s) => s.clone(),
-        None => {
-            eprintln!("  {} No active session to analyze.", theme::icon_err());
-            return Ok(());
-        }
-    };
-
-    let events = session_journal::read_journal(&session_id).map_err(|e| e.to_string())?;
-    let turns: Vec<_> = events
-        .iter()
-        .filter(|e| matches!(e.event_type, session_journal::JournalEventType::Turn))
-        .collect();
-
-    if turns.is_empty() {
-        eprintln!(
-            "  {} No turns in current session to analyze.",
-            theme::icon_warn()
-        );
-        return Ok(());
-    }
-
-    eprintln!(
-        "  {} Analyzing {} turns from session {}...",
-        theme::icon_info(),
-        turns.len(),
-        &session_id[..8.min(session_id.len())]
-    );
-
-    // ── Extract patterns ────────────────────────────────────────────────
-
-    // 1. Tool frequency
-    let mut tool_freq: HashMap<String, u32> = HashMap::new();
-    let mut total_tool_calls = 0u32;
-    for t in &turns {
-        if let Some(ref tools) = t.tools_used {
-            for tool in tools {
-                *tool_freq.entry(tool.clone()).or_insert(0) += 1;
-                total_tool_calls += 1;
-            }
-        }
-    }
-
-    // Sort by frequency, take top tools
-    let mut tool_ranked: Vec<_> = tool_freq.into_iter().collect();
-    tool_ranked.sort_by_key(|x| std::cmp::Reverse(x.1));
-    let top_tools: Vec<String> = tool_ranked.iter().take(10).map(|t| t.0.clone()).collect();
-
-    // 2. Collect user intents (first line of each user input)
-    let mut user_intents: Vec<String> = Vec::new();
-    for t in &turns {
-        if let Some(ref input) = t.user_input {
-            let first_line = input.lines().next().unwrap_or("").trim();
-            if !first_line.is_empty() && first_line.len() < 200 {
-                user_intents.push(first_line.to_string());
-            }
-        }
-    }
-
-    // 3. Skills already used
-    let mut skills_used: Vec<String> = Vec::new();
-    for t in &turns {
-        if let Some(ref skills) = t.selected_skills {
-            for s in skills {
-                if !skills_used.contains(s) {
-                    skills_used.push(s.clone());
-                }
-            }
-        }
-    }
-
-    // 4. Estimate description from first user message
-    let description = user_intents.first().cloned().unwrap_or_else(|| {
-        format!(
-            "Auto-generated skill from session {}",
-            prefix_chars(&session_id, 8)
-        )
-    });
-
-    // ── Build steps from turn transcript ────────────────────────────────
-
-    let mut steps = Vec::new();
-    for (i, t) in turns.iter().enumerate() {
-        let mut step = String::new();
-        if let Some(ref input) = t.user_input {
-            let preview = truncate_str(input, 120);
-            step.push_str(&format!("User asked: {preview}"));
-        }
-        if let Some(ref tools) = t.tools_used {
-            if !tools.is_empty() {
-                step.push_str(&format!(" → Tools: {}", tools.join(", ")));
-            }
-        }
-        if !step.is_empty() {
-            steps.push(format!("{}. {step}", i + 1));
-        }
-    }
-
-    // ── Generate SKILL.md ───────────────────────────────────────────────
-
-    let allowed_tools_yaml = if top_tools.is_empty() {
-        "allowed_tools: []".to_string()
-    } else {
-        let items: Vec<String> = top_tools.iter().map(|t| format!("  - {t}")).collect();
-        format!("allowed_tools:\n{}", items.join("\n"))
-    };
-
-    let session_steps = if steps.is_empty() {
-        "1. Understand the user's request\n2. Execute the task\n3. Report results".to_string()
-    } else {
-        steps.join("\n")
-    };
-
-    let skill_md = format!(
-        r#"---
-name: {name}
-description: "{description}"
-version: "0.1.0"
-user_invocable: true
-{allowed_tools_yaml}
-when_to_use: "{description}"
-# arguments:
-#   - name: TARGET
-#     description: "Target file or directory"
-#     required: false
----
-
-# {name}
-
-Skill auto-generated from session {session_short}.
-{total_tool_calls} tool calls across {turn_count} turns.
-
-## Objective
-
-{description}
-
-## Steps
-
-{session_steps}
-
-## Tools Available
-
-{tool_summary}
-
-## Guidelines
-
-- Follow the step sequence above, adapting to the specific request
-- Use the allowed tools listed in the frontmatter
-- Report progress and results clearly
-"#,
-        session_short = &session_id[..8.min(session_id.len())],
-        turn_count = turns.len(),
-        tool_summary = if top_tools.is_empty() {
-            "All tools available.".to_string()
-        } else {
-            format!(
-                "Primary tools (by frequency): {}",
-                tool_ranked
-                    .iter()
-                    .take(5)
-                    .map(|(n, c)| format!("{n} ({c}x)"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        },
-    );
-
-    // Write to disk
-    std::fs::create_dir_all(&skill_dir).map_err(|e| e.to_string())?;
-    std::fs::write(skill_dir.join("SKILL.md"), &skill_md).map_err(|e| e.to_string())?;
-
-    // Summary output
-    eprintln!(
-        "\n  {} Skill '{}' created from session analysis",
-        theme::icon_ok(),
-        name.to_string().magenta()
-    );
-    eprintln!("  {}", format!("  Path: {}", skill_dir.display()).dim());
-    eprintln!(
-        "  {}",
-        format!(
-            "  Derived from: {} turns, {} tool calls",
-            turns.len(),
-            total_tool_calls
-        )
-        .dim()
-    );
-    if !top_tools.is_empty() {
-        eprintln!(
-            "  {}",
-            format!(
-                "  Top tools: {}",
-                top_tools[..top_tools.len().min(5)].join(", ")
-            )
-            .dim()
-        );
-    }
-    eprintln!(
-        "\n  {}",
-        format!("  Edit: {}/SKILL.md", skill_dir.display()).dim()
-    );
-    match state.unified_skill_registry.discover_all().await {
-        Ok(_) => eprintln!("  {}", "  Skill registry refreshed.".dim()),
-        Err(err) => eprintln!(
-            "  {} {}",
-            "Warning:".yellow(),
-            format!("Skill registry refresh failed: {err}").dim()
-        ),
-    }
-    eprintln!("  {}", format!("  Dev mode: /skill dev {name}").dim());
-    eprintln!("  {}", format!("  Test: /skill test {name}").dim());
-    eprintln!();
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2305,6 +2242,214 @@ mod tests {
             assert_eq!(default_skill_category(Some("")), "general");
             assert_eq!(default_skill_category(Some("   ")), "general");
             assert_eq!(default_skill_category(Some("automation")), "automation");
+        }
+    }
+
+    mod authoring_tests {
+        use super::super::handle_skill_command;
+        use crate::cli::session::session_state::SessionState;
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        #[tokio::test]
+        async fn create_delegates_the_current_session_without_local_activation() {
+            let srv = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/harnesses/authoring/session-123"))
+                .and(header("authorization", "Bearer tok"))
+                .and(body_partial_json(serde_json::json!({
+                    "goal": "帮我生成一个 review helper", "create_new": true, "target_skill": null
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "target": "skill",
+                    "operation": "create",
+                    "resolution_source": "no_matching_active_skill",
+                    "goal": "帮我生成一个 review helper",
+                    "harness_run": {
+                        "harness_run_id": "run-123",
+                        "harness_id": "skillify",
+                        "version_id": "skillify.v1",
+                        "user_id": "user-1",
+                        "session_id": null,
+                        "status": "waiting_for_review",
+                        "input_json": {},
+                        "output_json": {},
+                        "error": null,
+                        "created_at": "2026-09-18T00:00:00Z",
+                        "updated_at": "2026-09-18T00:00:01Z"
+                    },
+                    "skill_drafts": [],
+                    "evaluation": {
+                        "status": "unavailable",
+                        "reason": "no replayable task case",
+                        "experiment_id": null
+                    },
+                    "inference": {
+                        "schema_version": 1,
+                        "invocation_count": 0,
+                        "physical_attempt_count": 0,
+                        "priced_attempt_count": 0,
+                        "exact_usage_attempt_count": 0,
+                        "complete": false,
+                        "settlement_pending": false,
+                        "usage_status": "unavailable",
+                        "providers": [],
+                        "models": [],
+                        "offering_ids": [],
+                        "operations": [],
+                        "prompt_tokens": null,
+                        "completion_tokens": null,
+                        "cache_read_tokens": null,
+                        "cache_creation_tokens": null,
+                        "estimated_cost_usd": null,
+                        "completeness_reasons": ["inference_ledger_empty"],
+                        "evidence_fingerprint": "sha256:test"
+                    }
+                })))
+                .expect(1)
+                .mount(&srv)
+                .await;
+
+            let client = astra_thin_client::ThinClient::new(&srv.uri(), None).unwrap();
+            let mut state = SessionState::default();
+            state.session_id = Some("session-123".to_string());
+            handle_skill_command(
+                "create 帮我生成一个 review helper",
+                &client,
+                &mut state,
+                None,
+                Some("tok"),
+            )
+            .await
+            .unwrap();
+
+            assert!(state.skill_dev.is_none());
+            assert!(state.active_system_skills.is_empty());
+        }
+
+        #[tokio::test]
+        async fn improve_requires_an_explicit_ambiguous_target_and_pins_its_version() {
+            let srv = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/harnesses/authoring/session-123"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"skill_name":"review","version_id":"review-v1"},
+                    {"skill_name":"deploy","version_id":"deploy-v2"}
+                ])))
+                .expect(2)
+                .mount(&srv)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/harnesses/authoring/session-123"))
+                .and(body_partial_json(
+                    serde_json::json!({"goal":"Keep examples", "create_new":false,
+                    "target_skill":{"skill_name":"review","version_id":"review-v1"}}),
+                ))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(1)
+                .mount(&srv)
+                .await;
+            let client = astra_thin_client::ThinClient::new(&srv.uri(), None).unwrap();
+            let mut state = SessionState::default();
+            state.session_id = Some("session-123".into());
+            let ambiguous = handle_skill_command(
+                "improve Keep examples",
+                &client,
+                &mut state,
+                None,
+                Some("tok"),
+            )
+            .await
+            .unwrap_err();
+            assert!(ambiguous.contains("--skill <name>"));
+            let selected = handle_skill_command(
+                "improve --skill review Keep examples",
+                &client,
+                &mut state,
+                None,
+                Some("tok"),
+            )
+            .await
+            .unwrap_err();
+            assert!(selected.contains("Authoring request failed"));
+            assert!(state.active_system_skills.is_empty());
+        }
+
+        #[tokio::test]
+        async fn saved_authoring_retries_the_exact_request_after_a_lost_response() {
+            let srv = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/harnesses/authoring/original-session"))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(2)
+                .mount(&srv)
+                .await;
+            let client = astra_thin_client::ThinClient::new(&srv.uri(), None).unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let saved = super::super::SavedAuthoringRequest {
+                api_origin: client.api_origin(),
+                session_id: "original-session".into(),
+                request: serde_json::json!({"goal":"Keep examples", "create_new":false,
+                    "target_skill":{"skill_name":"review", "version_id":"frozen-v1"},
+                    "idempotency_key":uuid::Uuid::new_v4().to_string()}),
+            };
+            let file = super::super::save_authoring_request(directory.path(), &saved).unwrap();
+            for _ in 0..2 {
+                let error = handle_skill_command(
+                    &format!("resume {}", file.display()),
+                    &client,
+                    &mut SessionState::default(),
+                    None,
+                    Some("tok"),
+                )
+                .await
+                .unwrap_err();
+                assert!(error.contains("/skill resume"));
+            }
+            let requests = srv.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].body, requests[1].body);
+            assert_eq!(
+                requests[0].body_json::<serde_json::Value>().unwrap(),
+                saved.request
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            let other = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+            let error = super::super::resume_authoring_request(&file, &other, Some("tok"))
+                .await
+                .unwrap_err();
+            assert!(error.contains("different server"));
+        }
+
+        #[tokio::test]
+        async fn create_without_a_session_fails_before_calling_the_service() {
+            let srv = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/harnesses/authoring/session-123"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(&srv)
+                .await;
+
+            let client = astra_thin_client::ThinClient::new(&srv.uri(), None).unwrap();
+            let mut state = SessionState::default();
+            let error = handle_skill_command(
+                "create 帮我生成一个 review helper",
+                &client,
+                &mut state,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("no active session"));
         }
     }
 }

@@ -80,6 +80,44 @@ fn structured_status_is_error(status: &str) -> bool {
     )
 }
 
+// This registration is also the implementation dispatch, so confinement
+// admission cannot drift into an independent list of permitted tool names.
+type NativeFileFn = fn(&Path, &Value) -> ToolResult;
+type ConfinedNativeFileFn = fn(&Path, &Value, &crate::fs_ops::FileAccess) -> ToolResult;
+
+struct NativeFileHandler {
+    ordinary: NativeFileFn,
+    confined: ConfinedNativeFileFn,
+}
+
+fn native_file_handler(name: &str) -> Option<NativeFileHandler> {
+    use crate::fs_ops;
+    let (ordinary, confined): (NativeFileFn, ConfinedNativeFileFn) = match name {
+        "read_file" => (fs_ops::read_file, fs_ops::read_file_with_access),
+        "write_file" => (
+            |root, args| {
+                if args.get("delete").and_then(Value::as_bool) == Some(true) {
+                    fs_ops::delete_file(root, args)
+                } else {
+                    fs_ops::write_file(root, args)
+                }
+            },
+            fs_ops::write_file_with_access,
+        ),
+        "delete_file" => (fs_ops::delete_file, fs_ops::delete_file_with_access),
+        "str_replace" => (fs_ops::str_replace, fs_ops::str_replace_with_access),
+        "multi_edit" => (fs_ops::multi_edit, fs_ops::multi_edit_with_access),
+        _ => return None,
+    };
+    Some(NativeFileHandler { ordinary, confined })
+}
+
+fn unsupported_managed_tool(name: &str) -> ToolResult {
+    ToolResult::error(format!(
+        "Error: tool '{name}' does not support the managed filesystem boundary; its native IO and helpers are not confined"
+    ))
+}
+
 // ─── DefaultToolExecutor ────────────────────────────────────────────────────
 
 /// Per-tool execution timeout. Prevents synchronous tools (tree-sitter, etc.)
@@ -107,6 +145,8 @@ pub struct DefaultToolExecutor {
     convergence_authority: Arc<str>,
     bash_cache_ttl: std::time::Duration,
     filesystem_write_boundary: Option<Vec<std::path::PathBuf>>,
+    shell_process_boundary: Option<astra_sandbox::ShellProcessBoundary>,
+    native_file_access: Option<Result<crate::fs_ops::FileAuthority, String>>,
 }
 
 /// Key for the per-session bash dedup cache. Bumping ANY of these
@@ -204,6 +244,8 @@ impl DefaultToolExecutor {
             convergence_authority: Arc::from(uuid::Uuid::new_v4().to_string()),
             bash_cache_ttl: DEFAULT_BASH_CACHE_TTL,
             filesystem_write_boundary: None,
+            shell_process_boundary: None,
+            native_file_access: None,
         }
     }
 
@@ -290,9 +332,42 @@ impl DefaultToolExecutor {
     }
 
     /// Require bash subprocesses to see host-owned runtime lanes as read-only.
-    /// Only managed Edge requests install this request-scoped boundary.
+    /// Only managed Edge requests install this request-scoped boundary. Native
+    /// file tools pin their workspace here and use descriptor-relative IO;
+    /// unsupported helper families are rejected and implicit formatters disabled.
+    /// The trusted host must provide a writable, same-filesystem workspace parent
+    /// outside the confined shell's mounted roots for private native staging.
     pub fn with_filesystem_write_boundary(mut self, paths: Vec<std::path::PathBuf>) -> Self {
+        self.native_file_access = Some(
+            crate::fs_ops::FileAccess::restricted(&self.ctx.workspace_root, &paths)
+                .map(crate::fs_ops::FileAccess::into_authority)
+                .map_err(|error| error.to_string()),
+        );
         self.filesystem_write_boundary = Some(paths);
+        self
+    }
+
+    /// Select restricted Linux shell launches with an explicit toolchain manifest.
+    /// No read roots are inferred and no ordinary-shell fallback is permitted.
+    /// Native files retain the same protected-path authority as managed tools.
+    /// The provider owns exclusive allocation, immutable inputs, private staging,
+    /// and supervisor entrypoint dispatch; this does not admit an Evaluation run.
+    pub fn with_shell_process_boundary(
+        mut self,
+        boundary: astra_sandbox::ShellProcessBoundary,
+        protected_paths: Vec<std::path::PathBuf>,
+    ) -> Self {
+        self = self.with_filesystem_write_boundary(protected_paths);
+        self.shell_process_boundary = Some(boundary);
+        self
+    }
+
+    /// Require the process sandbox to create an isolated network namespace.
+    /// Evaluation workspaces use this together with the filesystem boundary;
+    /// namespace unavailability therefore rejects execution rather than
+    /// degrading to host networking.
+    pub fn with_network_isolation(mut self) -> Self {
+        self.ctx.sandbox.network_allowed = false;
         self
     }
 
@@ -325,9 +400,15 @@ impl DefaultToolExecutor {
     }
 }
 
-#[async_trait]
-impl ToolExecutor for DefaultToolExecutor {
-    async fn execute(&self, name: &str, args: &Value) -> ToolResult {
+impl DefaultToolExecutor {
+    // The invocation-local flag records entry into the process owner, not a
+    // guess from a result string or missing metadata. Dropped futures return no proof.
+    async fn execute_with_launch_tracking(
+        &self,
+        name: &str,
+        args: &Value,
+        launch_attempted: &mut bool,
+    ) -> ToolResult {
         if let Err(error) = crate::schemas::validate_tool_arguments(name, args) {
             return error.into_tool_result();
         }
@@ -373,11 +454,28 @@ impl ToolExecutor for DefaultToolExecutor {
             return crate::cancelled_tool_result(name, false);
         }
 
-        if let Some(protected) = &self.filesystem_write_boundary
-            && let Err(error) =
-                validate_host_owned_write_boundary(name, args, &self.ctx.workspace_root, protected)
-        {
-            return ToolResult::error(error);
+        if let Some(access) = &self.native_file_access {
+            if name != "bash" && native_file_handler(name).is_none() {
+                return unsupported_managed_tool(name);
+            }
+            match access {
+                Ok(access)
+                    if access.matches_root(&self.ctx.workspace_root)
+                        && self
+                            .shell_process_boundary
+                            .as_ref()
+                            .is_none_or(|boundary| access.matches_root(&boundary.workspace)) => {}
+                Ok(_) => {
+                    return ToolResult::error(
+                        "SANDBOX_DENIED: pinned workspace root was replaced".into(),
+                    );
+                }
+                Err(error) => {
+                    return ToolResult::error(format!(
+                        "SANDBOX_DENIED: native filesystem authority unavailable: {error}"
+                    ));
+                }
+            }
         }
 
         // Resolve once per invocation. The same canonical identity drives
@@ -448,12 +546,21 @@ impl ToolExecutor for DefaultToolExecutor {
                 "run_script cannot recursively start another opaque script writer".into(),
             );
         }
-        let targeted_observer = self.convergence_tracker.requires_snapshot_lease(
-            &self.convergence_authority,
-            name,
-            args,
-            &self.ctx.workspace_root,
-        );
+        let native_operation = self
+            .native_file_access
+            .as_ref()
+            .and_then(|access| access.as_ref().ok())
+            .map(crate::fs_ops::FileAuthority::operation);
+        let native_access = native_operation.as_ref();
+        let targeted_observer = self
+            .convergence_tracker
+            .requires_snapshot_lease_with_access(
+                &self.convergence_authority,
+                name,
+                args,
+                &self.ctx.workspace_root,
+                native_access,
+            );
         let _workspace_mutation_lease = if name != "bash"
             && name != "run_script"
             && (is_workspace_mutation_tool(name, args) || targeted_observer)
@@ -521,7 +628,13 @@ impl ToolExecutor for DefaultToolExecutor {
         } else {
             None
         };
-        let dispatch = self.dispatch(name, args, bash_workdir.as_ref());
+        let dispatch = self.dispatch(
+            name,
+            args,
+            bash_workdir.as_ref(),
+            native_access,
+            launch_attempted,
+        );
         // Bash and run_script own their child timeout/cancellation paths. Do
         // not wrap either in the generic 60s future timeout: dropping one can
         // abandon the post-execution workspace receipt after a partial write.
@@ -549,7 +662,8 @@ impl ToolExecutor for DefaultToolExecutor {
                 )),
             }
         };
-        let coordination_integrity_valid = _workspace_mutation_lease.as_ref().is_none_or(
+        let coordination_integrity_valid = native_access.is_none_or(|access| access.matches_root(&self.ctx.workspace_root))
+            && _workspace_mutation_lease.as_ref().is_none_or(
             crate::workspace_observation::WorkspaceObservationLease::coordination_integrity_valid,
         ) && _recursive_writer_epoch.as_ref().is_none_or(
             crate::workspace_observation::WorkspaceWriterGuard::coordination_integrity_valid,
@@ -591,7 +705,8 @@ impl ToolExecutor for DefaultToolExecutor {
                 "\n\nError: workspace binding or coordination generation changed during execution; the mutation may have applied, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
             );
         }
-        let desired_state =
+        {
+            let desired_state =
             match crate::workspace_observation::consume_workspace_desired_state_convergence_marker(
                 &mut result.metadata,
                 args,
@@ -606,65 +721,85 @@ impl ToolExecutor for DefaultToolExecutor {
                     None
                 }
             };
-        // A successful structured workspace writer already crossed the
-        // owner executor's path/permission boundary. Carry that typed fact
-        // through the server/edge result ledger instead of making a remote
-        // runtime guess the target against its own filesystem. This does not
-        // satisfy final verification; it only opens the normal post-mutation
-        // observation obligation.
-        if let Some(receipt) =
-            crate::workspace_observation::typed_workspace_tool_receipt_for_applied(
+            // A successful structured workspace writer already crossed the
+            // owner executor's path/permission boundary. Carry that typed fact
+            // through the server/edge result ledger instead of making a remote
+            // runtime guess the target against its own filesystem. This does not
+            // satisfy final verification; it only opens the normal post-mutation
+            // observation obligation.
+            if native_access.is_none()
+                && let Some(receipt) =
+                    crate::workspace_observation::typed_workspace_tool_receipt_for_applied(
+                        name,
+                        args,
+                        &self.ctx.workspace_root,
+                        result.is_error,
+                        receipt_authority_valid
+                            && !nested_run_script_callback
+                            && result
+                                .metadata
+                                .as_ref()
+                                .and_then(|fields| fields.get("workspace_mutation_applied"))
+                                .and_then(Value::as_bool)
+                                == Some(true),
+                    )
+            {
+                result
+                    .metadata
+                    .get_or_insert_with(Default::default)
+                    .extend(receipt);
+            }
+            match crate::workspace_observation::project_typed_workspace_convergence_with_access(
+                &self.convergence_tracker,
+                Some(&self.convergence_authority),
                 name,
                 args,
                 &self.ctx.workspace_root,
                 result.is_error,
-                receipt_authority_valid
-                    && !nested_run_script_callback
-                    && result
-                        .metadata
-                        .as_ref()
-                        .and_then(|fields| fields.get("workspace_mutation_applied"))
-                        .and_then(Value::as_bool)
-                        == Some(true),
-            )
+                desired_state.as_ref(),
+                receipt_authority_valid && !nested_run_script_callback,
+                targeted_observer,
+                receipt_authority_valid && _workspace_mutation_lease.is_some(),
+                native_access,
+            ) {
+                Ok(projection) => {
+                    if let Some(receipt) = projection.convergence_receipt {
+                        result
+                            .metadata
+                            .get_or_insert_with(Default::default)
+                            .extend(receipt);
+                    }
+                    if let Some(receipt) = projection.observation_receipt {
+                        result
+                            .metadata
+                            .get_or_insert_with(Default::default)
+                            .extend(receipt);
+                    }
+                }
+                Err(error) => {
+                    result.is_error = true;
+                    result.output.push_str(&format!(
+                    "\n\nError: {error}; no completion receipt was issued. Retry inside the active turn after cancelling or finishing abandoned work."
+                ));
+                }
+            }
+        }
+        if native_access.is_some()
+            && receipt_authority_valid
+            && !result.is_error
+            && result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("workspace_mutation_applied"))
+                .and_then(Value::as_bool)
+                == Some(true)
         {
+            // Native preparation/commit already proved target authority through
+            // descriptors. Do not reopen paths to manufacture snapshot evidence.
             result
                 .metadata
                 .get_or_insert_with(Default::default)
-                .extend(receipt);
-        }
-        match crate::workspace_observation::project_typed_workspace_convergence(
-            &self.convergence_tracker,
-            Some(&self.convergence_authority),
-            name,
-            args,
-            &self.ctx.workspace_root,
-            result.is_error,
-            desired_state.as_ref(),
-            receipt_authority_valid && !nested_run_script_callback,
-            targeted_observer,
-            receipt_authority_valid && _workspace_mutation_lease.is_some(),
-        ) {
-            Ok(projection) => {
-                if let Some(receipt) = projection.convergence_receipt {
-                    result
-                        .metadata
-                        .get_or_insert_with(Default::default)
-                        .extend(receipt);
-                }
-                if let Some(receipt) = projection.observation_receipt {
-                    result
-                        .metadata
-                        .get_or_insert_with(Default::default)
-                        .extend(receipt);
-                }
-            }
-            Err(error) => {
-                result.is_error = true;
-                result.output.push_str(&format!(
-                    "\n\nError: {error}; no completion receipt was issued. Retry inside the active turn after cancelling or finishing abandoned work."
-                ));
-            }
+                .extend(crate::workspace_observation::typed_workspace_tool_receipt());
         }
 
         // This generic dispatch boundary does not establish ownership of a
@@ -762,6 +897,54 @@ impl ToolExecutor for DefaultToolExecutor {
         result
     }
 
+    fn unstarted_shell_result(&self, name: &str, mut result: ToolResult) -> ToolResult {
+        if name == "bash" && self.shell_process_boundary.is_some() {
+            let receipt = astra_runtime_env::ShellExecutionEvidence {
+                schema_version: 1,
+                profile: astra_runtime_env::WORKSPACE_CONFINEMENT_PROFILE.into(),
+                execution_started: false,
+                setup: astra_runtime_env::ShellSetupEvidence::Unverified {
+                    reason_code: "not_dispatched".into(),
+                },
+                settlement: astra_runtime_env::ShellSettlementEvidence {
+                    scope_settled: true,
+                    ownership: None,
+                    descendants_terminated: false,
+                },
+                timed_out: false,
+                cancelled: result
+                    .metadata
+                    .as_ref()
+                    .and_then(|fields| fields.get("cancelled"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            };
+            result
+                .metadata
+                .get_or_insert_with(serde_json::Map::new)
+                .insert(
+                    "shell_confinement".into(),
+                    serde_json::to_value(receipt).expect("shell evidence serializes"),
+                );
+        }
+        result
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for DefaultToolExecutor {
+    async fn execute(&self, name: &str, args: &Value) -> ToolResult {
+        let mut launch_attempted = false;
+        let result = self
+            .execute_with_launch_tracking(name, args, &mut launch_attempted)
+            .await;
+        if launch_attempted {
+            result
+        } else {
+            self.unstarted_shell_result(name, result)
+        }
+    }
+
     async fn execute_with_cancel(
         &self,
         name: &str,
@@ -772,7 +955,7 @@ impl ToolExecutor for DefaultToolExecutor {
             return self.execute(name, args).await;
         };
         if cancel_token.is_cancelled() {
-            return crate::cancelled_tool_result(name, false);
+            return self.unstarted_shell_result(name, crate::cancelled_tool_result(name, false));
         }
         // Execute against a shallow clone whose context carries the caller's
         // token.  Shared caches and generation remain
@@ -786,6 +969,13 @@ impl ToolExecutor for DefaultToolExecutor {
 
     fn tool_schemas(&self) -> Vec<Value> {
         let mut schemas = crate::schemas::all_tool_schemas();
+        if let Some(access) = &self.native_file_access {
+            schemas.retain(|schema| {
+                access.is_ok()
+                    && astra_core::tool_schema::tool_schema_name(schema)
+                        .is_some_and(|name| name == "bash" || native_file_handler(name).is_some())
+            });
+        }
         if !astra_sandbox::process_scope_available() {
             schemas.retain(|schema| {
                 astra_core::tool_schema::tool_schema_name(schema) != Some("run_script")
@@ -835,6 +1025,9 @@ impl DefaultToolExecutor {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
+        if self.shell_process_boundary.is_some() {
+            return None;
+        }
         let command = args.get("command")?.as_str()?.to_string();
         // Readonly classifier: only commands whose output depends
         // solely on fs + env may hit the cache. Anything with side
@@ -894,45 +1087,31 @@ impl DefaultToolExecutor {
         name: &str,
         args: &Value,
         bash_workdir: Option<&crate::shell_ops::PreparedBashWorkdir>,
+        access: Option<&crate::fs_ops::FileAccess>,
+        launch_attempted: &mut bool,
     ) -> ToolResult {
         let ws = &self.ctx.workspace_root;
 
+        if let Some(handler) = native_file_handler(name) {
+            return match access {
+                Some(access) => (handler.confined)(ws, args, access),
+                None if self.native_file_access.is_none() => (handler.ordinary)(ws, args),
+                None => ToolResult::error("SANDBOX_DENIED: missing native file operation".into()),
+            };
+        }
         match name {
-            // ── File operations ──────────────────────────────────────
-            "read_file" => crate::fs_ops::read_file(ws, args),
-            "write_file" => {
-                if args
-                    .get("delete")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                {
-                    crate::fs_ops::delete_file(ws, args)
-                } else if self.filesystem_write_boundary.is_some() {
-                    crate::fs_ops::write_file_without_formatter(ws, args)
-                } else {
-                    crate::fs_ops::write_file(ws, args)
-                }
-            }
-            "str_replace" => {
-                if self.filesystem_write_boundary.is_some() {
-                    crate::fs_ops::str_replace_without_formatter(ws, args)
-                } else {
-                    crate::fs_ops::str_replace(ws, args)
-                }
-            }
-            "delete_file" => crate::fs_ops::delete_file(ws, args),
-            "list_dir" => crate::fs_ops::list_dir(ws, args),
-
-            // ── Multi-edit (atomic) ──────────────────────────────────
-            "multi_edit" => {
-                if self.filesystem_write_boundary.is_some() {
-                    crate::fs_ops::multi_edit_without_formatter(ws, args)
-                } else {
-                    crate::fs_ops::multi_edit(ws, args)
-                }
-            }
-
             // ── Shell operations ─────────────────────────────────────
+            "bash" if self.shell_process_boundary.is_some() => {
+                crate::shell_ops::execute_bash_with_process_boundary_at_workdir(
+                    &self.ctx,
+                    args,
+                    self.shell_process_boundary.as_ref().expect("selected boundary"),
+                    launch_attempted,
+                    self.filesystem_write_boundary.as_deref().unwrap_or(&[]),
+                    bash_workdir.expect("bash dispatch requires a resolved workdir"),
+                )
+                .await
+            }
             "bash" => match &self.filesystem_write_boundary {
                 Some(paths) => {
                     crate::shell_ops::execute_bash_with_filesystem_boundary_at_workdir(
@@ -953,6 +1132,8 @@ impl DefaultToolExecutor {
                     .await
                 }
             },
+            _ if self.native_file_access.is_some() => unsupported_managed_tool(name),
+            "list_dir" => crate::fs_ops::list_dir(ws, args),
             "grep" => crate::shell_ops::grep(&self.ctx, args).await,
             "glob" => crate::shell_ops::glob(&self.ctx, args).await,
 
@@ -1166,45 +1347,6 @@ pub fn is_workspace_mutation_tool(name: &str, args: &Value) -> bool {
     }
 }
 
-fn validate_host_owned_write_boundary(
-    name: &str,
-    args: &Value,
-    workspace_root: &Path,
-    protected: &[std::path::PathBuf],
-) -> Result<(), String> {
-    if matches!(name, "run_script" | "worktree") {
-        return Err(format!(
-            "Error: tool '{name}' cannot run outside the managed filesystem boundary; use bash so the command executes inside the protected mount namespace"
-        ));
-    }
-
-    let mut paths = Vec::new();
-    if matches!(
-        name,
-        "write_file" | "str_replace" | "multi_edit" | "delete_file"
-    ) {
-        paths.extend(args.get("path").and_then(Value::as_str));
-    }
-    if name == "str_replace"
-        && let Some(edits) = args.get("edits").and_then(Value::as_array)
-    {
-        paths.extend(
-            edits
-                .iter()
-                .filter_map(|edit| edit.get("path").and_then(Value::as_str)),
-        );
-    }
-    for path in paths {
-        let resolved = crate::fs_ops::resolve_path(workspace_root, path)?;
-        if protected.iter().any(|root| resolved.starts_with(root)) {
-            return Err(format!(
-                "Error: tool '{name}' cannot modify host-owned managed runtime paths"
-            ));
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     #[tokio::test]
@@ -1242,7 +1384,6 @@ mod tests {
         assert!(!dir.path().join(".git").exists());
     }
 
-    use std::path::Path;
     use std::sync::Arc;
 
     use super::*;
@@ -1256,24 +1397,305 @@ mod tests {
         (tmp, exec)
     }
 
-    #[test]
-    fn managed_boundary_checks_every_str_replace_target() {
-        let workspace = Path::new("/sandbox");
-        let protected = vec![Path::new("/sandbox/.moi/runtime/task-1").to_path_buf()];
-        let args = serde_json::json!({
-            "edits": [
-                {"path": "ordinary.txt", "old_str": "a", "new_str": "b"},
-                {
-                    "path": ".moi/runtime/task-1/owned.txt",
-                    "old_str": "a",
-                    "new_str": "b"
-                }
-            ]
-        });
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restricted_shell_rejects_unsupported_routes_and_never_caches() {
+        let (root, exec) = test_executor();
+        std::fs::create_dir(root.path().join("nested")).unwrap();
+        let boundary = astra_sandbox::ShellProcessBoundary {
+            workspace: root.path().to_path_buf(),
+            home: root.path().join("unused-home"),
+            temp: root.path().join("unused-temp"),
+            read_only_paths: Vec::new(),
+        };
+        let exec = exec.with_shell_process_boundary(boundary.clone(), Vec::new());
+        let args = serde_json::json!({"command": "pwd"});
+        let workdir = crate::shell_ops::resolve_bash_workdir(root.path(), &args).unwrap();
+        assert!(exec.bash_cache_key(&args, &workdir).is_none());
+        for args in [
+            serde_json::json!({"command": "touch escaped", "workdir": "nested"}),
+            serde_json::json!({"command": "touch escaped", "workdir": "missing-directory"}),
+            serde_json::json!({}),
+            serde_json::json!({"command": "touch escaped", "env": {}}),
+            serde_json::json!({"command": "touch escaped", "detach": true}),
+            serde_json::json!({"command": "touch escaped", "run_in_background": true}),
+        ] {
+            let result = exec.execute("bash", &args).await;
+            assert!(result.is_error);
+            let receipt: astra_runtime_env::ShellExecutionEvidence =
+                serde_json::from_value(result.metadata.unwrap()["shell_confinement"].clone())
+                    .unwrap();
+            assert!(!receipt.execution_started);
+            assert!(receipt.settlement.scope_settled);
+            assert_eq!(receipt.verified_exit_code(), None);
+        }
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let refused = exec.execute_with_cancel("bash", &args, Some(&cancel)).await;
+        let receipt: astra_runtime_env::ShellExecutionEvidence =
+            serde_json::from_value(refused.metadata.unwrap()["shell_confinement"].clone()).unwrap();
+        assert!(!receipt.execution_started);
+        assert!(receipt.cancelled);
+        for name in ["run_script", "worktree", "grep", "glob"] {
+            assert!(exec.execute(name, &serde_json::json!({})).await.is_error);
+        }
+        // Invalid explicit toolchain inputs must not fall back even though
+        // the same command is executable by an ordinary host shell.
+        let mut invalid = boundary.clone();
+        invalid.read_only_paths = vec![root.path().join("missing-toolchain")];
+        let refused = exec
+            .clone()
+            .with_shell_process_boundary(invalid, Vec::new());
+        let result = refused
+            .execute("bash", &serde_json::json!({"command": "touch escaped"}))
+            .await;
+        assert!(result.is_error);
+        assert!(!root.path().join("escaped").exists());
+        assert!(!root.path().join("nested/escaped").exists());
+        let outside = TempDir::new().unwrap();
+        let mut mismatch = boundary;
+        mismatch.workspace = outside.path().to_path_buf();
+        let exec = exec.with_shell_process_boundary(mismatch, Vec::new());
+        assert!(exec.execute("bash", &args).await.is_error);
+        assert!(
+            exec.execute("read_file", &serde_json::json!({"path": "missing"}))
+                .await
+                .output
+                .contains("SANDBOX_DENIED")
+        );
+    }
 
-        let error = validate_host_owned_write_boundary("str_replace", &args, workspace, &protected)
-            .expect_err("a nested edit path must not bypass the host-owned lane");
-        assert!(error.contains("host-owned managed runtime paths"));
+    #[cfg(unix)]
+    #[test]
+    fn confined_native_schemas_follow_dispatch_capability() {
+        let root = TempDir::new().unwrap();
+        let exec = DefaultToolExecutor::new(ToolContext::test(root.path()))
+            .with_filesystem_write_boundary(Vec::new());
+        let schemas = exec.tool_schemas();
+        assert!(!schemas.is_empty());
+        for schema in schemas {
+            let name = astra_core::tool_schema::tool_schema_name(&schema).unwrap();
+            assert!(
+                name == "bash" || native_file_handler(name).is_some(),
+                "{name}"
+            );
+        }
+        let unavailable = DefaultToolExecutor::new(ToolContext::test(root.path().join("missing")))
+            .with_filesystem_write_boundary(Vec::new());
+        assert!(unavailable.tool_schemas().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confined_native_executor_enforces_all_dispatch_paths() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let host = outside.path().join("sentinel.txt");
+        std::fs::write(&host, "synthetic host bytes").unwrap();
+        let exec = DefaultToolExecutor::new(ToolContext::test(root.path()))
+            .with_filesystem_write_boundary(Vec::new());
+        for (name, args) in [
+            ("read_file", serde_json::json!({"path":host})),
+            (
+                "write_file",
+                serde_json::json!({"path":host,"content":"bad"}),
+            ),
+            ("write_file", serde_json::json!({"path":host,"delete":true})),
+            ("delete_file", serde_json::json!({"path":host})),
+            (
+                "str_replace",
+                serde_json::json!({"path":host,"old_str":"synthetic","new_str":"bad"}),
+            ),
+            (
+                "multi_edit",
+                serde_json::json!({"path":host,"edits":[{"old_str":"synthetic","new_str":"bad"}]}),
+            ),
+            ("list_dir", serde_json::json!({"path":outside.path()})),
+            ("glob", serde_json::json!({"pattern":"**/*"})),
+            ("symbols", serde_json::json!({"path":host})),
+        ] {
+            let result = exec
+                .dispatch(
+                    name,
+                    &args,
+                    None,
+                    Some(
+                        &exec
+                            .native_file_access
+                            .as_ref()
+                            .unwrap()
+                            .as_ref()
+                            .unwrap()
+                            .operation(),
+                    ),
+                    &mut false,
+                )
+                .await;
+            assert!(result.is_error, "{name}: {}", result.output);
+            assert!(!result.output.contains("synthetic host bytes"));
+        }
+        let result = exec
+            .dispatch(
+                "write_file",
+                &serde_json::json!({"path":"new.txt","content":"workspace bytes"}),
+                None,
+                Some(
+                    &exec
+                        .native_file_access
+                        .as_ref()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .operation(),
+                ),
+                &mut false,
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.output);
+        let result = exec
+            .execute("read_file", &serde_json::json!({"path":"new.txt"}))
+            .await;
+        assert!(
+            !result.is_error && result.output.contains("workspace bytes"),
+            "{}",
+            result.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(host).unwrap(),
+            "synthetic host bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confined_native_public_write_read_and_noop_preserve_evidence_and_generation() {
+        use crate::workspace_observation as observation;
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir(root.path().join("dir")).unwrap();
+        let exec = DefaultToolExecutor::new(ToolContext::test(root.path()))
+            .with_filesystem_write_boundary(Vec::new());
+        let args = serde_json::json!({"path":"dir/answer.txt", "content":"stable\n"});
+        let changed = exec.execute("write_file", &args).await;
+        assert!(!changed.is_error, "{changed:?}");
+        assert!(observation::is_typed_workspace_tool_receipt(
+            &changed.metadata.as_ref().unwrap()[observation::RECEIPT_FIELD]
+        ));
+        let read = exec
+            .execute("read_file", &serde_json::json!({"path":"dir/answer.txt"}))
+            .await;
+        assert!(!read.is_error, "{read:?}");
+        assert!(observation::is_typed_workspace_observation_receipt(
+            &read.metadata.as_ref().unwrap()[observation::OBSERVATION_RECEIPT_FIELD]
+        ));
+        // A legitimate replacement between invocations must not poison no-op
+        // convergence with a directory retained by the previous read.
+        std::fs::rename(root.path().join("dir"), root.path().join("old")).unwrap();
+        std::fs::create_dir(root.path().join("dir")).unwrap();
+        std::fs::write(root.path().join("dir/answer.txt"), b"stable\n").unwrap();
+        let generation = exec.workspace_generation.load(Ordering::Relaxed);
+        let before = std::fs::metadata(root.path().join("dir/answer.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let no_op = exec.execute("write_file", &args).await;
+        assert!(!no_op.is_error, "{no_op:?}");
+        assert!(
+            observation::is_typed_workspace_desired_state_convergence_receipt(
+                &no_op.metadata.as_ref().unwrap()[observation::RECEIPT_FIELD]
+            )
+        );
+        assert_eq!(
+            exec.workspace_generation.load(Ordering::Relaxed),
+            generation
+        );
+        assert_eq!(
+            std::fs::metadata(root.path().join("dir/answer.txt"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            before
+        );
+        let partial = exec
+            .execute(
+                "read_file",
+                &serde_json::json!({"path":"dir/answer.txt", "start_line":1, "end_line":1}),
+            )
+            .await;
+        assert!(!partial.is_error, "{partial:?}");
+        assert!(
+            observation::typed_workspace_observation_evidence(
+                &partial.metadata.as_ref().unwrap()[observation::OBSERVATION_RECEIPT_FIELD]
+            )
+            .is_none()
+        );
+        let full = exec
+            .execute("read_file", &serde_json::json!({"path":"dir/answer.txt"}))
+            .await;
+        assert!(!full.is_error, "{full:?}");
+        let evidence = observation::typed_workspace_observation_evidence(
+            &full.metadata.as_ref().unwrap()[observation::OBSERVATION_RECEIPT_FIELD],
+        )
+        .unwrap();
+        assert_eq!(evidence.target, "dir/answer.txt");
+        assert_eq!(
+            evidence.observed_state,
+            observation::workspace_file_state_identity(b"stable\n")
+        );
+        assert_eq!(
+            exec.workspace_generation.load(Ordering::Relaxed),
+            generation
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confined_native_directory_replaced_between_successful_reads() {
+        use crate::workspace_observation as observation;
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir(root.path().join("dir")).unwrap();
+        std::fs::write(root.path().join("dir/file"), b"first\n").unwrap();
+        let exec = DefaultToolExecutor::new(ToolContext::test(root.path()))
+            .with_filesystem_write_boundary(Vec::new());
+        let args = serde_json::json!({"path":"dir/file"});
+        let first = exec.execute("read_file", &args).await;
+        assert!(!first.is_error, "{first:?}");
+        std::fs::rename(root.path().join("dir"), root.path().join("old")).unwrap();
+        std::fs::create_dir(root.path().join("dir")).unwrap();
+        std::fs::write(root.path().join("dir/file"), b"second\n").unwrap();
+        let second = exec.execute("read_file", &args).await;
+        assert!(
+            !second.is_error && second.output.contains("second"),
+            "{second:?}"
+        );
+        assert_eq!(
+            observation::typed_workspace_observation_target(
+                &second.metadata.as_ref().unwrap()[observation::OBSERVATION_RECEIPT_FIELD]
+            ),
+            Some("dir/file")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confined_native_executor_rejects_replaced_workspace_root() {
+        let allocation = TempDir::new().unwrap();
+        let root = allocation.path().join("workspace");
+        let outside = TempDir::new().unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(outside.path().join("sentinel.txt"), "synthetic host bytes").unwrap();
+        let exec = DefaultToolExecutor::new(ToolContext::test(&root))
+            .with_filesystem_write_boundary(Vec::new());
+        std::fs::rename(&root, allocation.path().join("retained")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &root).unwrap();
+        let result = exec
+            .execute("read_file", &serde_json::json!({"path":"sentinel.txt"}))
+            .await;
+        assert!(
+            result.is_error && result.output.contains("pinned workspace root was replaced"),
+            "{}",
+            result.output
+        );
+        assert!(!result.output.contains("synthetic host bytes"));
     }
 
     #[tokio::test]

@@ -599,6 +599,7 @@ async fn edge_ws_relay_strips_legacy_boundary_and_preserves_inflight_dispatch() 
         &request_id,
     );
     let payload = astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
+        evaluation_allocation: None,
         request_id: request_id.clone(),
         identity: Box::new(tool_identity),
         delivery_generation: 1,
@@ -659,6 +660,7 @@ async fn edge_ws_replayed_result_after_reconnect_is_durably_accepted_and_acked()
         &request_id,
     );
     let payload = astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
+        evaluation_allocation: None,
         request_id: request_id.clone(),
         identity: Box::new(tool_identity.clone()),
         delivery_generation: 9,

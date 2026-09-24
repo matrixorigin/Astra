@@ -1,6 +1,5 @@
 //! Slash command fallback routing for the interactive session.
 
-use astra_runtime::prompts;
 use astra_services::{ModelListItemResponse, session_journal};
 use crossterm::style::Stylize;
 use std::{io::IsTerminal, path::PathBuf};
@@ -198,12 +197,11 @@ pub(crate) async fn handle_slash_command(
                     state.cached_pricing = slash_stats::fallback_pricing(&chosen);
                     let context_window =
                         selected_model.and_then(session_runtime::model_list_entry_context_window);
-                    state.context_budget =
-                        prompts::ContextBudget::from_runtime_config_with_context_window(
-                            &state.runtime_config,
-                            Some(&chosen),
-                            context_window,
-                        );
+                    state.context_budget = session_runtime::resolve_session_context_budget(
+                        &state.runtime_config,
+                        context_window,
+                        selected_model.and_then(session_runtime::model_list_entry_completion_limit),
+                    );
                     eprintln!(
                         "  {} {}",
                         theme::icon_ok(),
@@ -219,6 +217,7 @@ pub(crate) async fn handle_slash_command(
             let mut selected_offering_id: Option<String> = None;
             let mut selected_model_name: Option<String> = None;
             let mut context_window = None;
+            let mut max_completion_tokens = None;
             if let Some(tok) = token {
                 match fetch_model_catalog(api, Some(tok)).await {
                     Ok(models) => {
@@ -246,6 +245,8 @@ pub(crate) async fn handle_slash_command(
                                 .map(ToOwned::to_owned);
                             context_window =
                                 session_runtime::model_list_entry_context_window(entry);
+                            max_completion_tokens =
+                                session_runtime::model_list_entry_completion_limit(entry);
                         }
 
                         let available: Vec<String> = models
@@ -272,6 +273,7 @@ pub(crate) async fn handle_slash_command(
                                     selected_offering_id = Some(selection.offering_id);
                                     selected_model_name = Some(arg.to_string());
                                     context_window = selection.context_window;
+                                    max_completion_tokens = selection.max_completion_tokens;
                                 }
                                 Err(error) => exact_lookup_error = Some(error),
                             }
@@ -321,10 +323,10 @@ pub(crate) async fn handle_slash_command(
             let base_model =
                 astra_turn_core::thinking_config::resolve_model_thinking(&selected_model).0;
             state.cached_pricing = slash_stats::fallback_pricing(base_model);
-            state.context_budget = prompts::ContextBudget::from_runtime_config_with_context_window(
+            state.context_budget = session_runtime::resolve_session_context_budget(
                 &state.runtime_config,
-                Some(base_model),
                 context_window,
+                max_completion_tokens,
             );
             eprintln!(
                 "{}",

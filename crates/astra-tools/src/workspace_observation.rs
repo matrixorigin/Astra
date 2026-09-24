@@ -25,6 +25,10 @@ const MAX_MANIFEST_ENTRIES: usize = 16_384;
 const MAX_STATUS_CONTENT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_STATUS_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_STATUS_ENTRIES: usize = 8_192;
+// Permission observation reads only tracked path metadata, not tracked file
+// contents. Keep the index listing bounded independently from status output.
+const MAX_TRACKED_METADATA_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TRACKED_METADATA_ENTRIES: usize = 131_072;
 // Ignored build/output directories are useful deliverables, but expanding a
 // whole cache would make every Bash call expensive.  Scan a small bounded
 // tree; larger caches intentionally become Unknown rather than being treated
@@ -3173,6 +3177,9 @@ fn git_status_fingerprint(root: &Path) -> GitFingerprint {
             b"astra-unborn-head-v1".to_vec()
         }
     };
+    if !git_index_is_observable(root) {
+        return GitFingerprint::Unknown;
+    }
     let Some(mut status_command) = hardened_git_command(root) else {
         return GitFingerprint::UseManifest;
     };
@@ -3205,6 +3212,9 @@ fn git_status_fingerprint(root: &Path) -> GitFingerprint {
     // still produces a delta; hashing the full repository tree would make a
     // sibling-only commit look like a change in a nested workspace.
     tree_bytes.hash(&mut hasher);
+    if !hash_tracked_metadata(root, &mut hasher) {
+        return GitFingerprint::Unknown;
+    }
     // Status alone is insufficient for a pre-dirty workspace: changing a
     // file that was already marked `M` leaves the status bytes unchanged.
     // Hash the bounded content of every path reported by status so a generic
@@ -3302,6 +3312,165 @@ fn git_status_fingerprint(root: &Path) -> GitFingerprint {
     GitFingerprint::Captured(hasher.finish())
 }
 
+fn git_index_is_observable(root: &Path) -> bool {
+    let Some(mut stage_command) = hardened_git_command(root) else {
+        return false;
+    };
+    stage_command.args(["ls-files", "--stage", "-z", "--", "."]);
+    let Some(stage_output) = run_bounded_probe(
+        stage_command,
+        MAX_TRACKED_METADATA_OUTPUT_BYTES,
+        FINGERPRINT_PROBE_TIMEOUT,
+    ) else {
+        return false;
+    };
+    if !stage_output.success {
+        return false;
+    }
+    let mut stage_entries = 0usize;
+    for entry in stage_output.stdout.split(|byte| *byte == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        stage_entries = stage_entries.saturating_add(1);
+        if stage_entries > MAX_TRACKED_METADATA_ENTRIES
+            || entry.len() < 7
+            || entry[6] != b' '
+            || !entry[7..].contains(&b'\t')
+        {
+            return false;
+        }
+        // A populated submodule has a gitlink (mode 160000). Its own
+        // repository configuration can run filters during the parent status
+        // probe, so the parent fast path cannot safely observe it.
+        if &entry[..6] == b"160000" {
+            return false;
+        }
+    }
+
+    let Some(mut command) = hardened_git_command(root) else {
+        return false;
+    };
+    command.args(["ls-files", "-v", "-z", "--", "."]);
+    let Some(output) = run_bounded_probe(
+        command,
+        MAX_TRACKED_METADATA_OUTPUT_BYTES,
+        FINGERPRINT_PROBE_TIMEOUT,
+    ) else {
+        return false;
+    };
+    if !output.success {
+        return false;
+    }
+    let mut entries = 0usize;
+    for entry in output.stdout.split(|byte| *byte == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        entries = entries.saturating_add(1);
+        if entries > MAX_TRACKED_METADATA_ENTRIES || entry.get(1) != Some(&b' ') {
+            return false;
+        }
+        // `git status` intentionally trusts these index bits. A task can set
+        // them and then rewrite a file without producing a status entry, so
+        // an authoritative receipt is impossible until the checkout is reset.
+        if matches!(entry[0], b'h' | b'S' | b's') {
+            return false;
+        }
+    }
+    true
+}
+
+fn hash_tracked_metadata(root: &Path, hasher: &mut DefaultHasher) -> bool {
+    let Some(mut command) = hardened_git_command(root) else {
+        return false;
+    };
+    command.args(["ls-files", "-z", "--cached", "--", "."]);
+    let Some(output) = run_bounded_probe(
+        command,
+        MAX_TRACKED_METADATA_OUTPUT_BYTES,
+        FINGERPRINT_PROBE_TIMEOUT,
+    ) else {
+        return false;
+    };
+    if !output.success {
+        return false;
+    }
+
+    b"astra-tracked-metadata-v1".hash(hasher);
+    let mut entries = 0usize;
+    for path_bytes in output.stdout.split(|byte| *byte == 0) {
+        if path_bytes.is_empty() {
+            continue;
+        }
+        entries = entries.saturating_add(1);
+        if entries > MAX_TRACKED_METADATA_ENTRIES {
+            return false;
+        }
+        let Ok(path_text) = std::str::from_utf8(path_bytes) else {
+            return false;
+        };
+        let path = Path::new(path_text);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+        {
+            return false;
+        }
+        // `git -C root ls-files -- .` emits paths relative to the bound
+        // working directory, unlike `git status` when a parent ignore rule
+        // collapses an ignored entry. Resolve tracked paths from `root`.
+        let path_from_workspace = path;
+        let path_from_git_root = root.join(path);
+        if path_from_workspace
+            .components()
+            .next()
+            .is_some_and(|component| component.as_os_str() == ".astra")
+        {
+            continue;
+        }
+        path_from_workspace.to_string_lossy().hash(hasher);
+        let metadata = match fs::symlink_metadata(&path_from_git_root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // `git ls-files` retains an index entry for an unstaged
+                // deletion. Keep the same deterministic missing sentinel as
+                // the status-path content observer so the deletion remains
+                // observable instead of disabling the whole fast path.
+                b"missing".hash(hasher);
+                continue;
+            }
+            Err(_) => return false,
+        };
+        let state_before = tracked_metadata_state(&metadata, hasher);
+        if metadata.file_type().is_symlink() {
+            let Ok(target) = fs::read_link(&path_from_git_root) else {
+                return false;
+            };
+            target.to_string_lossy().hash(hasher);
+        }
+        let Ok(state_after) = fs::symlink_metadata(&path_from_git_root) else {
+            return false;
+        };
+        if state_before != tracked_metadata_state(&state_after, &mut DefaultHasher::new()) {
+            return false;
+        }
+    }
+    true
+}
+
+fn tracked_metadata_state(metadata: &fs::Metadata, hasher: &mut DefaultHasher) -> u64 {
+    let mut state = DefaultHasher::new();
+    metadata.file_type().is_symlink().hash(&mut state);
+    metadata.is_dir().hash(&mut state);
+    metadata.len().hash(&mut state);
+    hash_permissions(metadata, &mut state);
+    let value = state.finish();
+    value.hash(hasher);
+    value
+}
+
 fn hash_ignored_directory(
     git_root: &Path,
     directory: &Path,
@@ -3381,21 +3550,31 @@ fn hash_ignored_directory(
     true
 }
 
-/// Construct the read-only Git probe used by the observer.
+/// Construct the Git command used by callers that need Git metadata.
 ///
-/// Repository-local `core.fsmonitor` may point at an arbitrary executable.
-/// The observer runs outside the tool sandbox, so allowing that hook here
-/// would turn a metadata probe into host code execution. Disable hook-backed
-/// acceleration and optional locks explicitly; the ordinary status result is
-/// still bounded and any ambiguity fails closed.
-fn hardened_git_command(root: &Path) -> Option<Command> {
+/// The command runs outside the tool sandbox, so repository configuration is
+/// untrusted input.  Disable hook-backed acceleration and optional locks, pin
+/// the executable and environment, and neutralize every configured filter
+/// driver before returning the command to its caller.
+pub fn hardened_git_command(root: &Path) -> Option<Command> {
+    let mut command = base_hardened_git_command(root)?;
+    for driver in configured_git_filter_drivers(root)? {
+        for operation in ["clean", "smudge", "process"] {
+            command
+                .arg("-c")
+                .arg(format!("filter.{driver}.{operation}="));
+        }
+        command
+            .arg("-c")
+            .arg(format!("filter.{driver}.required=false"));
+    }
+    Some(command)
+}
+
+fn base_hardened_git_command(root: &Path) -> Option<Command> {
     let program = trusted_git_program()?;
     let mut command = Command::new(program);
     command
-        // Do not inherit PATH, HOME, GIT_* or loader/configuration variables
-        // from the model-controlled tool environment.  In particular, a
-        // workspace-local executable named `git` must never become the
-        // observer's host process.
         .env_clear()
         .env("PATH", TRUSTED_GIT_PATH)
         .env("HOME", "/nonexistent")
@@ -3408,12 +3587,11 @@ fn hardened_git_command(root: &Path) -> Option<Command> {
         .arg("-c")
         .arg("core.untrackedCache=false")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0");
     #[cfg(unix)]
     {
-        // Do not inherit a user/global config that can add include files or
-        // other process hooks to a probe running in a server host process.
         command
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null");
@@ -3421,9 +3599,47 @@ fn hardened_git_command(root: &Path) -> Option<Command> {
     Some(command)
 }
 
+fn configured_git_filter_drivers(root: &Path) -> Option<Vec<String>> {
+    let mut drivers = Vec::new();
+    for scope in ["--local", "--worktree"] {
+        let mut command = base_hardened_git_command(root)?;
+        command.args([
+            "config",
+            scope,
+            "--includes",
+            "--name-only",
+            "--get-regexp",
+            r"^filter\..+\.(clean|process|smudge)$",
+        ]);
+        let output = run_bounded_probe(command, 128 * 1024, FINGERPRINT_PROBE_TIMEOUT)?;
+        if !output.success {
+            // A non-Git root and a repository without worktree-scoped
+            // configuration both report no matching local keys.
+            continue;
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
+        for key in text.lines() {
+            let driver_and_operation = key.strip_prefix("filter.")?;
+            let (driver, operation) = driver_and_operation.rsplit_once('.')?;
+            if !matches!(operation, "clean" | "process" | "smudge")
+                || driver.is_empty()
+                || !driver
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || ".-_".contains(character))
+            {
+                return None;
+            }
+            if !drivers.iter().any(|known| known == driver) {
+                drivers.push(driver.to_string());
+            }
+        }
+    }
+    Some(drivers)
+}
+
 /// Resolve Git only from administrator-owned system locations.  Looking it
 /// up through PATH would let a task write `./git` (or a virtualenv shim) and
-/// execute that file from the observer, which runs outside the tool sandbox.
+/// execute that file from the observer's host process.
 fn trusted_git_program() -> Option<&'static Path> {
     #[cfg(unix)]
     const CANDIDATES: &[&str] = &["/usr/bin/git", "/bin/git", "/usr/local/bin/git"];
@@ -3441,12 +3657,9 @@ fn trusted_git_program() -> Option<&'static Path> {
         .find(|candidate| trusted_git_path(candidate))
 }
 
-/// The observer runs outside the tool sandbox, so a regular file at a fixed
-/// path is not sufficient provenance: a group-writable `/usr/local/bin` (or a
-/// writable parent) could still replace it between probes.  On Unix require a
-/// root-owned, non-symlink binary and root-owned, non-group/other-writable
-/// parent directories.  If the platform cannot prove this, the caller falls
-/// back to the bounded manifest instead of executing an ambiguous helper.
+/// Require a symlink-free, administrator-owned Git binary and parent path.
+/// If the platform cannot prove that property, callers fall back to the
+/// manifest or fail closed instead of executing an ambiguous helper.
 fn trusted_git_path(candidate: &Path) -> bool {
     let Ok(metadata) = fs::symlink_metadata(candidate) else {
         return false;
@@ -3480,10 +3693,6 @@ fn trusted_git_path(candidate: &Path) -> bool {
         }
     }
 
-    // Windows candidates are already restricted to administrator-managed
-    // installation roots.  ACL inspection is platform-specific and is not
-    // available through std::fs; a symlink-free regular file is the strongest
-    // portable check, while failure still falls back safely above.
     true
 }
 
@@ -3839,7 +4048,20 @@ impl DesiredStateConvergenceTracker {
         args: &serde_json::Value,
         workspace_root: &Path,
     ) -> bool {
-        let Some(target) = full_read_file_normalized_target(name, args, workspace_root) else {
+        self.requires_snapshot_lease_with_access(authority, name, args, workspace_root, None)
+    }
+
+    pub(crate) fn requires_snapshot_lease_with_access(
+        &self,
+        authority: &str,
+        name: &str,
+        args: &serde_json::Value,
+        workspace_root: &Path,
+        access: Option<&crate::fs_ops::FileAccess>,
+    ) -> bool {
+        let Some(target) =
+            full_read_file_normalized_target_with_access(name, args, workspace_root, access)
+        else {
             return false;
         };
         recover_mutex(&self.pending)
@@ -3854,7 +4076,20 @@ impl DesiredStateConvergenceTracker {
         args: &serde_json::Value,
         workspace_root: &Path,
     ) {
-        let Some(target) = full_read_file_normalized_target(name, args, workspace_root) else {
+        self.consume_snapshot_with_access(authority, name, args, workspace_root, None)
+    }
+
+    pub(crate) fn consume_snapshot_with_access(
+        &self,
+        authority: &str,
+        name: &str,
+        args: &serde_json::Value,
+        workspace_root: &Path,
+        access: Option<&crate::fs_ops::FileAccess>,
+    ) {
+        let Some(target) =
+            full_read_file_normalized_target_with_access(name, args, workspace_root, access)
+        else {
             return;
         };
         let key = (authority.to_string(), target);
@@ -3898,12 +4133,42 @@ pub fn project_typed_workspace_convergence(
     targeted_observer: bool,
     strong_snapshot_authority: bool,
 ) -> Result<TypedWorkspaceConvergenceProjection, &'static str> {
-    let convergence_receipt = typed_workspace_desired_state_convergence_receipt_for(
+    project_typed_workspace_convergence_with_access(
+        tracker,
+        authority,
+        name,
+        args,
+        workspace_root,
+        is_error,
+        desired_state,
+        convergence_allowed,
+        targeted_observer,
+        strong_snapshot_authority,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn project_typed_workspace_convergence_with_access(
+    tracker: &DesiredStateConvergenceTracker,
+    authority: Option<&str>,
+    name: &str,
+    args: &serde_json::Value,
+    workspace_root: &Path,
+    is_error: bool,
+    desired_state: Option<&WorkspaceFileStateIdentity>,
+    convergence_allowed: bool,
+    targeted_observer: bool,
+    strong_snapshot_authority: bool,
+    access: Option<&crate::fs_ops::FileAccess>,
+) -> Result<TypedWorkspaceConvergenceProjection, &'static str> {
+    let convergence_receipt = typed_workspace_desired_state_convergence_receipt_for_with_access(
         name,
         args,
         workspace_root,
         is_error,
         convergence_allowed.then_some(desired_state).flatten(),
+        access,
     );
     if let Some(receipt) = convergence_receipt.as_ref() {
         let authority = authority
@@ -3921,19 +4186,26 @@ pub fn project_typed_workspace_convergence(
         let authority = authority
             .filter(|authority| !authority.trim().is_empty())
             .ok_or("desired-state observation requires non-empty live run/turn authority")?;
-        let receipt = typed_workspace_observation_snapshot_receipt_for(
+        let receipt = typed_workspace_observation_snapshot_receipt_for_with_access(
             name,
             args,
             workspace_root,
             is_error,
             strong_snapshot_authority,
+            access,
         );
         if receipt.is_some() {
-            tracker.consume_snapshot(authority, name, args, workspace_root);
+            tracker.consume_snapshot_with_access(authority, name, args, workspace_root, access);
         }
         receipt
     } else {
-        typed_workspace_observation_receipt_for(name, args, workspace_root, is_error)
+        typed_workspace_observation_receipt_for_with_access(
+            name,
+            args,
+            workspace_root,
+            is_error,
+            access,
+        )
     };
 
     Ok(TypedWorkspaceConvergenceProjection {
@@ -4102,6 +4374,24 @@ pub fn typed_workspace_desired_state_convergence_receipt_for(
     is_error: bool,
     desired_state: Option<&WorkspaceFileStateIdentity>,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
+    typed_workspace_desired_state_convergence_receipt_for_with_access(
+        name,
+        args,
+        workspace_root,
+        is_error,
+        desired_state,
+        None,
+    )
+}
+
+pub(crate) fn typed_workspace_desired_state_convergence_receipt_for_with_access(
+    name: &str,
+    args: &serde_json::Value,
+    workspace_root: &Path,
+    is_error: bool,
+    desired_state: Option<&WorkspaceFileStateIdentity>,
+    access: Option<&crate::fs_ops::FileAccess>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
     if is_error
         || desired_state.is_none()
         || name != "write_file"
@@ -4112,7 +4402,7 @@ pub fn typed_workspace_desired_state_convergence_receipt_for(
     {
         return None;
     }
-    let target = normalized_bound_target_identity(name, args, workspace_root)?;
+    let target = normalized_bound_target_identity_with_access(name, args, workspace_root, access)?;
     let invocation_target = raw_invocation_target_identity(name, args)?;
     let desired_state = desired_state?.clone();
     let request = workspace_file_state_identity(args.get("content")?.as_str()?.as_bytes());
@@ -4120,7 +4410,11 @@ pub fn typed_workspace_desired_state_convergence_receipt_for(
         return None;
     }
     let normalized_path = target.get("path")?.as_str()?;
-    if stable_bounded_file_state_identity(&workspace_root.join(normalized_path))? != desired_state {
+    if stable_bounded_file_state_identity_with_access(
+        &workspace_root.join(normalized_path),
+        access,
+    )? != desired_state
+    {
         return None;
     }
     Some(serde_json::Map::from_iter([
@@ -4222,10 +4516,11 @@ fn structured_targets_are_bound(
     found
 }
 
-fn normalized_bound_target_identity(
+fn normalized_bound_target_identity_with_access(
     name: &str,
     args: &serde_json::Value,
     workspace_root: &Path,
+    access: Option<&crate::fs_ops::FileAccess>,
 ) -> Option<serde_json::Value> {
     let object = args.as_object()?;
     let keys: &[&str] = if name == "lsp" {
@@ -4248,8 +4543,12 @@ fn normalized_bound_target_identity(
             continue;
         };
         let raw = raw.as_str()?;
-        let resolved = crate::fs_ops::resolve_path_sandboxed(workspace_root, raw, &[]).ok()?;
-        let relative = crate::fs_ops::relative_to_workspace_root(workspace_root, &resolved)?;
+        let relative = if let Some(access) = access {
+            access.observation_target(Path::new(raw)).ok()?
+        } else {
+            let resolved = crate::fs_ops::resolve_path_sandboxed(workspace_root, raw, &[]).ok()?;
+            crate::fs_ops::relative_to_workspace_root(workspace_root, &resolved)?
+        };
         let normalized = normalized_relative_target(&relative)?;
         if normalized_target
             .as_ref()
@@ -4498,6 +4797,16 @@ pub fn typed_workspace_observation_receipt_for(
     workspace_root: &Path,
     is_error: bool,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
+    typed_workspace_observation_receipt_for_with_access(name, args, workspace_root, is_error, None)
+}
+
+pub(crate) fn typed_workspace_observation_receipt_for_with_access(
+    name: &str,
+    args: &serde_json::Value,
+    workspace_root: &Path,
+    is_error: bool,
+    access: Option<&crate::fs_ops::FileAccess>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
     if is_error
         || !is_typed_workspace_observer(name)
         || (name == "lsp"
@@ -4535,12 +4844,17 @@ pub fn typed_workspace_observation_receipt_for(
             continue;
         };
         let path = value.as_str()?;
-        if crate::fs_ops::resolve_path_sandboxed(workspace_root, path, &[]).is_err() {
+        if if let Some(access) = access {
+            access.observation_open(Path::new(path)).is_err()
+        } else {
+            crate::fs_ops::resolve_path_sandboxed(workspace_root, path, &[]).is_err()
+        } {
             return None;
         }
     }
     let mut receipt = typed_workspace_observation_receipt();
-    if let Some(target) = normalized_bound_target_identity(name, args, workspace_root)
+    if let Some(target) =
+        normalized_bound_target_identity_with_access(name, args, workspace_root, access)
         && let Some(value) = receipt.get_mut(OBSERVATION_RECEIPT_FIELD)
         && let Some(object) = value.as_object_mut()
     {
@@ -4565,18 +4879,43 @@ pub fn typed_workspace_observation_snapshot_receipt_for(
     is_error: bool,
     snapshot_authority: bool,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
+    typed_workspace_observation_snapshot_receipt_for_with_access(
+        name,
+        args,
+        workspace_root,
+        is_error,
+        snapshot_authority,
+        None,
+    )
+}
+
+pub(crate) fn typed_workspace_observation_snapshot_receipt_for_with_access(
+    name: &str,
+    args: &serde_json::Value,
+    workspace_root: &Path,
+    is_error: bool,
+    snapshot_authority: bool,
+    access: Option<&crate::fs_ops::FileAccess>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
     if !snapshot_authority {
         return None;
     }
-    let mut receipt =
-        typed_workspace_observation_receipt_for(name, args, workspace_root, is_error)?;
+    let mut receipt = typed_workspace_observation_receipt_for_with_access(
+        name,
+        args,
+        workspace_root,
+        is_error,
+        access,
+    )?;
     let value = receipt
         .get_mut(OBSERVATION_RECEIPT_FIELD)?
         .as_object_mut()?;
     let normalized_path =
         validated_target_identity(&serde_json::Value::Object(value.clone()))?.to_string();
-    let observed_state =
-        stable_bounded_file_state_identity(&workspace_root.join(&normalized_path))?;
+    let observed_state = stable_bounded_file_state_identity_with_access(
+        &workspace_root.join(&normalized_path),
+        access,
+    )?;
     value.insert(
         "observed_state".to_string(),
         serde_json::to_value(observed_state).ok()?,
@@ -4588,9 +4927,19 @@ pub fn typed_workspace_observation_snapshot_receipt_for(
     Some(receipt)
 }
 
-fn stable_bounded_file_state_identity(path: &Path) -> Option<WorkspaceFileStateIdentity> {
-    fn capture(path: &Path) -> Option<WorkspaceFileStateIdentity> {
-        let mut file = fs::File::open(path).ok()?;
+fn stable_bounded_file_state_identity_with_access(
+    path: &Path,
+    access: Option<&crate::fs_ops::FileAccess>,
+) -> Option<WorkspaceFileStateIdentity> {
+    fn capture(
+        path: &Path,
+        access: Option<&crate::fs_ops::FileAccess>,
+    ) -> Option<WorkspaceFileStateIdentity> {
+        let mut file = if let Some(access) = access {
+            access.observation_open(path).ok()?
+        } else {
+            fs::File::open(path).ok()?
+        };
         let metadata = file.metadata().ok()?;
         if !metadata.is_file() || metadata.len() > MAX_CONVERGENCE_SNAPSHOT_BYTES {
             return None;
@@ -4616,8 +4965,8 @@ fn stable_bounded_file_state_identity(path: &Path) -> Option<WorkspaceFileStateI
         })
     }
 
-    let first = capture(path)?;
-    let second = capture(path)?;
+    let first = capture(path, access)?;
+    let second = capture(path, access)?;
     (first == second).then_some(second)
 }
 
@@ -4686,6 +5035,15 @@ pub fn full_read_file_normalized_target(
     args: &serde_json::Value,
     workspace_root: &Path,
 ) -> Option<String> {
+    full_read_file_normalized_target_with_access(name, args, workspace_root, None)
+}
+
+pub(crate) fn full_read_file_normalized_target_with_access(
+    name: &str,
+    args: &serde_json::Value,
+    workspace_root: &Path,
+    access: Option<&crate::fs_ops::FileAccess>,
+) -> Option<String> {
     if name != "read_file"
         || args.get("start_line").is_some()
         || args.get("end_line").is_some()
@@ -4693,7 +5051,7 @@ pub fn full_read_file_normalized_target(
     {
         return None;
     }
-    normalized_bound_target_identity(name, args, workspace_root)
+    normalized_bound_target_identity_with_access(name, args, workspace_root, access)
         .and_then(|target| target.get("path")?.as_str().map(ToString::to_string))
 }
 
@@ -5697,8 +6055,72 @@ mod tests {
         assert_eq!(path, std::ffi::OsStr::new(TRUSTED_GIT_PATH));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn git_fingerprint_detects_change_inside_pre_dirty_path() {
+    fn git_probe_disables_repository_clean_and_process_filters() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(["-C", workspace.path().to_str().expect("workspace path")])
+                .args(args)
+                .status()
+                .expect("git available");
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "astra@example.invalid"]);
+        run(&["config", "user.name", "Astra Test"]);
+
+        let marker = workspace.path().join("filter-ran");
+        let filter = workspace.path().join("clean-filter.sh");
+        fs::write(
+            &filter,
+            format!("#!/bin/sh\nprintf x >> '{}'\ncat\n", marker.display()),
+        )
+        .expect("filter script");
+        fs::set_permissions(&filter, fs::Permissions::from_mode(0o700))
+            .expect("filter permissions");
+        run(&["config", "filter.evil.clean", filter.to_str().unwrap()]);
+        run(&["config", "filter.evil.smudge", filter.to_str().unwrap()]);
+        run(&["config", "filter.evil.required", "true"]);
+        fs::write(
+            workspace.path().join(".gitattributes"),
+            "*.txt filter=evil\n",
+        )
+        .expect("attributes");
+        fs::write(workspace.path().join("tracked.txt"), "before\n").expect("tracked file");
+        run(&["add", ".gitattributes"]);
+        run(&["add", "tracked.txt"]);
+        let _ = fs::remove_file(&marker);
+        run(&["commit", "-qm", "initial"]);
+        // Add the process driver only after setup and keep it in the
+        // worktree-scoped config; the hardened probe must enumerate both
+        // local and worktree scopes before Git considers the worktree.
+        run(&["config", "extensions.worktreeConfig", "true"]);
+        run(&[
+            "config",
+            "--worktree",
+            "filter.evil.process",
+            filter.to_str().unwrap(),
+        ]);
+        fs::write(workspace.path().join("tracked.txt"), "after\n").expect("change file");
+        let _ = fs::remove_file(&marker);
+
+        let mut command = hardened_git_command(workspace.path()).expect("trusted git installed");
+        command.args(["status", "--porcelain", "--untracked-files=no"]);
+        let output = run_bounded_probe(command, 128 * 1024, FINGERPRINT_PROBE_TIMEOUT)
+            .expect("bounded status probe");
+        assert!(output.success);
+        assert!(
+            !marker.exists(),
+            "Git status must not execute a repository filter"
+        );
+    }
+
+    #[test]
+    fn workspace_fingerprint_detects_change_inside_pre_dirty_path() {
         let temp = tempfile::tempdir().expect("tempdir");
         let run = |args: &[&str]| {
             let status = Command::new("git")
@@ -5717,14 +6139,14 @@ mod tests {
 
         // The path is already dirty before the observation window starts.
         fs::write(temp.path().join("tracked.txt"), "one!").unwrap();
-        let before = WorkspaceFingerprint::capture(temp.path()).expect("git fingerprint");
+        let before = WorkspaceFingerprint::capture(temp.path()).expect("workspace fingerprint");
         fs::write(temp.path().join("tracked.txt"), "two!").unwrap();
-        let after = WorkspaceFingerprint::capture(temp.path()).expect("git fingerprint");
+        let after = WorkspaceFingerprint::capture(temp.path()).expect("workspace fingerprint");
         assert!(before.changed_from(Some(after)));
     }
 
     #[test]
-    fn git_fingerprint_detects_clean_commit_inside_bound_workspace() {
+    fn workspace_fingerprint_detects_clean_commit_inside_bound_workspace() {
         let temp = tempfile::tempdir().expect("tempdir");
         let run = |args: &[&str]| {
             let status = Command::new("git")
@@ -5741,16 +6163,230 @@ mod tests {
         run(&["add", "tracked.txt"]);
         run(&["commit", "-qm", "initial"]);
 
-        let before = WorkspaceFingerprint::capture(temp.path()).expect("git fingerprint");
+        let before = WorkspaceFingerprint::capture(temp.path()).expect("workspace fingerprint");
         fs::write(temp.path().join("tracked.txt"), "committed").unwrap();
         run(&["add", "tracked.txt"]);
         run(&["commit", "-qm", "change"]);
-        let after = WorkspaceFingerprint::capture(temp.path()).expect("git fingerprint");
+        let after = WorkspaceFingerprint::capture(temp.path()).expect("workspace fingerprint");
         assert!(before.changed_from(Some(after)));
     }
 
     #[test]
-    fn git_fingerprint_handles_unborn_head_and_detects_worktree_write() {
+    fn clean_git_workspace_with_large_tracked_content_remains_observable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(["-C", temp.path().to_str().unwrap()])
+                .args(args)
+                .status()
+                .expect("git available");
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "astra@example.invalid"]);
+        run(&["config", "user.name", "Astra Test"]);
+        fs::write(
+            temp.path().join("large.bin"),
+            vec![0_u8; MAX_STATUS_CONTENT_BYTES + 1],
+        )
+        .expect("large tracked file");
+        run(&["add", "large.bin"]);
+        run(&["commit", "-qm", "large tracked file"]);
+
+        assert!(
+            WorkspaceFingerprint::capture(temp.path()).is_some(),
+            "a clean tracked file must not consume the uncommitted-content budget"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_tracked_permission_change_is_observable_when_git_ignores_filemode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(["-C", temp.path().to_str().unwrap()])
+                .args(args)
+                .status()
+                .expect("git available");
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "astra@example.invalid"]);
+        run(&["config", "user.name", "Astra Test"]);
+        run(&["config", "core.filemode", "false"]);
+        fs::write(temp.path().join("tracked.txt"), "base").expect("tracked file");
+        run(&["add", "tracked.txt"]);
+        run(&["commit", "-qm", "tracked file"]);
+
+        let before = WorkspaceFingerprint::capture(temp.path()).expect("before fingerprint");
+        let mut permissions = fs::metadata(temp.path().join("tracked.txt"))
+            .expect("tracked metadata")
+            .permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(temp.path().join("tracked.txt"), permissions)
+            .expect("change tracked permissions");
+        let after = WorkspaceFingerprint::capture(temp.path()).expect("after fingerprint");
+        assert!(before.changed_from(Some(after)));
+    }
+
+    #[test]
+    fn unstaged_tracked_deletion_remains_observable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(["-C", temp.path().to_str().unwrap()])
+                .args(args)
+                .status()
+                .expect("git available");
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "astra@example.invalid"]);
+        run(&["config", "user.name", "Astra Test"]);
+        fs::write(temp.path().join("tracked.txt"), "base").expect("tracked file");
+        run(&["add", "tracked.txt"]);
+        run(&["commit", "-qm", "tracked file"]);
+
+        let before = WorkspaceFingerprint::capture(temp.path()).expect("before fingerprint");
+        fs::remove_file(temp.path().join("tracked.txt")).expect("delete tracked file");
+        let after = WorkspaceFingerprint::capture(temp.path()).expect("after fingerprint");
+        assert!(before.changed_from(Some(after)));
+    }
+
+    #[test]
+    fn clean_large_index_is_observable_above_dirty_status_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(temp.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        run(&["init", "-q"]);
+        for index in 0..=MAX_STATUS_ENTRIES {
+            fs::write(temp.path().join(format!("file-{index}")), "x").unwrap();
+        }
+        run(&["add", "."]);
+        run(&[
+            "-c",
+            "user.name=Astra",
+            "-c",
+            "user.email=astra@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ]);
+        assert!(git_index_is_observable(temp.path()));
+        let before = WorkspaceFingerprint::capture(temp.path()).expect("clean large index");
+        fs::write(temp.path().join("file-0"), "changed").unwrap();
+        let after = WorkspaceFingerprint::capture(temp.path()).expect("one dirty entry");
+        assert!(before.changed_from(Some(after)));
+    }
+
+    #[test]
+    fn gitlink_entries_fail_closed_for_workspace_observation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(["-C", temp.path().to_str().unwrap()])
+                .args(args)
+                .status()
+                .expect("git available");
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "astra@example.invalid"]);
+        run(&["config", "user.name", "Astra Test"]);
+        fs::write(temp.path().join("tracked.txt"), "base").expect("tracked file");
+        run(&["add", "tracked.txt"]);
+        run(&["commit", "-qm", "tracked file"]);
+        let output = Command::new("git")
+            .args(["-C", temp.path().to_str().unwrap(), "rev-parse", "HEAD"])
+            .output()
+            .expect("git available");
+        assert!(output.status.success());
+        let commit = String::from_utf8(output.stdout)
+            .expect("commit id")
+            .trim()
+            .to_string();
+        let cacheinfo = format!("160000,{commit},nested");
+        run(&[
+            "update-index",
+            "--add",
+            "--info-only",
+            "--cacheinfo",
+            &cacheinfo,
+        ]);
+
+        assert!(!git_index_is_observable(temp.path()));
+        assert!(WorkspaceFingerprint::capture(temp.path()).is_none());
+    }
+
+    #[test]
+    fn hidden_git_index_flags_fail_closed_for_workspace_observation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(["-C", temp.path().to_str().unwrap()])
+                .args(args)
+                .status()
+                .expect("git available");
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "astra@example.invalid"]);
+        run(&["config", "user.name", "Astra Test"]);
+        fs::write(temp.path().join("tracked.txt"), "base").expect("tracked file");
+        run(&["add", "tracked.txt"]);
+        run(&["commit", "-qm", "tracked file"]);
+
+        run(&["update-index", "--assume-unchanged", "tracked.txt"]);
+        fs::write(temp.path().join("tracked.txt"), "assume-unchanged rewrite")
+            .expect("assume-unchanged rewrite");
+        assert!(
+            WorkspaceFingerprint::capture(temp.path()).is_none(),
+            "assume-unchanged hides worktree changes from git status"
+        );
+
+        run(&["update-index", "--no-assume-unchanged", "tracked.txt"]);
+        run(&["update-index", "--skip-worktree", "tracked.txt"]);
+        fs::write(temp.path().join("tracked.txt"), "skip-worktree rewrite")
+            .expect("skip-worktree rewrite");
+        assert!(
+            WorkspaceFingerprint::capture(temp.path()).is_none(),
+            "skip-worktree hides worktree changes from git status"
+        );
+
+        run(&[
+            "update-index",
+            "--no-assume-unchanged",
+            "--no-skip-worktree",
+            "tracked.txt",
+        ]);
+        run(&[
+            "update-index",
+            "--assume-unchanged",
+            "--skip-worktree",
+            "tracked.txt",
+        ]);
+        fs::write(temp.path().join("tracked.txt"), "combined-flags rewrite")
+            .expect("combined-flags rewrite");
+        assert!(
+            WorkspaceFingerprint::capture(temp.path()).is_none(),
+            "combined assume-unchanged and skip-worktree flags hide worktree changes from git status"
+        );
+    }
+
+    #[test]
+    fn workspace_fingerprint_handles_unborn_head_and_detects_worktree_write() {
         let temp = tempfile::tempdir().expect("tempdir");
         let status = Command::new("git")
             .args(["-C", temp.path().to_str().unwrap(), "init", "-q"])
@@ -5758,14 +6394,16 @@ mod tests {
             .expect("git available");
         assert!(status.success());
 
-        let before = WorkspaceFingerprint::capture(temp.path()).expect("unborn git fingerprint");
+        let before =
+            WorkspaceFingerprint::capture(temp.path()).expect("unborn workspace fingerprint");
         fs::write(temp.path().join("new.txt"), "created before first commit").unwrap();
-        let after = WorkspaceFingerprint::capture(temp.path()).expect("unborn git fingerprint");
+        let after =
+            WorkspaceFingerprint::capture(temp.path()).expect("unborn workspace fingerprint");
         assert!(before.changed_from(Some(after)));
     }
 
     #[test]
-    fn git_fingerprint_handles_bound_subtree_missing_from_head() {
+    fn workspace_fingerprint_handles_bound_subtree_missing_from_head() {
         let temp = tempfile::tempdir().expect("tempdir");
         let run = |args: &[&str]| {
             let status = Command::new("git")
@@ -6521,7 +7159,7 @@ mod tests {
     }
 
     #[test]
-    fn git_fingerprint_excludes_workspace_coordination_files() {
+    fn workspace_fingerprint_excludes_workspace_coordination_files() {
         let temp = tempfile::tempdir().expect("tempdir");
         let run = |args: &[&str]| {
             assert!(
@@ -7111,7 +7749,7 @@ mod tests {
     }
 
     #[test]
-    fn git_fingerprint_is_bound_to_subdirectory_and_observes_direct_ignored_files() {
+    fn workspace_fingerprint_is_bound_to_subdirectory_and_observes_direct_ignored_files() {
         let temp = tempfile::tempdir().expect("tempdir");
         let run = |args: &[&str]| {
             let status = Command::new("git")
@@ -7145,7 +7783,7 @@ mod tests {
     }
 
     #[test]
-    fn parent_ignored_ancestor_falls_back_to_bound_manifest() {
+    fn nested_workspace_manifest_detects_change() {
         let temp = tempfile::tempdir().expect("tempdir");
         let run = |args: &[&str]| {
             assert!(
@@ -7167,43 +7805,6 @@ mod tests {
         fs::write(workspace.join("result.txt"), "two").unwrap();
         let after = WorkspaceFingerprint::capture(&workspace).expect("bounded fallback");
         assert!(before.changed_from(Some(after)));
-    }
-
-    #[test]
-    fn ignored_directory_is_bounded_without_walking_an_unbounded_tree() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let run = |args: &[&str]| {
-            let status = Command::new("git")
-                .args(["-C", temp.path().to_str().unwrap()])
-                .args(args)
-                .status()
-                .expect("git available");
-            assert!(status.success());
-        };
-        run(&["init", "-q"]);
-        run(&["config", "user.email", "astra@example.invalid"]);
-        run(&["config", "user.name", "Astra Test"]);
-        fs::write(temp.path().join(".gitignore"), "build/\n").unwrap();
-        fs::write(temp.path().join("tracked"), "base").unwrap();
-        run(&["add", "."]);
-        run(&["commit", "-qm", "initial"]);
-        fs::create_dir(temp.path().join("build")).unwrap();
-        for index in 0..100 {
-            fs::write(temp.path().join(format!("build/file-{index}")), "x").unwrap();
-        }
-        let before = WorkspaceFingerprint::capture(temp.path()).expect("bounded git fingerprint");
-        fs::write(temp.path().join("build/file-1"), "changed").unwrap();
-        let after = WorkspaceFingerprint::capture(temp.path()).expect("bounded git fingerprint");
-        assert!(before.changed_from(Some(after)));
-
-        // A cache-sized ignored tree is not silently treated as unchanged;
-        // the bounded observer fails closed once its evidence budget is
-        // exceeded.
-        fs::create_dir(temp.path().join("build/large")).unwrap();
-        for index in 0..(MAX_IGNORED_ENTRIES + 1) {
-            fs::write(temp.path().join(format!("build/large/file-{index}")), "x").unwrap();
-        }
-        assert!(WorkspaceFingerprint::capture(temp.path()).is_none());
     }
 
     #[cfg(unix)]

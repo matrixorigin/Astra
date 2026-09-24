@@ -67,7 +67,6 @@ pub mod session_memory_inventory;
 pub mod session_restore;
 pub mod session_workspace;
 pub mod skill_auto_route_judge;
-pub mod skill_config;
 pub mod skills;
 pub mod snapshot_sql;
 pub mod state_projection;
@@ -190,22 +189,46 @@ pub use decisions::{
     DecisionRecord, DecisionService, DecisionWithContextRecord, UnconfiguredDecisionService,
 };
 pub use edge_context::{EdgeContext, EdgeProfile, EdgeSkillRef};
-pub use evaluation::{DatabaseEvaluationService, EvaluationService, UnconfiguredEvaluationService};
+pub use evaluation::{
+    ASSESSMENT_SCHEMA_VERSION, CausalStrength, ComparisonArm, ComparisonReport, DataIsolation,
+    DatabaseEvaluationObservationStore, DatabaseEvaluationPlanStore,
+    DatabaseEvaluationProjectionStore, DatabaseEvaluationService,
+    DatabaseMaterializationReceiptStore, EVALUATION_EXECUTION_SCHEMA_VERSION,
+    EVALUATION_REPORT_RENDERER_VERSION, EVALUATION_REPORT_SCHEMA_VERSION, EvaluationBudget,
+    EvaluationCase, EvaluationExecutionError, EvaluationExperimentProjection,
+    EvaluationExperimentRecord, EvaluationObservationRecord, EvaluationObservationRequest,
+    EvaluationPersistenceError, EvaluationProjectionError, EvaluationReportArtifact,
+    EvaluationReportCoverage, EvaluationReportManifest, EvaluationReportObservationRef,
+    EvaluationRunAdmission, EvaluationService, EvaluationSkillRevision, EvaluationTarget,
+    EvaluationTargetKind, EvaluationTrialBindingRecord, EvaluationTrialLifecycle,
+    EvaluationTrialProjection, EvidenceAvailability, EvidenceKind, EvidenceRef, ExperimentSpec,
+    FrozenConditions, MaterializationComponentKind, MaterializationOutcome,
+    MaterializationReceiptError, MaterializationReceiptRecord, MaterializationReceiptRequest,
+    MaterializationValidationError, Measurement, MeasurementStatus, MemoryIsolation, RevisionRef,
+    SNAPSHOT_ENVELOPE_SCHEMA_VERSION, SnapshotEnvelope, TrialObservation, TrialOrder, TrialStatus,
+    TrialUnit, TrustedMaterializerContext, UnconfiguredEvaluationService, apply_inference_evidence,
+    apply_tool_outcome_evidence, build_comparison_for_plan, build_report_artifact,
+    content_fingerprint, evaluation_component_idempotency_key, prompt_context_fingerprint,
+    prompt_only_snapshot_envelope, prompt_policy_fingerprint, render_markdown,
+    required_components_for_spec, terminal_run_observation, validate_receipt_set,
+};
 pub use events::{
     DatabaseEventService, EventCreateRequestData, EventIngestionSource, EventListFilter,
     EventListRecord, EventRecord, EventService, UnconfiguredEventService,
 };
 pub use execution_grant::{ExecutionGrantError, ExecutionGrantSigner};
 pub use harness::{
-    DatabaseHarnessService, HarnessCitationRecord, HarnessDecisionRequest, HarnessItemRecord,
-    HarnessNodeCatalogRecord, HarnessRunRecord, HarnessService, HarnessSkillDraftRecord,
-    HarnessSkillRuleRecord, HarnessTemplateRecord, SkillifyAgentCitation, SkillifyAgentDraft,
-    SkillifyAgentExecutor, SkillifyAgentOutput, SkillifyAgentRequest, SkillifyAgentRule,
-    SkillifyDraftRecord, SkillifyDraftRequest, SkillifyPublishRecord, SkillifyPublishRequest,
+    AuthoringEvaluationInput, AuthoringEvaluationSummary, AuthoringInferenceEvidence,
+    AuthoringIntentRecord, AuthoringIntentRequest, DatabaseHarnessService, HarnessCitationRecord,
+    HarnessDecisionRequest, HarnessItemRecord, HarnessNodeCatalogRecord, HarnessRunRecord,
+    HarnessService, HarnessSkillDraftRecord, HarnessSkillRuleRecord, HarnessTemplateRecord,
+    SkillifyAgentCitation, SkillifyAgentDraft, SkillifyAgentExecutor, SkillifyAgentOutput,
+    SkillifyAgentRequest, SkillifyAgentRule, SkillifyPublishRecord, SkillifyPublishRequest,
     SkillifyRunRequest, SkillifySourceFile, SkillifySourcePacket, UnconfiguredHarnessService,
 };
 pub use inference_execution::{
-    AuxiliaryExecutionAttemptFact, InferenceCanonicalTransitionReceipt,
+    AuxiliaryExecutionAttemptFact, EVALUATION_INFERENCE_EVIDENCE_SCHEMA_VERSION,
+    EvaluationInferenceEvidence, InferenceCanonicalTransitionReceipt,
     InferenceInvocationAdmissionResolution, InferenceInvocationInput, InferenceInvocationPlan,
     InferenceInvocationTerminal, InferenceOwnerLeaseRenewal, InferenceProviderAttemptPlan,
     InferenceProviderDeliveryState, InferenceProviderWireIdentity, InferenceRunAdmissionAuthority,
@@ -215,7 +238,7 @@ pub use inference_execution::{
     declare_inference_attempt_settlement, declare_inference_settlement,
     finish_inference_invocation, finish_inference_provider_attempt,
     finish_successful_inference_provider_attempt_and_invocation,
-    load_existing_inference_operation_ids_for_route,
+    load_evaluation_inference_evidence, load_existing_inference_operation_ids_for_route,
     load_inference_canonical_transitions_for_session, load_session_auxiliary_capture,
     load_tool_result_projection_decisions, next_inference_logical_attempt_pair_base,
     plan_inference_invocation, plan_inference_provider_attempt,
@@ -291,9 +314,9 @@ pub use pagination::{
 };
 pub use personal_skills::{
     ActivateUserSkillVersion, ActivePersonalSkillRecord, CreateUserSkillSource,
-    DatabasePersonalSkillStore, PersonalSkillError, RecordUserSkillEvaluation,
-    SKILL_MD_NORMALIZE_VERSION, SubmitUserSkillVersion, UserSkillEvaluationRecord,
-    UserSkillSourceRecord, UserSkillVersionRecord, normalize_skill_md, skill_md_content_hash,
+    DatabasePersonalSkillStore, PersonalSkillError, SKILL_MD_NORMALIZE_VERSION,
+    SubmitUserSkillVersion, UserSkillSourceRecord, UserSkillVersionRecord, normalize_skill_md,
+    skill_md_content_hash,
 };
 pub use prompt_delta::{
     PromptDeltaCounts, PromptRequestObservability, PromptRequestPersistInput,
@@ -362,13 +385,15 @@ pub use session_handoff::{
 };
 pub use session_identity::{MAX_PERSISTED_SESSION_ID_BYTES, validate_persisted_session_id};
 pub use skill_auto_route_judge::{
+    SKILL_AUTO_ROUTE_JUDGMENT_CONTRACT_VERSION, SKILL_AUTO_ROUTE_SINGLE_SKILL_OUTPUT_TOKENS,
     SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeContext,
-    SkillAutoRouteJudgeError, build_skill_auto_route_prompt, parse_skill_auto_route_response,
-    skill_auto_route_judge_messages, skill_auto_route_judgment_request,
+    SkillAutoRouteJudgeError, SkillAutoRouteParseResult, SkillAutoRouteParseStatus,
+    build_skill_auto_route_prompt, parse_skill_auto_route_response,
+    parse_skill_auto_route_response_with_status, skill_auto_route_judge_messages,
+    skill_auto_route_judgment_contract_fingerprint, skill_auto_route_judgment_request,
+    skill_auto_route_judgment_request_fingerprint,
 };
-pub use skill_config::{
-    DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,
-};
+
 pub use skills::{
     DatabaseSkillService, SkillPublishRequestData, SkillRecord, SkillService,
     UnconfiguredSkillService,

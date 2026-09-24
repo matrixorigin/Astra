@@ -8,9 +8,8 @@ Tool permissions and execution authority still belong to the runtime.
 
 ## Configure
 
-Register one TypeSafe connection and API key. Runtime judgments and
-`astra admin model compare` reuse that Offering; no extra environment variable is
-needed.
+Register one TypeSafe connection and API key. Runtime judgments and Evaluation
+reuse that Offering; no extra environment variable is needed.
 
 1. Register a `provider: typesafe` model using the existing model management
    flow. Set `base_url: https://api.typesafe.ai`, a pinned model such as
@@ -196,50 +195,35 @@ TypeSafe streaming, tools, ordinary chat, extraction, reasoning and arbitrary
 wire overrides are rejected before dispatch. Shared memory/reasoning defaults
 exclude it, and chat default projection will not select it.
 
-## Compare without changing deployment configuration
+## Compare through Evaluation
 
-Use your existing Astra login and registered Offerings. Obtain the IDs with
-`astra admin model list`, then run:
-
-```sh
-astra admin model compare <baseline-offering-id> <jev-offering-id>
-```
-
-This repeats the twelve built-in memory cases three times through the existing
-authenticated Server completion endpoint and ledger. It creates a separate
-comparison Session and never changes your active Session or deployment binding.
-Backend order alternates by repetition. Reports go to a new private directory
-under `/tmp`; the command prints its location and a readable summary.
-Unavailable calls and malformed answers remain distinct from label errors.
-
-For another replacement, provide a JSON case file:
+The old direct completion comparator has been removed. It created a second
+measurement path and could not prove the physical run evidence required for a
+causal comparison. Use the canonical Evaluation prepare request described in
+the [Evaluation guide](evaluation.md), then run it through the authenticated
+CLI:
 
 ```sh
-astra admin model compare <baseline-offering-id> <jev-offering-id> \
-  --cases examples/judgment-compare.json --repeat 3
+astra evaluation run evaluation-intent.json
 ```
 
-Each case defines its operation, structured evidence/questions, optional expected
-question IDs, and a probability threshold. All task criteria belong in the shared
-questions/state. The LLM system message only specifies output formatting, so both
-Offerings evaluate the same input. The example uses `verification_judge`; other
-supported completion operations include `turn_intent` and `skill_auto_route`.
-Comparison requests do not change the deployment's judgment binding.
+The CLI submits the intent, starts the server-owned trial Runs in sequence,
+waits for the projection to reach terminal evidence, asks the server to assess
+each trial, and prints the same report returned by the Web UI. If the terminal
+wait is interrupted, the experiment remains durable:
 
-`manifest.json` records the binary hash/version, normalized fixture hash, exact
-Offerings, shared instructions and deadline. `results.jsonl` is flushed after each
-call and retains raw probabilities, usage, actual typed-response model, input
-hash, ordering coordinates, latency and failures. `summary.json` reports valid
-and unavailable calls, label agreement and latency across all calls, including
-failed and malformed responses. Private case contents stay
-in the local report; users choose any custom evidence sent to their configured
-Offerings. Costs are not guessed: the public catalog has no price fields, so the
-runner reports actual token usage for comparison against Offering prices.
+```sh
+astra evaluation show <experiment-id>
+astra evaluation report <experiment-id>
+```
 
-Thresholds can be compared against saved Jev probabilities without making new
-paid calls. Repeated synthetic cases are not independent production coverage;
-the concise-preference relevance labels are subjective. Compare task quality
-and unhappy paths on a representative corpus before enabling a new replacement.
+For Skill routing, use `kind: "skill_routing_judgment"` and pin the same
+published Skill revision on both arms. The optional `judgment_model_offering_id`
+freezes Jev or an explicitly selected LLM substitute at prepare time. Omitting
+it uses the configured judgment Offering; no available Offering leaves the
+candidate enhancement explicitly unavailable while the basic Skill path stays
+executable. The report, rather than a successful judgment call, is the source
+of task, reliability, latency, physical usage, and cost evidence.
 
 ## See Jev usage in Explain
 
@@ -266,8 +250,7 @@ not invent auxiliary timings or claim that Jev reduces main-agent rounds.
 | Invalid answers, probabilities or question identities | Reject the judgment and use the same conservative business fallback |
 | Valid answers with missing/invalid token metadata | Keep the judgment; missing counters remain unknown |
 | Explain usage capture fails or exceeds its budget | Preserve the answer; report auxiliary capture unavailable |
-| A comparison call fails or returns invalid answers | Keep every observation, label the failure and return an unsuccessful comparison |
-| Comparison output directory already exists | Refuse overwrite and preserve the existing report |
+| An Evaluation trial cannot produce complete evidence | Preserve the trial as unavailable or incomplete; do not assign task success or cost |
 
 These describe the contract and its deterministic regression coverage, not proof
 that every live-provider failure has been reproduced. Optional auxiliary
@@ -276,15 +259,14 @@ inference failure does not become a primary task `ExecutionIncomplete` condition
 ## Validate
 
 Normal offline and online tests use local mock providers and fake keys. They do
-not load `JEV_KEY`, connect to Jev/DeepSeek, or run `admin model compare` against
-real Offerings. Real-provider evaluation is an explicit harness action, separate
-from these tests; the commands above perform that action and may incur charges.
+not load `JEV_KEY` or connect to Jev/DeepSeek. A live Evaluation run is an
+explicit user action and may incur provider charges.
 
 ```sh
 cargo test -p astra-runtime --lib turn::llm::typesafe::tests
 cargo test -p astra-runtime --lib memory_hooks::relevance::tests
 cargo test -p astra-runtime --lib memory_catalog_query_tests
-cargo test -p astra-cli --lib admin_cli::judgment_compare::tests
+cargo test -p astra-cli --lib cli::evaluation::tests
 ```
 
 Only claim lower rounds if an existing call is eliminated: replacing one selector

@@ -66,13 +66,33 @@ jobs:
           TEST_NAME_FILTER: ${{ github.event.inputs.test_name_filter || '' }}
         run: |
           set -euo pipefail
+          if [ -n "${ASTRA_EVALUATION_EDGE_BIN:-}" ]; then
+            EDGE_BIN="$ASTRA_EVALUATION_EDGE_BIN"
+          else
+            cargo build --manifest-path Cargo.toml -p astra-edge --bin astra-edge
+            EDGE_BIN="${CARGO_TARGET_DIR:-target}/debug/astra-edge"
+          fi
+          if [[ "$EDGE_BIN" != /* ]]; then EDGE_BIN="$PWD/$EDGE_BIN"; fi
+          export ASTRA_EVALUATION_EDGE_BIN="$EDGE_BIN"
           FILTER="${TEST_NAME_FILTER:-}"
           if [ -n "$FILTER" ]; then
+            SKIP_ARGS=()
+            if [ -z "${ASTRA_EVALUATION_EDGE_CONFIG:-}" ] || [ -z "${ASTRA_EVALUATION_EDGE_WORKSPACE_DIR:-}" ]; then
+              if [[ "$FILTER" == *e2e_matrix_evaluation_coding_real_edge* ]]; then
+                echo "The dedicated coding Evaluation journey requires ASTRA_EVALUATION_EDGE_CONFIG and ASTRA_EVALUATION_EDGE_WORKSPACE_DIR." >&2
+                exit 2
+              fi
+              SKIP_ARGS=(--skip e2e_matrix_evaluation_coding_real_edge)
+            fi
             cargo test --manifest-path Cargo.toml -p astra-runtime --test system_matrix_http_e2e \
-              --features e2e-hooks -- "$FILTER" --ignored --nocapture
-          else
+              --features e2e-hooks -- "$FILTER" --ignored --nocapture "${SKIP_ARGS[@]}"
+          elif [ -n "${ASTRA_EVALUATION_EDGE_CONFIG:-}" ] && [ -n "${ASTRA_EVALUATION_EDGE_WORKSPACE_DIR:-}" ]; then
             cargo test --manifest-path Cargo.toml -p astra-runtime --test system_matrix_http_e2e \
               --features e2e-hooks -- --ignored --nocapture
+          else
+            cargo test --manifest-path Cargo.toml -p astra-runtime --test system_matrix_http_e2e \
+              --features e2e-hooks -- --ignored --nocapture \
+              --skip e2e_matrix_evaluation_coding_real_edge
           fi
 
       - name: Dump dependency logs

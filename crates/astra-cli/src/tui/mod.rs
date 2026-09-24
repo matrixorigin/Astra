@@ -39,6 +39,7 @@ mod local_agent_snapshot;
 mod login_control;
 mod markdown;
 mod markdown_render;
+pub(crate) use markdown_render::render_markdown_text_with_width;
 mod mention_menu;
 pub(crate) mod path_style;
 mod permission_control;

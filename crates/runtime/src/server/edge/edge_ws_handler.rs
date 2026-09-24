@@ -1021,6 +1021,144 @@ async fn handle_edge_connection(
                                         );
                                     }
                                 }
+                                Ok(EdgeClientMessage::WorkspacePrepared {
+                                    request_id,
+                                    connection_generation,
+                                    workspace_dir,
+                                    allocation,
+                                    source_commit,
+                                    source_tree,
+                                    error,
+                                }) => {
+                                    let delivered = state.edge_connection_pool.deliver_workspace_operation(
+                                        &user_id,
+                                        &edge_agent_id,
+                                        &request_id,
+                                        connection_generation,
+                                        astra_server_types::edge_connection_pool::EdgeWorkspaceOperationResult {
+                                            kind: astra_server_types::edge_connection_pool::EdgeWorkspaceOperationKind::Prepare,
+                                            allocation,
+                                            connection_generation,
+                                            workspace_dir,
+                                            source_commit,
+                                            source_tree,
+                                            clean: error.is_none(),
+                                            base_revision: None,
+                                            result_revision: None,
+                                            patch: None,
+                                            verifier_exit_code: None,
+                                            verifier_output: None,
+                                            namespace_active: false,
+                                            scope_settled: false,
+                                            timed_out: false,
+                                            error,
+                                        },
+                                    );
+                                    if !delivered {
+                                        tracing::debug!(
+                                            target: "astra_runtime::edge_ws",
+                                            user_id = %user_id,
+                                            edge_agent_id = %edge_agent_id,
+                                            request_id = %request_id,
+                                            "Edge workspace preparation result had no live waiter"
+                                        );
+                                    }
+                                }
+                                Ok(EdgeClientMessage::WorkspaceSnapshot {
+                                    request_id,
+                                    connection_generation,
+                                    workspace_dir,
+                                    allocation,
+                                    source_commit,
+                                    source_tree,
+                                    clean,
+                                    error,
+                                }) => {
+                                    let delivered = state.edge_connection_pool.deliver_workspace_operation(
+                                        &user_id,
+                                        &edge_agent_id,
+                                        &request_id,
+                                        connection_generation,
+                                        astra_server_types::edge_connection_pool::EdgeWorkspaceOperationResult {
+                                            kind: astra_server_types::edge_connection_pool::EdgeWorkspaceOperationKind::Snapshot,
+                                            allocation,
+                                            connection_generation,
+                                            workspace_dir,
+                                            source_commit,
+                                            source_tree,
+                                            clean,
+                                            base_revision: None,
+                                            result_revision: None,
+                                            patch: None,
+                                            verifier_exit_code: None,
+                                            verifier_output: None,
+                                            namespace_active: false,
+                                            scope_settled: false,
+                                            timed_out: false,
+                                            error,
+                                        },
+                                    );
+                                    if !delivered {
+                                        tracing::debug!(
+                                            target: "astra_runtime::edge_ws",
+                                            user_id = %user_id,
+                                            edge_agent_id = %edge_agent_id,
+                                            request_id = %request_id,
+                                            "Edge workspace snapshot result had no live waiter"
+                                        );
+                                    }
+                                }
+                                Ok(EdgeClientMessage::WorkspaceFinalized {
+                                    request_id,
+                                    connection_generation,
+                                    workspace_dir,
+                                    allocation,
+                                    source_commit,
+                                    source_tree,
+                                    base_revision,
+                                    result_revision,
+                                    patch,
+                                    verifier_exit_code,
+                                    verifier_output,
+                                    namespace_active,
+                                    scope_settled,
+                                    timed_out,
+                                    error,
+                                }) => {
+                                    let delivered = state.edge_connection_pool.deliver_workspace_operation(
+                                        &user_id,
+                                        &edge_agent_id,
+                                        &request_id,
+                                        connection_generation,
+                                        astra_server_types::edge_connection_pool::EdgeWorkspaceOperationResult {
+                                            kind: astra_server_types::edge_connection_pool::EdgeWorkspaceOperationKind::Finalize,
+                                            allocation,
+                                            connection_generation,
+                                            workspace_dir,
+                                            source_commit,
+                                            source_tree,
+                                            clean: false,
+                                            base_revision,
+                                            result_revision,
+                                            patch,
+                                            verifier_exit_code,
+                                            verifier_output,
+                                            namespace_active,
+                                            scope_settled,
+                                            timed_out,
+                                            error,
+                                        },
+                                    );
+                                    if !delivered {
+                                        tracing::debug!(
+                                            target: "astra_runtime::edge_ws",
+                                            user_id = %user_id,
+                                            edge_agent_id = %edge_agent_id,
+                                            request_id = %request_id,
+                                            "Edge workspace finalization result had no live waiter"
+                                        );
+                                    }
+                                }
                                 Ok(EdgeClientMessage::Ping {}) => {
                                     let _ = send_edge_msg(&ws_sink_write, EdgeServerMessage::Pong {}).await;
                                 }
@@ -1623,6 +1761,12 @@ fn validate_edge_capabilities(
         ));
     }
 
+    if let Some(source) = advert.workspace_source.as_ref()
+        && !source.is_valid()
+    {
+        return Err("edge workspace source identity is invalid".to_string());
+    }
+
     // Ensure the executor is actually an edge agent (not a cloud executor
     // or local CLI masquerading as edge).
     if !advert.binding.executor.is_edge_agent() {
@@ -1889,6 +2033,7 @@ mod tests {
 
     fn relay_tool_request(args: serde_json::Value, tool: &str) -> EdgeServerMessage {
         EdgeServerMessage::ToolRequest {
+            evaluation_allocation: None,
             request_id: "dispatch-request".to_string(),
             identity: Box::new(
                 astra_turn_types::ToolInvocationIdentity::new(

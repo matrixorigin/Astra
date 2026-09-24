@@ -5,6 +5,7 @@ use astra_turn_types::{InferenceInvocationScope, InferencePurpose};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Acquire, MySql, QueryBuilder, Row};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
 
@@ -14,7 +15,10 @@ use crate::model_request_context::{
     ModelRequestTopology, ModelRequestUsage, ModelRequestWireComposition,
     compact_model_request_context_scope,
 };
-use crate::models::{ModelAccessKind, ModelExecutionPlacement, validate_model_offering_id};
+use crate::models::{
+    ModelAccessKind, ModelExecutionPlacement, PricingData, parse_pricing_snapshot,
+    validate_model_offering_id,
+};
 use crate::service_error::{ServiceError, ServiceErrorKind, ServiceResult};
 
 const INFERENCE_ID_HEX_LEN: usize = 32;
@@ -75,6 +79,10 @@ pub struct InferenceInvocationPlan {
     admission_token: String,
     owner_token: String,
     owner_generation: u64,
+    /// Pricing captured at the trusted Offering admission boundary. It is
+    /// stored on the route without credentials and never resolved at report
+    /// time from mutable model catalog state.
+    pricing_json: Option<String>,
     input: InferenceInvocationInput,
 }
 
@@ -162,6 +170,28 @@ impl InferenceInvocationPlan {
     #[must_use]
     pub fn logical_attempt(&self) -> u32 {
         self.input.scope.logical_attempt()
+    }
+
+    /// Attach the secret-free pricing snapshot carried by the admitted
+    /// Offering before durable route insertion.
+    pub fn with_pricing_snapshot(mut self, pricing: Option<&PricingData>) -> ServiceResult<Self> {
+        self.pricing_json = pricing
+            .map(|pricing| {
+                if !pricing.is_valid() {
+                    return Err(ServiceError::invalid(
+                        "admitted model pricing contains invalid rates",
+                    ));
+                }
+                serde_json::to_string(pricing).map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Internal,
+                        "serialize admitted model pricing",
+                        error,
+                    )
+                })
+            })
+            .transpose()?;
+        Ok(self)
     }
 }
 
@@ -1059,6 +1089,7 @@ pub fn plan_inference_invocation(
         admission_token: new_admission_token(),
         owner_token: new_admission_token(),
         owner_generation: 1,
+        pricing_json: None,
         input,
     })
 }
@@ -2597,8 +2628,8 @@ async fn insert_inference_invocation_admission(
             "INSERT INTO inference_routes
                  (route_id, user_id, session_id, scope_kind, run_id,
                   offering_id, resolved_model_name, upstream_model_name, provider,
-                  execution_placement, access_kind, purpose, created_at)
-                 VALUES (?, ?, ?, 'run', ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+                  execution_placement, access_kind, purpose, pricing_json, created_at)
+                 VALUES (?, ?, ?, 'run', ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         )
         .bind(&plan.route_id)
         .bind(&plan.input.user_id)
@@ -2608,8 +2639,8 @@ async fn insert_inference_invocation_admission(
             "INSERT INTO inference_routes
                  (route_id, user_id, session_id, scope_kind,
                   offering_id, resolved_model_name, upstream_model_name, provider,
-                  execution_placement, access_kind, purpose, created_at)
-                 VALUES (?, ?, ?, 'session', ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+                  execution_placement, access_kind, purpose, pricing_json, created_at)
+                 VALUES (?, ?, ?, 'session', ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         )
         .bind(&plan.route_id)
         .bind(&plan.input.user_id)
@@ -2618,8 +2649,8 @@ async fn insert_inference_invocation_admission(
             "INSERT INTO inference_routes
                  (route_id, user_id, scope_kind, harness_run_id,
                   offering_id, resolved_model_name, upstream_model_name, provider,
-                  execution_placement, access_kind, purpose, created_at)
-                 VALUES (?, ?, 'harness_run', ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+                  execution_placement, access_kind, purpose, pricing_json, created_at)
+                 VALUES (?, ?, 'harness_run', ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         )
         .bind(&plan.route_id)
         .bind(&plan.input.user_id)
@@ -2633,6 +2664,7 @@ async fn insert_inference_invocation_admission(
         .bind(plan.input.execution_placement.as_str())
         .bind(plan.input.access_kind.as_str())
         .bind(plan.input.purpose.as_str())
+        .bind(&plan.pricing_json)
         .execute(&mut *connection)
         .await
         .map_err(|error| {
@@ -2651,10 +2683,11 @@ async fn insert_inference_invocation_admission(
                  (invocation_id, route_id, user_id, session_id, scope_kind, run_id,
                   admission_token, owner_token, owner_generation, owner_lease_expires_at,
                   turn_index, round_index, operation_id, logical_attempt, purpose, status,
-                  terminal_fingerprint, usage_status, provider_delivery_state, created_at, terminal_at)
+                  terminal_fingerprint, terminal_attempt_id, usage_status,
+                  provider_delivery_state, created_at, terminal_at)
                  VALUES (?, ?, ?, ?, 'run', ?, ?, ?, ?,
                          DATE_ADD(NOW(6), INTERVAL 60 SECOND), ?, ?, ?, ?, ?,
-                         'admitted', NULL, 'unavailable', 'unknown', NOW(6), NULL)",
+                         'admitted', NULL, NULL, 'unavailable', 'unknown', NOW(6), NULL)",
         )
         .bind(&plan.invocation_id)
         .bind(&plan.route_id)
@@ -2666,10 +2699,11 @@ async fn insert_inference_invocation_admission(
                  (invocation_id, route_id, user_id, session_id, scope_kind,
                   admission_token, owner_token, owner_generation, owner_lease_expires_at,
                   turn_index, round_index, operation_id, logical_attempt, purpose, status,
-                  terminal_fingerprint, usage_status, provider_delivery_state, created_at, terminal_at)
+                  terminal_fingerprint, terminal_attempt_id, usage_status,
+                  provider_delivery_state, created_at, terminal_at)
                  VALUES (?, ?, ?, ?, 'session', ?, ?, ?,
                          DATE_ADD(NOW(6), INTERVAL 60 SECOND), ?, ?, ?, ?, ?,
-                         'admitted', NULL, 'unavailable', 'unknown', NOW(6), NULL)",
+                         'admitted', NULL, NULL, 'unavailable', 'unknown', NOW(6), NULL)",
         )
         .bind(&plan.invocation_id)
         .bind(&plan.route_id)
@@ -2680,10 +2714,11 @@ async fn insert_inference_invocation_admission(
                  (invocation_id, route_id, user_id, scope_kind, harness_run_id,
                   admission_token, owner_token, owner_generation, owner_lease_expires_at,
                   operation_id, logical_attempt, purpose, status, terminal_fingerprint,
-                  usage_status, provider_delivery_state, created_at, terminal_at)
+                  terminal_attempt_id, usage_status, provider_delivery_state,
+                  created_at, terminal_at)
                  VALUES (?, ?, ?, 'harness_run', ?, ?, ?, ?,
                          DATE_ADD(NOW(6), INTERVAL 60 SECOND), ?, ?, ?,
-                         'admitted', NULL, 'unavailable', 'unknown', NOW(6), NULL)",
+                         'admitted', NULL, NULL, 'unavailable', 'unknown', NOW(6), NULL)",
         )
         .bind(&plan.invocation_id)
         .bind(&plan.route_id)
@@ -5781,7 +5816,7 @@ pub async fn finish_successful_inference_provider_attempt_and_invocation(
 
     let invocation_update = sqlx::query(
         "UPDATE inference_invocations
-         SET status = ?, terminal_fingerprint = ?, usage_status = ?,
+         SET status = ?, terminal_fingerprint = ?, terminal_attempt_id = ?, usage_status = ?,
              provider_delivery_state = 'delivery_authorized',
              input_tokens = ?, output_tokens = ?, cache_read_tokens = ?,
              cache_creation_tokens = ?, provider_response_id = ?,
@@ -5792,6 +5827,7 @@ pub async fn finish_successful_inference_provider_attempt_and_invocation(
     )
     .bind(&terminal_state.status)
     .bind(&fingerprint)
+    .bind(&attempt.attempt_id)
     .bind(&terminal_state.usage_status)
     .bind(terminal_state.input_tokens)
     .bind(terminal_state.output_tokens)
@@ -6970,6 +7006,7 @@ async fn apply_inference_terminal_if_quiescent<'e, E>(
     invocation_id: &str,
     terminal: DurableInferenceTerminal,
     provider_delivery_state: &str,
+    terminal_attempt_id: Option<&str>,
 ) -> Result<u64, sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = sqlx::MySql>,
@@ -6978,6 +7015,16 @@ where
         "UPDATE inference_invocations
          SET status = ?,
              terminal_fingerprint = ?,
+             terminal_attempt_id = COALESCE(
+                 ?,
+                 (SELECT terminal_attempt.attempt_id
+                  FROM inference_provider_attempts AS terminal_attempt
+                  WHERE terminal_attempt.user_id = inference_invocations.user_id
+                    AND terminal_attempt.invocation_id = inference_invocations.invocation_id
+                    AND terminal_attempt.status <> 'started'
+                  ORDER BY terminal_attempt.attempt_index DESC, terminal_attempt.attempt_id DESC
+                  LIMIT 1)
+             ),
              usage_status = ?,
              provider_delivery_state = ?,
              input_tokens = ?,
@@ -7001,6 +7048,7 @@ where
     )
     .bind(terminal.status)
     .bind(terminal.terminal_fingerprint)
+    .bind(terminal_attempt_id)
     .bind(terminal.usage_status)
     .bind(provider_delivery_state)
     .bind(terminal.input_tokens)
@@ -7578,6 +7626,7 @@ async fn reconcile_inference_settlement_debt_on_connection(
             invocation_id,
             terminal,
             &provider_delivery_state,
+            provider_attempt_id.as_deref(),
         )
         .await?;
         if updated == 1 {
@@ -7813,6 +7862,10 @@ async fn recover_expired_inference_invocation(
                 .and_then(|_| attempt.try_get::<String, _>("attempt_id").ok())
         })
         .collect::<Vec<_>>();
+    let terminal_attempt_id = attempts
+        .last()
+        .map(|attempt| attempt.try_get::<String, _>("attempt_id"))
+        .transpose()?;
 
     let (terminal, delivery_state) = if attempts.is_empty() {
         let terminal = InferenceInvocationTerminal {
@@ -7914,7 +7967,7 @@ async fn recover_expired_inference_invocation(
     let updated = sqlx::query(
         "UPDATE inference_invocations
          SET owner_token = ?, owner_generation = ?, owner_lease_expires_at = NOW(6),
-             status = ?, terminal_fingerprint = ?, usage_status = ?,
+             status = ?, terminal_fingerprint = ?, terminal_attempt_id = ?, usage_status = ?,
              provider_delivery_state = ?, input_tokens = ?, output_tokens = ?,
              cache_read_tokens = ?, cache_creation_tokens = ?, provider_response_id = ?,
              error_kind = ?, error_message = ?, terminal_at = NOW(6)
@@ -7931,6 +7984,7 @@ async fn recover_expired_inference_invocation(
     .bind(new_owner_generation)
     .bind(&terminal.status)
     .bind(&terminal.terminal_fingerprint)
+    .bind(&terminal_attempt_id)
     .bind(&terminal.usage_status)
     .bind(delivery_state.as_str())
     .bind(terminal.input_tokens)
@@ -8252,7 +8306,17 @@ pub async fn finish_inference_invocation(
     let write_result: ServiceResult<()> = async {
         let invocation = sqlx::query(
             "UPDATE inference_invocations
-             SET status = ?, terminal_fingerprint = ?, usage_status = ?,
+             SET status = ?, terminal_fingerprint = ?,
+                 terminal_attempt_id = (
+                     SELECT terminal_attempt.attempt_id
+                     FROM inference_provider_attempts AS terminal_attempt
+                     WHERE terminal_attempt.user_id = inference_invocations.user_id
+                       AND terminal_attempt.invocation_id = inference_invocations.invocation_id
+                       AND terminal_attempt.status <> 'started'
+                     ORDER BY terminal_attempt.attempt_index DESC, terminal_attempt.attempt_id DESC
+                     LIMIT 1
+                 ),
+                 usage_status = ?,
                  provider_delivery_state = IF(
                      EXISTS (
                          SELECT 1 FROM inference_provider_attempts AS delivered_attempt
@@ -8531,6 +8595,1153 @@ pub async fn load_session_auxiliary_capture(
     let (facts, execution) =
         project_auxiliary_usage_rows_with_execution(rows, max_attempts, include_execution)?;
     Ok(SessionAuxiliaryUsageCapture { facts, execution })
+}
+
+pub const EVALUATION_INFERENCE_EVIDENCE_SCHEMA_VERSION: u32 = 2;
+const MAX_EVALUATION_INFERENCE_FACTS: usize = 32_768;
+
+/// Physical inference evidence for one canonical evaluation Run. The reader
+/// includes every logical invocation and every provider attempt, including
+/// failed, retried, delivery-unknown, and zero-attempt invocations. Numeric
+/// cost facts are optional by design: an unavailable usage or pricing snapshot
+/// is never projected as zero.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EvaluationInferenceEvidence {
+    pub schema_version: u32,
+    pub owner_user_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub invocation_count: usize,
+    pub physical_attempt_count: usize,
+    pub priced_attempt_count: usize,
+    pub exact_usage_attempt_count: usize,
+    /// The physical ledger still contains an admitted invocation, an open
+    /// provider attempt, or an unreconciled settlement debt. Such evidence is
+    /// not terminal enough to become an immutable Evaluation observation.
+    pub settlement_pending: bool,
+    pub complete: bool,
+    pub completeness_reasons: Vec<String>,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub provider_fallback_count: Option<u64>,
+    pub latency_ms: Option<u64>,
+    pub estimated_cost_usd: Option<f64>,
+    pub provider_binding_match: Option<bool>,
+    pub evidence_fingerprint: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct EvaluationInferenceInvocationFact {
+    invocation_id: String,
+    route_id: String,
+    operation_id: String,
+    logical_attempt: u32,
+    purpose: String,
+    status: String,
+    usage_status: String,
+    terminal_fingerprint: Option<String>,
+    terminal_attempt_id: Option<String>,
+    provider_delivery_state: String,
+    offering_id: Option<String>,
+    model_name: Option<String>,
+    provider: Option<String>,
+    pricing_json: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct EvaluationInferenceAttemptFact {
+    attempt_id: String,
+    invocation_id: String,
+    attempt_index: u32,
+    provider: String,
+    provider_protocol: String,
+    status: String,
+    usage_status: String,
+    terminal_fingerprint: Option<String>,
+    fresh_input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+    offering_id: Option<String>,
+    model_name: Option<String>,
+    pricing_json: Option<String>,
+    started_at: String,
+    terminal_at: Option<String>,
+}
+
+fn decode_non_negative_i64(
+    row: &sqlx::mysql::MySqlRow,
+    column: &str,
+    operation: &'static str,
+) -> ServiceResult<u64> {
+    let value: i64 = row.try_get(column).map_err(|error| {
+        ServiceError::with_source(ServiceErrorKind::Persistence, operation, error)
+    })?;
+    u64::try_from(value).map_err(|_| {
+        ServiceError::conflict(format!(
+            "evaluation inference evidence contains a negative {column}"
+        ))
+    })
+}
+
+fn checked_add_evidence_total(total: &mut u64, value: u64, label: &str) -> bool {
+    let Some(next) = total.checked_add(value) else {
+        tracing::warn!(
+            label,
+            "evaluation inference evidence token total overflowed"
+        );
+        return false;
+    };
+    *total = next;
+    true
+}
+
+fn evaluation_evidence_fingerprint(
+    owner_user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    settlement_pending: bool,
+    routes: &[(String, String)],
+    invocations: &[EvaluationInferenceInvocationFact],
+    attempts: &[EvaluationInferenceAttemptFact],
+) -> ServiceResult<String> {
+    let payload = serde_json::json!({
+        "schema_version": EVALUATION_INFERENCE_EVIDENCE_SCHEMA_VERSION,
+        "owner_user_id": owner_user_id,
+        "session_id": session_id,
+        "run_id": run_id,
+        "settlement_pending": settlement_pending,
+        "routes": routes,
+        "invocations": invocations,
+        "attempts": attempts,
+    });
+    let canonical = astra_core::canonical_json_string(&payload);
+    Ok(format!("sha256:{:x}", Sha256::digest(canonical.as_bytes())))
+}
+
+/// Read all durable inference facts for one evaluation Run and derive only
+/// facts whose completeness can be proven from those rows. The Offering
+/// pricing JSON is read from the route snapshot written at admission; the
+/// mutable model catalog is never consulted.
+pub async fn load_evaluation_inference_evidence(
+    pool: &SharedPool,
+    owner_user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    expected_primary_offering_id: &str,
+    expected_primary_provider: &str,
+    expected_judgment: Option<(&str, &str, &str, u32)>,
+) -> ServiceResult<EvaluationInferenceEvidence> {
+    for (label, value, max_bytes) in [
+        ("user_id", owner_user_id, 128),
+        ("session_id", session_id, 64),
+        ("run_id", run_id, 64),
+        (
+            "expected_primary_offering_id",
+            expected_primary_offering_id,
+            64,
+        ),
+        ("expected_primary_provider", expected_primary_provider, 64),
+    ] {
+        validate_identity(value, label, max_bytes)?;
+    }
+    if let Some((invocation_id, offering_id, provider, _logical_attempt)) = expected_judgment {
+        validate_identity(invocation_id, "expected_judgment_invocation_id", 128)?;
+        validate_identity(offering_id, "expected_judgment_offering_id", 64)?;
+        validate_identity(provider, "expected_judgment_provider", 64)?;
+    }
+
+    let mut tx = pool.get().begin().await.map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "begin evaluation inference evidence read",
+            error,
+        )
+    })?;
+
+    let invocations = sqlx::query(
+        "SELECT i.invocation_id, i.route_id, i.operation_id, i.logical_attempt, i.purpose,
+                i.status, i.usage_status, i.terminal_fingerprint,
+                i.terminal_attempt_id,
+                i.provider_delivery_state,
+                r.offering_id, r.resolved_model_name AS model_name,
+                r.provider, CAST(r.pricing_json AS CHAR) AS pricing_json
+         FROM inference_invocations AS i
+         LEFT JOIN inference_routes AS r
+           ON r.user_id = i.user_id AND r.route_id = i.route_id
+         WHERE i.user_id = ? AND i.session_id = ? AND i.run_id = ?
+         ORDER BY i.created_at ASC, i.invocation_id ASC
+         LIMIT ?",
+    )
+    .bind(owner_user_id)
+    .bind(session_id)
+    .bind(run_id)
+    .bind(
+        i64::try_from(MAX_EVALUATION_INFERENCE_FACTS + 1).map_err(|_| {
+            ServiceError::internal("evaluation inference fact limit exceeds BIGINT")
+        })?,
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "load evaluation inference invocations",
+            error,
+        )
+    })?;
+
+    let attempts = sqlx::query(
+        "SELECT a.attempt_id, a.invocation_id, a.attempt_index,
+                a.provider, a.provider_protocol, a.status, a.usage_status,
+                a.terminal_fingerprint,
+                a.input_tokens, a.output_tokens, a.cache_read_tokens,
+                a.cache_creation_tokens,
+                CAST(a.started_at AS CHAR) AS started_at,
+                CAST(a.terminal_at AS CHAR) AS terminal_at,
+                r.offering_id, r.resolved_model_name AS model_name,
+                CAST(r.pricing_json AS CHAR) AS pricing_json
+         FROM inference_provider_attempts AS a
+         INNER JOIN inference_invocations AS i
+           ON i.user_id = a.user_id AND i.invocation_id = a.invocation_id
+         LEFT JOIN inference_routes AS r
+           ON r.user_id = i.user_id AND r.route_id = i.route_id
+         WHERE a.user_id = ? AND a.session_id = ? AND a.run_id = ?
+         ORDER BY a.invocation_id ASC, a.attempt_index ASC, a.attempt_id ASC
+         LIMIT ?",
+    )
+    .bind(owner_user_id)
+    .bind(session_id)
+    .bind(run_id)
+    .bind(
+        i64::try_from(MAX_EVALUATION_INFERENCE_FACTS + 1).map_err(|_| {
+            ServiceError::internal("evaluation inference fact limit exceeds BIGINT")
+        })?,
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "load evaluation inference provider attempts",
+            error,
+        )
+    })?;
+
+    let pending_settlement_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM inference_invocation_settlement_debts AS debt
+         INNER JOIN inference_invocations AS invocation
+           ON invocation.user_id = debt.user_id
+          AND invocation.invocation_id = debt.invocation_id
+         WHERE debt.user_id = ?
+           AND debt.reconciliation_status = 'pending'
+           AND invocation.session_id = ?
+           AND invocation.run_id = ?",
+    )
+    .bind(owner_user_id)
+    .bind(session_id)
+    .bind(run_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "load evaluation inference settlement debt state",
+            error,
+        )
+    })?;
+    let quarantined_settlement_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM inference_invocation_settlement_debts AS debt
+         INNER JOIN inference_invocations AS invocation
+           ON invocation.user_id = debt.user_id
+          AND invocation.invocation_id = debt.invocation_id
+         WHERE debt.user_id = ?
+           AND debt.reconciliation_status = 'quarantined'
+           AND invocation.session_id = ?
+           AND invocation.run_id = ?",
+    )
+    .bind(owner_user_id)
+    .bind(session_id)
+    .bind(run_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "load quarantined evaluation inference settlement debt state",
+            error,
+        )
+    })?;
+    if quarantined_settlement_count > 0 {
+        return Err(ServiceError::conflict(
+            "evaluation inference evidence has a quarantined settlement debt",
+        ));
+    }
+
+    // This existence check is intentionally independent of the bounded fact
+    // payload below. An open row beyond the evidence limit must keep the
+    // observation repairable instead of being mistaken for a terminal Run.
+    let unsettled_ledger_count: i64 = sqlx::query_scalar(
+        "SELECT
+             (SELECT COUNT(*)
+              FROM inference_invocations
+              WHERE user_id = ? AND session_id = ? AND run_id = ?
+                AND status = 'admitted')
+           + (SELECT COUNT(*)
+              FROM inference_provider_attempts AS attempt
+              INNER JOIN inference_invocations AS invocation
+                ON invocation.user_id = attempt.user_id
+               AND invocation.invocation_id = attempt.invocation_id
+              WHERE attempt.user_id = ? AND attempt.session_id = ?
+                AND attempt.run_id = ? AND attempt.status = 'started')",
+    )
+    .bind(owner_user_id)
+    .bind(session_id)
+    .bind(run_id)
+    .bind(owner_user_id)
+    .bind(session_id)
+    .bind(run_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "load unsettled evaluation inference ledger state",
+            error,
+        )
+    })?;
+    let mut settlement_pending = pending_settlement_count > 0 || unsettled_ledger_count > 0;
+
+    let routes = sqlx::query(
+        "SELECT route_id, purpose
+         FROM inference_routes
+         WHERE user_id = ? AND session_id = ? AND run_id = ?
+         ORDER BY created_at ASC, route_id ASC
+         LIMIT ?",
+    )
+    .bind(owner_user_id)
+    .bind(session_id)
+    .bind(run_id)
+    .bind(
+        i64::try_from(MAX_EVALUATION_INFERENCE_FACTS + 1).map_err(|_| {
+            ServiceError::internal("evaluation inference route limit exceeds BIGINT")
+        })?,
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "load evaluation inference routes",
+            error,
+        )
+    })?
+    .into_iter()
+    .map(|row| {
+        Ok::<_, ServiceError>((
+            row.try_get::<String, _>("route_id").map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "decode evaluation inference route id",
+                    error,
+                )
+            })?,
+            row.try_get::<String, _>("purpose").map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "decode evaluation inference route purpose",
+                    error,
+                )
+            })?,
+        ))
+    })
+    .collect::<ServiceResult<Vec<_>>>()?;
+
+    let invocations_truncated = invocations.len() > MAX_EVALUATION_INFERENCE_FACTS;
+    let attempts_truncated = attempts.len() > MAX_EVALUATION_INFERENCE_FACTS;
+    let routes_truncated = routes.len() > MAX_EVALUATION_INFERENCE_FACTS;
+    let mut reasons = Vec::new();
+    if invocations_truncated || attempts_truncated || routes_truncated {
+        reasons.push("inference_evidence_truncated".to_string());
+    }
+
+    let invocation_facts = invocations
+        .into_iter()
+        .take(MAX_EVALUATION_INFERENCE_FACTS)
+        .map(|row| {
+            Ok::<_, ServiceError>(EvaluationInferenceInvocationFact {
+                invocation_id: row.try_get("invocation_id").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference invocation id",
+                        error,
+                    )
+                })?,
+                route_id: row.try_get("route_id").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference route id",
+                        error,
+                    )
+                })?,
+                operation_id: row.try_get("operation_id").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference operation id",
+                        error,
+                    )
+                })?,
+                logical_attempt: {
+                    let value: i64 = row.try_get("logical_attempt").map_err(|error| {
+                        ServiceError::with_source(
+                            ServiceErrorKind::Persistence,
+                            "decode evaluation inference logical attempt",
+                            error,
+                        )
+                    })?;
+                    u32::try_from(value).map_err(|_| {
+                        ServiceError::conflict(
+                            "evaluation inference logical attempt is outside the supported range",
+                        )
+                    })?
+                },
+                purpose: row.try_get("purpose").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference purpose",
+                        error,
+                    )
+                })?,
+                status: row.try_get("status").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference invocation status",
+                        error,
+                    )
+                })?,
+                usage_status: row.try_get("usage_status").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference invocation usage status",
+                        error,
+                    )
+                })?,
+                terminal_fingerprint: row.try_get("terminal_fingerprint").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference invocation terminal fingerprint",
+                        error,
+                    )
+                })?,
+                terminal_attempt_id: row.try_get("terminal_attempt_id").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference invocation terminal attempt",
+                        error,
+                    )
+                })?,
+                provider_delivery_state: row.try_get("provider_delivery_state").map_err(
+                    |error| {
+                        ServiceError::with_source(
+                            ServiceErrorKind::Persistence,
+                            "decode evaluation inference delivery state",
+                            error,
+                        )
+                    },
+                )?,
+                offering_id: row.try_get("offering_id").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference offering",
+                        error,
+                    )
+                })?,
+                model_name: row.try_get("model_name").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference model",
+                        error,
+                    )
+                })?,
+                provider: row.try_get("provider").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference provider",
+                        error,
+                    )
+                })?,
+                pricing_json: row.try_get("pricing_json").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference pricing snapshot",
+                        error,
+                    )
+                })?,
+            })
+        })
+        .collect::<ServiceResult<Vec<_>>>()?;
+
+    if let Some((
+        expected_invocation_id,
+        expected_offering_id,
+        expected_provider,
+        expected_logical_attempt,
+    )) = expected_judgment
+    {
+        let matched = invocation_facts.iter().any(|invocation| {
+            invocation.invocation_id == expected_invocation_id
+                && invocation.operation_id == "skill_auto_route"
+                && invocation.logical_attempt == expected_logical_attempt
+                && invocation.purpose == astra_turn_types::InferencePurpose::Introspection.as_str()
+                && invocation.offering_id.as_deref() == Some(expected_offering_id)
+                && invocation.provider.as_deref() == Some(expected_provider)
+        });
+        if !matched {
+            return Err(ServiceError::conflict(
+                "evaluation judgment evidence is not bound to the expected inference invocation",
+            ));
+        }
+    }
+
+    let attempt_facts = attempts
+        .into_iter()
+        .take(MAX_EVALUATION_INFERENCE_FACTS)
+        .map(|row| {
+            let attempt_index: i64 = row.try_get("attempt_index").map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "decode evaluation inference attempt index",
+                    error,
+                )
+            })?;
+            let attempt_index = u32::try_from(attempt_index).map_err(|_| {
+                ServiceError::conflict("evaluation inference attempt index is invalid")
+            })?;
+            Ok::<_, ServiceError>(EvaluationInferenceAttemptFact {
+                attempt_id: row.try_get("attempt_id").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference attempt id",
+                        error,
+                    )
+                })?,
+                invocation_id: row.try_get("invocation_id").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference attempt invocation id",
+                        error,
+                    )
+                })?,
+                attempt_index,
+                provider: row.try_get("provider").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference attempt provider",
+                        error,
+                    )
+                })?,
+                provider_protocol: row.try_get("provider_protocol").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference provider protocol",
+                        error,
+                    )
+                })?,
+                status: row.try_get("status").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference attempt status",
+                        error,
+                    )
+                })?,
+                usage_status: row.try_get("usage_status").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference attempt usage status",
+                        error,
+                    )
+                })?,
+                terminal_fingerprint: row.try_get("terminal_fingerprint").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference attempt terminal fingerprint",
+                        error,
+                    )
+                })?,
+                fresh_input_tokens: decode_non_negative_i64(
+                    &row,
+                    "input_tokens",
+                    "decode evaluation inference input tokens",
+                )?,
+                output_tokens: decode_non_negative_i64(
+                    &row,
+                    "output_tokens",
+                    "decode evaluation inference output tokens",
+                )?,
+                cache_read_tokens: decode_non_negative_i64(
+                    &row,
+                    "cache_read_tokens",
+                    "decode evaluation inference cache read tokens",
+                )?,
+                cache_creation_tokens: decode_non_negative_i64(
+                    &row,
+                    "cache_creation_tokens",
+                    "decode evaluation inference cache creation tokens",
+                )?,
+                offering_id: row.try_get("offering_id").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference attempt offering",
+                        error,
+                    )
+                })?,
+                model_name: row.try_get("model_name").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference attempt model",
+                        error,
+                    )
+                })?,
+                pricing_json: row.try_get("pricing_json").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference attempt pricing",
+                        error,
+                    )
+                })?,
+                started_at: row.try_get("started_at").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference attempt start",
+                        error,
+                    )
+                })?,
+                terminal_at: row.try_get("terminal_at").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode evaluation inference attempt terminal time",
+                        error,
+                    )
+                })?,
+            })
+        })
+        .collect::<ServiceResult<Vec<_>>>()?;
+
+    let mut attempts_by_invocation = HashMap::<String, Vec<&EvaluationInferenceAttemptFact>>::new();
+    for attempt in &attempt_facts {
+        attempts_by_invocation
+            .entry(attempt.invocation_id.clone())
+            .or_default()
+            .push(attempt);
+    }
+
+    let mut usage_complete = !invocation_facts.is_empty();
+    let mut topology_complete = !invocation_facts.is_empty() && !settlement_pending;
+    let mut pricing_complete = !invocation_facts.is_empty();
+    let mut latency_complete = !invocation_facts.is_empty() && !attempt_facts.is_empty();
+    let mut prompt_tokens = 0_u64;
+    let mut completion_tokens = 0_u64;
+    let mut total_latency_ms = 0_u64;
+    let mut estimated_cost_usd = 0_f64;
+    let mut priced_attempt_count = 0_usize;
+    let mut exact_usage_attempt_count = 0_usize;
+    let mut primary_routes = Vec::new();
+    let mut primary_route_coverage_complete = !routes_truncated;
+    let mut provider_fallback_count = 0_u64;
+    let mut fallback_coverage_complete =
+        !(invocations_truncated || attempts_truncated || routes_truncated);
+    let mut seen_reasons = BTreeMap::<String, ()>::new();
+
+    let add_reason =
+        |reasons: &mut Vec<String>, seen: &mut BTreeMap<String, ()>, reason: String| {
+            if seen.insert(reason.clone(), ()).is_none() {
+                reasons.push(reason);
+            }
+        };
+
+    if settlement_pending {
+        add_reason(
+            &mut reasons,
+            &mut seen_reasons,
+            "inference_settlement_pending".to_string(),
+        );
+    }
+    let route_ids = routes
+        .iter()
+        .take(MAX_EVALUATION_INFERENCE_FACTS)
+        .map(|(route_id, _)| route_id.as_str())
+        .collect::<HashSet<_>>();
+    let invocation_route_ids = invocation_facts
+        .iter()
+        .map(|invocation| invocation.route_id.as_str())
+        .collect::<HashSet<_>>();
+    for (route_id, purpose) in routes.iter().take(MAX_EVALUATION_INFERENCE_FACTS) {
+        if !invocation_route_ids.contains(route_id.as_str()) {
+            topology_complete = false;
+            if purpose == InferencePurpose::PrimaryAgent.as_str()
+                || purpose == InferencePurpose::SubAgent.as_str()
+            {
+                primary_route_coverage_complete = false;
+            }
+            add_reason(
+                &mut reasons,
+                &mut seen_reasons,
+                format!("invocation_missing_for_route:{route_id}"),
+            );
+        }
+    }
+    for invocation in &invocation_facts {
+        if !route_ids.contains(invocation.route_id.as_str()) {
+            topology_complete = false;
+            if invocation.purpose == InferencePurpose::PrimaryAgent.as_str()
+                || invocation.purpose == InferencePurpose::SubAgent.as_str()
+            {
+                primary_route_coverage_complete = false;
+            }
+            add_reason(
+                &mut reasons,
+                &mut seen_reasons,
+                format!("route_missing:{}", invocation.invocation_id),
+            );
+        }
+    }
+
+    if invocation_facts.is_empty() {
+        add_reason(
+            &mut reasons,
+            &mut seen_reasons,
+            "inference_ledger_empty".to_string(),
+        );
+    }
+    for invocation in &invocation_facts {
+        if invocation.status == "admitted" {
+            settlement_pending = true;
+            topology_complete = false;
+            add_reason(
+                &mut reasons,
+                &mut seen_reasons,
+                format!(
+                    "invocation_not_terminal:{}:{}",
+                    invocation.status, invocation.invocation_id
+                ),
+            );
+        }
+        if invocation.provider_delivery_state == "unknown" {
+            topology_complete = false;
+            add_reason(
+                &mut reasons,
+                &mut seen_reasons,
+                format!("provider_delivery_unknown:{}", invocation.invocation_id),
+            );
+        }
+        let route_provider = invocation.provider.as_deref().or_else(|| {
+            fallback_coverage_complete = false;
+            add_reason(
+                &mut reasons,
+                &mut seen_reasons,
+                format!("provider_route_unproven:{}", invocation.invocation_id),
+            );
+            None
+        });
+        if invocation.purpose == InferencePurpose::PrimaryAgent.as_str()
+            || invocation.purpose == InferencePurpose::SubAgent.as_str()
+        {
+            match (&invocation.offering_id, &invocation.provider) {
+                (Some(offering), Some(provider)) => {
+                    primary_routes.push((offering.as_str(), provider.as_str()))
+                }
+                _ => {
+                    primary_route_coverage_complete = false;
+                    add_reason(
+                        &mut reasons,
+                        &mut seen_reasons,
+                        format!("route_missing:{}", invocation.invocation_id),
+                    );
+                }
+            }
+        }
+        let attempts = attempts_by_invocation
+            .get(&invocation.invocation_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for (expected_index, attempt) in attempts.iter().enumerate() {
+            if attempt.attempt_index != expected_index as u32 {
+                topology_complete = false;
+                add_reason(
+                    &mut reasons,
+                    &mut seen_reasons,
+                    format!("attempt_sequence_gap:{}", invocation.invocation_id),
+                );
+                break;
+            }
+        }
+        if attempts.is_empty() {
+            latency_complete = false;
+            if invocation.terminal_attempt_id.is_some() {
+                topology_complete = false;
+                add_reason(
+                    &mut reasons,
+                    &mut seen_reasons,
+                    format!("terminal_attempt_missing:{}", invocation.invocation_id),
+                );
+            } else if invocation.status != "cancelled"
+                || invocation.provider_delivery_state != "pre_delivery"
+            {
+                topology_complete = false;
+                add_reason(
+                    &mut reasons,
+                    &mut seen_reasons,
+                    format!(
+                        "invocation_without_terminal_attempt:{}",
+                        invocation.invocation_id
+                    ),
+                );
+            }
+            continue;
+        }
+        let latest_attempt = attempts
+            .last()
+            .expect("non-empty attempt slice has a latest attempt");
+        let logical_terminal_matches_latest_attempt = if invocation.status == "cancelled"
+            && invocation.provider_delivery_state == "pre_delivery"
+        {
+            attempts.is_empty() && invocation.terminal_attempt_id.is_none()
+        } else {
+            latest_attempt.status == invocation.status
+                && latest_attempt.usage_status == invocation.usage_status
+                && latest_attempt.terminal_at.is_some()
+                && latest_attempt.terminal_fingerprint.is_some()
+                && latest_attempt.terminal_fingerprint.as_deref()
+                    == invocation.terminal_fingerprint.as_deref()
+                && invocation.terminal_attempt_id.as_deref()
+                    == Some(latest_attempt.attempt_id.as_str())
+        };
+        if !logical_terminal_matches_latest_attempt {
+            topology_complete = false;
+            add_reason(
+                &mut reasons,
+                &mut seen_reasons,
+                format!("logical_terminal_mismatch:{}", invocation.invocation_id),
+            );
+        }
+        let mut invocation_started_at = None;
+        let mut invocation_terminal_at = None;
+        let mut invocation_latency_valid = true;
+        for attempt in attempts {
+            let provider_matches_route =
+                route_provider.is_some_and(|route_provider| attempt.provider == route_provider);
+            if let Some(route_provider) = route_provider
+                && attempt.provider != route_provider
+            {
+                if !checked_add_evidence_total(
+                    &mut provider_fallback_count,
+                    1,
+                    "provider_fallback_count",
+                ) {
+                    fallback_coverage_complete = false;
+                    add_reason(
+                        &mut reasons,
+                        &mut seen_reasons,
+                        "provider_fallback_count_overflow".to_string(),
+                    );
+                }
+                // The route stores the admitted pricing snapshot. A
+                // fallback attempt has no attempt-scoped price here, so
+                // aggregating its cost from the original route would be
+                // false precision.
+                pricing_complete = false;
+                add_reason(
+                    &mut reasons,
+                    &mut seen_reasons,
+                    format!("fallback_attempt_pricing_unbound:{}", attempt.attempt_id),
+                );
+            }
+            let pricing = attempt
+                .pricing_json
+                .as_deref()
+                .map(parse_pricing_snapshot)
+                .transpose()
+                .map_err(|error| {
+                    ServiceError::conflict(format!(
+                        "invalid pricing snapshot for inference attempt {}: {error}",
+                        attempt.attempt_id
+                    ))
+                })?
+                .flatten();
+            let cache_lanes_known = attempt.provider_protocol != "typesafe_systemone"
+                || pricing.as_ref().is_some_and(|pricing| {
+                    pricing.cache_read.is_none() && pricing.cache_write.is_none()
+                });
+            if attempt.status == "started" {
+                settlement_pending = true;
+                topology_complete = false;
+                add_reason(
+                    &mut reasons,
+                    &mut seen_reasons,
+                    format!("attempt_not_terminal:{}", attempt.attempt_id),
+                );
+            }
+            if attempt.status == "delivery_unknown" {
+                topology_complete = false;
+                add_reason(
+                    &mut reasons,
+                    &mut seen_reasons,
+                    format!("attempt_delivery_unknown:{}", attempt.attempt_id),
+                );
+            }
+            if attempt.status == "started" {
+                latency_complete = false;
+            }
+            if attempt.usage_status == "provider_exact" {
+                exact_usage_attempt_count = exact_usage_attempt_count.saturating_add(1);
+                if !cache_lanes_known {
+                    pricing_complete = false;
+                    add_reason(
+                        &mut reasons,
+                        &mut seen_reasons,
+                        format!("cache_lanes_unknown:{}", attempt.attempt_id),
+                    );
+                }
+                let prompt_total_ok = if cache_lanes_known {
+                    checked_add_evidence_total(
+                        &mut prompt_tokens,
+                        attempt.fresh_input_tokens,
+                        "prompt_tokens",
+                    ) && checked_add_evidence_total(
+                        &mut prompt_tokens,
+                        attempt.cache_read_tokens,
+                        "prompt_tokens",
+                    ) && checked_add_evidence_total(
+                        &mut prompt_tokens,
+                        attempt.cache_creation_tokens,
+                        "prompt_tokens",
+                    )
+                } else {
+                    // System One persists total input tokens in this column;
+                    // its cache lanes are deliberately unknown.
+                    checked_add_evidence_total(
+                        &mut prompt_tokens,
+                        attempt.fresh_input_tokens,
+                        "prompt_tokens",
+                    )
+                };
+                if !prompt_total_ok
+                    || !checked_add_evidence_total(
+                        &mut completion_tokens,
+                        attempt.output_tokens,
+                        "completion_tokens",
+                    )
+                {
+                    usage_complete = false;
+                    add_reason(
+                        &mut reasons,
+                        &mut seen_reasons,
+                        "inference_token_total_overflow".to_string(),
+                    );
+                }
+            } else {
+                usage_complete = false;
+                add_reason(
+                    &mut reasons,
+                    &mut seen_reasons,
+                    format!("usage_{}:{}", attempt.usage_status, attempt.attempt_id),
+                );
+            }
+            let estimated_cost = (provider_matches_route && cache_lanes_known)
+                .then(|| {
+                    pricing.as_ref()?.estimated_cost_usd(
+                        attempt.fresh_input_tokens,
+                        attempt.output_tokens,
+                        attempt.cache_read_tokens,
+                        attempt.cache_creation_tokens,
+                    )
+                })
+                .flatten();
+            if let Some(cost) = estimated_cost {
+                priced_attempt_count = priced_attempt_count.saturating_add(1);
+                estimated_cost_usd += cost;
+                if !estimated_cost_usd.is_finite() {
+                    pricing_complete = false;
+                    add_reason(
+                        &mut reasons,
+                        &mut seen_reasons,
+                        "inference_cost_overflow".to_string(),
+                    );
+                }
+            } else {
+                pricing_complete = false;
+                add_reason(
+                    &mut reasons,
+                    &mut seen_reasons,
+                    format!("pricing_unavailable:{}", attempt.attempt_id),
+                );
+                if provider_matches_route && cache_lanes_known && pricing.is_some() {
+                    add_reason(
+                        &mut reasons,
+                        &mut seen_reasons,
+                        format!("pricing_rate_missing:{}", attempt.attempt_id),
+                    );
+                }
+            }
+            let started_at = chrono::NaiveDateTime::parse_from_str(
+                attempt.started_at.as_str(),
+                "%Y-%m-%d %H:%M:%S%.f",
+            )
+            .map_err(|error| {
+                ServiceError::conflict(format!(
+                    "invalid inference attempt start time {}: {error}",
+                    attempt.attempt_id
+                ))
+            })?;
+            invocation_started_at.get_or_insert(started_at);
+            let Some(terminal_at) = attempt.terminal_at.as_deref() else {
+                latency_complete = false;
+                invocation_latency_valid = false;
+                add_reason(
+                    &mut reasons,
+                    &mut seen_reasons,
+                    format!("attempt_latency_missing:{}", attempt.attempt_id),
+                );
+                continue;
+            };
+            let terminal_at =
+                chrono::NaiveDateTime::parse_from_str(terminal_at, "%Y-%m-%d %H:%M:%S%.f")
+                    .map_err(|error| {
+                        ServiceError::conflict(format!(
+                            "invalid inference attempt terminal time {}: {error}",
+                            attempt.attempt_id
+                        ))
+                    })?;
+            invocation_terminal_at = Some(terminal_at);
+            if terminal_at < started_at {
+                invocation_latency_valid = false;
+                latency_complete = false;
+                add_reason(
+                    &mut reasons,
+                    &mut seen_reasons,
+                    format!("attempt_latency_invalid:{}", attempt.attempt_id),
+                );
+            }
+        }
+        if invocation_latency_valid {
+            match (invocation_started_at, invocation_terminal_at) {
+                (Some(started_at), Some(terminal_at)) => {
+                    let latency = terminal_at
+                        .signed_duration_since(started_at)
+                        .num_milliseconds();
+                    if latency < 0
+                        || !checked_add_evidence_total(
+                            &mut total_latency_ms,
+                            latency as u64,
+                            "latency_ms",
+                        )
+                    {
+                        latency_complete = false;
+                        add_reason(
+                            &mut reasons,
+                            &mut seen_reasons,
+                            format!("invocation_latency_invalid:{}", invocation.invocation_id),
+                        );
+                    }
+                }
+                _ => latency_complete = false,
+            }
+        }
+    }
+    if exact_usage_attempt_count != attempt_facts.len() {
+        usage_complete = false;
+    }
+    if priced_attempt_count != attempt_facts.len() {
+        pricing_complete = false;
+    }
+    let evidence_truncated = invocations_truncated || attempts_truncated || routes_truncated;
+    let primary_invocation_ids = invocation_facts
+        .iter()
+        .filter(|invocation| {
+            invocation.purpose == InferencePurpose::PrimaryAgent.as_str()
+                || invocation.purpose == InferencePurpose::SubAgent.as_str()
+        })
+        .map(|invocation| invocation.invocation_id.as_str())
+        .collect::<HashSet<_>>();
+    let provider_binding_match = (!primary_routes.is_empty()
+        && primary_route_coverage_complete
+        && !evidence_truncated)
+        .then(|| {
+            primary_routes.iter().all(|(offering, provider)| {
+                *offering == expected_primary_offering_id && *provider == expected_primary_provider
+            }) && attempt_facts
+                .iter()
+                .filter(|attempt| primary_invocation_ids.contains(attempt.invocation_id.as_str()))
+                .all(|attempt| attempt.provider == expected_primary_provider)
+        });
+    if provider_binding_match == Some(false) {
+        add_reason(
+            &mut reasons,
+            &mut seen_reasons,
+            "primary_provider_binding_mismatch".to_string(),
+        );
+    }
+    if provider_binding_match.is_none() {
+        add_reason(
+            &mut reasons,
+            &mut seen_reasons,
+            "primary_provider_binding_unproven".to_string(),
+        );
+    }
+    let complete = topology_complete
+        && usage_complete
+        && pricing_complete
+        && provider_binding_match == Some(true)
+        && !evidence_truncated;
+    let fingerprint = evaluation_evidence_fingerprint(
+        owner_user_id,
+        session_id,
+        run_id,
+        settlement_pending,
+        &routes,
+        &invocation_facts,
+        &attempt_facts,
+    )?;
+    let evidence = EvaluationInferenceEvidence {
+        schema_version: EVALUATION_INFERENCE_EVIDENCE_SCHEMA_VERSION,
+        owner_user_id: owner_user_id.to_string(),
+        session_id: session_id.to_string(),
+        run_id: run_id.to_string(),
+        invocation_count: invocation_facts.len(),
+        physical_attempt_count: attempt_facts.len(),
+        priced_attempt_count,
+        exact_usage_attempt_count,
+        settlement_pending,
+        complete,
+        completeness_reasons: reasons,
+        prompt_tokens: (complete || (!evidence_truncated && topology_complete && usage_complete))
+            .then_some(prompt_tokens),
+        completion_tokens: (complete
+            || (!evidence_truncated && topology_complete && usage_complete))
+            .then_some(completion_tokens),
+        // Count every physical attempt whose provider differs from its
+        // logical invocation route. Missing route identity keeps the count
+        // unavailable; a complete zero is therefore evidence, not a default.
+        provider_fallback_count: (topology_complete
+            && fallback_coverage_complete
+            && !evidence_truncated)
+            .then_some(provider_fallback_count),
+        latency_ms: (topology_complete && latency_complete && !evidence_truncated)
+            .then_some(total_latency_ms),
+        estimated_cost_usd: (complete && pricing_complete).then_some(estimated_cost_usd),
+        provider_binding_match,
+        evidence_fingerprint: fingerprint,
+    };
+    tx.commit().await.map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "commit evaluation inference evidence read",
+            error,
+        )
+    })?;
+    Ok(evidence)
 }
 
 fn project_auxiliary_usage_rows(

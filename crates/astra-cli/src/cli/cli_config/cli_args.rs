@@ -183,6 +183,9 @@ pub(crate) enum Command {
     #[command(alias = "models")]
     #[command(subcommand)]
     Model(ModelCmd),
+    /// Run controlled, evidence-backed comparisons through the Evaluation API
+    #[command(subcommand)]
+    Evaluation(EvaluationCmd),
     /// Inspect and manage skills
     #[command(alias = "skills")]
     #[command(subcommand)]
@@ -1068,6 +1071,34 @@ pub(crate) enum ModelCmd {
     Probe(ModelShowArgs),
     /// Delete a personal Cloud BYOK model
     Delete(ModelShowArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum EvaluationCmd {
+    /// Prepare, execute, assess, and print one frozen evaluation intent.
+    Run(EvaluationRunArgs),
+    /// Read the owner-scoped projection for an experiment.
+    Show(EvaluationExperimentArgs),
+    /// Read the immutable report for an experiment.
+    Report(EvaluationExperimentArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct EvaluationRunArgs {
+    /// JSON file containing the Evaluation prepare request.
+    pub intent: PathBuf,
+    /// Maximum time to wait for all canonical Runs and assessments.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub wait_secs: Option<u64>,
+    /// Poll interval while the server-owned Runs settle.
+    #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u64).range(50..=10_000))]
+    pub poll_ms: u64,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct EvaluationExperimentArgs {
+    /// Owner-scoped experiment ID returned by `evaluation run`.
+    pub experiment_id: String,
 }
 
 #[derive(Args, Debug)]

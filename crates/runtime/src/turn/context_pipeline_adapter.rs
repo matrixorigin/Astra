@@ -587,6 +587,7 @@ pub(crate) fn build_session_context(
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     current_date: &str,
     user_id: Option<&str>,
+    compaction_thresholds: astra_turn_types::context_execution::CompactionThresholds,
 ) -> SessionContext {
     let provider_policy =
         super::prompt_cache::provider_cache_policy_for(cache_capability, provider);
@@ -596,6 +597,7 @@ pub(crate) fn build_session_context(
     );
     let provider_strategy = ProviderCacheStrategy::from_cache_capability(capability);
     SessionContext {
+        compaction_thresholds,
         session_id: session_id.to_string(),
         run_id: run_id.unwrap_or_default().to_string(),
         model_id: model_name.to_string(),
@@ -690,6 +692,7 @@ mod tests {
             None,
             "2026-05-25",
             None,
+            Default::default(),
         );
         // anthropic policy supports cache_control markers (max_markers > 0).
         assert!(
@@ -719,6 +722,7 @@ mod tests {
             Some(declared_cache_capability),
             "2026-05-25",
             None,
+            Default::default(),
         );
         // Bedrock multiplexes model families, so the provider name alone is
         // insufficient. A deployment-declared cachePoint capability selects
@@ -744,6 +748,7 @@ mod tests {
             None,
             "2026-05-25",
             None,
+            Default::default(),
         );
         assert_eq!(
             ctx.provider_policy.max_markers, 0,
@@ -766,6 +771,7 @@ mod tests {
             None,
             "2026-05-25",
             None,
+            Default::default(),
         );
         assert_eq!(ctx.model_limit, u32::MAX);
     }
@@ -784,6 +790,7 @@ mod tests {
             None,
             "2026-05-25",
             None,
+            Default::default(),
         );
         // OpenAI uses prefix-only caching — emitting cache_control is a no-op
         // at best and (for some proxies) a 400 Bad Request at worst.
@@ -812,6 +819,7 @@ mod tests {
             None,
             "2026-05-25",
             None,
+            Default::default(),
         );
         assert_eq!(ctx.provider_policy.max_markers, 0);
     }
@@ -838,6 +846,7 @@ mod tests {
             }),
             "2026-05-25",
             None,
+            Default::default(),
         );
         assert!(
             ctx.provider_strategy.supports_cache_control,
@@ -868,6 +877,7 @@ mod tests {
             None,
             "2026-05-25",
             None,
+            Default::default(),
         );
         assert!(
             ctx.project_context.contains("22 turns"),
@@ -890,6 +900,7 @@ mod tests {
             None,
             "2026-05-25",
             None,
+            Default::default(),
         );
         assert!(ctx.project_context.is_empty());
     }
@@ -908,6 +919,7 @@ mod tests {
             None,
             "1999-12-31",
             None,
+            Default::default(),
         );
         assert_eq!(ctx.current_date, "1999-12-31");
     }
@@ -1266,6 +1278,7 @@ mod tests {
             None,
             "2026-05-25",
             None,
+            Default::default(),
         );
         let turn = build_turn_state(state, user_content);
         let external = build_external_sources(edge_profile, state, &["bash"], None, None);

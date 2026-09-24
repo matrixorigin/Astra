@@ -75,6 +75,7 @@ pub(super) fn runtime_tool_engine() -> ToolEngine<RuntimeToolExecutor> {
     register_handler_or_log!(engine, "bash", BashToolHandler);
     register_handler_or_log!(engine, "get_agent_info", GetAgentInfoToolHandler);
     register_handler_or_log!(engine, "tool_search", ToolSearchToolHandler);
+    register_handler_or_log!(engine, "skill_creator", SkillCreatorToolHandler);
     register_handler_or_log!(engine, "memory", MemoryToolHandler);
     register_handler_or_log!(engine, "session", SessionToolHandler);
     register_handler_or_log!(engine, "start_work", StartWorkToolHandler);
@@ -378,6 +379,21 @@ impl ToolHandler<RuntimeToolExecutor> for ToolSearchToolHandler {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct MemoryToolHandler;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SkillCreatorToolHandler;
+
+#[async_trait]
+impl ToolHandler<RuntimeToolExecutor> for SkillCreatorToolHandler {
+    async fn execute(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        context.execute_skill_creator(args, cancel_token).await
+    }
+}
 
 /// Build executor-owned evidence for a successful mutation in the external
 /// Memoria service.  Filesystem fingerprinting cannot observe a database
@@ -1862,6 +1878,7 @@ mod tests {
             "session",
             "memory",
             "rollback_file_edits",
+            "skill_creator",
         ] {
             assert!(
                 !astra_tools::executor::is_server_direct_default_executor_tool(wrapped),

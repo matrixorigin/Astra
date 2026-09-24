@@ -176,6 +176,13 @@ impl ToolExecutor {
     }
 
     pub(super) fn is_within_sandbox_boundary(&self, path: &Path) -> bool {
+        if self
+            .shell_process_boundary
+            .as_ref()
+            .is_some_and(|boundary| boundary.validate_file_access(path, true).is_err())
+        {
+            return false;
+        }
         let guard = self
             .sandbox_policy
             .read()
@@ -299,18 +306,20 @@ impl ToolExecutor {
     }
 
     fn record_write_impl(&self, path: &Path, content: Option<&str>) {
-        if passive_cargo_check::should_schedule_passive_cargo(&self.project_root, path) {
-            self.passive_cargo_pending.store(true, Ordering::SeqCst);
-        }
-        if passive_tsc_check::should_schedule_passive_tsc(&self.project_root, path) {
-            self.passive_tsc_pending.store(true, Ordering::SeqCst);
-        }
-        match content {
-            Some(text) => {
-                self.passive_lsp
-                    .sync_after_write_with_content(&self.project_root, path, text)
+        if self.shell_process_boundary.is_none() {
+            if passive_cargo_check::should_schedule_passive_cargo(&self.project_root, path) {
+                self.passive_cargo_pending.store(true, Ordering::SeqCst);
             }
-            None => self.passive_lsp.sync_after_write(&self.project_root, path),
+            if passive_tsc_check::should_schedule_passive_tsc(&self.project_root, path) {
+                self.passive_tsc_pending.store(true, Ordering::SeqCst);
+            }
+            match content {
+                Some(text) => {
+                    self.passive_lsp
+                        .sync_after_write_with_content(&self.project_root, path, text)
+                }
+                None => self.passive_lsp.sync_after_write(&self.project_root, path),
+            }
         }
         let ts = Self::file_mtime_ms(path);
         let content_sha256 = content

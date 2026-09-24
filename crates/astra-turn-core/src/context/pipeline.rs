@@ -147,6 +147,7 @@ impl ContextPipeline {
 
         let started = Instant::now();
         let preliminary_plan_input = PlanInput {
+            compaction_thresholds: input.sources.session.compaction_thresholds,
             tokens: input.tokens,
             model_limit: input.model_limit,
             pre_reserved_output_tokens: input.sources.session.pre_reserved_output_tokens,
@@ -179,6 +180,7 @@ impl ContextPipeline {
 
         let started = Instant::now();
         let final_plan_input = PlanInput {
+            compaction_thresholds: input.sources.session.compaction_thresholds,
             tokens: &measured,
             model_limit: input.model_limit,
             pre_reserved_output_tokens: input.sources.session.pre_reserved_output_tokens,

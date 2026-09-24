@@ -13,7 +13,7 @@ use astra_turn_types::InferencePurpose;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::turn::llm::client::{LlmCall, LlmExecutionRoute, global_llm_client};
+use crate::turn::llm::client::{LlmCall, LlmExecutionRoute, shared_llm_transport};
 
 #[cfg(test)]
 use crate::turn::llm::client::call_llm_nonstream;
@@ -154,6 +154,9 @@ impl MemoryInferencePort for DurableMemoryInferenceClient {
         &self,
         request: MemoryInferenceRequest<'_>,
     ) -> Result<MemoryInferenceResponse, astra_core::ClassifiedError> {
+        let transport = shared_llm_transport().map_err(|error| {
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, error)
+        })?;
         // Reuse the run/completion admission contract for every background
         // provider attempt. Never retain stale plaintext routes in the client.
         let execution = astra_services::revalidate_admitted_model_execution(
@@ -215,9 +218,9 @@ impl MemoryInferencePort for DurableMemoryInferenceClient {
         );
         let result = ledger
             .execute_nonstream(
-                global_llm_client(),
                 request.invocation_scope.clone(),
                 LlmCall {
+                    transport: &transport,
                     purpose: request.purpose,
                     messages: request.messages,
                     tools: &[],
@@ -272,9 +275,12 @@ impl MemoryInferencePort for DirectMemoryInferenceClient {
         &self,
         request: MemoryInferenceRequest<'_>,
     ) -> Result<MemoryInferenceResponse, astra_core::ClassifiedError> {
+        let transport = shared_llm_transport().map_err(|error| {
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, error)
+        })?;
         let result = call_llm_nonstream(
-            global_llm_client(),
             LlmCall {
+                transport: &transport,
                 purpose: request.purpose,
                 messages: request.messages,
                 tools: &[],

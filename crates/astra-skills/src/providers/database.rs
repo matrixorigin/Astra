@@ -4,7 +4,9 @@
 //! database-backed skills through the unified skill framework.
 
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use astra_services::skills::SkillService;
 
@@ -18,11 +20,23 @@ use crate::traits::{SkillError, SkillProvider};
 pub struct DatabaseSkillProvider {
     service: Arc<dyn SkillService>,
     user_id: String,
+    cache: Mutex<DatabaseSkillProviderCache>,
+}
+
+#[derive(Default)]
+struct DatabaseSkillProviderCache {
+    discovered: Option<Vec<SkillManifest>>,
+    discovered_ids: HashMap<String, String>,
+    loaded: HashMap<String, LoadedSkill>,
 }
 
 impl DatabaseSkillProvider {
     pub fn new(service: Arc<dyn SkillService>, user_id: String) -> Self {
-        Self { service, user_id }
+        Self {
+            service,
+            user_id,
+            cache: Mutex::new(DatabaseSkillProviderCache::default()),
+        }
     }
 
     fn get_str<'a>(
@@ -95,11 +109,17 @@ impl SkillProvider for DatabaseSkillProvider {
     }
 
     async fn discover(&self) -> Result<Vec<SkillManifest>, SkillError> {
+        let mut cache = self.cache.lock().await;
+        if let Some(manifests) = &cache.discovered {
+            return Ok(manifests.clone());
+        }
+
         let mut cursor = None;
-        let mut manifests = Vec::new();
+        let mut fetched_rows = 0;
+        let mut latest_by_name: HashMap<String, (SkillManifest, String, bool, Option<String>)> =
+            HashMap::new();
         loop {
-            let remaining =
-                DATABASE_SKILL_DISCOVERY_MAX_ROWS.saturating_sub(manifests.len() as u32);
+            let remaining = DATABASE_SKILL_DISCOVERY_MAX_ROWS.saturating_sub(fetched_rows);
             if remaining == 0 {
                 break;
             }
@@ -116,18 +136,31 @@ impl SkillProvider for DatabaseSkillProvider {
                 })?;
 
             let page_len = result.skills.len() as u32;
-            manifests.extend(result.skills.into_iter().map(|item| {
+            fetched_rows = fetched_rows.saturating_add(page_len);
+            for item in result.skills {
                 let version = item.version.parse().unwrap_or_default();
-
-                SkillManifest {
+                let manifest = SkillManifest {
                     name: item.skill_name,
                     version,
                     description: item.description.unwrap_or_default(),
                     source: SkillSourceKind::Database,
                     category: item.category,
                     ..Default::default()
+                };
+                let should_replace =
+                    latest_by_name
+                        .get(&manifest.name)
+                        .is_none_or(|(_, id, owned, created_at)| {
+                            (item.is_owned, &item.created_at, &item.skill_id)
+                                > (*owned, created_at, id)
+                        });
+                if should_replace {
+                    latest_by_name.insert(
+                        manifest.name.clone(),
+                        (manifest, item.skill_id, item.is_owned, item.created_at),
+                    );
                 }
-            }));
+            }
 
             cursor = result.next_cursor.clone();
             if page_len < limit || cursor.is_none() {
@@ -135,13 +168,34 @@ impl SkillProvider for DatabaseSkillProvider {
             }
         }
 
+        let mut selected_ids = HashMap::with_capacity(latest_by_name.len());
+        let mut manifests: Vec<_> = latest_by_name
+            .into_iter()
+            .map(|(name, (manifest, id, _, _))| {
+                selected_ids.insert(name, id);
+                manifest
+            })
+            .collect();
+        manifests.sort_by(|left, right| left.name.cmp(&right.name));
+        cache.discovered = Some(manifests.clone());
+        cache.discovered_ids = selected_ids;
         Ok(manifests)
     }
 
     async fn load(&self, name: &str) -> Result<LoadedSkill, SkillError> {
+        let mut cache = self.cache.lock().await;
+        if let Some(loaded) = cache.loaded.get(name) {
+            return Ok(loaded.clone());
+        }
+
+        let selected_id = cache
+            .discovered_ids
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string());
         let record = self
             .service
-            .get_skill(self.user_id.clone(), name.to_string(), None)
+            .get_skill(self.user_id.clone(), selected_id, None)
             .await
             .map_err(|(status, err)| {
                 if status == axum::http::StatusCode::NOT_FOUND {
@@ -192,17 +246,22 @@ impl SkillProvider for DatabaseSkillProvider {
             ..Default::default()
         };
 
-        Ok(LoadedSkill {
+        let loaded = LoadedSkill {
             manifest,
             instructions,
             instruction_tokens,
             resources: None,
             skill_dir: None,
-        })
+        };
+        cache.loaded.insert(name.to_string(), loaded.clone());
+        Ok(loaded)
     }
 
     async fn refresh(&self) -> Result<(), SkillError> {
-        // Database is always "fresh" — each discover/load hits the DB directly.
+        let mut cache = self.cache.lock().await;
+        cache.discovered = None;
+        cache.discovered_ids.clear();
+        cache.loaded.clear();
         Ok(())
     }
 }
@@ -214,9 +273,11 @@ mod tests {
     use astra_services::skills::*;
     use axum::Json;
     use axum::http::StatusCode;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MockSkillService {
         skills: Vec<SkillListItem>,
+        list_calls: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -227,6 +288,7 @@ mod tests {
             limit: u32,
             cursor: Option<SkillListCursor>,
         ) -> Result<SkillListRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
             let start = cursor
                 .as_ref()
                 .map(|cursor| {
@@ -275,7 +337,7 @@ mod tests {
         ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
             self.skills
                 .iter()
-                .find(|s| s.skill_name == skill_id || s.skill_id == skill_id)
+                .find(|s| s.skill_id == skill_id || s.skill_name == skill_id)
                 .map(|s| {
                     let metadata = if s.skill_name == "remote-http" {
                         serde_json::json!({
@@ -380,41 +442,60 @@ mod tests {
         }
     }
 
+    fn mock_skills() -> Vec<SkillListItem> {
+        vec![
+            SkillListItem {
+                is_owned: false,
+                skill_id: "review@1.0.0".into(),
+                skill_name: "review".into(),
+                version: "1.0.0".into(),
+                description: Some("Code review skill".into()),
+                status: Some("active".into()),
+                source: Some("user".into()),
+                category: Some("code-quality".into()),
+                created_at: None,
+            },
+            SkillListItem {
+                is_owned: false,
+                skill_id: "deploy@2.0.0".into(),
+                skill_name: "deploy".into(),
+                version: "2.0.0".into(),
+                description: Some("Deployment automation".into()),
+                status: Some("active".into()),
+                source: Some("marketplace".into()),
+                category: Some("devops".into()),
+                created_at: None,
+            },
+            SkillListItem {
+                is_owned: false,
+                skill_id: "remote-http@1.0.0".into(),
+                skill_name: "remote-http".into(),
+                version: "1.0.0".into(),
+                description: Some("Remote HTTP skill".into()),
+                status: Some("active".into()),
+                source: Some("user".into()),
+                category: Some("integration".into()),
+                created_at: None,
+            },
+        ]
+    }
+
     fn mock_service() -> Arc<dyn SkillService> {
         Arc::new(MockSkillService {
-            skills: vec![
-                SkillListItem {
-                    skill_id: "review@1.0.0".into(),
-                    skill_name: "review".into(),
-                    version: "1.0.0".into(),
-                    description: Some("Code review skill".into()),
-                    status: Some("active".into()),
-                    source: Some("user".into()),
-                    category: Some("code-quality".into()),
-                    created_at: None,
-                },
-                SkillListItem {
-                    skill_id: "deploy@2.0.0".into(),
-                    skill_name: "deploy".into(),
-                    version: "2.0.0".into(),
-                    description: Some("Deployment automation".into()),
-                    status: Some("active".into()),
-                    source: Some("marketplace".into()),
-                    category: Some("devops".into()),
-                    created_at: None,
-                },
-                SkillListItem {
-                    skill_id: "remote-http@1.0.0".into(),
-                    skill_name: "remote-http".into(),
-                    version: "1.0.0".into(),
-                    description: Some("Remote HTTP skill".into()),
-                    status: Some("active".into()),
-                    source: Some("user".into()),
-                    category: Some("integration".into()),
-                    created_at: None,
-                },
-            ],
+            skills: mock_skills(),
+            list_calls: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    fn mock_service_with_counter() -> (Arc<dyn SkillService>, Arc<AtomicUsize>) {
+        let list_calls = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(MockSkillService {
+                skills: mock_skills(),
+                list_calls: Arc::clone(&list_calls),
+            }),
+            list_calls,
+        )
     }
 
     #[tokio::test]
@@ -432,6 +513,123 @@ mod tests {
             manifests
                 .iter()
                 .all(|m| m.source == SkillSourceKind::Database)
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_caches_latest_snapshot_until_refresh() {
+        let (service, list_calls) = mock_service_with_counter();
+        let provider = DatabaseSkillProvider::new(service, "user-1".to_string());
+
+        let first = provider.discover().await.unwrap();
+        let second = provider.discover().await.unwrap();
+        let snapshot = |manifests: &[SkillManifest]| {
+            manifests
+                .iter()
+                .map(|manifest| {
+                    (
+                        manifest.name.clone(),
+                        manifest.version.to_string(),
+                        manifest.description.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(snapshot(&first), snapshot(&second));
+        assert_eq!(list_calls.load(Ordering::SeqCst), 1);
+
+        provider.refresh().await.unwrap();
+        provider.discover().await.unwrap();
+        assert_eq!(list_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn discovery_and_load_preserve_private_owner_precedence() {
+        let service = Arc::new(MockSkillService {
+            skills: vec![
+                SkillListItem {
+                    is_owned: true,
+                    skill_id: "review@1.0.0".into(),
+                    skill_name: "review".into(),
+                    version: "1.0.0".into(),
+                    description: Some("old".into()),
+                    status: Some("active".into()),
+                    source: Some("marketplace".into()),
+                    category: None,
+                    created_at: None,
+                },
+                SkillListItem {
+                    is_owned: false,
+                    skill_id: "review@2.0.0".into(),
+                    skill_name: "review".into(),
+                    version: "2.0.0".into(),
+                    description: Some("new".into()),
+                    status: Some("active".into()),
+                    source: Some("marketplace".into()),
+                    category: None,
+                    created_at: None,
+                },
+            ],
+            list_calls: Arc::new(AtomicUsize::new(0)),
+        }) as Arc<dyn SkillService>;
+        let provider = DatabaseSkillProvider::new(service, "user-1".to_string());
+
+        let manifests = provider.discover().await.unwrap();
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].version.to_string(), "1.0.0");
+        assert_eq!(manifests[0].description, "old");
+        assert_eq!(
+            provider
+                .load("review")
+                .await
+                .unwrap()
+                .manifest
+                .version
+                .to_string(),
+            "1.0.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_uses_full_creation_order_not_version_order() {
+        let mut rows = Vec::new();
+        for (id, version, created_at) in [
+            ("older", "9.0.0", "2026-09-22T00:00:00.100000"),
+            ("newer-a", "1.0.0", "2026-09-22T00:00:00.200000"),
+            ("newer-b", "1.0.1", "2026-09-22T00:00:00.200000"),
+        ] {
+            rows.push(SkillListItem {
+                is_owned: true,
+                skill_id: id.into(),
+                skill_name: "review".into(),
+                version: version.into(),
+                description: None,
+                status: Some("active".into()),
+                source: Some("user".into()),
+                category: None,
+                created_at: Some(created_at.into()),
+            });
+        }
+        let provider = DatabaseSkillProvider::new(
+            Arc::new(MockSkillService {
+                skills: rows,
+                list_calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            "owner".into(),
+        );
+        assert_eq!(
+            provider.discover().await.unwrap()[0].version.to_string(),
+            "1.0.1"
+        );
+        assert_eq!(
+            provider
+                .load("review")
+                .await
+                .unwrap()
+                .manifest
+                .version
+                .to_string(),
+            "1.0.1"
         );
     }
 

@@ -15,6 +15,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::edge_ws_protocol::{
     EDGE_TOOL_RESULT_GRACE_SECS, EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage,
@@ -54,6 +55,7 @@ pub struct DurablyAdmittedEdgeInvocation<'a> {
     pub identity: &'a ToolInvocationIdentity,
     pub edge_agent_id: &'a str,
     pub tool: &'a str,
+    pub evaluation_allocation: Option<&'a astra_runtime_env::EvaluationAllocationReceipt>,
     pub args: &'a serde_json::Value,
     pub runtime_process_authorization:
         Option<&'a astra_services::runs::RuntimeProcessAuthorizationContext>,
@@ -187,6 +189,11 @@ pub struct EdgeConnectionPool {
     /// Global FIFO of dispatched request IDs for O(1)-amortized eviction when
     /// the pending set reaches capacity. Stale IDs are lazily skipped.
     pending_request_order: Arc<Mutex<VecDeque<String>>>,
+    /// Live request/response waiters for evaluation workspace management.
+    /// These are intentionally separate from tool invocation waiters: a
+    /// workspace probe has no model tool identity and must never become a
+    /// replayable tool result.
+    workspace_operations: Arc<DashMap<String, PendingWorkspaceOperation>>,
     /// Maximum number of inflight dispatched tool requests. When exceeded,
     /// the oldest entry is evicted before insertion.
     max_pending: usize,
@@ -213,6 +220,66 @@ struct PendingRequestEntry {
     request: DispatchedToolRequest,
 }
 
+#[derive(Debug)]
+struct PendingWorkspaceOperation {
+    user_id: String,
+    edge_agent_id: String,
+    kind: EdgeWorkspaceOperationKind,
+    connection_generation: u64,
+    sender: oneshot::Sender<EdgeWorkspaceOperationResult>,
+}
+
+struct WorkspaceOperationTarget<'a> {
+    user_id: &'a str,
+    edge_agent_id: &'a str,
+    generation: u64,
+}
+
+/// Frozen workspace and verifier inputs for one finalization operation.
+#[derive(Debug, Clone, Copy)]
+pub struct EdgeWorkspaceFinalizationRequest<'a> {
+    pub connection_generation: u64,
+    pub allocation: &'a astra_runtime_env::EvaluationAllocationReceipt,
+    pub verifier_command: &'a str,
+    pub verifier_timeout_secs: u64,
+}
+
+pub use crate::edge_ws_protocol::EdgeWorkspacePreparationRequest;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeWorkspaceOperationKind {
+    Prepare,
+    Snapshot,
+    Finalize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EdgeWorkspaceAllocationTarget<'a> {
+    pub connection_generation: u64,
+    pub allocation: &'a astra_runtime_env::EvaluationAllocationReceipt,
+}
+
+/// Result returned by a live Edge workspace management operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeWorkspaceOperationResult {
+    pub kind: EdgeWorkspaceOperationKind,
+    pub allocation: Option<astra_runtime_env::EvaluationAllocationReceipt>,
+    pub connection_generation: u64,
+    pub workspace_dir: String,
+    pub source_commit: Option<String>,
+    pub source_tree: Option<String>,
+    pub clean: bool,
+    pub base_revision: Option<String>,
+    pub result_revision: Option<String>,
+    pub patch: Option<String>,
+    pub verifier_exit_code: Option<i32>,
+    pub verifier_output: Option<String>,
+    pub namespace_active: bool,
+    pub scope_settled: bool,
+    pub timed_out: bool,
+    pub error: Option<String>,
+}
+
 impl EdgeConnectionPool {
     pub fn new() -> Self {
         Self {
@@ -220,6 +287,7 @@ impl EdgeConnectionPool {
             pending_requests: Arc::new(DashMap::new()),
             pending_request_ids_by_user: Arc::new(DashMap::new()),
             pending_request_order: Arc::new(Mutex::new(VecDeque::new())),
+            workspace_operations: Arc::new(DashMap::new()),
             max_pending: MAX_PENDING_REQUESTS,
             max_pending_per_user: MAX_PENDING_REQUESTS_PER_USER,
             next_connection_generation: Arc::new(AtomicU64::new(0)),
@@ -767,6 +835,238 @@ impl EdgeConnectionPool {
             .collect()
     }
 
+    /// Ask a live Edge to create an isolated, per-trial workspace clone.
+    pub async fn prepare_evaluation_workspace(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        request: EdgeWorkspacePreparationRequest<'_>,
+        timeout: Duration,
+    ) -> Option<EdgeWorkspaceOperationResult> {
+        self.request_workspace_operation(
+            WorkspaceOperationTarget {
+                user_id,
+                edge_agent_id,
+                generation: request.connection_generation,
+            },
+            timeout,
+            None,
+            false,
+            |request_id, connection_generation| EdgeServerMessage::WorkspacePrepare {
+                request_id,
+                connection_generation,
+                workspace_key: request.workspace_key.to_string(),
+                session_id: request.session_id.to_string(),
+                source_commit: request.source_commit.to_string(),
+                confinement: request.confinement.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Ask a live Edge for an immediate source/cleanliness proof of one
+    /// prepared evaluation workspace.
+    pub async fn snapshot_evaluation_workspace(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        target: EdgeWorkspaceAllocationTarget<'_>,
+        timeout: Duration,
+    ) -> Option<EdgeWorkspaceOperationResult> {
+        self.request_workspace_operation(
+            WorkspaceOperationTarget {
+                user_id,
+                edge_agent_id,
+                generation: target.connection_generation,
+            },
+            timeout,
+            None,
+            false,
+            |request_id, connection_generation| EdgeServerMessage::WorkspaceSnapshotRequest {
+                request_id,
+                connection_generation,
+                allocation: target.allocation.clone(),
+            },
+        )
+        .await
+    }
+
+    pub async fn finalize_evaluation_workspace(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        request: EdgeWorkspaceFinalizationRequest<'_>,
+        timeout: Duration,
+        cancel_token: &CancellationToken,
+    ) -> Option<EdgeWorkspaceOperationResult> {
+        let deadline_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis()
+            .saturating_add(timeout.as_millis());
+        let deadline_unix_ms = u64::try_from(deadline_unix_ms).ok()?;
+        self.request_workspace_operation(
+            WorkspaceOperationTarget {
+                user_id,
+                edge_agent_id,
+                generation: request.connection_generation,
+            },
+            timeout,
+            Some(cancel_token),
+            true,
+            |request_id, connection_generation| EdgeServerMessage::WorkspaceFinalize {
+                request_id,
+                connection_generation,
+                allocation: request.allocation.clone(),
+                verifier_command: request.verifier_command.to_string(),
+                verifier_timeout_secs: request.verifier_timeout_secs,
+                finalization_deadline_unix_ms: deadline_unix_ms,
+            },
+        )
+        .await
+    }
+
+    /// Best-effort release of one per-trial evaluation workspace. Edge keeps a
+    /// dirty clone for post-run evidence and removes a clean clone.
+    pub async fn release_evaluation_workspace(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        target: EdgeWorkspaceAllocationTarget<'_>,
+    ) -> bool {
+        let key = pool_key(user_id, edge_agent_id);
+        let (generation, sender) = {
+            let Some(entry) = self.connections.get(&key) else {
+                return false;
+            };
+            if entry.sender.is_closed() || entry.generation != target.connection_generation {
+                return false;
+            }
+            (entry.generation, entry.sender.clone())
+        };
+        sender
+            .send(EdgeServerMessage::WorkspaceRelease {
+                connection_generation: generation,
+                allocation: target.allocation.clone(),
+            })
+            .await
+            .is_ok()
+    }
+
+    async fn request_workspace_operation<F>(
+        &self,
+        target: WorkspaceOperationTarget<'_>,
+        timeout: Duration,
+        cancel_token: Option<&CancellationToken>,
+        cancel_finalize: bool,
+        build_message: F,
+    ) -> Option<EdgeWorkspaceOperationResult>
+    where
+        F: FnOnce(String, u64) -> EdgeServerMessage,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let key = pool_key(target.user_id, target.edge_agent_id);
+        let (generation, sender) = {
+            let entry = self.connections.get(&key)?;
+            if entry.sender.is_closed() || entry.generation != target.generation {
+                return None;
+            }
+            (entry.generation, entry.sender.clone())
+        };
+        let request_id = format!("edge-workspace-{}", Uuid::new_v4());
+        let (tx, rx) = oneshot::channel();
+        let message = build_message(request_id.clone(), generation);
+        let kind = match &message {
+            EdgeServerMessage::WorkspacePrepare { .. } => EdgeWorkspaceOperationKind::Prepare,
+            EdgeServerMessage::WorkspaceSnapshotRequest { .. } => {
+                EdgeWorkspaceOperationKind::Snapshot
+            }
+            EdgeServerMessage::WorkspaceFinalize { .. } => EdgeWorkspaceOperationKind::Finalize,
+            _ => return None,
+        };
+        self.workspace_operations.insert(
+            request_id.clone(),
+            PendingWorkspaceOperation {
+                user_id: target.user_id.into(),
+                edge_agent_id: target.edge_agent_id.into(),
+                kind,
+                connection_generation: generation,
+                sender: tx,
+            },
+        );
+        let sent = if let Some(cancel_token) = cancel_token {
+            tokio::select! {
+                result = sender.send(message) => result.is_ok(),
+                _ = cancel_token.cancelled() => false,
+                _ = tokio::time::sleep_until(deadline) => false,
+            }
+        } else {
+            tokio::select! {
+                result = sender.send(message) => result.is_ok(),
+                _ = tokio::time::sleep_until(deadline) => false,
+            }
+        };
+        if !sent {
+            self.workspace_operations.remove(&request_id);
+            return None;
+        }
+        let result = if let Some(cancel_token) = cancel_token {
+            tokio::select! {
+                result = tokio::time::timeout_at(deadline, rx) => result.ok().and_then(Result::ok),
+                _ = cancel_token.cancelled() => None,
+            }
+        } else {
+            tokio::time::timeout_at(deadline, rx)
+                .await
+                .ok()
+                .and_then(Result::ok)
+        };
+        if result.is_none() {
+            self.workspace_operations.remove(&request_id);
+            if cancel_finalize {
+                let _ = sender.try_send(EdgeServerMessage::WorkspaceFinalizeCancel {
+                    request_id,
+                    connection_generation: generation,
+                });
+            }
+        }
+        result
+    }
+
+    /// Deliver a workspace operation result only to the connection generation
+    /// that received the request. A reconnect therefore cannot answer an old
+    /// probe or release a newer materialization by accident.
+    pub fn deliver_workspace_operation(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        request_id: &str,
+        connection_generation: u64,
+        result: EdgeWorkspaceOperationResult,
+    ) -> bool {
+        let key = pool_key(user_id, edge_agent_id);
+        if self
+            .connections
+            .get(&key)
+            .is_none_or(|entry| entry.generation != connection_generation)
+        {
+            return false;
+        }
+        let Some((_, pending)) = self
+            .workspace_operations
+            .remove_if(request_id, |_, pending| {
+                pending.user_id == user_id
+                    && pending.edge_agent_id == edge_agent_id
+                    && pending.kind == result.kind
+                    && pending.connection_generation == connection_generation
+                    && result.connection_generation == connection_generation
+            })
+        else {
+            return false;
+        };
+        pending.sender.send(result).is_ok()
+    }
+
     /// Deliver an invocation whose exact identity, edge owner, and payload
     /// were already admitted by the durable dispatch authority.
     pub async fn execute_durably_admitted_invocation_with_cancel(
@@ -780,6 +1080,7 @@ impl EdgeConnectionPool {
         self.execute_durably_admitted_invocation_on_connection_with_cancel(
             DurablyAdmittedEdgeInvocation {
                 connection_user_id: &identity.user_id,
+                evaluation_allocation: None,
                 identity,
                 edge_agent_id,
                 tool,
@@ -820,6 +1121,7 @@ impl EdgeConnectionPool {
             tool,
             args,
             runtime_process_authorization,
+            evaluation_allocation,
             timeout_secs,
             cancel_token,
         } = invocation;
@@ -869,6 +1171,7 @@ impl EdgeConnectionPool {
         );
 
         let msg = EdgeServerMessage::ToolRequest {
+            evaluation_allocation: evaluation_allocation.cloned().map(Box::new),
             request_id: request_id.clone(),
             identity: Box::new(identity.clone()),
             delivery_generation,
@@ -1261,6 +1564,141 @@ mod tests {
         assert_eq!(pool.connection_count(), 1);
     }
 
+    #[tokio::test]
+    async fn mismatched_workspace_responses_do_not_consume_the_pending_operation() {
+        let pool = EdgeConnectionPool::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let generation = pool.register("owner", "edge", None, None, tx);
+        let (other_tx, _other_rx) = mpsc::channel(1);
+        let other_generation = pool.register("other", "edge", None, None, other_tx);
+        let (sender, receiver) = oneshot::channel();
+        pool.workspace_operations.insert(
+            "request".into(),
+            PendingWorkspaceOperation {
+                user_id: "owner".into(),
+                edge_agent_id: "edge".into(),
+                kind: EdgeWorkspaceOperationKind::Snapshot,
+                connection_generation: generation,
+                sender,
+            },
+        );
+        let result = EdgeWorkspaceOperationResult {
+            kind: EdgeWorkspaceOperationKind::Snapshot,
+            allocation: Some(crate::edge_ws_protocol::test_allocation_receipt()),
+            connection_generation: generation,
+            workspace_dir: "/workspace/trial".into(),
+            source_commit: None,
+            source_tree: None,
+            clean: true,
+            base_revision: None,
+            result_revision: None,
+            patch: None,
+            verifier_exit_code: None,
+            verifier_output: None,
+            namespace_active: false,
+            scope_settled: false,
+            timed_out: false,
+            error: None,
+        };
+        let mut wrong_kind = result.clone();
+        wrong_kind.kind = EdgeWorkspaceOperationKind::Prepare;
+        let mut wrong_generation = result.clone();
+        wrong_generation.connection_generation = generation + 1;
+        for (owner, edge, response_generation, response) in [
+            ("other", "edge", other_generation, result.clone()),
+            ("owner", "wrong-edge", generation, result.clone()),
+            ("owner", "edge", generation, wrong_kind),
+            ("owner", "edge", generation, wrong_generation),
+        ] {
+            assert!(!pool.deliver_workspace_operation(
+                owner,
+                edge,
+                "request",
+                response_generation,
+                response
+            ));
+            assert!(pool.workspace_operations.contains_key("request"));
+        }
+        assert!(pool.deliver_workspace_operation(
+            "owner",
+            "edge",
+            "request",
+            generation,
+            result.clone()
+        ));
+        assert_eq!(receiver.await.unwrap(), result);
+        assert!(!pool.workspace_operations.contains_key("request"));
+    }
+
+    #[tokio::test]
+    async fn workspace_operations_reject_replacement_connection_before_dispatch() {
+        let pool = EdgeConnectionPool::new();
+        let (old_tx, mut old_rx) = mpsc::channel(1);
+        let expected = pool.register("owner", "edge", None, None, old_tx);
+        let (new_tx, mut new_rx) = mpsc::channel(1);
+        assert_ne!(pool.register("owner", "edge", None, None, new_tx), expected);
+        let timeout = Duration::from_secs(1);
+        assert!(
+            pool.prepare_evaluation_workspace(
+                "owner",
+                "edge",
+                EdgeWorkspacePreparationRequest {
+                    connection_generation: expected,
+                    workspace_key: "trial",
+                    session_id: "session",
+                    source_commit: "commit",
+                    confinement: &astra_runtime_env::WorkspaceConfinementContract {
+                        profile_id: astra_runtime_env::WORKSPACE_CONFINEMENT_PROFILE.into(),
+                        toolchain_manifest: astra_runtime_env::ToolchainManifest {
+                            schema_version: 1,
+                            inputs: vec![astra_runtime_env::ToolchainInput {
+                                guest_mount_path: "/usr/bin".into(),
+                                content_digest: format!("sha256:{}", "a".repeat(64)),
+                            }],
+                            launcher_digest: format!("sha256:{}", "b".repeat(64)),
+                            supervisor_digest: format!("sha256:{}", "c".repeat(64)),
+                        },
+                    },
+                },
+                timeout,
+            )
+            .await
+            .is_none()
+        );
+        assert!(
+            pool.snapshot_evaluation_workspace(
+                "owner",
+                "edge",
+                EdgeWorkspaceAllocationTarget {
+                    connection_generation: expected,
+                    allocation: &crate::edge_ws_protocol::test_allocation_receipt()
+                },
+                timeout,
+            )
+            .await
+            .is_none()
+        );
+        assert!(
+            pool.finalize_evaluation_workspace(
+                "owner",
+                "edge",
+                EdgeWorkspaceFinalizationRequest {
+                    connection_generation: expected,
+                    allocation: &crate::edge_ws_protocol::test_allocation_receipt(),
+                    verifier_command: "true",
+                    verifier_timeout_secs: 1,
+                },
+                timeout,
+                &CancellationToken::new(),
+            )
+            .await
+            .is_none()
+        );
+        assert!(old_rx.try_recv().is_err());
+        assert!(new_rx.try_recv().is_err());
+        assert!(pool.workspace_operations.is_empty());
+    }
+
     #[test]
     fn stable_materialization_identity_survives_pool_projection_and_reconnect() {
         let pool = EdgeConnectionPool::new();
@@ -1419,6 +1857,7 @@ mod tests {
             caller_pool
                 .execute_durably_admitted_invocation_on_connection_with_cancel(
                     DurablyAdmittedEdgeInvocation {
+                        evaluation_allocation: None,
                         connection_user_id: "user-1",
                         identity: &identity,
                         edge_agent_id: "edge-a",

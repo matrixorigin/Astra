@@ -199,6 +199,215 @@ async fn append_user_intent(
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn run_action_history_detects_missing_and_corrupted_admission_evidence() {
+    use astra_services::runs::{
+        RunActionHistoryError, load_verified_run_action_history_in_transaction,
+    };
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let ledger = DatabaseToolInvocationLedger::new(shared);
+    for damage in ["prefix", "middle", "tail", "all", "hash", "watermark"] {
+        let prefix = Uuid::new_v4().simple().to_string();
+        let first = identity(&prefix, "call-0");
+        insert_active_run(&pool, &first).await;
+        for index in 0..3 {
+            let call = identity(&prefix, &format!("call-{index}"));
+            ledger
+                .prepare(&call, &fingerprint("read"), &decision())
+                .await
+                .unwrap();
+            ledger
+                .claim_dispatch(&call, "worker", 90_000, dispatch_admission())
+                .await
+                .unwrap();
+        }
+        let mut tx = pool.begin().await.unwrap();
+        let history = load_verified_run_action_history_in_transaction(
+            &mut tx,
+            &first.user_id,
+            &first.session_id,
+            &first.run_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(history.last_event_index, 2);
+        assert_eq!(history.grants.len(), 3);
+        assert_eq!(
+            history.grants[0].action_id,
+            format!("tool_invocation:{}", first.storage_key())
+        );
+        assert!(matches!(
+            load_verified_run_action_history_in_transaction(
+                &mut tx,
+                &first.user_id,
+                "wrong-session",
+                &first.run_id,
+            )
+            .await,
+            Err(RunActionHistoryError::Unavailable)
+        ));
+        tx.commit().await.unwrap();
+        let statement = match damage {
+            "prefix" => {
+                "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = 0"
+            }
+            "middle" => {
+                "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = 1"
+            }
+            "tail" => {
+                "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = 2"
+            }
+            "all" => "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+            "hash" => {
+                "UPDATE agent_run_events SET event_hash = 'corrupt' WHERE user_id = ? AND run_id = ? AND event_idx = 1"
+            }
+            "watermark" => {
+                "UPDATE agent_runs SET last_event_idx = 1 WHERE user_id = ? AND run_id = ?"
+            }
+            _ => unreachable!(),
+        };
+        sqlx::query(statement)
+            .bind(&first.user_id)
+            .bind(&first.run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        assert!(
+            matches!(
+                load_verified_run_action_history_in_transaction(
+                    &mut tx,
+                    &first.user_id,
+                    &first.session_id,
+                    &first.run_id,
+                )
+                .await,
+                Err(RunActionHistoryError::Integrity(_))
+            ),
+            "{damage}"
+        );
+        tx.rollback().await.unwrap();
+        cleanup(&pool, &first).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn invocation_coverage_survives_compaction_and_detects_wholesale_evidence_loss() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let ledger = DatabaseToolInvocationLedger::new(shared);
+    for damage in ["hot", "archive_index", "both", "artifact", "hash"] {
+        let prefix = Uuid::new_v4().simple().to_string();
+        let first = identity(&prefix, "call-0");
+        insert_active_run(&pool, &first).await;
+        let empty = ledger
+            .inspect_run_evidence(&first.user_id, &first.session_id, &first.run_id)
+            .await
+            .unwrap();
+        assert!(empty.completions.is_empty());
+        let count = if damage == "both" { 33 } else { 2 };
+        for index in 0..count {
+            let call = identity(&prefix, &format!("call-{index}"));
+            ledger
+                .prepare(&call, &fingerprint("read"), &decision())
+                .await
+                .unwrap();
+            ledger
+                .claim_dispatch(&call, "worker", 90_000, dispatch_admission())
+                .await
+                .unwrap();
+            if index == 0 {
+                assert!(matches!(
+                    ledger
+                        .inspect_run_evidence(&first.user_id, &first.session_id, &first.run_id)
+                        .await,
+                    Err(ToolInvocationLedgerStoreError::EvidenceUnresolved(_))
+                ));
+            }
+            ledger
+                .compare_and_complete(
+                    &call,
+                    ToolInvocationState::Dispatched,
+                    Some("worker"),
+                    &success("evidence"),
+                )
+                .await
+                .unwrap();
+        }
+        let before = ledger
+            .inspect_run_evidence(&first.user_id, &first.session_id, &first.run_id)
+            .await
+            .unwrap();
+        assert_eq!(before.completions.len(), count);
+        if damage != "hot" {
+            sqlx::query(
+                "UPDATE agent_runs SET status = 'completed' WHERE user_id = ? AND run_id = ?",
+            )
+            .bind(&first.user_id)
+            .bind(&first.run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            ledger
+                .compact_terminal_run_batch(&first.user_id, &first.session_id, &first.run_id)
+                .await
+                .unwrap();
+            let after = ledger
+                .inspect_run_evidence(&first.user_id, &first.session_id, &first.run_id)
+                .await
+                .unwrap();
+            assert_eq!(after.completions, before.completions, "{damage}");
+        }
+        if matches!(damage, "hot" | "both") {
+            sqlx::query("DELETE FROM tool_invocation_ledger WHERE user_id = ? AND run_id = ?")
+                .bind(&first.user_id)
+                .bind(&first.run_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        if matches!(damage, "archive_index" | "both") {
+            sqlx::query(
+                "DELETE FROM tool_invocation_archive_chunks WHERE user_id = ? AND run_id = ?",
+            )
+            .bind(&first.user_id)
+            .bind(&first.run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        if damage == "artifact" {
+            sqlx::query("DELETE FROM session_artifacts WHERE user_id = ? AND session_id = ?")
+                .bind(&first.user_id)
+                .bind(&first.session_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        if damage == "hash" {
+            sqlx::query("UPDATE session_artifacts SET metadata = JSON_SET(metadata, '$.contentHash', 'corrupt') WHERE user_id = ? AND session_id = ?")
+                .bind(&first.user_id).bind(&first.session_id).execute(&pool).await.unwrap();
+        }
+        assert!(
+            ledger
+                .inspect_run_evidence(&first.user_id, &first.session_id, &first.run_id)
+                .await
+                .is_err(),
+            "{damage}"
+        );
+        if matches!(damage, "artifact" | "hash") {
+            assert!(
+                ledger.get(&first).await.is_err(),
+                "corrupt archives cannot authorize replay"
+            );
+        }
+        cleanup(&pool, &first).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn large_terminal_outcome_commits_and_roundtrips_without_a_varchar_projection_limit() {
     let shared = common::setup_pool().await;
     let pool = shared.get().clone();
@@ -1049,6 +1258,7 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
                 format!("sha256:{}", "b".repeat(64)),
             )
             .unwrap(),
+            dispatch_admission(),
         )
         .await
         .unwrap();
@@ -1059,6 +1269,15 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
     );
     assert_eq!(cached_record.attempt_count, 0);
     assert!(cached_record.dispatch_lease.is_none());
+    let cache_evidence = ledger
+        .inspect_run_evidence(&cached.user_id, &cached.session_id, &cached.run_id)
+        .await
+        .unwrap();
+    assert_eq!(cache_evidence.completions.len(), 1);
+    assert_eq!(
+        cache_evidence.history.grants[0].action_id,
+        format!("tool_invocation:{}", cached.storage_key())
+    );
     assert!(cached_record.completion_source.is_some());
     assert_eq!(ledger.get(&cached).await.unwrap().unwrap(), cached_record);
     assert!(matches!(

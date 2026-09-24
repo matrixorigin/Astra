@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use astra_turn_types::auxiliary_execution::{AuxiliaryCallGate, WorkAdmissionGate};
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex as TokioMutex;
@@ -54,10 +55,11 @@ use crate::turn::agentic_loop::execution_phase::{
 use crate::turn::agentic_loop::host::{
     AdmittedToolCallControl, AdmittedToolCallOutcome, AgenticLoopHost, AgenticLoopOutcome,
     AgenticLoopState, HostTurnResult, SkillAutoRouteDecision, SkillAutoRouteJudgeContext,
-    TurnInteractionMode, TurnInteractionPolicy, TurnPhaseKind, TurnPhaseOutcome, TurnPhaseReceipt,
-    complete_turn_phase, context_manifest_identity_from_result,
-    interaction_scoped_tool_restrictions,
+    SkillAutoRouteJudgmentEvidence, SkillAutoRouteJudgmentOutcome, TurnInteractionMode,
+    TurnInteractionPolicy, TurnPhaseKind, TurnPhaseOutcome, TurnPhaseReceipt, complete_turn_phase,
+    context_manifest_identity_from_result, interaction_scoped_tool_restrictions,
 };
+use crate::turn::execution_config::PreparedExecutionPolicy;
 use crate::turn::llm::client::{
     LlmCall, LlmCallResult, LlmCancel, LlmStreamUpdate, OwnedLlmExecutionRoute,
     call_llm_and_collect_with_stream_callback,
@@ -85,6 +87,7 @@ use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal, SharedAgentLiveEventSink,
 };
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
+use astra_turn_core::cloud_summary::SummaryInvocationIdentity;
 use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind, CompactionTier};
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
 use astra_turn_core::rate_limit_cooldown::{
@@ -1282,15 +1285,6 @@ impl AuxiliaryLlmPolicy {
             .map(parse_auxiliary_llm_policy)
             .unwrap_or(Self::CapacityAware)
     }
-
-    fn as_label(self) -> &'static str {
-        match self {
-            Self::CapacityAware => "capacity_aware",
-            Self::Always => "always",
-            Self::Disabled => "disabled",
-            Self::BoundaryOnly => "boundary_only",
-        }
-    }
 }
 
 fn parse_auxiliary_llm_policy(raw: &str) -> AuxiliaryLlmPolicy {
@@ -1307,27 +1301,32 @@ fn parse_auxiliary_llm_policy(raw: &str) -> AuxiliaryLlmPolicy {
     }
 }
 
-fn should_skip_auxiliary_llm_for_capacity() -> Option<&'static str> {
-    let policy = AuxiliaryLlmPolicy::from_env();
-    match policy {
-        AuxiliaryLlmPolicy::Disabled => Some("disabled"),
-        // Work admission is the product's lifecycle classifier and is
-        // intentionally handled by `should_skip_work_admission_judge`; this
-        // helper continues to gate unrelated optional auxiliaries.
-        AuxiliaryLlmPolicy::BoundaryOnly => Some("boundary_only"),
-        AuxiliaryLlmPolicy::Always => None,
+/// Resolve optional-call admission once at execution-input capture.
+/// Work admission retains its separate lifecycle-classifier policy.
+pub(crate) fn resolve_optional_auxiliary_call_gate() -> AuxiliaryCallGate {
+    match AuxiliaryLlmPolicy::from_env() {
+        AuxiliaryLlmPolicy::Disabled => AuxiliaryCallGate::Disabled,
+        AuxiliaryLlmPolicy::BoundaryOnly => AuxiliaryCallGate::BoundaryOnly,
+        AuxiliaryLlmPolicy::Always => AuxiliaryCallGate::Allowed,
         AuxiliaryLlmPolicy::CapacityAware => {
             if crate::llm_provider_admission::ProviderAdmissionConfig::from_env().is_enabled() {
-                Some("provider_admission_enabled")
+                AuxiliaryCallGate::ProviderAdmissionEnabled
             } else {
-                None
+                AuxiliaryCallGate::Allowed
             }
         }
     }
 }
 
-fn auxiliary_llm_policy_label() -> &'static str {
-    AuxiliaryLlmPolicy::from_env().as_label()
+/// Capture Work admission separately from optional provider-capacity gating.
+pub(crate) fn resolve_work_admission_gate() -> WorkAdmissionGate {
+    match AuxiliaryLlmPolicy::from_env() {
+        AuxiliaryLlmPolicy::Disabled => WorkAdmissionGate::Disabled,
+        AuxiliaryLlmPolicy::BoundaryOnly | AuxiliaryLlmPolicy::CapacityAware => {
+            WorkAdmissionGate::BoundaryOnly
+        }
+        AuxiliaryLlmPolicy::Always => WorkAdmissionGate::Allowed,
+    }
 }
 
 /// Work admission is the semantic lifecycle classifier. The capacity-aware
@@ -1340,16 +1339,15 @@ fn auxiliary_llm_policy_label() -> &'static str {
 /// is settled before canonical admission. With no configured judge or no
 /// usable result, normal typed admission remains.
 fn should_skip_work_admission_judge(
+    gate: WorkAdmissionGate,
     admission_boundary: bool,
     topology_boundary: bool,
 ) -> Option<&'static str> {
-    match AuxiliaryLlmPolicy::from_env() {
-        AuxiliaryLlmPolicy::BoundaryOnly if admission_boundary || topology_boundary => None,
-        AuxiliaryLlmPolicy::BoundaryOnly => Some("ordinary_primary_turn"),
-        AuxiliaryLlmPolicy::Disabled => Some("disabled"),
-        AuxiliaryLlmPolicy::Always => None,
-        AuxiliaryLlmPolicy::CapacityAware if admission_boundary || topology_boundary => None,
-        AuxiliaryLlmPolicy::CapacityAware => Some("ordinary_primary_turn"),
+    match gate {
+        WorkAdmissionGate::BoundaryOnly if admission_boundary || topology_boundary => None,
+        WorkAdmissionGate::BoundaryOnly => Some("ordinary_primary_turn"),
+        WorkAdmissionGate::Disabled => Some("disabled"),
+        WorkAdmissionGate::Allowed => None,
     }
 }
 
@@ -2062,6 +2060,8 @@ fn mock_round_partial_text(error: &astra_core::ClassifiedError) -> Option<String
 
 #[derive(Clone, Debug)]
 struct ResolvedTurnLlmConfig {
+    context_budget: crate::prompts::ContextBudget,
+    memoria_config: astra_turn_types::context_execution::MemoriaCompactConfig,
     model_name: String,
     /// Upstream literal name to put in the request body's `model` field.
     /// `None` → send `model_name`. See `ResolvedActiveLlmModel::upstream_model_name`.
@@ -2124,6 +2124,7 @@ async fn try_resolve_same_owner_fallback(
     encryptor: &FernetTokenEncryptor,
     pool: Option<&sqlx::Pool<sqlx::MySql>>,
     credential_owner: &ResolvedTurnLlmConfig,
+    runtime_config: &astra_config::runtime_config::RuntimeConfig,
 ) -> FallbackOutcome<ResolvedTurnLlmConfig> {
     try_resolve_fallback(cooldown, chain, reason, |fallback_name| async move {
         let candidate = resolve_llm_model_for_turn(
@@ -2132,6 +2133,7 @@ async fn try_resolve_same_owner_fallback(
             Some(fallback_name.as_str()),
             pool,
             None,
+            runtime_config,
         )
         .await?;
         if !credential_owner.shares_credential_owner_with(&candidate) {
@@ -2627,6 +2629,27 @@ fn pending_work_admission_judge_for_test(
 
 struct SummaryClientSkillAutoRouteJudge {
     client: Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
+    last_status: Arc<std::sync::Mutex<Option<astra_services::SkillAutoRouteParseStatus>>>,
+}
+
+impl SummaryClientSkillAutoRouteJudge {
+    fn new(client: Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>) -> Self {
+        Self {
+            client,
+            last_status: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn last_invocation_identity(&self) -> Option<SummaryInvocationIdentity> {
+        self.client.last_invocation_identity()
+    }
+
+    fn last_status(&self) -> Option<astra_services::SkillAutoRouteParseStatus> {
+        *self
+            .last_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 const RESOLVED_TURN_LLM_CONFIG_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -2950,6 +2973,10 @@ impl SkillAutoRouteJudge for SummaryClientSkillAutoRouteJudge {
         &self,
         ctx: &astra_services::SkillAutoRouteJudgeContext,
     ) -> Result<Option<String>, SkillAutoRouteJudgeError> {
+        *self
+            .last_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let messages = astra_services::skill_auto_route_judge_messages(ctx)?;
         let response = self
             .client
@@ -2961,12 +2988,17 @@ impl SkillAutoRouteJudge for SummaryClientSkillAutoRouteJudge {
                 "skill judgment did not finish normally".into(),
             ));
         }
-        astra_services::parse_skill_auto_route_response(
+        let parsed = astra_services::parse_skill_auto_route_response_with_status(
             response.text.as_str(),
             ctx,
             &response.model_used,
             response.judgment_provenance,
-        )
+        )?;
+        *self
+            .last_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(parsed.status);
+        Ok(parsed.skill_name)
     }
 }
 
@@ -2988,12 +3020,41 @@ fn skill_auto_route_service_context(
     }
 }
 
+fn resolved_admitted_llm_config(
+    execution: &AdmittedModelExecution,
+    context_budget: crate::prompts::ContextBudget,
+) -> ResolvedTurnLlmConfig {
+    ResolvedTurnLlmConfig {
+        context_budget,
+        memoria_config: Default::default(),
+        model_name: execution.model_name.clone(),
+        wire_model_name: execution.wire_model_name.clone(),
+        api_key: execution.api_key.clone(),
+        base_url: execution.base_url.clone(),
+        provider: execution.provider.clone(),
+        cache_capability: crate::turn::llm::context::cache_capability_from_model_metadata(
+            execution.cache_capability,
+        ),
+        thinking_capability: execution.thinking_capability,
+        fixed_temperature: execution.fixed_temperature,
+        thinking_protocol: execution.thinking_protocol,
+        fallback_chain: Vec::new(),
+        header_overrides: execution.header_overrides.clone(),
+        request_body_overrides: execution.request_body_overrides.clone(),
+        completions_url_override: execution.completions_url_override.clone(),
+        request_timeout: execution.request_timeout_ms.map(Duration::from_millis),
+        context_window: execution.context_window,
+        max_completion_tokens: execution.max_completion_tokens,
+    }
+}
+
 async fn resolve_llm_model_for_turn(
     matrixone: &MatrixOneSettings,
     encryptor: &FernetTokenEncryptor,
     preferred_model: Option<&str>,
     pool: Option<&sqlx::Pool<sqlx::MySql>>,
     admitted_execution: Option<&astra_services::AdmittedModelExecution>,
+    runtime_config: &astra_config::runtime_config::RuntimeConfig,
 ) -> Result<ResolvedTurnLlmConfig, String> {
     if let Some(execution) = admitted_execution {
         if preferred_model.is_some_and(|preferred| preferred != execution.model_name) {
@@ -3001,31 +3062,27 @@ async fn resolve_llm_model_for_turn(
                 "model override does not match the Offering admitted for this run".to_string(),
             );
         }
-        return Ok(ResolvedTurnLlmConfig {
-            model_name: execution.model_name.clone(),
-            wire_model_name: execution.wire_model_name.clone(),
-            api_key: execution.api_key.clone(),
-            base_url: execution.base_url.clone(),
-            provider: execution.provider.clone(),
-            cache_capability: crate::turn::llm::context::cache_capability_from_model_metadata(
-                execution.cache_capability,
+        return Ok(resolved_admitted_llm_config(
+            execution,
+            crate::turn::execution_config::resolve_context_budget(
+                runtime_config,
+                execution.context_window,
+                execution.max_completion_tokens,
+                crate::prompts::CompactConfig::default(),
             ),
-            thinking_capability: execution.thinking_capability,
-            fixed_temperature: execution.fixed_temperature,
-            thinking_protocol: execution.thinking_protocol,
-            fallback_chain: Vec::new(),
-            header_overrides: execution.header_overrides.clone(),
-            request_body_overrides: execution.request_body_overrides.clone(),
-            completions_url_override: execution.completions_url_override.clone(),
-            request_timeout: execution.request_timeout_ms.map(Duration::from_millis),
-            context_window: execution.context_window,
-            max_completion_tokens: execution.max_completion_tokens,
-        });
+        ));
     }
     let resolved =
         astra_services::resolve_active_llm_model(matrixone, encryptor, preferred_model, pool)
             .await?;
     Ok(ResolvedTurnLlmConfig {
+        context_budget: crate::turn::execution_config::resolve_context_budget(
+            runtime_config,
+            resolved.context_window,
+            resolved.max_completion_tokens,
+            crate::prompts::CompactConfig::default(),
+        ),
+        memoria_config: Default::default(),
         model_name: resolved.model_name,
         wire_model_name: resolved.wire_model_name,
         api_key: resolved.api_key,
@@ -3828,6 +3885,8 @@ pub struct ServerAgenticLoopHost {
         Option<Arc<dyn crate::turn::llm::durable::InferenceLedgerPersistence>>,
     model_override: Option<String>,
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
+    llm_transport: Result<Arc<crate::turn::llm::client::LlmTransport>, String>,
+    execution_inputs: crate::turn::execution_config::PreparedExecutionInputs,
     inference_owner_pod_id: Option<String>,
     resolved_model_name: Option<String>,
     resolved_context_window: Option<u32>,
@@ -4214,6 +4273,11 @@ pub struct ServerAgenticLoopHost {
     /// the configured auxiliary LLM path; failure is non-fatal and leaves
     /// pre-routing disabled for that turn.
     skill_auto_route_judge: Option<Arc<dyn SkillAutoRouteJudge>>,
+    /// One durable classification for the evaluation Skill adapter. Normal
+    /// runs do not project this process-local value into evaluation evidence.
+    evaluation_judgment_outcome: Option<SkillAutoRouteJudgmentOutcome>,
+    /// Exact durable inference identity for the evaluation routing judgment.
+    evaluation_judgment_evidence: Option<SkillAutoRouteJudgmentEvidence>,
 }
 
 struct ExecutionHandoffContext {
@@ -6278,6 +6342,8 @@ pub struct ServerAgenticLoopHostBuilder {
         Option<Arc<dyn crate::turn::llm::durable::InferenceLedgerPersistence>>,
     model_override: Option<String>,
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
+    llm_transport: Result<Arc<crate::turn::llm::client::LlmTransport>, String>,
+    execution_inputs: Option<crate::turn::execution_config::PreparedExecutionInputs>,
     inference_owner_pod_id: Option<String>,
     execution_time_budget: Option<RunExecutionTimeBudget>,
     edge_tools: Vec<Value>,
@@ -6365,6 +6431,8 @@ impl ServerAgenticLoopHostBuilder {
             inference_ledger_persistence: None,
             model_override: None,
             admitted_model_execution: None,
+            llm_transport: crate::turn::llm::client::shared_llm_transport(),
+            execution_inputs: None,
             inference_owner_pod_id: None,
             execution_time_budget: None,
             edge_tools: Vec::new(),
@@ -6704,7 +6772,30 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
+    pub(crate) fn with_execution_inputs(
+        mut self,
+        execution_inputs: crate::turn::execution_config::PreparedExecutionInputs,
+    ) -> Self {
+        self.execution_inputs = Some(execution_inputs);
+        self
+    }
+
     pub fn build(self) -> ServerAgenticLoopHost {
+        let execution_inputs = self.execution_inputs.unwrap_or_else(|| {
+            crate::turn::execution_config::PreparedExecutionInputs::capture(
+                astra_config::runtime_config::RuntimeConfig::load(),
+                &self.user_id,
+                &self.session_id,
+            )
+        });
+        let (llm_transport, admitted_model_execution) = match &execution_inputs.policy {
+            PreparedExecutionPolicy::Normal(_) => {
+                (self.llm_transport, self.admitted_model_execution)
+            }
+            PreparedExecutionPolicy::Evaluation(frozen) => {
+                (Ok(frozen.transport.clone()), Some(frozen.admitted.clone()))
+            }
+        };
         // Compose the prompt-visible tool surface from provider declarations:
         // server-owned tools are always eligible when the server catalog is
         // enabled, while workspace/process tools require an explicit runtime
@@ -6877,21 +6968,38 @@ impl ServerAgenticLoopHostBuilder {
         // admitted schema in the activation catalog. Otherwise the schema is
         // visible and simultaneously absent from the deferred activation
         // scope, so `tool_search` cannot ever select it.
-        let server_tool_surface = crate::tool_registry::surface::ToolSurface::build(
-            server_catalog_tools.clone(),
-            &astra_config::runtime_config::RuntimeConfig::cached().tool_surface,
-            &[],
-        );
-        let mut server_visible_tools = server_tool_surface.always_load_schemas();
+        let (mut server_visible_tools, server_always_load_tool_names) =
+            match &execution_inputs.policy {
+                PreparedExecutionPolicy::Normal(runtime) => {
+                    let surface = crate::tool_registry::surface::ToolSurface::build(
+                        server_catalog_tools.clone(),
+                        &runtime.tool_surface,
+                        &[],
+                    );
+                    (
+                        surface.always_load_schemas(),
+                        surface
+                            .always_load_names()
+                            .into_iter()
+                            .filter(|name| !edge_profile_deferred_tool_names.contains(name))
+                            .collect::<HashSet<String>>(),
+                    )
+                }
+                PreparedExecutionPolicy::Evaluation(_) => {
+                    // Version-pinned instruction-only profile. Lifecycle
+                    // supplies a pinned resolver only for Skill trials;
+                    // normal readiness/allowlist checks hide it for Prompt trials.
+                    server_catalog_tools = vec![crate::turn::skill_tool::skill_tool_schema_v2()];
+                    (
+                        server_catalog_tools.clone(),
+                        HashSet::from([crate::turn::skill_tool::SKILL_TOOL_NAME.to_string()]),
+                    )
+                }
+            };
         server_visible_tools.retain(|schema| {
             tool_schema_name(schema)
                 .is_none_or(|name| !edge_profile_deferred_tool_names.contains(name))
         });
-        let server_always_load_tool_names: HashSet<String> = server_tool_surface
-            .always_load_names()
-            .into_iter()
-            .filter(|name| !edge_profile_deferred_tool_names.contains(name))
-            .collect();
         // Keep the full admitted catalog behind the stable carrier, including
         // tools whose ordinary shape is resident. A strict provider validates
         // a direct call against the compact resident schema, so a model that
@@ -7014,7 +7122,9 @@ impl ServerAgenticLoopHostBuilder {
             shared_pool: self.shared_pool,
             inference_ledger_persistence: self.inference_ledger_persistence,
             model_override: self.model_override,
-            admitted_model_execution: self.admitted_model_execution,
+            admitted_model_execution,
+            llm_transport,
+            execution_inputs,
             inference_owner_pod_id: self.inference_owner_pod_id,
             resolved_model_name: None,
             resolved_context_window: None,
@@ -7155,6 +7265,8 @@ impl ServerAgenticLoopHostBuilder {
                 .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(HashMap::new()))),
             turn_intent_judge: None,
             skill_auto_route_judge: None,
+            evaluation_judgment_outcome: None,
+            evaluation_judgment_evidence: None,
         }
     }
 
@@ -9040,14 +9152,16 @@ impl ServerAgenticLoopHost {
         {
             return false;
         }
-        if let Some(reason) =
-            should_skip_work_admission_judge(admission_boundary, topology_boundary)
-        {
+        if let Some(reason) = should_skip_work_admission_judge(
+            self.execution_inputs.work_admission_gate,
+            admission_boundary,
+            topology_boundary,
+        ) {
             // Disabled is not a NotRequired decision. Under Auto it means the
             // required semantic service is unavailable, so retain a terminal
             // admission fact for the action/completion gate. BoundaryOnly's
             // ordinary-turn skip remains Unchecked until a typed boundary.
-            if reason == "disabled" {
+            if self.execution_inputs.work_admission_gate == WorkAdmissionGate::Disabled {
                 self.work_admission_attempted = true;
                 self.work_admission_unavailable = true;
                 self.work_admission_unavailable_reason =
@@ -9059,7 +9173,7 @@ impl ServerAgenticLoopHost {
                 operation = "turn_intent.judge",
                 source = "work_admission_judge",
                 status = "skipped",
-                policy = auxiliary_llm_policy_label(),
+                policy = self.execution_inputs.work_admission_gate.as_str(),
                 reason,
                 "Work admission preflight skipped by capacity policy"
             );
@@ -11503,10 +11617,47 @@ impl ServerAgenticLoopHost {
         self.skill_auto_route_judge = Some(judge);
     }
 
+    fn record_evaluation_judgment_outcome(&mut self, outcome: SkillAutoRouteJudgmentOutcome) {
+        if matches!(
+            self.execution_inputs.policy,
+            PreparedExecutionPolicy::Evaluation(_)
+        ) && self.evaluation_judgment_outcome.is_none()
+        {
+            self.evaluation_judgment_outcome = Some(outcome);
+        }
+    }
+
+    fn take_evaluation_judgment_outcome(&mut self) -> Option<SkillAutoRouteJudgmentOutcome> {
+        self.evaluation_judgment_outcome.take()
+    }
+
+    fn record_evaluation_judgment_evidence(&mut self, evidence: SkillAutoRouteJudgmentEvidence) {
+        if matches!(
+            self.execution_inputs.policy,
+            PreparedExecutionPolicy::Evaluation(_)
+        ) && self.evaluation_judgment_evidence.is_none()
+        {
+            self.evaluation_judgment_evidence = Some(evidence);
+        }
+    }
+
+    fn take_evaluation_judgment_evidence(&mut self) -> Option<SkillAutoRouteJudgmentEvidence> {
+        self.evaluation_judgment_evidence.take()
+    }
+
     async fn resolve_llm_config_for_state(
         &mut self,
         state: &AgenticLoopState,
     ) -> Result<ResolvedTurnLlmConfig, String> {
+        if let PreparedExecutionPolicy::Evaluation(frozen) = &self.execution_inputs.policy {
+            if self
+                .model_override
+                .as_deref()
+                .is_some_and(|name| name != frozen.admitted.model_name)
+            {
+                return Err("model override differs from frozen evaluation model".into());
+            }
+        }
         self.revalidate_catalog_execution().await?;
         if let Some(config) = self.resolved_llm_config.as_ref() {
             if self.cached_llm_config_matches_state(state) {
@@ -11520,19 +11671,46 @@ impl ServerAgenticLoopHost {
             .effective_model_override_for_state(state)
             .map(ToString::to_string);
         let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
-        let llm_cfg = resolve_llm_model_for_turn(
-            &self.matrixone,
-            self.encryptor.as_ref(),
-            effective_model_override.as_deref(),
-            pool_ref,
-            self.admitted_model_execution.as_ref(),
-        )
-        .await?;
+        let llm_cfg = match &self.execution_inputs.policy {
+            PreparedExecutionPolicy::Normal(runtime) => {
+                resolve_llm_model_for_turn(
+                    &self.matrixone,
+                    self.encryptor.as_ref(),
+                    effective_model_override.as_deref(),
+                    pool_ref,
+                    self.admitted_model_execution.as_ref(),
+                    runtime,
+                )
+                .await?
+            }
+            PreparedExecutionPolicy::Evaluation(frozen) => {
+                let admitted = self
+                    .admitted_model_execution
+                    .as_ref()
+                    .ok_or_else(|| "frozen evaluation model admission missing".to_string())?;
+                if effective_model_override
+                    .as_deref()
+                    .is_some_and(|name| name != admitted.model_name)
+                {
+                    return Err("model override differs from frozen evaluation model".into());
+                }
+                resolved_admitted_llm_config(admitted, frozen.config.context_budget.clone())
+            }
+        };
         self.remember_resolved_llm_config(&llm_cfg);
         Ok(llm_cfg)
     }
 
     async fn revalidate_catalog_execution(&mut self) -> Result<(), String> {
+        if let PreparedExecutionPolicy::Evaluation(frozen) = &self.execution_inputs.policy {
+            let admitted = self
+                .admitted_model_execution
+                .as_ref()
+                .ok_or_else(|| "frozen evaluation model admission missing".to_string())?;
+            if admitted.freeze_projection(self.encryptor.as_ref())? != frozen.config.model {
+                return Err("admitted model differs from frozen evaluation model".into());
+            }
+        }
         let Some(admitted) = self.admitted_model_execution.as_ref() else {
             return Ok(());
         };
@@ -11566,6 +11744,11 @@ impl ServerAgenticLoopHost {
             astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
         )
         .map_err(|(_, body)| body.0.detail)?;
+        if let PreparedExecutionPolicy::Evaluation(frozen) = &self.execution_inputs.policy {
+            if execution.freeze_projection(self.encryptor.as_ref())? != frozen.config.model {
+                return Err("revalidated model differs from frozen evaluation model".into());
+            }
+        }
         self.admitted_model_execution = Some(execution);
         self.clear_resolved_llm_config();
         Ok(())
@@ -11636,6 +11819,9 @@ impl ServerAgenticLoopHost {
         &self,
         operation_id: &str,
     ) -> Result<ResolvedJudgmentRoute, JudgmentClientUnavailable> {
+        let PreparedExecutionPolicy::Normal(runtime) = &self.execution_inputs.policy else {
+            return Err(JudgmentClientUnavailable::DurableMaterialUnavailable);
+        };
         let Some(pool) = &self.shared_pool else {
             tracing::debug!(
                 operation_id,
@@ -11676,6 +11862,7 @@ impl ServerAgenticLoopHost {
             None,
             Some(pool.get()),
             Some(&execution),
+            runtime,
         )
         .await
         .map_err(|error| {
@@ -11694,6 +11881,7 @@ impl ServerAgenticLoopHost {
         operation_id: &str,
         max_output_tokens: usize,
         route: &ResolvedJudgmentRoute,
+        purpose: astra_turn_types::InferencePurpose,
         selection_identity: bool,
     ) -> Result<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>, JudgmentClientUnavailable>
     {
@@ -11717,7 +11905,9 @@ impl ServerAgenticLoopHost {
                 max_output_tokens,
                 state,
                 operation_id,
+                purpose,
                 Some(&route.execution),
+                None,
             )
             .ok_or(JudgmentClientUnavailable::DurableMaterialUnavailable)?;
         let client = if selection_identity {
@@ -11792,12 +11982,116 @@ impl ServerAgenticLoopHost {
         if let Some(client) = self.test_judgment_clients.pop_front() {
             return Ok(client);
         }
+        if let PreparedExecutionPolicy::Evaluation(frozen) = &self.execution_inputs.policy {
+            if operation_id == "request_judgment" {
+                let execution = frozen.admitted.clone();
+                if execution
+                    .max_completion_tokens
+                    .is_some_and(|cap| max_output_tokens > cap as usize)
+                {
+                    return Err(JudgmentClientUnavailable::OutputBudget);
+                }
+                let auxiliary_policy = frozen
+                    .config
+                    .auxiliary_policies
+                    .iter()
+                    .find(|policy| {
+                        policy.operation_id == operation_id
+                            && policy.purpose == astra_turn_types::InferencePurpose::Introspection
+                    })
+                    .cloned()
+                    .ok_or(JudgmentClientUnavailable::DurableMaterialUnavailable)?;
+                let route =
+                    resolved_admitted_llm_config(&execution, frozen.config.context_budget.clone());
+                return self
+                    .durable_summary_client_for_execution(
+                        &route,
+                        max_output_tokens,
+                        state,
+                        operation_id,
+                        astra_turn_types::InferencePurpose::Introspection,
+                        Some(&execution),
+                        Some(auxiliary_policy),
+                    )
+                    .map(|client| Box::new(client) as Box<_>)
+                    .ok_or(JudgmentClientUnavailable::DurableMaterialUnavailable);
+            }
+            if operation_id != "skill_auto_route" {
+                return Err(JudgmentClientUnavailable::DurableMaterialUnavailable);
+            }
+            let Some(astra_services::evaluation::FrozenSkillRoutingPolicy::Available {
+                model,
+                auxiliary_policy,
+                ..
+            }) = frozen.judgment_policy.as_ref()
+            else {
+                tracing::debug!(
+                    operation_id,
+                    "frozen evaluation judgment policy is unavailable; no inference dispatched"
+                );
+                return Err(JudgmentClientUnavailable::NoOffering);
+            };
+            let Some(model_service) = self.model_service.as_ref() else {
+                return Err(JudgmentClientUnavailable::RouteUnavailable);
+            };
+            let execution = model_service
+                .admit_model_offering(self.user_id.clone(), model.offering_id.clone())
+                .await
+                .map_err(|(_, _)| JudgmentClientUnavailable::RouteUnavailable)?;
+            if astra_services::models::validate_model_execution_purpose(
+                &execution,
+                astra_core::model_wire::purpose::ModelRequestPurpose::TypedJudgment,
+            )
+            .is_err()
+                || execution
+                    .freeze_projection(self.encryptor.as_ref())
+                    .ok()
+                    .as_ref()
+                    != Some(model.as_ref())
+            {
+                tracing::warn!(
+                    operation_id,
+                    offering_id = %model.offering_id,
+                    "frozen judgment Offering no longer matches the admitted route"
+                );
+                return Err(JudgmentClientUnavailable::RouteUnavailable);
+            }
+            if execution
+                .max_completion_tokens
+                .is_some_and(|cap| max_output_tokens > cap as usize)
+            {
+                tracing::warn!(
+                    operation_id,
+                    model_name = %execution.model_name,
+                    configured_max_completion_tokens = ?execution.max_completion_tokens,
+                    required_output_tokens = max_output_tokens,
+                    "frozen judgment route cannot emit a complete typed answer; no provider request dispatched"
+                );
+                return Err(JudgmentClientUnavailable::OutputBudget);
+            }
+            let route =
+                resolved_admitted_llm_config(&execution, frozen.config.context_budget.clone());
+            return self
+                .durable_summary_client_for_execution(
+                    &route,
+                    max_output_tokens,
+                    state,
+                    operation_id,
+                    astra_turn_types::InferencePurpose::Introspection,
+                    Some(&execution),
+                    Some(auxiliary_policy.clone()),
+                )
+                .map(|client| Box::new(client) as Box<_>)
+                .ok_or(JudgmentClientUnavailable::DurableMaterialUnavailable);
+        }
+
         let route = self.resolve_judgment_route(operation_id).await?;
         self.judgment_summary_client_for_route(
             state,
             operation_id,
             max_output_tokens,
             &route,
+            astra_turn_types::InferencePurpose::Introspection,
             selection_identity,
         )
     }
@@ -11812,15 +12106,6 @@ impl ServerAgenticLoopHost {
         if let Some(client) = self.test_judgment_clients.pop_front() {
             return Some(client);
         }
-        if self.resolved_llm_config.is_some() && !self.cached_llm_config_matches_state(state) {
-            self.clear_resolved_llm_config();
-        }
-        if let Some(config) = self.resolved_llm_config.as_ref() {
-            return self
-                .durable_summary_client(config, max_output_tokens, state, operation_id)
-                .map(|client| Box::new(client) as Box<_>);
-        }
-
         let llm_cfg = match self.resolve_llm_config_for_state(state).await {
             Ok(config) => config,
             Err(error) => {
@@ -11832,9 +12117,45 @@ impl ServerAgenticLoopHost {
                 return None;
             }
         };
-        self.remember_resolved_llm_config(&llm_cfg);
-        self.durable_summary_client(&llm_cfg, max_output_tokens, state, operation_id)
-            .map(|client| Box::new(client) as Box<_>)
+        self.durable_summary_client(
+            &llm_cfg,
+            max_output_tokens,
+            state,
+            operation_id,
+            astra_turn_types::InferencePurpose::Introspection,
+        )
+        .map(|client| Box::new(client) as Box<_>)
+    }
+
+    fn resolved_auxiliary_policy(
+        &self,
+        operation_id: &str,
+        max_output_tokens: usize,
+        purpose: astra_turn_types::InferencePurpose,
+        route: &OwnedLlmExecutionRoute,
+    ) -> Result<astra_turn_types::auxiliary_execution::AuxiliaryGenerationPolicy, String> {
+        match &self.execution_inputs.policy {
+            PreparedExecutionPolicy::Normal(_) => {
+                crate::turn::llm::summary_client::resolve_auxiliary_generation_policy(
+                    operation_id,
+                    max_output_tokens,
+                    purpose,
+                    route,
+                )
+            }
+            PreparedExecutionPolicy::Evaluation(frozen) => {
+                let mut matches = frozen.config.auxiliary_policies.iter().filter(|policy| {
+                    policy.operation_id == operation_id && policy.purpose == purpose
+                });
+                match (matches.next(), matches.next()) {
+                    (Some(policy), None) => Ok(policy.clone()),
+                    _ => Err(format!(
+                        "frozen auxiliary policy missing or ambiguous for {operation_id}/{}",
+                        purpose.as_str()
+                    )),
+                }
+            }
+        }
     }
 
     fn durable_summary_client(
@@ -11843,13 +12164,16 @@ impl ServerAgenticLoopHost {
         max_output_tokens: usize,
         state: &AgenticLoopState,
         operation_id: &str,
+        purpose: astra_turn_types::InferencePurpose,
     ) -> Option<RuntimeSummaryClient> {
         self.durable_summary_client_for_execution(
             config,
             max_output_tokens,
             state,
             operation_id,
+            purpose,
             self.admitted_model_execution.as_ref(),
+            None,
         )
     }
 
@@ -11859,7 +12183,9 @@ impl ServerAgenticLoopHost {
         max_output_tokens: usize,
         state: &AgenticLoopState,
         operation_id: &str,
+        purpose: astra_turn_types::InferencePurpose,
         execution: Option<&astra_services::AdmittedModelExecution>,
+        policy_override: Option<astra_turn_types::auxiliary_execution::AuxiliaryGenerationPolicy>,
     ) -> Option<RuntimeSummaryClient> {
         let authority = match self.inference_run_authority(state) {
             Ok(authority) => authority,
@@ -11914,9 +12240,22 @@ impl ServerAgenticLoopHost {
                 logical_attempt: 0,
             },
         };
-        Some(RuntimeSummaryClient::new_with_attempt_allocator(
-            config.execution_route(),
-            max_output_tokens,
+        let transport = match self.llm_transport.as_ref() {
+            Ok(transport) => transport.clone(),
+            Err(error) => {
+                tracing::warn!(operation_id, error = %error, "auxiliary inference transport unavailable");
+                return None;
+            }
+        };
+        let route = config.execution_route();
+        let policy = policy_override.map_or_else(
+            || self.resolved_auxiliary_policy(operation_id, max_output_tokens, purpose, &route),
+            Ok,
+        );
+        Some(RuntimeSummaryClient::new_with_resolved_policy(
+            transport,
+            route,
+            policy,
             ledger,
             scope,
             self.summary_attempt_allocator.clone(),
@@ -13837,7 +14176,11 @@ impl ServerAgenticLoopHost {
         let cache_cfg = match &self.mock_provider {
             Some((provider, model)) => {
                 self.resolved_model_name = Some(model.clone());
-                PromptCacheConfig::from_cache_capability(self.mock_cache_capability, provider)
+                PromptCacheConfig::from_captured_enablement(
+                    self.mock_cache_capability,
+                    provider,
+                    self.execution_inputs.prompt_cache_enabled,
+                )
             }
             None => PromptCacheConfig::default(),
         };
@@ -13901,6 +14244,13 @@ impl ServerAgenticLoopHost {
             request_timeout: None,
             context_window: None,
             max_completion_tokens: None,
+            context_budget: crate::turn::execution_config::resolve_context_budget(
+                &astra_config::runtime_config::RuntimeConfig::default(),
+                None,
+                None,
+                crate::prompts::CompactConfig::default(),
+            ),
+            memoria_config: Default::default(),
         };
         let wire_messages = self.assemble_llm_messages(
             system_msgs.clone(),
@@ -16644,6 +16994,7 @@ impl ServerAgenticLoopHost {
             args: args.clone(),
             workspace: self.workspace_binding.clone(),
             workspace_record: None,
+            evaluation_workspace: None,
             executor: self.executor_binding.clone(),
             runtime: self.runtime_binding.clone(),
             selected_offer: None,
@@ -16929,6 +17280,7 @@ impl ServerAgenticLoopHost {
                 args: args.clone(),
                 workspace: self.workspace_binding.clone(),
                 workspace_record: None,
+                evaluation_workspace: None,
                 executor: self.executor_binding.clone(),
                 runtime: self.runtime_binding.clone(),
                 selected_offer: None,
@@ -17231,7 +17583,12 @@ impl ServerAgenticLoopHost {
                 )
             })
             && !restricted_tools.contains("submit_task_resolution");
-        if !tools.is_empty() || reconciliation_active {
+        if (!tools.is_empty() || reconciliation_active)
+            && !matches!(
+                &self.execution_inputs.policy,
+                PreparedExecutionPolicy::Evaluation(_)
+            )
+        {
             // Keep the stable resident schemas contiguous. The carrier is
             // part of that stable prefix; dynamic schemas remain after it so
             // their per-turn churn cannot move the cache breakpoint.
@@ -17919,7 +18276,12 @@ impl ServerAgenticLoopHost {
             provider,
             model_name,
             model_context_window,
-            None,
+            &crate::turn::execution_config::resolve_context_budget(
+                &astra_config::runtime_config::RuntimeConfig::default(),
+                model_context_window,
+                None,
+                crate::prompts::CompactConfig::default(),
+            ),
             cache_capability,
             session_memory_entry,
             memory_entries,
@@ -17935,7 +18297,7 @@ impl ServerAgenticLoopHost {
         provider: &str,
         model_name: &str,
         model_context_window: Option<u32>,
-        model_max_completion_tokens: Option<u32>,
+        context_budget: &crate::prompts::ContextBudget,
         cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
         session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
         memory_entries: &[astra_turn_core::context_sources::MemoryEntry],
@@ -18007,7 +18369,17 @@ impl ServerAgenticLoopHost {
             model_name,
             model_context_window,
         );
-        let cache_cfg = PromptCacheConfig::from_cache_capability(cache_capability, provider);
+        let cache_cfg = PromptCacheConfig::from_captured_enablement(
+            cache_capability,
+            provider,
+            self.execution_inputs.prompt_cache_enabled,
+        );
+        // Checkpoint restoration does not serialize the compiled static cache.
+        // Seed it from this Run's captured input before assembly can read files.
+        if let Some(session) = state.pipeline_session.as_mut() {
+            session
+                .static_sections_or_init(|| self.execution_inputs.static_sections.as_ref().clone());
+        }
         crate::turn::llm::context::assemble_context_pipeline(
             crate::turn::llm::context::LlmContextAssemblyInput {
                 state,
@@ -18031,8 +18403,7 @@ impl ServerAgenticLoopHost {
                 cache_cfg: &cache_cfg,
                 provider,
                 model_name,
-                context_window: model_context_window,
-                max_completion_tokens: model_max_completion_tokens,
+                context_budget,
                 cache_capability,
                 user_content,
                 query_source: "agentic_loop",
@@ -18053,17 +18424,18 @@ impl ServerAgenticLoopHost {
         tier: CompactionTier,
         llm_cfg: &ResolvedTurnLlmConfig,
     ) -> crate::turn::cloud::compaction::CompactResult {
-        let compact_config = crate::prompts::CompactConfig::from_env();
         let summary_client = self.durable_summary_client(
             llm_cfg,
-            compact_config.summary_token_budget,
+            llm_cfg.context_budget.compact_config.summary_token_budget,
             state,
             "required_compaction",
+            astra_turn_types::InferencePurpose::RequiredCompaction,
         );
         let ctx = crate::turn::wire_assembly::MemoriaContext {
             session_id: &self.session_id,
-            model_name: &llm_cfg.model_name,
-            context_window: llm_cfg.context_window,
+            context_budget: &llm_cfg.context_budget,
+            memoria_config: &llm_cfg.memoria_config,
+            summary_prompt_templates: &self.execution_inputs.summary_templates,
             memoria_client: self.memoria_client.as_deref(),
             summary_client: summary_client
                 .as_ref()
@@ -18177,12 +18549,10 @@ impl ServerAgenticLoopHost {
                 &llm_cfg.provider,
                 llm_cfg.cache_capability,
             );
-            let candidate_status = crate::turn::wire_assembly::wire_budget_status_with_metadata(
+            let candidate_status = crate::turn::wire_assembly::wire_budget_status(
                 &wire_messages,
                 final_tools,
-                &llm_cfg.model_name,
-                llm_cfg.context_window,
-                llm_cfg.max_completion_tokens,
+                &llm_cfg.context_budget,
                 requested_output_tokens,
             );
             let available_output_tokens = candidate_status
@@ -18913,6 +19283,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         true // Server injects guidance into the system prompt in execute_turn.
     }
 
+    fn evaluation_midloop_guard_thresholds(&self) -> Option<(usize, usize)> {
+        match &self.execution_inputs.policy {
+            PreparedExecutionPolicy::Evaluation(frozen) => Some((
+                frozen.config.runtime.parallel_batching_force_streak as usize,
+                frozen.config.runtime.cache_waste_midloop_threshold as usize,
+            )),
+            PreparedExecutionPolicy::Normal(_) => None,
+        }
+    }
+
     fn requires_turn_intent_decision(&self) -> bool {
         // The built-in auxiliary admission judge is an optimization and a
         // typed Work projection, not the only authority capable of starting
@@ -18924,6 +19304,23 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // still opt in through the trait method (the lifecycle keeps that
         // fail-closed path for them).
         false
+    }
+
+    fn allows_skill_auto_route_without_turn_intent(&self) -> bool {
+        matches!(
+            &self.execution_inputs.policy,
+            PreparedExecutionPolicy::Evaluation(_)
+        )
+    }
+
+    fn take_skill_auto_route_judgment_outcome(&mut self) -> Option<SkillAutoRouteJudgmentOutcome> {
+        self.take_evaluation_judgment_outcome()
+    }
+
+    fn take_skill_auto_route_judgment_evidence(
+        &mut self,
+    ) -> Option<SkillAutoRouteJudgmentEvidence> {
+        self.take_evaluation_judgment_evidence()
     }
 
     fn on_turn_started(&mut self, state: &AgenticLoopState) {
@@ -19397,6 +19794,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         state: &AgenticLoopState,
         ctx: SkillAutoRouteJudgeContext<'_>,
     ) -> Option<SkillAutoRouteDecision> {
+        let evaluation = matches!(
+            &self.execution_inputs.policy,
+            PreparedExecutionPolicy::Evaluation(_)
+        );
         if self.skill_auto_route_policy == SkillAutoRouteExecutionPolicy::Disabled {
             tracing::info!(
                 target: "astra::skill_auto_route_judge",
@@ -19404,38 +19805,122 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 status = "disabled",
                 "skill auto-route skipped by request policy"
             );
+            if evaluation {
+                self.record_evaluation_judgment_outcome(SkillAutoRouteJudgmentOutcome::Disabled);
+            }
             return None;
         }
         if ctx.query.trim().is_empty() || ctx.visible_skills.is_empty() {
+            if evaluation {
+                self.record_evaluation_judgment_outcome(
+                    SkillAutoRouteJudgmentOutcome::NotDispatched {
+                        reason: "empty_query_or_catalog".to_string(),
+                    },
+                );
+            }
             return None;
         }
         let service_ctx = skill_auto_route_service_context(ctx);
 
-        let judged = if let Some(judge) = self.skill_auto_route_judge.as_ref() {
+        let injected_judge = match &self.execution_inputs.policy {
+            PreparedExecutionPolicy::Normal(_) => self.skill_auto_route_judge.as_ref(),
+            // Evaluation judgment must use the exact frozen Offering. Test or
+            // runtime injection cannot replace the experiment's decision
+            // function without changing its identity.
+            PreparedExecutionPolicy::Evaluation(_) => None,
+        };
+        let request_fingerprint = if evaluation {
+            match astra_services::skill_auto_route_judgment_request_fingerprint(&service_ctx) {
+                Ok(fingerprint) => Some(fingerprint),
+                Err(error) => {
+                    tracing::warn!(%error, "invalid skill judgment input; no inference dispatched");
+                    self.record_evaluation_judgment_outcome(
+                        SkillAutoRouteJudgmentOutcome::NotDispatched {
+                            reason: "invalid_request".to_string(),
+                        },
+                    );
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+        let mut parsed_status = None;
+        let judged = if let Some(judge) = injected_judge {
             judge.judge(&service_ctx).await
         } else {
-            if let Some(reason) = should_skip_auxiliary_llm_for_capacity() {
+            if self.execution_inputs.pre_turn_compaction_gate != AuxiliaryCallGate::Allowed {
                 tracing::debug!(
                     target: "astra::skill_auto_route_judge",
-                    policy = auxiliary_llm_policy_label(),
-                    reason,
+                    policy = self.execution_inputs.pre_turn_compaction_gate.as_str(),
+                    reason = self.execution_inputs.pre_turn_compaction_gate.as_str(),
                     "skill auto-route judge skipped by capacity policy"
                 );
+                if evaluation {
+                    self.record_evaluation_judgment_outcome(
+                        SkillAutoRouteJudgmentOutcome::NotDispatched {
+                            reason: "capacity_policy".to_string(),
+                        },
+                    );
+                }
                 return None;
             }
             let request = match astra_services::skill_auto_route_judgment_request(&service_ctx) {
                 Ok(request) => request,
                 Err(error) => {
                     tracing::warn!(%error, "invalid skill judgment input; no inference dispatched");
+                    if evaluation {
+                        self.record_evaluation_judgment_outcome(
+                            SkillAutoRouteJudgmentOutcome::NotDispatched {
+                                reason: "invalid_request".to_string(),
+                            },
+                        );
+                    }
                     return None;
                 }
             };
-            let client = self
+            let client = match self
                 .judgment_summary_client(state, "skill_auto_route", &request)
                 .await
-                .ok()?;
-            let judge = SummaryClientSkillAutoRouteJudge { client };
-            judge.judge(&service_ctx).await
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    if evaluation {
+                        self.record_evaluation_judgment_outcome(
+                            SkillAutoRouteJudgmentOutcome::NotDispatched {
+                                reason: match error {
+                                    JudgmentClientUnavailable::NoOffering => "no_offering",
+                                    JudgmentClientUnavailable::InvalidRequest => "invalid_request",
+                                    JudgmentClientUnavailable::OutputBudget => "output_budget",
+                                    JudgmentClientUnavailable::RouteUnavailable => {
+                                        "route_unavailable"
+                                    }
+                                    JudgmentClientUnavailable::DurableMaterialUnavailable => {
+                                        "durable_material_unavailable"
+                                    }
+                                }
+                                .to_string(),
+                            },
+                        );
+                    }
+                    return None;
+                }
+            };
+            let judge = SummaryClientSkillAutoRouteJudge::new(client);
+            let judged = judge.judge(&service_ctx).await;
+            if let (true, Some(request_fingerprint), Some(identity)) = (
+                evaluation,
+                request_fingerprint,
+                judge.last_invocation_identity(),
+            ) {
+                self.record_evaluation_judgment_evidence(SkillAutoRouteJudgmentEvidence {
+                    invocation_id: identity.invocation_id,
+                    logical_attempt: identity.logical_attempt,
+                    request_fingerprint,
+                });
+            }
+            parsed_status = judge.last_status();
+            judged
         };
 
         match judged {
@@ -19445,15 +19930,39 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     skill_name,
                     "skill auto-route judged"
                 );
+                if evaluation {
+                    self.record_evaluation_judgment_outcome(
+                        SkillAutoRouteJudgmentOutcome::Selected {
+                            skill_name: skill_name.clone(),
+                        },
+                    );
+                }
                 Some(SkillAutoRouteDecision { skill_name })
             }
-            Ok(None) => None,
+            Ok(None) => {
+                if evaluation {
+                    self.record_evaluation_judgment_outcome(match parsed_status {
+                        Some(astra_services::SkillAutoRouteParseStatus::Uncertain) => {
+                            SkillAutoRouteJudgmentOutcome::Uncertain
+                        }
+                        _ => SkillAutoRouteJudgmentOutcome::Negative,
+                    });
+                }
+                None
+            }
             Err(error) => {
                 tracing::warn!(
                     target: "astra::skill_auto_route_judge",
                     error = %error,
                     "skill auto-route judge unavailable; proceeding without pre-route"
                 );
+                if evaluation {
+                    self.record_evaluation_judgment_outcome(
+                        SkillAutoRouteJudgmentOutcome::Failed {
+                            reason: "provider_or_decode_failure".to_string(),
+                        },
+                    );
+                }
                 None
             }
         }
@@ -19800,6 +20309,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             return Err(error);
         }
 
+        let transport = self.llm_transport.clone().map_err(|error| {
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, error)
+        })?;
+
         // ── 1. Resolve LLM model ────────────────────────────────────────
         let mut llm_cfg = match self.resolve_llm_config_for_state(state).await {
             Ok(m) => m,
@@ -19849,6 +20362,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 let mx = &self.matrixone;
                 let enc = self.encryptor.as_ref();
                 let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
+                let PreparedExecutionPolicy::Normal(runtime) = &self.execution_inputs.policy else {
+                    return Err(astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        "frozen evaluation cannot switch to a fallback model".to_string(),
+                    ));
+                };
                 match try_resolve_same_owner_fallback(
                     cooldown,
                     &fallback_chain,
@@ -19857,6 +20376,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     enc,
                     pool_ref,
                     &credential_owner,
+                    runtime,
                 )
                 .await
                 {
@@ -20001,8 +20521,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
         // Latch prompt cache config from provider info (once per turn is fine;
         // provider doesn't change within a turn).
-        let cache_cfg =
-            PromptCacheConfig::from_cache_capability(llm_cfg.cache_capability, &llm_cfg.provider);
+        let cache_cfg = PromptCacheConfig::from_captured_enablement(
+            llm_cfg.cache_capability,
+            &llm_cfg.provider,
+            self.execution_inputs.prompt_cache_enabled,
+        );
         self.remember_resolved_llm_config(&llm_cfg);
 
         // ── 2b. Run the context pipeline ─────────────────────────────────
@@ -20035,7 +20558,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &llm_cfg.provider,
             &llm_cfg.model_name,
             llm_cfg.context_window,
-            llm_cfg.max_completion_tokens,
+            &llm_cfg.context_budget,
             llm_cfg.cache_capability,
             initial_session_memory_entry.clone(),
             &memoria_prefetch_entries,
@@ -20118,14 +20641,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &compact_result,
             &compaction_fixed_context,
             context_tool_surface,
-            Some(
-                crate::prompts::budget_for_model_with_metadata(
-                    Some(&llm_cfg.model_name),
-                    llm_cfg.context_window,
-                    llm_cfg.max_completion_tokens,
-                )
-                .window_policy(),
-            ),
+            Some(llm_cfg.context_budget.window_policy()),
         )
         .into_iter()
         .collect::<Vec<_>>();
@@ -20147,7 +20663,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     &llm_cfg.provider,
                     &llm_cfg.model_name,
                     llm_cfg.context_window,
-                    llm_cfg.max_completion_tokens,
+                    &llm_cfg.context_budget,
                     llm_cfg.cache_capability,
                     session_memory_entry,
                     memory_entries,
@@ -20260,12 +20776,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &mut compacted_messages,
             compact_result.boundary.is_some(),
         );
-        let budget = crate::prompts::budget_for_model_with_metadata(
-            Some(&llm_cfg.model_name),
-            llm_cfg.context_window,
-            llm_cfg.max_completion_tokens,
-        );
-        let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
+        let max_output_tokens = llm_cfg.context_budget.capped_output_tokens();
         // Tool annotations are part of the same provider-visible schema
         // surface used by the final budget owner below.
         crate::turn::llm::context::annotate_tool_schemas_for_cache(
@@ -20351,22 +20862,18 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         crate::turn::llm::context::WireTraceDetail::MetricsOnly
                     },
                 );
-                crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget_and_metadata(
+                crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget(
                     trace,
                     &provider_budget_messages,
                     &final_tools,
-                    &llm_cfg.model_name,
-                    llm_cfg.context_window,
-                    llm_cfg.max_completion_tokens,
+                    &llm_cfg.context_budget,
                     max_output_tokens,
                 )
             } else {
-                crate::turn::wire_assembly::wire_budget_status_with_metadata(
+                crate::turn::wire_assembly::wire_budget_status(
                     &provider_budget_messages,
                     &final_tools,
-                    &llm_cfg.model_name,
-                    llm_cfg.context_window,
-                    llm_cfg.max_completion_tokens,
+                    &llm_cfg.context_budget,
                     max_output_tokens,
                 )
             };
@@ -20452,8 +20959,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             std::mem::take(&mut state.provider_adaptation.force_next_thinking_off);
         let provider_attempt_boundary =
             ProviderAttemptBoundary::new(force_provider_convergence, use_no_tool_choice);
+        let base_thinking = match &self.execution_inputs.policy {
+            PreparedExecutionPolicy::Normal(_) => &state.thinking,
+            PreparedExecutionPolicy::Evaluation(frozen) => &frozen.config.primary_thinking,
+        };
         let primary_thinking = primary_thinking_for_attempt(
-            &state.thinking,
+            base_thinking,
             canonical_work_establishment_pending,
             final_answer_settlement_text_only,
             provider_attempt_boundary,
@@ -20611,6 +21122,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             &operation_id,
                             output_budget,
                             route,
+                            astra_turn_types::InferencePurpose::ToolResultRerank,
                             true,
                         )
                     } else {
@@ -21419,6 +21931,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     };
                     let execution_route = llm_cfg.execution_route();
                     let call = LlmCall {
+                        transport: &transport,
                         purpose: state.inference_purpose,
                         messages: attempt_llm_messages,
                         tools: &final_tools,
@@ -22678,11 +23191,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         {
             return None;
         }
-        if let Some(reason) = should_skip_auxiliary_llm_for_capacity() {
+        if self.execution_inputs.pre_turn_compaction_gate != AuxiliaryCallGate::Allowed {
             tracing::debug!(
                 target: "astra::pre_turn_compaction",
-                policy = auxiliary_llm_policy_label(),
-                reason,
+                policy = self.execution_inputs.pre_turn_compaction_gate.as_str(),
+                reason = self.execution_inputs.pre_turn_compaction_gate.as_str(),
                 "pre-turn LLM compaction skipped by capacity policy"
             );
             return None;
@@ -22723,7 +23236,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &config.provider,
             &config.model_name,
             config.context_window,
-            config.max_completion_tokens,
+            &config.context_budget,
             Some(cache_capability),
             None,
             &[],
@@ -22749,7 +23262,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             state.sticky_tool_schemas.clone()
         };
         let client = self
-            .durable_summary_client(&config, 4096, state, "pre_turn_compaction")?
+            .durable_summary_client(
+                &config,
+                4096,
+                state,
+                "pre_turn_compaction",
+                astra_turn_types::InferencePurpose::RequiredCompaction,
+            )?
             .with_prompt_cache_context(summary_tools, cache_capability);
         let spill_count = pre_turn_summary_spill_count(&state.messages);
         if spill_count == 0 {
@@ -22774,6 +23293,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 astra_turn_core::cloud_summary::InlineSummaryHistoryProjection::Semantic
             },
             &client,
+            &self.execution_inputs.summary_templates,
         )
         .await
         {
@@ -24767,6 +25287,14 @@ mod tests {
                 execution_topology: None,
             },
         );
+        state.skills.execution.adopted.insert(
+            "personal-review".into(),
+            crate::turn::agentic_loop::host::AdoptedSkillRevision {
+                version_id: "frozen-v1".into(),
+                content_hash: "frozen-hash".into(),
+                content_markdown: "USER_ADOPTED_REVIEW_INSTRUCTIONS".into(),
+            },
+        );
         for index in 0..10 {
             state.messages.push(json!({
                 "role": "user",
@@ -24778,8 +25306,16 @@ mod tests {
             }));
         }
         let mut llm_cfg = summary_test_config(String::new());
-        llm_cfg.context_window = Some(4_000);
-        llm_cfg.max_completion_tokens = Some(256);
+        let context_window = Some(2_000);
+        let max_completion_tokens = Some(256);
+        llm_cfg.context_window = context_window;
+        llm_cfg.max_completion_tokens = max_completion_tokens;
+        llm_cfg.context_budget = crate::turn::execution_config::resolve_context_budget(
+            &astra_config::runtime_config::RuntimeConfig::default(),
+            context_window,
+            max_completion_tokens,
+            crate::prompts::CompactConfig::default(),
+        );
 
         let (wire, _output_tokens, boundary) = host
             .assemble_llm_messages_with_final_budget(
@@ -24812,6 +25348,14 @@ mod tests {
             "the rebuilt candidate must carry one bounded skill recovery attachment"
         );
         assert!(message_text(skill_attachments[0]).contains("review instructions"));
+        let full_wire = wire.iter().map(message_text).collect::<Vec<_>>().join("\n");
+        assert_eq!(
+            full_wire
+                .matches("USER_ADOPTED_REVIEW_INSTRUCTIONS")
+                .count(),
+            1
+        );
+        assert!(full_wire.contains("Version: frozen-v1\nContent hash: frozen-hash"));
     }
 
     #[test]
@@ -25960,15 +26504,13 @@ mod tests {
             ),
         ] {
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let judge = SummaryClientSkillAutoRouteJudge {
-                client: Box::new(SequencedSummaryClient {
-                    provenance,
-                    responses: std::sync::Mutex::new(std::collections::VecDeque::from([
-                        raw.to_string()
-                    ])),
-                    requests: requests.clone(),
-                }),
-            };
+            let judge = SummaryClientSkillAutoRouteJudge::new(Box::new(SequencedSummaryClient {
+                provenance,
+                responses: std::sync::Mutex::new(std::collections::VecDeque::from([
+                    raw.to_string()
+                ])),
+                requests: requests.clone(),
+            }));
             assert_eq!(
                 judge.judge(&ctx).await.unwrap().as_deref(),
                 Some("review-changes")
@@ -25998,8 +26540,8 @@ mod tests {
         for (is_ptl_error, finish_reason) in
             [(false, Some("length")), (true, Some("stop")), (false, None)]
         {
-            let judge = SummaryClientSkillAutoRouteJudge {
-                client: Box::new(UsageSequencedSummaryClient {
+            let judge =
+                SummaryClientSkillAutoRouteJudge::new(Box::new(UsageSequencedSummaryClient {
                     responses: std::sync::Mutex::new(std::collections::VecDeque::from([Ok(
                         astra_turn_core::cloud_summary::SummaryResponse {
                             judgment_provenance: Some(
@@ -26013,8 +26555,7 @@ mod tests {
                             execution: None,
                         },
                     )])),
-                }),
-            };
+                }));
             assert!(matches!(
                 judge.judge(&ctx).await,
                 Err(SkillAutoRouteJudgeError::Rejected(_))
@@ -28653,6 +29194,13 @@ mod tests {
             request_timeout: None,
             context_window: None,
             max_completion_tokens: None,
+            context_budget: crate::turn::execution_config::resolve_context_budget(
+                &astra_config::runtime_config::RuntimeConfig::default(),
+                None,
+                None,
+                crate::prompts::CompactConfig::default(),
+            ),
+            memoria_config: Default::default(),
         }
     }
 
@@ -36852,6 +37400,13 @@ mod tests {
             request_timeout: None,
             context_window: None,
             max_completion_tokens: None,
+            context_budget: crate::turn::execution_config::resolve_context_budget(
+                &astra_config::runtime_config::RuntimeConfig::default(),
+                None,
+                None,
+                crate::prompts::CompactConfig::default(),
+            ),
+            memoria_config: Default::default(),
         };
         let msgs = host
             .assemble_llm_messages(
@@ -46348,6 +46903,7 @@ mod tests {
             Some("gpt-5-mini"),
             None,
             Some(&execution),
+            &astra_config::runtime_config::RuntimeConfig::default(),
         )
         .await
         .expect("resolve admitted execution");
@@ -46385,6 +46941,7 @@ mod tests {
             None,
             None,
             Some(&execution),
+            &astra_config::runtime_config::RuntimeConfig::default(),
         )
         .await
         .expect("resolve admitted execution");
@@ -46410,6 +46967,7 @@ mod tests {
                 thinking_capability: None,
                 context_window: Some(64_000),
                 max_completion_tokens: Some(8_192),
+                pricing: None,
                 request_headers: Some(serde_json::Map::from_iter([(
                     "x-provider-mode".to_string(),
                     Value::String("coding".to_string()),
@@ -46419,19 +46977,156 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn frozen_host_consumes_exact_inputs_and_rejects_model_drift() {
+        use crate::turn::execution_config::PreparedExecutionInputs;
+        use astra_turn_types::InferencePurpose;
+
+        let encryptor = mock_encryptor();
+        let admitted = test_gateway_execution("https://provider.example/v1", Some(15_000));
+        let mut frozen = PreparedExecutionInputs::freeze_for_prepare(
+            &admitted,
+            encryptor.as_ref(),
+            "case",
+            "Explain this concept",
+        )
+        .unwrap();
+        frozen.context_budget = crate::prompts::ContextBudget::resolve(
+            Some(128_000),
+            Some(8_000),
+            0.61,
+            9,
+            4_000,
+            crate::prompts::CompactConfig::default(),
+        );
+        let policy = frozen
+            .auxiliary_policies
+            .iter_mut()
+            .find(|policy| policy.operation_id == "pre_turn_compaction")
+            .unwrap();
+        policy.max_output_tokens = 733;
+        let expected_policy = policy.clone();
+        let inputs = PreparedExecutionInputs::from_frozen(
+            &frozen,
+            &admitted,
+            encryptor.as_ref(),
+            "case",
+            None,
+        )
+        .unwrap();
+        let PreparedExecutionPolicy::Evaluation(material) = &inputs.policy else {
+            unreachable!()
+        };
+        let expected_transport = material.transport.clone();
+        let mut host =
+            ServerAgenticLoopHostBuilder::new(mock_matrixone(), encryptor, "u".into(), "s".into())
+                .with_execution_inputs(inputs)
+                .build();
+        assert!(Arc::ptr_eq(
+            host.llm_transport.as_ref().unwrap(),
+            &expected_transport
+        ));
+        let mut state = create_test_state();
+        let judgment = astra_services::work_admission_classification_request(&Default::default());
+        assert!(matches!(
+            host.judgment_summary_client(&state, "request_judgment", &judgment)
+                .await,
+            Err(JudgmentClientUnavailable::DurableMaterialUnavailable)
+        ));
+        let config = host.resolve_llm_config_for_state(&state).await.unwrap();
+        assert_eq!(config.context_budget, frozen.context_budget);
+        assert!(config.fallback_chain.is_empty());
+        let mut route = config.execution_route();
+        // A late resolver would reject this invalid temperature. The frozen
+        // consumer must use the exact previously checked policy instead.
+        route.fixed_temperature = Some(f64::NAN);
+        assert_eq!(
+            host.resolved_auxiliary_policy(
+                "pre_turn_compaction",
+                4096,
+                InferencePurpose::RequiredCompaction,
+                &route,
+            )
+            .unwrap(),
+            expected_policy
+        );
+        assert!(
+            host.resolved_auxiliary_policy(
+                "pre_turn_compaction",
+                4096,
+                InferencePurpose::Introspection,
+                &route,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            host.tool_schemas
+                .iter()
+                .filter_map(tool_schema_name)
+                .collect::<Vec<_>>(),
+            vec![crate::turn::skill_tool::SKILL_TOOL_NAME],
+            "the fixed Evaluation profile must retain the instruction adapter"
+        );
+        host.tool_schemas
+            .push(json!({"type":"function","function":{"name":"bash"}}));
+        assert!(host.visible_turn_tools(&mut state).is_empty());
+        state.skills.resolver = Some(Arc::new(ListedSkillResolver));
+        assert_eq!(
+            host.visible_turn_tools(&mut state)
+                .iter()
+                .filter_map(tool_schema_name)
+                .collect::<Vec<_>>(),
+            vec![crate::turn::skill_tool::SKILL_TOOL_NAME],
+            "a Skill resolver enables only the direct adapter, not bash or invoke_tool"
+        );
+        state
+            .restricted_tools
+            .insert(crate::turn::skill_tool::SKILL_TOOL_NAME.into());
+        assert!(
+            host.visible_turn_tools(&mut state).is_empty(),
+            "explicit restrictions remain authoritative"
+        );
+        host.admitted_model_execution.as_mut().unwrap().api_key = "rotated-secret".into();
+        host.revalidate_catalog_execution().await.unwrap();
+        host.admitted_model_execution
+            .as_mut()
+            .unwrap()
+            .wire_model_name = Some("different-model".into());
+        assert!(
+            host.revalidate_catalog_execution()
+                .await
+                .unwrap_err()
+                .contains("frozen evaluation")
+        );
+        host.model_override = Some("different-model".into());
+        assert!(
+            host.resolve_llm_config_for_state(&state)
+                .await
+                .unwrap_err()
+                .contains("model override")
+        );
+    }
+
+    #[tokio::test]
     async fn admitted_offering_material_drives_turn_without_model_name_resolution() {
         let execution = AdmittedModelExecution::from_offering(admitted_test_offering())
             .expect("valid Offering material");
+        let mut runtime_config = astra_config::runtime_config::RuntimeConfig::default();
+        runtime_config.compression.compression_threshold = 0.6;
+        runtime_config.compression.preserve_recent_turns = 9;
         let resolved = resolve_llm_model_for_turn(
             &mock_matrixone(),
             mock_encryptor().as_ref(),
             Some("catalog-model"),
             None,
             Some(&execution),
+            &runtime_config,
         )
         .await
         .expect("admitted material should not require a database lookup");
 
+        assert_eq!(resolved.context_budget.compact_threshold, 0.6);
+        assert_eq!(resolved.context_budget.keep_recent_turns, 9);
         assert_eq!(resolved.model_name, "catalog-model");
         assert_eq!(resolved.wire_model_name.as_deref(), Some("upstream-model"));
         assert_eq!(resolved.api_key, "provider-secret");
@@ -46459,6 +47154,7 @@ mod tests {
             None,
             None,
             Some(&execution),
+            &astra_config::runtime_config::RuntimeConfig::default(),
         )
         .await
         .expect("resolve credential owner");
@@ -46614,6 +47310,7 @@ mod tests {
             Some("other-model"),
             None,
             Some(&execution),
+            &astra_config::runtime_config::RuntimeConfig::default(),
         )
         .await;
 
@@ -48146,6 +48843,7 @@ mod tests {
         forwarded.insert("authorization".to_string(), "Bearer moi-token".to_string());
         forwarded.insert("x-workspace-id".to_string(), "ws-001".to_string());
         let client = RuntimeSummaryClient::new_direct_for_test(
+            Arc::new(crate::turn::llm::client::test_llm_transport()),
             OwnedLlmExecutionRoute {
                 model_name: "gpt-4o-mini".to_string(),
                 wire_model_name: None,
@@ -48161,6 +48859,7 @@ mod tests {
                 request_timeout: Some(Duration::from_secs(2)),
             },
             128,
+            astra_turn_types::InferencePurpose::RequiredCompaction,
         );
 
         let response = client
@@ -48319,6 +49018,20 @@ mod tests {
             "session-inline".to_string(),
         )
         .build();
+        assert_eq!(
+            host.execution_inputs.pre_turn_compaction_gate,
+            AuxiliaryCallGate::ProviderAdmissionEnabled
+        );
+        let _changed_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
+        assert_eq!(
+            resolve_optional_auxiliary_call_gate(),
+            AuxiliaryCallGate::Allowed
+        );
+        assert_eq!(
+            host.execution_inputs.pre_turn_compaction_gate,
+            AuxiliaryCallGate::ProviderAdmissionEnabled,
+            "ambient changes must not replace the captured optional-call gate"
+        );
         host.resolved_llm_config = Some(summary_test_config(format!("http://{addr}/gateway")));
 
         let mut state = create_test_state();
@@ -50479,6 +51192,47 @@ mod tests {
 
         #[test]
         fn auxiliary_llm_capacity_policy_parser_is_stable() {
+            for gate in [
+                WorkAdmissionGate::Allowed,
+                WorkAdmissionGate::Disabled,
+                WorkAdmissionGate::BoundaryOnly,
+            ] {
+                let encoded = serde_json::to_value(gate).unwrap();
+                assert_eq!(encoded, json!(gate.as_str()));
+                assert_eq!(
+                    serde_json::from_value::<WorkAdmissionGate>(encoded).unwrap(),
+                    gate
+                );
+            }
+            for invalid in [
+                json!(null),
+                json!("always"),
+                json!("boundary-only"),
+                json!("provider_admission_enabled"),
+            ] {
+                assert!(serde_json::from_value::<WorkAdmissionGate>(invalid).is_err());
+            }
+            for gate in [
+                AuxiliaryCallGate::Allowed,
+                AuxiliaryCallGate::Disabled,
+                AuxiliaryCallGate::BoundaryOnly,
+                AuxiliaryCallGate::ProviderAdmissionEnabled,
+            ] {
+                let encoded = serde_json::to_value(gate).unwrap();
+                assert_eq!(encoded, json!(gate.as_str()));
+                assert_eq!(
+                    serde_json::from_value::<AuxiliaryCallGate>(encoded).unwrap(),
+                    gate
+                );
+            }
+            for invalid in [
+                json!(null),
+                json!("always"),
+                json!("boundary-only"),
+                json!("Allowed"),
+            ] {
+                assert!(serde_json::from_value::<AuxiliaryCallGate>(invalid).is_err());
+            }
             assert_eq!(
                 parse_auxiliary_llm_policy("always"),
                 AuxiliaryLlmPolicy::Always
@@ -50508,16 +51262,26 @@ mod tests {
             let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
 
             assert_eq!(
+                resolve_optional_auxiliary_call_gate(),
+                AuxiliaryCallGate::Allowed
+            );
+            assert_eq!(
                 AuxiliaryLlmPolicy::from_env(),
                 AuxiliaryLlmPolicy::CapacityAware
             );
             assert_eq!(
-                should_skip_work_admission_judge(false, false),
+                should_skip_work_admission_judge(resolve_work_admission_gate(), false, false),
                 Some("ordinary_primary_turn"),
-                "the default must not speculate beside an ordinary primary turn"
+                "default policy waits for an admission or topology boundary"
             );
-            assert_eq!(should_skip_work_admission_judge(true, false), None);
-            assert_eq!(should_skip_work_admission_judge(true, true), None);
+            assert_eq!(
+                should_skip_work_admission_judge(resolve_work_admission_gate(), true, false),
+                None
+            );
+            assert_eq!(
+                should_skip_work_admission_judge(resolve_work_admission_gate(), true, true),
+                None
+            );
         }
 
         #[test]
@@ -50533,12 +51297,36 @@ mod tests {
         fn boundary_only_is_an_explicit_latency_opt_out() {
             let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "boundary_only");
 
+            let host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u".into(),
+                "s".into(),
+            )
+            .build();
+            let captured = host.execution_inputs.work_admission_gate;
+            assert_eq!(captured, WorkAdmissionGate::BoundaryOnly);
+
             assert_eq!(
-                should_skip_work_admission_judge(false, false),
+                resolve_optional_auxiliary_call_gate(),
+                AuxiliaryCallGate::BoundaryOnly
+            );
+            assert_eq!(
+                should_skip_work_admission_judge(resolve_work_admission_gate(), false, false),
                 Some("ordinary_primary_turn")
             );
-            assert_eq!(should_skip_work_admission_judge(true, false), None);
-            assert_eq!(should_skip_work_admission_judge(false, true), None);
+            assert_eq!(
+                should_skip_work_admission_judge(captured, true, false),
+                None
+            );
+            let _changed = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "disabled");
+            assert_eq!(resolve_work_admission_gate(), WorkAdmissionGate::Disabled);
+            assert_eq!(host.execution_inputs.work_admission_gate, captured);
+            assert_eq!(
+                should_skip_work_admission_judge(captured, false, false),
+                Some("ordinary_primary_turn")
+            );
+            assert_eq!(should_skip_work_admission_judge(captured, true, true), None);
         }
 
         #[test]
@@ -50549,21 +51337,31 @@ mod tests {
             let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
 
             assert_eq!(
-                should_skip_work_admission_judge(false, false),
-                Some("ordinary_primary_turn"),
-                "capacity-aware Work admission must wait for an existing boundary"
+                resolve_optional_auxiliary_call_gate(),
+                AuxiliaryCallGate::ProviderAdmissionEnabled
             );
-            assert_eq!(should_skip_work_admission_judge(true, false), None);
             assert_eq!(
-                should_skip_work_admission_judge(true, true),
+                should_skip_work_admission_judge(resolve_work_admission_gate(), false, false),
+                Some("ordinary_primary_turn"),
+                "provider quota does not create a Work admission boundary"
+            );
+            assert_eq!(
+                should_skip_work_admission_judge(resolve_work_admission_gate(), true, false),
+                None
+            );
+            assert_eq!(
+                should_skip_work_admission_judge(resolve_work_admission_gate(), true, true),
                 None,
                 "fanout remains one of the structural ambiguities the Work judge resolves"
             );
-            assert_eq!(should_skip_work_admission_judge(false, true), None);
+            assert_eq!(
+                should_skip_work_admission_judge(resolve_work_admission_gate(), false, true),
+                None
+            );
 
             let _disabled = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "disabled");
             assert_eq!(
-                should_skip_work_admission_judge(true, true),
+                should_skip_work_admission_judge(resolve_work_admission_gate(), true, true),
                 Some("disabled")
             );
         }

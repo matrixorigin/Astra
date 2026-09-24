@@ -22,7 +22,7 @@ use super::tool_execution_binding::{
 };
 use super::tool_route_selection::ToolExecutionRouteKind;
 
-const DECISION_CONTRACT_VERSION: &str = "tool-dispatch-decision-v5";
+const DECISION_CONTRACT_VERSION: &str = "tool-dispatch-decision-v6";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) struct ToolInvocationDecisionSnapshot {
@@ -30,6 +30,8 @@ pub(crate) struct ToolInvocationDecisionSnapshot {
     pub tool: DurableToolReference,
     pub route: ToolExecutionRouteKind,
     pub workspace: InvocationWorkspaceSnapshot,
+    pub evaluation_workspace:
+        Option<astra_services::evaluation::workspace_evidence::EvaluationWorkspaceMaterialization>,
     pub executor: InvocationExecutorSnapshot,
     pub runtime: Option<InvocationRuntimeSnapshot>,
     pub selected_offer: Option<SelectedToolOfferSnapshot>,
@@ -170,7 +172,9 @@ impl ToolInvocationDecisionSnapshot {
         transport_policy.semantic_read_freshness = None;
         transport_policy.semantic_read_condition = None;
 
+        validate_evaluation_request(request)?;
         Ok(Self {
+            evaluation_workspace: request.evaluation_workspace.clone(),
             contract_version: DECISION_CONTRACT_VERSION.to_string(),
             tool,
             route,
@@ -226,6 +230,16 @@ impl ToolInvocationDecisionSnapshot {
             runtime_edge_dispatch_authorization_required: request
                 .runtime_edge_dispatch_authorization_required,
         })
+    }
+
+    pub(crate) fn validate_evaluation_binding(
+        &self,
+        request: &ToolExecutionRequest,
+    ) -> Result<(), ToolInvocationDecisionError> {
+        if self.evaluation_workspace != request.evaluation_workspace {
+            return Err(ToolInvocationDecisionError::EvaluationAllocationMismatch);
+        }
+        validate_evaluation_request(request)
     }
 
     pub(crate) fn decision_id(&self) -> Result<String, ToolInvocationDecisionError> {
@@ -302,6 +316,7 @@ impl ToolInvocationDecisionSnapshot {
     /// execution authority; every route/policy/identity-bearing field comes
     /// from the durable decision.
     pub(crate) fn apply_to_request(&self, request: &mut ToolExecutionRequest) {
+        request.evaluation_workspace = self.evaluation_workspace.clone();
         request.workspace.kind = self.workspace.kind;
         request.workspace.cwd = self.workspace.cwd.clone();
         request.workspace.authority = self.workspace.authority;
@@ -430,8 +445,30 @@ fn resolve_semantic_read_cache_decision(
         }
     }
 }
+fn validate_evaluation_request(
+    request: &ToolExecutionRequest,
+) -> Result<(), ToolInvocationDecisionError> {
+    if let Some(workspace) = &request.evaluation_workspace {
+        let allocation = &workspace.allocation;
+        if allocation.validate().is_err()
+            || allocation.owner_user_id != request.user_id
+            || allocation.session_id != request.session_id
+            || allocation.run_id != request.run_id
+            || request.workspace.kind != WorkspaceBindingKind::EdgeWorkspace
+            || request.executor.kind != ExecutorBindingKind::EdgeAgent
+            || request.workspace.cwd.as_deref() != Some(allocation.workspace_dir.as_str())
+            || request.executor.executor_id != workspace.edge_executor_id
+        {
+            return Err(ToolInvocationDecisionError::EvaluationAllocationMismatch);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum ToolInvocationDecisionError {
+    #[error("evaluation allocation does not match the admitted invocation or its frozen decision")]
+    EvaluationAllocationMismatch,
     #[error("tool '{tool_name}' has no exact provider descriptor or built-in registry contract")]
     MissingToolContract { tool_name: String },
     #[error("provider tool '{tool_name}' has no selected provider offer")]
@@ -555,6 +592,84 @@ mod tests {
             semantic_cache,
         ));
         request
+    }
+
+    #[test]
+    fn evaluation_decision_binds_allocation_across_durable_replay() {
+        let mut request = request();
+        request.workspace = super::super::tool_execution_binding::WorkspaceBinding::edge_workspace(
+            "evaluation",
+            "/workspace",
+            WorkspaceAuthority::ReadWrite,
+        );
+        request.executor = super::super::tool_execution_binding::ExecutorBinding::edge_agent(
+            "edge",
+            "evaluation",
+            ToolTransportKind::EdgeWs,
+            astra_runtime_env::ExecutorStatus::Online,
+        );
+        request.evaluation_workspace = Some(
+            astra_services::evaluation::workspace_evidence::EvaluationWorkspaceMaterialization {
+                schema_version: 1,
+                experiment_id: "experiment".into(),
+                trial_id: "trial".into(),
+                run_generation: 0,
+                spec_fingerprint: "d".repeat(64),
+                edge_executor_id: request.executor.executor_id.clone(),
+                connection_generation: 1,
+                allocation: astra_runtime_env::EvaluationAllocationReceipt {
+                    schema_version: 1,
+                    allocation_id: "allocation".into(),
+                    owner_user_id: request.user_id.clone(),
+                    session_id: request.session_id.clone(),
+                    run_id: request.run_id.clone(),
+                    deployment_id: "deployment".into(),
+                    materialization_id: "materialization".into(),
+                    workspace_dir: "/workspace".into(),
+                    source_commit: "a".repeat(40),
+                    source_tree: "b".repeat(40),
+                    confinement_fingerprint: format!("sha256:{}", "c".repeat(64)),
+                },
+            },
+        );
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let decision = ToolInvocationDecisionSnapshot::resolve(
+            &request,
+            ToolExecutionRouteKind::EdgeBound,
+            &registry,
+        )
+        .unwrap();
+        let restored =
+            ToolInvocationDecisionSnapshot::from_durable(&decision.durable().unwrap()).unwrap();
+        restored.validate_evaluation_binding(&request).unwrap();
+        request
+            .evaluation_workspace
+            .as_mut()
+            .unwrap()
+            .allocation
+            .allocation_id = "replacement".into();
+        assert!(restored.validate_evaluation_binding(&request).is_err());
+        let replacement = ToolInvocationDecisionSnapshot::resolve(
+            &request,
+            ToolExecutionRouteKind::EdgeBound,
+            &registry,
+        )
+        .unwrap();
+        assert_ne!(
+            restored.decision_id().unwrap(),
+            replacement.decision_id().unwrap()
+        );
+        request.run_id = "another-run".into();
+        assert!(
+            ToolInvocationDecisionSnapshot::resolve(
+                &request,
+                ToolExecutionRouteKind::EdgeBound,
+                &registry,
+            )
+            .is_err()
+        );
+        request.evaluation_workspace = None;
+        assert!(restored.validate_evaluation_binding(&request).is_err());
     }
 
     #[test]

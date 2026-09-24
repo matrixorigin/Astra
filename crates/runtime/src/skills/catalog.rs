@@ -238,6 +238,7 @@ fn skill_source_label(source: &SkillSourceKind) -> &'static str {
 
 fn skill_list_item_from_manifest(manifest: astra_skills::manifest::SkillManifest) -> SkillListItem {
     SkillListItem {
+        is_owned: false,
         skill_id: manifest.name.clone(),
         skill_name: manifest.name,
         version: manifest.version.to_string(),

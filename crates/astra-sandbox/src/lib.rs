@@ -36,7 +36,8 @@ pub use policy::{
 pub use process_isolation::{
     BashInvocationOwner, CgroupGuard, InvocationSupervisor, IsolatedOutput, IsolationConfig,
     ScopeOwnership, ScopeSettlement, apply_cgroup, apply_process_scope, execute_isolated,
-    execute_isolated_with_cancel, invocation_supervisor_is_requested, process_scope_available,
+    execute_isolated_with_cancel, execute_isolated_with_cancel_supervised,
+    invocation_supervisor_is_requested, process_scope_available,
     run_invocation_supervisor_if_requested,
 };
 pub use shell_hardening::{
@@ -54,3 +55,18 @@ pub use workspace_inspection::{
 
 mod sync_process;
 pub use sync_process::{SyncProcessError, SyncProcessOutput, run_sync_process};
+
+mod shell_process_boundary;
+pub use shell_process_boundary::ShellProcessBoundary;
+
+#[cfg(target_os = "linux")]
+mod linux_shell_boundary;
+#[cfg(target_os = "linux")]
+mod shell_seccomp;
+#[cfg(target_os = "linux")]
+pub use linux_shell_boundary::{ShellLaunchPlan, ShellLaunchReceipt};
+
+#[cfg(target_os = "linux")]
+pub use process_isolation::{
+    ConfinedOutput, ShellConfinementEvidence, execute_confined_with_cancel,
+};

@@ -437,6 +437,11 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         control_plane("rollback_session_state", ToolLoadPolicy::Deferred),
         control_plane("session", ToolLoadPolicy::Deferred),
         control_plane("skill", ToolLoadPolicy::AlwaysLoad),
+        // Authoring is a standard discoverable service, but it is not a
+        // first-round primitive. Keep the resident prefix small; the model
+        // can select it through tool_search when the user's goal calls for
+        // Skill creation or improvement.
+        authoring_service("skill_creator", ToolLoadPolicy::Deferred),
         work_coordinator_control_plane("start_work", ToolLoadPolicy::AlwaysLoad),
         // This is intentionally distinct from the generic `agent` surface:
         // it selects and starts one canonical Work item from durable state.
@@ -1389,6 +1394,21 @@ fn server_service(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     }
 }
 
+fn authoring_service(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
+    ToolSpec {
+        name: name.to_string(),
+        load_policy,
+        effect: ToolEffect {
+            mutates_external_state: true,
+            ..ToolEffect::none()
+        },
+        required: ToolRequirements {
+            work_execution_role: WorkExecutionRole::Coordinator,
+            ..ToolRequirements::service_executor()
+        },
+    }
+}
+
 fn shared_network(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
@@ -1686,6 +1706,24 @@ mod tests {
         }
         assert!(registry.permits_work_execution_role("web_fetch", false));
         assert!(registry.permits_work_execution_role("web_fetch", true));
+    }
+
+    #[test]
+    fn skill_creator_is_a_coordinator_owned_server_service() {
+        let registry = registry();
+        let skill_creator = registry.get("skill_creator").expect("skill_creator");
+        assert_eq!(skill_creator.load_policy, ToolLoadPolicy::Deferred);
+        assert_eq!(
+            skill_creator.required.executor,
+            RequiredExecutor::ServiceExecutor
+        );
+        assert_eq!(
+            skill_creator.required.work_execution_role,
+            WorkExecutionRole::Coordinator
+        );
+        assert!(skill_creator.effect.mutates_external_state);
+        assert!(registry.permits_work_execution_role("skill_creator", false));
+        assert!(!registry.permits_work_execution_role("skill_creator", true));
     }
 
     #[test]

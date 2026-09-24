@@ -1,0 +1,861 @@
+//! Generic evidence and comparison primitives for controlled evaluations.
+//!
+//! This module deliberately has no Skill, prompt, provider, or runner
+//! knowledge.  It records what an evaluation observed and what it could not
+//! observe.  Product-specific candidate builders and durable trial schedulers
+//! should use these types instead of inventing a second report format.
+
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+
+use super::experiment::ExperimentSpec;
+
+pub const ASSESSMENT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    Context,
+    Trace,
+    Journal,
+    Artifact,
+    Assessment,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceAvailability {
+    Available,
+    Missing,
+    Redacted,
+    Revoked,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceRef {
+    pub evidence_id: String,
+    pub kind: EvidenceKind,
+    pub availability: EvidenceAvailability,
+    pub content_hash: Option<String>,
+    pub locator: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeasurementStatus {
+    Observed,
+    Missing,
+    Unavailable,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Measurement {
+    pub name: String,
+    pub value: Option<f64>,
+    pub unit: String,
+    pub status: MeasurementStatus,
+    pub basis: Option<String>,
+}
+
+impl Measurement {
+    /// An observed zero is a fact; an absent value is never an observation.
+    pub fn validate_value_status(&self) -> Result<(), String> {
+        match (&self.status, self.value) {
+            (MeasurementStatus::Observed, Some(value)) if value.is_finite() => Ok(()),
+            (MeasurementStatus::Observed, _) => Err(format!(
+                "observed measurement {} must have a finite value",
+                self.name
+            )),
+            (_, None) => Ok(()),
+            (_, Some(_)) => Err(format!(
+                "non-observed measurement {} must not have a value",
+                self.name
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonArm {
+    Baseline,
+    Candidate,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrialStatus {
+    Completed,
+    Failed,
+    Cancelled,
+    TimedOut,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgmentExecutionStatus {
+    Disabled,
+    Unavailable,
+    NotDispatched,
+    Negative,
+    Uncertain,
+    Selected,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JudgmentExecutionObservation {
+    pub operation_id: String,
+    pub status: JudgmentExecutionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrialObservation {
+    pub experiment_fingerprint: String,
+    pub trial_id: String,
+    pub case_id: String,
+    pub arm: ComparisonArm,
+    pub repetition: u32,
+    pub status: TrialStatus,
+    pub measurements: Vec<Measurement>,
+    pub evidence: Vec<EvidenceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judgment: Option<JudgmentExecutionObservation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CausalStrength {
+    Unknown,
+    PairedSupport,
+    MechanismSupported,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComparisonReport {
+    pub schema_version: u32,
+    pub spec_fingerprint: Option<String>,
+    pub baseline_label: String,
+    pub candidate_label: String,
+    /// Number of cases in the frozen plan, or observed cases for the
+    /// unbound internal helper.
+    pub case_count: usize,
+    pub observed_case_count: usize,
+    pub paired_case_count: usize,
+    pub paired_trial_pair_count: usize,
+    pub planned_trial_count: usize,
+    pub observed_trial_count: usize,
+    pub missing_trial_ids: Vec<String>,
+    pub status_counts: BTreeMap<String, usize>,
+    /// Per-trial observations are retained so metrics and evidence cannot be
+    /// mistaken for one another after aggregation.
+    pub observations: Vec<TrialObservation>,
+    pub causal_strength: CausalStrength,
+    pub unavailable: Vec<String>,
+    pub conclusion: String,
+}
+
+/// Build a report without dropping failures, cancellations, unknown usage, or
+/// unavailable evidence.  A report with no complete baseline/candidate pair is
+/// explicitly evidence-incomplete and cannot claim an improvement.
+fn build_comparison(
+    baseline_label: impl Into<String>,
+    candidate_label: impl Into<String>,
+    observations: &[TrialObservation],
+) -> ComparisonReport {
+    let observations = observations.to_vec();
+    let mut cases = BTreeMap::<String, BTreeSet<ComparisonArm>>::new();
+    let mut case_repetitions = BTreeMap::<(String, u32), BTreeSet<ComparisonArm>>::new();
+    let mut status_counts = BTreeMap::new();
+    for observation in &observations {
+        cases
+            .entry(observation.case_id.clone())
+            .or_default()
+            .insert(observation.arm.clone());
+        case_repetitions
+            .entry((observation.case_id.clone(), observation.repetition))
+            .or_default()
+            .insert(observation.arm.clone());
+        *status_counts
+            .entry(format!("{:?}", observation.status).to_ascii_lowercase())
+            .or_insert(0) += 1;
+    }
+    let paired_trial_pair_count = case_repetitions
+        .values()
+        .filter(|arms| {
+            arms.contains(&ComparisonArm::Baseline) && arms.contains(&ComparisonArm::Candidate)
+        })
+        .count();
+    let paired_case_count = case_repetitions
+        .iter()
+        .filter(|(_, arms)| {
+            arms.contains(&ComparisonArm::Baseline) && arms.contains(&ComparisonArm::Candidate)
+        })
+        .map(|((case_id, _), _)| case_id)
+        .collect::<BTreeSet<_>>()
+        .len();
+    let mut unavailable = observations
+        .iter()
+        .filter(|observation| !matches!(observation.status, TrialStatus::Completed))
+        .map(|observation| {
+            format!(
+                "trial {} has status {:?}",
+                observation.trial_id, observation.status
+            )
+        })
+        .collect::<Vec<_>>();
+    for observation in &observations {
+        if observation.measurements.is_empty() {
+            unavailable.push(format!(
+                "trial {} has no measurements",
+                observation.trial_id
+            ));
+        }
+        if observation.evidence.is_empty() {
+            unavailable.push(format!(
+                "trial {} has no evidence references",
+                observation.trial_id
+            ));
+        }
+    }
+    // Arm presence is not evidence of a controlled comparison.  The durable
+    // trial controller must prove frozen inputs, isolation, ordering, and
+    // verifier integrity before a stronger causal classification is allowed.
+    let causal_strength = CausalStrength::Unknown;
+    let conclusion = if paired_case_count == 0 {
+        "No complete baseline/candidate case pair is available; do not claim an improvement."
+            .to_string()
+    } else if !unavailable.is_empty() {
+        "Paired observations exist, but non-completed, unavailable or unknown trials limit the conclusion."
+            .to_string()
+    } else {
+        "Both arms are present for at least one case; controlled comparability has not been proven."
+            .to_string()
+    };
+    ComparisonReport {
+        schema_version: ASSESSMENT_SCHEMA_VERSION,
+        spec_fingerprint: None,
+        baseline_label: baseline_label.into(),
+        candidate_label: candidate_label.into(),
+        case_count: cases.len(),
+        observed_case_count: cases.len(),
+        paired_case_count,
+        paired_trial_pair_count,
+        planned_trial_count: observations.len(),
+        observed_trial_count: observations.len(),
+        missing_trial_ids: Vec::new(),
+        status_counts,
+        observations,
+        causal_strength,
+        unavailable,
+        conclusion,
+    }
+}
+
+/// Assess observations against the exact frozen plan. This is the pure
+/// contract the durable executor will call after settling runs.
+pub fn build_comparison_for_plan(
+    spec: &ExperimentSpec,
+    baseline_label: impl Into<String>,
+    candidate_label: impl Into<String>,
+    observations: &[TrialObservation],
+) -> Result<ComparisonReport, String> {
+    let planned = spec.plan_trials()?;
+    let fingerprint = spec.spec_fingerprint()?;
+    let expected = planned
+        .iter()
+        .map(|trial| (trial.trial_id.as_str(), trial))
+        .collect::<BTreeMap<_, _>>();
+    let mut accepted = BTreeMap::<&str, TrialObservation>::new();
+    for observation in observations {
+        for measurement in &observation.measurements {
+            measurement.validate_value_status()?;
+        }
+        if observation.experiment_fingerprint != fingerprint {
+            return Err(format!(
+                "trial {} has fingerprint {}, expected {}",
+                observation.trial_id, observation.experiment_fingerprint, fingerprint
+            ));
+        }
+        let trial = expected.get(observation.trial_id.as_str()).ok_or_else(|| {
+            format!(
+                "observation references unknown trial {}",
+                observation.trial_id
+            )
+        })?;
+        if trial.case_id != observation.case_id
+            || trial.arm != observation.arm
+            || trial.repetition != observation.repetition
+        {
+            return Err(format!(
+                "observation {} does not match its planned case, arm, or repetition",
+                observation.trial_id
+            ));
+        }
+        if let Some(previous) = accepted.get(observation.trial_id.as_str()) {
+            if *previous != *observation {
+                return Err(format!(
+                    "trial {} has conflicting duplicate observations",
+                    observation.trial_id
+                ));
+            }
+            continue;
+        }
+        accepted.insert(observation.trial_id.as_str(), observation.clone());
+    }
+    let accepted = accepted.into_values().collect::<Vec<_>>();
+    let mut report = build_comparison(baseline_label, candidate_label, &accepted);
+    let observed_ids = accepted
+        .iter()
+        .map(|observation| observation.trial_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let missing_trial_ids = planned
+        .iter()
+        .filter(|trial| !observed_ids.contains(trial.trial_id.as_str()))
+        .map(|trial| trial.trial_id.clone())
+        .collect::<Vec<_>>();
+    report.spec_fingerprint = Some(fingerprint);
+    report.case_count = spec.cases.len();
+    report.observed_case_count = accepted
+        .iter()
+        .map(|observation| observation.case_id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    report.planned_trial_count = planned.len();
+    report.observed_trial_count = accepted.len();
+    report.missing_trial_ids = missing_trial_ids.clone();
+    report.unavailable.extend(
+        missing_trial_ids
+            .iter()
+            .map(|trial_id| format!("planned trial {trial_id} has no observation")),
+    );
+    if !report.missing_trial_ids.is_empty() {
+        report.conclusion = if report.observed_trial_count == 0 {
+            "No planned trial has an observation; do not claim an improvement.".to_string()
+        } else {
+            "The comparison is partial because planned trials have no observation; do not claim a complete improvement."
+                .to_string()
+        };
+    }
+    Ok(report)
+}
+
+// Keep comparisons within a frozen case and repetition; never average away
+// failed trials or silently compare different units.
+fn render_metric_comparisons(
+    report: &ComparisonReport,
+    incomplete_metrics: &BTreeSet<(&str, &str)>,
+    output: &mut String,
+) {
+    let mut pairs = BTreeMap::new();
+    for observation in &report.observations {
+        pairs
+            .entry((&observation.case_id, observation.repetition))
+            .or_insert_with(BTreeMap::new)
+            .insert(&observation.arm, observation);
+    }
+    output.push_str("\n## Measured comparisons\n\nDelta is candidate minus baseline, not a quality verdict. Missing values are not zero. Costs are estimated trial costs, excluding Skill authoring.\n");
+    for ((case_id, repetition), arms) in pairs {
+        let baseline = arms.get(&ComparisonArm::Baseline);
+        let candidate = arms.get(&ComparisonArm::Candidate);
+        output.push_str(&format!(
+            "\n### {} · repetition {repetition}\n\n| Metric (unit) | Baseline | Candidate | Delta |\n| --- | ---: | ---: | ---: |\n",
+            markdown_cell(case_id)
+        ));
+        let status = |trial: Option<&&TrialObservation>| {
+            trial.map_or_else(
+                || "Missing".to_string(),
+                |trial| format!("{:?}", trial.status),
+            )
+        };
+        output.push_str(&format!(
+            "| Trial status | {} | {} | — |\n",
+            status(baseline),
+            status(candidate)
+        ));
+        let metrics: BTreeSet<_> = arms
+            .values()
+            .flat_map(|trial| {
+                trial
+                    .measurements
+                    .iter()
+                    .map(|m| (m.name != "task_success", &m.name, &m.unit))
+            })
+            .collect();
+        for (_, name, unit) in metrics {
+            let [before, after] = [baseline, candidate].map(|trial| {
+                trial.and_then(|trial| {
+                    trial
+                        .measurements
+                        .iter()
+                        .find(|m| &m.name == name && &m.unit == unit)
+                })
+            });
+            let value = |measurement: Option<&Measurement>| {
+                measurement
+                    .filter(|m| m.status == MeasurementStatus::Observed)
+                    .and_then(|m| m.value)
+                    .filter(|value| value.is_finite())
+            };
+            let [before_incomplete, after_incomplete] = [baseline, candidate].map(|trial| {
+                trial.is_some_and(|trial| {
+                    incomplete_metrics.contains(&(trial.trial_id.as_str(), name.as_str()))
+                })
+            });
+            let cell =
+                |measurement: Option<&Measurement>, incomplete: bool| match value(measurement) {
+                    Some(value) if incomplete => format!("{value} (coverage incomplete)"),
+                    Some(value) => value.to_string(),
+                    None => measurement
+                        .map_or_else(|| "Missing".to_string(), |m| format!("{:?}", m.status)),
+                };
+            let delta = match (value(before), value(after)) {
+                (Some(before), Some(after))
+                    if !before_incomplete && !after_incomplete && (after - before).is_finite() =>
+                {
+                    format!("{:+}", after - before)
+                }
+                _ => "—".to_string(),
+            };
+            output.push_str(&format!(
+                "| {} ({}) | {} | {} | {} |\n",
+                markdown_cell(name),
+                markdown_cell(unit),
+                cell(before, before_incomplete),
+                cell(after, after_incomplete),
+                delta
+            ));
+        }
+    }
+}
+
+fn markdown_cell(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace(['\r', '\n'], " ")
+}
+
+/// Render the same structured report for Markdown or a terminal preview.
+pub fn render_markdown(
+    report: &ComparisonReport,
+    incomplete_metrics: &BTreeSet<(&str, &str)>,
+) -> String {
+    let mut output = format!(
+        "# Evaluation comparison\n\nBaseline: `{}`  \nCandidate: `{}`  \nCases: {} planned, {} observed (paired: {} cases / {} trial pairs)  \nTrials: {} / {} observed\n\n",
+        report.baseline_label,
+        report.candidate_label,
+        report.case_count,
+        report.observed_case_count,
+        report.paired_case_count,
+        report.paired_trial_pair_count,
+        report.observed_trial_count,
+        report.planned_trial_count
+    );
+    output.push_str("## Trial outcomes\n\n");
+    for (status, count) in &report.status_counts {
+        output.push_str(&format!("- {status}: {count}\n"));
+    }
+    output.push_str("\n## Conclusion\n\n");
+    output.push_str(&report.conclusion);
+    output.push_str(&format!(
+        "\nCausal strength: `{:?}`\n",
+        report.causal_strength
+    ));
+    if !report.unavailable.is_empty() {
+        output.push_str("\n## Unavailable\n\n");
+        for item in &report.unavailable {
+            output.push_str(&format!("- {item}\n"));
+        }
+    }
+    render_metric_comparisons(report, incomplete_metrics, &mut output);
+    output.push_str("\n## Trials and evidence\n\n");
+    for observation in &report.observations {
+        output.push_str(&format!(
+            "### `{}` · {} · {:?} · {:?} · repetition {}\n\n",
+            observation.trial_id,
+            observation.case_id,
+            observation.arm,
+            observation.status,
+            observation.repetition
+        ));
+        for measurement in &observation.measurements {
+            output.push_str(&format!(
+                "- measurement `{}`: {:?} {} ({:?})\n",
+                measurement.name, measurement.value, measurement.unit, measurement.status
+            ));
+            if let Some(basis) = &measurement.basis {
+                output.push_str(&format!("  - basis: {}\n", markdown_cell(basis)));
+            }
+        }
+        for item in &observation.evidence {
+            output.push_str(&format!(
+                "- evidence `{}` ({:?}, {:?})\n",
+                item.evidence_id, item.kind, item.availability
+            ));
+            if let Some(locator) = &item.locator {
+                output.push_str(&format!("  - reference: {}\n", markdown_cell(locator)));
+            }
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::evaluation::experiment::{
+        DataIsolation, EXPERIMENT_SCHEMA_VERSION, EvaluationBudget, EvaluationCase,
+        EvaluationTarget, EvaluationTargetKind, ExperimentSpec, FrozenConditions, MemoryIsolation,
+        RevisionRef, TrialOrder, TrialUnit,
+    };
+
+    fn observation(case_id: &str, arm: ComparisonArm, status: TrialStatus) -> TrialObservation {
+        TrialObservation {
+            experiment_fingerprint: "sha256:test".to_string(),
+            trial_id: format!("{case_id}-{arm:?}"),
+            case_id: case_id.to_string(),
+            arm,
+            repetition: 0,
+            status,
+            measurements: vec![Measurement {
+                name: "tokens".to_string(),
+                value: None,
+                unit: "tokens".to_string(),
+                status: MeasurementStatus::Missing,
+                basis: None,
+            }],
+            evidence: vec![EvidenceRef {
+                evidence_id: format!("evidence-{case_id}"),
+                kind: EvidenceKind::Trace,
+                availability: EvidenceAvailability::Available,
+                content_hash: None,
+                locator: Some(case_id.to_string()),
+            }],
+            judgment: None,
+        }
+    }
+
+    #[test]
+    fn keeps_failures_and_unknowns_in_the_report() {
+        let report = build_comparison(
+            "baseline",
+            "candidate",
+            &[
+                observation("case-1", ComparisonArm::Baseline, TrialStatus::Failed),
+                observation("case-1", ComparisonArm::Candidate, TrialStatus::Completed),
+                observation("case-2", ComparisonArm::Baseline, TrialStatus::Unknown),
+            ],
+        );
+        assert_eq!(report.status_counts.get("failed"), Some(&1));
+        assert_eq!(report.status_counts.get("unknown"), Some(&1));
+        assert_eq!(report.paired_case_count, 1);
+        assert_eq!(report.paired_trial_pair_count, 1);
+        assert!(report.conclusion.contains("unavailable or unknown"));
+        assert_eq!(report.causal_strength, CausalStrength::Unknown);
+        assert!(render_markdown(&report, &BTreeSet::new()).contains("evidence-case-1"));
+    }
+
+    #[test]
+    fn comparison_table_preserves_pairing_missing_values_and_evidence() {
+        let mut baseline = observation("case|1", ComparisonArm::Baseline, TrialStatus::Completed);
+        baseline.measurements[0].value = Some(120.0);
+        baseline.measurements[0].status = MeasurementStatus::Observed;
+        baseline.measurements[0].basis = Some("provider usage".into());
+        let mut candidate = observation("case|1", ComparisonArm::Candidate, TrialStatus::Failed);
+        candidate.measurements[0].value = Some(80.0);
+        candidate.measurements[0].status = MeasurementStatus::Observed;
+        let mut missing = candidate.clone();
+        missing.repetition = 1;
+        missing.measurements[0].value = None;
+        missing.measurements[0].status = MeasurementStatus::Unavailable;
+        let mut different_unit = candidate.clone();
+        different_unit.repetition = 2;
+        different_unit.measurements[0].unit = "USD".into();
+        let mut baseline_different_unit = baseline.clone();
+        baseline_different_unit.repetition = 2;
+        let report = build_comparison(
+            "old",
+            "new",
+            &[
+                baseline,
+                candidate,
+                missing,
+                baseline_different_unit,
+                different_unit,
+            ],
+        );
+        let rendered = render_markdown(&report, &BTreeSet::new());
+        assert!(rendered.contains("| tokens (tokens) | 120 | 80 | -40 |"));
+        assert!(rendered.contains("| tokens (tokens) | Missing | Unavailable | — |"));
+        assert!(rendered.contains("| tokens (USD) | Missing | 80 | — |"));
+        assert!(rendered.contains("| tokens (tokens) | 120 | Missing | — |"));
+        assert!(rendered.contains("case\\|1 · repetition 0"));
+        assert!(rendered.contains("basis: provider usage"));
+        assert!(rendered.contains("reference: case\\|1"));
+        assert!(rendered.contains("Failed"));
+    }
+
+    #[test]
+    fn refuses_to_claim_without_a_pair() {
+        let report = build_comparison(
+            "baseline",
+            "candidate",
+            &[observation(
+                "case-1",
+                ComparisonArm::Candidate,
+                TrialStatus::Completed,
+            )],
+        );
+        assert_eq!(report.causal_strength, CausalStrength::Unknown);
+        assert!(report.conclusion.contains("No complete"));
+    }
+
+    #[test]
+    fn missing_measurements_are_not_zero() {
+        let report = build_comparison(
+            "baseline",
+            "candidate",
+            &[
+                observation("case-1", ComparisonArm::Baseline, TrialStatus::Completed),
+                observation("case-1", ComparisonArm::Candidate, TrialStatus::Completed),
+            ],
+        );
+        assert!(
+            report
+                .observations
+                .iter()
+                .flat_map(|observation| &observation.measurements)
+                .all(|measurement| measurement.value.is_none())
+        );
+    }
+
+    #[test]
+    fn measurement_status_requires_consistent_values() {
+        for (status, value, valid) in [
+            (MeasurementStatus::Observed, Some(0.0), true),
+            (MeasurementStatus::Observed, None, false),
+            (MeasurementStatus::Observed, Some(f64::NAN), false),
+            (MeasurementStatus::Observed, Some(f64::INFINITY), false),
+            (MeasurementStatus::Missing, None, true),
+            (MeasurementStatus::Missing, Some(0.0), false),
+            (MeasurementStatus::Unavailable, Some(1.0), false),
+            (MeasurementStatus::Failed, Some(1.0), false),
+        ] {
+            let measurement = Measurement {
+                name: "tokens".into(),
+                unit: "tokens".into(),
+                status,
+                value,
+                basis: None,
+            };
+            assert_eq!(measurement.validate_value_status().is_ok(), valid);
+        }
+    }
+
+    fn plan_spec() -> ExperimentSpec {
+        ExperimentSpec {
+            schema_version: EXPERIMENT_SCHEMA_VERSION,
+            experiment_id: "eval-1".to_string(),
+            target: EvaluationTarget {
+                kind: EvaluationTargetKind::Workflow,
+                baseline: RevisionRef {
+                    revision_id: "base".to_string(),
+                    content_hash: "sha256:base".to_string(),
+                    content: None,
+                },
+                candidate: RevisionRef {
+                    revision_id: "candidate".to_string(),
+                    content_hash: "sha256:candidate".to_string(),
+                    content: None,
+                },
+                skill_name: None,
+                judgment_policy: crate::evaluation::EvaluationJudgmentPolicy::Disabled,
+            },
+            cases: vec![EvaluationCase {
+                case_id: "case-1".to_string(),
+                input_snapshot_ref: "snapshot-1".to_string(),
+                input_content_hash: "sha256:input".to_string(),
+                holdout: true,
+                task_verifier: crate::evaluation::task_verifier::TaskVerifierSpec::freeze(
+                    crate::evaluation::task_verifier::JsonValueEqualsConfig {
+                        expected: serde_json::json!({"ok": true}),
+                    },
+                )
+                .unwrap(),
+                input_content: None,
+            }],
+            repetitions: 2,
+            order: TrialOrder::BaselineFirst,
+            conditions: FrozenConditions {
+                execution_config: crate::evaluation::test_support::execution_config(
+                    "model-v1",
+                    "provider-v1",
+                    "case-1",
+                ),
+                isolation_profile: "prompt_only_private".to_string(),
+                model_binding: "model-v1".to_string(),
+                provider_binding: "provider-v1".to_string(),
+                context_snapshot_hash: "sha256:context".to_string(),
+                tool_policy_hash: "sha256:tools".to_string(),
+                cache_policy: "provider_default_recorded".to_string(),
+                memory_isolation: MemoryIsolation::Disabled,
+                data_isolation: DataIsolation::Disabled,
+                workspace_execution: None,
+            },
+            budget: EvaluationBudget {
+                max_trials: 4,
+                max_concurrency: 2,
+                max_wall_time_secs: 60,
+            },
+            adapter_profile_version: None,
+            measurement_profile:
+                crate::evaluation::measurement_profile::MeasurementProfile::InstructionOnlyV1,
+        }
+    }
+
+    fn observation_for(trial: &TrialUnit, status: TrialStatus) -> TrialObservation {
+        TrialObservation {
+            experiment_fingerprint: trial.spec_fingerprint.clone(),
+            trial_id: trial.trial_id.clone(),
+            case_id: trial.case_id.clone(),
+            arm: trial.arm.clone(),
+            repetition: trial.repetition,
+            status,
+            measurements: vec![Measurement {
+                name: "wall_time".to_string(),
+                value: Some(1.0),
+                unit: "seconds".to_string(),
+                status: MeasurementStatus::Observed,
+                basis: Some("trace".to_string()),
+            }],
+            evidence: vec![EvidenceRef {
+                evidence_id: format!("evidence-{}", trial.trial_id),
+                kind: EvidenceKind::Trace,
+                availability: EvidenceAvailability::Available,
+                content_hash: Some("sha256:evidence".to_string()),
+                locator: Some(trial.trial_id.clone()),
+            }],
+            judgment: None,
+        }
+    }
+
+    #[test]
+    fn plan_bound_assessment_preserves_missing_and_deduplicates_delivery() {
+        let spec = plan_spec();
+        let planned = spec.plan_trials().unwrap();
+        let first = observation_for(&planned[0], TrialStatus::Completed);
+        let second = observation_for(&planned[1], TrialStatus::Failed);
+        let report = build_comparison_for_plan(
+            &spec,
+            "baseline",
+            "candidate",
+            &[first.clone(), second, first],
+        )
+        .unwrap();
+        assert_eq!(
+            report.spec_fingerprint,
+            Some(spec.spec_fingerprint().unwrap())
+        );
+        assert_eq!(report.planned_trial_count, 4);
+        assert_eq!(report.observed_trial_count, 2);
+        assert_eq!(report.missing_trial_ids.len(), 2);
+        assert_eq!(report.case_count, 1);
+        assert_eq!(report.observed_case_count, 1);
+        assert_eq!(report.status_counts.get("completed"), Some(&1));
+        assert_eq!(report.status_counts.get("failed"), Some(&1));
+        assert!(render_markdown(&report, &BTreeSet::new()).contains("baseline"));
+    }
+
+    #[test]
+    fn plan_bound_assessment_rejects_unknown_and_conflicting_observations() {
+        let spec = plan_spec();
+        let planned = spec.plan_trials().unwrap();
+        let first = observation_for(&planned[0], TrialStatus::Completed);
+        let mut conflict = first.clone();
+        conflict.status = TrialStatus::Failed;
+        assert!(
+            build_comparison_for_plan(&spec, "baseline", "candidate", &[first.clone(), conflict])
+                .unwrap_err()
+                .contains("conflicting duplicate")
+        );
+
+        let mut unknown = first;
+        unknown.trial_id = "trial:sha256:unknown".to_string();
+        assert!(
+            build_comparison_for_plan(&spec, "baseline", "candidate", &[unknown])
+                .unwrap_err()
+                .contains("unknown trial")
+        );
+    }
+
+    #[test]
+    fn pairing_requires_the_same_case_and_repetition() {
+        let mut baseline = observation("case-1", ComparisonArm::Baseline, TrialStatus::Completed);
+        baseline.repetition = 0;
+        let mut candidate = observation("case-1", ComparisonArm::Candidate, TrialStatus::Completed);
+        candidate.repetition = 1;
+        let report = build_comparison("baseline", "candidate", &[baseline, candidate]);
+        assert_eq!(report.paired_case_count, 0);
+        assert_eq!(report.paired_trial_pair_count, 0);
+    }
+
+    #[test]
+    fn plan_bound_report_uses_planned_case_denominator_for_partial_results() {
+        let mut spec = plan_spec();
+        spec.cases.push(EvaluationCase {
+            case_id: "case-2".to_string(),
+            input_snapshot_ref: "snapshot-2".to_string(),
+            input_content_hash: "sha256:input-2".to_string(),
+            holdout: false,
+            task_verifier: crate::evaluation::task_verifier::TaskVerifierSpec::freeze(
+                crate::evaluation::task_verifier::JsonValueEqualsConfig {
+                    expected: serde_json::json!({"ok": true}),
+                },
+            )
+            .unwrap(),
+            input_content: None,
+        });
+        let budget = spec
+            .conditions
+            .execution_config
+            .runtime
+            .round_budget_by_case["case-1"]
+            .clone();
+        spec.conditions
+            .execution_config
+            .runtime
+            .round_budget_by_case
+            .insert("case-2".into(), budget);
+        spec.budget.max_trials = 8;
+        let planned = spec.plan_trials().unwrap();
+        let report = build_comparison_for_plan(
+            &spec,
+            "baseline",
+            "candidate",
+            &[
+                observation_for(&planned[0], TrialStatus::Completed),
+                observation_for(&planned[1], TrialStatus::Completed),
+            ],
+        )
+        .unwrap();
+        assert_eq!(report.case_count, 2);
+        assert_eq!(report.observed_case_count, 1);
+        assert_eq!(report.paired_case_count, 1);
+        assert!(report.conclusion.contains("partial"));
+    }
+}

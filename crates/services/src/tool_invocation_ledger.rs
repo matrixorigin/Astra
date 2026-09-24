@@ -20,6 +20,9 @@ use sqlx::{MySql, Row, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod evidence;
+pub use evidence::ToolInvocationRunEvidence;
+
 const TOOL_INVOCATION_ARCHIVE_VERSION: &str = "tool-invocation-run-archive-v1";
 const TOOL_INVOCATION_COMPACTION_BATCH_RECORDS: i64 = 32;
 const TOOL_INVOCATION_ARCHIVE_CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -915,7 +918,9 @@ impl DatabaseToolInvocationLedger {
     ) -> Result<Option<ToolInvocationRecord>, ToolInvocationLedgerStoreError> {
         let identity_key = identity.storage_key();
         let rows = sqlx::query(
-            "SELECT chunks.artifact_id, artifacts.status, artifacts.content_json
+            "SELECT chunks.artifact_id, chunks.first_identity_key, chunks.last_identity_key,
+                    chunks.record_count, chunks.encoded_bytes, artifacts.status,
+                    artifacts.artifact_kind, artifacts.source, artifacts.content_json, JSON_UNQUOTE(artifacts.metadata) AS metadata
              FROM tool_invocation_archive_chunks chunks
              LEFT JOIN session_artifacts artifacts
                ON artifacts.user_id = chunks.user_id
@@ -923,7 +928,7 @@ impl DatabaseToolInvocationLedger {
               AND artifacts.artifact_id = chunks.artifact_id
              WHERE chunks.user_id = ? AND chunks.session_id = ? AND chunks.run_id = ?
                AND chunks.first_identity_key <= ? AND chunks.last_identity_key >= ?
-             ORDER BY chunks.chunk_index LIMIT 2",
+             ORDER BY chunks.chunk_index",
         )
         .bind(&identity.user_id)
         .bind(&identity.session_id)
@@ -932,12 +937,7 @@ impl DatabaseToolInvocationLedger {
         .bind(&identity_key)
         .fetch_all(self.pool.get())
         .await?;
-        if rows.len() > 1 {
-            return Err(ToolInvocationLedgerStoreError::OverlappingArchiveRanges {
-                identity: identity.clone(),
-            });
-        }
-        let Some(row) = rows.first() else {
+        if rows.is_empty() {
             let status: Option<String> = sqlx::query_scalar(
                 "SELECT status FROM agent_runs
                  WHERE user_id = ? AND session_id = ? AND run_id = ?",
@@ -959,34 +959,23 @@ impl DatabaseToolInvocationLedger {
             }
             return Ok(None);
         };
-        let artifact_id: String = row.try_get("artifact_id")?;
-        let status: Option<String> = row.try_get("status")?;
-        let content_json: Option<String> = row.try_get("content_json")?;
-        if status.as_deref() != Some("active") || content_json.is_none() {
-            return Err(ToolInvocationLedgerStoreError::ArchiveUnavailable {
-                artifact_id,
-                status,
-            });
-        }
-        let content_json = content_json.expect("checked archive content");
-        let chunk: ToolInvocationArchiveChunk =
-            serde_json::from_str(&content_json).map_err(|source| {
-                ToolInvocationLedgerStoreError::InvalidArchive {
-                    artifact_id: artifact_id.clone(),
-                    source,
+        let mut found = None;
+        for row in &rows {
+            let chunk = evidence::validate_archive(
+                row,
+                &identity.user_id,
+                &identity.session_id,
+                &identity.run_id,
+            )?;
+            for record in chunk.records {
+                if record.identity == *identity && found.replace(record).is_some() {
+                    return Err(ToolInvocationLedgerStoreError::OverlappingArchiveRanges {
+                        identity: identity.clone(),
+                    });
                 }
-            })?;
-        if chunk.version != TOOL_INVOCATION_ARCHIVE_VERSION
-            || chunk.user_id != identity.user_id
-            || chunk.session_id != identity.session_id
-            || chunk.run_id != identity.run_id
-        {
-            return Err(ToolInvocationLedgerStoreError::ArchiveScopeMismatch { artifact_id });
+            }
         }
-        Ok(chunk
-            .records
-            .into_iter()
-            .find(|record| record.identity == *identity))
+        Ok(found)
     }
 
     /// Atomically grant one worker the right to cross the provider boundary.
@@ -1047,11 +1036,27 @@ impl DatabaseToolInvocationLedger {
         match admission_outcome {
             crate::runs::TransactionalRunActionAdmission::Granted { .. } => {}
             crate::runs::TransactionalRunActionAdmission::AlreadyStarted { event_index } => {
+                let cached_terminal =
+                    load_record_in_tx(&mut tx, identity)
+                        .await?
+                        .is_some_and(|record| {
+                            matches!(
+                                record.completion_source,
+                                Some(ToolInvocationCompletionSource::SemanticReadCache { .. })
+                            ) && record.state == ToolInvocationState::Succeeded
+                        });
                 if rollback(tx, "tool dispatch action was already started")
                     .await
                     .is_ok()
                 {
                     connection.release();
+                }
+                if cached_terminal {
+                    return Err(ToolInvocationLedgerStoreError::StateMismatch {
+                        identity: identity.clone(),
+                        expected: ToolInvocationState::Prepared,
+                        actual: ToolInvocationState::Succeeded,
+                    });
                 }
                 return Err(ToolInvocationLedgerStoreError::ActionAlreadyStarted {
                     identity: Box::new(identity.clone()),
@@ -1636,6 +1641,7 @@ impl DatabaseToolInvocationLedger {
         identity: &ToolInvocationIdentity,
         result: &ToolInvocationResultPayload,
         completion_source: &ToolInvocationCompletionSource,
+        admission: ToolInvocationDispatchAdmission,
     ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
         result.validate()?;
         completion_source.validate()?;
@@ -1657,6 +1663,109 @@ impl DatabaseToolInvocationLedger {
             })?;
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
         let mut tx = connection.begin().await?;
+        validate_execution_binding_generation_in_tx(
+            &mut tx,
+            identity,
+            admission.expected_execution_binding_generation,
+        )
+        .await?;
+        let action_id = tool_invocation_action_id(identity);
+        let action = crate::runs::admit_run_action_in_existing_transaction(
+            &mut tx,
+            crate::runs::AtomicRunActionAdmissionRequest {
+                user_id: &identity.user_id,
+                run_id: &identity.run_id,
+                expected_session_id: &identity.session_id,
+                action_id: &action_id,
+                expected_control_epoch: admission.expected_control_epoch,
+                expected_owner_generation: admission.expected_owner_generation,
+            },
+            &admission.expected_owner_pod_id,
+        )
+        .await
+        .map_err(
+            |reason| ToolInvocationLedgerStoreError::ActionAdmissionFailed {
+                identity: Box::new(identity.clone()),
+                reason: format!("semantic cache action admission: {reason}"),
+            },
+        )?;
+        match action {
+            crate::runs::TransactionalRunActionAdmission::Granted { .. } => {}
+            crate::runs::TransactionalRunActionAdmission::AlreadyStarted { event_index } => {
+                if rollback(tx, "semantic cache action was already started")
+                    .await
+                    .is_ok()
+                {
+                    connection.release();
+                }
+                return Err(ToolInvocationLedgerStoreError::ActionAlreadyStarted {
+                    identity: Box::new(identity.clone()),
+                    event_index,
+                });
+            }
+            crate::runs::TransactionalRunActionAdmission::Superseded {
+                user_intent_event_index,
+            } => {
+                if rollback(tx, "semantic cache action was superseded")
+                    .await
+                    .is_ok()
+                {
+                    connection.release();
+                }
+                return Err(ToolInvocationLedgerStoreError::ActionSuperseded {
+                    identity: Box::new(identity.clone()),
+                    user_intent_event_index,
+                });
+            }
+            crate::runs::TransactionalRunActionAdmission::Inactive { status } => {
+                if rollback(tx, "semantic cache run is inactive").await.is_ok() {
+                    connection.release();
+                }
+                return Err(ToolInvocationLedgerStoreError::RunNotExecutable {
+                    run_id: identity.run_id.clone(),
+                    status,
+                });
+            }
+            crate::runs::TransactionalRunActionAdmission::OwnerGenerationMismatch {
+                actual_owner_generation,
+            } => {
+                if rollback(tx, "semantic cache owner generation changed")
+                    .await
+                    .is_ok()
+                {
+                    connection.release();
+                }
+                return Err(ToolInvocationLedgerStoreError::RunOwnerGenerationMismatch {
+                    run_id: identity.run_id.clone(),
+                    expected_owner_generation: admission.expected_owner_generation,
+                    actual_owner_generation,
+                });
+            }
+            crate::runs::TransactionalRunActionAdmission::OwnerMismatch {
+                actual_owner_pod_id,
+            } => {
+                if rollback(tx, "semantic cache owner pod changed")
+                    .await
+                    .is_ok()
+                {
+                    connection.release();
+                }
+                return Err(ToolInvocationLedgerStoreError::RunOwnerMismatch {
+                    run_id: identity.run_id.clone(),
+                    expected_owner_pod_id: admission.expected_owner_pod_id,
+                    actual_owner_pod_id,
+                });
+            }
+            crate::runs::TransactionalRunActionAdmission::Missing => {
+                if rollback(tx, "semantic cache run is missing").await.is_ok() {
+                    connection.release();
+                }
+                return Err(ToolInvocationLedgerStoreError::RunNotFound {
+                    user_id: identity.user_id.clone(),
+                    run_id: identity.run_id.clone(),
+                });
+            }
+        }
         let updated = sqlx::query(
             "UPDATE tool_invocation_ledger
              SET state = 'succeeded', dispatch_certainty = 'not_dispatched',
@@ -2151,6 +2260,12 @@ fn certainty_label(certainty: DispatchCertainty) -> &'static str {
 
 #[derive(Debug, Error)]
 pub enum ToolInvocationLedgerStoreError {
+    #[error(transparent)]
+    ActionHistory(#[from] crate::runs::RunActionHistoryError),
+    #[error("tool invocation evidence integrity error: {0}")]
+    EvidenceIntegrity(String),
+    #[error("tool invocation evidence is unresolved: {0}")]
+    EvidenceUnresolved(String),
     #[error("tool invocation ledger database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("serialize tool invocation ledger {field}: {source}")]
@@ -2309,6 +2424,16 @@ pub enum ToolInvocationLedgerStoreError {
     InvalidAttemptCount(u64),
     #[error(transparent)]
     Contract(#[from] astra_turn_types::ToolInvocationContractError),
+}
+
+impl ToolInvocationLedgerStoreError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Database(_)
+                | Self::ActionHistory(crate::runs::RunActionHistoryError::Database(_))
+        )
+    }
 }
 
 #[cfg(test)]

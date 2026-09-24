@@ -16,6 +16,7 @@
 
 mod binding;
 mod capability;
+mod confinement;
 mod local_state;
 mod materialization;
 mod policy;
@@ -29,6 +30,7 @@ mod workspace_snapshot_capture;
 
 pub use binding::*;
 pub use capability::*;
+pub use confinement::*;
 pub use local_state::*;
 pub use materialization::*;
 pub use policy::*;

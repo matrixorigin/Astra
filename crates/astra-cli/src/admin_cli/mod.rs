@@ -17,7 +17,6 @@ mod config;
 mod http_helpers;
 mod input;
 mod interactive;
-mod judgment_compare;
 mod setup;
 
 pub use cli_args::AdminArgs;
@@ -623,10 +622,6 @@ pub async fn run(
                 .map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(())
-        }
-        Command::Model(ModelCmd::Compare(args)) => {
-            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            judgment_compare::run(&api, &token, &args).await
         }
         Command::Model(ModelCmd::List) => {
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;

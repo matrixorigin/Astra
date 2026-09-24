@@ -467,10 +467,14 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
     // an asynchronous Work-admission decision must not race a separate skill
     // judge and let a repository skill seize an unrelated user task. The
     // primary model still sees the catalog and may explicitly invoke a skill.
-    let Some(turn_intent) = state.turn_intent.as_ref() else {
+    if state.turn_intent.is_none() && !host.allows_skill_auto_route_without_turn_intent() {
         return;
-    };
-    if turn_intent.work_lifecycle == WorkLifecycleIntent::Required {
+    }
+    if state
+        .turn_intent
+        .as_ref()
+        .is_some_and(|turn_intent| turn_intent.work_lifecycle == WorkLifecycleIntent::Required)
+    {
         return;
     }
 
@@ -538,6 +542,8 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
 
     let composition_ctx = crate::skills::composition::CompositionContext::root();
     let skill_ctx = crate::turn::agentic::tool_interception::build_skill_context(state);
+    let tool_call_id = auto_route_tool_call_id(&skill_name);
+    let execution_started = Instant::now();
     let result = crate::turn::skill_tool::execute_skill_direct(
         resolver.as_ref(),
         state.skills.executor.as_ref(),
@@ -552,7 +558,42 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
         .as_ref()
         .map(|outcome| outcome.all_required_passed)
         .unwrap_or(true);
-    if !result.success || !verified {
+    let execution_succeeded = result.success && verified;
+    state
+        .stall
+        .tool_call_records
+        .push(astra_services::session_journal::ToolCallRecord {
+            tool_call_id: Some(tool_call_id.clone()),
+            name: crate::turn::skill_tool::SKILL_TOOL_NAME.to_string(),
+            ok: execution_succeeded,
+            ms: execution_started
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            error: (!execution_succeeded).then(|| {
+                if result.success {
+                    "skill verification failed".to_string()
+                } else {
+                    "skill execution failed".to_string()
+                }
+            }),
+            input_bytes: Some(
+                serde_json::json!({"skill_name": &skill_name, "task": &query})
+                    .to_string()
+                    .len()
+                    .try_into()
+                    .unwrap_or(u32::MAX),
+            ),
+            output_bytes: Some(result.output.len().try_into().unwrap_or(u32::MAX)),
+            args_preview: Some(format!("skill_name={skill_name}")),
+            result_preview: (!result.output.is_empty())
+                .then(|| result.output.chars().take(500).collect::<String>()),
+            result_full: Some(result.output.clone()),
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+    if !execution_succeeded {
         state
             .skills
             .execution
@@ -561,7 +602,6 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
         return;
     }
 
-    let tool_call_id = auto_route_tool_call_id(&skill_name);
     let mut skill_result =
         crate::turn::skill_tool::append_skill_loaded_marker(&result.output, &skill_name);
     if let Some(activation) = result.activation {

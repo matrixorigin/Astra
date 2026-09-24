@@ -55,6 +55,7 @@ pub struct SkillListCursor {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SkillListItem {
+    pub is_owned: bool,
     pub skill_id: String,
     pub skill_name: String,
     pub version: String,
@@ -151,8 +152,8 @@ fn strip_reserved_skill_definition_keys(map: &mut serde_json::Map<String, serde_
 /// `list_skills` row projection — excludes `skill_definition` (large JSON); use `get_skill` for body.
 const SKILL_REGISTRY_LIST_SELECT: &str = "\
     skill_id, skill_name, version, description, \
-    status, source, category, \
-    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at";
+    status, source, category, created_by, \
+    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at";
 const SKILL_LIST_ORDER_SQL: &str = " ORDER BY skill_name ASC, version ASC, skill_id ASC LIMIT ?";
 const SKILL_LIST_CURSOR_SQL: &str = "\
     AND (skill_name > ? \
@@ -183,7 +184,7 @@ const VISIBLE_SKILL_PREDICATE: &str = "is_active = 1 AND (is_public = 1 OR creat
 /// lose their private skill because a newer public skill with the same name was
 /// published later.
 const USER_OWNED_SKILL_FIRST_ORDER: &str =
-    "CASE WHEN created_by = ? THEN 0 ELSE 1 END, created_at DESC";
+    "CASE WHEN created_by = ? THEN 0 ELSE 1 END, created_at DESC, skill_id DESC";
 
 fn validate_skill_list_limit(limit: u32) -> u32 {
     limit.clamp(1, MAX_API_LIST_LIMIT)
@@ -252,8 +253,10 @@ fn skill_metadata_from_definition_json(
 fn skill_list_item_from_row(
     row: &MySqlRow,
     source_override: Option<&str>,
+    user_id: &str,
 ) -> Result<SkillListItem, sqlx::Error> {
     Ok(SkillListItem {
+        is_owned: optional_string_column(row, "created_by")?.as_deref() == Some(user_id),
         skill_id: row.try_get::<String, _>("skill_id")?,
         skill_name: row.try_get::<String, _>("skill_name")?,
         version: row.try_get::<String, _>("version")?,
@@ -463,7 +466,7 @@ impl SkillService for DatabaseSkillService {
         let mut skills: Vec<SkillListItem> = rows
             .iter()
             .map(|row| -> Result<SkillListItem, _> {
-                skill_list_item_from_row(row, None).map_err(internal_error)
+                skill_list_item_from_row(row, None, &user_id).map_err(internal_error)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let has_more = skills.len() > limit as usize;
@@ -495,7 +498,7 @@ impl SkillService for DatabaseSkillService {
         let by_id_sql = format!(
             "SELECT skill_id, skill_name, version, description, \
              IFNULL(CAST(skill_definition AS CHAR), 'null') AS definition_json, \
-             DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+             DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at \
              FROM skills_registry WHERE skill_id = ? AND {VISIBLE_SKILL_PREDICATE}",
         );
         let row = query(&by_id_sql)
@@ -511,7 +514,7 @@ impl SkillService for DatabaseSkillService {
                 let by_name_version_sql = format!(
                     "SELECT skill_id, skill_name, version, description, \
                      IFNULL(CAST(skill_definition AS CHAR), 'null') AS definition_json, \
-                     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+                     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at \
                      FROM skills_registry WHERE skill_name = ? AND version = ? AND {VISIBLE_SKILL_PREDICATE} \
                      ORDER BY {USER_OWNED_SKILL_FIRST_ORDER} LIMIT 1",
                 );
@@ -527,7 +530,7 @@ impl SkillService for DatabaseSkillService {
                 let by_name_latest_sql = format!(
                     "SELECT skill_id, skill_name, version, description, \
                      IFNULL(CAST(skill_definition AS CHAR), 'null') AS definition_json, \
-                     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+                     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at \
                      FROM skills_registry WHERE skill_name = ? AND {VISIBLE_SKILL_PREDICATE} \
                      ORDER BY {USER_OWNED_SKILL_FIRST_ORDER} LIMIT 1",
                 );
@@ -571,7 +574,7 @@ impl SkillService for DatabaseSkillService {
         let info_sql = format!(
             "SELECT skill_name, version, description, source, status, created_by, category, \
              publisher_id, trust_tier, \
-             DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+             DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at \
              FROM skills_registry WHERE skill_name = ? AND {VISIBLE_SKILL_PREDICATE} \
              ORDER BY {USER_OWNED_SKILL_FIRST_ORDER} LIMIT 1",
         );
@@ -589,13 +592,12 @@ impl SkillService for DatabaseSkillService {
             )
         })?;
 
-        let install_count_row = query(
-            "SELECT COUNT(*) AS cnt FROM skill_installations WHERE skill_name = ? AND status = 'installed'"
-        )
-        .bind(&skill_name)
-        .fetch_one(&pool)
-        .await
-        .map_err(internal_error)?;
+        let install_count_row =
+            query("SELECT COUNT(*) AS cnt FROM skill_installations WHERE skill_name = ?")
+                .bind(&skill_name)
+                .fetch_one(&pool)
+                .await
+                .map_err(internal_error)?;
         let install_count: i64 = install_count_row.try_get("cnt").map_err(internal_error)?;
 
         Ok(SkillInfoRecord {
@@ -621,7 +623,7 @@ impl SkillService for DatabaseSkillService {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let versions_sql = format!(
             "SELECT version, status, is_active, \
-             DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+             DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at \
              FROM skills_registry WHERE skill_name = ? AND {VISIBLE_SKILL_PREDICATE} \
              ORDER BY {USER_OWNED_SKILL_FIRST_ORDER}",
         );
@@ -659,8 +661,8 @@ impl SkillService for DatabaseSkillService {
             let source = source.to_string();
             async move {
                 let group_sql = format!(
-                    "SELECT skill_id, skill_name, version, description, status, category, \
-                     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+                    "SELECT skill_id, skill_name, version, description, status, category, created_by, \
+                     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at \
                      FROM skills_registry WHERE source = ? AND {VISIBLE_SKILL_PREDICATE} \
                      ORDER BY skill_name LIMIT ?",
                 );
@@ -673,7 +675,7 @@ impl SkillService for DatabaseSkillService {
 
                 let items = rows
                     .iter()
-                    .map(|row| skill_list_item_from_row(row, Some(source.as_str())))
+                    .map(|row| skill_list_item_from_row(row, Some(source.as_str()), &user_id))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok::<_, sqlx::Error>(items)
             }
@@ -1035,13 +1037,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn install_count_query_uses_status_not_is_active() {
-        let sql = "SELECT COUNT(*) AS cnt FROM skill_installations WHERE skill_name = ? AND status = 'installed'";
+    fn install_count_query_counts_the_current_installation_row() {
+        let sql = "SELECT COUNT(*) AS cnt FROM skill_installations WHERE skill_name = ?";
         assert!(
             !sql.contains("is_active"),
-            "skill_installations has no is_active column; use status = 'installed'"
+            "skill_installations has no is_active column"
         );
-        assert!(sql.contains("status = 'installed'"));
+        assert!(!sql.contains("status"));
     }
 
     #[test]

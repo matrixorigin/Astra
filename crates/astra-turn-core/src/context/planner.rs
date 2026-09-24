@@ -42,6 +42,7 @@ pub struct ContextPlan {
 /// Inputs to the planner — everything it needs to make a decision.
 /// All references are immutable (Plan is a pure function).
 pub struct PlanInput<'a> {
+    pub compaction_thresholds: astra_turn_types::context_execution::CompactionThresholds,
     pub tokens: &'a TokenAccounting,
     pub model_limit: u32,
     /// Output capacity already excluded from `model_limit`. This keeps an
@@ -88,8 +89,8 @@ pub fn plan_turn(input: &PlanInput<'_>) -> ContextPlan {
     );
 
     // 3. Select compaction tier (gated: predictive can escalate, not de-escalate)
-    let tier =
-        select_tier_gated(pressure.raw, pressure.value).escalate_for_recovery(input.recovery);
+    let tier = select_tier_gated(pressure.raw, pressure.value, input.compaction_thresholds)
+        .escalate_for_recovery(input.recovery.consecutive_ptl_errors);
 
     // 4. Allocate token budgets per section
     let section_history = input.stats.section_token_history();
@@ -303,6 +304,7 @@ mod tests {
         policy: &'a ProviderCachePolicy,
     ) -> PlanInput<'a> {
         PlanInput {
+            compaction_thresholds: Default::default(),
             tokens,
             model_limit: 100_000,
             pre_reserved_output_tokens: 0,

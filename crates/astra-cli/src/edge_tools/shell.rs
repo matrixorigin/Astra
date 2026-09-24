@@ -3135,6 +3135,7 @@ struct ShellRunConfig {
     harden_command: bool,
     effective_project_root: PathBuf,
     sandbox_policy: Option<SandboxPolicy>,
+    process_boundary: Option<astra_sandbox::ShellProcessBoundary>,
     progress_sink: Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
     cancel_token: Option<tokio_util::sync::CancellationToken>,
     #[cfg(test)]
@@ -3212,19 +3213,32 @@ fn run_shell_output_with_config(
     target_args.push(config.shell_flag.clone());
     target_args.push(effective_command);
 
+    let boundary = config
+        .process_boundary
+        .as_ref()
+        .map(|boundary| boundary.validate(&config.effective_project_root))
+        .transpose()
+        .map_err(ShellRunError::new)?;
+    let (target_program, target_args) = match &boundary {
+        Some(boundary) => boundary
+            .wrap(&config.program, &target_args)
+            .map_err(ShellRunError::new)?,
+        None => (config.program.clone(), target_args),
+    };
+
     #[cfg(all(test, target_os = "linux"))]
     let prepared = if let Some((program, args)) = &config.supervisor_test_helper {
         astra_sandbox::BashInvocationOwner::prepare_with_supervisor_helper(
             program.clone(),
             args.clone(),
-            &config.program,
+            &target_program,
             &target_args,
         )
     } else {
-        astra_sandbox::BashInvocationOwner::prepare(&config.program, &target_args)
+        astra_sandbox::BashInvocationOwner::prepare(&target_program, &target_args)
     };
     #[cfg(not(all(test, target_os = "linux")))]
-    let prepared = astra_sandbox::BashInvocationOwner::prepare(&config.program, &target_args);
+    let prepared = astra_sandbox::BashInvocationOwner::prepare(&target_program, &target_args);
     let (mut child_cmd, mut invocation_owner) = prepared.map_err(|error| {
         ShellRunError::new(format!(
             "Error: unable to establish Bash invocation owner: {error}"
@@ -3254,6 +3268,11 @@ fn run_shell_output_with_config(
         return Err(ShellRunError::new(format!(
             "Error: sandbox policy application failed: {e}"
         )));
+    }
+
+    if let Some(boundary) = &boundary {
+        child_cmd.env_clear().envs(boundary.environment());
+        child_cmd.current_dir(&config.effective_project_root);
     }
 
     if config
@@ -3539,6 +3558,9 @@ async fn run_shell_output_with_detach_config(
     detach: &astra_tools::detach::DetachShellHandle,
     command_label: &str,
 ) -> Result<DetachableShellOutput, String> {
+    if config.process_boundary.is_some() {
+        return Err("confined shell execution cannot detach; run in the foreground".into());
+    }
     let mut child_cmd = configure_detachable_tokio_command(&config);
     let mut child = child_cmd.spawn().map_err(|e| format!("Error: {e}"))?;
     let mut stdout = child
@@ -4417,6 +4439,7 @@ impl ToolExecutor {
             harden_command,
             effective_project_root: self.effective_project_root(),
             sandbox_policy,
+            process_boundary: self.shell_process_boundary.clone(),
             progress_sink: self.current_bash_progress_sink(),
             cancel_token: cancel_token.cloned(),
             #[cfg(test)]
@@ -5178,6 +5201,11 @@ impl ToolExecutor {
         invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> super::ToolExecutionOutcome {
+        if self.shell_process_boundary.is_some() {
+            return super::ToolExecutionOutcome::error(
+                "confined shell execution cannot launch environment background tasks".into(),
+            );
+        }
         if std::env::var(ENVIRONMENT_BACKGROUND_TASK_AUTH).as_deref() != Ok("1") {
             return super::ToolExecutionOutcome::error(
                 "Error: environment-lifetime background tasks are not authorized by this execution environment; no process was started".to_string(),
@@ -6432,6 +6460,62 @@ mod tests {
     };
     use std::process::Command;
     use std::time::Duration;
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn confined_bash_uses_canonical_cli_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        std::fs::write(&sentinel, "private").unwrap();
+        std::os::unix::fs::symlink(&sentinel, root.path().join("outside")).unwrap();
+        let home = root.path().join("home");
+        let temp = root.path().join("tmp");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&temp).unwrap();
+        let executor = test_executor_in(root.path())
+            .with_shell_process_boundary(astra_sandbox::ShellProcessBoundary {
+                workspace: root.path().to_path_buf(),
+                home,
+                temp,
+                read_only_paths: vec![],
+            })
+            .unwrap();
+        // Runtime permission/Skill policy replacement must not remove the host boundary.
+        *executor.sandbox_policy.write().unwrap() = None;
+        let result = executor
+            .bash_outcome_with_cancel_async(
+                &serde_json::json!({"command": "printf checked > result; cat result"}),
+                astra_tools::tool_engine::ToolInvocationMetadata::default(),
+                None,
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.contains("checked"));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("result")).unwrap(),
+            "checked"
+        );
+        let denied = executor
+            .bash_outcome_with_cancel_async(
+                &serde_json::json!({"command": "cat outside"}),
+                astra_tools::tool_engine::ToolInvocationMetadata::default(),
+                None,
+            )
+            .await;
+        assert!(denied.is_error, "{}", denied.output);
+        assert!(!denied.output.contains("private"));
+        let background = executor.start_environment_background_task(
+            &serde_json::json!({"command": "printf changed > outside", "run_in_background": true}),
+            astra_tools::tool_engine::ToolInvocationMetadata::default(), None,
+        ).await;
+        assert!(
+            background.output.contains("confined shell execution"),
+            "{}",
+            background.output
+        );
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "private");
+    }
 
     static ENVIRONMENT_BACKGROUND_TEST_LOCK: tokio::sync::Mutex<()> =
         tokio::sync::Mutex::const_new(());

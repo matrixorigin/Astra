@@ -342,10 +342,14 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
         let row = query(
-            "SELECT skill_name, publisher_id, total_installs, active_users_7d, \
-             avg_quality, avg_rating, report_count, compatibility_score, \
-             trust_tier, CAST(updated_at AS CHAR) AS last_updated \
-             FROM skill_metrics WHERE skill_name = ? AND metric_type = ? LIMIT 1",
+            "SELECT sm.skill_name, sm.publisher_id, \
+             (SELECT COUNT(*) FROM skill_installations i WHERE i.skill_name = sm.skill_name) \
+                 AS total_installs, \
+             sm.active_users_7d, sm.avg_quality, sm.avg_rating, sm.report_count, \
+             sm.compatibility_score, sm.trust_tier, \
+             CAST(sm.updated_at AS CHAR) AS last_updated \
+             FROM skill_metrics sm \
+             WHERE sm.skill_name = ? AND sm.metric_type = ? LIMIT 1",
         )
         .bind(&skill_name)
         .bind(SKILL_METRIC_TYPE_AGGREGATE)
@@ -373,8 +377,20 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
         let cursor = search.cursor()?;
 
         // Build dynamic WHERE clauses
-        let mut conditions = Vec::new();
+        let mut conditions = vec!["sr.is_active = 1 AND sr.is_public = 1".to_string()];
         let mut binds: Vec<String> = Vec::new();
+
+        // Search and install must name one current public catalog entry per
+        // skill. `created_at` is the publication order and `skill_id` breaks
+        // ties deterministically without relying on version string ordering.
+        conditions.push(
+            "NOT EXISTS (SELECT 1 FROM skills_registry newer \
+             WHERE newer.skill_name = sr.skill_name \
+               AND newer.is_active = 1 AND newer.is_public = 1 \
+               AND (newer.created_at > sr.created_at \
+                    OR (newer.created_at = sr.created_at AND newer.skill_id > sr.skill_id)))"
+                .to_string(),
+        );
 
         if let Some(ref q) = search.query {
             conditions.push("(sr.skill_name LIKE ? OR sr.description LIKE ?)".to_string());
@@ -433,11 +449,14 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
              ms.publisher_id, ms.trust_tier, sr.category, \
              ({ranking_sql}) AS ranking_score, \
              COALESCE(ms.avg_quality, 0.0) AS avg_quality, \
-             COALESCE(ms.total_installs, 0) AS total_installs, \
+             COALESCE(inst.total_installs, 0) AS total_installs, \
              COALESCE(ms.active_users_7d, 0) AS active_users_7d \
              FROM skills_registry sr \
              LEFT JOIN skill_metrics ms \
                ON sr.skill_name = ms.skill_name AND ms.metric_type = '{SKILL_METRIC_TYPE_AGGREGATE}' \
+             LEFT JOIN (SELECT skill_name, COUNT(*) AS total_installs \
+                        FROM skill_installations GROUP BY skill_name) inst \
+               ON sr.skill_name = inst.skill_name \
              {where_clause} \
              ORDER BY ranking_score DESC, sr.skill_name ASC, sr.version ASC \
              LIMIT ?"

@@ -1407,13 +1407,25 @@ pub struct ToolOutcomeSummary {
     pub reused: u32,
     pub suppressed: u32,
     pub deferred: u32,
+    /// Number of requested calls rejected by an explicit policy/safety
+    /// boundary. This is an attempted violation count, not proof that a
+    /// side effect occurred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_denied: Option<u32>,
 }
 
 impl ToolOutcomeSummary {
     pub fn from_records(records: &[ToolCallRecord]) -> Self {
-        let mut summary = Self::default();
+        let mut summary = Self {
+            policy_denied: Some(0),
+            ..Self::default()
+        };
         for record in records {
             summary.requested = summary.requested.saturating_add(1);
+            if record.was_policy_denied() {
+                summary.policy_denied =
+                    Some(summary.policy_denied.unwrap_or_default().saturating_add(1));
+            }
             match record.effective_disposition() {
                 ToolCallDisposition::Executed => {
                     summary.executed = summary.executed.saturating_add(1);
@@ -1447,6 +1459,9 @@ impl ToolOutcomeSummary {
                     .saturating_add(self.reused)
                     .saturating_add(self.suppressed)
                     .saturating_add(self.deferred)
+            && self
+                .policy_denied
+                .is_none_or(|count| count <= self.rejected)
     }
 }
 
@@ -1525,6 +1540,13 @@ impl ToolCallRecord {
     /// turn-level success/failure to them creates a self-reinforcing block loop.
     pub fn was_blocked_by_policy(&self) -> bool {
         !self.ok && self.result_class.as_deref() == Some(BLOCKED_TOOL_RESULT_CLASS)
+    }
+
+    /// True when the canonical record says a policy/safety boundary rejected
+    /// the requested call. Argument and provider-schema failures are kept out
+    /// of this count even when they also prevent dispatch.
+    pub fn was_policy_denied(&self) -> bool {
+        self.error_kind == Some(astra_core::ErrorKind::PolicyDenied) || self.was_blocked_by_policy()
     }
 
     /// True when the tool call did not produce new observations because the

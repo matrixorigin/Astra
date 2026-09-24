@@ -536,6 +536,7 @@ mod tests {
             args: serde_json::json!({}),
             workspace: WorkspaceBinding::server_sandbox("/tmp/test"),
             workspace_record: None,
+            evaluation_workspace: None,
             executor: ExecutorBinding::server_local(),
             runtime: None,
             runtime_process_authorization: None,

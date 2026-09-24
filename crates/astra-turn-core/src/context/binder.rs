@@ -470,6 +470,7 @@ mod tests {
             agent: AgentContext::default(),
             latches: SessionLatches::default(),
             session: SessionContext {
+                compaction_thresholds: Default::default(),
                 session_id: "test-session".into(),
                 run_id: "test-run".into(),
                 model_id: "test-model".into(),
@@ -623,6 +624,7 @@ mod tests {
         fixture.session.skill_listing_block = "<available_skills>y</available_skills>".to_string();
         let sources = fixture.context();
         let plan_input = crate::context_planner::PlanInput {
+            compaction_thresholds: Default::default(),
             tokens: &sources.turn.tokens,
             model_limit: 100_000,
             pre_reserved_output_tokens: 0,
@@ -1049,6 +1051,7 @@ mod tests {
         let sources = fixture.context();
 
         let plan_input = crate::context_planner::PlanInput {
+            compaction_thresholds: Default::default(),
             tokens: &sources.turn.tokens,
             model_limit: 100_000,
             pre_reserved_output_tokens: 0,

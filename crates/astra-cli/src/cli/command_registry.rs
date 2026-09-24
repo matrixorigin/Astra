@@ -223,7 +223,7 @@ const REVIEW_SUBCOMMANDS: &[(&str, &str)] = &[
 
 const SKILL_SUBCOMMANDS: &[(&str, &str)] = &[
     ("browse", "Browse marketplace"),
-    ("create", "Generate skill from session"),
+    ("create", "Create Skillify draft from session"),
     ("dev", "Skill dev mode"),
     ("feedback", "Record user feedback (+/-)"),
     ("health", "Skill catalog health"),

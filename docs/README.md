@@ -29,6 +29,7 @@ operators, and kernel contributors to the level of detail they need.
 | [TUI slash commands](reference/slash-commands.md) | Interactive workspace, planning, observability, memory, MCP, and team commands |
 | [TypeScript SDK](../packages/sdk/README.md) | REST, SSE, WebSocket, React hooks, and browser integration |
 | [HTTP API](reference/api-reference.md) | Authentication and server resource contracts |
+| [Compare Skill revisions](guides/evaluation.md) | Frozen trials, retryable task assessments, and evidence-backed reports |
 | [Configuration](reference/configuration.md) | Models, authentication, Server, User Runner, and observability settings |
 
 ## Deploy and operate Astra

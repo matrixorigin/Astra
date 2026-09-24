@@ -3,11 +3,39 @@ use super::super::*;
 pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
     router
         .route(
+            "/evaluation/experiments",
+            post(evaluation::create_experiment_handler),
+        )
+        .route(
+            "/evaluation/experiments/prepare",
+            post(evaluation::prepare_experiment_handler),
+        )
+        .route(
+            "/evaluation/experiments/by-submission/{submission_idempotency_key}",
+            get(evaluation::get_experiment_by_submission_handler),
+        )
+        .route(
+            "/evaluation/experiments/{experiment_id}/trials/{trial_id}/start",
+            post(evaluation::start_trial_handler),
+        )
+        .route(
+            "/evaluation/experiments/{experiment_id}/trials/{trial_id}/assess",
+            post(evaluation::assess_trial_handler),
+        )
+        .route(
+            "/evaluation/experiments/{experiment_id}",
+            get(evaluation::get_experiment_projection_handler)
+                .delete(evaluation::delete_experiment_handler),
+        )
+        .route(
+            "/evaluation/experiments/{experiment_id}/report",
+            get(evaluation::get_experiment_report_handler),
+        )
+        .route(
             "/evaluation/quality/trend",
             get(evaluation::quality_trend_handler),
         )
         .route("/evaluation/drift", get(evaluation::drift_handler))
-        .route("/evaluation/gates", get(evaluation::gate_history_handler))
         .route(
             "/evaluation/calibration",
             get(evaluation::calibration_handler),
@@ -16,12 +44,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             "/evaluation/sessions/scores",
             get(evaluation::session_scores_handler),
         )
-        .route(
-            "/evaluation/gate/validate",
-            post(evaluation::gate_validate_handler),
-        )
-        .route("/evaluation/drift/run", post(evaluation::drift_run_handler))
-        .route("/evaluation/loop", post(evaluation::closed_loop_handler))
         .route(
             "/evaluation/trust-report",
             get(evaluation::trust_report_handler),

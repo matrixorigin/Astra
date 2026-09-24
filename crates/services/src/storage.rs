@@ -107,7 +107,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-22-v89";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-22-v91";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -2835,6 +2835,23 @@ fn inference_invocation_schema_mismatches(
             ));
         }
     }
+    let Some(terminal_attempt_id) = columns.get("terminal_attempt_id") else {
+        reasons.push("missing nullable column terminal_attempt_id".to_string());
+        return reasons;
+    };
+    if !terminal_attempt_id
+        .data_type
+        .eq_ignore_ascii_case("varchar")
+        || terminal_attempt_id.character_maximum_length != Some(64)
+        || !terminal_attempt_id.nullable
+    {
+        reasons.push(format!(
+            "column terminal_attempt_id has type {}({:?}) nullable={}, expected nullable varchar(64)",
+            terminal_attempt_id.data_type,
+            terminal_attempt_id.character_maximum_length,
+            terminal_attempt_id.nullable
+        ));
+    }
     reasons
 }
 
@@ -2850,7 +2867,7 @@ async fn verify_inference_invocation_schema_contract(
          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
            AND COLUMN_NAME IN ('admission_token', 'owner_token', 'owner_generation',
                                'owner_lease_expires_at', 'usage_status',
-                               'provider_delivery_state')",
+                               'provider_delivery_state', 'terminal_attempt_id')",
     )
     .bind(database)
     .bind(table)
@@ -2885,6 +2902,35 @@ async fn verify_inference_invocation_schema_contract(
         "obsolete core schema table {table} is unsupported; recreate the database before startup: {}",
         reasons.join(", ")
     )))
+}
+
+async fn verify_inference_route_schema_contract(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    validate_schema_identifier(database, "matrixone database")?;
+    let row = query(
+        "SELECT DATA_TYPE, IS_NULLABLE
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'inference_routes'
+           AND COLUMN_NAME = 'pricing_json'",
+    )
+    .bind(database)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Err(sqlx::Error::Protocol(
+            "obsolete core schema table inference_routes requires pricing_json; rebuild the pre-release table before startup".into(),
+        ));
+    };
+    let data_type: String = row.try_get("DATA_TYPE")?;
+    let nullable: String = row.try_get("IS_NULLABLE")?;
+    if !data_type.eq_ignore_ascii_case("json") || nullable != "YES" {
+        return Err(sqlx::Error::Protocol(format!(
+            "obsolete core schema table inference_routes has pricing_json {data_type} {nullable}; expected nullable JSON"
+        )));
+    }
+    Ok(())
 }
 
 async fn verify_inference_provider_attempt_schema_contract(
@@ -3452,6 +3498,7 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
+
     core_schema_create!(
         pool,
         "auth_roles",
@@ -3464,7 +3511,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-
     core_schema_create!(
         pool,
         "auth_user_roles",
@@ -3613,6 +3659,7 @@ async fn ensure_core_schema_while_leased(
             metadata JSON NULL,
             project_id VARCHAR(128) NULL,
             provider_creation_hash CHAR(64) NULL,
+            bootstrap_creation_hash CHAR(64) NULL,
             project_retention_policy VARCHAR(32) NOT NULL DEFAULT 'session',
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -3690,6 +3737,154 @@ async fn ensure_core_schema_while_leased(
         .execute(&pool)
         .await?;
 
+    // Generic evaluation registration and trial identity. These tables only
+    // bind immutable Eval plans to the canonical Session/Run backbone; they
+    // are deliberately owner-scoped and do not hold a second run lifecycle.
+    core_schema_create!(
+        pool,
+        "evaluation_experiments",
+        "CREATE TABLE IF NOT EXISTS evaluation_experiments (
+            owner_user_id VARCHAR(128) NOT NULL,
+            experiment_id VARCHAR(128) NOT NULL,
+            spec_fingerprint VARCHAR(128) NOT NULL,
+            spec_json LONGTEXT NOT NULL,
+            submission_idempotency_key VARCHAR(128) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (owner_user_id, experiment_id),
+            UNIQUE KEY uq_eval_experiment_submission
+                (owner_user_id, submission_idempotency_key),
+            INDEX idx_eval_experiments_owner_updated
+                (owner_user_id, updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    core_schema_create!(
+        pool,
+        "evaluation_trial_bindings",
+        "CREATE TABLE IF NOT EXISTS evaluation_trial_bindings (
+            owner_user_id VARCHAR(128) NOT NULL,
+            trial_id VARCHAR(128) NOT NULL,
+            experiment_id VARCHAR(128) NOT NULL,
+            spec_fingerprint VARCHAR(128) NOT NULL,
+            sequence_num INT NOT NULL,
+            trial_json LONGTEXT NOT NULL,
+            binding_status VARCHAR(32) NOT NULL DEFAULT 'planned',
+            session_id VARCHAR(64) NULL,
+            run_id VARCHAR(64) NULL,
+            run_generation BIGINT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (owner_user_id, trial_id),
+            UNIQUE KEY uq_eval_trial_sequence
+                (owner_user_id, experiment_id, sequence_num),
+            UNIQUE KEY uq_eval_trial_run (owner_user_id, run_id),
+            INDEX idx_eval_trials_owner_binding
+                (owner_user_id, binding_status, updated_at),
+            CONSTRAINT chk_eval_trial_binding_status
+                CHECK (binding_status IN ('planned', 'bound')),
+            CONSTRAINT chk_eval_trial_binding_refs
+                CHECK (
+                    (binding_status = 'planned' AND session_id IS NULL AND run_id IS NULL
+                     AND run_generation IS NULL)
+                    OR
+                    (binding_status = 'bound' AND session_id IS NOT NULL AND run_id IS NOT NULL
+                     AND run_generation IS NOT NULL)
+                )
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    core_schema_create!(
+        pool,
+        "evaluation_materialization_receipts",
+        "CREATE TABLE IF NOT EXISTS evaluation_materialization_receipts (
+            schema_version INT NOT NULL DEFAULT 1,
+            owner_user_id VARCHAR(128) NOT NULL,
+            receipt_id VARCHAR(64) NOT NULL,
+            experiment_id VARCHAR(128) NOT NULL,
+            trial_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            spec_fingerprint VARCHAR(128) NOT NULL,
+            envelope_id VARCHAR(64) NOT NULL,
+            envelope_fingerprint VARCHAR(128) NOT NULL,
+            component_kind VARCHAR(32) NOT NULL,
+            component_snapshot_ref VARCHAR(2048) NULL,
+            component_base_snapshot_ref VARCHAR(2048) NULL,
+            component_content_fingerprint VARCHAR(128) NULL,
+            outcome VARCHAR(32) NOT NULL,
+            failure_code VARCHAR(128) NULL,
+            materializer_kind VARCHAR(128) NOT NULL,
+            provider_binding_id VARCHAR(128) NULL,
+            execution_run_id VARCHAR(128) NULL,
+            execution_run_generation BIGINT NULL,
+            request_fingerprint VARCHAR(128) NOT NULL,
+            idempotency_key VARCHAR(128) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            expires_at DATETIME(6) NULL,
+            PRIMARY KEY (owner_user_id, receipt_id),
+            UNIQUE KEY uq_eval_materialization_idempotency
+                (owner_user_id, idempotency_key),
+            INDEX idx_eval_materialization_owner_trial
+                (owner_user_id, trial_id, created_at, receipt_id),
+            INDEX idx_eval_materialization_owner_expiry
+                (owner_user_id, expires_at),
+            CONSTRAINT chk_eval_materialization_outcome
+                CHECK (outcome IN ('available', 'unavailable', 'failed')),
+            CONSTRAINT chk_eval_materialization_component
+                CHECK (component_kind IN ('context', 'policy', 'memory', 'data', 'workspace'))
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    core_schema_create!(
+        pool,
+        "evaluation_task_assessments",
+        "CREATE TABLE IF NOT EXISTS evaluation_task_assessments (
+            owner_user_id VARCHAR(128) NOT NULL,
+            trial_id VARCHAR(128) NOT NULL,
+            experiment_id VARCHAR(128) NOT NULL,
+            assessment_id VARCHAR(128) NOT NULL,
+            assessment_json LONGTEXT NOT NULL,
+            PRIMARY KEY (owner_user_id, trial_id),
+            UNIQUE KEY uq_eval_task_assessment_id (owner_user_id, assessment_id),
+            INDEX idx_eval_task_assessment_experiment (owner_user_id, experiment_id, trial_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    core_schema_create!(
+        pool,
+        "evaluation_trial_observations",
+        "CREATE TABLE IF NOT EXISTS evaluation_trial_observations (
+            schema_version INT NOT NULL DEFAULT 2,
+            owner_user_id VARCHAR(128) NOT NULL,
+            observation_id VARCHAR(64) NOT NULL,
+            experiment_id VARCHAR(128) NOT NULL,
+            trial_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            execution_run_id VARCHAR(128) NOT NULL,
+            admission_run_generation BIGINT NOT NULL,
+            execution_run_generation BIGINT NOT NULL,
+            spec_fingerprint VARCHAR(128) NOT NULL,
+            observation_json LONGTEXT NOT NULL,
+            materialization_receipt_ids_json TEXT NOT NULL,
+            request_fingerprint VARCHAR(128) NOT NULL,
+            idempotency_key VARCHAR(128) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (owner_user_id, observation_id),
+            UNIQUE KEY uq_eval_observation_trial (owner_user_id, trial_id),
+            UNIQUE KEY uq_eval_observation_idempotency (owner_user_id, idempotency_key),
+            INDEX idx_eval_observation_owner_experiment
+                (owner_user_id, experiment_id, created_at, observation_id),
+            INDEX idx_eval_observation_owner_run
+                (owner_user_id, execution_run_id, execution_run_generation)
+        )",
+    )
+    .execute(&pool)
+    .await?;
     core_schema_create!(
         pool,
         "agent_session_execution_slots",
@@ -5181,6 +5376,7 @@ async fn ensure_core_schema_while_leased(
             execution_placement VARCHAR(32) NOT NULL,
             access_kind VARCHAR(32) NOT NULL,
             purpose VARCHAR(64) NOT NULL,
+            pricing_json JSON NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, route_id),
             CONSTRAINT chk_inference_routes_scope_kind
@@ -5221,6 +5417,7 @@ async fn ensure_core_schema_while_leased(
             purpose VARCHAR(64) NOT NULL,
             status VARCHAR(32) NOT NULL,
             terminal_fingerprint CHAR(64) NULL,
+            terminal_attempt_id VARCHAR(64) NULL,
             usage_status VARCHAR(32) NOT NULL,
             provider_delivery_state VARCHAR(32) NOT NULL,
             input_tokens BIGINT NOT NULL DEFAULT 0,
@@ -6128,28 +6325,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    core_schema_create!(
-        pool,
-        "user_skill_evaluations",
-        "CREATE TABLE IF NOT EXISTS user_skill_evaluations (
-            evaluation_id VARCHAR(128) PRIMARY KEY,
-            owner_user_id VARCHAR(128) NOT NULL,
-            source_id VARCHAR(128) NOT NULL,
-            version_id VARCHAR(128) NOT NULL,
-            run_id VARCHAR(128) NULL,
-            hits BIGINT NOT NULL DEFAULT 0,
-            suspects BIGINT NOT NULL DEFAULT 0,
-            false_positives BIGINT NOT NULL DEFAULT 0,
-            payload_json LONGTEXT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_user_skill_eval_owner_source_created (owner_user_id, source_id, created_at),
-            INDEX idx_user_skill_eval_owner_version_created (owner_user_id, version_id, created_at),
-            INDEX idx_user_skill_eval_owner_run (owner_user_id, run_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     core_schema_create!(pool, "skill_installations",
         "CREATE TABLE IF NOT EXISTS skill_installations (
             installation_id  VARCHAR(36) PRIMARY KEY,
@@ -6162,26 +6337,6 @@ async fn ensure_core_schema_while_leased(
             updated_at       DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
             UNIQUE INDEX idx_si_user_skill (user_id, skill_name),
             INDEX idx_si_status (status)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "skill_settings",
-        "CREATE TABLE IF NOT EXISTS skill_settings (
-            setting_id    VARCHAR(36) PRIMARY KEY,
-            skill_id      VARCHAR(36),
-            skill_name    VARCHAR(128) NOT NULL,
-            setting_name  VARCHAR(128) NOT NULL,
-            setting_value TEXT,
-            is_secret     SMALLINT NOT NULL DEFAULT 0,
-            scope_type    VARCHAR(32) NOT NULL DEFAULT 'global',
-            scope_id      VARCHAR(36),
-            updated_by    VARCHAR(128),
-            created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-            UNIQUE INDEX idx_ss_skill_setting_scope (skill_name, setting_name, scope_type, scope_id),
-            INDEX idx_ss_skill (skill_name)
         )",
     )
     .execute(&pool)
@@ -6200,41 +6355,6 @@ async fn ensure_core_schema_while_leased(
             updated_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
             UNIQUE INDEX idx_rld_host_port (domain_host, domain_port),
             INDEX idx_rld_enabled (is_enabled)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "skill_resource_bindings",
-        "CREATE TABLE IF NOT EXISTS skill_resource_bindings (
-            binding_id    VARCHAR(36) PRIMARY KEY,
-            user_id       VARCHAR(128) NOT NULL,
-            skill_name    VARCHAR(128) NOT NULL,
-            resource_type VARCHAR(64) NOT NULL,
-            resource_key  VARCHAR(128) NOT NULL,
-            binding_name  VARCHAR(128) NOT NULL,
-            binding_value TEXT,
-            is_secret     SMALLINT NOT NULL DEFAULT 0,
-            updated_by    VARCHAR(128),
-            created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-            INDEX idx_srb_user_skill (user_id, skill_name),
-            INDEX idx_srb_resource (resource_type, resource_key)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "skill_user_credentials",
-        "CREATE TABLE IF NOT EXISTS skill_user_credentials (
-            credential_id   VARCHAR(36) PRIMARY KEY,
-            user_id         VARCHAR(128) NOT NULL,
-            skill_name      VARCHAR(128) NOT NULL,
-            credential_name VARCHAR(128) NOT NULL,
-            value_encrypted TEXT NOT NULL,
-            created_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-            UNIQUE INDEX idx_suc_user_skill_cred (user_id, skill_name, credential_name)
         )",
     )
     .execute(&pool)
@@ -6319,27 +6439,6 @@ async fn ensure_core_schema_while_leased(
     .await?;
 
     // ─── Evaluation tables ───────────────────────────────────────────────────────
-
-    core_schema_create!(
-        pool,
-        "eval_gate_results",
-        "CREATE TABLE IF NOT EXISTS eval_gate_results (
-            gate_id         VARCHAR(36) PRIMARY KEY,
-            user_id         VARCHAR(128) NULL,
-            change_type     VARCHAR(64) NOT NULL,
-            change_id       VARCHAR(64) NOT NULL,
-            sessions_tested INT NOT NULL DEFAULT 0,
-            error_rate      DECIMAL(5,4),
-            score_delta     DECIMAL(5,4),
-            passed          SMALLINT NOT NULL DEFAULT 0,
-            created_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_egr_user_created (user_id, created_at),
-            INDEX idx_egr_change (change_type, change_id),
-            INDEX idx_egr_passed (passed)
-        )",
-    )
-    .execute(&pool)
-    .await?;
 
     core_schema_create!(pool, "eval_quality_assessments",
         "CREATE TABLE IF NOT EXISTS eval_quality_assessments (
@@ -6550,6 +6649,7 @@ async fn verify_core_schema_shape(
             &[
                 "delete_requested_at",
                 "provider_creation_hash",
+                "bootstrap_creation_hash",
                 "project_id",
                 "project_retention_policy",
             ][..],
@@ -7565,6 +7665,7 @@ async fn verify_core_schema_shape(
         &["scope_kind", "operation_id"],
     )
     .await?;
+    verify_inference_route_schema_contract(pool, database).await?;
     verify_inference_invocation_schema_contract(pool, database).await?;
     verify_inference_provider_attempt_schema_contract(pool, database).await?;
     verify_inference_canonical_transition_head_schema_contract(pool, database).await?;
@@ -9099,10 +9200,29 @@ mod tests {
                     nullable: false,
                 },
             ),
+            (
+                "terminal_attempt_id".to_string(),
+                ObservedColumnShape {
+                    data_type: "varchar".to_string(),
+                    character_maximum_length: Some(64),
+                    nullable: true,
+                },
+            ),
         ]
         .into_iter()
         .collect();
         assert!(inference_invocation_schema_mismatches(&exact).is_empty());
+
+        let mut missing_terminal_attempt = exact.clone();
+        missing_terminal_attempt.remove("terminal_attempt_id");
+        assert!(!inference_invocation_schema_mismatches(&missing_terminal_attempt).is_empty());
+
+        let mut required_terminal_attempt = exact.clone();
+        required_terminal_attempt
+            .get_mut("terminal_attempt_id")
+            .unwrap()
+            .nullable = false;
+        assert!(!inference_invocation_schema_mismatches(&required_terminal_attempt).is_empty());
 
         let mut nullable = exact.clone();
         nullable.get_mut("admission_token").unwrap().nullable = true;

@@ -1146,8 +1146,7 @@ fn collect_session_artifact_handles(
 }
 
 fn parse_complete_text_json(outcome: &RunOutcome) -> Result<serde_json::Value, String> {
-    serde_json::from_str(outcome.text.trim())
-        .map_err(|error| format!("assistant text is not exactly one JSON value: {error}"))
+    astra_services::evaluation::task_verifier::parse_complete_json(&outcome.text)
 }
 
 fn required_json_array<'a>(
@@ -1474,18 +1473,9 @@ fn evaluate_one(
         }
         Criterion::TextJsonValue { path, equals } => {
             let result = parse_complete_text_json(outcome).and_then(|document| {
-                document
-                    .pointer(path)
-                    .ok_or_else(|| format!("JSON pointer {path:?} is absent"))
-                    .and_then(|actual| {
-                        if actual == equals {
-                            Ok(())
-                        } else {
-                            Err(format!(
-                                "JSON pointer {path:?} did not equal its expected value"
-                            ))
-                        }
-                    })
+                astra_services::evaluation::task_verifier::verify_json_pointer(
+                    &document, path, equals,
+                )
             });
             CriterionResult {
                 criterion: c.clone(),

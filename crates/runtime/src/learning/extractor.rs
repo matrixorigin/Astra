@@ -20,7 +20,7 @@ use astra_services::{LessonKind, NewLesson};
 use crate::observability::ObservabilitySession;
 
 /// Minimal session-end signal bundle. The runtime already tracks every
-/// field in `TurnState` / `ImprovementTracker`; this struct is just the
+/// fields in `TurnState`; this struct is just the
 /// view the extractor needs, so the extractor stays independent of those
 /// concrete types.
 #[derive(Debug, Clone, Default, PartialEq)]

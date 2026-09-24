@@ -635,6 +635,7 @@ mod tests {
         let agent = AgentContext::default();
         let latches = SessionLatches::default();
         let session = SessionContext {
+            compaction_thresholds: Default::default(),
             session_id: "s1".into(),
             run_id: "r1".into(),
             model_id: "m1".into(),
@@ -681,6 +682,7 @@ mod tests {
         };
 
         let plan_input = PlanInput {
+            compaction_thresholds: Default::default(),
             tokens: &turn.tokens,
             model_limit: 100_000,
             pre_reserved_output_tokens: 0,

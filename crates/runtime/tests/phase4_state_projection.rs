@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use astra_services::{
     BubbleUpTarget, DatabasePersonalSkillStore, DatabaseRunStateStore,
-    DatabaseStateProjectionStore, DelegationProjectionUpsert, SubmitUserSkillVersion,
+    DatabaseStateProjectionStore, DelegationProjectionUpsert, StateProjectionError,
+    SubmitUserSkillVersion,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -428,7 +429,13 @@ async fn personal_skill_activation_pins_version_and_records_ui_events() {
     insert_session(&pool, &session_id, &user_id).await;
     let version_id = publish_personal_skill_version(&pool, &user_id, "review_changes").await;
     DatabaseStateProjectionStore::new(pool.clone())
-        .activate_personal_skill_from_ui(&user_id, &session_id, "review_changes", &version_id)
+        .activate_personal_skill_from_ui_with_expected(
+            &user_id,
+            &session_id,
+            "review_changes",
+            &version_id,
+            None,
+        )
         .await
         .unwrap();
     let payload = sqlx::query(
@@ -461,6 +468,439 @@ async fn personal_skill_activation_pins_version_and_records_ui_events() {
     .unwrap();
     assert_eq!(row.try_get::<i64, _>("ui_events").unwrap(), 1);
     assert_eq!(row.try_get::<i64, _>("state_events").unwrap(), 1);
+}
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn l2_43_skill_activation_compare_and_set_rejects_stale_writer() {
+    let pool = setup_pool().await;
+    let (session_id, user_id, _) = ids();
+    insert_session(&pool, &session_id, &user_id).await;
+    let first = publish_personal_skill_version(&pool, &user_id, "cas_skill").await;
+    let second = publish_personal_skill_version(&pool, &user_id, "cas_skill").await;
+    let store = DatabaseStateProjectionStore::new(pool.clone());
+    store
+        .activate_personal_skill_from_ui_with_expected(
+            &user_id,
+            &session_id,
+            "cas_skill",
+            &first,
+            None,
+        )
+        .await
+        .expect("first activation");
+    let conflict = store
+        .activate_personal_skill_from_ui_with_expected(
+            &user_id,
+            &session_id,
+            "cas_skill",
+            &second,
+            None,
+        )
+        .await
+        .expect_err("stale writer must not replace the active version");
+    assert!(matches!(
+        conflict,
+        StateProjectionError::PersonalSkillActivationConflict {
+            expected: None,
+            actual: Some(_),
+            ..
+        }
+    ));
+    store
+        .activate_personal_skill_from_ui_with_expected(
+            &user_id,
+            &session_id,
+            "cas_skill",
+            &second,
+            Some(&first),
+        )
+        .await
+        .expect("compare-and-set replacement");
+}
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn l2_44_skill_activation_concurrent_writers_have_one_winner() {
+    let pool = setup_pool().await;
+    let (session_id, user_id, _) = ids();
+    insert_session(&pool, &session_id, &user_id).await;
+    let first = publish_personal_skill_version(&pool, &user_id, "concurrent_skill").await;
+    let second = publish_personal_skill_version(&pool, &user_id, "concurrent_skill").await;
+    let store = Arc::new(DatabaseStateProjectionStore::new(pool.clone()));
+    let left_store = store.clone();
+    let right_store = store.clone();
+    let (left, right) = tokio::join!(
+        left_store.activate_personal_skill_from_ui_with_expected(
+            &user_id,
+            &session_id,
+            "concurrent_skill",
+            &first,
+            None,
+        ),
+        right_store.activate_personal_skill_from_ui_with_expected(
+            &user_id,
+            &session_id,
+            "concurrent_skill",
+            &second,
+            None,
+        ),
+    );
+    let results = [left, right];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(
+                result,
+                Err(StateProjectionError::PersonalSkillActivationConflict { .. })
+            ))
+            .count(),
+        1,
+        "the losing writer must observe a CAS conflict"
+    );
+    let row = sqlx::query(
+        "SELECT
+          (SELECT COUNT(*) FROM agent_events
+           WHERE session_id = ? AND user_id = ? AND event_type = 'ui.skill.activate') AS agent_events,
+          (SELECT COUNT(*) FROM session_state_item_events
+           WHERE session_id = ? AND user_id = ? AND category = 'active_skill') AS state_events",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&user_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(row.try_get::<i64, _>("agent_events").unwrap(), 1);
+    assert_eq!(row.try_get::<i64, _>("state_events").unwrap(), 1);
+}
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn l2_45_skill_activation_retry_requires_current_baseline() {
+    let pool = setup_pool().await;
+    let (session_id, user_id, _) = ids();
+    insert_session(&pool, &session_id, &user_id).await;
+    let version = publish_personal_skill_version(&pool, &user_id, "retry_skill").await;
+    let store = DatabaseStateProjectionStore::new(pool.clone());
+    store
+        .activate_personal_skill_from_ui_with_expected(
+            &user_id,
+            &session_id,
+            "retry_skill",
+            &version,
+            None,
+        )
+        .await
+        .unwrap();
+    let before = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM agent_events
+         WHERE session_id = ? AND user_id = ? AND event_type = 'ui.skill.activate'",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    store
+        .activate_personal_skill_from_ui_with_expected(
+            &user_id,
+            &session_id,
+            "retry_skill",
+            &version,
+            Some(&version),
+        )
+        .await
+        .expect("same target with current baseline is idempotent");
+    let after = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM agent_events
+         WHERE session_id = ? AND user_id = ? AND event_type = 'ui.skill.activate'",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(before, after, "idempotent retry must not append an event");
+    assert!(matches!(
+        store
+            .activate_personal_skill_from_ui_with_expected(
+                &user_id,
+                &session_id,
+                "retry_skill",
+                &version,
+                None,
+            )
+            .await,
+        Err(StateProjectionError::PersonalSkillActivationConflict {
+            expected: None,
+            actual: Some(_),
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn l2_46_skill_activation_rejects_corrupt_target_hash_without_writes() {
+    let pool = setup_pool().await;
+    let (session_id, user_id, _) = ids();
+    insert_session(&pool, &session_id, &user_id).await;
+    let skill_name = format!("corrupt-target-{}", Uuid::new_v4());
+    let version_id = publish_personal_skill_version(&pool, &user_id, &skill_name).await;
+    sqlx::query(
+        "UPDATE user_skill_versions SET content_hash = 'sha256:corrupt' WHERE version_id = ?",
+    )
+    .bind(&version_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    let error = DatabaseStateProjectionStore::new(pool.clone())
+        .activate_personal_skill_from_ui_with_expected(
+            &user_id,
+            &session_id,
+            &skill_name,
+            &version_id,
+            None,
+        )
+        .await
+        .expect_err("content hash corruption must fail closed");
+    assert!(matches!(
+        error,
+        StateProjectionError::InvalidDatabaseValue {
+            operation: "validate_skill_activation_version",
+            column: "content_hash",
+            ..
+        }
+    ));
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM agent_events
+         WHERE session_id = ? AND user_id = ? AND event_type = 'ui.skill.activate'",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(count, 0, "failed validation must leave no activation event");
+}
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn l2_47_skill_activation_rejects_corrupt_projection_without_replacement() {
+    let pool = setup_pool().await;
+    let (session_id, user_id, _) = ids();
+    insert_session(&pool, &session_id, &user_id).await;
+    let skill_name = format!("corrupt-projection-{}", Uuid::new_v4());
+    let first = publish_personal_skill_version(&pool, &user_id, &skill_name).await;
+    let second = publish_personal_skill_version(&pool, &user_id, &skill_name).await;
+    let store = DatabaseStateProjectionStore::new(pool.clone());
+    store
+        .activate_personal_skill_from_ui_with_expected(
+            &user_id,
+            &session_id,
+            &skill_name,
+            &first,
+            None,
+        )
+        .await
+        .unwrap();
+    let payload = json!({
+        "skill_name": skill_name,
+        "version_id": first,
+        "content_hash": "sha256:corrupt-projection",
+        "activation_source": "ui_structured_intent",
+        "llm_involved": false,
+    });
+    sqlx::query(
+        "UPDATE session_state_items
+         SET payload_json = ?
+         WHERE user_id = ? AND session_id = ? AND category = 'active_skill' AND item_key = ?",
+    )
+    .bind(payload.to_string())
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&skill_name)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    let error = store
+        .activate_personal_skill_from_ui_with_expected(
+            &user_id,
+            &session_id,
+            &skill_name,
+            &second,
+            Some(&first),
+        )
+        .await
+        .expect_err("corrupt projection must fail closed");
+    assert!(matches!(
+        error,
+        StateProjectionError::InvalidDatabaseValue {
+            operation: "validate_current_skill_activation_hash",
+            ..
+        }
+    ));
+    let active_version = sqlx::query_scalar::<_, String>(
+        "SELECT JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.version_id'))
+         FROM session_state_items
+         WHERE user_id = ? AND session_id = ? AND category = 'active_skill' AND item_key = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&skill_name)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        active_version, first,
+        "failed replacement must preserve revision"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn l2_48_skill_activation_rolls_back_when_event_count_update_fails() {
+    let pool = setup_pool().await;
+    let (session_id, user_id, _) = ids();
+    insert_session(&pool, &session_id, &user_id).await;
+    let skill_name = format!("rollback-{}", Uuid::new_v4());
+    let version_id = publish_personal_skill_version(&pool, &user_id, &skill_name).await;
+    sqlx::query(
+        "UPDATE agent_sessions
+         SET event_count = 9223372036854775807
+         WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    let error = DatabaseStateProjectionStore::new(pool.clone())
+        .activate_personal_skill_from_ui_with_expected(
+            &user_id,
+            &session_id,
+            &skill_name,
+            &version_id,
+            None,
+        )
+        .await
+        .expect_err("event-count overflow must fail activation");
+    assert!(matches!(
+        error,
+        StateProjectionError::Database {
+            operation: "skill_activation_event_count_delta",
+            ..
+        }
+    ));
+    let row = sqlx::query(
+        "SELECT
+          (SELECT COUNT(*) FROM agent_events
+           WHERE session_id = ? AND user_id = ? AND event_type = 'ui.skill.activate') AS agent_events,
+          (SELECT COUNT(*) FROM session_state_items
+           WHERE session_id = ? AND user_id = ? AND category = 'active_skill' AND item_key = ?) AS state_items,
+          (SELECT event_count FROM agent_sessions
+           WHERE session_id = ? AND user_id = ?) AS event_count",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&user_id)
+    .bind(&skill_name)
+    .bind(&session_id)
+    .bind(&user_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(row.try_get::<i64, _>("agent_events").unwrap(), 0);
+    assert_eq!(row.try_get::<i64, _>("state_items").unwrap(), 0);
+    assert_eq!(
+        row.try_get::<i64, _>("event_count").unwrap(),
+        i64::MAX,
+        "failed activation must roll back the event-count write too"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn l2_49_skill_activation_is_isolated_by_owner_and_session() {
+    let pool = setup_pool().await;
+    let (session_a, user_a, _) = ids();
+    let session_b = format!("session-{}", Uuid::new_v4());
+    let user_b = format!("user-{}", Uuid::new_v4());
+    insert_session(&pool, &session_a, &user_a).await;
+    insert_session(&pool, &session_b, &user_a).await;
+    insert_session(&pool, &format!("session-{}", Uuid::new_v4()), &user_b).await;
+    let skill_name = format!("scoped-{}", Uuid::new_v4());
+    let version_id = publish_personal_skill_version(&pool, &user_a, &skill_name).await;
+    let store = Arc::new(DatabaseStateProjectionStore::new(pool.clone()));
+    let (first, second) = tokio::join!(
+        store.activate_personal_skill_from_ui_with_expected(
+            &user_a,
+            &session_a,
+            &skill_name,
+            &version_id,
+            None,
+        ),
+        store.activate_personal_skill_from_ui_with_expected(
+            &user_a,
+            &session_b,
+            &skill_name,
+            &version_id,
+            None,
+        ),
+    );
+    first.expect("session A activation");
+    second.expect("session B activation");
+    let foreign_session = sqlx::query_scalar::<_, String>(
+        "SELECT session_id FROM agent_sessions
+         WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(&user_b)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert!(matches!(
+        store
+            .activate_personal_skill_from_ui_with_expected(
+                &user_b,
+                &foreign_session,
+                &skill_name,
+                &version_id,
+                None,
+            )
+            .await,
+        Err(StateProjectionError::PersonalSkillVersionUnavailable { .. })
+    ));
+    let own_state_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM session_state_items
+         WHERE user_id = ? AND category = 'active_skill' AND item_key = ?",
+    )
+    .bind(&user_a)
+    .bind(&skill_name)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        own_state_count, 2,
+        "concurrent sessions must each receive an owner-scoped projection"
+    );
+    let state_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM session_state_items
+         WHERE user_id = ? AND session_id = ? AND category = 'active_skill' AND item_key = ?",
+    )
+    .bind(&user_b)
+    .bind(&foreign_session)
+    .bind(&skill_name)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        state_count, 0,
+        "foreign owner must not receive a projection"
+    );
 }
 
 #[tokio::test]

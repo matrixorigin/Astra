@@ -946,6 +946,7 @@ fn request(
         args: serde_json::json!({}),
         workspace,
         workspace_record: None,
+        evaluation_workspace: None,
         executor,
         runtime: None,
         runtime_process_authorization: None,
@@ -3828,7 +3829,12 @@ async fn edge_dispatch_waiter_poller_and_callback_do_not_require_sticky_pod() {
             } => {
                 assert_eq!(request_id, row.request_id);
                 assert_eq!(tool, "bash");
-                assert_eq!(args, serde_json::json!({}));
+                assert_eq!(
+                    args,
+                    serde_json::json!({
+                        "__astra_workspace_dir": "/Users/test/project"
+                    })
+                );
                 assert!(timeout_secs > 0);
             }
             other => panic!("expected tool request payload, got {other:?}"),
@@ -5050,6 +5056,7 @@ fn edge_executor_id_returns_none_for_empty_id() {
             authority: WorkspaceAuthority::ReadWrite,
         },
         workspace_record: None,
+        evaluation_workspace: None,
         runtime: None,
         runtime_process_authorization: None,
         runtime_process_authorization_required: false,
@@ -5090,6 +5097,7 @@ fn edge_executor_id_rejects_whitespace_only_id() {
             authority: WorkspaceAuthority::ReadWrite,
         },
         workspace_record: None,
+        evaluation_workspace: None,
         runtime: None,
         runtime_process_authorization: None,
         runtime_process_authorization_required: false,
@@ -5130,6 +5138,7 @@ fn edge_executor_id_returns_some_for_valid_id() {
             authority: WorkspaceAuthority::ReadWrite,
         },
         workspace_record: None,
+        evaluation_workspace: None,
         runtime: None,
         runtime_process_authorization: None,
         runtime_process_authorization_required: false,
