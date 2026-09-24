@@ -8046,6 +8046,7 @@ impl AgenticRunLifecycleService {
                 "cache_creation_tokens": physical.cache_creation_tokens,
                 "completion_tokens": physical.output_tokens,
             })),
+            "last_request_input_tokens": loop_state.last_measured_prompt_tokens,
         });
         usage["tool_outcomes"] = serde_json::to_value(
             astra_services::session_journal::ToolOutcomeSummary::from_records(

@@ -50,6 +50,9 @@ pub struct TokenUsagePresence {
     pub cache_read_tokens: bool,
     pub cache_creation_tokens: bool,
     pub output_tokens: bool,
+    /// Inclusive input reported for this physical request. This remains
+    /// useful for context limits when cache billing lanes are incomplete.
+    pub measured_input_tokens: Option<u64>,
     /// Irreversible raw evidence defects within one physical attempt.
     pub input_invalid: bool,
     pub output_invalid: bool,
@@ -61,12 +64,16 @@ impl TokenUsagePresence {
         self.cache_read_tokens |= other.cache_read_tokens;
         self.cache_creation_tokens |= other.cache_creation_tokens;
         self.output_tokens |= other.output_tokens;
+        if other.measured_input_tokens.is_some() {
+            self.measured_input_tokens = other.measured_input_tokens;
+        }
         self.input_invalid |= other.input_invalid;
         self.output_invalid |= other.output_invalid;
         if self.input_invalid {
             self.fresh_input_tokens = false;
             self.cache_read_tokens = false;
             self.cache_creation_tokens = false;
+            self.measured_input_tokens = None;
         }
         if self.output_invalid {
             self.output_tokens = false;
@@ -118,6 +125,21 @@ impl TokenUsage {
         }
         presence.merge(observed);
         self.quarantine(presence);
+        // Disjoint providers can update just one cumulative lane per frame.
+        // Recompute from the retained qualified lanes, never from a previous
+        // frame's sum or a partial update's zero-filled projection.
+        presence.measured_input_tokens = if !presence.input_invalid
+            && presence.fresh_input_tokens
+            && presence.cache_read_tokens
+            && presence.cache_creation_tokens
+        {
+            self.input_tokens
+                .checked_add(self.cached_input_tokens)
+                .and_then(|total| total.checked_add(self.cache_creation_tokens))
+                .filter(|total| i64::try_from(*total).is_ok())
+        } else {
+            None
+        };
     }
 
     fn quarantine(&mut self, presence: &mut TokenUsagePresence) {
@@ -460,6 +482,8 @@ fn parse_openai_usage(
         cache_read_tokens: cached.is_some(),
         cache_creation_tokens: creation.is_some(),
         output_tokens: output.is_some(),
+        measured_input_tokens: prompt
+            .filter(|_| !input_invalid && !partition_conflict && !alias_conflict),
         input_invalid,
         output_invalid,
     };
@@ -476,6 +500,7 @@ fn parse_openai_usage(
         presence.fresh_input_tokens = false;
         presence.cache_read_tokens = false;
         presence.cache_creation_tokens = false;
+        presence.measured_input_tokens = None;
     }
     Some((usage, presence))
 }
@@ -523,6 +548,10 @@ fn parse_disjoint_usage(
         cache_read_tokens: cached.is_some(),
         cache_creation_tokens: creation.is_some(),
         output_tokens: output.is_some(),
+        measured_input_tokens: input
+            .and_then(|input| input.checked_add(cached?))
+            .and_then(|input| input.checked_add(creation?))
+            .filter(|total| i64::try_from(*total).is_ok()),
         input_invalid: input_invalid || cached_invalid || creation_invalid,
         output_invalid,
     };
@@ -532,6 +561,29 @@ fn parse_disjoint_usage(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inclusive_prompt_measurement_is_independent_of_cache_billing_completeness() {
+        let partial = serde_json::json!({
+            "prompt_tokens": 100_000,
+            "completion_tokens": 20,
+            "prompt_tokens_details": {"cached_tokens": 90_000}
+        });
+        let (_, presence) =
+            super::parse_usage(super::UsageDialect::OpenAi, partial.as_object().unwrap()).unwrap();
+        assert_eq!(presence.measured_input_tokens, Some(100_000));
+        assert!(!presence.cache_creation_tokens);
+
+        for invalid in [
+            serde_json::json!({"prompt_tokens": -1, "completion_tokens": 20}),
+            serde_json::json!({"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 101}}),
+        ] {
+            let (_, presence) =
+                super::parse_usage(super::UsageDialect::OpenAi, invalid.as_object().unwrap())
+                    .unwrap();
+            assert_eq!(presence.measured_input_tokens, None);
+        }
+    }
+
     #[test]
     fn openai_raw_combined_overflow_stays_invalid_after_assembled_repair() {
         let mut raw = Map::new();
@@ -573,6 +625,44 @@ mod tests {
                 map.get("output_tokens").and_then(Value::as_u64),
                 output_survives.then_some(7)
             );
+        }
+    }
+
+    #[test]
+    fn cumulative_disjoint_updates_recompute_inclusive_input_from_retained_lanes() {
+        let (mut usage, mut presence) = parse_usage(
+            UsageDialect::AnthropicMessages,
+            &obj(json!({
+                "input_tokens": 100,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "output_tokens": 1
+            })),
+        )
+        .unwrap();
+        assert_eq!(presence.measured_input_tokens, Some(100));
+
+        let (update, observed) = parse_usage(
+            UsageDialect::AnthropicMessages,
+            &obj(json!({"input_tokens": 200, "output_tokens": 2})),
+        )
+        .unwrap();
+        usage.update_disjoint_lanes(&mut presence, update, observed);
+        assert_eq!(presence.measured_input_tokens, Some(200));
+
+        let (mut split_usage, mut split_presence) = parse_usage(
+            UsageDialect::BedrockConverse,
+            &obj(json!({"inputTokens": 50})),
+        )
+        .unwrap();
+        for (raw, expected) in [
+            (json!({"cacheReadInputTokens": 40}), None),
+            (json!({"cacheWriteInputTokens": 10}), Some(100)),
+            (json!({"inputTokens": 80}), Some(130)),
+        ] {
+            let (update, observed) = parse_usage(UsageDialect::BedrockConverse, &obj(raw)).unwrap();
+            split_usage.update_disjoint_lanes(&mut split_presence, update, observed);
+            assert_eq!(split_presence.measured_input_tokens, expected);
         }
     }
 

@@ -237,6 +237,9 @@ pub struct ChatTurnSseAccum {
     /// accounting but cannot describe the active context window after a tool
     /// loop or bounded retry.
     pub current_request_usage: Option<astra_turn_types::RequestTokenUsage>,
+    /// Inclusive input for the latest physical request, independent of
+    /// whether every pricing lane and output token count was reported.
+    pub current_request_input_tokens: Option<u64>,
     pub error_message: Option<String>,
     pub error_code: Option<String>,
     pub error_metadata: Option<Value>,
@@ -306,6 +309,22 @@ pub struct StreamAppliedUserIntent {
 }
 
 impl ChatTurnSseAccum {
+    /// Context occupancy is independent of complete billing evidence.
+    pub fn measured_request_input_tokens(&self) -> Option<u64> {
+        let partition = (|| {
+            let usage = self.current_request_usage?;
+            usage
+                .fresh_input_tokens
+                .checked_add(usage.cache_read_tokens)?
+                .checked_add(usage.cache_creation_tokens)
+        })();
+        match (self.current_request_input_tokens, partition) {
+            (Some(reported), Some(partition)) if reported != partition => None,
+            (Some(reported), _) => Some(reported),
+            (_, partition) => partition,
+        }
+    }
+
     /// Run snapshots need the existing summary/identity deduplication boundary.
     /// Missing coverage must not turn a snapshot into a qualified increment.
     pub fn accounted_usage(&self) -> Option<astra_turn_types::CanonicalTokenUsage> {
@@ -1316,6 +1335,12 @@ fn apply_one_event(
                     .ok()
                 });
                 accum.current_request_usage = physical;
+                accum.current_request_input_tokens = last_request
+                    .and_then(|usage| usage.get("input_total_tokens"))
+                    .or_else(|| event.get("last_request_input_tokens"))
+                    .or_else(|| nested.and_then(|usage| usage.get("last_request_input_tokens")))
+                    .and_then(Value::as_u64)
+                    .filter(|tokens| i64::try_from(*tokens).is_ok());
             } else {
                 accum.current_request_usage = (|| {
                     astra_turn_types::RequestTokenUsage::try_new(
@@ -1326,6 +1351,11 @@ fn apply_one_event(
                     )
                     .ok()
                 })();
+                accum.current_request_input_tokens = event
+                    .get("input_total_tokens")
+                    .or_else(|| nested.and_then(|usage| usage.get("input_total_tokens")))
+                    .and_then(Value::as_u64)
+                    .filter(|tokens| i64::try_from(*tokens).is_ok());
             }
         }
         "context_usage" => {
@@ -1356,6 +1386,10 @@ fn apply_one_event(
             // An incomplete latest observation must not inherit measured
             // context/cache evidence from a previous physical request.
             accum.current_request_usage = usage;
+            accum.current_request_input_tokens = event
+                .get("input_total_tokens")
+                .and_then(Value::as_u64)
+                .filter(|tokens| i64::try_from(*tokens).is_ok());
         }
         "error" => {
             // Indexed errors are durable historical events. An error without
@@ -3496,6 +3530,28 @@ mod tests {
             }),
             "the context rail must use the last physical exchange, not run total"
         );
+    }
+
+    #[test]
+    fn partial_physical_input_survives_logical_totals_without_fabricating_cache_lanes() {
+        let mut accum = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "usage",
+                ",\"usage_scope\":\"logical_request_total\",\"input_tokens\":10000,\"cached_input_tokens\":90000,\"output_tokens\":20,\"last_request_usage\":{\"prompt_tokens\":10000,\"cache_read_tokens\":90000,\"input_total_tokens\":100000,\"completion_tokens\":20}",
+            ),
+            &mut accum,
+            &mut vec![],
+        );
+        assert_eq!(accum.current_request_usage, None);
+        assert_eq!(accum.measured_request_input_tokens(), Some(100_000));
+
+        dispatch_chat_turn_sse_event_block(
+            &sse("usage", ",\"usage_scope\":\"logical_request_total\""),
+            &mut accum,
+            &mut vec![],
+        );
+        assert_eq!(accum.measured_request_input_tokens(), None);
     }
 
     #[test]

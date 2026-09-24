@@ -318,6 +318,13 @@ If a deployment has one trusted TaaS instance, the user never selects or enters 
 ### Usage and billing
 
 Usage is attributable by run, agent, inference purpose, Model Access, and billing owner.
+The final physical provider request may report an inclusive input total without
+reporting every cache billing lane or output count. That validated input total
+drives context occupancy and the measured per-turn input budget; unknown billing
+lanes remain unknown. Logical retry and run aggregates never replace the final
+physical request's context measurement. Server stream usage carries this
+measurement separately as `last_request_input_tokens` or nested
+`last_request_usage.input_total_tokens`.
 
 ```text
 Primary agent       120k tokens   Personal Cloud

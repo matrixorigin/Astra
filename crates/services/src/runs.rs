@@ -5138,6 +5138,19 @@ pub trait RunStateStore: Send + Sync {
         events: &[serde_json::Value],
     ) -> Result<bool, String>;
 
+    /// Repair the derived display projection when an owner proves a terminal
+    /// transaction committed after its store response was abandoned. Normal
+    /// transitions perform this refresh in their store call; the default is
+    /// a no-op for stores without a separate projection.
+    async fn repair_terminal_projection_after_receipt(
+        &self,
+        _user_id: &str,
+        _expected_session_id: &str,
+        _run_id: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Append immutable facts without rewriting lifecycle state, but only
     /// while the exact execution generation and one of the expected statuses
     /// still match. This is the late-drain primitive for accounting produced
@@ -14607,6 +14620,17 @@ impl DatabaseRunStateStore {
 
 #[async_trait]
 impl RunStateStore for DatabaseRunStateStore {
+    async fn repair_terminal_projection_after_receipt(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+    ) -> Result<(), String> {
+        self.sync_projection_for_user(user_id, expected_session_id, run_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn request_permission_mode(
         &self,
         user_id: &str,

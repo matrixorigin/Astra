@@ -3027,10 +3027,15 @@ fn fold_provider_completion_error_usage(
         return;
     }
     state.last_measured_prompt_tokens = details
-        .get("last_request_usage")
-        .and_then(|usage| astra_turn_types::CanonicalTokenUsage::from_json(usage).ok())
-        .and_then(|usage| usage.input_column())
-        .and_then(|tokens| u64::try_from(tokens).ok());
+        .get("last_request_input_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            details
+                .get("last_request_usage")
+                .and_then(|usage| astra_turn_types::CanonicalTokenUsage::from_json(usage).ok())
+                .and_then(|usage| usage.input_column())
+                .and_then(|tokens| u64::try_from(tokens).ok())
+        });
     state.last_request_usage = details
         .get("last_request_usage")
         .and_then(|usage| astra_turn_types::CanonicalTokenUsage::from_json(usage).ok())
@@ -3804,12 +3809,7 @@ fn record_superseded_llm_round(
             return;
         }
         state.last_request_usage = turn_result.accum.current_request_usage;
-        state.last_measured_prompt_tokens = state.last_request_usage.and_then(|usage| {
-            usage
-                .fresh_input_tokens
-                .checked_add(usage.cache_read_tokens)?
-                .checked_add(usage.cache_creation_tokens)
-        });
+        state.last_measured_prompt_tokens = turn_result.accum.measured_request_input_tokens();
         if state.telemetry.first_ttft_ms.is_none() {
             state.telemetry.first_ttft_ms = turn_result.ttft_ms;
         }
@@ -3860,12 +3860,7 @@ fn record_superseded_llm_round(
     state.has_any_usage |= turn_result.accum.has_usage;
     state.add_qualified_usage(turn_result.accum.accounted_usage());
     state.last_request_usage = turn_result.accum.current_request_usage;
-    state.last_measured_prompt_tokens = turn_result.accum.current_request_usage.and_then(|usage| {
-        usage
-            .fresh_input_tokens
-            .checked_add(usage.cache_read_tokens)?
-            .checked_add(usage.cache_creation_tokens)
-    });
+    state.last_measured_prompt_tokens = turn_result.accum.measured_request_input_tokens();
     let tool_names = turn_result
         .accum
         .tool_calls
@@ -4007,13 +4002,8 @@ fn apply_terminal_control_stream_snapshot<H: AgenticLoopHost>(
         .step_recorder
         .record_tokens(snap.prompt_tokens, snap.completion_tokens);
     state.has_any_usage |= snap.has_usage;
-    state.last_measured_prompt_tokens = snap.current_request_usage.and_then(|usage| {
-        // Only a physical request can calibrate the next context window.
-        usage
-            .fresh_input_tokens
-            .checked_add(usage.cache_read_tokens)?
-            .checked_add(usage.cache_creation_tokens)
-    });
+    // Only physical-request evidence can calibrate the next context window.
+    state.last_measured_prompt_tokens = snap.measured_request_input_tokens();
     state.consecutive_context_window_errors = 0;
 
     state.last_request_usage = snap.current_request_usage;
@@ -22513,6 +22503,24 @@ mod tests {
         assert_eq!(state.token_usage_coverage().provider_reported, 1);
         assert_eq!(state.token_usage_coverage().unavailable, 0);
 
+        let partial_error = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ProviderDeadline,
+            "provider completed without visible text or a selected tool",
+        )
+        .with_details_json(
+            serde_json::json!({
+                "provider_response": {"transport_success": true},
+                "last_request_usage": {"input_tokens": 10_000, "cached_input_tokens": 90_000},
+                "last_request_input_tokens": 100_000,
+                "usage": {"input_tokens": 10_000, "cached_input_tokens": 90_000, "output_tokens": 20}
+            })
+            .to_string(),
+        );
+        let mut partial_state = make_state();
+        fold_provider_completion_error_usage(&mut partial_state, &partial_error);
+        assert_eq!(partial_state.last_request_usage, None);
+        assert_eq!(partial_state.last_measured_prompt_tokens, Some(100_000));
+
         let mut aggregate_only_details: serde_json::Value =
             serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
         aggregate_only_details
@@ -24590,6 +24598,23 @@ mod tests {
         assert_eq!(round.prompt_tokens, 100);
         assert_eq!(round.cache_read_tokens, 900);
         assert_eq!(round.completion_tokens, 10);
+    }
+
+    #[test]
+    fn partial_pricing_evidence_still_calibrates_the_physical_input_budget() {
+        let mut state = make_state();
+        state.last_measured_prompt_tokens = Some(7);
+        let mut result = text_result("answer", 10_000, 20, Some(7));
+        result.accum.cache_read_tokens = 90_000;
+        result.accum.current_request_usage = None;
+        result.accum.current_request_input_tokens = Some(100_000);
+
+        record_superseded_llm_round(&mut state, &result, Instant::now());
+
+        assert_eq!(state.last_request_usage, None);
+        assert_eq!(state.last_measured_prompt_tokens, Some(100_000));
+        assert_eq!(state.total_prompt, 10_000);
+        assert_eq!(state.total_cache_read, 90_000);
     }
 
     #[test]

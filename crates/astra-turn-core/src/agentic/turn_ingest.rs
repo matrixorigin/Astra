@@ -33,9 +33,27 @@ pub struct AgenticTurnStreamSnapshot<'a> {
     pub has_usage: bool,
     pub qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
     pub current_request_usage: Option<astra_turn_types::RequestTokenUsage>,
+    pub current_request_input_tokens: Option<u64>,
     pub error_message: &'a Option<String>,
     /// Pre-classified error kind from the host. When `Some`, skip string re-classification.
     pub error_kind: Option<astra_core::ErrorKind>,
+}
+
+impl AgenticTurnStreamSnapshot<'_> {
+    pub fn measured_request_input_tokens(&self) -> Option<u64> {
+        let partition = (|| {
+            let usage = self.current_request_usage?;
+            usage
+                .fresh_input_tokens
+                .checked_add(usage.cache_read_tokens)?
+                .checked_add(usage.cache_creation_tokens)
+        })();
+        match (self.current_request_input_tokens, partition) {
+            (Some(reported), Some(partition)) if reported != partition => None,
+            (Some(reported), _) => Some(reported),
+            (_, partition) => partition,
+        }
+    }
 }
 
 /// Build [`AgenticTurnStreamSnapshot`] from a [`ChatTurnSseAccum`] plus TTFT (CLI `TurnResult` derefs to accum).
@@ -68,6 +86,9 @@ pub fn agentic_turn_stream_snapshot_with_kind<'a>(
         has_usage: accum.has_usage,
         qualified_usage: accum.accounted_usage(),
         current_request_usage: accum.current_request_usage,
+        // Preserve raw evidence so a conflict with the complete physical
+        // partition remains invalid when the snapshot rechecks it.
+        current_request_input_tokens: accum.current_request_input_tokens,
         error_message: &accum.error_message,
         // A host-side kind is an authoritative override, but absence must not
         // erase the typed kind already decoded from the SSE producer.
@@ -141,12 +162,7 @@ pub fn ingest_agentic_turn_stream(
 ) -> AgenticTurnIngestOutcome {
     // Measurement is evidence even when response guards or provider errors
     // end ingestion early. Error-streak accounting remains independent.
-    *st.last_measured_prompt_tokens = snap.current_request_usage.and_then(|usage| {
-        usage
-            .fresh_input_tokens
-            .checked_add(usage.cache_read_tokens)?
-            .checked_add(usage.cache_creation_tokens)
-    });
+    *st.last_measured_prompt_tokens = snap.measured_request_input_tokens();
     if st.first_ttft_ms.is_none() {
         *st.first_ttft_ms = snap.ttft_ms;
     }
@@ -431,6 +447,31 @@ mod tests {
     }
 
     #[test]
+    fn conflicting_physical_input_evidence_stays_invalid_through_snapshot_and_ingest() {
+        let accum = ChatTurnSseAccum {
+            current_request_usage: astra_turn_types::RequestTokenUsage::try_new(50, 50, 0, 10).ok(),
+            current_request_input_tokens: Some(200),
+            ..Default::default()
+        };
+        assert_eq!(accum.measured_request_input_tokens(), None);
+
+        let snap = agentic_turn_stream_snapshot_from_sse_accum(&accum, None);
+        assert_eq!(snap.measured_request_input_tokens(), None);
+        let mut pack = Pack::new();
+        pack.last_measured_prompt_tokens = Some(123);
+        let _ = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            "continue this session",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert_eq!(pack.last_measured_prompt_tokens, None);
+    }
+
+    #[test]
     fn ingest_binds_step_persistence_only_after_authoritative_run_pair() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
@@ -459,6 +500,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: None,
             has_usage: false,
             error_message: &error_message,
@@ -503,6 +545,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: None,
             has_usage: false,
             error_message: &error_message,
@@ -622,6 +665,7 @@ mod tests {
             cache_read_tokens: 149_000,
             cache_creation_tokens: 0,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: Some(
                 astra_turn_types::RequestTokenUsage::try_new(1_700, 37_000, 0, 200).unwrap(),
             ),
@@ -759,6 +803,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: None,
             has_usage: false,
             error_message: &err,
@@ -793,6 +838,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: None,
             has_usage: true,
             error_message: &err,
@@ -831,6 +877,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: None,
             has_usage: false,
             error_message: &err,
@@ -884,6 +931,7 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
                 qualified_usage: None,
+                current_request_input_tokens: None,
                 current_request_usage: None,
                 has_usage: false,
                 error_message: &err,
@@ -924,6 +972,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: None,
             has_usage: true,
             error_message: &None,
@@ -966,6 +1015,7 @@ mod tests {
                 cache_read_tokens: 38_000,
                 has_usage: true,
                 qualified_usage: None,
+                current_request_input_tokens: None,
                 current_request_usage: physical,
                 ..Default::default()
             };
@@ -1004,6 +1054,7 @@ mod tests {
                     error_message: (!guarded).then(|| "context too long".into()),
                     error_kind: (!guarded).then_some(astra_core::ErrorKind::ContextWindow),
                     qualified_usage: None,
+                    current_request_input_tokens: None,
                     current_request_usage: physical,
                     ..Default::default()
                 };
@@ -1045,6 +1096,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: None,
             has_usage: false,
             error_message: &None,
@@ -1084,6 +1136,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: None,
             has_usage: false,
             error_message: &None,
@@ -1121,6 +1174,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: None,
             has_usage: false,
             error_message: &None,
@@ -1159,6 +1213,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: None,
             has_usage: false,
             error_message: &None,
@@ -1203,6 +1258,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: None,
             has_usage: false,
             error_message: &None,
@@ -1237,6 +1293,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: None,
             has_usage: true,
             error_message: &None,
@@ -1275,6 +1332,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: None,
             has_usage: true,
             error_message: &None,
@@ -1330,6 +1388,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: None,
             has_usage: true,
             error_message: &None,
@@ -1375,6 +1434,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: None,
             has_usage: true,
             error_message: &None,
@@ -1413,6 +1473,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: None,
             has_usage: true,
             error_message: &None,
@@ -1473,6 +1534,7 @@ mod tests {
             cache_read_tokens: 80,
             cache_creation_tokens: 20,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: None,
             has_usage: true,
             error_message: &None,
@@ -1533,6 +1595,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: None,
             has_usage: true,
             error_message: &None,
@@ -1568,6 +1631,7 @@ mod tests {
             cache_read_tokens: 400,
             cache_creation_tokens: 50,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: None,
             has_usage: true,
             error_message: &None,
@@ -1604,6 +1668,7 @@ mod tests {
             cache_read_tokens: 90,
             cache_creation_tokens: 0,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: None,
             has_usage: true,
             error_message: &None,
@@ -1662,6 +1727,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: None,
             has_usage: true,
             error_message: &err_msg,
@@ -1696,6 +1762,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             qualified_usage: None,
+            current_request_input_tokens: None,
             current_request_usage: None,
             has_usage: true,
             error_message: &no_err,

@@ -297,6 +297,7 @@ fn reject_provider_completion_without_delivery_with_usage(
             "tool_calls": &result.tool_calls,
             "provider_response": {"transport_success": true},
             "last_request_usage": &result.usage,
+            "last_request_input_tokens": result.usage_presence.measured_input_tokens,
             "qualified_usage": qualified_usage.map(|usage| usage.to_json()),
             "usage": aggregate_usage.map(|usage| json!({
                 "input_tokens": usage.input_tokens,
@@ -332,6 +333,10 @@ fn attach_transport_success_usage(
     object.insert("partial_reasoning".to_string(), json!(&result.reasoning));
     object.insert("tool_calls".to_string(), json!(&result.tool_calls));
     object.insert("last_request_usage".to_string(), json!(&result.usage));
+    object.insert(
+        "last_request_input_tokens".to_string(),
+        json!(result.usage_presence.measured_input_tokens),
+    );
     object.insert(
         "qualified_usage".to_string(),
         json!(qualified_usage.map(|usage| usage.to_json())),
@@ -374,6 +379,7 @@ fn logical_request_usage_event(
             "cache_read_tokens": result.usage.get("cached_input_tokens"),
             "cache_creation_tokens": result.usage.get("cache_creation_tokens"),
             "completion_tokens": result.usage.get("output_tokens"),
+            "input_total_tokens": result.usage_presence.measured_input_tokens,
         },
     })
 }
@@ -13343,6 +13349,8 @@ impl ServerAgenticLoopHost {
             )
             .ok()
         });
+        let current_request_input_tokens =
+            measured.and_then(|(_, presence)| presence.measured_input_tokens);
         let u =
             measured
                 .map(|(tokens, _)| tokens)
@@ -13373,6 +13381,7 @@ impl ServerAgenticLoopHost {
             has_usage: true,
             qualified_usage,
             current_request_usage,
+            current_request_input_tokens,
             system_prompt_tokens: Some(mock_pipeline.breakdown.total_tokens),
             system_prompt_breakdown: serde_json::to_value(&mock_pipeline.breakdown).ok(),
             context_manifest_trace: clone_server_context_trace(
@@ -17692,6 +17701,7 @@ impl ServerAgenticLoopHost {
                     cache_creation_tokens: u.cache_creation_tokens,
                     output_tokens: u.output_tokens,
                 }),
+            current_request_input_tokens: result.usage_presence.measured_input_tokens,
             finish_reason: result.lifecycle_finish_reason().map(str::to_string),
             session_id: None,
             run_id: None,
@@ -33642,6 +33652,30 @@ mod tests {
         assert!(accum.has_usage);
         assert_eq!(accum.prompt_tokens, 1200);
         assert_eq!(accum.completion_tokens, 7);
+        assert_eq!(accum.current_request_usage, None);
+    }
+
+    #[test]
+    fn partial_openai_cache_usage_preserves_measured_request_input() {
+        let raw = json!({
+            "prompt_tokens": 100_000,
+            "completion_tokens": 20,
+            "prompt_tokens_details": {"cached_tokens": 90_000}
+        });
+        let (tokens, presence) = crate::turn::token_usage::parse_usage(
+            crate::turn::token_usage::UsageDialect::OpenAi,
+            raw.as_object().unwrap(),
+        )
+        .unwrap();
+        let result = LlmCallResult {
+            full_text: "done".into(),
+            usage: tokens.to_qualified_json_map(presence),
+            usage_presence: presence,
+            ..Default::default()
+        };
+        let accum = ServerAgenticLoopHost::result_to_accum_with_usage(&result, None);
+        assert_eq!(accum.current_request_input_tokens, Some(100_000));
+        assert_eq!(accum.measured_request_input_tokens(), Some(100_000));
         assert_eq!(accum.current_request_usage, None);
     }
 

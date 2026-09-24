@@ -116,7 +116,11 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
                         "usage_scope".to_string(),
                         serde_json::Value::String("run_total".to_string()),
                     );
-                    for key in ["qualified_usage", "last_request_usage"] {
+                    for key in [
+                        "qualified_usage",
+                        "last_request_usage",
+                        "last_request_input_tokens",
+                    ] {
                         if let Some(value) = data.get(key) {
                             usage.insert(key.to_string(), value.clone());
                         }
@@ -1413,6 +1417,42 @@ mod tests {
                 output_tokens: 901,
             })
         );
+    }
+
+    #[test]
+    fn terminal_projection_preserves_partial_physical_input_without_context_pricing_lanes() {
+        let projected = transform_stream_run_events_for_client(
+            "run-partial-physical-input",
+            vec![json!({
+                "event_type": "run_finished",
+                "data": {
+                    "prompt_tokens": 10_000,
+                    "cache_read_tokens": 90_000,
+                    "cache_creation_tokens": 0,
+                    "completion_tokens": 20,
+                    "last_request_usage": null,
+                    "last_request_input_tokens": 100_000
+                }
+            })],
+        );
+        assert_eq!(projected[0]["type"], "usage");
+        assert_eq!(projected[0]["last_request_input_tokens"], 100_000);
+        assert!(
+            !projected
+                .iter()
+                .any(|event| event["type"] == "context_usage")
+        );
+
+        let mut accumulated = astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum::default();
+        for event in &projected {
+            astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+                &format!("data: {}\n\n", serde_json::to_string(event).unwrap()),
+                &mut accumulated,
+                &mut Vec::new(),
+            );
+        }
+        assert_eq!(accumulated.current_request_usage, None);
+        assert_eq!(accumulated.measured_request_input_tokens(), Some(100_000));
     }
 
     #[test]

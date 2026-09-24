@@ -51,6 +51,14 @@ Checkpoint must include enough information to resume safely:
 
 - Only the owner may advance active execution.
 - Lease expiry enables recovery.
+- A local owner-lease deadline bounds an unconfirmed terminal attempt. If the
+  store response stalls, the exact-generation durable status and event receipt
+  are checked before reporting failure. The heartbeat allows this bounded
+  check within its durable safety margin; an unconfirmed attempt still loses
+  execution authority when that margin expires. A confirmed terminal retires
+  the heartbeat before best-effort display projection work. A reconciled
+  post-commit timeout refreshes the display projection on that exceptional
+  path; ordinary commits do not add a second refresh.
 - Recovery must avoid double execution of non-idempotent actions.
 - Session execution slots prevent conflicting root runs when required by product semantics.
 - Recovery discovery is only a candidate list. A claim returns the new run
