@@ -56,7 +56,10 @@ Checkpoint must include enough information to resume safely:
   are checked before reporting failure. The heartbeat allows this bounded
   check within its durable safety margin; an unconfirmed attempt still loses
   execution authority when that margin expires. A confirmed terminal retires
-  the heartbeat before best-effort display projection work. A reconciled
+  the heartbeat before best-effort display projection work. If a different
+  terminal status won the same generation, the owner returns that durable
+  result and retires its heartbeat; an active row without a receipt remains
+  unconfirmed. A reconciled
   post-commit timeout refreshes the display projection on that exceptional
   path; ordinary commits do not add a second refresh.
 - Recovery must avoid double execution of non-idempotent actions.

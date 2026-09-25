@@ -324,7 +324,9 @@ drives context occupancy and the measured per-turn input budget; unknown billing
 lanes remain unknown. Logical retry and run aggregates never replace the final
 physical request's context measurement. Server stream usage carries this
 measurement separately as `last_request_input_tokens` or nested
-`last_request_usage.input_total_tokens`.
+`last_request_usage.input_total_tokens`. CLI context observers forward that
+validated measurement independently of complete billing lanes, including
+updates that arrive while those lanes remain unknown.
 
 ```text
 Primary agent       120k tokens   Personal Cloud

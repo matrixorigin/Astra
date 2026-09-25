@@ -93,6 +93,12 @@ impl SseBlankLineUtf8Buf {
         drain_complete_sse_event_blocks(&mut self.buf)
     }
 
+    /// Transfer an incomplete event without decoding it. A second reader may
+    /// receive the remaining bytes while an Edge callback is in progress.
+    pub(crate) fn take_pending_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.buf)
+    }
+
     /// Replace the inner buffer with empty and return the previous UTF-8 text (trailing partial SSE event).
     pub fn take_buf(&mut self) -> Result<String, SseUtf8Error> {
         let bytes = std::mem::take(&mut self.buf);

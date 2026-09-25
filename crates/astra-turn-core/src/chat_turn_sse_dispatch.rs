@@ -1802,6 +1802,12 @@ impl ChatTurnSseFramer {
         Ok(blocks)
     }
 
+    /// Move an unfinished SSE event to the Edge read-ahead lane. HTTP chunks
+    /// can split a UTF-8 character, so this handoff must preserve raw bytes.
+    pub(crate) fn take_pending_bytes(&mut self) -> Vec<u8> {
+        self.sse.take_pending_bytes()
+    }
+
     /// After the byte stream ends: run TTFT detection on any trailing bytes, then take the buffer
     /// for a final [`dispatch_chat_turn_sse_event_block`] pass (partial event without `\n\n` yet).
     pub fn take_trailing_dispatch_blob(&mut self) -> Result<String, SseUtf8Error> {

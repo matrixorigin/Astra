@@ -161,6 +161,19 @@ pub enum TerminalTransitionOutcome {
     Superseded(Box<DurableRunRecord>),
 }
 
+/// What a bounded owner transition and its optional durable receipt proved.
+enum OwnerTerminalAttempt {
+    Committed { needs_projection_repair: bool },
+    Superseded(Box<DurableRunRecord>),
+    NotCommitted,
+}
+
+enum TerminalReceipt {
+    Committed,
+    Superseded(Box<DurableRunRecord>),
+    Unconfirmed,
+}
+
 #[derive(Clone, Copy)]
 struct DelegationOutcomeTransition {
     canonical_status: &'static str,
@@ -2546,7 +2559,8 @@ impl RunEngine {
                             expected_owner_generation,
                             last_error.as_deref(),
                         )
-                        .await;
+                        .await
+                        .map(|receipt| matches!(receipt, TerminalReceipt::Committed));
                 }
                 Ok(false) => return Ok(false),
                 Err(error) => {
@@ -2586,7 +2600,7 @@ impl RunEngine {
         error_message: Option<&str>,
         events: &[serde_json::Value],
         local_deadline: Option<tokio::time::Instant>,
-    ) -> Result<(bool, bool), String> {
+    ) -> Result<OwnerTerminalAttempt, String> {
         let transition = self.try_transition_terminal_status_with_events_if_current(
             user_id,
             expected_session_id,
@@ -2599,10 +2613,26 @@ impl RunEngine {
             Some(expected_owner_generation),
         );
         let Some(local_deadline) = local_deadline else {
-            return transition.await.map(|committed| (committed, false));
+            return transition.await.map(|committed| {
+                if committed {
+                    OwnerTerminalAttempt::Committed {
+                        needs_projection_repair: false,
+                    }
+                } else {
+                    OwnerTerminalAttempt::NotCommitted
+                }
+            });
         };
         match tokio::time::timeout_at(local_deadline, transition).await {
-            Ok(result) => result.map(|committed| (committed, false)),
+            Ok(result) => result.map(|committed| {
+                if committed {
+                    OwnerTerminalAttempt::Committed {
+                        needs_projection_repair: false,
+                    }
+                } else {
+                    OwnerTerminalAttempt::NotCommitted
+                }
+            }),
             Err(_) => {
                 let deadline_error = "owner-fenced terminal transition exceeded the lease deadline";
                 match tokio::time::timeout(
@@ -2619,8 +2649,13 @@ impl RunEngine {
                 )
                 .await
                 {
-                    Ok(Ok(true)) => Ok((true, true)),
-                    Ok(Ok(false)) => Err(deadline_error.to_string()),
+                    Ok(Ok(TerminalReceipt::Committed)) => Ok(OwnerTerminalAttempt::Committed {
+                        needs_projection_repair: true,
+                    }),
+                    Ok(Ok(TerminalReceipt::Superseded(durable))) => {
+                        Ok(OwnerTerminalAttempt::Superseded(durable))
+                    }
+                    Ok(Ok(TerminalReceipt::Unconfirmed)) => Err(deadline_error.to_string()),
                     Ok(Err(error)) => Err(error),
                     Err(_) => Err(format!(
                         "{deadline_error}; durable receipt lookup timed out"
@@ -2703,7 +2738,7 @@ impl RunEngine {
             Some(authority) => Some(authority.begin().await?),
             None => None,
         };
-        let (terminal_committed, needs_projection_repair) = self
+        let terminal_attempt = self
             .try_owner_terminal_with_receipt(
                 user_id,
                 expected_session_id,
@@ -2719,7 +2754,22 @@ impl RunEngine {
                     .map(RunOwnerLeaseTerminalOperation::deadline),
             )
             .await?;
-        if terminal_committed {
+        let needs_projection_repair = match terminal_attempt {
+            OwnerTerminalAttempt::Committed {
+                needs_projection_repair,
+            } => Some(needs_projection_repair),
+            OwnerTerminalAttempt::Superseded(durable) => {
+                if durable.run_generation == expected_owner_generation
+                    && durable_run_status_is_terminal(&durable.status)
+                    && let Some(operation) = terminal_operation.take()
+                {
+                    operation.retire();
+                }
+                return Ok(TerminalTransitionOutcome::Superseded(durable));
+            }
+            OwnerTerminalAttempt::NotCommitted => None,
+        };
+        if let Some(needs_projection_repair) = needs_projection_repair {
             if let Some(operation) = terminal_operation.take() {
                 operation.retire();
             }
@@ -2777,7 +2827,7 @@ impl RunEngine {
         {
             let event = serde_json::json!({"event_type":"run_finished","data":{"run_id":run_id,"status":STATUS_CANCELLED,"cancelled":true,"reason":"durable cancellation request won terminal race","source":"terminal_transition_reconciliation","cancellation_origin":astra_turn_core::orchestration_types::CancellationOrigin::User}});
             let cancellation_events = [event];
-            let (cancellation_committed, needs_projection_repair) = self
+            let cancellation_attempt = self
                 .try_owner_terminal_with_receipt(
                     user_id,
                     expected_session_id,
@@ -2793,7 +2843,22 @@ impl RunEngine {
                         .map(RunOwnerLeaseTerminalOperation::deadline),
                 )
                 .await?;
-            if cancellation_committed {
+            let needs_projection_repair = match cancellation_attempt {
+                OwnerTerminalAttempt::Committed {
+                    needs_projection_repair,
+                } => Some(needs_projection_repair),
+                OwnerTerminalAttempt::Superseded(durable) => {
+                    if durable.run_generation == expected_owner_generation
+                        && durable_run_status_is_terminal(&durable.status)
+                        && let Some(operation) = terminal_operation.take()
+                    {
+                        operation.retire();
+                    }
+                    return Ok(TerminalTransitionOutcome::Superseded(durable));
+                }
+                OwnerTerminalAttempt::NotCommitted => None,
+            };
+            if let Some(needs_projection_repair) = needs_projection_repair {
                 if let Some(operation) = terminal_operation.take() {
                     operation.retire();
                 }
@@ -2824,7 +2889,7 @@ impl RunEngine {
         events: &[serde_json::Value],
         expected_owner_generation: Option<u64>,
         last_error: Option<&str>,
-    ) -> Result<bool, String> {
+    ) -> Result<TerminalReceipt, String> {
         let Some(run) = self
             .store
             .load_run(user_id, run_id)
@@ -2839,12 +2904,21 @@ impl RunEngine {
                 }
             })?
         else {
-            return Ok(false);
+            return Ok(TerminalReceipt::Unconfirmed);
         };
         if run.status != status
             || expected_owner_generation.is_some_and(|generation| run.run_generation != generation)
         {
-            return Ok(false);
+            return Ok(
+                if durable_run_status_is_terminal(&run.status)
+                    || expected_owner_generation
+                        .is_some_and(|generation| run.run_generation != generation)
+                {
+                    TerminalReceipt::Superseded(Box::new(run))
+                } else {
+                    TerminalReceipt::Unconfirmed
+                },
+            );
         }
         if !durable_run_contains_event_batch(&run, events) {
             self.store
@@ -2869,7 +2943,7 @@ impl RunEngine {
                 "terminal run transition reconciled status but had to repair missing events"
             );
         }
-        Ok(true)
+        Ok(TerminalReceipt::Committed)
     }
 
     async fn repair_terminal_projection_bounded(
@@ -6014,6 +6088,71 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!lease_lost.load(Ordering::Acquire));
         assert!(!cancel.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_terminal_receipt_returns_concurrent_cancellation_winner() {
+        let store = Arc::new(
+            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
+                .with_owner_lease_policy(Duration::from_secs(10), Duration::from_secs(30))
+                .with_terminal_transition_delay(Duration::from_secs(40)),
+        );
+        let engine = RunEngine::new(store.clone());
+        let execution = engine
+            .start_run("cancel-winner", "user-1", "session-1")
+            .await
+            .unwrap();
+        let lease_lost = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        let _guard = engine
+            .start_owner_lease_heartbeat(
+                "user-1".into(),
+                "session-1".into(),
+                "cancel-winner".into(),
+                execution.owner_generation,
+                test_confirmed_execution_authority(&engine),
+                lease_lost.clone(),
+                cancel.clone(),
+            )
+            .unwrap();
+        assert!(
+            store
+                .inner
+                .update_run_status_with_events_if_current(
+                    "user-1",
+                    "session-1",
+                    "cancel-winner",
+                    &[STATUS_RUNNING],
+                    Some(execution.owner_generation),
+                    STATUS_CANCELLED,
+                    None,
+                    None,
+                    &delegation_terminal_events(STATUS_CANCELLED, None),
+                )
+                .await
+                .unwrap()
+        );
+        let outcome = engine
+            .commit_terminal_status_with_events_if_current_owner(
+                "user-1",
+                "session-1",
+                "cancel-winner",
+                &[STATUS_RUNNING],
+                execution.owner_generation,
+                STATUS_COMPLETED,
+                None,
+                None,
+                &[],
+            )
+            .await;
+        assert!(
+            matches!(&outcome, Ok(TerminalTransitionOutcome::Superseded(run)) if run.status == STATUS_CANCELLED),
+            "durable cancellation must survive a delayed CAS response: {outcome:?}"
+        );
+        tokio::task::yield_now().await;
+        assert!(!lease_lost.load(Ordering::Acquire));
+        assert!(!cancel.is_cancelled());
+        assert_eq!(store.projection_repairs.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(start_paused = true)]

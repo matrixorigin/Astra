@@ -77,9 +77,11 @@ struct EdgeExecutionReadAhead {
 
 impl EdgeExecutionReadAhead {
     fn pop_front(&mut self) -> Option<Vec<u8>> {
-        let bytes = self.queued.pop_front()?;
-        self.queued_bytes = self.queued_bytes.saturating_sub(bytes.len());
-        Some(bytes)
+        if let Some(bytes) = self.queued.pop_front() {
+            self.queued_bytes = self.queued_bytes.saturating_sub(bytes.len());
+            return Some(bytes);
+        }
+        (!self.framing.is_empty()).then(|| std::mem::take(&mut self.framing))
     }
 
     fn push_bytes(&mut self, bytes: &[u8], strict_json: bool) -> Result<(), String> {
@@ -111,15 +113,11 @@ impl EdgeExecutionReadAhead {
         self.ensure_bounded()
     }
 
-    /// Finish one edge execution window without inventing an SSE boundary.
-    /// The partial bytes have already passed the durable terminal probe, so
-    /// replaying them skips that probe and lets the normal framer join them to
-    /// the next network chunk.
+    /// Finish one execution window without inventing an SSE boundary. A queued
+    /// tool may start another window before the partial tail can be replayed;
+    /// keep it here so subsequent network bytes extend the same event. After
+    /// all complete queued blocks drain, `pop_front` hands it to the main framer.
     fn finish_window(&mut self) -> Result<(), String> {
-        if !self.framing.is_empty() {
-            let partial = std::mem::take(&mut self.framing);
-            self.queue_bytes(partial)?;
-        }
         self.ensure_bounded()
     }
 
@@ -800,27 +798,37 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         // for a tiny window; side-effectful tools still execute inline to avoid
         // the bridge/result deadlock guarded by `tool_request_executes_inline_not_deferred`.
         while !terminal_marker_seen && pending_is_coalescible_tool_batch(&pending) {
-            let (next, reached_eof) = if let Some(token) = cancel_token {
+            if cancel_token.is_some_and(|token| token.is_cancelled()) {
+                abort = Some(astra_core::ErrorKind::Cancelled);
+                break;
+            }
+            // Replayed blocks and the trailing partial event precede any new
+            // network chunk. Consume that backlog through the same framer
+            // before waiting for another sibling request.
+            let (next, reached_eof, chunk_was_probed) = if let Some(bytes) = read_ahead.pop_front()
+            {
+                (Some(Ok(bytes)), false, true)
+            } else if let Some(token) = cancel_token {
                 tokio::select! {
                     biased;
                     _ = token.cancelled() => {
                         abort = Some(astra_core::ErrorKind::Cancelled);
-                        (None, false)
+                        (None, false, false)
                     }
                     r = tokio::time::timeout(
                         tool_batch_coalesce_duration(),
                         chunks.next(),
                     ) => match r {
-                        Ok(Some(item)) => (Some(item), false),
-                        Ok(None) => (None, true),
-                        Err(_) => (None, false),
+                        Ok(Some(item)) => (Some(item), false, false),
+                        Ok(None) => (None, true, false),
+                        Err(_) => (None, false, false),
                     },
                 }
             } else {
                 match tokio::time::timeout(tool_batch_coalesce_duration(), chunks.next()).await {
-                    Ok(Some(item)) => (Some(item), false),
-                    Ok(None) => (None, true),
-                    Err(_) => (None, false),
+                    Ok(Some(item)) => (Some(item), false, false),
+                    Ok(None) => (None, true, false),
+                    Err(_) => (None, false, false),
                 }
             };
 
@@ -886,7 +894,11 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                     // terminal gate before dispatch; otherwise a cancellation
                     // arriving inside this short window can be observed only
                     // as data while the now-cancelled tool still executes.
-                    match terminal_probe.push_bytes(&bytes) {
+                    match if chunk_was_probed {
+                        Ok(None)
+                    } else {
+                        terminal_probe.push_bytes(&bytes)
+                    } {
                         Ok(Some(terminal)) if terminal.status.is_unsuccessful() => {
                             if let Some(token) = cancel_token {
                                 token.cancel();
@@ -973,6 +985,20 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             // bounded read-ahead lane alive so an exact-owner run_finished can
             // cancel a long local tool/approval immediately. Ordinary frames
             // remain queued and are dispatched in wire order after execution.
+            // The main framer may already hold the beginning of the next SSE
+            // event, including an incomplete UTF-8 character. The read-ahead
+            // lane must inherit those bytes before it consumes another chunk.
+            if let Err(error) = read_ahead.push_bytes(
+                &framer.take_pending_bytes(),
+                host.requires_strict_sse_json(),
+            ) {
+                abort = Some(astra_core::ErrorKind::StreamTransport);
+                abort_message = Some(format!("Error: {error}"));
+                if let Some(token) = cancel_token {
+                    token.cancel();
+                }
+                break;
+            }
             let live_gaps = {
                 let strict_read_ahead_json = host.requires_strict_sse_json();
                 let flush = flush_pending_via_host(
@@ -3943,6 +3969,127 @@ mod tests {
         assert_eq!(host.agent_live_gaps[0].agent_id, "child-agent");
         assert_eq!(host.agent_live_gaps[0].dropped_event_count, 300);
         bridge.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn edge_read_ahead_joins_utf8_split_across_tool_execution() {
+        let (tx, mut stream) = test_channel();
+        let bridge = tokio::spawn(async move {
+            let tool = sse_event(
+                "tool_request",
+                ",\"request_id\":\"tool-1\",\"tool\":\"bash\",\"args\":{\"command\":\"echo ok\"}",
+            );
+            let text = sse_event("text_delta", ",\"content\":\"中文\"");
+            let split = text.find('中').unwrap() + 1;
+            let mut first = tool.into_bytes();
+            first.extend_from_slice(&text.as_bytes()[..split]);
+            tx.send(Ok(first)).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tx.send(Ok(text.as_bytes()[split..].to_vec()))
+                .await
+                .unwrap();
+            tx.send(Ok(b"data: [DONE]\n\n".to_vec())).await.unwrap();
+        });
+        let mut host =
+            RecordingSseStreamHost::new().with_tool_delay(std::time::Duration::from_millis(200));
+        let (result, abort) =
+            consume_sse_stream(&mut stream, &mut host, stream_idle_timeout()).await;
+        bridge.await.unwrap();
+        assert_eq!(
+            abort, None,
+            "valid UTF-8 split across execution boundary was rejected: {:?}",
+            result.accum.error_message
+        );
+        assert_eq!(result.accum.full_text, "中文");
+        assert_eq!(result.tool_results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn edge_read_ahead_preserves_partial_event_across_two_tool_windows() {
+        let (tx, mut stream) = test_channel();
+        let bridge = tokio::spawn(async move {
+            tx.send(Ok(sse_event(
+                "tool_request",
+                ",\"request_id\":\"tool-1\",\"tool\":\"bash\",\"args\":{\"command\":\"echo one\"}",
+            )
+            .into_bytes()))
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let tool = sse_event(
+                "tool_request",
+                ",\"request_id\":\"tool-2\",\"tool\":\"bash\",\"args\":{\"command\":\"echo two\"}",
+            );
+            let text = sse_event("text_delta", ",\"content\":\"中文\"");
+            let split = text.find('中').unwrap() + 1;
+            let mut second = tool.into_bytes();
+            second.extend_from_slice(&text.as_bytes()[..split]);
+            tx.send(Ok(second)).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(590)).await;
+            tx.send(Ok(text.as_bytes()[split..].to_vec()))
+                .await
+                .unwrap();
+            tx.send(Ok(b"data: [DONE]\n\n".to_vec())).await.unwrap();
+        });
+        let mut host =
+            RecordingSseStreamHost::new().with_tool_delay(std::time::Duration::from_millis(500));
+        let (result, abort) =
+            consume_sse_stream(&mut stream, &mut host, stream_idle_timeout()).await;
+        bridge.await.unwrap();
+        assert_eq!(
+            abort, None,
+            "successive Edge windows rejected valid UTF-8: {:?}",
+            result.accum.error_message
+        );
+        assert_eq!(result.accum.full_text, "中文");
+        assert_eq!(result.tool_results.len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalescing_replays_partial_event_before_new_network_bytes() {
+        let (tx, mut stream) = test_channel();
+        let bridge = tokio::spawn(async move {
+            tx.send(Ok(sse_event(
+                "tool_request",
+                ",\"request_id\":\"tool-1\",\"tool\":\"bash\",\"args\":{\"command\":\"echo one\"}",
+            )
+            .into_bytes()))
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let tool = sse_event(
+                "tool_request",
+                ",\"request_id\":\"tool-2\",\"tool\":\"read_file\",\"args\":{\"path\":\"note.txt\"}",
+            );
+            let text = sse_event("text_delta", ",\"content\":\"中文\"");
+            let split = text.find('中').unwrap() + 1;
+            let mut second = tool.into_bytes();
+            second.extend_from_slice(&text.as_bytes()[..split]);
+            tx.send(Ok(second)).await.unwrap();
+            // Tool 1 settles at 500 ms. The suffix arrives inside tool 2's
+            // 25 ms coalescing window, after its queued partial prefix.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tx.send(Ok(text.as_bytes()[split..].to_vec()))
+                .await
+                .unwrap();
+            tx.send(Ok(b"data: [DONE]\n\n".to_vec())).await.unwrap();
+        });
+        let mut host =
+            RecordingSseStreamHost::new().with_tool_delay(std::time::Duration::from_millis(500));
+        let (result, abort) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            consume_sse_stream(&mut stream, &mut host, stream_idle_timeout()),
+        )
+        .await
+        .expect("coalescing must settle");
+        bridge.await.unwrap();
+        assert_eq!(
+            abort, None,
+            "coalescing crossed a UTF-8 event boundary: {:?}",
+            result.accum.error_message
+        );
+        assert_eq!(result.accum.full_text, "中文");
+        assert_eq!(result.tool_results.len(), 2);
     }
 
     #[test]

@@ -1284,6 +1284,7 @@ struct CliSseStreamHost<'a> {
     /// Last durable server run identity forwarded to active-run controls.
     last_bound_run_id: Option<String>,
     /// Last provider-confirmed input occupancy forwarded to observers.
+    last_context_window_measured: Option<Option<u64>>,
     /// Last provider-normalized request lanes forwarded to observers.
     last_request_token_usage: Option<Option<astra_turn_types::RequestTokenUsage>>,
     /// Optional direct stream sink for bounded/live paths.
@@ -1789,6 +1790,7 @@ impl<'a> CliSseStreamHost<'a> {
             last_context_system_prompt_tokens: None,
             last_context_window_policy: None,
             last_bound_run_id: None,
+            last_context_window_measured: None,
             last_request_token_usage: None,
             stream_event_sink: ctx.stream_event_sink,
             stream_json_exchange: None,
@@ -4804,15 +4806,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             self.last_context_window_policy = server_policy;
         }
 
+        let measured = accum.measured_request_input_tokens();
+        if Some(measured) != self.last_context_window_measured {
+            self.try_emit_stream_event(chat_stream::StreamEvent::ContextWindowMeasured(measured));
+            self.last_context_window_measured = Some(measured);
+        }
         let request_usage = request_token_usage_from_accum(accum);
         if Some(request_usage) != self.last_request_token_usage {
-            let measured = request_usage.and_then(|usage| {
-                usage
-                    .fresh_input_tokens
-                    .checked_add(usage.cache_read_tokens)?
-                    .checked_add(usage.cache_creation_tokens)
-            });
-            self.try_emit_stream_event(chat_stream::StreamEvent::ContextWindowMeasured(measured));
             self.try_emit_stream_event(chat_stream::StreamEvent::RequestTokenUsage(request_usage));
             self.last_request_token_usage = Some(request_usage);
         }
@@ -9380,6 +9380,93 @@ mod tests {
         assert!(matches!(
             event_rx.try_recv(),
             Ok(chat_stream::StreamEvent::RequestTokenUsage(None))
+        ));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn partial_input_measurement_reaches_context_observers_without_billing_lanes() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let workspace = tempdir().unwrap();
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
+        let mut tool_cache = EdgeToolCache::new(1);
+        let (event_tx, mut event_rx) = chat_stream::stream_event_channel();
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "token",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: Some(event_tx),
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+        let mut accum = ChatTurnSseAccum {
+            current_request_input_tokens: Some(100_000),
+            ..Default::default()
+        };
+        host.on_accum_update(&accum);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(chat_stream::StreamEvent::ContextWindowMeasured(Some(
+                100_000
+            )))
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(chat_stream::StreamEvent::RequestTokenUsage(None))
+        ));
+
+        accum.current_request_input_tokens = Some(120_000);
+        host.on_accum_update(&accum);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(chat_stream::StreamEvent::ContextWindowMeasured(Some(
+                120_000
+            )))
+        ));
+        assert!(event_rx.try_recv().is_err());
+
+        accum.current_request_usage = Some(astra_turn_types::RequestTokenUsage {
+            fresh_input_tokens: 20_000,
+            cache_read_tokens: 100_000,
+            cache_creation_tokens: 0,
+            output_tokens: 1_000,
+        });
+        host.on_accum_update(&accum);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(chat_stream::StreamEvent::RequestTokenUsage(Some(_)))
+        ));
+        assert!(event_rx.try_recv().is_err());
+
+        accum.current_request_input_tokens = Some(130_000);
+        host.on_accum_update(&accum);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(chat_stream::StreamEvent::ContextWindowMeasured(None))
+        ));
+        accum.current_request_input_tokens = Some(120_000);
+        host.on_accum_update(&accum);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(chat_stream::StreamEvent::ContextWindowMeasured(Some(
+                120_000
+            )))
         ));
         assert!(event_rx.try_recv().is_err());
     }
