@@ -1,0 +1,38 @@
+name: previous_explain_report_recovery
+description: |
+  A follow-up asks about the runtime Explain report from an earlier turn.
+  Verify that the agent discovers the report through the session reader and
+  grounds its answer in that result without searching runtime-owned files.
+prompt: "用一句话说明代码审查的目的。"
+capability: "custom:previous_explain_report_recovery"
+difficulty: 3
+weight: 2.0
+timeout_seconds: 180
+debug_log: true
+steps:
+  - prompt: |
+      解读一下刚才那轮运行的 Explain 报告：它是否完整，主要耗时在哪里？
+      请核对实际报告后回答；若无法读取，说明具体缺少什么证据。
+    criteria:
+      - type: hard_judger
+        question: |
+          Verify that the answer uses the actual Explain artifact returned by
+          introspect for the previous run. It must distinguish capture status
+          from metric coverage and cite measured timing rather than invent it.
+          If the reader reports unavailable, credit only a precise limitation
+          grounded in that result. Do not accept SQL EXPLAIN interpretation,
+          filesystem discovery, or a claim that no report exists based solely
+          on ordinary live introspection counters.
+        threshold: 0.8
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_json
+    name: introspect
+    document: arguments
+    path: /explain/target
+    equals: previous
+  - type: journal_tool_call_count
+    name: bash
+    min: 0
+    max: 0

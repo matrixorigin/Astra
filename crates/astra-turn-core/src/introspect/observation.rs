@@ -268,7 +268,7 @@ pub fn build_introspect_report(
             evidence_class: "durable_state_evidence".to_string(),
             source: "matrixone.tool_invocation_lifecycle".to_string(),
             summary: format!(
-                "hot={} prepared={} dispatched={} unknown={} archives={} artifact_refs={} reconciliations={} deferred={}",
+                "hot={} prepared={} dispatched={} unknown={} archives={} invocation_artifact_refs={} reconciliations={} deferred={}",
                 lifecycle.hot_total,
                 lifecycle.prepared,
                 lifecycle.dispatched,
@@ -1247,7 +1247,7 @@ fn build_introspect_observations(
                 kind: "durable_invocation_lifecycle".to_string(),
                 severity: if unhealthy { "warning" } else { "info" }.to_string(),
                 summary: format!(
-                    "hot={} prepared={} dispatched={} unknown={} archives={} artifact_refs={} reconciliations={} deferred={}",
+                    "hot={} prepared={} dispatched={} unknown={} archives={} invocation_artifact_refs={} reconciliations={} deferred={}",
                     lifecycle.hot_total,
                     lifecycle.prepared,
                     lifecycle.dispatched,

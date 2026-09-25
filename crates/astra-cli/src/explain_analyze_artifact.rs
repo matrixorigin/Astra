@@ -677,45 +677,6 @@ fn latest_notice_for_capture(capture: &LatestExplainAnalyzeCapture) -> Option<St
     }
 }
 
-fn context_notice_for_capture(capture: &LatestExplainAnalyzeCapture) -> String {
-    let notice = latest_notice_for_capture(capture).unwrap_or_else(|| {
-        "Explain Analyze artifact is not currently readable; report that limitation instead of inferring runtime facts."
-            .to_string()
-    });
-    let read_instruction = capture
-        .handle
-        .as_deref()
-        .map(|handle| {
-            format!(
-                "If the user asks about the previous/latest Explain Analyze run, call introspect(artifact=\"{handle}\", offset=0, max_bytes=65536) before drawing conclusions. The handle is readable only through the host that owns this session artifact store; a remote Server may report it unavailable rather than reading a client path. If introspect is unavailable in the visible tool set, report that artifact recovery is unavailable instead of guessing."
-            )
-        })
-        .unwrap_or_else(|| {
-            "The latest Explain Analyze capture is not currently readable; report that limitation instead of inferring runtime facts."
-                .to_string()
-        });
-    format!(
-        "[Explain Analyze artifact discovery]\n{notice}\n{read_instruction}\nThe CLI may also show a local rendered report path to the user; that path is a presentation affordance, while the opaque artifact handle is the model-facing source. Treat the artifact as the runtime source of truth; do not infer timing from renderer text or source code."
-    )
-}
-
-/// Compact prompt-facing discovery notice for the next model turn. It names
-/// the typed artifact capability and the bounded reader without copying the
-/// report into the prompt or exposing a host filesystem path.
-pub(crate) fn latest_context_notice(session_dir: &Path) -> Result<Option<String>, String> {
-    let artifact_directory = session_dir.join(ARTIFACT_DIR);
-    if let Some(failure) = publication_failure(&artifact_directory) {
-        return Ok(Some(format!(
-            "[Explain Analyze artifact discovery]\n{}\nThe CLI may show a rendered report path to the user when available, but the local path is not a model authority. The latest Explain Analyze capture is not currently readable; report that limitation instead of inferring runtime facts.",
-            publication_failure_notice(&failure)
-        )));
-    }
-    let Some(capture) = latest_capture(session_dir)? else {
-        return Ok(None);
-    };
-    Ok(Some(context_notice_for_capture(&capture)))
-}
-
 fn read_artifact_window(
     path: &Path,
     offset: usize,
@@ -1439,11 +1400,6 @@ mod tests {
             .expect("latest notice")
             .expect("completed notice");
         assert!(notice.contains(&handle), "{notice}");
-        let context = latest_context_notice(temp.path())
-            .expect("latest context notice")
-            .expect("completed context notice");
-        assert!(context.contains("introspect(artifact="), "{context}");
-        assert!(context.contains("runtime source of truth"), "{context}");
     }
 
     #[test]

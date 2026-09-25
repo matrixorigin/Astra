@@ -1078,7 +1078,7 @@ fn render_hint(s: &IntrospectSnapshot) -> String {
     }
     if let Some(lifecycle) = s.invocation_lifecycle.as_ref() {
         out.push_str(&format!(
-            " invocation_lifecycle=hot:{} prepared:{} dispatched:{} unknown:{} archives:{} refs:{}",
+            " invocation_lifecycle=hot:{} prepared:{} dispatched:{} unknown:{} archives:{} invocation_artifact_refs:{}",
             lifecycle.hot_total,
             lifecycle.prepared,
             lifecycle.dispatched,
@@ -1250,7 +1250,7 @@ fn render_summary(s: &IntrospectSnapshot) -> String {
     }
     if let Some(lifecycle) = s.invocation_lifecycle.as_ref() {
         out.push_str(&format!(
-            "Durable invocation lifecycle: hot={} prepared={} dispatched={} succeeded={} failed={} rejected={} not_dispatched_rejections={} outcome_unknown={} archive_chunks={} artifact_refs={} reconciliations={} deferred={}\n",
+            "Durable invocation lifecycle (not an Explain catalog): hot={} prepared={} dispatched={} succeeded={} failed={} rejected={} not_dispatched_rejections={} outcome_unknown={} archive_chunks={} invocation_artifact_refs={} reconciliations={} deferred={}\n",
             lifecycle.hot_total,
             lifecycle.prepared,
             lifecycle.dispatched,
@@ -1445,7 +1445,7 @@ fn render_full(s: &IntrospectSnapshot) -> String {
             lifecycle.outcome_unknown,
         ));
         out.push_str(&format!(
-            "Evidence: not_dispatched_rejections={} archive_chunks={} artifact_refs={} reconciliation_events={} deferred_events={}\n",
+            "Evidence: not_dispatched_rejections={} archive_chunks={} invocation_artifact_refs={} reconciliation_events={} deferred_events={}\n",
             lifecycle.rejected_without_dispatch,
             lifecycle.archive_chunks,
             lifecycle.durable_artifact_references,
@@ -2614,9 +2614,12 @@ mod tests {
 
         let hint = render_introspect(&snapshot, IntrospectTextDepth::Hint);
         assert!(hint.contains("invocation_lifecycle=hot:3"));
+        assert!(hint.contains("invocation_artifact_refs:4"));
         let full = render_introspect(&snapshot, IntrospectTextDepth::Full);
         assert!(full.contains("## Durable Invocation Lifecycle"));
         assert!(full.contains("outcome_unknown=1"));
+        assert!(full.contains("invocation_artifact_refs=4"));
+        assert!(full.contains("not an Explain catalog"));
         let request = IntrospectRequest::from_args(&serde_json::json!({
             "facet": "session",
             "depth": "diagnostic",
