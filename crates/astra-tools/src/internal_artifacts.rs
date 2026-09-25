@@ -7,7 +7,7 @@
 //! entry point can fail the same way.
 
 pub fn references_internal_tool_result_artifact(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
+    let lower = value.replace('\\', "/").to_ascii_lowercase();
     lower.contains("artifact://session/tool-result/")
         || (lower.contains(".astra/sessions/") && contains_tool_results_segment(&lower))
         || (lower.contains(".astra/tool-results/") || lower.contains(".astra/tool-results "))
@@ -59,6 +59,12 @@ mod tests {
         ));
         assert!(references_internal_tool_result_artifact(
             "/home/me/.astra/tool-results/call_abc.txt"
+        ));
+        assert!(references_internal_tool_result_artifact(
+            "ls ~/.astra/sessions/session-1/tool-results"
+        ));
+        assert!(references_internal_tool_result_artifact(
+            "type C:\\Users\\me\\.astra\\sessions\\s1\\tool-results\\call_abc.txt"
         ));
         assert!(!references_internal_tool_result_artifact(
             "/repo/.astra-notes/tool-results.txt"

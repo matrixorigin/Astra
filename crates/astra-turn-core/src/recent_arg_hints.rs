@@ -25,13 +25,6 @@ pub const MAX_RECENT_PATHS: usize = 5;
 /// Maximum number of distinct shell commands to surface.
 pub const MAX_RECENT_COMMANDS: usize = 3;
 
-fn references_internal_tool_result_artifact(value: &str) -> bool {
-    let value = value.replace('\\', "/");
-    value.starts_with("artifact://session/tool-result/")
-        || (value.contains(".astra/sessions/") && value.contains("/tool-results/"))
-        || value.contains(".astra/tool-results/")
-}
-
 /// Extracted hints from recent tool calls.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecentArgHints {
@@ -101,7 +94,7 @@ where
         let args = normalize_llm_function_arguments(raw_args);
         if hints.paths.len() < MAX_RECENT_PATHS {
             if let Some(p) = path_hint_from_args(&args) {
-                if !references_internal_tool_result_artifact(&p)
+                if !astra_tools::internal_artifacts::references_internal_tool_result_artifact(&p)
                     && !hints.paths.iter().any(|existing| existing == &p)
                 {
                     hints.paths.push(p);
@@ -111,8 +104,9 @@ where
         if hints.commands.len() < MAX_RECENT_COMMANDS {
             if let Some(c) = command_hint_from_args(&args) {
                 let owned = c.to_string();
-                if !references_internal_tool_result_artifact(&owned)
-                    && !hints.commands.iter().any(|existing| existing == &owned)
+                if !astra_tools::internal_artifacts::references_internal_tool_result_artifact(
+                    &owned,
+                ) && !hints.commands.iter().any(|existing| existing == &owned)
                 {
                     hints.commands.push(owned);
                 }
@@ -257,11 +251,16 @@ mod tests {
             "command": "cat /home/me/.astra/sessions/v1/users/b64-wrong/sessions/s1/tool-results/call_abc.txt"
         });
         let normal = json!({"path": "src/lib.rs"});
+        let directory = json!({"command": "ls ~/.astra/sessions/s1/tool-results"});
+        let case_variant =
+            json!({"path": "C:\\Users\\me\\.ASTRA\\sessions\\s1\\tool-results\\call.txt"});
 
         let hints = build_recent_arg_hints([
             ("read_file", &physical),
             ("read_file", &logical),
             ("bash", &command),
+            ("bash", &directory),
+            ("read_file", &case_variant),
             ("read_file", &normal),
         ]);
 
