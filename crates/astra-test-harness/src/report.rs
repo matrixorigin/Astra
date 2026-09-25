@@ -311,6 +311,21 @@ fn auxiliary_judgment_lines(run: &CaseRunReport) -> Vec<String> {
     lines
 }
 
+/// The aggregate outcome is not a physical execution when retries or steps
+/// exist. Never borrow its mixed counters to fill missing capture evidence.
+fn physical_executions(run: &CaseRunReport) -> Vec<&RunOutcome> {
+    match (run.attempts.is_empty(), run.steps.is_empty()) {
+        (true, true) => vec![&run.outcome],
+        (true, false) => Vec::new(),
+        (false, _) => run
+            .attempts
+            .iter()
+            .map(|attempt| &attempt.outcome)
+            .chain(run.steps.iter().map(|step| &step.outcome))
+            .collect(),
+    }
+}
+
 fn auxiliary_lines_for_outcome(label: &str, outcome: &RunOutcome) -> Vec<String> {
     let heading = if label.is_empty() {
         "    auxiliary".to_owned()
@@ -530,27 +545,52 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
     };
     let wall_secs = wall_ms / 1000;
 
-    let primary_cache = report
-        .runs
-        .iter()
-        .try_fold((0_u128, 0_u128), |(read, input), run| {
-            let usage = run
-                .outcome
-                .explain_capture
-                .as_ref()?
-                .primary_prompt_cache_usage()?;
-            Some((
-                read + u128::from(usage.cache_read_tokens),
-                input + u128::from(usage.checked_total_input_tokens()?),
-            ))
-        });
+    let has_execution = report.runs.iter().any(CaseRunReport::is_evidence);
+    let primary_cache = if has_execution {
+        report.runs.iter().filter(|run| run.is_evidence()).try_fold(
+            (0_u128, 0_u128),
+            |(read, input), run| {
+                let usage =
+                    crate::criteria::primary_execution_cache_usage(&physical_executions(run))?;
+                Some((
+                    read + u128::from(usage.cache_read_tokens),
+                    input + u128::from(usage.checked_total_input_tokens()?),
+                ))
+            },
+        )
+    } else {
+        None
+    };
+    let observed_cache_read = if primary_cache.is_none() {
+        has_execution
+            .then(|| {
+                report
+                    .runs
+                    .iter()
+                    .filter(|run| run.is_evidence())
+                    .try_fold(0_u128, |read, run| {
+                        let observed = crate::criteria::primary_execution_cache_read_tokens(
+                            &physical_executions(run),
+                        )?;
+                        read.checked_add(u128::from(observed))
+                    })
+            })
+            .flatten()
+    } else {
+        None
+    };
     let cache_ratio_pct = match primary_cache {
         Some((read, input)) if input > 0 => format!(
             "primary prompt-cache read={:.1}%",
             read as f64 / input as f64 * 100.0
         ),
         Some(_) => "primary prompt-cache read=n/a".to_owned(),
-        None => "primary prompt-cache read=unknown (input coverage incomplete)".to_owned(),
+        None => match observed_cache_read {
+            Some(read) => format!(
+                "primary prompt-cache read=unknown (input coverage incomplete; observed read-tokens={read})"
+            ),
+            None => "primary prompt-cache read=unknown (input coverage incomplete)".to_owned(),
+        },
     };
     s.push_str(&format!(
         "total={} passed={} failed={} cancelled={} unavailable={} | terminal-reported tokens: {} fresh-in/{}out cache-read={} cache-write={} (not full model cost) | {} | wall: {}m{}s (sum: {}m{}s)\n\n",
@@ -668,17 +708,7 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
                 cap.skipped_lines,
                 cap.tools_invoked()
             ));
-            let executions: Vec<_> = match (run.attempts.is_empty(), run.steps.is_empty()) {
-                (true, true) => vec![&run.outcome],
-                // An aggregate with steps cannot stand in for a missing root.
-                (true, false) => Vec::new(),
-                (false, _) => run
-                    .attempts
-                    .iter()
-                    .map(|attempt| &attempt.outcome)
-                    .chain(run.steps.iter().map(|step| &step.outcome))
-                    .collect(),
-            };
+            let executions = physical_executions(run);
             let health = crate::pipeline_analysis::analyze_pipeline_health(cap, &executions);
             let prefix = health
                 .stable_prefix_cache_coverage
@@ -1861,6 +1891,7 @@ mod tests {
             }
         }
         capture.bind(Some("r"));
+        r.runs[0].outcome.run_id = Some("r".into());
         r.runs[0].outcome.explain_capture = Some(capture);
         let rendered = render_text(&r, false);
         assert!(rendered.contains("primary prompt-cache read=90.0%"));
@@ -1868,6 +1899,59 @@ mod tests {
         assert!(rendered.contains(
             "auxiliary usage: jev · request_judgment · exact · fresh-in=999999 cache-read=unknown cache-write=unknown out=100"
         ));
+
+        let mut partial = r.clone();
+        let capture = partial.runs[0].outcome.explain_capture.as_mut().unwrap();
+        let request = capture
+            .events
+            .iter_mut()
+            .find(|event| event.node_id == "request" && event.usage.is_some())
+            .unwrap();
+        let usage = request.usage.as_mut().unwrap();
+        usage.basis = astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderPartial;
+        usage.cache_creation_tokens = None;
+        let rendered = render_text(&partial, false);
+        assert!(rendered.contains("primary prompt-cache read=unknown"));
+        assert!(rendered.contains("observed read-tokens=900"));
+
+        let mut unavailable = partial.runs[0].clone();
+        unavailable.case_name = "unsupported".into();
+        unavailable.status = CaseRunStatus::Unavailable;
+        unavailable.outcome.explain_capture = None;
+        let mut cancelled = unavailable.clone();
+        cancelled.case_name = "not_started".into();
+        cancelled.status = CaseRunStatus::Cancelled;
+        let mut mixed = partial.clone();
+        mixed.runs.extend([unavailable, cancelled]);
+        assert!(render_text(&mixed, false).contains("observed read-tokens=900"));
+        mixed.runs.remove(0);
+        let rendered = render_text(&mixed, false);
+        assert!(rendered.contains("primary prompt-cache read=unknown"));
+        assert!(!rendered.contains("observed read-tokens="));
+
+        let mut multistep = partial.clone();
+        multistep.runs[0].attempts = vec![AttemptRecord {
+            attempt_index: 0,
+            outcome: partial.runs[0].outcome.clone(),
+        }];
+        multistep.runs[0].steps = vec![StepResult {
+            step_index: 0,
+            prompt: "continue".into(),
+            outcome: crate::exec::test_support::cache_request_outcome(
+                "next-run",
+                "next-turn",
+                &[(50, 100, 0)],
+            ),
+            duration_ms: 0,
+            criteria: vec![],
+            passed: true,
+        }];
+        let rendered = render_text(&multistep, false);
+        assert!(rendered.contains("observed read-tokens=1000"));
+        multistep.runs[0].attempts[0].outcome.explain_capture = None;
+        let rendered = render_text(&multistep, false);
+        assert!(rendered.contains("primary prompt-cache read=unknown"));
+        assert!(!rendered.contains("observed read-tokens="));
 
         let mut failed_auxiliary = r.clone();
         let capture = failed_auxiliary.runs[0]

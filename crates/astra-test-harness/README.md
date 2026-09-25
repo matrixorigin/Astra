@@ -89,13 +89,17 @@ The primary prompt-cache percentage uses the canonical Explain graph and only
 certifies complete, exact input buckets across closed execution scopes. Output
 coverage is independent. Missing input evidence, conflicts or transport gaps
 produce an unknown percentage while terminal-reported cache counts remain
-visible under their separate, non-authoritative accounting label. No provider
-or model name is used to infer an unreported cache-write lane as zero.
+visible under their separate, non-authoritative accounting label. When every
+physical execution has a known provider cache-read lane, the summary also
+shows its observed read-token total without inventing an input percentage. No
+provider or model name is used to infer an unreported cache-write lane as zero.
 In particular, terminal `cache-write=0` does not prove an explicitly reported
 provider zero: those scalar counters no longer retain field presence. Retry
-and multi-step aggregate captures remain unknown here; their individual
-attempt/step facts are retained. Other journal-based cache criteria and pipeline
-statistics have not yet all been migrated to this coverage check.
+and multi-step cases use individual attempt/step captures, never the mixed
+aggregate as a substitute for missing physical evidence. Cancelled and
+unavailable rows are not executions and do not enter this measurement. Other
+journal-based cache criteria and pipeline statistics have not yet all been
+migrated to this coverage check.
 `prompt_cache_tokens` uses canonical primary physical-attempt evidence, not
 mixed terminal counters. A read-only floor (`min_creation: 0`, no
 `max_creation`) accepts a provider-observed cache-read lane even when creation

@@ -848,7 +848,7 @@ fn requires_exact_primary_cache_evidence(criterion: &Criterion) -> bool {
     }
 }
 
-fn primary_execution_cache_usage(
+pub(crate) fn primary_execution_cache_usage(
     executions: &[&RunOutcome],
 ) -> Option<astra_turn_types::NormalizedPromptCacheUsage> {
     primary_execution_evidence(
@@ -871,7 +871,7 @@ fn primary_execution_cache_usage(
     )
 }
 
-fn primary_execution_cache_read_tokens(executions: &[&RunOutcome]) -> Option<u64> {
+pub(crate) fn primary_execution_cache_read_tokens(executions: &[&RunOutcome]) -> Option<u64> {
     primary_execution_evidence(
         executions,
         0_u64,
