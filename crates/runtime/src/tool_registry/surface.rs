@@ -430,7 +430,7 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
                 "offset",
                 "max_bytes",
             ][..],
-            "Live; question=label. Server Explain: explain={target:previous}; page artifact; omit explain.",
+            "question=label. Server Explain: explain={target:previous} OR artifact=handle; never both.",
         ),
         "reflect" => (
             &["question"][..],
