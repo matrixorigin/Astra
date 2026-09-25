@@ -1352,6 +1352,9 @@ pub struct DurableSessionRunPage {
     pub runs: Vec<DurableRunRecord>,
     pub limit: u32,
     pub truncated: bool,
+    /// Run IDs selected by the user-cancellation recovery lane. Event-only
+    /// parent rows must not trigger a control lookup in the reconciler.
+    pub recovery_cancellation_run_ids: Vec<String>,
     /// Seek cursor for the typed cancellation-recovery lane. Ordinary session
     /// working-set rows do not influence this value.
     pub recovery_next_cursor: Option<String>,
@@ -3093,6 +3096,18 @@ const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, roo
      ancestor_path, depth, delegation_id, agent_id, retry_of, retry_scope, status, waiting_for, \
      owner_pod_id, owner_lease_expires_at, cancellation_requested_at, run_generation, last_event_idx, checkpoint_version, \
      checkpoint_json, error_code, error_message, retry_count, total_prompt_tokens, \
+     total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
+     agent_binding_schema_version, model_offering_id, resolved_model_name, \
+     runtime_profile, start_request_fingerprint, work_id, \
+     work_branch_id, work_graph_revision, work_item_id, work_item_revision, \
+     work_item_attempt_id, created_at, updated_at";
+// Recovery only projects agent identity, lifecycle, and result metadata. A
+// checkpoint is never executed from this read-only path, so avoid pulling the
+// potentially large JSON column for cancellation/event candidates.
+const AGENT_RUN_RECOVERY_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, root_run_id, \
+     ancestor_path, depth, delegation_id, agent_id, retry_of, retry_scope, status, waiting_for, \
+     owner_pod_id, owner_lease_expires_at, cancellation_requested_at, run_generation, last_event_idx, checkpoint_version, \
+     CAST(NULL AS CHAR) AS checkpoint_json, error_code, error_message, retry_count, total_prompt_tokens, \
      total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
      agent_binding_schema_version, model_offering_id, resolved_model_name, \
      runtime_profile, start_request_fingerprint, work_id, \
@@ -5446,7 +5461,7 @@ pub trait RunStateStore: Send + Sync {
 
     /// Load the same bounded session working set plus only the lifecycle
     /// events required to reconstruct read-only agent/fanout results. The
-    /// database implementation overrides this with two batch queries; this
+    /// database implementation overrides this with bounded batch reads; this
     /// fallback is for deterministic test stores.
     async fn load_session_agent_recovery(
         &self,
@@ -9783,6 +9798,7 @@ impl RunStateStore for InMemoryRunStateStore {
             runs: session_runs,
             limit,
             truncated,
+            recovery_cancellation_run_ids: Vec::new(),
             recovery_next_cursor: None,
         })
     }
@@ -9823,6 +9839,7 @@ impl RunStateStore for InMemoryRunStateStore {
             page.truncated = true;
             control.truncate(recovery_limit);
         }
+        page.recovery_cancellation_run_ids = control.iter().map(|run| run.run_id.clone()).collect();
         page.recovery_next_cursor = control.last().map(|run| run.run_id.clone());
         let mut included = page
             .runs
@@ -10467,6 +10484,8 @@ pub struct DatabaseRunStateStore {
     orphan_cancellation_commit_ack_loss_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     cancellation_marker_commit_ack_loss_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    terminal_transition_commit_ack_loss_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 const UNSETTLED_USER_INTENT_EVENTS_SELECT_SQL: &str =
@@ -10971,10 +10990,59 @@ impl DatabaseRunStateStore {
         } else {
             None
         };
-        tx.commit().await.map_err(|source| {
-            db_error("transition_run_status_with_events_commit", run_id, source).to_string()
-        })?;
-        connection.release();
+        let commit_error = match tx.commit().await {
+            Ok(()) => {
+                connection.release();
+                #[cfg(test)]
+                {
+                    self.terminal_transition_commit_ack_loss_once
+                        .swap(false, std::sync::atomic::Ordering::SeqCst)
+                        .then(|| {
+                            format!(
+                                "injected terminal transition commit acknowledgement loss for {run_id}"
+                            )
+                        })
+                }
+                #[cfg(not(test))]
+                {
+                    None
+                }
+            }
+            Err(source) => {
+                drop(connection);
+                Some(
+                    db_error("transition_run_status_with_events_commit", run_id, source)
+                        .to_string(),
+                )
+            }
+        };
+        if let Some(commit_error) = commit_error {
+            let exact = self
+                .transition_commit_is_durable(
+                    user_id,
+                    expected_session_id,
+                    run_id,
+                    status,
+                    next_last_event_idx,
+                    &event_rows,
+                )
+                .await
+                .map_err(|error| format!("{commit_error}; {error}"))?;
+            if !exact {
+                return Err(format!(
+                    "{commit_error}; durable transition acknowledgement remains ambiguous"
+                ));
+            }
+            tracing::warn!(
+                user_id,
+                session_id = expected_session_id,
+                run_id,
+                status,
+                event_count = event_rows.len(),
+                error = %commit_error,
+                "recovered terminal transition commit acknowledgement"
+            );
+        }
 
         self.repair_run_projection_after_status_for_user(user_id, expected_session_id, run_id)
             .await;
@@ -11049,6 +11117,10 @@ impl DatabaseRunStateStore {
             ),
             #[cfg(test)]
             cancellation_marker_commit_ack_loss_once: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
+            #[cfg(test)]
+            terminal_transition_commit_ack_loss_once: std::sync::Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
             ),
         }
@@ -11167,6 +11239,13 @@ impl DatabaseRunStateStore {
     #[cfg(test)]
     fn with_cancellation_marker_commit_ack_loss_once(self) -> Self {
         self.cancellation_marker_commit_ack_loss_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_terminal_transition_commit_ack_loss_once(self) -> Self {
+        self.terminal_transition_commit_ack_loss_once
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self
     }
@@ -12371,6 +12450,54 @@ impl DatabaseRunStateStore {
         run_id: &str,
     ) -> DbStoreResult<Option<DurableRunRecord>> {
         load_run_metadata_for_exact_session_tx(tx, user_id, expected_session_id, run_id).await
+    }
+
+    async fn transition_commit_is_durable(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+        expected_status: &str,
+        expected_last_event_idx: i64,
+        event_rows: &[RunEventInsertRow],
+    ) -> Result<bool, String> {
+        let row = sqlx::query(
+            "SELECT session_id, status, last_event_idx
+             FROM agent_runs
+             WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| {
+            db_error("reconcile_transition_commit_run", run_id, source).to_string()
+        })?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let session_id: String = row.try_get("session_id").map_err(|source| {
+            db_error("decode_reconciled_transition_session", run_id, source).to_string()
+        })?;
+        let status: String = row.try_get("status").map_err(|source| {
+            db_error("decode_reconciled_transition_status", run_id, source).to_string()
+        })?;
+        let last_event_idx: i64 = row.try_get("last_event_idx").map_err(|source| {
+            db_error(
+                "decode_reconciled_transition_last_event_idx",
+                run_id,
+                source,
+            )
+            .to_string()
+        })?;
+        if session_id != expected_session_id
+            || status != expected_status
+            || last_event_idx != expected_last_event_idx
+        {
+            return Ok(false);
+        }
+        self.exact_run_event_rows_are_durable(event_rows, "reconcile_transition_commit_events")
+            .await
     }
 
     async fn load_run_projection_metadata_for_user(
@@ -21375,92 +21502,8 @@ impl RunStateStore for DatabaseRunStateStore {
         session_id: &str,
         limit: u32,
     ) -> Result<DurableSessionRunPage, String> {
-        let limit = validate_run_list_limit(limit);
-        let sql = format!(
-            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs \
-             WHERE user_id = ? AND session_id = ? \
-             ORDER BY CASE WHEN status IN (?, ?, ?, ?) THEN 1 ELSE 0 END ASC, \
-                      updated_at DESC, created_at DESC, run_id DESC \
-             LIMIT ?"
-        );
-        let rows = sqlx::query(&sql)
-            .bind(user_id)
-            .bind(session_id)
-            .bind(STATUS_COMPLETED)
-            .bind(STATUS_DELEGATED)
-            .bind(STATUS_FAILED)
-            .bind(STATUS_CANCELLED)
-            .bind(session_run_query_limit(limit))
-            .fetch_all(self.pool.get())
+        self.list_session_runs_with_columns(user_id, session_id, limit, AGENT_RUN_COLUMNS)
             .await
-            .map_err(|source| db_error("list_session_runs", session_id, source).to_string())?;
-        let mut runs = rows
-            .into_iter()
-            .map(run_record_from_row)
-            .collect::<DbStoreResult<Vec<_>>>()
-            .map_err(|error| error.to_string())?;
-        let truncated = runs.len() > limit as usize;
-        runs.truncate(limit as usize);
-
-        // Preserve the ancestry required to interpret every selected node.
-        // Fetch one parent level per round in a single batch; delegation depth
-        // is bounded, and the visited set also makes malformed cycles finite.
-        let mut included = runs
-            .iter()
-            .map(|run| run.run_id.clone())
-            .collect::<HashSet<_>>();
-        let mut frontier = runs
-            .iter()
-            .filter_map(|run| run.parent_run_id.clone())
-            .filter(|run_id| !included.contains(run_id))
-            .collect::<HashSet<_>>();
-        while !frontier.is_empty() {
-            let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
-                "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs WHERE user_id = "
-            ));
-            builder
-                .push_bind(user_id)
-                .push(" AND session_id = ")
-                .push_bind(session_id)
-                .push(" AND run_id IN (");
-            let mut separated = builder.separated(", ");
-            for run_id in &frontier {
-                separated.push_bind(run_id);
-            }
-            separated.push_unseparated(")");
-            let parent_rows =
-                builder
-                    .build()
-                    .fetch_all(self.pool.get())
-                    .await
-                    .map_err(|source| {
-                        db_error("list_session_run_ancestors", session_id, source).to_string()
-                    })?;
-            let parents = parent_rows
-                .into_iter()
-                .map(run_record_from_row)
-                .collect::<DbStoreResult<Vec<_>>>()
-                .map_err(|error| error.to_string())?;
-            frontier.clear();
-            for parent in parents {
-                if !included.insert(parent.run_id.clone()) {
-                    continue;
-                }
-                if let Some(grandparent_id) = parent.parent_run_id.clone()
-                    && !included.contains(&grandparent_id)
-                {
-                    frontier.insert(grandparent_id);
-                }
-                runs.push(parent);
-            }
-        }
-        sort_session_run_tree(&mut runs);
-        Ok(DurableSessionRunPage {
-            runs,
-            limit,
-            truncated,
-            recovery_next_cursor: None,
-        })
     }
 
     async fn list_active_session_runs_cursor(
@@ -21550,7 +21593,11 @@ impl RunStateStore for DatabaseRunStateStore {
         limit: u32,
         after_run_id: Option<&str>,
     ) -> Result<DurableSessionRunPage, String> {
-        let mut page = self.list_session_runs(user_id, session_id, limit).await?;
+        // Fanout recovery never executes a checkpoint; keep the working-set
+        // projection narrow so each refresh avoids reading checkpoint JSON.
+        let mut page = self
+            .list_session_runs_with_columns(user_id, session_id, limit, AGENT_RUN_RECOVERY_COLUMNS)
+            .await?;
         // The ordinary bounded session page can contain a cancellation run
         // that the recovery cursor already consumed. Remove only exact,
         // durable cancellation facts at or before the cursor; applying the
@@ -21593,14 +21640,11 @@ impl RunStateStore for DatabaseRunStateStore {
             page.runs
                 .retain(|run| !processed_run_ids.contains(&run.run_id));
         }
-        // User cancellation is one run-level control fact. A generic session
-        // page can be saturated by newer active runs, so select a separate
-        // bounded marker batch. Runtime/unverified cancellation never enters
-        // this recovery plane: its exact live owner commits terminal state in
-        // one transaction.
-        let recovery_limit = validate_run_list_limit(limit);
+        // A generic session page can be saturated by newer active runs, so
+        // select a separate bounded cancellation marker batch.
+        let recovery_limit = validate_run_list_limit(limit) as usize;
         let mut cancellation_query = format!(
-            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
+            "SELECT {AGENT_RUN_RECOVERY_COLUMNS} FROM agent_runs
              WHERE user_id = ? AND session_id = ?
                AND status IN (?, ?, ?)
                AND cancellation_requested_at IS NOT NULL"
@@ -21618,8 +21662,8 @@ impl RunStateStore for DatabaseRunStateStore {
         if let Some(after_run_id) = after_run_id {
             cancellation_query = cancellation_query.bind(after_run_id);
         }
-        let cancellation_rows = cancellation_query
-            .bind(session_run_query_limit(recovery_limit))
+        let mut cancellation_runs = cancellation_query
+            .bind(session_run_query_limit(recovery_limit as u32))
             .fetch_all(self.pool.get())
             .await
             .map_err(|source| {
@@ -21629,16 +21673,19 @@ impl RunStateStore for DatabaseRunStateStore {
                     source,
                 )
                 .to_string()
-            })?;
-        let mut cancellation_runs = cancellation_rows
+            })?
             .into_iter()
             .map(run_record_from_row)
             .collect::<DbStoreResult<Vec<_>>>()
             .map_err(|error| error.to_string())?;
-        if cancellation_runs.len() > recovery_limit as usize {
+        if cancellation_runs.len() > recovery_limit {
             page.truncated = true;
-            cancellation_runs.truncate(recovery_limit as usize);
+            cancellation_runs.truncate(recovery_limit);
         }
+        page.recovery_cancellation_run_ids = cancellation_runs
+            .iter()
+            .map(|run| run.run_id.clone())
+            .collect();
         page.recovery_next_cursor = cancellation_runs.last().map(|run| run.run_id.clone());
         let mut included = page
             .runs
@@ -21650,50 +21697,16 @@ impl RunStateStore for DatabaseRunStateStore {
                 page.runs.push(run);
             }
         }
-        // Group cancellation events live on the parent run, but a bounded
-        // cancellation page can select only a child. Load missing direct
-        // parents in one batch so those events have a durable run to attach
-        // to instead of being silently discarded after the event query.
+        // Keep the possible direct parents as event-query identities. We only
+        // load their run rows below if the bounded event query actually finds
+        // a fanout cancellation; ordinary child recovery stays one read wave.
         let parent_run_ids = page
             .runs
             .iter()
             .filter_map(|run| run.parent_run_id.as_deref())
             .filter(|parent_run_id| !included.contains(*parent_run_id))
+            .map(ToString::to_string)
             .collect::<HashSet<_>>();
-        if !parent_run_ids.is_empty() {
-            let mut parent_query = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
-                "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs WHERE user_id = "
-            ));
-            parent_query
-                .push_bind(user_id)
-                .push(" AND session_id = ")
-                .push_bind(session_id)
-                .push(" AND run_id IN (");
-            {
-                let mut ids = parent_query.separated(",");
-                for run_id in &parent_run_ids {
-                    ids.push_bind(*run_id);
-                }
-            }
-            parent_query.push(")");
-            let parent_rows = parent_query
-                .build()
-                .fetch_all(self.pool.get())
-                .await
-                .map_err(|source| {
-                    db_error("load_session_agent_recovery_parents", session_id, source).to_string()
-                })?;
-            for parent in parent_rows
-                .into_iter()
-                .map(run_record_from_row)
-                .collect::<DbStoreResult<Vec<_>>>()
-                .map_err(|error| error.to_string())?
-            {
-                if included.insert(parent.run_id.clone()) {
-                    page.runs.push(parent);
-                }
-            }
-        }
         sort_session_run_tree(&mut page.runs);
         if page.runs.is_empty() {
             return Ok(page);
@@ -21760,26 +21773,31 @@ impl RunStateStore for DatabaseRunStateStore {
         }
         builder.push(
             ")
-               ) ranked_terminal WHERE recovery_rank = 1
+               ) ranked_terminal WHERE recovery_rank = 1",
+        );
+        if !recovery_event_run_ids.is_empty() {
+            builder.push(
+                "
                UNION ALL
                SELECT run_id, event_idx, payload_json
                FROM agent_run_events
                WHERE user_id = ",
-        );
-        builder
-            .push_bind(user_id)
-            .push(" AND session_id = ")
-            .push_bind(session_id)
-            .push(" AND event_type = 'fanout_group_cancelled' AND run_id IN (");
-        {
-            let mut ids = builder.separated(",");
-            for run_id in &recovery_event_run_ids {
-                ids.push_bind(*run_id);
+            );
+            builder
+                .push_bind(user_id)
+                .push(" AND session_id = ")
+                .push_bind(session_id)
+                .push(" AND event_type = 'fanout_group_cancelled' AND run_id IN (");
+            {
+                let mut ids = builder.separated(",");
+                for run_id in &recovery_event_run_ids {
+                    ids.push_bind(*run_id);
+                }
             }
+            builder.push(")");
         }
         builder.push(
-            ")
-             ) recovery_events
+            ") recovery_events
              ORDER BY run_id, event_idx",
         );
         let rows = builder
@@ -21807,6 +21825,56 @@ impl RunStateStore for DatabaseRunStateStore {
                 .entry(run_id)
                 .or_default()
                 .push((event_idx, payload));
+        }
+        // Group cancellation events live on the parent run, but a bounded
+        // cancellation page can select only a child. Read missing direct
+        // parents only when that event query proves the parent owns a group
+        // cancellation. A normal recovery refresh therefore pays no extra
+        // parent-row SQL round trip.
+        let parents_with_group_cancellations = parent_run_ids
+            .into_iter()
+            .filter(|parent_run_id| {
+                events_by_run.get(parent_run_id).is_some_and(|events| {
+                    events
+                        .iter()
+                        .any(|(_, event)| extract_event_type(event) == "fanout_group_cancelled")
+                })
+            })
+            .collect::<Vec<_>>();
+        if !parents_with_group_cancellations.is_empty() {
+            let mut parent_query = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
+                "SELECT {AGENT_RUN_RECOVERY_COLUMNS} FROM agent_runs WHERE user_id = "
+            ));
+            parent_query
+                .push_bind(user_id)
+                .push(" AND session_id = ")
+                .push_bind(session_id)
+                .push(" AND run_id IN (");
+            {
+                let mut ids = parent_query.separated(",");
+                for run_id in &parents_with_group_cancellations {
+                    ids.push_bind(run_id);
+                }
+            }
+            parent_query.push(")");
+            let parent_rows = parent_query
+                .build()
+                .fetch_all(self.pool.get())
+                .await
+                .map_err(|source| {
+                    db_error("load_session_agent_recovery_parents", session_id, source).to_string()
+                })?;
+            for parent in parent_rows
+                .into_iter()
+                .map(run_record_from_row)
+                .collect::<DbStoreResult<Vec<_>>>()
+                .map_err(|error| error.to_string())?
+            {
+                if included.insert(parent.run_id.clone()) {
+                    page.runs.push(parent);
+                }
+            }
+            sort_session_run_tree(&mut page.runs);
         }
         for run in &mut page.runs {
             if let Some(mut events) = events_by_run.remove(&run.run_id) {
@@ -22137,6 +22205,102 @@ impl RunStateStore for DatabaseRunStateStore {
 }
 
 impl DatabaseRunStateStore {
+    async fn list_session_runs_with_columns(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        limit: u32,
+        projection_columns: &str,
+    ) -> Result<DurableSessionRunPage, String> {
+        let limit = validate_run_list_limit(limit);
+        let sql = format!(
+            "SELECT {projection_columns} FROM agent_runs \
+             WHERE user_id = ? AND session_id = ? \
+             ORDER BY CASE WHEN status IN (?, ?, ?, ?) THEN 1 ELSE 0 END ASC, \
+                      updated_at DESC, created_at DESC, run_id DESC \
+             LIMIT ?"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(user_id)
+            .bind(session_id)
+            .bind(STATUS_COMPLETED)
+            .bind(STATUS_DELEGATED)
+            .bind(STATUS_FAILED)
+            .bind(STATUS_CANCELLED)
+            .bind(session_run_query_limit(limit))
+            .fetch_all(self.pool.get())
+            .await
+            .map_err(|source| db_error("list_session_runs", session_id, source).to_string())?;
+        let mut runs = rows
+            .into_iter()
+            .map(run_record_from_row)
+            .collect::<DbStoreResult<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        let truncated = runs.len() > limit as usize;
+        runs.truncate(limit as usize);
+
+        // Preserve the ancestry required to interpret every selected node.
+        // Fetch one parent level per round in a single batch; delegation depth
+        // is bounded, and the visited set also makes malformed cycles finite.
+        let mut included = runs
+            .iter()
+            .map(|run| run.run_id.clone())
+            .collect::<HashSet<_>>();
+        let mut frontier = runs
+            .iter()
+            .filter_map(|run| run.parent_run_id.clone())
+            .filter(|run_id| !included.contains(run_id))
+            .collect::<HashSet<_>>();
+        while !frontier.is_empty() {
+            let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
+                "SELECT {projection_columns} FROM agent_runs WHERE user_id = "
+            ));
+            builder
+                .push_bind(user_id)
+                .push(" AND session_id = ")
+                .push_bind(session_id)
+                .push(" AND run_id IN (");
+            let mut separated = builder.separated(", ");
+            for run_id in &frontier {
+                separated.push_bind(run_id);
+            }
+            separated.push_unseparated(")");
+            let parent_rows =
+                builder
+                    .build()
+                    .fetch_all(self.pool.get())
+                    .await
+                    .map_err(|source| {
+                        db_error("list_session_run_ancestors", session_id, source).to_string()
+                    })?;
+            let parents = parent_rows
+                .into_iter()
+                .map(run_record_from_row)
+                .collect::<DbStoreResult<Vec<_>>>()
+                .map_err(|error| error.to_string())?;
+            frontier.clear();
+            for parent in parents {
+                if !included.insert(parent.run_id.clone()) {
+                    continue;
+                }
+                if let Some(grandparent_id) = parent.parent_run_id.clone()
+                    && !included.contains(&grandparent_id)
+                {
+                    frontier.insert(grandparent_id);
+                }
+                runs.push(parent);
+            }
+        }
+        sort_session_run_tree(&mut runs);
+        Ok(DurableSessionRunPage {
+            runs,
+            limit,
+            truncated,
+            recovery_cancellation_run_ids: Vec::new(),
+            recovery_next_cursor: None,
+        })
+    }
+
     async fn reconcile_guidance_commit(
         &self,
         request: AtomicRunGuidanceAdmissionRequest<'_>,
@@ -30604,6 +30768,87 @@ mod tests {
             .execute(pool.get())
             .await
             .expect("cleanup exact create session");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_terminal_transition_commit_ack_loss_reconciles_exact_status_and_events_on_matrixone()
+     {
+        let (_, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("transition-ack-u-{}", Uuid::new_v4());
+        let session_id = format!("transition-ack-s-{}", Uuid::new_v4());
+        let run_id = format!("transition-ack-r-{}", Uuid::new_v4());
+        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+        let store = DatabaseRunStateStore::new(pool.clone())
+            .with_owner_pod_id("transition-ack-owner")
+            .with_terminal_transition_commit_ack_loss_once();
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user_id.clone();
+        run.session_id = session_id.clone();
+        store
+            .insert_run(run)
+            .await
+            .expect("insert transition ACK-loss run");
+        assert!(
+            store
+                .request_run_cancellation(&user_id, &run_id)
+                .await
+                .expect("persist user cancellation marker")
+        );
+
+        let terminal_event = json!({
+            "event_type": "run_finished",
+            "data": {
+                "run_id": run_id,
+                "status": STATUS_CANCELLED,
+                "cancelled": true,
+                "reason": "test cancellation",
+                "source": "test",
+                "cancellation_origin": "user"
+            }
+        });
+        assert!(
+            store
+                .update_run_status_with_events_if_current(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    &[STATUS_RUNNING],
+                    None,
+                    STATUS_CANCELLED,
+                    None,
+                    None,
+                    &[terminal_event],
+                )
+                .await
+                .expect("exact terminal transition survives lost COMMIT acknowledgement")
+        );
+        let durable = store
+            .load_run(&user_id, &run_id)
+            .await
+            .expect("load reconciled transition")
+            .expect("reconciled transition exists");
+        assert_eq!(durable.status, STATUS_CANCELLED);
+        assert_eq!(
+            durable
+                .events
+                .iter()
+                .filter(|event| event["event_type"] == "run_finished")
+                .count(),
+            1
+        );
+
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup transition execution slot");
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup transition session");
     }
 
     #[tokio::test]

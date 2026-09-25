@@ -4973,9 +4973,7 @@ impl DynamicAgentSpawner {
                 origin,
                 CancellationOrigin::User | CancellationOrigin::Runtime
             );
-            let Some(existing_group) = groups.get(group_id) else {
-                return None;
-            };
+            let existing_group = groups.get(group_id)?;
             if expected_parent_run_id.is_some_and(|parent_run_id| {
                 existing_group.parent_run_id.as_deref() != Some(parent_run_id)
             }) {

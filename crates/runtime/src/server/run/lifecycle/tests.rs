@@ -5924,7 +5924,8 @@ async fn runtime_cancellation_failure_retains_exact_context_without_user_recover
 
 #[tokio::test]
 async fn durable_reconciler_ignores_active_runtime_run_without_user_marker() {
-    let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+    let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]));
+    let engine = RunEngine::new(store.clone());
     engine
         .start_run("strict-intent-child", "user-a", "session-1")
         .await
@@ -5937,6 +5938,11 @@ async fn durable_reconciler_ignores_active_runtime_run_without_user_marker() {
     };
     let recovered = reconciler.load_agent_recovery().await.unwrap();
     assert_eq!(recovered[0].status, STATUS_RUNNING);
+    assert_eq!(
+        store.load_run_control_calls(),
+        0,
+        "a recovery snapshot without cancellation candidates must not fan out control SELECTs"
+    );
     assert!(
         !engine
             .load_run_control("user-a", "strict-intent-child")
@@ -5948,11 +5954,51 @@ async fn durable_reconciler_ignores_active_runtime_run_without_user_marker() {
 }
 
 #[tokio::test]
+async fn durable_reconciler_next_scan_recovers_late_marker() {
+    let store = Arc::new(InMemoryRunStateStore::new());
+    let engine = RunEngine::new(store.clone());
+    engine
+        .start_run("late-cancel", "user-a", "session-1")
+        .await
+        .expect("start durable child");
+    let reconciler = ServerDurableAgentReconciler {
+        run_engine: engine.clone(),
+        user_id: "user-a".to_string(),
+        session_id: "session-1".to_string(),
+        state: TokioMutex::new(ServerDurableAgentReconcileState::default()),
+    };
+    let first = reconciler.load_agent_recovery().await.unwrap();
+    assert_eq!(first[0].status, STATUS_RUNNING);
+    assert!(
+        engine
+            .request_run_cancellation("user-a", "late-cancel")
+            .await
+            .expect("persist durable User cancellation marker")
+    );
+    // Expire only the process-local cache; the marker arrived after the
+    // previous scan, and the cancellation cursor must wrap to find it.
+    reconciler.state.lock().await.last_attempt = Some(Instant::now() - Duration::from_secs(1));
+    reconciler
+        .load_agent_recovery()
+        .await
+        .expect("next scan must recover a late marker");
+    assert_eq!(
+        engine
+            .load_run("user-a", "late-cancel")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        STATUS_CANCELLED
+    );
+}
+
+#[tokio::test]
 async fn server_child_cancellation_retains_runtime_identity_until_terminal_convergence() {
     let store = Arc::new(
         FaultInjectedRunStateStore::new(&[], &[]).with_failed_terminal_transition_calls(&[1, 2, 3]),
     );
-    let engine = RunEngine::new(store);
+    let engine = RunEngine::new(store.clone());
     engine
         .start_run("child-run", "user-a", "session-1")
         .await
@@ -6014,7 +6060,7 @@ async fn server_child_cancellation_retains_runtime_identity_until_terminal_conve
 async fn child_cancellation_recovery_does_not_let_one_failed_run_starve_its_sibling() {
     let store =
         Arc::new(FaultInjectedRunStateStore::new(&[], &[]).with_failed_status_run("child-a"));
-    let engine = RunEngine::new(store);
+    let engine = RunEngine::new(store.clone());
     engine
         .start_run("root-run", "user-a", "session-1")
         .await
@@ -6039,6 +6085,7 @@ async fn child_cancellation_recovery_does_not_let_one_failed_run_starve_its_sibl
                 .expect("record durable User cancellation marker")
         );
     }
+    store.reset_read_counters();
 
     let reconciler = ServerDurableAgentReconciler {
         run_engine: engine,
@@ -6057,12 +6104,69 @@ async fn child_cancellation_recovery_does_not_let_one_failed_run_starve_its_sibl
             .count(),
         1
     );
-    assert_eq!(
+    assert!(
         recovered
             .iter()
-            .filter(|run| run.parent_run_id.is_some() && run.status == STATUS_RUNNING)
-            .count(),
-        1
+            .any(|run| run.run_id == "child-b" && run.status == STATUS_CANCELLED),
+        "the healthy sibling must still converge"
+    );
+    assert!(
+        recovered.iter().all(|run| run.run_id != "child-a"),
+        "a failed terminal transition must not publish an unverified snapshot"
+    );
+    assert_eq!(
+        store.read_counters().0,
+        0,
+        "a successful cancellation CAS must not trigger a read-after-write"
+    );
+}
+
+#[tokio::test]
+async fn child_cancellation_recovery_does_not_publish_stale_snapshot_when_winner_read_fails() {
+    let store = Arc::new(
+        FaultInjectedRunStateStore::new(&[], &[])
+            .with_cas_loss_run("child-a")
+            .with_failed_load_run_call(2),
+    );
+    let engine = RunEngine::new(store.clone());
+    engine
+        .start_run("root-run", "user-a", "session-1")
+        .await
+        .expect("start durable root");
+    engine
+        .start_run_ext(
+            "child-a",
+            "user-a",
+            "session-1",
+            Some("root-run"),
+            None,
+            Some("child-a"),
+            None,
+        )
+        .await
+        .expect("start durable child");
+    engine
+        .request_run_cancellation("user-a", "child-a")
+        .await
+        .expect("record durable User cancellation marker");
+
+    let reconciler = ServerDurableAgentReconciler {
+        run_engine: engine,
+        user_id: "user-a".to_string(),
+        session_id: "session-1".to_string(),
+        state: TokioMutex::new(ServerDurableAgentReconcileState::default()),
+    };
+    let recovered = reconciler
+        .load_agent_recovery()
+        .await
+        .expect("recovery remains available when the conflict read is unavailable");
+    assert!(
+        recovered.iter().all(|run| run.run_id != "child-a"),
+        "a CAS loser must not publish its stale active snapshot: {:?}",
+        recovered
+            .iter()
+            .map(|run| (&run.run_id, &run.status))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -7456,6 +7560,7 @@ struct FaultInjectedRunStoreCounters {
     terminal_transition_calls: usize,
     append_calls: usize,
     load_run_calls: usize,
+    load_run_control_calls: usize,
     status_snapshot_calls: usize,
     interaction_lookup_calls: usize,
     explain_lookup_calls: usize,
@@ -7481,6 +7586,8 @@ struct FaultInjectedRunStateStore {
     inner: InMemoryRunStateStore,
     fail_status_calls: HashSet<usize>,
     fail_status_run_ids: HashSet<String>,
+    fail_load_run_calls: HashSet<usize>,
+    cas_loss_run_ids: HashSet<String>,
     fail_terminal_transition_calls: HashSet<usize>,
     fail_append_calls: HashSet<usize>,
     generation_append_cas_loss_calls: HashSet<usize>,
@@ -7515,6 +7622,8 @@ impl FaultInjectedRunStateStore {
             inner: InMemoryRunStateStore::new(),
             fail_status_calls: fail_status_calls.iter().copied().collect(),
             fail_status_run_ids: HashSet::new(),
+            fail_load_run_calls: HashSet::new(),
+            cas_loss_run_ids: HashSet::new(),
             fail_terminal_transition_calls: HashSet::new(),
             fail_append_calls: fail_append_calls.iter().copied().collect(),
             generation_append_cas_loss_calls: HashSet::new(),
@@ -7551,6 +7660,16 @@ impl FaultInjectedRunStateStore {
 
     fn with_failed_status_run(mut self, run_id: &str) -> Self {
         self.fail_status_run_ids.insert(run_id.to_string());
+        self
+    }
+
+    fn with_failed_load_run_call(mut self, call: usize) -> Self {
+        self.fail_load_run_calls.insert(call);
+        self
+    }
+
+    fn with_cas_loss_run(mut self, run_id: &str) -> Self {
+        self.cas_loss_run_ids.insert(run_id.to_string());
         self
     }
 
@@ -7738,6 +7857,7 @@ impl FaultInjectedRunStateStore {
     fn reset_read_counters(&self) {
         let mut counters = self.counters.lock().expect("read counter lock");
         counters.load_run_calls = 0;
+        counters.load_run_control_calls = 0;
         counters.status_snapshot_calls = 0;
         counters.interaction_lookup_calls = 0;
     }
@@ -7749,6 +7869,13 @@ impl FaultInjectedRunStateStore {
             counters.status_snapshot_calls,
             counters.interaction_lookup_calls,
         )
+    }
+
+    fn load_run_control_calls(&self) -> usize {
+        self.counters
+            .lock()
+            .expect("control read counter lock")
+            .load_run_control_calls
     }
 
     async fn apply_status_mutation_before_call(&self, call: usize) -> Result<(), String> {
@@ -7842,6 +7969,10 @@ impl RunStateStore for FaultInjectedRunStateStore {
         user_id: &str,
         run_id: &str,
     ) -> Result<Option<astra_services::runs::DurableRunControlRecord>, String> {
+        self.counters
+            .lock()
+            .expect("control read counter lock")
+            .load_run_control_calls += 1;
         self.inner.load_run_control(user_id, run_id).await
     }
 
@@ -7883,6 +8014,9 @@ impl RunStateStore for FaultInjectedRunStateStore {
             counters.load_run_calls += 1;
             counters.load_run_calls
         };
+        if self.fail_load_run_calls.contains(&call) {
+            return Err(format!("injected load_run failure on call {call}"));
+        }
         if let Some(append) = self.append_events_before_load_call.get(&call) {
             self.inner
                 .append_events_batch(
@@ -8073,6 +8207,9 @@ impl RunStateStore for FaultInjectedRunStateStore {
         event: serde_json::Value,
     ) -> Result<bool, String> {
         let call = self.next_status_call();
+        if self.cas_loss_run_ids.contains(run_id) {
+            return Ok(false);
+        }
         self.apply_status_mutation_before_call(call).await?;
         if self.fail_status_calls.contains(&call) || self.fail_status_run_ids.contains(run_id) {
             return Err(format!(
@@ -8176,6 +8313,9 @@ impl RunStateStore for FaultInjectedRunStateStore {
         }
         let terminal_call = self.next_terminal_transition_call();
         let call = self.next_status_call();
+        if self.cas_loss_run_ids.contains(run_id) {
+            return Ok(false);
+        }
         self.apply_status_mutation_before_call(call).await?;
         if self.fail_terminal_transition_calls.contains(&terminal_call) {
             return Err(format!(

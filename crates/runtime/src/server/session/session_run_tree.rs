@@ -413,6 +413,7 @@ mod tests {
             ],
             limit: 200,
             truncated: false,
+            recovery_cancellation_run_ids: Vec::new(),
             recovery_next_cursor: None,
         };
         let first = build_session_run_tree_snapshot("session-1".into(), page.clone()).unwrap();
@@ -441,6 +442,7 @@ mod tests {
             runs: vec![run("delegated", STATUS_DELEGATED, 0)],
             limit: 200,
             truncated: false,
+            recovery_cancellation_run_ids: Vec::new(),
             recovery_next_cursor: None,
         };
 
@@ -462,6 +464,7 @@ mod tests {
                 runs: vec![descendant, ancestor],
                 limit: 200,
                 truncated: false,
+                recovery_cancellation_run_ids: Vec::new(),
                 recovery_next_cursor: None,
             };
 
@@ -487,6 +490,7 @@ mod tests {
             runs: vec![grandchild, child, root],
             limit: 200,
             truncated: false,
+            recovery_cancellation_run_ids: Vec::new(),
             recovery_next_cursor: None,
         };
 
@@ -508,6 +512,7 @@ mod tests {
             runs: vec![child, root],
             limit: 200,
             truncated: false,
+            recovery_cancellation_run_ids: Vec::new(),
             recovery_next_cursor: None,
         };
 
@@ -541,6 +546,7 @@ mod tests {
             runs: vec![child],
             limit: 200,
             truncated: false,
+            recovery_cancellation_run_ids: Vec::new(),
             recovery_next_cursor: None,
         };
 
@@ -562,6 +568,7 @@ mod tests {
             runs: vec![run("broken", "mystery", 1)],
             limit: 200,
             truncated: false,
+            recovery_cancellation_run_ids: Vec::new(),
             recovery_next_cursor: None,
         };
         let error = build_session_run_tree_snapshot("session-1".into(), page).unwrap_err();

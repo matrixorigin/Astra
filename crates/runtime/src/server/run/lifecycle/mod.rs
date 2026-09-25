@@ -4482,7 +4482,7 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
         let cancellation_cursor = state.cancellation_cursor.clone();
         let mut next_cancellation_cursor = None;
         let result = async {
-            let page = self
+            let mut page = self
                 .run_engine
                 .load_session_agent_recovery_after(
                     &self.user_id,
@@ -4492,82 +4492,114 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
                 )
                 .await?;
             next_cancellation_cursor = page.recovery_next_cursor.clone();
-            let mut must_reload = false;
+            let recovery_cancellation_run_ids = page
+                .recovery_cancellation_run_ids
+                .iter()
+                .collect::<HashSet<_>>();
             let mut failed_run_ids = Vec::new();
-            let active_runs = page
+            let cancellation_run_ids = page
                 .runs
                 .iter()
-                .filter(|run| {
-                    matches!(
-                        run.status.as_str(),
-                        STATUS_RUNNING | STATUS_WAITING | STATUS_PAUSED
-                    )
-                })
+                .filter(|run| recovery_cancellation_run_ids.contains(&run.run_id))
+                .map(|run| run.run_id.clone())
                 .collect::<Vec<_>>();
-            // Control records are narrow and independent. Bound each read
-            // wave so a large session does not serialize 200 MatrixOne RTTs
-            // or issue an unbounded burst through the shared pool.
-            for chunk in active_runs.chunks(16) {
-                let controls = futures_util::future::join_all(chunk.iter().map(|run| {
-                    self.run_engine
-                        .load_run_control(&run.user_id, &run.run_id)
-                }))
-                .await;
-                for (run, control) in chunk.iter().copied().zip(controls) {
-                    let cancellation_requested = match control {
-                        Ok(Some(control)) => control.cancellation_requested,
-                        Ok(None) => false,
-                        Err(error) => {
-                            failed_run_ids.push(run.run_id.clone());
-                            tracing::warn!(
-                                user_id = %run.user_id,
-                                session_id = %run.session_id,
-                                run_id = %run.run_id,
-                                %error,
-                                "durable child User cancellation marker lookup failed"
-                            );
-                            false
-                        }
-                    };
-                    if !cancellation_requested {
-                        continue;
+            // The recovery query already selected these rows from the
+            // durable cancellation lane. Re-reading one control row per
+            // active run only repeats the same predicate and can turn one
+            // refresh into hundreds of database round trips.
+            for run_id in cancellation_run_ids {
+                let Some(run) = page.runs.iter().find(|run| run.run_id == run_id) else {
+                    continue;
+                };
+                let user_id = run.user_id.clone();
+                let session_id = run.session_id.clone();
+                let run_id = run.run_id.clone();
+                let event = json!({
+                    "event_type": "run_finished",
+                    "data": {
+                        "run_id": &run_id,
+                        "status": STATUS_CANCELLED,
+                        "cancelled": true,
+                        "reason": "recovered durable child User cancellation request",
+                        "source": "agent_cancellation_reconciler",
+                        "cancellation_origin": CancellationOrigin::User,
                     }
-                    let event = json!({
-                        "event_type": "run_finished",
-                        "data": {
-                            "run_id": run.run_id,
-                            "status": STATUS_CANCELLED,
-                            "cancelled": true,
-                            "reason": "recovered durable child User cancellation request",
-                            "source": "agent_cancellation_reconciler",
-                            "cancellation_origin": CancellationOrigin::User,
+                });
+                match self
+                    .run_engine
+                    .transition_status_with_event_if_current(
+                        &user_id,
+                        &session_id,
+                        &run_id,
+                        &[STATUS_RUNNING, STATUS_WAITING, STATUS_PAUSED],
+                        STATUS_CANCELLED,
+                        None,
+                        None,
+                        event.clone(),
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        if let Some(run) = page.runs.iter_mut().find(|run| run.run_id == run_id) {
+                            run.status = STATUS_CANCELLED.to_string();
+                            run.waiting_for = None;
+                            // The transition may also append interaction and
+                            // intent-closure events in the same transaction.
+                            // This page is a read-only projection with sparse
+                            // event payloads, so do not fabricate a high-water
+                            // mark from the one event supplied by the caller.
+                            run.events.push(event);
                         }
-                    });
-                    match self
-                        .run_engine
-                        .transition_status_with_event_if_current(
-                            &run.user_id,
-                            &run.session_id,
-                            &run.run_id,
-                            &[STATUS_RUNNING, STATUS_WAITING, STATUS_PAUSED],
-                            STATUS_CANCELLED,
-                            None,
-                            None,
-                            event,
-                        )
-                        .await
-                    {
-                        Ok(_) => must_reload = true,
-                        Err(error) => {
-                            failed_run_ids.push(run.run_id.clone());
-                            tracing::warn!(
-                                user_id = %run.user_id,
-                                session_id = %run.session_id,
-                                run_id = %run.run_id,
-                                %error,
-                                "durable child User cancellation recovery failed; retaining the shared marker for retry"
-                            );
+                    }
+                    Ok(false) => {
+                        // A concurrent terminal winner is not an invitation
+                        // to publish the stale active snapshot. This is a
+                        // conflict-only read: the normal path still has zero
+                        // per-run control queries, while the rare CAS loser
+                        // refreshes its exact durable record for convergence.
+                        match self.run_engine.load_run(&user_id, &run_id).await {
+                            Ok(Some(fresh)) => {
+                                if let Some(snapshot) =
+                                    page.runs.iter_mut().find(|run| run.run_id == run_id)
+                                {
+                                    *snapshot = fresh;
+                                }
+                            }
+                            Ok(None) => page.runs.retain(|run| run.run_id != run_id),
+                            Err(error) => {
+                                // The CAS already lost, so the page snapshot
+                                // is no longer authoritative. If the exact
+                                // winner read is unavailable, omit this run
+                                // rather than publishing a stale active
+                                // state; the durable cancellation marker and
+                                // the periodic safety sweep retain retry
+                                // responsibility.
+                                page.runs.retain(|run| run.run_id != run_id);
+                                failed_run_ids.push(run_id.clone());
+                                tracing::warn!(
+                                    user_id = %user_id,
+                                    session_id = %session_id,
+                                    run_id = %run_id,
+                                    %error,
+                                    "durable child cancellation CAS lost and exact winner read failed"
+                                );
+                            }
                         }
+                    }
+                    Err(error) => {
+                        // A failed terminal transition leaves the prior
+                        // snapshot unverified. Do not let an active-looking
+                        // row escape after an ambiguous COMMIT; the durable
+                        // marker remains available for the next sweep.
+                        page.runs.retain(|run| run.run_id != run_id);
+                        failed_run_ids.push(run_id.clone());
+                        tracing::warn!(
+                            user_id = %user_id,
+                            session_id = %session_id,
+                            run_id = %run_id,
+                            %error,
+                            "durable child User cancellation recovery failed; retaining the shared marker for retry"
+                        );
                     }
                 }
             }
@@ -4579,21 +4611,14 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
                     "one or more durable child cancellation recoveries remain pending"
                 );
             }
-            if must_reload {
-                self.run_engine
-                    .load_session_agent_recovery(&self.user_id, &self.session_id, 200)
-                    .await
-                    .map(|page| page.runs)
-            } else {
-                Ok(page.runs)
-            }
+            Ok(page.runs)
         }
         .await;
         state.last_attempt = Some(Instant::now());
-        // An empty seek page wraps the next refresh to the beginning. Poison
-        // rows therefore delay at most one bounded cycle and cannot occupy a
-        // permanent front page.
-        state.cancellation_cursor = next_cancellation_cursor;
+        if result.is_ok() {
+            // An empty seek page wraps the cancellation lane to the beginning.
+            state.cancellation_cursor = next_cancellation_cursor;
+        }
         state.cached = Some(result.clone());
         result
     }
@@ -21541,15 +21566,21 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
                 format!("no durable owner identity for fanout parent run {parent_run_id}")
             })?,
         };
-        let Some(snapshot) = run_engine
-            .load_run_status_snapshot(&user_id, parent_run_id)
-            .await?
-        else {
-            return Err(format!(
-                "fanout parent run {parent_run_id} no longer exists"
-            ));
+        let Some(control) = run_engine.load_run_control(&user_id, parent_run_id).await? else {
+            // A deleted parent cannot later admit a child. Treat the local
+            // admission fence as converged instead of retrying a write that
+            // can never have a durable owner. Database/transport errors still
+            // use the retry path above; a successful "not found" is a stable
+            // authority result.
+            tracing::warn!(
+                target: "fanout",
+                %parent_run_id,
+                %user_id,
+                "fanout group cancellation parent no longer exists; durable admission is already closed"
+            );
+            return Ok(());
         };
-        if snapshot.session_id != owner_session_id {
+        if control.session_id != owner_session_id {
             return Err(format!(
                 "fanout parent run {parent_run_id} belongs to a different session"
             ));
@@ -21567,15 +21598,15 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             }
         });
         if matches!(
-            snapshot.status.as_str(),
+            control.status.as_str(),
             STATUS_RUNNING | STATUS_WAITING | STATUS_PAUSED
         ) {
             let appended = run_engine
                 .append_events_if_current_generation_and_status(
                     &user_id,
-                    &snapshot.session_id,
+                    &control.session_id,
                     parent_run_id,
-                    snapshot.run_generation,
+                    control.run_generation,
                     &[STATUS_RUNNING, STATUS_WAITING, STATUS_PAUSED],
                     std::slice::from_ref(&event),
                 )
@@ -21603,7 +21634,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         run_engine
             .append_events_batch(
                 &user_id,
-                &snapshot.session_id,
+                &control.session_id,
                 parent_run_id,
                 std::slice::from_ref(&event),
             )
