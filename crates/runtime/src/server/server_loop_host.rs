@@ -33680,6 +33680,44 @@ mod tests {
     }
 
     #[test]
+    fn disjoint_proxy_input_reaches_context_budget_with_correct_total() {
+        for (raw, expected) in [
+            (
+                json!({
+                    "prompt_tokens": 100,
+                    "completion_tokens": 20,
+                    "cache_read_input_tokens": 200,
+                    "cache_creation_input_tokens": 50
+                }),
+                Some(350),
+            ),
+            (
+                json!({
+                    "prompt_tokens": 100,
+                    "completion_tokens": 20,
+                    "cache_read_input_tokens": 200
+                }),
+                None,
+            ),
+        ] {
+            let (tokens, presence) = crate::turn::token_usage::parse_usage(
+                crate::turn::token_usage::UsageDialect::OpenAi,
+                raw.as_object().unwrap(),
+            )
+            .unwrap();
+            let result = LlmCallResult {
+                usage: tokens.to_qualified_json_map(presence),
+                usage_presence: presence,
+                ..Default::default()
+            };
+            let accum = ServerAgenticLoopHost::result_to_accum_with_usage(&result, None);
+            assert_eq!(accum.current_request_input_tokens, expected);
+            assert_eq!(accum.measured_request_input_tokens(), expected);
+            assert_eq!(accum.current_request_usage.is_some(), expected.is_some());
+        }
+    }
+
+    #[test]
     fn provider_convergence_boundary_is_one_shot_text_only_and_bounded() {
         let no_tools = HashSet::new();
         let work_tools = HashSet::from(["start_work".to_string()]);

@@ -477,13 +477,26 @@ fn parse_openai_usage(
         cache_creation_tokens: creation.unwrap_or(0),
         output_tokens: output.unwrap_or(0),
     };
+    // Native OpenAI/DeepSeek reports an inclusive prompt total. A proxy that
+    // supplies only top-level cache lanes reports fresh input separately;
+    // its physical total is known only after both cache lanes are present.
+    let measured_input_tokens = if inclusive {
+        prompt
+    } else if top_read.is_some() || top_write.is_some() {
+        fresh
+            .and_then(|fresh| fresh.checked_add(top_read?))
+            .and_then(|input| input.checked_add(top_write?))
+            .filter(|total| i64::try_from(*total).is_ok())
+    } else {
+        prompt
+    }
+    .filter(|_| !input_invalid && !partition_conflict && !alias_conflict);
     let mut presence = TokenUsagePresence {
         fresh_input_tokens: fresh.is_some(),
         cache_read_tokens: cached.is_some(),
         cache_creation_tokens: creation.is_some(),
         output_tokens: output.is_some(),
-        measured_input_tokens: prompt
-            .filter(|_| !input_invalid && !partition_conflict && !alias_conflict),
+        measured_input_tokens,
         input_invalid,
         output_invalid,
     };
@@ -1465,6 +1478,58 @@ mod tests {
         assert_eq!(t.cache_creation_tokens, 50);
         assert_eq!(t.output_tokens, 20);
         assert_eq!(t.total_tokens(), 370);
+    }
+
+    #[test]
+    fn openai_disjoint_proxy_measures_only_complete_physical_input() {
+        let complete = obj(json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "cache_read_input_tokens": 200,
+            "cache_creation_input_tokens": 50
+        }));
+        let (usage, presence) = parse_usage(UsageDialect::OpenAi, &complete).unwrap();
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(presence.measured_input_tokens, Some(350));
+
+        let mut incomplete = complete;
+        incomplete.remove("cache_creation_input_tokens");
+        let (_, presence) = parse_usage(UsageDialect::OpenAi, &incomplete).unwrap();
+        assert_eq!(presence.measured_input_tokens, None);
+
+        let inclusive = obj(json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "prompt_tokens_details": {"cached_tokens": 80},
+            "cache_read_input_tokens": 80
+        }));
+        let (_, presence) = parse_usage(UsageDialect::OpenAi, &inclusive).unwrap();
+        assert_eq!(presence.measured_input_tokens, Some(100));
+    }
+
+    #[test]
+    fn openai_stream_reassembles_disjoint_proxy_measurement_in_either_order() {
+        let prompt = obj(json!({"prompt_tokens": 100, "completion_tokens": 20}));
+        let read = obj(json!({"cache_read_input_tokens": 200}));
+        let write = obj(json!({"cache_creation_input_tokens": 50}));
+        for frames in [[&prompt, &read, &write], [&read, &write, &prompt]] {
+            let mut accumulated = Map::new();
+            let mut previous = TokenUsagePresence::default();
+            for (index, frame) in frames.into_iter().enumerate() {
+                let (usage, presence) =
+                    update_openai_usage(&mut accumulated, frame, previous).unwrap();
+                if index == 1 {
+                    assert_eq!(presence.measured_input_tokens, None);
+                }
+                if index == 2 {
+                    assert_eq!(presence.measured_input_tokens, Some(350));
+                    assert_eq!(usage.input_tokens, 100);
+                    assert_eq!(usage.cached_input_tokens, 200);
+                    assert_eq!(usage.cache_creation_tokens, 50);
+                }
+                previous = presence;
+            }
+        }
     }
 
     #[test]
