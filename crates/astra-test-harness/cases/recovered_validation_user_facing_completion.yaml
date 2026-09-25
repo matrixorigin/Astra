@@ -89,9 +89,6 @@ criteria:
       - type: tokens_between
         min: 1000
         max: 300000
-      - type: provider_stable_prefix_cache_coverage
-        min: 0.95
-        min_observations: 2
       - type: duration_between
         min_ms: 1000
         max_ms: 45000

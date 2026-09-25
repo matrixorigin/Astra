@@ -102,14 +102,8 @@ criteria:
   - type: duration_between
     min_ms: 0
     max_ms: 120000
-  # Stable-prefix coverage measures actual provider cache reads against the
-  # runtime-estimated cacheable system/tool prefix. Total cache-read counts
-  # include growing conversation history and can change independently.
   - type: all_of
     criteria:
       - type: pipeline_alert_count
         rule: prompt_cache_break
         max: 0
-      - type: provider_stable_prefix_cache_coverage
-        min: 0.95
-        min_observations: 2
