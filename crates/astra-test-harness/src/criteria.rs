@@ -7210,6 +7210,40 @@ mod tests {
     }
 
     #[test]
+    fn shipped_volatile_lane_case_checks_each_post_correction_turn() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("cases/cache_volatile_lane_stability.yaml");
+        let case = crate::case::Case::from_path(&path).expect("load shipped volatile-lane case");
+        assert_eq!(case.steps.len(), 4);
+
+        let weak = cache_request_outcome("weak", "turn", &[(100, 1_000, 0)]);
+        let mut strong = cache_request_outcome("strong", "turn", &[(100, 10_500, 0)]);
+        for event in &mut strong.explain_capture.as_mut().unwrap().events {
+            if let Some(usage) = &mut event.usage {
+                usage.basis = astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderPartial;
+                usage.cache_creation_tokens = None;
+            }
+        }
+
+        for (index, step) in case.steps.iter().enumerate().skip(1) {
+            let weak_result = evaluate_deterministic_with_session(&step.criteria, &weak, None);
+            assert!(
+                weak_result
+                    .iter()
+                    .any(|result| !result.passed && result.severity == CriterionSeverity::Hard),
+                "post-correction step {index} must hard-fail weak reads: {weak_result:?}"
+            );
+            let strong_result = evaluate_deterministic_with_session(&step.criteria, &strong, None);
+            assert!(
+                strong_result
+                    .iter()
+                    .any(|result| result.passed && result.severity == CriterionSeverity::Hard),
+                "post-correction step {index} must accept observed partial reads: {strong_result:?}"
+            );
+        }
+    }
+
+    #[test]
     fn required_prompt_cache_scope_reports_one_witness_after_full_coverage_validation() {
         let many = cache_request_outcome("r1", "t1", &[(0, 0, 0); 3]);
         let witness = cache_request_outcome("r2", "t2", &[(0, 0, 0), (0, 300, 0)]);
