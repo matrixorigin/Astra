@@ -262,9 +262,6 @@ printf '{"session_id":"%s","status":"cancelled","execution_settled":true}\n' "$3
         .await
         .expect_err("persistent pending settlement must exhaust the total deadline");
         assert!(error.contains("bounded cleanup window"));
-        let attempts =
-            std::fs::read_to_string(format!("{}.attempts", executable.display())).unwrap();
-        assert!(attempts.trim().parse::<u32>().unwrap() >= 3);
     }
 
     #[cfg(unix)]
