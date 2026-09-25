@@ -21697,7 +21697,7 @@ impl RunStateStore for DatabaseRunStateStore {
             .push(", 1 AS recovery_kind FROM (SELECT ");
         recovery_query
             .push(AGENT_RUN_RECOVERY_COLUMNS)
-            .push(", ROW_NUMBER() OVER (ORDER BY run_id ASC) AS recovery_rank\n                 FROM agent_runs WHERE user_id = ")
+            .push(" FROM agent_runs WHERE user_id = ")
             .push_bind(user_id)
             .push(" AND session_id = ")
             .push_bind(session_id)
@@ -21714,8 +21714,9 @@ impl RunStateStore for DatabaseRunStateStore {
                 .push_bind(after_run_id);
         }
         recovery_query
-            .push(") ranked_active WHERE recovery_rank <= ")
-            .push_bind(session_run_query_limit(recovery_limit as u32));
+            .push(" ORDER BY run_id ASC LIMIT ")
+            .push_bind(session_run_query_limit(recovery_limit as u32))
+            .push(") selected_active");
         if let Some(after_run_id) = after_run_id
             && !page_run_ids.is_empty()
         {
