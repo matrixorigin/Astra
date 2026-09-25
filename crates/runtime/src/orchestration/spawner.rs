@@ -38,10 +38,12 @@ use super::agent_trace_terminal_event_type;
 
 /// Sentinel run ID for the top-level (root) agent.
 pub const ROOT_RUN_ID: &str = "root";
-/// Maximum number of fanout groups tracked concurrently. Beyond this
-/// limit, new groups are rejected with `SpawnError::FanoutGroupLimitExceeded`
-/// to prevent unbounded memory growth in long-running sessions.
-pub const MAX_FANOUT_GROUPS: usize = 64;
+/// Maximum number of live fanout projections retained per session. A group
+/// may contain up to 50 slots, so this intentionally small bound keeps the
+/// normal in-memory projection below roughly 800 slots; terminal groups are
+/// evicted first. Durable recovery has its own history path and does not use
+/// this live-admission cap.
+pub const MAX_FANOUT_GROUPS: usize = 16;
 pub const FANOUT_GROUP_CANCELLED_EVENT_TYPE: &str = "fanout_group_cancelled";
 pub const SPAWN_STATUS_COMPLETED: &str = "completed";
 pub const SPAWN_STATUS_INTERRUPTED: &str = "interrupted";
