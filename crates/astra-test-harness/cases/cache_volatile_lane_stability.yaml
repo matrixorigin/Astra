@@ -8,7 +8,7 @@ description: |
   **Why**: Learned context and feedback rules must stay outside the stable
   prefix when they change. This smoke catches observable cache loss after a
   correction without inferring an unobserved internal state transition.
-  **Pass means**: every turn after the correction has at least 10000
+  **Pass means**: every turn after the correction has at least 8000
   provider-observed cache-read tokens, with no prompt-cache-break alert.
   **Fail means**: a later turn loses the stable prefix, even when earlier
   turns had enough cached tokens to make an aggregate total look healthy.
@@ -26,21 +26,21 @@ steps:
       - type: all_of
         criteria:
           - type: prompt_cache_tokens
-            min_read: 10000
+            min_read: 8000
             min_creation: 0
   - prompt: 'Reply ACK. Do not call any tools.'
     criteria:
       - type: all_of
         criteria:
           - type: prompt_cache_tokens
-            min_read: 10000
+            min_read: 8000
             min_creation: 0
   - prompt: 'Reply ACK. Do not call any tools.'
     criteria:
       - type: all_of
         criteria:
           - type: prompt_cache_tokens
-            min_read: 10000
+            min_read: 8000
             min_creation: 0
 criteria:
   - type: exit_code

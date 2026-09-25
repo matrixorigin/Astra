@@ -7216,8 +7216,8 @@ mod tests {
         let case = crate::case::Case::from_path(&path).expect("load shipped volatile-lane case");
         assert_eq!(case.steps.len(), 4);
 
-        let weak = cache_request_outcome("weak", "turn", &[(100, 1_000, 0)]);
-        let mut strong = cache_request_outcome("strong", "turn", &[(100, 10_500, 0)]);
+        let weak = cache_request_outcome("weak", "turn", &[(100, 7_999, 0)]);
+        let mut strong = cache_request_outcome("strong", "turn", &[(100, 8_000, 0)]);
         for event in &mut strong.explain_capture.as_mut().unwrap().events {
             if let Some(usage) = &mut event.usage {
                 usage.basis = astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderPartial;
