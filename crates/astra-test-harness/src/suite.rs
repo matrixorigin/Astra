@@ -709,9 +709,9 @@ impl<'a> SuiteRunner<'a> {
                         args
                     },
                     timeout_seconds: step.timeout_seconds.unwrap_or(case.timeout_seconds),
-                    cli_wall_time_seconds: case.cli_wall_time_seconds.filter(|deadline| {
-                        *deadline < step.timeout_seconds.unwrap_or(case.timeout_seconds)
-                    }),
+                    cli_wall_time_seconds: case.cli_wall_time_override_for(
+                        step.timeout_seconds.unwrap_or(case.timeout_seconds),
+                    ),
                     capability: None,
                     required_cache_scope: None,
                     difficulty: None,
