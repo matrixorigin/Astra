@@ -69,6 +69,11 @@ passes that same explicit profile to health, model probes and case execution;
 it does not validate a native MOI endpoint and then execute on a legacy one.
 An automatic switch to the isolated `harness-auto` profile rechecks readiness
 and revision before registration and again before retrying the model probe.
+Each model probe has a 90-second deadline. On timeout, the CLI process group is
+terminated and an exactly observed Server session is cancelled and deleted
+before the case can run. Missing session identity is reported, not guessed.
+This is a readiness limit, not a case time budget or evidence that the model is
+inactive.
 Artifact-only `--build-info-json` remains independent of profiles/configuration.
 The built-in executor enables `--explain=on` and retains bounded canonical
 Explain facts in each attempt's `outcome.explain_capture` before deleting its

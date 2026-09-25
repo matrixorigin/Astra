@@ -4,8 +4,9 @@
 //! and auth + model connectivity works. Fails fast with actionable
 //! error messages so users don't waste time on doomed runs.
 
+use std::io::Read;
 use std::path::Path;
-use std::process::{ExitStatus, Stdio};
+use std::process::{ExitStatus, Output, Stdio};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -13,7 +14,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::runner::parse_strict_cli_outcome;
-use crate::session_identity::delete_server_session;
+use crate::session_identity::{delete_server_session, session_id_from_stream_event};
 
 /// Errors surfaced by pre-flight checks.
 #[derive(Debug, Error)]
@@ -38,6 +39,7 @@ pub enum PreflightError {
 
 const OWNER_READINESS_PROBE_USER: &str = "astra-owner-readiness-probe";
 const OWNER_READINESS_PROBE_QUERY: &str = "__astra_owner_auth_readiness_probe__";
+const MODEL_PROBE_TIMEOUT: Duration = Duration::from_secs(90);
 
 fn stderr_indicates_cli_auth_failure(stderr: &str) -> bool {
     stderr.contains("Could not validate credentials")
@@ -661,6 +663,99 @@ fn astra_command(astra_bin: &Path, profile: Option<&str>) -> Command {
     command
 }
 
+async fn capture_model_probe(
+    mut command: Command,
+    astra_bin: &Path,
+    profile: Option<&str>,
+    workspace: &Path,
+    timeout: Duration,
+) -> Result<Output, String> {
+    let events = tempfile::Builder::new()
+        .prefix("astra-model-probe-")
+        .tempdir_in(workspace)
+        .map_err(|error| format!("could not create model probe event directory: {error}"))?;
+    let event_path = events.path().join("events.jsonl");
+    command
+        .arg("--stream-events")
+        .arg(&event_path)
+        .current_dir(workspace)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("spawn failed: {error}"))?;
+    let mut stdout = child.stdout.take().expect("probe stdout was piped");
+    let mut stderr = child.stderr.take().expect("probe stderr was piped");
+    let output = tokio::time::timeout(timeout, async {
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        tokio::try_join!(
+            stdout.read_to_end(&mut stdout_bytes),
+            stderr.read_to_end(&mut stderr_bytes)
+        )?;
+        let status = child.wait().await?;
+        Ok::<Output, std::io::Error>(Output {
+            status,
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+        })
+    })
+    .await;
+    match output {
+        Ok(Ok(output)) => Ok(output),
+        failure => {
+            let group_id = child.id();
+            #[cfg(unix)]
+            if let Some(pid) = group_id.filter(|pid| *pid <= i32::MAX as u32) {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = group_id;
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            let cleanup = match observed_probe_session(&event_path) {
+                Ok(Some(session_id)) => {
+                    match delete_server_session(astra_bin, profile, &session_id).await {
+                        Ok(()) => "observed server session cancelled and deleted".to_string(),
+                        Err(error) => format!("observed server session cleanup failed: {error}"),
+                    }
+                }
+                Ok(None) => "no server-issued session identity observed".to_string(),
+                Err(error) => format!("server session identity unavailable: {error}"),
+            };
+            let reason = match failure {
+                Ok(Err(error)) => format!("probe output failed: {error}"),
+                Err(_) => format!("timed out after {}s", timeout.as_secs()),
+                Ok(Ok(_)) => unreachable!(),
+            };
+            Err(format!("{reason}; {cleanup}"))
+        }
+    }
+}
+
+fn observed_probe_session(path: &Path) -> Result<Option<String>, String> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("could not read model probe events: {error}"))?;
+    let mut bytes = Vec::new();
+    file.take(64 * 1024)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("could not read model probe events: {error}"))?;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if let Ok(line) = std::str::from_utf8(line)
+            && let Some(session_id) = session_id_from_stream_event(line)
+        {
+            return Ok(Some(session_id));
+        }
+    }
+    Ok(None)
+}
+
 async fn release_model_probe_session(
     astra_bin: &Path,
     profile: Option<&str>,
@@ -692,27 +787,18 @@ async fn check_model(
         "--json",
         "-y",
     ]);
-    let result = tokio::time::timeout(
-        Duration::from_secs(30),
-        command.current_dir(probe_workspace).output(),
+    let output = capture_model_probe(
+        command,
+        astra_bin,
+        profile,
+        probe_workspace,
+        MODEL_PROBE_TIMEOUT,
     )
-    .await;
-
-    let output = match result {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => {
-            return Err(PreflightError::ModelUnavailable {
-                model: model.to_string(),
-                detail: format!("spawn failed: {e}"),
-            });
-        }
-        Err(_) => {
-            return Err(PreflightError::ModelUnavailable {
-                model: model.to_string(),
-                detail: "timed out after 30s".to_string(),
-            });
-        }
-    };
+    .await
+    .map_err(|detail| PreflightError::ModelUnavailable {
+        model: model.to_string(),
+        detail,
+    })?;
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     if stderr_indicates_model_inactive(&stderr, model) {
@@ -761,13 +847,16 @@ async fn check_model(
                     "--json",
                     "-y",
                 ]);
-                let retry = tokio::time::timeout(
-                    Duration::from_secs(30),
-                    retry_command.current_dir(probe_workspace).output(),
+                let retry = capture_model_probe(
+                    retry_command,
+                    astra_bin,
+                    Some(auto_profile),
+                    probe_workspace,
+                    MODEL_PROBE_TIMEOUT,
                 )
                 .await;
                 match retry {
-                    Ok(Ok(o)) => {
+                    Ok(o) => {
                         if o.status.success() {
                             match validate_successful_model_probe(
                                 &o.stdout,
@@ -819,16 +908,10 @@ async fn check_model(
                             ),
                         });
                     }
-                    Ok(Err(error)) => {
+                    Err(detail) => {
                         return Err(PreflightError::ModelUnavailable {
                             model: model.to_string(),
-                            detail: format!("retry spawn failed: {error}"),
-                        });
-                    }
-                    Err(_) => {
-                        return Err(PreflightError::ModelUnavailable {
-                            model: model.to_string(),
-                            detail: "retry timed out after 30s".to_string(),
+                            detail: format!("retry {detail}"),
                         });
                     }
                 }
@@ -1698,6 +1781,123 @@ esac
             result,
             Err(PreflightError::ModelUnavailable { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_probe_accepts_a_slow_success_within_its_deadline() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "sleep 0.05; printf ready"]);
+        let output = super::capture_model_probe(
+            command,
+            std::path::Path::new("sh"),
+            None,
+            workspace.path(),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"ready");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn model_probe_timeout_reaps_its_child() {
+        let workspace = tempfile::tempdir().unwrap();
+        let pid_file = workspace.path().join("probe.pid");
+        let descendant_file = workspace.path().join("descendant.pid");
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            "printf '%s' $$ > \"$1\"; sleep 5 & printf '%s' $! > \"$2\"; wait",
+            "sh",
+            pid_file.to_str().unwrap(),
+            descendant_file.to_str().unwrap(),
+        ]);
+        let error = super::capture_model_probe(
+            command,
+            std::path::Path::new("sh"),
+            None,
+            workspace.path(),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        for file in [pid_file, descendant_file] {
+            let pid = std::fs::read_to_string(file).unwrap();
+            let proc_path = format!("/proc/{pid}/stat");
+            for _ in 0..40 {
+                let inactive = std::fs::read_to_string(&proc_path)
+                    .map(|stat| stat.split_whitespace().nth(2) == Some("Z"))
+                    .unwrap_or(true);
+                if inactive {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            let active = std::fs::read_to_string(&proc_path)
+                .map(|stat| stat.split_whitespace().nth(2) != Some("Z"))
+                .unwrap_or(false);
+            assert!(!active, "timed-out model probe process {pid} stayed active");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_probe_timeout_cancels_exact_observed_server_session() {
+        const SESSION: &str = "550e8400-e29b-41d4-a716-446655440000";
+        let workspace = tempfile::tempdir().unwrap();
+        let bin = workspace.path().join("astra-shim");
+        let calls = workspace.path().join("calls");
+        crate::test_support::write_executable_shim(
+            &bin,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{calls}'
+if [ "$1" = session ]; then
+  if [ "$2" = cancel ]; then
+    printf '%s' '{{"session_id":"{SESSION}","status":"cancelled","execution_settled":true}}'
+  fi
+  exit 0
+fi
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --stream-events ]; then
+    printf '%s\n' '{{"type":"session_bound","session_id":"{SESSION}"}}' > "$2"
+    break
+  fi
+  shift
+done
+exec sleep 5
+"#,
+                calls = calls.display()
+            ),
+        )
+        .unwrap();
+        let error = super::capture_model_probe(
+            tokio::process::Command::new(&bin),
+            &bin,
+            None,
+            workspace.path(),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("observed server session cancelled and deleted"),
+            "{error}"
+        );
+        let calls = std::fs::read_to_string(calls).unwrap();
+        assert!(
+            calls.contains(&format!("session cancel {SESSION}")),
+            "{calls}"
+        );
+        assert!(
+            calls.contains(&format!("session delete {SESSION}")),
+            "{calls}"
+        );
     }
 
     #[cfg(unix)]
