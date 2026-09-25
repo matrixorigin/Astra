@@ -13773,6 +13773,56 @@ impl DatabaseRunStateStore {
             "insert_initial_run_events",
         )
         .await?;
+        let projection = build_run_display_projection(
+            &record,
+            initial_event_rows
+                .last()
+                .map(|event| event.event_type.clone()),
+            None,
+        );
+        let insert_projection_sql = matrixone_statement_with_null_shape(
+            "INSERT INTO run_display_projections
+             (run_id, user_id, session_id, status, waiting_for, error_message,
+              projection_event_idx, latest_event_type, latest_checkpoint_id,
+              latest_checkpoint_kind, latest_checkpoint_version, total_prompt_tokens,
+              total_completion_tokens, total_tool_calls, projection_hash, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, NOW(6))",
+            [
+                projection.waiting_for.is_some(),
+                projection.error_message.is_some(),
+                projection.latest_event_type.is_some(),
+            ],
+        );
+        sqlx::query(&insert_projection_sql)
+            .bind(&projection.run_id)
+            .bind(&projection.user_id)
+            .bind(&projection.session_id)
+            .bind(&projection.status)
+            .bind(&projection.waiting_for)
+            .bind(&projection.error_message)
+            .bind(projection.projection_event_idx)
+            .bind(&projection.latest_event_type)
+            .bind(i64::try_from(projection.total_prompt_tokens).map_err(|_| {
+                format!(
+                    "initial projection prompt tokens overflow for {}",
+                    record.run_id
+                )
+            })?)
+            .bind(
+                i64::try_from(projection.total_completion_tokens).map_err(|_| {
+                    format!(
+                        "initial projection completion tokens overflow for {}",
+                        record.run_id
+                    )
+                })?,
+            )
+            .bind(i64::from(projection.total_tool_calls))
+            .bind(&projection.projection_hash)
+            .execute(&mut *tx)
+            .await
+            .map_err(|source| {
+                db_error("insert_initial_run_projection", &record.run_id, source).to_string()
+            })?;
         let commit_error = match tx.commit().await {
             Ok(()) => {
                 connection.release();
@@ -13824,17 +13874,6 @@ impl DatabaseRunStateStore {
                 session_id = %record.session_id,
                 run_id = %record.run_id,
                 "recovered exact run create commit acknowledgement"
-            );
-        }
-        if let Err(error) = self
-            .sync_projection_for_user(&record.user_id, &record.session_id, &record.run_id)
-            .await
-        {
-            tracing::warn!(
-                user_id = %record.user_id,
-                run_id = %record.run_id,
-                error = %error,
-                "run create committed but projection refresh failed"
             );
         }
         Ok(DurableRunStartClaim::Started {
@@ -31059,6 +31098,53 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_run_create_projection_conflict_rolls_back_run_and_initial_events_on_matrixone()
+     {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let nonce = Uuid::new_v4();
+        let user_id = format!("create-projection-u-{nonce}");
+        let session_id = format!("create-projection-s-{nonce}");
+        let run_id = format!("create-projection-r-{nonce}");
+        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+        sqlx::query(
+            "INSERT INTO run_display_projections
+             (run_id, user_id, session_id, status, projection_hash)
+             VALUES (?, ?, ?, 'completed', ?)",
+        )
+        .bind(&run_id)
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind("conflicting-projection")
+        .execute(pool.get())
+        .await
+        .expect("seed conflicting projection identity");
+
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user_id.clone();
+        run.session_id = session_id.clone();
+        assert!(store.insert_run(run).await.is_err());
+        assert!(store.load_run(&user_id, &run_id).await.unwrap().is_none());
+        let event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .fetch_one(pool.get())
+        .await
+        .expect("count rolled-back initial events");
+        assert_eq!(event_count, 0);
+
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup projection conflict session");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn database_run_create_commit_ack_loss_recovers_exact_run_slot_and_initial_events_on_matrixone()
      {
         let (_, pool) = setup_database_run_state_store_it().await;
@@ -31099,6 +31185,21 @@ mod tests {
         assert_eq!(durable.events.len(), 2);
         assert_eq!(durable.events[0]["index"], 0);
         assert_eq!(durable.events[1]["index"], 1);
+        let projection = store
+            .load_run_projection(&user_id, &run_id)
+            .await
+            .expect("load ACK-loss projection")
+            .expect("ACK-loss projection committed with run");
+        assert_eq!(projection.projection_event_idx, 1);
+        assert_eq!(
+            projection.latest_event_type.as_deref(),
+            Some("user_message")
+        );
+        assert_eq!(
+            projection.projection_hash,
+            build_run_display_projection(&durable, Some("user_message".into()), None)
+                .projection_hash
+        );
         assert_eq!(
             sqlx::query_scalar::<_, Option<String>>(
                 "SELECT run_id FROM agent_session_execution_slots
@@ -31314,6 +31415,13 @@ mod tests {
         assert_eq!(receipt["event_type"], "run_created");
         assert_eq!(receipt["data"]["run_id"], run_id);
         assert_eq!(receipt["data"]["session_id"], session_id);
+        let projection = store
+            .load_run_projection(&user_id, &run_id)
+            .await
+            .expect("load receipt projection")
+            .expect("receipt projection committed with run");
+        assert_eq!(projection.projection_event_idx, 0);
+        assert_eq!(projection.latest_event_type.as_deref(), Some("run_created"));
         assert!(
             receipt["data"]["receipt_id"]
                 .as_str()
