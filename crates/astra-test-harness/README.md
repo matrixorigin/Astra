@@ -223,9 +223,8 @@ prompt_variants:
       并设置 inherit_prefix: {required: true}。呈现其持久化结果。
 debug_log: true # turn on session journal capture
 timeout_seconds: 240
-# Long cases automatically give Astra a 225-second inner deadline before the
-# 240-second harness watchdog. Override only when an earlier boundary is needed;
-# an explicit value must be >72 and at least 15 seconds below timeout_seconds.
+# Optional explicit CLI deadline when the case requires earlier settlement;
+# it must be >72 and at least 15 seconds below timeout_seconds.
 # cli_wall_time_seconds: 220
 criteria:
   - type: exit_code
@@ -356,11 +355,10 @@ Enable capture by either:
 `extra_cli_args` supports pass-through flags like `--explain`, but
 rejects at case-load time any flag the harness manages:
 
-- Wall-time budget: `--max-wall-time-seconds` (long cases derive an inner CLI
-  deadline 15 seconds before the outer `timeout_seconds` watchdog; use
-  `cli_wall_time_seconds` for an earlier explicit deadline. Cases too short
-  for a process action, its settlement, final synthesis, and the CLI's
-  72-second terminal reserve retain only the outer watchdog.)
+- Wall-time budget: `--max-wall-time-seconds` (only an explicit
+  `cli_wall_time_seconds` sets an inner CLI deadline. It must leave the CLI's
+  72-second terminal reserve and at least 15 seconds before the outer
+  `timeout_seconds` watchdog.)
 
 - Prompt / input: `-m`, `--message`, `--stdin`
 - Model selection: `--model`

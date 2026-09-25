@@ -146,7 +146,7 @@ impl CaseExecutor for AstraCliExecutor {
             "\"$(mktemp -d)/events.jsonl\"".into(),
             "-y".into(),
         ]);
-        if let Some(cli_wall_time_seconds) = case.effective_cli_wall_time_seconds() {
+        if let Some(cli_wall_time_seconds) = case.cli_wall_time_override_for(case.timeout_seconds) {
             parts.push("--max-wall-time-seconds".into());
             parts.push(shell_escape(cli_wall_time_seconds.to_string()));
         }
@@ -604,7 +604,7 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
         .arg("--stream-events")
         .arg(&stream_event_path)
         .arg("-y");
-    if let Some(cli_wall_time_seconds) = case.effective_cli_wall_time_seconds() {
+    if let Some(cli_wall_time_seconds) = case.cli_wall_time_override_for(case.timeout_seconds) {
         cmd.arg("--max-wall-time-seconds")
             .arg(cli_wall_time_seconds.to_string());
     }
@@ -1577,24 +1577,14 @@ mod tests {
             !exec
                 .reproducer(&default_case, "qwen-flash")
                 .contains("--max-wall-time-seconds"),
-            "short cases cannot afford the CLI terminal reserve"
+            "unconfigured cases must retain their full outer watchdog budget"
         );
         default_case.timeout_seconds = 180;
         assert!(
-            exec.reproducer(&default_case, "qwen-flash")
-                .contains("--max-wall-time-seconds '165'"),
-            "long cases must finish before the outer harness watchdog"
-        );
-        default_case.timeout_seconds = 177;
-        assert!(
             !exec
                 .reproducer(&default_case, "qwen-flash")
-                .contains("--max-wall-time-seconds")
-        );
-        default_case.timeout_seconds = 178;
-        assert!(
-            exec.reproducer(&default_case, "qwen-flash")
-                .contains("--max-wall-time-seconds '163'")
+                .contains("--max-wall-time-seconds"),
+            "case duration alone must not truncate tool execution"
         );
         // POSIX single-quote escape: `'say '\''hello'\'''` preserves
         // the original bytes without relying on double-quote semantics
@@ -1651,12 +1641,10 @@ mod tests {
         );
         assert!(root_args.lines().any(|arg| arg == "--no-resume"));
         assert!(
-            root_args
+            !root_args
                 .lines()
-                .collect::<Vec<_>>()
-                .windows(2)
-                .any(|pair| pair == ["--max-wall-time-seconds", "165"]),
-            "CLI deadline must leave room before the outer watchdog: {root_args:?}"
+                .any(|arg| arg == "--max-wall-time-seconds"),
+            "unconfigured cases must preserve the outer watchdog budget: {root_args:?}"
         );
 
         case.extra_cli_args = vec![

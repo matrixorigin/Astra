@@ -13,9 +13,6 @@ use std::path::Path;
 
 const CLI_TERMINAL_RESERVE_SECONDS: u64 = 72;
 const CLI_PROCESS_CUSHION_SECONDS: u64 = 15;
-const CLI_MIN_USEFUL_EXECUTION_SECONDS: u64 =
-    astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET.as_secs() * 2
-        + astra_turn_core::chat_turn_heuristics::PROCESS_ACTION_SETTLEMENT_GRACE.as_secs();
 
 /// A single test case. One YAML file == one `Case`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,9 +72,8 @@ pub struct Case {
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
 
-    /// Optional override for the CLI wall deadline. Long cases otherwise
-    /// derive one from the outer watchdog, leaving time for terminal output;
-    /// short cases retain only the outer watchdog.
+    /// Optional explicit CLI wall deadline. Without one, only the outer
+    /// harness watchdog applies, preserving the full case execution budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_wall_time_seconds: Option<u64>,
 
@@ -483,21 +479,6 @@ impl Case {
         })
     }
 
-    /// Give the CLI a terminal boundary before the outer subprocess watchdog.
-    /// Too-short cases cannot fit one process-backed action, its settlement,
-    /// final synthesis, and the CLI's terminal reserve. They retain only the
-    /// outer watchdog. An explicit case budget remains the tighter authority.
-    pub(crate) fn effective_cli_wall_time_seconds(&self) -> Option<u64> {
-        self.cli_wall_time_override_for(self.timeout_seconds)
-            .or_else(|| {
-                self.timeout_seconds
-                    .checked_sub(CLI_PROCESS_CUSHION_SECONDS)
-                    .filter(|seconds| {
-                        *seconds > CLI_TERMINAL_RESERVE_SECONDS + CLI_MIN_USEFUL_EXECUTION_SECONDS
-                    })
-            })
-    }
-
     /// Whether this case needs the live Memoria contract and its durable
     /// post-loop settlement marker. Explicit opt-in, exact-record cleanup, or
     /// a post-loop memory health criterion enables it; a capability label
@@ -711,12 +692,12 @@ mod tests {
         assert!(c.criteria.is_empty());
         assert_eq!(c.timeout_seconds, 180);
         assert_eq!(c.cli_wall_time_seconds, None);
-        assert_eq!(c.effective_cli_wall_time_seconds(), Some(165));
+        assert_eq!(c.cli_wall_time_override_for(c.timeout_seconds), None);
         assert!(!c.debug_log);
     }
 
     #[test]
-    fn explicit_cli_wall_deadline_overrides_default_and_precedes_watchdog() {
+    fn explicit_cli_wall_deadline_precedes_watchdog() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("bounded-case.yaml");
         std::fs::write(
@@ -726,7 +707,10 @@ mod tests {
         .unwrap();
         let case = Case::from_path(&path).expect("independent inner deadline parses");
         assert_eq!(case.cli_wall_time_seconds, Some(310));
-        assert_eq!(case.effective_cli_wall_time_seconds(), Some(310));
+        assert_eq!(
+            case.cli_wall_time_override_for(case.timeout_seconds),
+            Some(310)
+        );
         assert_eq!(case.cli_wall_time_override_for(320), None);
         assert_eq!(case.cli_wall_time_override_for(325), Some(310));
 
