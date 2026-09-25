@@ -7185,8 +7185,26 @@ mod tests {
             );
             let results = evaluate_deterministic_with_session(&step.criteria, &weak, None);
             assert!(
-                results.iter().any(|result| !result.passed),
-                "warm step {index} accepted only 2,400 cache-read tokens: {results:?}"
+                results
+                    .iter()
+                    .any(|result| !result.passed && result.severity == CriterionSeverity::Hard),
+                "warm step {index} must hard-fail at only 2,400 cache-read tokens: {results:?}"
+            );
+        }
+        let mut strong = cache_request_outcome("strong", "turn", &[(100, 8_500, 0)]);
+        for event in &mut strong.explain_capture.as_mut().unwrap().events {
+            if let Some(usage) = &mut event.usage {
+                usage.basis = astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderPartial;
+                usage.cache_creation_tokens = None;
+            }
+        }
+        for (index, step) in case.steps.iter().enumerate() {
+            let results = evaluate_deterministic_with_session(&step.criteria, &strong, None);
+            assert!(
+                results
+                    .iter()
+                    .any(|result| { result.passed && result.severity == CriterionSeverity::Hard }),
+                "warm step {index} must accept observed partial-provider reads: {results:?}"
             );
         }
     }

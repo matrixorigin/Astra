@@ -7,7 +7,7 @@ description: |
   **Why**: Commit b70ced03 moved volatile content out of system message for
   prefix providers. If someone reverts this or leaks volatile content back,
   cache hits drop from ~10K+ to ~2.4K.
-  **Pass means**: cache_read >= 8000 on each warm follow-up turn
+  **Pass means**: each warm follow-up turn hard-requires cache_read >= 8000
   (system prompt ~7K + tool schemas cached).
   Previously this was ~2400 when volatile content broke the prefix.
   **Fail means**: volatile content leaked back into system message, breaking
@@ -23,19 +23,25 @@ timeout_seconds: 60
 steps:
   - prompt: 'Reply with the single word ACK. Do not call any tools.'
     criteria:
-      - type: prompt_cache_tokens
-        min_read: 8000
-        min_creation: 0
+      - type: all_of
+        criteria:
+          - type: prompt_cache_tokens
+            min_read: 8000
+            min_creation: 0
   - prompt: 'Reply with the single word ACK. Do not call any tools.'
     criteria:
-      - type: prompt_cache_tokens
-        min_read: 8000
-        min_creation: 0
+      - type: all_of
+        criteria:
+          - type: prompt_cache_tokens
+            min_read: 8000
+            min_creation: 0
   - prompt: 'Reply with the single word ACK. Do not call any tools.'
     criteria:
-      - type: prompt_cache_tokens
-        min_read: 8000
-        min_creation: 0
+      - type: all_of
+        criteria:
+          - type: prompt_cache_tokens
+            min_read: 8000
+            min_creation: 0
 criteria:
   - type: exit_code
     code: 0
