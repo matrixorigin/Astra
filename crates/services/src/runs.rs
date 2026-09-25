@@ -21930,7 +21930,13 @@ impl RunStateStore for DatabaseRunStateStore {
                 .push_bind(user_id)
                 .push(" AND session_id = ")
                 .push_bind(session_id)
-                .push(" AND event_type = 'fanout_group_cancelled' AND run_id IN (");
+                .push(" AND event_type = 'fanout_group_cancelled'")
+                .push(" AND JSON_TYPE(JSON_EXTRACT(payload_json, '$.data.group_id')) = 'STRING'")
+                .push(" AND TRIM(JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.data.group_id'))) <> ''")
+                .push(
+                    " AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.data.cancellation_origin')) IN ('user', 'runtime')",
+                )
+                .push(" AND run_id IN (");
             {
                 let mut ids = builder.separated(",");
                 for run_id in &recovery_event_run_ids {
@@ -30092,6 +30098,35 @@ mod tests {
                             "parent_run_id": root_id,
                             "target_count": 3,
                             "reason": "second group stopped",
+                            "cancellation_origin": "runtime"
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "fanout_group_cancelled",
+                        "data": {
+                            "group_id": "malformed-latest",
+                            "parent_run_id": root_id,
+                            "target_count": 3,
+                            "reason": "missing trusted origin"
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "fanout_group_cancelled",
+                        "data": {
+                            "group_id": "   ",
+                            "parent_run_id": root_id,
+                            "target_count": 3,
+                            "reason": "blank group identity",
+                            "cancellation_origin": "runtime"
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "fanout_group_cancelled",
+                        "data": {
+                            "group_id": [],
+                            "parent_run_id": root_id,
+                            "target_count": 3,
+                            "reason": "non-string group identity",
                             "cancellation_origin": "runtime"
                         }
                     }),

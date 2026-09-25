@@ -70,6 +70,7 @@ const CANCELLATION_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::f
 /// cancelled group into a detached retry task. Callers beyond this bound
 /// apply backpressure instead of creating unbounded in-memory debt.
 const FANOUT_GROUP_PERSISTENCE_CONCURRENCY: usize = 4;
+const FANOUT_GROUP_PERSISTENCE_QUEUE_CAPACITY: usize = MAX_FANOUT_GROUPS;
 /// One session/root may occupy only a small part of the process-wide durable
 /// cancellation budget. A large fanout therefore cannot enqueue all of its
 /// database work ahead of a newly-cancelled session.
@@ -581,7 +582,6 @@ struct DurableFanoutGroupCancellation {
     parent_run_id: String,
     group_id: String,
     target_count: usize,
-    owner: FanoutDurableOwner,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -631,10 +631,6 @@ fn durable_fanout_group_cancellations(
                         .and_then(|count| usize::try_from(count).ok())
                         .filter(|count| *count > 0)
                         .unwrap_or(1),
-                    owner: FanoutDurableOwner {
-                        user_id: run.user_id.clone(),
-                        session_id: run.session_id.clone(),
-                    },
                 })
             })
         })
@@ -1547,16 +1543,19 @@ pub struct DynamicAgentSpawner {
     max_concurrent_agents: Option<usize>,
     /// Fanout group accounting keyed by group id. Group target_count
     /// is a user/model invariant, not a derived live-agent count.
-    /// New live admissions are capped at [`MAX_FANOUT_GROUPS`]. Recovery may
-    /// temporarily retain more historical closed projections so a paginated
-    /// durable snapshot cannot silently lose cancellation evidence.
+    /// New and recovered admissions share one bounded projection. Recovery
+    /// fails closed when a durable snapshot exceeds the bound instead of
+    /// allowing a restart to grow process-local state without limit.
     fanout_groups: Arc<RwLock<HashMap<String, AgentFanoutGroupProjection>>>,
-    /// Session-lifetime admission fences for parent/group identities whose
-    /// user/runtime cancellation permanently closed child admission. This is
-    /// intentionally not evicted: reopening after projection eviction would
-    /// be a correctness and authorization failure, while the set is local to
-    /// one session spawner and avoids a database read on every late retry.
-    closed_fanout_group_ids: Arc<RwLock<HashSet<(String, String)>>>,
+    /// Session-local admission fences for parents whose user/runtime
+    /// cancellation permanently closed child admission. The current contract
+    /// permits one group per parent, so fencing the parent prevents an older
+    /// group identity from reopening after projection eviction.
+    closed_fanout_parent_ids: Arc<RwLock<HashSet<String>>>,
+    /// Set when the bounded local projection, cancellation debt queue, or
+    /// admission-fence set cannot represent another identity. New unknown
+    /// groups then fail closed until this session runtime is replaced.
+    fanout_admission_overflow: Arc<std::sync::atomic::AtomicBool>,
     fanout_group_durable_owners: Arc<RwLock<HashMap<(String, String), FanoutDurableOwner>>>,
     /// One retry worker per exact group identity. Group cancellation is rare;
     /// keeping a failed durable fence alive is safer than abandoning it after
@@ -1749,7 +1748,8 @@ impl DynamicAgentSpawner {
             trace_writer: None,
             max_concurrent_agents: None,
             fanout_groups: Arc::new(RwLock::new(HashMap::new())),
-            closed_fanout_group_ids: Arc::new(RwLock::new(HashSet::new())),
+            closed_fanout_parent_ids: Arc::new(RwLock::new(HashSet::new())),
+            fanout_admission_overflow: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fanout_group_durable_owners: Arc::new(RwLock::new(HashMap::new())),
             pending_fanout_group_cancellations: Arc::new(std::sync::Mutex::new(HashSet::new())),
             fanout_agent_index: Arc::new(RwLock::new(HashMap::new())),
@@ -2448,57 +2448,42 @@ impl DynamicAgentSpawner {
         let _activity = self.begin_lifecycle_activity();
         let spawned = durable_agent_spawn_metadata(runs);
         let group_cancellations = durable_fanout_group_cancellations(runs);
-        if !group_cancellations.is_empty() {
-            self.mark_closed_fanout_groups(group_cancellations.iter().map(|cancellation| {
-                (
-                    cancellation.parent_run_id.clone(),
-                    cancellation.group_id.clone(),
-                )
-            }))
-            .await;
-            for cancellation in &group_cancellations {
-                self.fanout_group_durable_owners
-                    .write()
-                    .await
-                    .entry((
-                        cancellation.parent_run_id.clone(),
-                        cancellation.group_id.clone(),
-                    ))
-                    .or_insert_with(|| cancellation.owner.clone());
-                let identity = AgentFanoutSlotIdentity::new(
-                    cancellation.group_id.clone(),
-                    cancellation.target_count,
-                    0,
-                    None,
+        for cancellation in &group_cancellations {
+            self.mark_closed_fanout_group(&cancellation.parent_run_id)
+                .await;
+            let identity = AgentFanoutSlotIdentity::new(
+                cancellation.group_id.clone(),
+                cancellation.target_count,
+                0,
+                None,
+            );
+            let Ok(identity) = identity else {
+                tracing::warn!(
+                    target: "fanout",
+                    group_id = %cancellation.group_id,
+                    parent_run_id = %cancellation.parent_run_id,
+                    target_count = cancellation.target_count,
+                    "ignoring invalid durable fanout cancellation projection"
                 );
-                let Ok(identity) = identity else {
-                    tracing::warn!(
-                        target: "fanout",
-                        group_id = %cancellation.group_id,
-                        parent_run_id = %cancellation.parent_run_id,
-                        target_count = cancellation.target_count,
-                        "ignoring invalid durable fanout cancellation projection"
-                    );
-                    continue;
-                };
-                if let Err(error) = self
-                    .get_or_validate_fanout_group(
-                        &identity,
-                        Some("Recovered fanout"),
-                        None,
-                        &cancellation.parent_run_id,
-                        true,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        target: "fanout",
-                        group_id = %cancellation.group_id,
-                        parent_run_id = %cancellation.parent_run_id,
-                        %error,
-                        "could not restore durable fanout group cancellation projection"
-                    );
-                }
+                continue;
+            };
+            if let Err(error) = self
+                .get_or_validate_fanout_group(
+                    &identity,
+                    Some("Recovered fanout"),
+                    None,
+                    &cancellation.parent_run_id,
+                    true,
+                )
+                .await
+            {
+                tracing::warn!(
+                    target: "fanout",
+                    group_id = %cancellation.group_id,
+                    parent_run_id = %cancellation.parent_run_id,
+                    %error,
+                    "could not restore durable fanout group cancellation projection"
+                );
             }
         }
         let mut restored = 0;
@@ -2775,19 +2760,21 @@ impl DynamicAgentSpawner {
         registry.observe(&observation.with_wake_policy(WorkUnitWakePolicy::OnAttentionOrTerminal));
     }
 
-    /// Add closed group identities to the session-lifetime admission fence and
-    /// keep an already-present projection fenced as well.
-    async fn mark_closed_fanout_groups<I>(&self, groups_to_close: I)
-    where
-        I: IntoIterator<Item = (String, String)>,
-    {
+    /// Add a parent identity to the bounded admission fence and keep an
+    /// already-present projection fenced as well.
+    async fn mark_closed_fanout_group(&self, parent_run_id: &str) {
         let mut groups = self.fanout_groups.write().await;
-        let mut closed = self.closed_fanout_group_ids.write().await;
-        for (parent_run_id, group_id) in groups_to_close {
-            closed.insert((parent_run_id.clone(), group_id.clone()));
-            if let Some(group) = groups.get_mut(&group_id)
-                && group.parent_run_id.as_deref() == Some(parent_run_id.as_str())
-            {
+        let mut closed = self.closed_fanout_parent_ids.write().await;
+        if !closed.contains(parent_run_id) {
+            if closed.len() >= MAX_FANOUT_GROUPS {
+                self.fanout_admission_overflow
+                    .store(true, std::sync::atomic::Ordering::Release);
+            } else {
+                closed.insert(parent_run_id.to_string());
+            }
+        }
+        for group in groups.values_mut() {
+            if group.parent_run_id.as_deref() == Some(parent_run_id) {
                 group.close_spawn_admission();
             }
         }
@@ -2799,10 +2786,10 @@ impl DynamicAgentSpawner {
         parent_run_id: &str,
     ) -> Result<(), SpawnError> {
         if self
-            .closed_fanout_group_ids
+            .closed_fanout_parent_ids
             .read()
             .await
-            .contains(&(parent_run_id.to_string(), identity.group_id.clone()))
+            .contains(parent_run_id)
         {
             return Err(SpawnError::Race(format!(
                 "fanout group '{}' no longer accepts child admissions after cancellation",
@@ -2823,6 +2810,15 @@ impl DynamicAgentSpawner {
             // Do not turn every slot admission into a durable lookup merely
             // because an unrelated closed-group cache entry was evicted.
             return Ok(());
+        }
+        if self
+            .fanout_admission_overflow
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(SpawnError::FanoutGroupLimitExceeded {
+                active: MAX_FANOUT_GROUPS,
+                limit: MAX_FANOUT_GROUPS,
+            });
         }
         Ok(())
     }
@@ -3091,10 +3087,10 @@ impl DynamicAgentSpawner {
         }
         let mut groups = self.fanout_groups.write().await;
         let closed_by_tombstone = self
-            .closed_fanout_group_ids
+            .closed_fanout_parent_ids
             .read()
             .await
-            .contains(&(parent_run_id.to_string(), identity.group_id.clone()));
+            .contains(parent_run_id);
         if closed_by_tombstone && !allow_closed_admission {
             return Err(SpawnError::Race(format!(
                 "fanout group '{}' no longer accepts child admissions after cancellation",
@@ -3103,14 +3099,9 @@ impl DynamicAgentSpawner {
         }
         let is_new = !groups.contains_key(&identity.group_id);
         let evicted_agent_ids = if is_new {
-            // A live tool call has one fixed group per parent. Recovery is
-            // deliberately more permissive: historical durable events can
-            // contain more than one group for the same parent, and dropping
-            // the later event would make restart state silently incomplete.
-            if !allow_closed_admission
-                && let Some(existing) = groups
-                    .values()
-                    .find(|group| group.parent_run_id.as_deref() == Some(parent_run_id))
+            if let Some(existing) = groups
+                .values()
+                .find(|group| group.parent_run_id.as_deref() == Some(parent_run_id))
             {
                 return Err(SpawnError::InvalidInput(format!(
                     "parent run '{parent_run_id}' already owns fanout group '{}' with fixed target_count {}; a parent run may start only one fanout group",
@@ -3118,14 +3109,43 @@ impl DynamicAgentSpawner {
                 )));
             }
             if allow_closed_admission {
-                // Durable recovery is a read-only projection of authoritative
-                // history. Applying the live-memory cap here would turn a
-                // later cancellation page into an invisible group and make a
-                // restart lose the admission fence. Recovery is bounded by
-                // the durable snapshot and the spawner lifetime; live new
-                // admissions still use the cap below.
+                if self
+                    .fanout_admission_overflow
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    || groups.len() >= MAX_FANOUT_GROUPS
+                {
+                    self.fanout_admission_overflow
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    return Err(SpawnError::FanoutGroupLimitExceeded {
+                        active: groups.len().max(MAX_FANOUT_GROUPS),
+                        limit: MAX_FANOUT_GROUPS,
+                    });
+                }
                 Vec::new()
             } else {
+                if self
+                    .fanout_admission_overflow
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Err(SpawnError::FanoutGroupLimitExceeded {
+                        active: MAX_FANOUT_GROUPS,
+                        limit: MAX_FANOUT_GROUPS,
+                    });
+                }
+                if self
+                    .pending_fanout_group_cancellations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len()
+                    >= FANOUT_GROUP_PERSISTENCE_QUEUE_CAPACITY
+                {
+                    self.fanout_admission_overflow
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    return Err(SpawnError::FanoutGroupLimitExceeded {
+                        active: FANOUT_GROUP_PERSISTENCE_QUEUE_CAPACITY,
+                        limit: FANOUT_GROUP_PERSISTENCE_QUEUE_CAPACITY,
+                    });
+                }
                 self.evict_terminal_fanout_group_if_full(&mut groups)?
             }
         } else {
@@ -3506,10 +3526,19 @@ impl DynamicAgentSpawner {
         if groups.len() < MAX_FANOUT_GROUPS {
             return Ok(Vec::new());
         }
-        // Find the terminal group with the oldest last_touched.
+        // Find the terminal group with the oldest last_touched. A projection
+        // carrying an unpersisted fence is not evictable: otherwise pending
+        // debt could fill the queue while new live groups take its slots,
+        // leaving a later cancellation with no durable owner.
         let Some((evict_id, _)) = groups
             .iter()
-            .filter(|(_, g)| g.is_terminal())
+            .filter(|(group_id, group)| {
+                group.is_terminal()
+                    && !self.has_pending_fanout_group_cancellation(
+                        group.parent_run_id.as_deref().unwrap_or(ROOT_RUN_ID),
+                        group_id,
+                    )
+            })
             .min_by_key(|(_, g)| g.last_touched)
         else {
             return Err(SpawnError::FanoutGroupLimitExceeded {
@@ -3992,6 +4021,17 @@ impl DynamicAgentSpawner {
         // attempts that bypass the group contract. A later user turn has
         // a new parent_run_id and is unaffected.
         if fanout_slot.is_none() {
+            if self
+                .closed_fanout_parent_ids
+                .read()
+                .await
+                .contains(&context.parent_run_id)
+            {
+                return Err(SpawnError::Race(format!(
+                    "parent run '{}' no longer accepts fanout child admissions after cancellation",
+                    context.parent_run_id
+                )));
+            }
             if let Some(group) = self
                 .fanout_group_for_parent_run(&context.parent_run_id)
                 .await
@@ -4004,6 +4044,15 @@ impl DynamicAgentSpawner {
                     group.status.as_str(),
                     group.group_id
                 )));
+            }
+            if self
+                .fanout_admission_overflow
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(SpawnError::FanoutGroupLimitExceeded {
+                    active: MAX_FANOUT_GROUPS,
+                    limit: MAX_FANOUT_GROUPS,
+                });
             }
         }
 
@@ -4176,10 +4225,10 @@ impl DynamicAgentSpawner {
         }
         if let Some(identity) = fanout_slot.as_ref() {
             let closed_by_tombstone = self
-                .closed_fanout_group_ids
+                .closed_fanout_parent_ids
                 .read()
                 .await
-                .contains(&(context.parent_run_id.clone(), identity.group_id.clone()));
+                .contains(&context.parent_run_id);
             let closed_projection = self
                 .fanout_group_for_parent_run_and_id(&context.parent_run_id, &identity.group_id)
                 .await
@@ -5001,8 +5050,15 @@ impl DynamicAgentSpawner {
                 .get(&(parent_run_id.clone(), group_id.to_string()))
                 .cloned();
             if closes_admission {
-                let mut closed = self.closed_fanout_group_ids.write().await;
-                closed.insert((parent_run_id.clone(), group_id.to_string()));
+                let mut closed = self.closed_fanout_parent_ids.write().await;
+                if !closed.contains(&parent_run_id) {
+                    if closed.len() >= MAX_FANOUT_GROUPS {
+                        self.fanout_admission_overflow
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    } else {
+                        closed.insert(parent_run_id.clone());
+                    }
+                }
             }
             let group = groups
                 .get_mut(group_id)
@@ -5060,6 +5116,9 @@ impl DynamicAgentSpawner {
                     .flatten(),
             )
         };
+        // Transfer the durable obligation before any cancellable local-stop
+        // await. Scheduling is synchronous: it only records the bounded
+        // owner and launches a worker whose database waits are detached.
         if let Some((parent_run_id, target_count, owner)) = persist_group_cancellation {
             self.schedule_fanout_group_cancellation_persistence(
                 group_id,
@@ -5068,8 +5127,7 @@ impl DynamicAgentSpawner {
                 reason,
                 origin,
                 owner,
-            )
-            .await;
+            );
         }
         // A spawn future may be waiting on mailbox/worktree/trace setup after
         // reserving local capacity but before attaching its identity to the
@@ -5133,7 +5191,7 @@ impl DynamicAgentSpawner {
     /// durable event keeps retrying with the same idempotency key until it
     /// succeeds or the spawner shuts down; the bounded permit pool applies
     /// backpressure instead of multiplying detached retry workers.
-    async fn schedule_fanout_group_cancellation_persistence(
+    fn schedule_fanout_group_cancellation_persistence(
         &self,
         group_id: &str,
         parent_run_id: String,
@@ -5147,20 +5205,24 @@ impl DynamicAgentSpawner {
         };
         let group_id = group_id.to_string();
         let pending_key = (parent_run_id.clone(), group_id.clone());
-        // Admission closure is already local and synchronous. Backpressure
-        // only the detached durable worker, so repeated cancellation requests
-        // for a new group cannot create an unbounded task/debt queue.
-        let permit = tokio::select! {
-            _ = self.fanout_group_persistence_shutdown.cancelled() => return,
-            permit = self.fanout_group_persistence_capacity.clone().acquire_owned() => {
-                permit.expect("fanout persistence capacity must remain open")
-            }
-        };
         {
             let mut pending = self
                 .pending_fanout_group_cancellations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if pending.len() >= FANOUT_GROUP_PERSISTENCE_QUEUE_CAPACITY {
+                self.fanout_admission_overflow
+                    .store(true, std::sync::atomic::Ordering::Release);
+                tracing::error!(
+                    target: "fanout",
+                    %group_id,
+                    %parent_run_id,
+                    pending = pending.len(),
+                    limit = FANOUT_GROUP_PERSISTENCE_QUEUE_CAPACITY,
+                    "fanout group cancellation persistence debt reached its bounded capacity"
+                );
+                return;
+            }
             if !pending.insert(pending_key.clone()) {
                 return;
             }
@@ -5171,23 +5233,39 @@ impl DynamicAgentSpawner {
         let durable_owners = Arc::clone(&self.fanout_group_durable_owners);
         let durable_owner_key = pending_key.clone();
         let global_capacity = Arc::clone(cancellation_retry_global_capacity());
+        let persistence_capacity = Arc::clone(&self.fanout_group_persistence_capacity);
         tokio::spawn(async move {
-            let _permit = permit;
+            let clear_pending = || {
+                pending_cancellations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&pending_key);
+            };
             let mut attempt = 0_u32;
             loop {
                 if shutdown.is_cancelled() {
-                    pending_cancellations
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remove(&pending_key);
+                    clear_pending();
                     return;
                 }
-                let permit = tokio::select! {
+                // A retry worker owns only the bounded queue slot between
+                // attempts. Acquire the per-spawner database permit for one
+                // attempt at a time; a permanently failing provider cannot
+                // starve newer obligations for the lifetime of its retry.
+                // Fairness order matters: do not occupy a process-wide
+                // permit while waiting for this session's smaller budget.
+                let persistence_permit = tokio::select! {
                     _ = shutdown.cancelled() => {
-                        pending_cancellations
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .remove(&pending_key);
+                        clear_pending();
+                        return;
+                    }
+                    permit = persistence_capacity.clone().acquire_owned() => {
+                        permit.expect("fanout persistence capacity must remain open")
+                    }
+                };
+                let global_permit = tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        drop(persistence_permit);
+                        clear_pending();
                         return;
                     }
                     permit = global_capacity.clone().acquire_owned() => {
@@ -5208,13 +5286,11 @@ impl DynamicAgentSpawner {
                     .catch_unwind(),
                 )
                 .await;
-                drop(permit);
+                drop(persistence_permit);
+                drop(global_permit);
                 match persistence {
                     Ok(Ok(Ok(()))) => {
-                        pending_cancellations
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .remove(&pending_key);
+                        clear_pending();
                         durable_owners.write().await.remove(&durable_owner_key);
                         return;
                     }
@@ -5257,10 +5333,7 @@ impl DynamicAgentSpawner {
                     .min(CANCELLATION_RETRY_MAX_DELAY);
                 tokio::select! {
                     _ = shutdown.cancelled() => {
-                        pending_cancellations
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .remove(&pending_key);
+                        clear_pending();
                         return;
                     }
                     _ = tokio::time::sleep(delay) => {}
@@ -6522,7 +6595,8 @@ impl DynamicAgentSpawner {
             trace_writer: self.trace_writer.clone(),
             max_concurrent_agents: self.max_concurrent_agents,
             fanout_groups: Arc::clone(&self.fanout_groups),
-            closed_fanout_group_ids: Arc::clone(&self.closed_fanout_group_ids),
+            closed_fanout_parent_ids: Arc::clone(&self.closed_fanout_parent_ids),
+            fanout_admission_overflow: Arc::clone(&self.fanout_admission_overflow),
             fanout_group_durable_owners: Arc::clone(&self.fanout_group_durable_owners),
             pending_fanout_group_cancellations: Arc::clone(
                 &self.pending_fanout_group_cancellations,
@@ -7768,6 +7842,20 @@ mod tests {
                 |slot| slot.status == AgentFanoutSlotStatus::Planned && slot.agent_id.is_none()
             )
         );
+
+        {
+            let mut groups = spawner.fanout_groups.write().await;
+            groups.remove("second-group");
+            assert!(!groups.contains_key("second-group"));
+        }
+        let identity = AgentFanoutSlotIdentity::new("first-group", 2, 0, None)
+            .expect("valid historical group identity");
+        assert!(matches!(
+            spawner
+                .ensure_fanout_admission_can_be_checked(&identity, "root-run")
+                .await,
+            Err(SpawnError::Race(message)) if message.contains("no longer accepts")
+        ));
     }
 
     #[tokio::test]
@@ -7854,6 +7942,36 @@ mod tests {
             format!("recovered-cancel-{MAX_FANOUT_GROUPS}")
         );
         assert!(groups[0].spawn_admission_closed());
+    }
+
+    #[tokio::test]
+    async fn durable_restore_fails_closed_when_projection_capacity_is_exceeded() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let mut runs = Vec::new();
+        for index in 0..=MAX_FANOUT_GROUPS {
+            let mut root = durable_run(&format!("root-run-{index}"), 0, astra_core::STATUS_RUNNING);
+            root.events.push(json!({
+                "event_type": FANOUT_GROUP_CANCELLED_EVENT_TYPE,
+                "data": {
+                    "group_id": format!("recovered-group-{index}"),
+                    "parent_run_id": format!("root-run-{index}"),
+                    "target_count": 1,
+                    "cancellation_origin": "runtime"
+                }
+            }));
+            runs.push(root);
+        }
+
+        assert_eq!(spawner.restore_durable_agent_runs(&runs).await, 0);
+        assert_eq!(spawner.list_fanout_groups().await.len(), MAX_FANOUT_GROUPS);
+        let result = spawner
+            .declare_fanout_group("new-group", "new", 1, None, "new-parent")
+            .await;
+        assert!(matches!(
+            result,
+            Err(SpawnError::FanoutGroupLimitExceeded { active, limit })
+                if active == MAX_FANOUT_GROUPS && limit == MAX_FANOUT_GROUPS
+        ));
     }
 
     #[tokio::test]
@@ -11862,6 +11980,13 @@ mod tests {
             .await
             .expect("cancelled group");
         assert!(cancellation.group.spawn_admission_closed());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while spawner.has_pending_fanout_group_cancellations() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successful durable fence before projection eviction");
 
         {
             let mut groups = spawner.fanout_groups.write().await;
@@ -11895,6 +12020,17 @@ mod tests {
             executor.starts.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "a late retry must not reach the provider after projection eviction"
+        );
+
+        let bare_result = spawner.spawn(make_bg_input(), &make_bg_context()).await;
+        assert!(
+            matches!(bare_result, Err(SpawnError::Race(ref message)) if message.contains("no longer accepts")),
+            "a bare child cannot bypass a closed parent fence: {bare_result:?}"
+        );
+        assert_eq!(
+            executor.starts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a bare late retry must not reach the provider"
         );
     }
 
