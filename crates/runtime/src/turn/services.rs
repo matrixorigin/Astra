@@ -597,6 +597,47 @@ impl DatabaseTraceEventWriter {
         )
         .await
         .map_err(TraceWriteError::Persist)?;
+        Self::write_many_in_tx_after_admission(tx, events, None).await
+    }
+
+    /// Persist trace rows after the caller has already admitted their exact
+    /// owner in this same transaction. Canonical run settlement and terminal
+    /// trace repair both hold that lock before reaching this writer; repeating
+    /// session admission here only performs the same fence/status reads again.
+    ///
+    /// The owner pair is required by those callers so a future builder cannot
+    /// accidentally bypass admission for a mixed-user batch.
+    pub(crate) async fn write_many_in_admitted_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        admitted_user_id: &str,
+        admitted_session_id: &str,
+        events: Vec<TraceEvent>,
+    ) -> Result<TraceEventPersistOutcome, TraceWriteError> {
+        Self::write_many_in_tx_after_admission(
+            tx,
+            events,
+            Some((admitted_user_id, admitted_session_id)),
+        )
+        .await
+    }
+
+    async fn write_many_in_tx_after_admission(
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        events: Vec<TraceEvent>,
+        admitted_owner: Option<(&str, &str)>,
+    ) -> Result<TraceEventPersistOutcome, TraceWriteError> {
+        if events.is_empty() {
+            return Ok(TraceEventPersistOutcome::default());
+        }
+        if let Some((admitted_user_id, admitted_session_id)) = admitted_owner
+            && events.iter().any(|event| {
+                event.user_id != admitted_user_id || event.session_id != admitted_session_id
+            })
+        {
+            return Err(TraceWriteError::Persist(
+                "admitted trace batch contains a different owner".to_string(),
+            ));
+        }
         let mut by_session = std::collections::BTreeMap::<(String, String), Vec<TraceEvent>>::new();
         for event in events {
             by_session
@@ -1799,6 +1840,107 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup trace-tail sessions");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn admitted_trace_batch_rejects_mixed_owner_without_writes() {
+        let shared = setup_live_pool_for_test().await;
+        let pool = shared.get().clone();
+        let suffix = Uuid::new_v4().to_string();
+        let first_user = format!("admitted-trace-user-a-{suffix}");
+        let first_session = format!("admitted-trace-session-a-{suffix}");
+        let second_user = format!("admitted-trace-user-b-{suffix}");
+        let second_session = format!("admitted-trace-session-b-{suffix}");
+
+        for (user_id, session_id) in [
+            (&first_user, &first_session),
+            (&second_user, &second_session),
+        ] {
+            sqlx::query(
+                "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+                 VALUES (?, ?, 'admitted-trace-owner-it', 'active', 0)",
+            )
+            .bind(session_id)
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert admitted-trace owner session");
+        }
+
+        let mut connection = astra_services::CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .expect("acquire admitted-trace transaction connection");
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .expect("begin admitted-trace transaction");
+        admit_event_owners_in_tx(
+            &mut tx,
+            std::iter::once((first_user.clone(), first_session.clone())),
+        )
+        .await
+        .expect("admit the exact trace owner");
+
+        let error = DatabaseTraceEventWriter::write_many_in_admitted_tx(
+            &mut tx,
+            &first_user,
+            &first_session,
+            vec![
+                trace_event("admitted-trace-first", &first_user, &first_session),
+                trace_event("admitted-trace-mixed", &second_user, &second_session),
+            ],
+        )
+        .await
+        .expect_err("mixed-owner admitted batch must be rejected before insert");
+        assert!(
+            error.to_string().contains("different owner"),
+            "unexpected mixed-owner error: {error}"
+        );
+        for (user_id, session_id) in [
+            (&first_user, &first_session),
+            (&second_user, &second_session),
+        ] {
+            let event_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("count mixed-owner trace events before rollback");
+            assert_eq!(event_count, 0, "mixed-owner batch must not insert events");
+
+            let session_event_count: i64 = sqlx::query_scalar(
+                "SELECT event_count FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read mixed-owner session event count before rollback");
+            assert_eq!(
+                session_event_count, 0,
+                "mixed-owner batch must not change session counters"
+            );
+        }
+        tx.rollback()
+            .await
+            .expect("rollback mixed-owner admitted batch");
+        connection.release();
+
+        sqlx::query(
+            "DELETE FROM agent_sessions WHERE (user_id = ? AND session_id = ?) \
+             OR (user_id = ? AND session_id = ?)",
+        )
+        .bind(&first_user)
+        .bind(&first_session)
+        .bind(&second_user)
+        .bind(&second_session)
+        .execute(&pool)
+        .await
+        .expect("cleanup admitted-trace owner sessions");
     }
 
     /// Verify that all Database*Writer structs fail instantly when no pool is

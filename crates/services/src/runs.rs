@@ -21650,10 +21650,65 @@ impl RunStateStore for DatabaseRunStateStore {
                 page.runs.push(run);
             }
         }
+        // Group cancellation events live on the parent run, but a bounded
+        // cancellation page can select only a child. Load missing direct
+        // parents in one batch so those events have a durable run to attach
+        // to instead of being silently discarded after the event query.
+        let parent_run_ids = page
+            .runs
+            .iter()
+            .filter_map(|run| run.parent_run_id.as_deref())
+            .filter(|parent_run_id| !included.contains(*parent_run_id))
+            .collect::<HashSet<_>>();
+        if !parent_run_ids.is_empty() {
+            let mut parent_query = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
+                "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs WHERE user_id = "
+            ));
+            parent_query
+                .push_bind(user_id)
+                .push(" AND session_id = ")
+                .push_bind(session_id)
+                .push(" AND run_id IN (");
+            {
+                let mut ids = parent_query.separated(",");
+                for run_id in &parent_run_ids {
+                    ids.push_bind(*run_id);
+                }
+            }
+            parent_query.push(")");
+            let parent_rows = parent_query
+                .build()
+                .fetch_all(self.pool.get())
+                .await
+                .map_err(|source| {
+                    db_error("load_session_agent_recovery_parents", session_id, source).to_string()
+                })?;
+            for parent in parent_rows
+                .into_iter()
+                .map(run_record_from_row)
+                .collect::<DbStoreResult<Vec<_>>>()
+                .map_err(|error| error.to_string())?
+            {
+                if included.insert(parent.run_id.clone()) {
+                    page.runs.push(parent);
+                }
+            }
+        }
         sort_session_run_tree(&mut page.runs);
         if page.runs.is_empty() {
             return Ok(page);
         }
+        // A fanout cancellation is recorded on the parent run, while the
+        // selected recovery page may contain only its child (for example when
+        // the parent fell outside the bounded active-run page). Include direct
+        // parent identities so the admission fence is not lost in that case.
+        let recovery_event_run_ids = page
+            .runs
+            .iter()
+            .flat_map(|run| {
+                std::iter::once(run.run_id.as_str()).chain(run.parent_run_id.as_deref())
+            })
+            .collect::<HashSet<_>>();
         // Recovery needs one exact spawn envelope per selected child plus the
         // latest terminal facts per selected run. `event_idx` is run-local, so
         // a global ORDER BY/LIMIT lets one noisy run starve every other run.
@@ -21706,6 +21761,24 @@ impl RunStateStore for DatabaseRunStateStore {
         builder.push(
             ")
                ) ranked_terminal WHERE recovery_rank = 1
+               UNION ALL
+               SELECT run_id, event_idx, payload_json
+               FROM agent_run_events
+               WHERE user_id = ",
+        );
+        builder
+            .push_bind(user_id)
+            .push(" AND session_id = ")
+            .push_bind(session_id)
+            .push(" AND event_type = 'fanout_group_cancelled' AND run_id IN (");
+        {
+            let mut ids = builder.separated(",");
+            for run_id in &recovery_event_run_ids {
+                ids.push_bind(*run_id);
+            }
+        }
+        builder.push(
+            ")
              ) recovery_events
              ORDER BY run_id, event_idx",
         );
@@ -29689,6 +29762,26 @@ mod tests {
                         "fanout_slot": {"group_id":"review","target_count":1,"slot_index":0,"slot_id":"correctness"}
                     }),
                     serde_json::json!({"type":"agent_progress","status":"noise"}),
+                    serde_json::json!({
+                        "type": "fanout_group_cancelled",
+                        "data": {
+                            "group_id": "review-a",
+                            "parent_run_id": root_id,
+                            "target_count": 2,
+                            "reason": "first group stopped",
+                            "cancellation_origin": "user"
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "fanout_group_cancelled",
+                        "data": {
+                            "group_id": "review-b",
+                            "parent_run_id": root_id,
+                            "target_count": 3,
+                            "reason": "second group stopped",
+                            "cancellation_origin": "runtime"
+                        }
+                    }),
                 ],
             )
             .await
@@ -29747,10 +29840,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             root.events.len(),
-            1,
-            "unneeded progress events stay out of recovery"
+            3,
+            "recovery keeps the spawn envelope and every selected group cancellation event"
         );
         assert_eq!(root.events[0]["type"], "agent_spawned");
+        assert_eq!(root.events[1]["type"], "fanout_group_cancelled");
+        assert_eq!(root.events[1]["data"]["group_id"], "review-a");
+        assert_eq!(root.events[2]["type"], "fanout_group_cancelled");
+        assert_eq!(root.events[2]["data"]["group_id"], "review-b");
         assert_eq!(child.status, STATUS_RUNNING);
         assert_eq!(child.events.len(), 1);
         assert_eq!(child.events[0]["data"]["attempt"], 39);

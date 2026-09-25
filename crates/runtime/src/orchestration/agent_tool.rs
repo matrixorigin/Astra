@@ -1572,17 +1572,22 @@ async fn render_agent_fanout_results(
     reconcile_durable: bool,
 ) -> String {
     if read_options.is_default()
-        && let Some(cached) = ctx.spawner.cached_terminal_fanout_result(group_id).await
+        && let Some(cached) = ctx
+            .spawner
+            .cached_terminal_fanout_result(&ctx.run_id, group_id)
+            .await
     {
         return cached;
     }
-    if reconcile_durable && let Err(error) = ctx.spawner.reconcile_durable_agent_runs().await {
-        tracing::warn!(
-            target: "fanout",
-            %group_id,
-            %error,
-            "durable fanout reconciliation failed; returning the last confirmed observation"
-        );
+    if reconcile_durable {
+        if let Err(error) = reconcile_durable_agent_runs_for_tool(ctx.spawner.as_ref()).await {
+            tracing::warn!(
+                target: "fanout",
+                %group_id,
+                %error,
+                "durable fanout reconciliation failed; returning the last confirmed observation"
+            );
+        }
     }
     let Some(group) = find_fanout_group(ctx, group_id).await else {
         return render_agent_tool_error(None, &format!("Unknown fanout group_id: {group_id}"));
@@ -1890,10 +1895,19 @@ async fn render_agent_fanout_results(
     let rendered = serde_json::to_string_pretty(&response).unwrap_or_else(|_| response.to_string());
     if read_options.is_default() && updated.is_terminal() && incomplete_result_count == 0 {
         ctx.spawner
-            .cache_terminal_fanout_result(group_id, rendered.clone())
+            .cache_terminal_fanout_result(&ctx.run_id, group_id, rendered.clone())
             .await;
     }
     rendered
+}
+
+/// Durable reconciliation builds a large async state machine. Keep its frame
+/// off the small worker stack when a result tool is already nested inside the
+/// agent tool pipeline (fanout can invoke this once per parent turn).
+async fn reconcile_durable_agent_runs_for_tool(
+    spawner: &DynamicAgentSpawner,
+) -> Result<usize, String> {
+    Box::pin(spawner.reconcile_durable_agent_runs()).await
 }
 
 async fn handle_agent_fanout_stop_slot_action(
@@ -1940,7 +1954,7 @@ async fn handle_agent_fanout_stop_slot_action(
     // it. Refresh remotely-owned durable observations before deciding whether
     // a slot is stoppable; otherwise a run already cancelled by an ancestor
     // can remain locally `Waiting` until the session registry expires.
-    if let Err(error) = ctx.spawner.reconcile_durable_agent_runs().await {
+    if let Err(error) = reconcile_durable_agent_runs_for_tool(ctx.spawner.as_ref()).await {
         tracing::warn!(
             target: "fanout",
             %group_id,
@@ -2076,7 +2090,7 @@ async fn handle_agent_fanout_stop_group_action(
     // the last in-memory fanout projection. In particular, ancestor
     // cancellation can terminalize a remotely-owned child without a local
     // executor callback.
-    if let Err(error) = ctx.spawner.reconcile_durable_agent_runs().await {
+    if let Err(error) = reconcile_durable_agent_runs_for_tool(ctx.spawner.as_ref()).await {
         tracing::warn!(
             target: "fanout",
             %group_id,
@@ -2489,19 +2503,21 @@ async fn handle_agent_spawn_action_with_deadline(
         delegation_chain: child_delegation_chain,
     };
 
-    // Allocate the outer async state before constructing the dynamically sized
-    // spawn supervisor future. This keeps its first construction and poll off
-    // the already-deep generic tool pipeline stack on debug Tokio workers.
-    // Yield once before invoking the supervisor so this handler is polled from
-    // a fresh scheduler boundary; dynamic child startup must not inherit the
-    // parent tool pipeline's large synchronous stack.
+    // The spawner future contains the complete child-preparation and
+    // execution state machine. Heap-box it before handing it to Tokio: a
+    // fanout constructs several child spawns while already nested in the
+    // generic tool pipeline, and constructing that large future inline can
+    // exhaust a debug worker's small stack before Tokio gets to poll it.
+    // Yield once as well so child startup is polled from a fresh scheduler
+    // boundary rather than inheriting the parent tool pipeline's stack.
     tokio::task::yield_now().await;
     let spawner = Arc::clone(&ctx.spawner);
-    let spawn = AbortOnDropJoinHandle::new(tokio::spawn(async move {
+    let spawn_future = Box::pin(async move {
         spawner
             .spawn_with_execution_deadline(input, &spawn_ctx, execution_deadline)
             .await
-    }));
+    });
+    let spawn = AbortOnDropJoinHandle::new(tokio::spawn(spawn_future));
     match spawn.await {
         Ok(Ok(output)) => render_spawn_agent_output(output, ctx.transcript_location),
         Ok(Err(SpawnError::ExecutorUnavailable)) => {
@@ -2756,7 +2772,9 @@ async fn handle_agent_get_result_action_inner(
         );
     }
 
-    if reconcile_durable && let Err(error) = ctx.spawner.reconcile_durable_agent_runs().await {
+    if reconcile_durable
+        && let Err(error) = reconcile_durable_agent_runs_for_tool(ctx.spawner.as_ref()).await
+    {
         tracing::warn!(
             target: "fanout",
             %agent_id,
@@ -4488,6 +4506,10 @@ mod tests {
                 .count(),
             1,
             "only the straggler is cancelled by the settlement deadline"
+        );
+        assert!(
+            spawner.list_all_agents().await.is_empty(),
+            "a timed-out real child must not remain active after fanout settlement"
         );
     }
 
@@ -6531,7 +6553,7 @@ mod tests {
         assert_eq!(value["incomplete_results"], 1);
         assert!(
             spawner
-                .cached_terminal_fanout_result("empty-result")
+                .cached_terminal_fanout_result(&ctx.run_id, "empty-result")
                 .await
                 .is_none(),
             "an unavailable result must remain re-readable after durable convergence"

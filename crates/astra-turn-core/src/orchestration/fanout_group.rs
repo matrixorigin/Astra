@@ -13,6 +13,10 @@ use astra_core::work_unit::{
     WorkUnitObservation, WorkUnitObservationMode, WorkUnitStatus, WorkUnitWakePolicy,
 };
 
+/// Leave room for the durable cancellation-event idempotency-key prefix in
+/// `agent_run_events.idempotency_key` (VARCHAR(128)).
+pub const MAX_FANOUT_GROUP_ID_BYTES: usize = 96;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentFanoutSlotIdentity {
     pub group_id: String,
@@ -32,6 +36,12 @@ impl AgentFanoutSlotIdentity {
         let group_id = group_id.trim();
         if group_id.is_empty() {
             return Err("fanout metadata requires non-empty fanout_group_id".to_string());
+        }
+        if group_id.len() > MAX_FANOUT_GROUP_ID_BYTES {
+            return Err(format!(
+                "fanout_group_id exceeds the {}-byte limit",
+                MAX_FANOUT_GROUP_ID_BYTES
+            ));
         }
         if target_count == 0 {
             return Err(format!(
@@ -83,6 +93,10 @@ pub struct AgentFanoutGroupProjection {
     /// Monotonic timestamp of last mutation or access.  Used for
     /// LRU eviction when the fanout-groups map exceeds its cap.
     pub last_touched: SystemTime,
+    /// Once cancellation or a runtime deadline wins the group-level admission
+    /// fence, no later retry may reuse a rejected slot. The group can remain
+    /// non-terminal while accepted children finish durable reconciliation.
+    spawn_admission_closed: bool,
     summary_cache: AgentFanoutSummary,
     agent_slot_index: HashMap<String, usize>,
 }
@@ -202,6 +216,7 @@ impl AgentFanoutGroupProjection {
             status: AgentFanoutStatus::Planned,
             revision: 1,
             last_touched: SystemTime::now(),
+            spawn_admission_closed: false,
             summary_cache: AgentFanoutSummary {
                 target_count,
                 planned: target_count,
@@ -227,6 +242,33 @@ impl AgentFanoutGroupProjection {
             self.status,
             AgentFanoutStatus::Finished | AgentFanoutStatus::Incomplete
         )
+    }
+
+    /// Whether this group has permanently stopped accepting new child
+    /// admissions. This is distinct from group terminality: an accepted child
+    /// may still need durable cancellation reconciliation.
+    pub fn spawn_admission_closed(&self) -> bool {
+        self.spawn_admission_closed
+    }
+
+    /// Close the group-level admission fence. Rejected slots remain rejected
+    /// for reporting, but cannot be retried after cancellation/deadline.
+    pub fn close_spawn_admission(&mut self) {
+        if !self.spawn_admission_closed {
+            self.spawn_admission_closed = true;
+            self.revision = self.revision.saturating_add(1);
+        }
+    }
+
+    fn ensure_spawn_admission_open(&self) -> Result<(), String> {
+        if self.spawn_admission_closed {
+            Err(format!(
+                "fanout group '{}' no longer accepts child admissions",
+                self.group_id
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     /// Canonical lifecycle projection shared by runtime, CLI, and UI lanes.
@@ -277,7 +319,49 @@ impl AgentFanoutGroupProjection {
         role: impl Into<String>,
         requested_description: impl Into<String>,
     ) -> Result<(), String> {
+        self.set_slot_request_inner(slot_index, slot_id, role, requested_description, true)
+    }
+
+    /// Restore request metadata for a child already proven by durable
+    /// execution evidence. Recovery may rebuild a closed projection but must
+    /// not use that path for a new spawn.
+    pub fn restore_slot_request(
+        &mut self,
+        slot_index: usize,
+        slot_id: Option<String>,
+        role: impl Into<String>,
+        requested_description: impl Into<String>,
+    ) -> Result<(), String> {
+        self.set_slot_request_inner(slot_index, slot_id, role, requested_description, false)
+    }
+
+    fn set_slot_request_inner(
+        &mut self,
+        slot_index: usize,
+        slot_id: Option<String>,
+        role: impl Into<String>,
+        requested_description: impl Into<String>,
+        require_open_admission: bool,
+    ) -> Result<(), String> {
+        if require_open_admission {
+            self.ensure_spawn_admission_open()?;
+        }
         let slot = self.slot_mut(slot_index)?;
+        // An accepted slot owns an immutable execution identity. Validate it
+        // before touching request metadata; otherwise a duplicate retry can
+        // return an error while silently replacing the original slot label or
+        // description.
+        if slot.agent_id.is_some() {
+            return Err(format!(
+                "fanout slot {slot_index} already accepted an agent"
+            ));
+        }
+        if slot.status.is_terminal() && slot.status != AgentFanoutSlotStatus::SpawnRejected {
+            return Err(format!(
+                "fanout slot {slot_index} already reached terminal status {:?}",
+                slot.status
+            ));
+        }
         slot.slot_id = slot_id;
         slot.role = role.into();
         slot.requested_description = requested_description.into();
@@ -290,11 +374,18 @@ impl AgentFanoutGroupProjection {
         slot_index: usize,
         reason: impl Into<String>,
     ) -> Result<(), String> {
+        self.ensure_spawn_admission_open()?;
         let old_status = {
             let slot = self.slot_mut(slot_index)?;
             if slot.agent_id.is_some() {
                 return Err(format!(
                     "fanout slot {slot_index} already has an accepted agent; reject cannot replace it"
+                ));
+            }
+            if slot.status.is_terminal() && slot.status != AgentFanoutSlotStatus::SpawnRejected {
+                return Err(format!(
+                    "fanout slot {slot_index} already reached terminal status {:?}",
+                    slot.status
                 ));
             }
             let old_status = slot.status;
@@ -371,12 +462,43 @@ impl AgentFanoutGroupProjection {
         agent_id: impl Into<String>,
         run_id: Option<String>,
     ) -> Result<(), String> {
+        self.record_spawn_accepted_with_run_inner(slot_index, agent_id, run_id, true)
+    }
+
+    /// Restore an already accepted child from durable execution evidence.
+    /// Recovery may rebuild a group whose admission fence is closed, but it
+    /// must never use that authority to admit a new provider execution.
+    pub fn restore_spawn_accepted_with_run(
+        &mut self,
+        slot_index: usize,
+        agent_id: impl Into<String>,
+        run_id: Option<String>,
+    ) -> Result<(), String> {
+        self.record_spawn_accepted_with_run_inner(slot_index, agent_id, run_id, false)
+    }
+
+    fn record_spawn_accepted_with_run_inner(
+        &mut self,
+        slot_index: usize,
+        agent_id: impl Into<String>,
+        run_id: Option<String>,
+        require_open_admission: bool,
+    ) -> Result<(), String> {
+        if require_open_admission {
+            self.ensure_spawn_admission_open()?;
+        }
         let agent_id = agent_id.into();
         let old_status = {
             let slot = self.slot_mut(slot_index)?;
             if let Some(existing) = slot.agent_id.as_ref() {
                 return Err(format!(
                     "fanout slot {slot_index} already accepted agent {existing}; explicit replacement is required"
+                ));
+            }
+            if slot.status.is_terminal() && slot.status != AgentFanoutSlotStatus::SpawnRejected {
+                return Err(format!(
+                    "fanout slot {slot_index} already reached terminal status {:?}",
+                    slot.status
                 ));
             }
             let old_status = slot.status;
@@ -734,6 +856,15 @@ mod tests {
     }
 
     #[test]
+    fn slot_identity_rejects_group_ids_that_cannot_fit_durable_keys() {
+        let group_id = "x".repeat(MAX_FANOUT_GROUP_ID_BYTES + 1);
+        let error = AgentFanoutSlotIdentity::new(group_id, 1, 0, None)
+            .expect_err("durable cancellation keys must fit their storage column");
+
+        assert!(error.contains("byte limit"), "{error}");
+    }
+
+    #[test]
     fn revision_changes_only_for_material_projection_mutations() {
         let mut group = AgentFanoutGroupProjection::new("review-1", "Review fanout", 1);
         assert_eq!(group.revision, 1);
@@ -758,6 +889,28 @@ mod tests {
             group.revision, 5,
             "idempotent collection cannot manufacture progress"
         );
+    }
+
+    #[test]
+    fn duplicate_slot_request_cannot_mutate_accepted_slot_metadata() {
+        let mut group = AgentFanoutGroupProjection::new("review-1", "Review fanout", 1);
+        group
+            .set_slot_request(0, Some("original".into()), "reviewer", "Review auth")
+            .unwrap();
+        group.record_spawn_accepted(0, "reviewer@run-1").unwrap();
+        let before = group.clone();
+
+        let error = group
+            .set_slot_request(
+                0,
+                Some("replacement".into()),
+                "different-role",
+                "mutated description",
+            )
+            .expect_err("accepted slot must reject duplicate metadata");
+
+        assert!(error.contains("already accepted"), "{error}");
+        assert_eq!(group, before, "rejected duplicate must be side-effect free");
     }
 
     #[test]
@@ -797,6 +950,44 @@ mod tests {
         assert!(err.contains("explicit replacement"), "{err}");
         assert_eq!(group.summary().accepted, 1);
         assert_eq!(group.target_count, 3);
+    }
+
+    #[test]
+    fn cancelled_unassigned_slot_cannot_be_reopened_by_late_spawn() {
+        let mut group = AgentFanoutGroupProjection::new("review-1", "Review fanout", 2);
+        group
+            .record_unassigned_terminal(
+                1,
+                AgentFanoutSlotStatus::CancelledByUser,
+                "user stopped fanout",
+            )
+            .unwrap();
+
+        let error = group
+            .record_spawn_accepted(1, "late-child")
+            .expect_err("a cancellation terminal must be absorbing");
+        assert!(error.contains("terminal status"), "{error}");
+        assert_eq!(
+            group.slots[1].status,
+            AgentFanoutSlotStatus::CancelledByUser
+        );
+        assert!(group.slots[1].agent_id.is_none());
+    }
+
+    #[test]
+    fn closed_group_cannot_retry_a_rejected_slot() {
+        let mut group = AgentFanoutGroupProjection::new("review-1", "Review fanout", 2);
+        group
+            .record_spawn_rejected(1, "provider unavailable")
+            .unwrap();
+        group.close_spawn_admission();
+
+        let error = group
+            .record_spawn_accepted(1, "late-child")
+            .expect_err("a closed group must reject late retries");
+        assert!(error.contains("no longer accepts"), "{error}");
+        assert_eq!(group.slots[1].status, AgentFanoutSlotStatus::SpawnRejected);
+        assert!(group.spawn_admission_closed());
     }
 
     #[test]

@@ -104,9 +104,10 @@ use crate::MatrixOneSettings;
 use crate::observability::ObservabilityHub;
 use crate::orchestration::{
     AgentProgressEvent, AgentToolContext, AgentTranscriptLocation, CancellationOrigin,
-    DurableAgentReconciler, DynamicAgentSpawner, InheritedPermissions, PermissionMode,
-    PermissionSyncContext, ProgressBroadcaster, ProgressEventType, SpawnAgentExecutor,
-    SpawnRunCancellationDurability, SpawnRunConfig, SpawnRunResult, SpawnedAgentState,
+    DurableAgentReconciler, DynamicAgentSpawner, FANOUT_GROUP_CANCELLED_EVENT_TYPE,
+    InheritedPermissions, PermissionMode, PermissionSyncContext, ProgressBroadcaster,
+    ProgressEventType, SpawnAgentExecutor, SpawnRunCancellationDurability, SpawnRunConfig,
+    SpawnRunResult, SpawnedAgentState,
 };
 use crate::server::run::cloud_workspace_provisioning::CloudWorkspaceProvisioner;
 use crate::server::run::workspace_provisioning::{
@@ -4445,6 +4446,7 @@ impl ServerAgentSpawnerEntry {
         !self.spawner.has_lifecycle_activity()
             && self.spawner.background_task_count() == 0
             && !self.spawner.has_in_flight_cancellation_owners().await
+            && !self.spawner.has_pending_fanout_group_cancellations()
             && self.spawner.list_all_agents().await.is_empty()
             && !self.spawner.has_lifecycle_activity()
             && self.spawner.activity_epoch() == activity_epoch
@@ -21506,6 +21508,137 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             origin,
         )
         .await
+    }
+
+    async fn persist_fanout_group_cancellation(
+        &self,
+        group_id: &str,
+        parent_run_id: &str,
+        target_count: usize,
+        reason: &str,
+        origin: CancellationOrigin,
+    ) -> Result<(), String> {
+        let Some(run_engine) = self.run_engine.as_ref() else {
+            return Ok(());
+        };
+        let context = {
+            let registry = self.runtime_context_registry.read().await;
+            registry
+                .current_context_id_by_run
+                .get(parent_run_id)
+                .and_then(|context_id| registry.contexts_by_id.get(context_id))
+                .cloned()
+        };
+        let Some(context) = context else {
+            return Err(format!(
+                "no live runtime context for fanout parent run {parent_run_id}"
+            ));
+        };
+        let owner_generation = match context
+            .execution_owner_generation
+            .wait_until_published_or_stopped()
+            .await
+        {
+            ExecutionOwnerGenerationPublication::Acquired(generation) => generation,
+            ExecutionOwnerGenerationPublication::Preparing { .. }
+            | ExecutionOwnerGenerationPublication::StoppedBeforeAcquisition { .. } => {
+                // The parent cannot admit another child after its owner was
+                // stopped; there is no durable group admission to preserve.
+                return Ok(());
+            }
+        };
+        let idempotency_key = format!("fanout-group-cancelled:{group_id}");
+        let event = json!({
+            "event_type": FANOUT_GROUP_CANCELLED_EVENT_TYPE,
+            "idempotency_key": &idempotency_key,
+            "data": {
+                "group_id": group_id,
+                "parent_run_id": parent_run_id,
+                "target_count": target_count,
+                "reason": reason,
+                "cancellation_origin": origin.as_str(),
+            }
+        });
+        let appended = run_engine
+            .append_events_if_current_generation_and_status(
+                &context.user_id,
+                &context.session_id,
+                parent_run_id,
+                owner_generation,
+                &[STATUS_RUNNING, STATUS_WAITING, STATUS_PAUSED],
+                &[event],
+            )
+            .await?;
+        if appended {
+            return Ok(());
+        }
+        // A terminal parent already prevents a later child admission. If the
+        // parent is still active, report the lost fence instead of claiming a
+        // restart-safe cancellation that was never recorded.
+        if run_engine
+            .load_run_event_by_idempotency_key(
+                &context.user_id,
+                parent_run_id,
+                FANOUT_GROUP_CANCELLED_EVENT_TYPE,
+                &idempotency_key,
+            )
+            .await?
+            .is_some()
+        {
+            // A retry after a committed append can return `false` from the
+            // generation fence because the append is idempotent. The durable
+            // event itself is the authoritative success signal.
+            return Ok(());
+        }
+        match run_engine
+            .load_run_status_snapshot(&context.user_id, parent_run_id)
+            .await?
+        {
+            Some(run)
+                if matches!(
+                    run.status.as_str(),
+                    STATUS_COMPLETED | STATUS_FAILED | STATUS_CANCELLED | STATUS_DELEGATED
+                ) =>
+            {
+                Ok(())
+            }
+            Some(run) => Err(format!(
+                "fanout group cancellation lost parent owner fence for {parent_run_id} at generation {} (current status {})",
+                run.run_generation, run.status
+            )),
+            None => Ok(()),
+        }
+    }
+
+    async fn fanout_group_cancellation_is_durable(
+        &self,
+        group_id: &str,
+        parent_run_id: &str,
+    ) -> Result<bool, String> {
+        let Some(run_engine) = self.run_engine.as_ref() else {
+            return Ok(false);
+        };
+        let context = {
+            let registry = self.runtime_context_registry.read().await;
+            registry
+                .current_context_id_by_run
+                .get(parent_run_id)
+                .and_then(|context_id| registry.contexts_by_id.get(context_id))
+                .cloned()
+        };
+        let Some(context) = context else {
+            return Ok(false);
+        };
+        let idempotency_key = format!("fanout-group-cancelled:{group_id}");
+        Ok(run_engine
+            .load_run_event_by_idempotency_key(
+                &context.user_id,
+                parent_run_id,
+                FANOUT_GROUP_CANCELLED_EVENT_TYPE,
+                &idempotency_key,
+            )
+            .await?
+            .is_some())
     }
 
     async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {

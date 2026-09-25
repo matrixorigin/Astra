@@ -67,9 +67,9 @@ pub(crate) fn workspace_mutation_from_context(
 pub use spawner::{
     AgentHistoryRecord, AgentStatus, CANCELLATION_ORIGIN_UNVERIFIED, CancellationTransferOutcome,
     DescendantCancellationReason, DurableAgentReconciler, DynamicAgentSpawner,
-    FanoutGroupCancellation, InheritedChildPrefix, PermissionSummary, ROOT_RUN_ID,
-    SpawnAgentExecutor, SpawnContext, SpawnError, SpawnRunCancellationDurability, SpawnRunConfig,
-    SpawnRunResult, SpawnStatusProjection, SpawnedAgentInfo, SpawnedAgentMetrics,
-    SpawnedAgentState, WaitForAgentOutcome, project_subrun_status_to_spawn,
-    spawn_completion_status_from_finish_reason,
+    FANOUT_GROUP_CANCELLED_EVENT_TYPE, FanoutGroupCancellation, InheritedChildPrefix,
+    PermissionSummary, ROOT_RUN_ID, SpawnAgentExecutor, SpawnContext, SpawnError,
+    SpawnRunCancellationDurability, SpawnRunConfig, SpawnRunResult, SpawnStatusProjection,
+    SpawnedAgentInfo, SpawnedAgentMetrics, SpawnedAgentState, WaitForAgentOutcome,
+    project_subrun_status_to_spawn, spawn_completion_status_from_finish_reason,
 };
