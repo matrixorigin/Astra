@@ -9872,11 +9872,11 @@ impl RunStateStore for InMemoryRunStateStore {
             .chain(retry_control.iter())
             .map(|run| run.run_id.clone())
             .collect();
-        page.recovery_next_cursor = control.last().map(|run| run.run_id.clone()).or_else(|| {
-            after_run_id
-                .filter(|_| !retry_control.is_empty())
-                .map(str::to_string)
-        });
+        // The forward cursor owns discovery progress; retry rows are an
+        // independent reconciliation lane. Keeping `after_run_id` here when
+        // only retry rows are present can pin the scan forever on a full
+        // ordinary page of lower-ID poison rows and starve newer markers.
+        page.recovery_next_cursor = control.last().map(|run| run.run_id.clone());
         let mut included = page
             .runs
             .iter()
@@ -12527,6 +12527,15 @@ impl DatabaseRunStateStore {
         expected_last_event_idx: i64,
         event_rows: &[RunEventInsertRow],
     ) -> Result<bool, String> {
+        // An empty event batch has no immutable receipt. Matching only the
+        // status and event watermark can therefore mistake an already-present
+        // same-status row for this transition after an ambiguous COMMIT.
+        // Refuse to claim durability; the caller will surface the ambiguity
+        // instead of fabricating success. Non-empty batches are verified by
+        // their exact event IDs, indexes, and hashes below.
+        if event_rows.is_empty() {
+            return Ok(false);
+        }
         let row = sqlx::query(
             "SELECT session_id, status, last_event_idx
              FROM agent_runs
@@ -21802,14 +21811,10 @@ impl RunStateStore for DatabaseRunStateStore {
             .chain(retry_cancellation_runs.iter())
             .map(|run| run.run_id.clone())
             .collect();
-        page.recovery_next_cursor = cancellation_runs
-            .last()
-            .map(|run| run.run_id.clone())
-            .or_else(|| {
-                after_run_id
-                    .filter(|_| !retry_cancellation_runs.is_empty())
-                    .map(str::to_string)
-            });
+        // Retry rows must not hold the forward cursor. If discovery has no
+        // fresh row, returning no cursor deliberately wraps the forward lane
+        // while the retry lane is still reconciled from the ordinary page.
+        page.recovery_next_cursor = cancellation_runs.last().map(|run| run.run_id.clone());
         let mut included = page
             .runs
             .iter()
@@ -21913,9 +21918,13 @@ impl RunStateStore for DatabaseRunStateStore {
             builder.push(
                 "
                UNION ALL
-               SELECT run_id, event_idx, payload_json
-               FROM agent_run_events
-               WHERE user_id = ",
+               SELECT run_id, event_idx, payload_json FROM (
+                 SELECT run_id, event_idx, payload_json,
+                        ROW_NUMBER() OVER (
+                          PARTITION BY run_id ORDER BY event_idx DESC
+                        ) AS recovery_rank
+                 FROM agent_run_events
+                 WHERE user_id = ",
             );
             builder
                 .push_bind(user_id)
@@ -21928,7 +21937,10 @@ impl RunStateStore for DatabaseRunStateStore {
                     ids.push_bind(*run_id);
                 }
             }
-            builder.push(")");
+            builder.push(
+                ")
+               ) ranked_group_cancellations WHERE recovery_rank = 1",
+            );
         }
         builder.push(
             ") recovery_events
@@ -30141,14 +30153,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             root.events.len(),
-            3,
-            "recovery keeps the spawn envelope and every selected group cancellation event"
+            2,
+            "recovery keeps the spawn envelope and newest group cancellation fence"
         );
         assert_eq!(root.events[0]["type"], "agent_spawned");
         assert_eq!(root.events[1]["type"], "fanout_group_cancelled");
-        assert_eq!(root.events[1]["data"]["group_id"], "review-a");
-        assert_eq!(root.events[2]["type"], "fanout_group_cancelled");
-        assert_eq!(root.events[2]["data"]["group_id"], "review-b");
+        assert_eq!(root.events[1]["data"]["group_id"], "review-b");
         assert_eq!(child.status, STATUS_RUNNING);
         assert_eq!(child.events.len(), 1);
         assert_eq!(child.events[0]["data"]["attempt"], 39);
@@ -30160,15 +30170,21 @@ mod tests {
             .load_session_agent_recovery_after(&user_id, &session_id, 2, Some(&child_id))
             .await
             .expect("MatrixOne cancellation recovery seek");
-        assert_eq!(
-            after_page.recovery_next_cursor.as_deref(),
-            Some(child_id.as_str())
-        );
+        assert_eq!(after_page.recovery_next_cursor.as_deref(), None);
         assert_eq!(
             after_page.recovery_cancellation_run_ids,
             vec![child_id.clone()]
         );
         assert!(after_page.runs.iter().any(|run| run.run_id == child_id));
+        let wrapped_page = store
+            .load_session_agent_recovery(&user_id, &session_id, 2)
+            .await
+            .expect("MatrixOne cancellation recovery wraps after retry-only page");
+        assert!(
+            wrapped_page
+                .recovery_cancellation_run_ids
+                .contains(&child_id)
+        );
 
         assert!(
             store
@@ -31153,6 +31169,81 @@ mod tests {
             .execute(pool.get())
             .await
             .expect("cleanup transition session");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_empty_terminal_transition_ack_loss_fails_closed_on_matrixone() {
+        let (_, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("transition-empty-ack-u-{}", Uuid::new_v4());
+        let session_id = format!("transition-empty-ack-s-{}", Uuid::new_v4());
+        let run_id = format!("transition-empty-ack-r-{}", Uuid::new_v4());
+        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+        let store = DatabaseRunStateStore::new(pool.clone())
+            .with_owner_pod_id("transition-empty-ack-owner");
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user_id.clone();
+        run.session_id = session_id.clone();
+        store
+            .insert_run(run)
+            .await
+            .expect("insert empty-batch ACK-loss run");
+        assert!(
+            store
+                .update_run_status_with_events_if_current(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    &[STATUS_RUNNING],
+                    None,
+                    STATUS_COMPLETED,
+                    None,
+                    None,
+                    &[],
+                )
+                .await
+                .expect("seed same-status empty transition")
+        );
+        let store = DatabaseRunStateStore::new(pool.clone())
+            .with_owner_pod_id("transition-empty-ack-owner")
+            .with_terminal_transition_commit_ack_loss_once();
+        let error = store
+            .update_run_status_with_events_if_current(
+                &user_id,
+                &session_id,
+                &run_id,
+                &[STATUS_COMPLETED],
+                None,
+                STATUS_COMPLETED,
+                None,
+                None,
+                &[],
+            )
+            .await
+            .expect_err("empty-batch ACK loss must not be reported as verified");
+        assert!(
+            error.contains("durable transition acknowledgement remains ambiguous"),
+            "unexpected empty-batch recovery error: {error}"
+        );
+        let durable = store
+            .load_run(&user_id, &run_id)
+            .await
+            .expect("load empty-batch ACK-loss run")
+            .expect("empty-batch ACK-loss run exists");
+        assert_eq!(durable.status, STATUS_COMPLETED);
+        assert_eq!(durable.last_event_idx, 0);
+
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup empty transition execution slot");
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup empty transition session");
     }
 
     #[tokio::test]
