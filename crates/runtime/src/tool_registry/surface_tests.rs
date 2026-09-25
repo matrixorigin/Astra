@@ -1125,8 +1125,8 @@ fn observation_recovery_and_reflection_are_eager() {
             .contains("explain={target:previous}")
     );
     let description = introspect["function"]["description"].as_str().unwrap();
-    assert!(description.contains("Live only"));
-    assert!(description.contains("question labels"));
+    assert!(description.contains("question=label"));
+    assert!(description.contains("page artifact; omit explain"));
     for field in ["explain", "artifact", "offset", "max_bytes"] {
         assert!(
             properties.get(field).is_some(),

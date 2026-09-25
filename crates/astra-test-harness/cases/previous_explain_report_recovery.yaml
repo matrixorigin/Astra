@@ -1,8 +1,8 @@
 name: previous_explain_report_recovery
 description: |
   A follow-up asks about the runtime Explain report from an earlier turn.
-  Verify that the agent discovers the report through the session reader and
-  grounds its answer in that result without searching runtime-owned files.
+  Verify that the agent discovers its identity and status through the session
+  reader without searching runtime-owned files.
 prompt: "用一句话说明代码审查的目的。"
 capability: "custom:previous_explain_report_recovery"
 difficulty: 3
@@ -11,8 +11,8 @@ timeout_seconds: 180
 debug_log: true
 steps:
   - prompt: |
-      解读一下刚才那轮运行的 Explain 报告：它是否完整，主要耗时在哪里？
-      请核对实际报告后回答；若无法读取，说明具体缺少什么证据。
+      刚才那轮运行的 Explain 报告是哪一个 run、capture status 是什么？
+      请读取报告后回答，并区分报告读取完成与采集覆盖完整。
 criteria:
   - type: exit_code
     code: 0
@@ -25,13 +25,15 @@ criteria:
     name: bash
     min: 0
     max: 0
+  - type: journal_tool_outcome_count
+    name: introspect
+    ok: false
+    min: 0
+    max: 0
   - type: hard_judger
     question: |
-      Verify that the follow-up answer uses the actual Explain artifact returned
-      by introspect for the previous run. It must distinguish capture status
-      from metric coverage and cite measured timing rather than invent it.
-      If the reader reports unavailable, credit only a precise limitation
-      grounded in that result. Do not accept SQL EXPLAIN interpretation,
-      filesystem discovery, or a claim that no report exists based solely
-      on ordinary live introspection counters.
+      Match the follow-up's run ID (or unambiguous prefix) and capture status
+      to the previous Explain artifact header returned by introspect. Require
+      the answer to distinguish byte-window completion from metric coverage.
+      Do not accept SQL EXPLAIN interpretation or absence inferred from live counters.
     threshold: 0.8
