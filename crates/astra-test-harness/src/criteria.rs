@@ -464,6 +464,10 @@ pub enum Criterion {
     ///   if cache is being rebuilt excessively (partial-hit regressions where
     ///   reads look healthy but creations explode).
     ///
+    /// With `min_creation: 0` and no ceiling, only the provider-observed read
+    /// lane is required; unknown creation remains unknown. Creation bounds
+    /// still require complete exact input evidence.
+    ///
     /// Distinct from `cache_rate_above`, which checks the local idempotent
     /// tool-result cache.
     PromptCacheTokens {
@@ -819,7 +823,7 @@ pub(crate) fn evaluate_with_primary_executions(
     session: Option<&SessionCapture>,
     executions: &[&RunOutcome],
 ) -> Vec<CriterionResult> {
-    let primary_cache = if criteria.iter().any(requires_primary_cache_evidence) {
+    let primary_cache = if criteria.iter().any(requires_exact_primary_cache_evidence) {
         primary_execution_cache_usage(executions)
     } else {
         None
@@ -830,11 +834,15 @@ pub(crate) fn evaluate_with_primary_executions(
         .collect()
 }
 
-fn requires_primary_cache_evidence(criterion: &Criterion) -> bool {
+fn requires_exact_primary_cache_evidence(criterion: &Criterion) -> bool {
     match criterion {
-        Criterion::PromptCacheTokens { .. } => true,
+        Criterion::PromptCacheTokens {
+            min_creation,
+            max_creation,
+            ..
+        } => *min_creation > 0 || max_creation.is_some(),
         Criterion::AllOf { criteria } | Criterion::AnyOf { criteria } => {
-            criteria.iter().any(requires_primary_cache_evidence)
+            criteria.iter().any(requires_exact_primary_cache_evidence)
         }
         _ => false,
     }
@@ -843,14 +851,51 @@ fn requires_primary_cache_evidence(criterion: &Criterion) -> bool {
 fn primary_execution_cache_usage(
     executions: &[&RunOutcome],
 ) -> Option<astra_turn_types::NormalizedPromptCacheUsage> {
+    primary_execution_evidence(
+        executions,
+        astra_turn_types::NormalizedPromptCacheUsage::default(),
+        |capture| capture.primary_prompt_cache_usage(),
+        |total, usage| {
+            total.fresh_input_tokens = total
+                .fresh_input_tokens
+                .checked_add(usage.fresh_input_tokens)?;
+            total.cache_read_tokens = total
+                .cache_read_tokens
+                .checked_add(usage.cache_read_tokens)?;
+            total.cache_creation_tokens = total
+                .cache_creation_tokens
+                .checked_add(usage.cache_creation_tokens)?;
+            total.checked_total_input_tokens()?;
+            Some(())
+        },
+    )
+}
+
+fn primary_execution_cache_read_tokens(executions: &[&RunOutcome]) -> Option<u64> {
+    primary_execution_evidence(
+        executions,
+        0_u64,
+        |capture| capture.primary_prompt_cache_read_tokens(),
+        |total, read| {
+            *total = total.checked_add(read)?;
+            Some(())
+        },
+    )
+}
+
+fn primary_execution_evidence<T: Copy>(
+    executions: &[&RunOutcome],
+    mut total: T,
+    mut observe: impl FnMut(&crate::explain_capture::ExplainCapture) -> Option<T>,
+    mut add: impl FnMut(&mut T, T) -> Option<()>,
+) -> Option<T> {
     if executions.is_empty() {
         return None;
     }
     let mut scopes = std::collections::HashSet::new();
-    let mut total = astra_turn_types::NormalizedPromptCacheUsage::default();
     for execution in executions {
         let capture = execution.explain_capture.as_ref()?;
-        let usage = capture.primary_prompt_cache_usage()?;
+        let usage = observe(capture)?;
         let mut local_scopes = std::collections::HashSet::new();
         for event in &capture.events {
             if execution.run_id.as_deref() != Some(event.run_id.as_str()) {
@@ -862,17 +907,8 @@ fn primary_execution_cache_usage(
         if local_scopes.into_iter().any(|scope| !scopes.insert(scope)) {
             return None;
         }
-        total.fresh_input_tokens = total
-            .fresh_input_tokens
-            .checked_add(usage.fresh_input_tokens)?;
-        total.cache_read_tokens = total
-            .cache_read_tokens
-            .checked_add(usage.cache_read_tokens)?;
-        total.cache_creation_tokens = total
-            .cache_creation_tokens
-            .checked_add(usage.cache_creation_tokens)?;
+        add(&mut total, usage)?;
     }
-    total.checked_total_input_tokens()?;
     Some(total)
 }
 
@@ -1340,7 +1376,7 @@ fn evaluate_one(
     outcome: &RunOutcome,
     session: Option<&SessionCapture>,
 ) -> CriterionResult {
-    let primary_cache = if requires_primary_cache_evidence(c) {
+    let primary_cache = if requires_exact_primary_cache_evidence(c) {
         primary_execution_cache_usage(&[outcome])
     } else {
         None
@@ -3315,6 +3351,25 @@ fn evaluate_one_with_primary_cache(
             min_creation,
             max_creation,
         } => {
+            if *min_creation == 0 && max_creation.is_none() {
+                let Some(read) = primary_execution_cache_read_tokens(executions) else {
+                    return CriterionResult {
+                        criterion: c.clone(), severity: criterion_severity(c), passed: false,
+                        detail: "primary cache-read evidence unavailable: missing, incomplete, conflicting, or overlapping execution capture".into(),
+                        full_detail: None, score: None,
+                    };
+                };
+                return CriterionResult {
+                    criterion: c.clone(),
+                    severity: criterion_severity(c),
+                    passed: read >= *min_read,
+                    detail: format!(
+                        "primary_prompt_cache read={read}, expected read>={min_read}; creation unknown or unused"
+                    ),
+                    full_detail: None,
+                    score: None,
+                };
+            }
             let Some(usage) = primary_cache else {
                 return CriterionResult {
                     criterion: c.clone(), severity: criterion_severity(c), passed: false,
@@ -3816,7 +3871,9 @@ fn evaluate_prompt_cache_reuse_scope(
 ) -> CriterionResult {
     let intra = scope == PromptCacheReuseScope::IntraTurnRounds;
     // Intra-run requests retain the run boundary; conversation turns do not.
-    let Some(groups) = primary_execution_cache_groups(executions, intra, intra) else {
+    let Some(groups) =
+        crate::explain_capture::primary_execution_cache_read_groups(executions, intra, intra)
+    else {
         return CriterionResult {
             criterion: criterion.clone(),
             severity: criterion_severity(criterion),
@@ -3830,11 +3887,7 @@ fn evaluate_prompt_cache_reuse_scope(
         let witness = groups
             .iter()
             .map(|requests| {
-                let reads: u128 = requests
-                    .iter()
-                    .skip(1)
-                    .map(|usage| u128::from(usage.cache_read_tokens))
-                    .sum();
+                let reads: u128 = requests.iter().skip(1).map(|read| u128::from(*read)).sum();
                 (requests.len(), reads)
             })
             .max_by_key(|(count, reads)| (*count >= 2 && *reads > 0, *reads, *count))
@@ -3845,7 +3898,7 @@ fn evaluate_prompt_cache_reuse_scope(
             .iter()
             .skip(1)
             .flatten()
-            .map(|usage| u128::from(usage.cache_read_tokens))
+            .map(|read| u128::from(*read))
             .sum();
         (groups.len(), reads, "conversation_turns")
     };
@@ -7050,6 +7103,95 @@ mod tests {
     }
 
     #[test]
+    fn cache_read_witness_survives_unknown_creation_without_claiming_exact_input() {
+        let mut cold = cache_request_outcome("r1", "t1", &[(315, 8_192, 0)]);
+        let mut warm = cache_request_outcome("r2", "t2", &[(265, 8_448, 0)]);
+        for outcome in [&mut cold, &mut warm] {
+            for event in &mut outcome.explain_capture.as_mut().unwrap().events {
+                if event.kind == astra_turn_types::ExplainAnalyzeNodeKindV1::ProviderAttempt
+                    && let Some(usage) = &mut event.usage
+                {
+                    usage.basis = astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderPartial;
+                    usage.cache_creation_tokens = None;
+                }
+            }
+        }
+        let criteria = [
+            Criterion::PromptCacheReuseScope {
+                scope: PromptCacheReuseScope::ConversationTurns,
+            },
+            Criterion::PromptCacheTokens {
+                min_read: 16_000,
+                min_creation: 0,
+                max_creation: None,
+            },
+            Criterion::ProviderPromptCacheReadRatio {
+                min: 0.5,
+                warmup_turns: 0,
+                warmup_rounds: 0,
+            },
+        ];
+        let result = evaluate_with_primary_executions(
+            &criteria,
+            &RunOutcome::new("aggregate"),
+            None,
+            &[&cold, &warm],
+        );
+        assert!(result[0].passed, "{result:?}");
+        assert!(result[1].passed, "{result:?}");
+        assert!(!result[2].passed, "unknown creation cannot prove a ratio");
+
+        let creation_bound = evaluate_with_primary_executions(
+            &[Criterion::PromptCacheTokens {
+                min_read: 16_000,
+                min_creation: 0,
+                max_creation: Some(25_000),
+            }],
+            &RunOutcome::new("aggregate"),
+            None,
+            &[&cold, &warm],
+        );
+        assert!(
+            !creation_bound[0].passed,
+            "unknown creation cannot meet a bound"
+        );
+
+        let mut missing_read = warm.clone();
+        for event in &mut missing_read.explain_capture.as_mut().unwrap().events {
+            if let Some(usage) = &mut event.usage {
+                usage.cache_read_tokens = None;
+            }
+        }
+        let missing = evaluate_with_primary_executions(
+            &criteria[..2],
+            &RunOutcome::new("aggregate"),
+            None,
+            &[&cold, &missing_read],
+        );
+        assert!(missing.iter().all(|result| !result.passed));
+    }
+
+    #[test]
+    fn shipped_prefix_cache_case_rejects_low_reads_on_each_warm_turn() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("cases/cache_prefix_provider_stable_system.yaml");
+        let case = crate::case::Case::from_path(&path).expect("load shipped cache case");
+        assert_eq!(case.steps.len(), 3);
+        let weak = cache_request_outcome("weak", "turn", &[(100, 2_400, 0)]);
+        for (index, step) in case.steps.iter().enumerate() {
+            assert!(
+                !step.criteria.is_empty(),
+                "warm step {index} must measure its own cache read"
+            );
+            let results = evaluate_deterministic_with_session(&step.criteria, &weak, None);
+            assert!(
+                results.iter().any(|result| !result.passed),
+                "warm step {index} accepted only 2,400 cache-read tokens: {results:?}"
+            );
+        }
+    }
+
+    #[test]
     fn required_prompt_cache_scope_reports_one_witness_after_full_coverage_validation() {
         let many = cache_request_outcome("r1", "t1", &[(0, 0, 0); 3]);
         let witness = cache_request_outcome("r2", "t2", &[(0, 0, 0), (0, 300, 0)]);
@@ -7072,7 +7214,7 @@ mod tests {
         let mut unknown = cache_request_outcome("r3", "t3", &[(0, 0, 0)]);
         for event in &mut unknown.explain_capture.as_mut().unwrap().events {
             if let Some(usage) = &mut event.usage {
-                usage.cache_creation_tokens = None;
+                usage.cache_read_tokens = None;
             }
         }
         let result = evaluate_with_primary_executions(

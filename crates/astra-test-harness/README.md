@@ -96,19 +96,22 @@ provider zero: those scalar counters no longer retain field presence. Retry
 and multi-step aggregate captures remain unknown here; their individual
 attempt/step facts are retained. Other journal-based cache criteria and pipeline
 statistics have not yet all been migrated to this coverage check.
-`prompt_cache_tokens` uses complete canonical primary input evidence from every
-physical attempt and follow-up step, not mixed terminal counters. Missing or
-overlapping captures cannot certify the bounds, including when an earlier retry
-has no usage evidence. Auxiliary judgments do not contribute to this criterion;
-thresholds retain their values but now refer explicitly to primary requests.
-`provider_prompt_cache_read_ratio` uses the same primary-only input qualification
+`prompt_cache_tokens` uses canonical primary physical-attempt evidence, not
+mixed terminal counters. A read-only floor (`min_creation: 0`, no
+`max_creation`) accepts a provider-observed cache-read lane even when creation
+is unknown. Creation bounds and input-share ratios still require complete,
+exact buckets. Missing read evidence or overlapping captures cannot certify a
+read floor, including when an earlier retry has no usage evidence. Auxiliary
+judgments do not contribute.
+`provider_prompt_cache_read_ratio` uses exact primary-only input qualification
 before applying warmup. It preserves zero-input groups, combines adjacent
 executions of the same user turn, and orders request groups by typed ModelRound
 coordinates within each execution. Multiple executions require the same session;
 overlapping archives, nonadjacent repeated turns, and multiple physical scopes
 inside one capture are unavailable rather than assigned a guessed order. There
 is no journal or terminal-counter fallback for this ratio.
-The injected `required_cache_scope` hard gate uses these same qualified facts.
+The injected `required_cache_scope` hard gate uses qualified cache-read facts;
+it does not require unrelated creation or fresh-input lanes.
 Conversation reuse requires reads after the first user turn; intra-turn reuse
 requires reads after the first ModelRound request in one user turn and run.
 Physical retries alone cannot establish another request boundary. Consecutive
@@ -269,7 +272,7 @@ focus without duplicating the whole scripted journey.
 | `duration_between { min_ms, max_ms }`               | wall-clock duration in range                                 | envelope    |
 | `turn_rounds_between { min, max }`                  | Provider LLM round-trips (`LlmRoundStarted`, with a bounded legacy fallback) in range | step_events |
 | `cache_rate_above { threshold }`                    | tool cache hit rate ≥ threshold (0.0–1.0)                    | step_events |
-| `prompt_cache_tokens { min_read, min_creation }`    | exact primary prompt-cache read/write token buckets meet minimums; incomplete evidence is unavailable | canonical Explain execution facts |
+| `prompt_cache_tokens { min_read, min_creation }`    | observed primary read floor when creation is unconstrained; creation bounds require exact complete buckets | canonical Explain execution facts |
 | `provider_prompt_cache_read_ratio { min, warmup_turns, warmup_rounds }` | token-weighted primary cache-read ratio after explicit user-turn or ModelRound-request warmup ≥ `min`; physical retries share their parent group, phase attempts remain distinct; all executions must qualify before warmup | canonical Explain execution facts |
 | `pipeline_avg_cache_hit_ratio { min, optional }` | arithmetic mean of complete primary ModelRound request-group cache-read shares ≥ `min`; zero input is n/a, unknown is not zero; optional unavailable checks explicitly skip | canonical Explain execution facts |
 | `provider_prompt_cache_read_nonregression_ratio { min, min_pairs, max_identity_transitions_per_run }` | within typed system/tool identity epochs, primary-request `current cache_read / previous cache_read` ≥ `min`, with enough pairs in every multi-observation run and bounded identity transitions; only the first pair with a zero previous read per epoch is exempt. Ratios may exceed 1.0; reads include history. Auxiliary requests are outside this metric; `provider_prompt_cache_read_ratio` measures absolute primary-input share, also excluding them | canonical pipeline feedback |

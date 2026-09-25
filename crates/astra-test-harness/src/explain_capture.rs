@@ -27,6 +27,10 @@ impl ExplainCapture {
         self.canonical_graph()?.primary_prompt_cache_usage()
     }
 
+    pub(crate) fn primary_prompt_cache_read_tokens(&self) -> Option<u64> {
+        self.canonical_graph()?.primary_prompt_cache_read_tokens()
+    }
+
     pub(crate) fn canonical_graph(&self) -> Option<astra_turn_types::ExplainAnalyzeGraphV1> {
         if !self.identity_verified
             || !self.diagnostics.is_empty()
@@ -152,7 +156,63 @@ pub(crate) fn primary_execution_cache_groups(
     rounds: bool,
     within_run: bool,
 ) -> Option<Vec<Vec<astra_turn_types::NormalizedPromptCacheUsage>>> {
-    use astra_turn_types::NormalizedPromptCacheUsage;
+    primary_execution_groups(
+        executions,
+        rounds,
+        within_run,
+        |graph, rounds| {
+            if rounds {
+                graph.primary_prompt_cache_request_groups()
+            } else {
+                Some(vec![graph.primary_prompt_cache_usage()?])
+            }
+        },
+        |total, usage| {
+            total.fresh_input_tokens = total
+                .fresh_input_tokens
+                .checked_add(usage.fresh_input_tokens)?;
+            total.cache_read_tokens = total
+                .cache_read_tokens
+                .checked_add(usage.cache_read_tokens)?;
+            total.cache_creation_tokens = total
+                .cache_creation_tokens
+                .checked_add(usage.cache_creation_tokens)?;
+            total.checked_total_input_tokens()?;
+            Some(())
+        },
+    )
+}
+
+pub(crate) fn primary_execution_cache_read_groups(
+    executions: &[&crate::runner::RunOutcome],
+    rounds: bool,
+    within_run: bool,
+) -> Option<Vec<Vec<u64>>> {
+    primary_execution_groups(
+        executions,
+        rounds,
+        within_run,
+        |graph, rounds| {
+            if rounds {
+                graph.primary_prompt_cache_read_request_groups()
+            } else {
+                Some(vec![graph.primary_prompt_cache_read_tokens()?])
+            }
+        },
+        |total, read| {
+            *total = total.checked_add(read)?;
+            Some(())
+        },
+    )
+}
+
+fn primary_execution_groups<T: Copy>(
+    executions: &[&crate::runner::RunOutcome],
+    rounds: bool,
+    within_run: bool,
+    mut observations: impl FnMut(&astra_turn_types::ExplainAnalyzeGraphV1, bool) -> Option<Vec<T>>,
+    mut add: impl FnMut(&mut T, T) -> Option<()>,
+) -> Option<Vec<Vec<T>>> {
     if executions.is_empty() || (within_run && !rounds) {
         return None;
     }
@@ -173,7 +233,7 @@ pub(crate) fn primary_execution_cache_groups(
     let mut last_turn = None;
     let mut last_run = None;
     let mut seen_groups = std::collections::HashSet::new();
-    let mut groups = Vec::<Vec<NormalizedPromptCacheUsage>>::new();
+    let mut groups = Vec::<Vec<T>>::new();
     for execution in executions {
         let capture = execution.explain_capture.as_ref()?;
         if capture
@@ -209,27 +269,18 @@ pub(crate) fn primary_execution_cache_groups(
         }
         last_turn = Some(scope.turn_id);
         last_run = Some(scope.run_id);
+        let values = observations(&graph, rounds)?;
         if rounds {
-            let requests = graph.primary_prompt_cache_request_groups()?;
             if same_group {
-                groups.last_mut()?.extend(requests);
+                groups.last_mut()?.extend(values);
             } else {
-                groups.push(requests);
+                groups.push(values);
             }
         } else {
-            let usage = graph.primary_prompt_cache_usage()?;
+            let usage = *values.first()?;
             if same_turn {
                 let total = groups.last_mut()?.first_mut()?;
-                total.fresh_input_tokens = total
-                    .fresh_input_tokens
-                    .checked_add(usage.fresh_input_tokens)?;
-                total.cache_read_tokens = total
-                    .cache_read_tokens
-                    .checked_add(usage.cache_read_tokens)?;
-                total.cache_creation_tokens = total
-                    .cache_creation_tokens
-                    .checked_add(usage.cache_creation_tokens)?;
-                total.checked_total_input_tokens()?;
+                add(total, usage)?;
             } else {
                 groups.push(vec![usage]);
             }
