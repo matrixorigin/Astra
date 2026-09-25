@@ -582,6 +582,34 @@ struct DurableFanoutGroupCancellation {
     parent_run_id: String,
     group_id: String,
     target_count: usize,
+    origin: CancellationOrigin,
+    reason: String,
+}
+
+#[derive(Clone, Copy)]
+enum FanoutAdmission {
+    Live,
+    Recovery { parent_terminal: bool },
+}
+
+fn settle_recovered_cancelled_group(
+    group: &mut AgentFanoutGroupProjection,
+    cancellation: &DurableFanoutGroupCancellation,
+) {
+    group.close_spawn_admission();
+    let status = if cancellation.origin == CancellationOrigin::User {
+        AgentFanoutSlotStatus::CancelledByUser
+    } else {
+        AgentFanoutSlotStatus::CancelledByRuntime
+    };
+    for slot_index in 0..group.slots.len() {
+        if group.slots[slot_index].agent_id.is_none()
+            && !group.slots[slot_index].status.is_terminal()
+        {
+            let _ =
+                group.record_unassigned_terminal(slot_index, status, cancellation.reason.as_str());
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -614,14 +642,16 @@ fn durable_fanout_group_cancellations(
                     .and_then(serde_json::Value::as_str)
                     .filter(|parent_run_id| !parent_run_id.trim().is_empty())
                     .unwrap_or(run.run_id.as_str());
-                match event
+                let origin = match event
                     .pointer("/data/cancellation_origin")
                     .and_then(serde_json::Value::as_str)
                     .and_then(|origin| origin.parse::<CancellationOrigin>().ok())
                 {
-                    Some(CancellationOrigin::User | CancellationOrigin::Runtime) => {}
+                    Some(origin @ (CancellationOrigin::User | CancellationOrigin::Runtime)) => {
+                        origin
+                    }
                     Some(CancellationOrigin::Unverified) | None => return None,
-                }
+                };
                 Some(DurableFanoutGroupCancellation {
                     parent_run_id: parent_run_id.to_string(),
                     group_id: group_id.to_string(),
@@ -631,6 +661,12 @@ fn durable_fanout_group_cancellations(
                         .and_then(|count| usize::try_from(count).ok())
                         .filter(|count| *count > 0)
                         .unwrap_or(1),
+                    origin,
+                    reason: event
+                        .pointer("/data/reason")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("recovered fanout group cancellation")
+                        .to_string(),
                 })
             })
         })
@@ -2415,7 +2451,10 @@ impl DynamicAgentSpawner {
                         None,
                         &state.parent_run_id,
                         None,
-                        true,
+                        FanoutAdmission::Recovery {
+                            parent_terminal: false,
+                        },
+                        None,
                     )
                     .await
                 {
@@ -2448,9 +2487,35 @@ impl DynamicAgentSpawner {
         let _activity = self.begin_lifecycle_activity();
         let spawned = durable_agent_spawn_metadata(runs);
         let group_cancellations = durable_fanout_group_cancellations(runs);
+        let terminal_parent_run_ids = runs
+            .iter()
+            .filter(|run| durable_run_is_terminal(&run.status))
+            .map(|run| run.run_id.as_str())
+            .collect::<HashSet<_>>();
+        let cancelled_groups = group_cancellations
+            .iter()
+            .map(|cancellation| {
+                (
+                    (
+                        cancellation.parent_run_id.as_str(),
+                        cancellation.group_id.as_str(),
+                    ),
+                    cancellation,
+                )
+            })
+            .collect::<HashMap<_, _>>();
         for cancellation in &group_cancellations {
-            self.mark_closed_fanout_group(&cancellation.parent_run_id)
-                .await;
+            let parent_terminal =
+                terminal_parent_run_ids.contains(cancellation.parent_run_id.as_str());
+            if parent_terminal {
+                self.closed_fanout_parent_ids
+                    .write()
+                    .await
+                    .remove(&cancellation.parent_run_id);
+            } else {
+                self.mark_closed_fanout_group(&cancellation.parent_run_id)
+                    .await;
+            }
             let identity = AgentFanoutSlotIdentity::new(
                 cancellation.group_id.clone(),
                 cancellation.target_count,
@@ -2467,23 +2532,33 @@ impl DynamicAgentSpawner {
                 );
                 continue;
             };
-            if let Err(error) = self
+            match self
                 .get_or_validate_fanout_group(
                     &identity,
                     Some("Recovered fanout"),
                     None,
                     &cancellation.parent_run_id,
-                    true,
+                    FanoutAdmission::Recovery { parent_terminal },
                 )
                 .await
             {
-                tracing::warn!(
+                Ok((mut groups, evicted_agent_ids)) => {
+                    let mut index = self.fanout_agent_index.write().await;
+                    for agent_id in evicted_agent_ids {
+                        index.remove(&agent_id);
+                    }
+                    if let Some(group) = groups.get_mut(&cancellation.group_id) {
+                        settle_recovered_cancelled_group(group, cancellation);
+                        self.publish_fanout_group(group);
+                    }
+                }
+                Err(error) => tracing::warn!(
                     target: "fanout",
                     group_id = %cancellation.group_id,
                     parent_run_id = %cancellation.parent_run_id,
                     %error,
                     "could not restore durable fanout group cancellation projection"
-                );
+                ),
             }
         }
         let mut restored = 0;
@@ -2547,7 +2622,13 @@ impl DynamicAgentSpawner {
                         None,
                         &state.parent_run_id,
                         None,
-                        true,
+                        FanoutAdmission::Recovery {
+                            parent_terminal: terminal_parent_run_ids
+                                .contains(state.parent_run_id.as_str()),
+                        },
+                        cancelled_groups
+                            .get(&(state.parent_run_id.as_str(), identity.group_id.as_str()))
+                            .copied(),
                     )
                     .await
                     .is_ok()
@@ -2860,7 +2941,7 @@ impl DynamicAgentSpawner {
                 Some(title),
                 created_by_tool_use_id,
                 parent_run_id,
-                false,
+                FanoutAdmission::Live,
             )
             .await?;
         let mut index = self.fanout_agent_index.write().await;
@@ -3073,7 +3154,7 @@ impl DynamicAgentSpawner {
         group_title: Option<&str>,
         created_by_tool_use_id: Option<&str>,
         parent_run_id: &str,
-        allow_closed_admission: bool,
+        admission: FanoutAdmission,
     ) -> Result<
         (
             tokio::sync::RwLockWriteGuard<'_, HashMap<String, AgentFanoutGroupProjection>>,
@@ -3081,7 +3162,7 @@ impl DynamicAgentSpawner {
         ),
         SpawnError,
     > {
-        if !allow_closed_admission {
+        if matches!(admission, FanoutAdmission::Live) {
             self.ensure_fanout_admission_can_be_checked(identity, parent_run_id)
                 .await?;
         }
@@ -3091,7 +3172,7 @@ impl DynamicAgentSpawner {
             .read()
             .await
             .contains(parent_run_id);
-        if closed_by_tombstone && !allow_closed_admission {
+        if closed_by_tombstone && matches!(admission, FanoutAdmission::Live) {
             return Err(SpawnError::Race(format!(
                 "fanout group '{}' no longer accepts child admissions after cancellation",
                 identity.group_id
@@ -3108,20 +3189,27 @@ impl DynamicAgentSpawner {
                     existing.group_id, existing.target_count
                 )));
             }
-            if allow_closed_admission {
-                if self
-                    .fanout_admission_overflow
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    || groups.len() >= MAX_FANOUT_GROUPS
+            if let FanoutAdmission::Recovery { parent_terminal } = admission {
+                if !parent_terminal
+                    && self
+                        .fanout_admission_overflow
+                        .load(std::sync::atomic::Ordering::Acquire)
                 {
-                    self.fanout_admission_overflow
-                        .store(true, std::sync::atomic::Ordering::Release);
                     return Err(SpawnError::FanoutGroupLimitExceeded {
                         active: groups.len().max(MAX_FANOUT_GROUPS),
                         limit: MAX_FANOUT_GROUPS,
                     });
                 }
-                Vec::new()
+                match self.evict_terminal_fanout_group_if_full(&mut groups).await {
+                    Ok(evicted) => evicted,
+                    Err(error) => {
+                        if !parent_terminal {
+                            self.fanout_admission_overflow
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        return Err(error);
+                    }
+                }
             } else {
                 if self
                     .fanout_admission_overflow
@@ -3146,7 +3234,8 @@ impl DynamicAgentSpawner {
                         limit: FANOUT_GROUP_PERSISTENCE_QUEUE_CAPACITY,
                     });
                 }
-                self.evict_terminal_fanout_group_if_full(&mut groups)?
+                self.evict_terminal_fanout_group_if_full(&mut groups)
+                    .await?
             }
         } else {
             Vec::new()
@@ -3189,10 +3278,12 @@ impl DynamicAgentSpawner {
         // LLM must create a new group_id for retries rather than
         // appending to a settled group, which would corrupt the
         // fixed-size accounting.
-        if matches!(
-            group.status,
-            AgentFanoutStatus::Finished | AgentFanoutStatus::Incomplete
-        ) {
+        if matches!(admission, FanoutAdmission::Live)
+            && matches!(
+                group.status,
+                AgentFanoutStatus::Finished | AgentFanoutStatus::Incomplete
+            )
+        {
             let status_label = match group.status {
                 AgentFanoutStatus::Finished => "finished",
                 AgentFanoutStatus::Incomplete => "incomplete",
@@ -3203,7 +3294,7 @@ impl DynamicAgentSpawner {
                 identity.group_id, group.target_count
             )));
         }
-        if group.spawn_admission_closed() && !allow_closed_admission {
+        if group.spawn_admission_closed() && matches!(admission, FanoutAdmission::Live) {
             return Err(SpawnError::Race(format!(
                 "fanout group '{}' no longer accepts child admissions after cancellation",
                 identity.group_id
@@ -3223,7 +3314,8 @@ impl DynamicAgentSpawner {
         created_by_tool_use_id: Option<&str>,
         parent_run_id: &str,
         execution_deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
-        allow_closed_admission: bool,
+        admission: FanoutAdmission,
+        recovered_cancellation: Option<&DurableFanoutGroupCancellation>,
     ) -> Result<(), SpawnError> {
         let (mut groups, evicted_agent_ids) = self
             .get_or_validate_fanout_group(
@@ -3231,7 +3323,7 @@ impl DynamicAgentSpawner {
                 group_title,
                 created_by_tool_use_id,
                 parent_run_id,
-                allow_closed_admission,
+                admission,
             )
             .await?;
         // Acquire the index lock while still holding `groups` to close the
@@ -3251,6 +3343,16 @@ impl DynamicAgentSpawner {
                 identity.group_id
             ))
         })?;
+        if recovered_cancellation.is_some()
+            || matches!(
+                admission,
+                FanoutAdmission::Recovery {
+                    parent_terminal: true
+                }
+            )
+        {
+            group.close_spawn_admission();
+        }
         // Admission is the mutation below, not the earlier active-agent
         // reservation. Recheck after obtaining every admission lock so lock
         // contention cannot make an expired child look accepted.
@@ -3293,20 +3395,15 @@ impl DynamicAgentSpawner {
             return Err(SpawnError::ExecutionDeadlineElapsed);
         }
         let active_before = group.summary().active;
-        if allow_closed_admission {
-            group
-                .restore_slot_request(
-                    identity.slot_index,
-                    identity.slot_id.clone(),
-                    agent_type,
-                    description,
-                )
-                .map_err(SpawnError::InvalidInput)?;
+        if matches!(admission, FanoutAdmission::Recovery { .. }) {
             group
                 .restore_spawn_accepted_with_run(
                     identity.slot_index,
                     agent_id,
                     Some(run_id.to_string()),
+                    identity.slot_id.clone(),
+                    agent_type,
+                    description,
                 )
                 .map_err(SpawnError::InvalidInput)?;
         } else {
@@ -3325,6 +3422,9 @@ impl DynamicAgentSpawner {
                     Some(run_id.to_string()),
                 )
                 .map_err(SpawnError::InvalidInput)?;
+        }
+        if let Some(cancellation) = recovered_cancellation {
+            settle_recovered_cancelled_group(group, cancellation);
         }
         let active_after = group.summary().active;
         group.touch();
@@ -3354,7 +3454,7 @@ impl DynamicAgentSpawner {
                 group_title,
                 created_by_tool_use_id,
                 parent_run_id,
-                false,
+                FanoutAdmission::Live,
             )
             .await?;
         // Acquire index lock while still holding `groups` to close the
@@ -3519,7 +3619,7 @@ impl DynamicAgentSpawner {
     /// accounting.  Returns `Err(FanoutGroupLimitExceeded)` when at capacity
     /// and no terminal candidate is available, so the caller fails loudly
     /// instead of leaking memory through unbounded growth.
-    fn evict_terminal_fanout_group_if_full(
+    async fn evict_terminal_fanout_group_if_full(
         &self,
         groups: &mut HashMap<String, AgentFanoutGroupProjection>,
     ) -> Result<Vec<String>, SpawnError> {
@@ -3547,16 +3647,20 @@ impl DynamicAgentSpawner {
             });
         };
         let evict_id = evict_id.clone();
-        Ok(groups
-            .remove(&evict_id)
-            .map(|group| {
-                group
-                    .slots
-                    .into_iter()
-                    .filter_map(|slot| slot.agent_id)
-                    .collect()
-            })
-            .unwrap_or_default())
+        let Some(group) = groups.remove(&evict_id) else {
+            return Ok(Vec::new());
+        };
+        if let Some(parent_run_id) = group.parent_run_id.as_ref() {
+            self.fanout_group_durable_owners
+                .write()
+                .await
+                .remove(&(parent_run_id.clone(), evict_id));
+        }
+        Ok(group
+            .slots
+            .into_iter()
+            .filter_map(|slot| slot.agent_id)
+            .collect())
     }
 
     /// Recompute `cached_active_fanout_slots` from the authoritative
@@ -4473,7 +4577,8 @@ impl DynamicAgentSpawner {
                     context.spawn_tool_call_id.as_deref(),
                     &context.parent_run_id,
                     execution_deadline,
-                    false,
+                    FanoutAdmission::Live,
+                    None,
                 )
                 .await
         {
@@ -7790,6 +7895,7 @@ mod tests {
             }
             spawner
                 .evict_terminal_fanout_group_if_full(&mut groups)
+                .await
                 .expect("evict recovered cancelled projection");
             assert!(!groups.contains_key("cancelled-recovered-group"));
         }
@@ -7837,11 +7943,9 @@ mod tests {
         assert_eq!(group.parent_run_id.as_deref(), Some("root-run"));
         assert!(group.spawn_admission_closed());
         assert_eq!(group.slots.len(), 2);
-        assert!(
-            group.slots.iter().all(
-                |slot| slot.status == AgentFanoutSlotStatus::Planned && slot.agent_id.is_none()
-            )
-        );
+        assert!(group.slots.iter().all(|slot| slot.status
+            == AgentFanoutSlotStatus::CancelledByRuntime
+            && slot.agent_id.is_none()));
 
         {
             let mut groups = spawner.fanout_groups.write().await;
@@ -7883,9 +7987,10 @@ mod tests {
             .await
             .expect("cancellation page creates a closed projection");
         assert!(first_page_group.spawn_admission_closed());
+        assert!(first_page_group.is_terminal());
         assert_eq!(
             first_page_group.slots[0].status,
-            AgentFanoutSlotStatus::Planned
+            AgentFanoutSlotStatus::CancelledByUser
         );
 
         let mut child = durable_run("paged-child", 1, astra_core::STATUS_COMPLETED);
@@ -7916,6 +8021,7 @@ mod tests {
         assert!(recovered.spawn_admission_closed());
         assert_eq!(recovered.slots[0].agent_id.as_deref(), Some("paged-agent"));
         assert_eq!(recovered.slots[0].status, AgentFanoutSlotStatus::Completed);
+        assert!(recovered.is_terminal());
     }
 
     #[tokio::test]
@@ -7972,6 +8078,146 @@ mod tests {
             Err(SpawnError::FanoutGroupLimitExceeded { active, limit })
                 if active == MAX_FANOUT_GROUPS && limit == MAX_FANOUT_GROUPS
         ));
+    }
+
+    #[tokio::test]
+    async fn durable_restore_evicts_completed_history_without_blocking_new_parent() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let runs = (0..=MAX_FANOUT_GROUPS)
+            .map(|index| {
+                let parent_run_id = format!("completed-parent-{index}");
+                let mut root = durable_run(&parent_run_id, 0, astra_core::STATUS_COMPLETED);
+                root.events.push(json!({
+                    "event_type": FANOUT_GROUP_CANCELLED_EVENT_TYPE,
+                    "data": {
+                        "group_id": format!("completed-group-{index}"),
+                        "parent_run_id": parent_run_id,
+                        "target_count": 1,
+                        "cancellation_origin": "user"
+                    }
+                }));
+                root
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(spawner.restore_durable_agent_runs(&runs).await, 0);
+        assert_eq!(spawner.list_fanout_groups().await.len(), MAX_FANOUT_GROUPS);
+        spawner
+            .declare_fanout_group("fresh-group", "fresh", 1, None, "fresh-parent")
+            .await
+            .expect("completed historical groups must not close fresh parent admission");
+        assert!(spawner.fanout_group("fresh-group").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn completed_history_at_live_capacity_does_not_poison_future_admission() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        for index in 0..MAX_FANOUT_GROUPS {
+            spawner
+                .declare_fanout_group(
+                    &format!("live-group-{index}"),
+                    "live",
+                    1,
+                    None,
+                    &format!("live-parent-{index}"),
+                )
+                .await
+                .unwrap();
+        }
+        let mut history = durable_run("completed-parent", 0, astra_core::STATUS_COMPLETED);
+        history.events.push(json!({
+            "event_type": FANOUT_GROUP_CANCELLED_EVENT_TYPE,
+            "data": {
+                "group_id": "completed-history",
+                "parent_run_id": "completed-parent",
+                "target_count": 1,
+                "cancellation_origin": "user"
+            }
+        }));
+        assert_eq!(spawner.restore_durable_agent_runs(&[history]).await, 0);
+        assert!(spawner.fanout_group("completed-history").await.is_none());
+
+        spawner
+            .fanout_groups
+            .write()
+            .await
+            .get_mut("live-group-0")
+            .unwrap()
+            .record_unassigned_terminal(0, AgentFanoutSlotStatus::SpawnRejected, "settled")
+            .unwrap();
+        spawner
+            .declare_fanout_group("fresh-group", "fresh", 1, None, "fresh-parent")
+            .await
+            .expect("optional completed history must not set sticky overflow");
+    }
+
+    #[tokio::test]
+    async fn evicted_cancelled_history_stays_closed_when_child_arrives_in_same_page() {
+        let executor = Arc::new(CountingSuccessExecutor {
+            starts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(executor.clone() as Arc<dyn SpawnAgentExecutor>);
+        let mut runs = Vec::new();
+        for index in 0..=MAX_FANOUT_GROUPS {
+            let parent_run_id = format!("completed-parent-{index}");
+            let child_run_id = format!("completed-child-{index}");
+            let group_id = format!("completed-group-{index}");
+            let agent_id = format!("completed-agent-{index}");
+            let mut parent = durable_run(&parent_run_id, 0, astra_core::STATUS_COMPLETED);
+            parent.events.push(json!({
+                "event_type": FANOUT_GROUP_CANCELLED_EVENT_TYPE,
+                "data": {
+                    "group_id": group_id,
+                    "parent_run_id": parent_run_id,
+                    "target_count": 2,
+                    "cancellation_origin": "user"
+                }
+            }));
+            let mut child = durable_run(&child_run_id, 1, astra_core::STATUS_COMPLETED);
+            child.parent_run_id = Some(parent_run_id.clone());
+            child.root_run_id = Some(parent_run_id.clone());
+            child.agent_id = Some(agent_id.clone());
+            child.events.push(json!({
+                "type": "agent_spawned",
+                "run_id": child_run_id,
+                "agent_id": agent_id,
+                "fanout_slot": {
+                    "group_id": group_id,
+                    "target_count": 2,
+                    "slot_index": 0
+                }
+            }));
+            child.events.push(json!({
+                "event_type": "text_done",
+                "data": {"full_text": "done"}
+            }));
+            runs.push(parent);
+            runs.push(child);
+        }
+
+        assert_eq!(
+            spawner.restore_durable_agent_runs(&runs).await,
+            MAX_FANOUT_GROUPS + 1
+        );
+        let groups = spawner.list_fanout_groups().await;
+        assert_eq!(groups.len(), MAX_FANOUT_GROUPS);
+        assert!(groups.iter().all(|group| group.spawn_admission_closed()));
+        assert!(groups.iter().all(AgentFanoutGroupProjection::is_terminal));
+        assert!(groups.iter().all(|group| group.summary().planned == 0));
+        let group = &groups[0];
+        let mut input = make_bg_input();
+        input.fanout_group_id = Some(group.group_id.clone());
+        input.fanout_target_count = Some(2);
+        input.fanout_slot_index = Some(1);
+        let result = spawner
+            .spawn(
+                input,
+                &make_bg_context_with_parent(group.parent_run_id.as_deref().unwrap()),
+            )
+            .await;
+        assert!(matches!(result, Err(SpawnError::Race(_))));
+        assert_eq!(executor.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -8062,9 +8308,9 @@ mod tests {
             .expect("an empty cancelled group remains queryable after recovery");
         assert_eq!(restored.target_count, 2);
         assert!(restored.spawn_admission_closed());
-        assert!(!restored.is_terminal());
-        assert_eq!(restored.summary().planned, 2);
-        assert_eq!(restored.summary().cancelled_by_runtime, 0);
+        assert!(restored.is_terminal());
+        assert_eq!(restored.summary().planned, 0);
+        assert_eq!(restored.summary().cancelled_by_runtime, 2);
         let mut input = make_bg_input();
         input.fanout_group_id = Some("empty-cancelled-group".into());
         input.fanout_target_count = Some(2);
@@ -8159,7 +8405,8 @@ mod tests {
                 None,
                 "root-run",
                 None,
-                false,
+                FanoutAdmission::Live,
+                None,
             )
             .await
             .unwrap();
@@ -11924,7 +12171,9 @@ mod tests {
             }
         }
         let mut groups = spawner.fanout_groups.write().await;
-        let result = spawner.evict_terminal_fanout_group_if_full(&mut groups);
+        let result = spawner
+            .evict_terminal_fanout_group_if_full(&mut groups)
+            .await;
         match result {
             Err(SpawnError::FanoutGroupLimitExceeded { active, limit }) => {
                 assert_eq!(active, MAX_FANOUT_GROUPS);
@@ -11958,10 +12207,50 @@ mod tests {
         let mut groups = spawner.fanout_groups.write().await;
         let evicted = spawner
             .evict_terminal_fanout_group_if_full(&mut groups)
+            .await
             .expect("terminal candidate exists, eviction should succeed");
         assert_eq!(evicted.len(), 0, "terminal group had no settled agents");
         assert!(!groups.contains_key("terminal-old"));
         assert_eq!(groups.len(), MAX_FANOUT_GROUPS - 1);
+    }
+
+    #[tokio::test]
+    async fn fanout_group_owner_entries_follow_bounded_projection_eviction() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        for index in 0..(MAX_FANOUT_GROUPS * 3) {
+            let group_id = format!("owned-group-{index}");
+            let parent_run_id = format!("owned-parent-{index}");
+            spawner
+                .declare_fanout_group_with_owner(
+                    &group_id,
+                    "owned",
+                    1,
+                    None,
+                    &parent_run_id,
+                    Some(("user", "session")),
+                )
+                .await
+                .expect("terminal history can be evicted");
+            let mut groups = spawner.fanout_groups.write().await;
+            groups
+                .get_mut(&group_id)
+                .expect("declared group")
+                .record_unassigned_terminal(
+                    0,
+                    AgentFanoutSlotStatus::SpawnRejected,
+                    "fixture terminal",
+                )
+                .expect("settle fixture group");
+        }
+        let groups = spawner.fanout_groups.read().await;
+        let owners = spawner.fanout_group_durable_owners.read().await;
+        assert_eq!(groups.len(), MAX_FANOUT_GROUPS);
+        assert_eq!(owners.len(), groups.len());
+        assert!(owners.keys().all(|(parent_run_id, group_id)| {
+            groups
+                .get(group_id)
+                .is_some_and(|group| group.parent_run_id.as_deref() == Some(parent_run_id.as_str()))
+        }));
     }
 
     #[tokio::test]
@@ -12002,6 +12291,7 @@ mod tests {
             }
             let evicted = spawner
                 .evict_terminal_fanout_group_if_full(&mut groups)
+                .await
                 .expect("terminal group eviction");
             assert!(evicted.is_empty());
             assert!(!groups.contains_key("cancelled-eviction"));
@@ -12368,7 +12658,8 @@ mod tests {
                 Some("call-1"),
                 "parent-123",
                 None,
-                false,
+                FanoutAdmission::Live,
+                None,
             )
             .await
             .unwrap();
@@ -12711,7 +13002,8 @@ mod tests {
                         None,
                         "root",
                         Some(deadline),
-                        false,
+                        FanoutAdmission::Live,
+                        None,
                     )
                     .await
             })

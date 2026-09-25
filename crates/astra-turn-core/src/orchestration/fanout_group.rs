@@ -322,19 +322,6 @@ impl AgentFanoutGroupProjection {
         self.set_slot_request_inner(slot_index, slot_id, role, requested_description, true)
     }
 
-    /// Restore request metadata for a child already proven by durable
-    /// execution evidence. Recovery may rebuild a closed projection but must
-    /// not use that path for a new spawn.
-    pub fn restore_slot_request(
-        &mut self,
-        slot_index: usize,
-        slot_id: Option<String>,
-        role: impl Into<String>,
-        requested_description: impl Into<String>,
-    ) -> Result<(), String> {
-        self.set_slot_request_inner(slot_index, slot_id, role, requested_description, false)
-    }
-
     fn set_slot_request_inner(
         &mut self,
         slot_index: usize,
@@ -462,31 +449,7 @@ impl AgentFanoutGroupProjection {
         agent_id: impl Into<String>,
         run_id: Option<String>,
     ) -> Result<(), String> {
-        self.record_spawn_accepted_with_run_inner(slot_index, agent_id, run_id, true)
-    }
-
-    /// Restore an already accepted child from durable execution evidence.
-    /// Recovery may rebuild a group whose admission fence is closed, but it
-    /// must never use that authority to admit a new provider execution.
-    pub fn restore_spawn_accepted_with_run(
-        &mut self,
-        slot_index: usize,
-        agent_id: impl Into<String>,
-        run_id: Option<String>,
-    ) -> Result<(), String> {
-        self.record_spawn_accepted_with_run_inner(slot_index, agent_id, run_id, false)
-    }
-
-    fn record_spawn_accepted_with_run_inner(
-        &mut self,
-        slot_index: usize,
-        agent_id: impl Into<String>,
-        run_id: Option<String>,
-        require_open_admission: bool,
-    ) -> Result<(), String> {
-        if require_open_admission {
-            self.ensure_spawn_admission_open()?;
-        }
+        self.ensure_spawn_admission_open()?;
         let agent_id = agent_id.into();
         let old_status = {
             let slot = self.slot_mut(slot_index)?;
@@ -508,12 +471,80 @@ impl AgentFanoutGroupProjection {
             slot.terminal_reason = None;
             old_status
         };
+        self.finish_accepted_slot(slot_index, agent_id, old_status);
+        Ok(())
+    }
+
+    /// Restore an already accepted child from durable execution evidence.
+    /// Recovery may rebuild a group whose admission fence is closed, but it
+    /// must never use that authority to admit a new provider execution.
+    pub fn restore_spawn_accepted_with_run(
+        &mut self,
+        slot_index: usize,
+        agent_id: impl Into<String>,
+        run_id: Option<String>,
+        slot_id: Option<String>,
+        role: impl Into<String>,
+        requested_description: impl Into<String>,
+    ) -> Result<(), String> {
+        let agent_id = agent_id.into();
+        let closed = self.spawn_admission_closed;
+        let old_status = {
+            let slot = self.slot_mut(slot_index)?;
+            if let Some(existing) = slot.agent_id.as_ref() {
+                return Err(format!(
+                    "fanout slot {slot_index} already accepted agent {existing}; explicit replacement is required"
+                ));
+            }
+            let cancelled_placeholder = closed
+                && matches!(
+                    slot.status,
+                    AgentFanoutSlotStatus::CancelledByUser
+                        | AgentFanoutSlotStatus::CancelledByRuntime
+                );
+            if slot.status.is_terminal()
+                && slot.status != AgentFanoutSlotStatus::SpawnRejected
+                && !cancelled_placeholder
+            {
+                return Err(format!(
+                    "fanout slot {slot_index} already reached terminal status {:?}",
+                    slot.status
+                ));
+            }
+            let old_status = slot.status;
+            slot.slot_id = slot_id;
+            slot.role = role.into();
+            slot.requested_description = requested_description.into();
+            slot.agent_id = Some(agent_id.clone());
+            slot.run_id = run_id;
+            slot.status = AgentFanoutSlotStatus::Running;
+            slot.terminal_reason = None;
+            old_status
+        };
+        self.finish_accepted_slot(slot_index, agent_id, old_status);
+        Ok(())
+    }
+
+    fn finish_accepted_slot(
+        &mut self,
+        slot_index: usize,
+        agent_id: String,
+        old_status: AgentFanoutSlotStatus,
+    ) {
         self.summary_cache.accepted += 1;
-        self.apply_slot_status_transition(old_status, AgentFanoutSlotStatus::Running, true, false);
+        // No agent owned the old slot, including a durable cancellation
+        // placeholder. An unrelated terminal child may be uncollected.
+        adjust_summary_for_status(&mut self.summary_cache, old_status, false, false, -1);
+        adjust_summary_for_status(
+            &mut self.summary_cache,
+            AgentFanoutSlotStatus::Running,
+            true,
+            false,
+            1,
+        );
         self.agent_slot_index.insert(agent_id, slot_index);
         self.recompute_status_from_cache();
         self.revision = self.revision.saturating_add(1);
-        Ok(())
     }
 
     pub fn mark_result_collected(&mut self, agent_id: &str) -> bool {
@@ -972,6 +1003,75 @@ mod tests {
             AgentFanoutSlotStatus::CancelledByUser
         );
         assert!(group.slots[1].agent_id.is_none());
+    }
+
+    #[test]
+    fn durable_child_replaces_only_a_closed_unassigned_cancellation_placeholder() {
+        let mut group = AgentFanoutGroupProjection::new("review-1", "Review fanout", 1);
+        group.close_spawn_admission();
+        group
+            .record_unassigned_terminal(0, AgentFanoutSlotStatus::CancelledByUser, "cancelled")
+            .unwrap();
+        assert!(group.is_terminal());
+        assert!(group.record_spawn_accepted(0, "late-live-child").is_err());
+
+        group
+            .restore_spawn_accepted_with_run(
+                0,
+                "durable-child",
+                Some("durable-run".into()),
+                Some("slot".into()),
+                "reviewer",
+                "Recovered child",
+            )
+            .expect("durable child evidence replaces the unassigned placeholder");
+        assert!(group.spawn_admission_closed());
+        assert_eq!(group.summary().accepted, 1);
+        assert_eq!(group.summary().cancelled_by_user, 0);
+        assert_eq!(group.summary().active, 1);
+        assert_eq!(group.summary().terminal, 0);
+        assert_eq!(group.slots[0].run_id.as_deref(), Some("durable-run"));
+        assert!(
+            group
+                .restore_spawn_accepted_with_run(
+                    0,
+                    "duplicate",
+                    Some("other-run".into()),
+                    None,
+                    "reviewer",
+                    "Duplicate",
+                )
+                .is_err()
+        );
+        assert_eq!(group.slots[0].agent_id.as_deref(), Some("durable-child"));
+    }
+
+    #[test]
+    fn replacing_cancelled_placeholder_keeps_other_child_uncollected() {
+        let mut group = AgentFanoutGroupProjection::new("review-1", "Review fanout", 2);
+        group.record_spawn_accepted(0, "completed-child").unwrap();
+        group
+            .record_terminal_by_agent("completed-child", AgentFanoutSlotStatus::Completed, None)
+            .unwrap();
+        group.close_spawn_admission();
+        group
+            .record_unassigned_terminal(1, AgentFanoutSlotStatus::CancelledByUser, "cancelled")
+            .unwrap();
+        assert_eq!(group.summary().uncollected, 1);
+
+        group
+            .restore_spawn_accepted_with_run(
+                1,
+                "late-durable-child",
+                Some("durable-run".into()),
+                None,
+                "reviewer",
+                "Recovered",
+            )
+            .unwrap();
+        assert_eq!(group.summary().uncollected, 1);
+        assert_eq!(group.summary().accepted, 2);
+        assert_eq!(group.summary().cancelled_by_user, 0);
     }
 
     #[test]
