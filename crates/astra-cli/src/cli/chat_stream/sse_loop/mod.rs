@@ -49,7 +49,11 @@ use agentic_sse_loop::{
     partial_interruption_notice, resolved_tool_metrics,
 };
 use serde_json::{Value, json};
-use server_admission_host::{CliServerAdmissionHost, is_pre_admission_rejection};
+use server_admission_host::CliServerAdmissionHost;
+// `pub(crate)` (rather than the module-private `use` above) so the
+// settlement boundary test in `crate::cli::turn::turn_settlement` can call
+// the real classifier instead of re-deriving its logic.
+pub(crate) use server_admission_host::is_pre_admission_rejection;
 
 fn non_tty_output_failure(
     is_terminal: bool,

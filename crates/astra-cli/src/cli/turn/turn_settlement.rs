@@ -198,6 +198,77 @@ mod tests {
         );
     }
 
+    /// The actual SSE-to-settlement boundary for a `session_execution_slot_occupied`
+    /// start-rejection: `admission_rejected` here is exactly what
+    /// `is_pre_admission_rejection` computes from the server's `error_code`/
+    /// `error_metadata`/`run_id` on the wire (see
+    /// `crate::cli::chat_stream::sse_loop::server_admission_host`), not a
+    /// hand-picked test shortcut. No run was ever admitted, so this must take
+    /// the early-return branch in `settle_failed_turn`: the draft goes back to
+    /// the user, the local turn cursor does not advance, and — because that
+    /// branch returns before `reconcile_and_report_turn_failure` — no
+    /// TurnError is journaled and no reconciliation network call is made.
+    #[tokio::test]
+    async fn settle_failed_turn_restores_draft_without_advancing_cursor_for_session_slot_conflict()
+    {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let ctx = TurnContext {
+            api: &api,
+            profile: None,
+            post_commit_tx: None,
+            explain_analyze_terminal_degraded: None,
+        };
+        let mut ui = crate::tests::TestUi::default();
+        let mut state = SessionState::default();
+        let mut dispatch = TurnDispatch {
+            ctx: &ctx,
+            line: "hello again",
+            effective_line: "hello again",
+            user_intent: "hello again",
+            input_runtime_required_texts: &[],
+            input_active_system_skills: &[],
+            input_runtime_volatile_texts: &[],
+            token: "token",
+            session_id: "session-1",
+            semantic_query_override: None,
+            turn_start: Instant::now(),
+            ui: &mut ui,
+            turn_usage_sink: None,
+        };
+        let error_code = Some("session_execution_slot_occupied".to_string());
+        let error_metadata = Some(serde_json::json!({"admission_state": "rejected"}));
+        let admission_rejected = crate::cli::chat_stream::is_pre_admission_rejection(
+            error_code.as_deref(),
+            error_metadata.as_ref(),
+            None,
+        );
+        assert!(
+            admission_rejected,
+            "server_admission_host's own classifier must agree this is pre-admission"
+        );
+        let mut failure = crate::TurnFailure {
+            error: "session already has an active run".into(),
+            partial: crate::PartialTurnData {
+                error_code,
+                error_metadata,
+                admission_rejected,
+                ..Default::default()
+            },
+        };
+
+        settle_failed_turn(&mut state, &mut dispatch, &mut failure).await;
+
+        assert_eq!(
+            state.turn, 0,
+            "a start-rejection must not advance the local turn cursor"
+        );
+        assert_eq!(ui.restored_inputs, vec!["hello again"]);
+        assert!(
+            state.journal.is_none(),
+            "a start-rejection must not bootstrap a journal or record a TurnError"
+        );
+    }
+
     #[tokio::test]
     async fn admission_rejection_does_not_consume_a_turn_or_poll_a_run() {
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();

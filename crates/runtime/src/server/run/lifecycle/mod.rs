@@ -196,6 +196,25 @@ const DURABLE_LIVE_BATCH_MAX_BYTES: usize = 256 * 1024;
 const DURABLE_LIVE_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
 const HOST_INTERACTION_COMMITTED_FIELD: &str = "_astra_host_interaction_committed";
 
+/// Machine code shared by every "session already has an active run" 409:
+/// the in-process `self.runs` admission guard in `create_run`/`stream_chat`,
+/// the durable insert conflict surfaced from `persist_run_start`, and the
+/// durable session-execution-slot check in `resume_run`. All five detect the
+/// same product-facing condition — this session's execution slot is held by
+/// another run — just at different layers (same-pod fast path vs. the
+/// cross-pod durable authority).
+///
+/// The blocking status can be `waiting` or a manual `paused`, either of which
+/// may need explicit user action rather than clearing on its own — so this is
+/// never blanket-retryable. The three *start*-rejection sites
+/// (`create_run`/`stream_chat`'s guard, `persist_run_start`) additionally
+/// carry `admission_state: "rejected"` metadata: no run was ever admitted, so
+/// the client's pre-admission-rejection contract restores the draft instead
+/// of settling this as a failed, executed turn. `resume_run`'s two sites
+/// deliberately do not — a resume conflict is not a new-turn admission and
+/// must not be treated as one.
+const SESSION_EXECUTION_SLOT_OCCUPIED_ERROR_CODE: &str = "session_execution_slot_occupied";
+
 fn explain_artifact_publishable_status(status: RunStatus) -> bool {
     RunStatus::TERMINAL.contains(&status)
 }
@@ -7857,17 +7876,24 @@ impl AgenticRunLifecycleService {
             }
         };
         result.map_err(|error| {
-            let status = if error == "session already has an active run" {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::SERVICE_UNAVAILABLE
-            };
-            let detail = if status == StatusCode::CONFLICT {
-                error
-            } else {
-                format!("Failed to persist durable run start: {error}")
-            };
-            error_response(status, detail)
+            if error == "session already has an active run" {
+                // Start-rejection, not a failed execution: no run was ever
+                // admitted. `admission_state: "rejected"` is the client's
+                // pre-admission-rejection contract (see
+                // `is_pre_admission_rejection` in astra-cli) — it restores the
+                // draft and skips ordinary failure settlement (no TurnError
+                // journal event, no turn-cursor advance, no reconciliation).
+                return error_response_coded_with_metadata(
+                    StatusCode::CONFLICT,
+                    error,
+                    SESSION_EXECUTION_SLOT_OCCUPIED_ERROR_CODE,
+                    json!({"admission_state": "rejected"}),
+                );
+            }
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("Failed to persist durable run start: {error}"),
+            )
         })
     }
 
@@ -15055,9 +15081,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let mut runs = self.runs.write().await;
             let has_active = Self::session_has_blocking_run(&runs, &user_id, &session_id);
             if has_active {
-                return Err(error_response(
+                // Start-rejection: no run was admitted, so this must flow
+                // through the client's pre-admission-rejection contract
+                // (`admission_state: "rejected"`) rather than ordinary failed-
+                // turn settlement.
+                return Err(error_response_coded_with_metadata(
                     StatusCode::CONFLICT,
-                    "session already has an active run".to_string(),
+                    "session already has an active run",
+                    SESSION_EXECUTION_SLOT_OCCUPIED_ERROR_CODE,
+                    json!({"admission_state": "rejected"}),
                 ));
             }
             runs.insert(run_id.clone(), run_state);
@@ -16808,9 +16840,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 )
                 .await;
             }
-            return Err(error_response(
+            // Start-rejection, same contract as the `create_run` guard above.
+            return Err(error_response_coded_with_metadata(
                 StatusCode::CONFLICT,
-                "session already has an active run".to_string(),
+                "session already has an active run",
+                SESSION_EXECUTION_SLOT_OCCUPIED_ERROR_CODE,
+                json!({"admission_state": "rejected"}),
             ));
         }
         // Persist run first, so the binding is durable before the client
@@ -19280,6 +19315,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
             AtomicRunGuidanceAdmission::Inactive { status } => {
                 Self::run_status_from_durable(&status)?;
+                if durable_run_status_is_terminal(&status) {
+                    // The run reached a terminal status (completed/failed/
+                    // cancelled/delegated) between the client's last observed
+                    // stream-lifecycle signal and this submission. There is no
+                    // "current run" left to guide; give this a stable code so
+                    // the client can requeue the text as the next turn instead
+                    // of surfacing a bare rejection, matching how the
+                    // settlement-fence conflict is already handled below.
+                    return Err(error_response_coded(
+                        StatusCode::CONFLICT,
+                        "This run has already finished and no longer accepts current-run guidance. Submit it as the next session turn instead.",
+                        "run_intent_run_terminal",
+                    ));
+                }
                 return Err(Self::run_state_conflict("submit input to", &status));
             }
             AtomicRunGuidanceAdmission::SettlementFenced => {
@@ -19782,9 +19831,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 })?
                 .is_some_and(|blocker| blocker.run_id != run_id)
             {
-                return Err(error_response(
+                // Deliberately no `admission_state: "rejected"` metadata: this
+                // is a resume conflict on an existing paused/waiting run, not
+                // a fresh-turn admission rejection, and must not be settled as
+                // one (no draft to restore here; the caller is resuming, not
+                // submitting new input).
+                return Err(error_response_coded(
                     StatusCode::CONFLICT,
-                    "session already has an active run".to_string(),
+                    "session already has an active run",
+                    SESSION_EXECUTION_SLOT_OCCUPIED_ERROR_CODE,
                 ));
             }
             let current = self.require_durable_run_for_user(&run_id, &user_id).await?;
@@ -19825,9 +19880,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         match transition {
             astra_services::runs::GuardedRunStatusTransition::Updated => {}
             astra_services::runs::GuardedRunStatusTransition::SessionBlocked => {
-                return Err(error_response(
+                // Same reasoning as the resume conflict above: this is a
+                // resume, not a new-turn admission, so it stays outside the
+                // pre-admission-rejection contract.
+                return Err(error_response_coded(
                     StatusCode::CONFLICT,
-                    "session already has an active run".to_string(),
+                    "session already has an active run",
+                    SESSION_EXECUTION_SLOT_OCCUPIED_ERROR_CODE,
                 ));
             }
             astra_services::runs::GuardedRunStatusTransition::StatusConflict => {

@@ -25,6 +25,11 @@ pub(crate) use params::{
     SharedStreamEventSink, StreamEvent, StreamEventRx, StreamEventSink, StreamEventTx,
     ToolProgressSink, enqueue_interactive_request, stream_event_channel,
 };
+// Only the settlement-boundary test in `crate::cli::turn::turn_settlement`
+// reaches through this far; the production trait impl in `sse_loop` calls
+// the function through its own closer-scoped re-export.
+#[cfg(test)]
+pub(crate) use sse_loop::is_pre_admission_rejection;
 pub(crate) use sse_loop::server_loop_admission_payload_with_execution_time_budget;
 pub(crate) use sse_loop::stream_chat_sse;
 pub(crate) use sse_loop::turn_policy_from_payload_edge_tools;

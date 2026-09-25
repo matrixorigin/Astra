@@ -3413,8 +3413,8 @@ async fn submit_active_run_guidance(
                     GuidanceSubmissionError::Rejected(error) => {
                         return Err(GuidanceSubmissionError::Rejected(error));
                     }
-                    GuidanceSubmissionError::SettlementFenced => {
-                        return Err(GuidanceSubmissionError::SettlementFenced);
+                    GuidanceSubmissionError::GuidanceClosed(notice) => {
+                        return Err(GuidanceSubmissionError::GuidanceClosed(notice));
                     }
                     GuidanceSubmissionError::Unconfirmed(error) => {
                         last_unconfirmed = Some(error);
@@ -3571,8 +3571,23 @@ fn expire_guidance_closure_as_unconfirmed(
 /// guidance because the run is already settling. The submission did not commit.
 const RUN_INTENT_SETTLEMENT_FENCED_ERROR_CODE: &str = "run_intent_settlement_fenced";
 
+/// Machine code returned when the run had already reached a terminal status
+/// (completed/failed/cancelled/delegated) before this submission landed.
+/// Ownership never existed to transfer, so this is handled the same way as
+/// the settlement fence: requeue the text as the next turn.
+const RUN_INTENT_RUN_TERMINAL_ERROR_CODE: &str = "run_intent_run_terminal";
+
 const SETTLEMENT_FENCED_FOLLOW_UP_NOTICE: &str =
     "This run is settling. Your message is queued and will be sent as the next turn.";
+
+/// Terminal covers `cancelled` and `failed`, not just `completed`. Those two
+/// are exactly the cases where the turn also settles abnormally, and then
+/// `should_start_queued_followups` holds the backlog back and the text is
+/// restored to the composer instead. So this notice states what is true when
+/// it is printed — the text is on the next-turn queue — without promising a
+/// delivery the settlement path may not make.
+const RUN_TERMINAL_FOLLOW_UP_NOTICE: &str =
+    "That run has already finished. Your message was moved to the next-turn queue.";
 
 const UNBOUND_RUN_FOLLOW_UP_NOTICE: &str =
     "The current run is starting. Your message is queued and will be sent as the next turn.";
@@ -3581,10 +3596,13 @@ const UNBOUND_RUN_FOLLOW_UP_NOTICE: &str =
 enum GuidanceSubmissionError {
     /// The request is known not to have transferred ownership to the run.
     Rejected(String),
-    /// The server rolled this guidance back at the settlement fence. Ownership
-    /// did not transfer, so the original text can move to the next-turn queue.
-    /// Do not retry it against the fenced run.
-    SettlementFenced,
+    /// The server rolled this guidance back because current-run ownership is
+    /// gone — either the run fenced for settlement or it already reached a
+    /// terminal status. Either way ownership did not transfer, so the
+    /// original text can move to the next-turn queue instead of being
+    /// retried against a run that will never accept it. The carried notice
+    /// is the exact user-facing text for whichever case applied.
+    GuidanceClosed(&'static str),
     /// The request may have committed, but its acknowledgement was lost or
     /// malformed. Keep the stable local identity pending until durable run
     /// events settle it; never manufacture a second intent id.
@@ -3627,7 +3645,14 @@ impl GuidanceSubmissionError {
                     && api_error_code(body).as_deref()
                         == Some(RUN_INTENT_SETTLEMENT_FENCED_ERROR_CODE) =>
             {
-                Self::SettlementFenced
+                Self::GuidanceClosed(SETTLEMENT_FENCED_FOLLOW_UP_NOTICE)
+            }
+            astra_thin_client::ThinClientError::Api { status, ref body }
+                if status == reqwest::StatusCode::CONFLICT
+                    && api_error_code(body).as_deref()
+                        == Some(RUN_INTENT_RUN_TERMINAL_ERROR_CODE) =>
+            {
+                Self::GuidanceClosed(RUN_TERMINAL_FOLLOW_UP_NOTICE)
             }
             astra_thin_client::ThinClientError::Api { status, body }
                 if status.is_client_error() && status != reqwest::StatusCode::REQUEST_TIMEOUT =>
@@ -8842,7 +8867,7 @@ pub(crate) async fn run_tui_session(
                                                                 history_cell::system::SystemCell::error(error),
                                                             );
                                                         }
-                                                        Err(GuidanceSubmissionError::SettlementFenced) => {
+                                                        Err(GuidanceSubmissionError::GuidanceClosed(notice)) => {
                                                             let queue_index = submitted_queue_index.unwrap_or_else(
                                                                 || {
                                                                     bottom_pane
@@ -8860,8 +8885,7 @@ pub(crate) async fn run_tui_session(
                                                             if queued {
                                                                 chat_widget.commit_system(
                                                                     history_cell::system::SystemCell::info(
-                                                                        SETTLEMENT_FENCED_FOLLOW_UP_NOTICE
-                                                                            .to_string(),
+                                                                        notice.to_string(),
                                                                     ),
                                                                 );
                                                             }
@@ -17941,9 +17965,58 @@ mod tests {
                 .to_string(),
             },
         );
-        assert_eq!(fenced, GuidanceSubmissionError::SettlementFenced);
+        assert_eq!(
+            fenced,
+            GuidanceSubmissionError::GuidanceClosed(SETTLEMENT_FENCED_FOLLOW_UP_NOTICE)
+        );
         assert!(!SETTLEMENT_FENCED_FOLLOW_UP_NOTICE.contains("HTTP"));
         assert!(!SETTLEMENT_FENCED_FOLLOW_UP_NOTICE.contains("request_id"));
+
+        let run_terminal = GuidanceSubmissionError::from_thin_client(
+            astra_thin_client::ThinClientError::Api {
+                status: reqwest::StatusCode::CONFLICT,
+                body: serde_json::json!({
+                    "detail": "This run has already finished and no longer accepts current-run guidance. Submit it as the next session turn instead.",
+                    "error_code": "run_intent_run_terminal",
+                    "request_id": "bdf2d58e521a46de78d71c3ecc5fdf8e"
+                })
+                .to_string(),
+            },
+        );
+        assert_eq!(
+            run_terminal,
+            GuidanceSubmissionError::GuidanceClosed(RUN_TERMINAL_FOLLOW_UP_NOTICE)
+        );
+        assert!(!RUN_TERMINAL_FOLLOW_UP_NOTICE.contains("HTTP"));
+        assert!(!RUN_TERMINAL_FOLLOW_UP_NOTICE.contains("request_id"));
+        // `cancelled`/`failed` are terminal too, and both settle the turn
+        // abnormally, so `should_start_queued_followups` will hold the
+        // backlog and restore this text to the composer instead of sending
+        // it. The notice must not promise a delivery that never happens.
+        assert!(!RUN_TERMINAL_FOLLOW_UP_NOTICE.contains("will be sent"));
+        assert!(!should_start_queued_followups(
+            false, false, false, false, false
+        ));
+        assert!(!should_start_queued_followups(
+            true, true, false, false, false
+        ));
+
+        // A conflict on the SAME run, but in a durable status this branch
+        // does not special-case (e.g. a manual pause), must keep falling
+        // through to a plain rejection. Only terminal statuses and the
+        // settlement fence get requeued to the next turn.
+        let unhandled_status_conflict =
+            GuidanceSubmissionError::from_thin_client(astra_thin_client::ThinClientError::Api {
+                status: reqwest::StatusCode::CONFLICT,
+                body: serde_json::json!({
+                    "detail": "Cannot submit input to run in 'paused' state",
+                })
+                .to_string(),
+            });
+        assert!(matches!(
+            unhandled_status_conflict,
+            GuidanceSubmissionError::Rejected(_)
+        ));
 
         let identity_conflict =
             GuidanceSubmissionError::from_thin_client(astra_thin_client::ThinClientError::Api {
@@ -18024,6 +18097,154 @@ mod tests {
             false,
         );
         assert_eq!(restored.as_deref(), Some("list my workspaces"));
+    }
+
+    /// Terminal-guidance rejection (`run_intent_run_terminal`) reuses the exact
+    /// same next-turn queue as the settlement fence — but its wording promises
+    /// only "queued", not "will be sent" (see `RUN_TERMINAL_FOLLOW_UP_NOTICE`),
+    /// precisely because completion, cancellation, and failure settle
+    /// differently. This exercises the real queue/settlement path — the real
+    /// `should_start_queued_followups`, not a hand-picked bool — for all three
+    /// outcomes, alongside an earlier-queued message, to prove exactly-once
+    /// delivery and stable ordering in every case.
+    #[test]
+    fn terminal_guidance_followup_delivery_matches_turn_outcome() {
+        // Completed: the turn that made the guidance target terminal settled
+        // normally, so the rejected text starts as the next turn — exactly
+        // once, after whatever was already queued ahead of it.
+        {
+            let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+            let mut bottom_pane = BottomPane::new();
+            assert!(bottom_pane.queue_next_turn_submission("earlier message".to_string()));
+            let queue_index = bottom_pane.queued_next_turn_submission_count();
+            bottom_pane
+                .try_accept_user_intent(
+                    "intent-terminal-completed",
+                    astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    astra_turn_types::UserIntentStatus::AcceptedLocal,
+                    "rejected by completed run",
+                )
+                .expect("local guidance intent");
+            run_control.expect_remote_user_intent_submission("intent-terminal-completed");
+            assert!(release_settlement_fenced_guidance(
+                &run_control,
+                &mut bottom_pane,
+                "intent-terminal-completed",
+                "rejected by completed run",
+                queue_index,
+            ));
+
+            let mut queued = bottom_pane.take_queued_next_turn_submissions();
+            let mut followups = std::collections::VecDeque::new();
+            let should_start = should_start_queued_followups(true, false, false, false, false);
+            assert!(should_start, "a normally-settled turn must start followups");
+            assert!(
+                settle_followup_submissions(
+                    &mut followups,
+                    std::iter::empty(),
+                    &mut queued,
+                    should_start
+                )
+                .is_none(),
+                "delivered followups must not also be reported as a restored draft"
+            );
+            assert_eq!(
+                followups.into_iter().collect::<Vec<_>>(),
+                vec![
+                    "earlier message".to_string(),
+                    "rejected by completed run".to_string(),
+                ],
+                "exactly once, in submission order"
+            );
+        }
+
+        // Cancelled: the outer turn was interrupted, so nothing starts on its
+        // own — both messages come back as one restored draft, in order.
+        {
+            let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+            let mut bottom_pane = BottomPane::new();
+            assert!(bottom_pane.queue_next_turn_submission("earlier message".to_string()));
+            let queue_index = bottom_pane.queued_next_turn_submission_count();
+            bottom_pane
+                .try_accept_user_intent(
+                    "intent-terminal-cancelled",
+                    astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    astra_turn_types::UserIntentStatus::AcceptedLocal,
+                    "rejected by cancelled run",
+                )
+                .expect("local guidance intent");
+            run_control.expect_remote_user_intent_submission("intent-terminal-cancelled");
+            assert!(release_settlement_fenced_guidance(
+                &run_control,
+                &mut bottom_pane,
+                "intent-terminal-cancelled",
+                "rejected by cancelled run",
+                queue_index,
+            ));
+
+            let mut queued = bottom_pane.take_queued_next_turn_submissions();
+            let mut followups = std::collections::VecDeque::new();
+            let should_start = should_start_queued_followups(true, true, false, false, false);
+            assert!(
+                !should_start,
+                "an interrupted turn must not start followups"
+            );
+            let restored = settle_followup_submissions(
+                &mut followups,
+                std::iter::empty(),
+                &mut queued,
+                should_start,
+            );
+            assert_eq!(
+                restored.as_deref(),
+                Some("earlier message\n\nrejected by cancelled run")
+            );
+            assert!(
+                followups.is_empty(),
+                "a restored draft must not also sit in the followup queue"
+            );
+        }
+
+        // Failed: same non-starting outcome as cancelled, driven by turn_ok
+        // instead of the interrupted flag.
+        {
+            let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+            let mut bottom_pane = BottomPane::new();
+            assert!(bottom_pane.queue_next_turn_submission("earlier message".to_string()));
+            let queue_index = bottom_pane.queued_next_turn_submission_count();
+            bottom_pane
+                .try_accept_user_intent(
+                    "intent-terminal-failed",
+                    astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    astra_turn_types::UserIntentStatus::AcceptedLocal,
+                    "rejected by failed run",
+                )
+                .expect("local guidance intent");
+            run_control.expect_remote_user_intent_submission("intent-terminal-failed");
+            assert!(release_settlement_fenced_guidance(
+                &run_control,
+                &mut bottom_pane,
+                "intent-terminal-failed",
+                "rejected by failed run",
+                queue_index,
+            ));
+
+            let mut queued = bottom_pane.take_queued_next_turn_submissions();
+            let mut followups = std::collections::VecDeque::new();
+            let should_start = should_start_queued_followups(false, false, false, false, false);
+            assert!(!should_start, "a failed turn must not start followups");
+            let restored = settle_followup_submissions(
+                &mut followups,
+                std::iter::empty(),
+                &mut queued,
+                should_start,
+            );
+            assert_eq!(
+                restored.as_deref(),
+                Some("earlier message\n\nrejected by failed run")
+            );
+            assert!(followups.is_empty());
+        }
     }
 
     #[test]
