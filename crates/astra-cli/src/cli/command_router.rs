@@ -1268,6 +1268,7 @@ async fn execute_cli_command_impl(
             );
             let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
             let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
+                mcp_manager: Some(_pipeline.mcp_manager.clone()),
                 api,
                 auth_profile: profile.as_deref(),
                 message: &message,
@@ -1901,6 +1902,7 @@ async fn execute_cli_command_impl(
                 astra_harness::SessionTrace::new(None),
             ));
             let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
+                mcp_manager: Some(_pipeline.mcp_manager.clone()),
                 api,
                 auth_profile: profile.as_deref(),
                 message: &message,
@@ -3177,6 +3179,7 @@ pub(crate) async fn run_print_mode(
     };
 
     let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
+        mcp_manager: Some(_pipeline.mcp_manager.clone()),
         api,
         auth_profile: profile,
         message: &message,

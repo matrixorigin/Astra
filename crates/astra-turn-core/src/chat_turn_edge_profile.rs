@@ -221,6 +221,10 @@ pub const EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES: &str = "deferred_tool_om
 /// copied into the model-visible `tools[]` surface.
 pub const EDGE_PROFILE_KEY_DEFERRED_TOOL_SCHEMAS: &str = "deferred_tool_schemas";
 
+/// Explicit public-name to native dispatch identity mapping supplied by the
+/// connected Edge adapter. Names alone must never synthesize this proof.
+pub const EDGE_PROFILE_KEY_TOOL_NATIVE_IDS: &str = "tool_native_ids";
+
 /// Project the provider-owned contracts selected by one deferred manifest.
 ///
 /// This is a control-plane projection only. Keeping it here gives normal chat

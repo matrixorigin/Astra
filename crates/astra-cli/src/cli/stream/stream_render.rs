@@ -2106,14 +2106,13 @@ impl<'a> CliSseStreamHost<'a> {
         }
     }
 
-    fn cli_runtime_environment_advertisement(&self) -> Value {
+    fn cli_runtime_environment_advertisement(&self, tool: &str) -> Value {
         static REGISTRY: std::sync::OnceLock<astra_runtime_env::ToolRegistry> =
             std::sync::OnceLock::new();
         let registry = REGISTRY.get_or_init(astra_runtime_env::ToolRegistry::builtins);
-        let binding = astra_runtime_env::RunBinding::local_developer(
-            self.executor.project_root.to_string_lossy().to_string(),
-            registry,
-        );
+        let binding = self
+            .executor
+            .runtime_environment_binding_for_tool(tool, registry);
         serde_json::to_value(astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
             binding,
         ))
@@ -2122,12 +2121,13 @@ impl<'a> CliSseStreamHost<'a> {
 
     fn tool_result_fields_with_cli_runtime(
         &self,
+        tool: &str,
         fields: Option<Map<String, Value>>,
     ) -> Map<String, Value> {
         let mut fields = fields.unwrap_or_default();
         fields
             .entry("runtime_environment_advertisement".to_string())
-            .or_insert_with(|| self.cli_runtime_environment_advertisement());
+            .or_insert_with(|| self.cli_runtime_environment_advertisement(tool));
         fields
     }
 
@@ -2229,7 +2229,7 @@ impl<'a> CliSseStreamHost<'a> {
             }
         }
 
-        let tool_result_fields = self.tool_result_fields_with_cli_runtime(tool_result_fields);
+        let tool_result_fields = self.tool_result_fields_with_cli_runtime(tool, tool_result_fields);
         let result = EdgeToolExecResult {
             execution_completion: None,
             request_id: request_id.to_string(),
@@ -2962,7 +2962,8 @@ impl<'a> CliSseStreamHost<'a> {
         // them.
         let (output, _) =
             astra_tools::credential_redaction::redact_credentials_for_display(&output);
-        let mut tool_result_fields = self.tool_result_fields_with_cli_runtime(tool_result_fields);
+        let mut tool_result_fields =
+            self.tool_result_fields_with_cli_runtime(&req.tool, tool_result_fields);
         for value in tool_result_fields.values_mut() {
             astra_tools::credential_redaction::redact_credentials_in_json(value);
         }
@@ -4442,7 +4443,8 @@ async fn settle_unexecuted_server_tool_result(
     host: &mut CliSseStreamHost<'_>,
     result: &mut EdgeToolExecResult,
 ) {
-    let fields = host.tool_result_fields_with_cli_runtime(result.tool_result_fields.take());
+    let fields =
+        host.tool_result_fields_with_cli_runtime(&result.tool, result.tool_result_fields.take());
     result.tool_result_fields = Some(fields.clone());
     host.edge_tool_round.push(result.clone());
     if let Some(body) = host.tool_result_request(
@@ -5875,7 +5877,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             self.render
                 .tool_done(idx, tool, args, &status, duration_ms, &output);
         }
-        let tool_result_fields = self.tool_result_fields_with_cli_runtime(tool_result_fields);
+        let tool_result_fields = self.tool_result_fields_with_cli_runtime(tool, tool_result_fields);
         self.edge_tool_round.push(EdgeToolExecResult {
             execution_completion: None,
             request_id: request_id.to_string(),
@@ -6803,7 +6805,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             }
 
             let tool_result_fields =
-                self.tool_result_fields_with_cli_runtime(outcome.tool_result_fields);
+                self.tool_result_fields_with_cli_runtime(&req.tool, outcome.tool_result_fields);
             let result = EdgeToolExecResult {
                 execution_completion: None,
                 request_id: req.request_id.clone(),
@@ -16218,7 +16220,32 @@ mod tests {
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let mut manager = crate::mcp_client::McpClientManager::new();
+        manager
+            .connect(crate::mcp_client::McpServerConfig {
+                name: "mock".to_string(),
+                transport: crate::mcp_client::Transport::Stdio {
+                    command: vec![
+                        crate::mcp_client::ensure_mock_mcp_server_binary()
+                            .to_string_lossy()
+                            .to_string(),
+                    ],
+                    args: vec![],
+                    env: std::collections::HashMap::new(),
+                },
+                description: String::new(),
+                enabled: true,
+                retry: crate::mcp_client::RetryConfig::default(),
+            })
+            .await
+            .expect("connect mock MCP");
+        let schemas = manager.all_tool_schemas();
+        executor.install_mcp_bundle(
+            std::sync::Arc::new(tokio::sync::RwLock::new(manager)),
+            schemas,
+        );
+        let executor = std::sync::Arc::new(executor);
         let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
@@ -16249,6 +16276,33 @@ mod tests {
             false,
         );
 
+        for (name, allowed) in [("mcp__mock__echo", true), ("mcp__missing__echo", false)] {
+            let fields = host.tool_result_fields_with_cli_runtime(name, None);
+            let advertisement: astra_runtime_env::RuntimeEnvironmentAdvertisement =
+                serde_json::from_value(fields["runtime_environment_advertisement"].clone())
+                    .unwrap();
+            let admission = astra_runtime_env::CapabilityResolver.check_tool_call_for_surface(
+                &astra_runtime_env::ToolRegistry::builtins(),
+                name,
+                &serde_json::json!({"message": "hello"}),
+                &advertisement.binding.capabilities,
+                &advertisement.binding.tool_surface,
+            );
+            assert_eq!(admission.is_ok(), allowed, "{name}: {admission:?}");
+        }
+        executor
+            .accept_server_tool_surface_admission("mcp__mock__echo")
+            .unwrap();
+        let echo = executor
+            .execute(
+                "mcp__mock__echo",
+                &serde_json::json!({"message": "connected MCP response"}),
+            )
+            .await;
+        assert!(
+            echo.contains("connected MCP response"),
+            "MCP must execute after discovery: {echo}"
+        );
         let result = host
             .execute_tool(
                 "turn-bash-ro",

@@ -1943,6 +1943,9 @@ impl ToolExecutor {
         if self.runtime_environment_tool_denial(name, args).is_some() {
             return false;
         }
+        if astra_runtime_env::is_mcp_namespaced_tool_name(name) {
+            return self.mcp_tool_has_runtime_binding(name);
+        }
 
         let Some(meta) = astra_turn_core::tool::registry::meta::tool_meta(name) else {
             return self.cli_declared_local_tool_has_name(name)
@@ -1968,7 +1971,7 @@ impl ToolExecutor {
             .err()
     }
 
-    fn runtime_environment_binding_for_tool(
+    pub(crate) fn runtime_environment_binding_for_tool(
         &self,
         name: &str,
         registry: &astra_runtime_env::ToolRegistry,

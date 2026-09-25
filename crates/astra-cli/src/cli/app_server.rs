@@ -549,6 +549,7 @@ async fn run_turn(
     .await;
     let spawner_for_drain = agent_spawner.clone();
     let chat_ctx = BasicCliChatContext {
+        mcp_manager: None,
         api: &ctx.api,
         auth_profile: ctx.auth_profile.as_deref(),
         message: &message,
