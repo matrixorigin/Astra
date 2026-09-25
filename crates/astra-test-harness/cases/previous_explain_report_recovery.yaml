@@ -13,17 +13,6 @@ steps:
   - prompt: |
       解读一下刚才那轮运行的 Explain 报告：它是否完整，主要耗时在哪里？
       请核对实际报告后回答；若无法读取，说明具体缺少什么证据。
-    criteria:
-      - type: hard_judger
-        question: |
-          Verify that the answer uses the actual Explain artifact returned by
-          introspect for the previous run. It must distinguish capture status
-          from metric coverage and cite measured timing rather than invent it.
-          If the reader reports unavailable, credit only a precise limitation
-          grounded in that result. Do not accept SQL EXPLAIN interpretation,
-          filesystem discovery, or a claim that no report exists based solely
-          on ordinary live introspection counters.
-        threshold: 0.8
 criteria:
   - type: exit_code
     code: 0
@@ -36,3 +25,13 @@ criteria:
     name: bash
     min: 0
     max: 0
+  - type: hard_judger
+    question: |
+      Verify that the follow-up answer uses the actual Explain artifact returned
+      by introspect for the previous run. It must distinguish capture status
+      from metric coverage and cite measured timing rather than invent it.
+      If the reader reports unavailable, credit only a precise limitation
+      grounded in that result. Do not accept SQL EXPLAIN interpretation,
+      filesystem discovery, or a claim that no report exists based solely
+      on ordinary live introspection counters.
+    threshold: 0.8
