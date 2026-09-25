@@ -119,9 +119,12 @@ criteria:
       - type: pipeline_alert_count
         rule: prompt_cache_break
         max: 1
-      - type: provider_stable_prefix_cache_coverage
-        min: 0.95
-        min_observations: 2
+  # Provider-partial usage can report cache reads without the exact request
+  # denominator needed to prove stable-prefix coverage. Keep that gap visible
+  # as a quality diagnostic, not a hard failure of Work delivery.
+  - type: provider_stable_prefix_cache_coverage
+    min: 0.95
+    min_observations: 2
   - type: journal_tool_call_count
     name: ask_user
     min: 0

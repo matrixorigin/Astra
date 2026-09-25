@@ -7244,6 +7244,39 @@ mod tests {
     }
 
     #[test]
+    fn shipped_work_capability_case_keeps_partial_cache_evidence_diagnostic() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("cases/work_item_inherits_admitted_capability_journey.yaml");
+        let case = crate::case::Case::from_path(&path).expect("load shipped Work capability case");
+        let coverage = case
+            .criteria
+            .iter()
+            .find(|criterion| {
+                matches!(
+                    criterion,
+                    Criterion::ProviderStablePrefixCacheCoverage { .. }
+                )
+            })
+            .expect("stable-prefix coverage diagnostic");
+        assert_eq!(criterion_severity(coverage), CriterionSeverity::Quality);
+
+        let cache_break_gate = case
+            .criteria
+            .iter()
+            .find(|criterion| {
+                matches!(criterion, Criterion::AllOf { criteria }
+                    if criteria.iter().any(|inner| matches!(inner, Criterion::PipelineAlertCount { rule, .. } if rule == "prompt_cache_break")))
+            })
+            .expect("hard cache-break gate");
+        assert_eq!(
+            criterion_severity(cache_break_gate),
+            CriterionSeverity::Hard
+        );
+        assert!(!matches!(cache_break_gate, Criterion::AllOf { criteria }
+            if criteria.iter().any(|inner| matches!(inner, Criterion::ProviderStablePrefixCacheCoverage { .. }))));
+    }
+
+    #[test]
     fn required_prompt_cache_scope_reports_one_witness_after_full_coverage_validation() {
         let many = cache_request_outcome("r1", "t1", &[(0, 0, 0); 3]);
         let witness = cache_request_outcome("r2", "t2", &[(0, 0, 0), (0, 300, 0)]);
