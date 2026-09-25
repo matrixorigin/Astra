@@ -12,7 +12,7 @@ debug_log: true
 steps:
   - prompt: |
       刚才那轮运行的 Explain 报告是哪一个 run、capture status 是什么？
-      请读取报告后回答，并区分报告读取完成与采集覆盖完整。
+      请读取报告后回答，并说明报告声明的采集覆盖情况。
 criteria:
   - type: exit_code
     code: 0
@@ -33,7 +33,7 @@ criteria:
   - type: hard_judger
     question: |
       Match the follow-up's run ID (or unambiguous prefix) and capture status
-      to the previous Explain artifact header returned by introspect. Require
-      the answer to distinguish byte-window completion from metric coverage.
+      to the previous Explain artifact returned by introspect. Check that any
+      claims about coverage match its declared capture status and gaps.
       Do not accept SQL EXPLAIN interpretation or absence inferred from live counters.
     threshold: 0.8
