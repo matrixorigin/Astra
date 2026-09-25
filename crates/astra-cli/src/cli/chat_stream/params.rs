@@ -183,9 +183,9 @@ pub enum StreamEvent {
         fanout_slot: Option<AgentFanoutSlotIdentity>,
         fanout_title: Option<String>,
     },
-    /// Tool execution completed. `tool_use_id` MUST match the paired
-    /// `ToolStarted`. `parent_tool_use_id` is propagated for the same
-    /// nested-event routing reason.
+    /// Tool execution completed. `tool_use_id` matches `ToolStarted` when
+    /// execution began; a server pre-dispatch rejection has no start.
+    /// `server_terminal` carries same-call evidence for that exception.
     ToolCompleted {
         name: String,
         description: String,
@@ -195,6 +195,7 @@ pub enum StreamEvent {
         output: Option<String>,
         tool_use_id: String,
         parent_tool_use_id: Option<String>,
+        server_terminal: Option<serde_json::Value>,
     },
     /// Server-issued projection of a durable canonical Work mutation. This is
     /// a dedicated protocol event rather than an inference from a tool card,

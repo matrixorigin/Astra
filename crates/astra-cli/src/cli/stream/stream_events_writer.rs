@@ -200,6 +200,7 @@ fn event_to_json(event: &StreamEvent) -> String {
             output,
             tool_use_id,
             parent_tool_use_id,
+            server_terminal,
         } => {
             serde_json::json!({
                 "type": "tool_completed",
@@ -211,6 +212,7 @@ fn event_to_json(event: &StreamEvent) -> String {
                 "output": output,
                 "tool_use_id": tool_use_id,
                 "parent_tool_use_id": parent_tool_use_id,
+                "server_terminal": server_terminal,
             })
         }
         StreamEvent::WorkTaskBoardUpdate(update) => serde_json::json!({
@@ -652,12 +654,37 @@ mod tests {
             output: None,
             tool_use_id: "tu_01H000000000000000000002".into(),
             parent_tool_use_id: None,
+            server_terminal: None,
         });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "tool_completed");
         assert_eq!(v["duration_ms"], 42);
         assert_eq!(v["output_summary"], "150 lines");
         assert_eq!(v["tool_use_id"], "tu_01H000000000000000000002");
+        assert!(v["server_terminal"].is_null());
+    }
+
+    #[test]
+    fn tool_completed_preserves_same_call_rejection_evidence() {
+        let evidence = serde_json::json!({
+            "disposition": "rejected",
+            "executed": false,
+            "terminal_event_type": "tool_call_rejected",
+        });
+        let json = event_to_json(&StreamEvent::ToolCompleted {
+            name: "git".into(),
+            description: "invalid arguments".into(),
+            status: "rejected".into(),
+            duration_ms: 0,
+            output_summary: None,
+            output: Some("Invalid arguments before dispatch".into()),
+            tool_use_id: "call-rejected".into(),
+            parent_tool_use_id: None,
+            server_terminal: Some(evidence.clone()),
+        });
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["server_terminal"], evidence);
+        assert_eq!(value["tool_use_id"], "call-rejected");
     }
 
     #[test]
@@ -719,6 +746,7 @@ mod tests {
                 output: None,
                 tool_use_id: "tu_test".into(),
                 parent_tool_use_id: None,
+                server_terminal: None,
             },
             StreamEvent::AskUserPrompted {
                 request_id: "ask_evt".into(),
@@ -781,6 +809,7 @@ mod tests {
             output: None,
             tool_use_id: "call-1".into(),
             parent_tool_use_id: None,
+            server_terminal: None,
         })
         .await
         .unwrap();
@@ -883,6 +912,7 @@ mod tests {
             output: None,
             tool_use_id: "tu_test".into(),
             parent_tool_use_id: None,
+            server_terminal: None,
         });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(v["output_summary"].is_null());

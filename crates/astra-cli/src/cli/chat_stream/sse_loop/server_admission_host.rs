@@ -220,6 +220,7 @@ fn recovered_agent_fanout_completion_event(
         output: Some(tool_output_event_text("agent_fanout", output)),
         tool_use_id: tool_call_id.to_string(),
         parent_tool_use_id: None,
+        server_terminal: None,
     }
 }
 
@@ -1818,6 +1819,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                     output: Some(event_output),
                     tool_use_id: tool_call_id.to_string(),
                     parent_tool_use_id: None,
+                    server_terminal: None,
                 });
             }
             return ControlToolRecovery::Recovered(Box::new(EdgeToolExecResult {
@@ -2773,6 +2775,7 @@ mod tests {
                 output: None,
                 tool_use_id: "call-1".into(),
                 parent_tool_use_id: None,
+                server_terminal: None,
             },
         ]);
         let consumer = tokio::spawn(async move {

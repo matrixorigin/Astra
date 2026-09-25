@@ -2223,6 +2223,7 @@ impl<'a> CliSseStreamHost<'a> {
                     output: Some(tool_output_event_text(tool, &output)),
                     tool_use_id: request_id.to_string(),
                     parent_tool_use_id: None,
+                    server_terminal: None,
                 })
                 .await;
             }
@@ -3006,6 +3007,7 @@ impl<'a> CliSseStreamHost<'a> {
                     output: Some(tool_output_event_text(&req.tool, &output)),
                     tool_use_id: req.request_id.clone(),
                     parent_tool_use_id: None,
+                    server_terminal: None,
                 })
                 .await;
             }
@@ -3889,6 +3891,18 @@ impl CliSseStreamHost<'_> {
             })
             .await;
         }
+        let server_terminal = (status == "rejected"
+            && event.get("disposition").and_then(Value::as_str) == Some("rejected")
+            && event.get("executed").and_then(Value::as_bool) == Some(false)
+            && event.get("terminal_event_type").and_then(Value::as_str)
+                == Some("tool_call_rejected"))
+        .then(|| {
+            serde_json::json!({
+                "disposition": "rejected",
+                "executed": false,
+                "terminal_event_type": "tool_call_rejected",
+            })
+        });
         self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
             name: state.name,
             description,
@@ -3898,6 +3912,7 @@ impl CliSseStreamHost<'_> {
             output: Some(tool_output_event_text("server_tool", &output)),
             tool_use_id: id,
             parent_tool_use_id: state.parent_tool_use_id,
+            server_terminal,
         })
         .await;
     }
@@ -5849,6 +5864,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     output: Some(tool_output_event_text(tool, &output)),
                     tool_use_id: request_id.to_string(),
                     parent_tool_use_id: None,
+                    server_terminal: None,
                 })
                 .await;
             }
@@ -6763,6 +6779,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         output: Some(tool_output_event_text(&req.tool, &output)),
                         tool_use_id: req.request_id.clone(),
                         parent_tool_use_id: None,
+                        server_terminal: None,
                     })
                     .await;
                 }
@@ -9642,6 +9659,37 @@ mod tests {
             request_session_execution_lease: None,
         };
         let mut host = CliSseStreamHost::from_edge_ctx(ctx, 80, false);
+
+        for (call_id, executed, expected_evidence) in [
+            ("pre-dispatch-rejected", false, true),
+            ("executed-rejected", true, false),
+        ] {
+            host.on_accepted_sse_event(&serde_json::json!({
+                "type": "tool_call_end",
+                "call_id": call_id,
+                "tool": "introspect",
+                "arguments": {},
+                "status": "rejected",
+                "disposition": "rejected",
+                "executed": executed,
+                "terminal_event_type": "tool_call_rejected",
+                "output": "Invalid arguments before dispatch",
+                "transport": "server_local",
+                "executor": {"kind": "server_local"}
+            }))
+            .await
+            .expect("server terminal accepted without a prior execution start");
+            let Some(chat_stream::StreamEvent::ToolCompleted {
+                tool_use_id,
+                server_terminal,
+                ..
+            }) = rx.recv().await
+            else {
+                panic!("expected one tool terminal");
+            };
+            assert_eq!(tool_use_id, call_id);
+            assert_eq!(server_terminal.is_some(), expected_evidence);
+        }
 
         host.on_accepted_sse_event(&serde_json::json!({
             "type": "tool_call",

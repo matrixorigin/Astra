@@ -176,9 +176,8 @@ def _is_unpaired_rejection_terminal(event: dict[str, object]) -> bool:
     The stream is an observation of model/tool protocol, not the executor's
     callback lifecycle.  Admission can reject a requested call before an
     executor-owned ``tool_started`` event exists, while still publishing the
-    typed terminal result to the model/UI.  Such a terminal is valid only when
-    both the event and its structured result explicitly carry ``rejected``;
-    ordinary completed/failed events still require a matching start.
+    typed terminal result to the model/UI. A structured rejection body is one
+    witness. A plain-text schema error needs same-call terminal evidence.
     """
 
     if event.get("status") != "rejected":
@@ -189,13 +188,18 @@ def _is_unpaired_rejection_terminal(event: dict[str, object]) -> bool:
     try:
         payload = json.loads(output)
     except (TypeError, json.JSONDecodeError):
-        return False
+        return event.get("server_terminal") == {
+            "disposition": "rejected",
+            "executed": False,
+            "terminal_event_type": "tool_call_rejected",
+        }
     return isinstance(payload, dict) and payload.get("status") == "rejected"
 
 
 def validate_stream_event_jsonl(path: Path) -> int:
     """Validate the isolated machine-event artifact and exact tool closure."""
     active_tools: set[str] = set()
+    completed_tools: set[str] = set()
     event_count = 0
     try:
         with path.open("r", encoding="utf-8") as handle:
@@ -221,6 +225,10 @@ def validate_stream_event_jsonl(path: Path) -> int:
                         raise RuntimeError(
                             f"Astra machine event {line_number} lacks a tool identity"
                         )
+                    if tool_id in completed_tools:
+                        raise RuntimeError(
+                            f"Astra machine event {line_number} repeats a completed tool"
+                        )
                     if event_type == "tool_started":
                         if tool_id in active_tools:
                             raise RuntimeError(
@@ -234,6 +242,8 @@ def validate_stream_event_jsonl(path: Path) -> int:
                             )
                     else:
                         active_tools.remove(tool_id)
+                    if event_type == "tool_completed":
+                        completed_tools.add(tool_id)
                 event_count += 1
     except (OSError, UnicodeDecodeError) as error:
         raise RuntimeError("Astra machine-event artifact is unavailable") from error

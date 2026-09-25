@@ -473,6 +473,7 @@ pub(crate) fn map_stream_event(event: StreamEvent) -> Option<TuiAppEvent> {
             output,
             tool_use_id,
             parent_tool_use_id,
+            server_terminal: _,
         } => TuiAppEvent::ToolCompleted {
             name,
             description,

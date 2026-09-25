@@ -117,6 +117,44 @@ class AstraRuntimeEnvTests(unittest.TestCase):
             )
             self.assertEqual(validate_stream_event_jsonl(path), 1)
 
+    def test_plain_rejection_needs_same_call_terminal_evidence(self):
+        evidence = {
+            "disposition": "rejected",
+            "executed": False,
+            "terminal_event_type": "tool_call_rejected",
+        }
+        terminal = {
+            "type": "tool_completed",
+            "name": "example_tool",
+            "status": "rejected",
+            "output": "Invalid arguments before dispatch",
+            "tool_use_id": "call-rejected",
+            "server_terminal": evidence,
+        }
+        cases = (
+            ([terminal], True),
+            ([{**terminal, "server_terminal": None}], False),
+            ([{**terminal, "server_terminal": {**evidence, "executed": True}}], False),
+            ([{**terminal, "server_terminal": {**evidence, "disposition": "failed"}}], False),
+            ([{**terminal, "server_terminal": {**evidence, "terminal_event_type": "tool_call_end"}}], False),
+            ([{**terminal, "status": "failed"}], False),
+            ([{**terminal, "output": '{"status":"failed"}'}], False),
+            ([terminal, terminal], False),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            for events, accepted in cases:
+                path.write_text(
+                    "".join(json.dumps(event) + "\n" for event in events),
+                    encoding="utf-8",
+                )
+                with self.subTest(events=events, accepted=accepted):
+                    if accepted:
+                        self.assertEqual(validate_stream_event_jsonl(path), 1)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "unknown tool|repeats a completed tool"):
+                            validate_stream_event_jsonl(path)
+
     def test_unpaired_non_rejection_terminal_remains_invalid(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "events.jsonl"
@@ -790,7 +828,7 @@ class AstraRunClassificationTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             agent = Astra(
-                Path(directory),
+                Path(directory) / "agent",
                 model_name="deepseek-v4-flash",
                 extra_env={
                     "ASTRA_API_URL": "http://172.17.0.1:17015",
