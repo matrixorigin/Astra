@@ -9813,12 +9813,11 @@ impl RunStateStore for InMemoryRunStateStore {
         let mut page = self.list_session_runs(user_id, session_id, limit).await?;
         let recovery_limit = validate_run_list_limit(limit) as usize;
         let cancellation_requests = self.cancellation_requests.read().await;
-        if let Some(cursor) = after_run_id {
-            page.runs.retain(|run| {
-                run.run_id.as_str() > cursor
-                    || !cancellation_requests.contains(&(user_id.to_string(), run.run_id.clone()))
-            });
-        }
+        let page_run_ids = page
+            .runs
+            .iter()
+            .map(|run| run.run_id.clone())
+            .collect::<HashSet<_>>();
         let runs = self.runs.read().await;
         let mut control = runs
             .values()
@@ -9834,20 +9833,68 @@ impl RunStateStore for InMemoryRunStateStore {
             })
             .cloned()
             .collect::<Vec<_>>();
+        let mut retry_control = runs
+            .values()
+            .filter(|run| {
+                run.user_id == user_id
+                    && run.session_id == session_id
+                    && matches!(
+                        run.status.as_str(),
+                        STATUS_RUNNING | STATUS_WAITING | STATUS_PAUSED
+                    )
+                    && after_run_id.is_some_and(|cursor| run.run_id.as_str() <= cursor)
+                    && page_run_ids.contains(&run.run_id)
+                    && cancellation_requests.contains(&(user_id.to_string(), run.run_id.clone()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut terminal_refresh = runs
+            .values()
+            .filter(|run| {
+                run.user_id == user_id
+                    && run.session_id == session_id
+                    && !matches!(
+                        run.status.as_str(),
+                        STATUS_RUNNING | STATUS_WAITING | STATUS_PAUSED
+                    )
+                    && page_run_ids.contains(&run.run_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         control.sort_by(|left, right| left.run_id.cmp(&right.run_id));
         if control.len() > recovery_limit {
             page.truncated = true;
             control.truncate(recovery_limit);
         }
-        page.recovery_cancellation_run_ids = control.iter().map(|run| run.run_id.clone()).collect();
-        page.recovery_next_cursor = control.last().map(|run| run.run_id.clone());
+        retry_control.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+        page.recovery_cancellation_run_ids = control
+            .iter()
+            .chain(retry_control.iter())
+            .map(|run| run.run_id.clone())
+            .collect();
+        page.recovery_next_cursor = control.last().map(|run| run.run_id.clone()).or_else(|| {
+            after_run_id
+                .filter(|_| !retry_control.is_empty())
+                .map(str::to_string)
+        });
         let mut included = page
             .runs
             .iter()
             .map(|run| run.run_id.clone())
             .collect::<HashSet<_>>();
-        for run in control {
-            if included.insert(run.run_id.clone()) {
+        terminal_refresh.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+        for run in control
+            .into_iter()
+            .chain(retry_control)
+            .chain(terminal_refresh)
+        {
+            if let Some(existing) = page
+                .runs
+                .iter_mut()
+                .find(|existing| existing.run_id == run.run_id)
+            {
+                *existing = run;
+            } else if included.insert(run.run_id.clone()) {
                 page.runs.push(run);
             }
         }
@@ -10486,6 +10533,10 @@ pub struct DatabaseRunStateStore {
     cancellation_marker_commit_ack_loss_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     terminal_transition_commit_ack_loss_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    recovery_page_loaded: Option<std::sync::Arc<tokio::sync::Notify>>,
+    #[cfg(test)]
+    recovery_page_continue: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 const UNSETTLED_USER_INTENT_EVENTS_SELECT_SQL: &str =
@@ -11123,6 +11174,10 @@ impl DatabaseRunStateStore {
             terminal_transition_commit_ack_loss_once: std::sync::Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
             ),
+            #[cfg(test)]
+            recovery_page_loaded: None,
+            #[cfg(test)]
+            recovery_page_continue: None,
         }
     }
 
@@ -11138,6 +11193,17 @@ impl DatabaseRunStateStore {
 
     pub fn with_session_execution_slot_stale_after(mut self, stale_after: Duration) -> Self {
         self.session_execution_slot_stale_after = stale_after;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_recovery_page_pause(
+        mut self,
+        loaded: std::sync::Arc<tokio::sync::Notify>,
+        continue_: std::sync::Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.recovery_page_loaded = Some(loaded);
+        self.recovery_page_continue = Some(continue_);
         self
     }
 
@@ -21598,72 +21664,104 @@ impl RunStateStore for DatabaseRunStateStore {
         let mut page = self
             .list_session_runs_with_columns(user_id, session_id, limit, AGENT_RUN_RECOVERY_COLUMNS)
             .await?;
-        // The ordinary bounded session page can contain a cancellation run
-        // that the recovery cursor already consumed. Remove only exact,
-        // durable cancellation facts at or before the cursor; applying the
-        // lexical cursor to every run would discard unrelated agent state and
-        // ancestor context.
-        if let Some(cursor) = after_run_id
-            && !page.runs.is_empty()
+        #[cfg(test)]
+        if let (Some(loaded), Some(continue_)) =
+            (&self.recovery_page_loaded, &self.recovery_page_continue)
         {
-            let mut processed = sqlx::QueryBuilder::<sqlx::MySql>::new(
-                "SELECT run_id FROM agent_runs WHERE user_id = ",
-            );
-            processed
+            loaded.notify_one();
+            continue_.notified().await;
+        }
+        // A generic session page can be saturated by newer active runs, so
+        // select a separate bounded cancellation marker batch. The terminal
+        // lane refreshes rows already present in the ordinary page in the
+        // same read wave. This makes a status transition between the two
+        // reads observable without a per-run read or a second transaction.
+        let recovery_limit = validate_run_list_limit(limit) as usize;
+        let page_run_ids = page
+            .runs
+            .iter()
+            .map(|run| run.run_id.clone())
+            .collect::<Vec<_>>();
+        let mut recovery_query = sqlx::QueryBuilder::<sqlx::MySql>::new("SELECT ");
+        recovery_query
+            .push(AGENT_RUN_RECOVERY_COLUMNS)
+            .push(", 1 AS recovery_kind FROM (SELECT ");
+        recovery_query
+            .push(AGENT_RUN_RECOVERY_COLUMNS)
+            .push(", ROW_NUMBER() OVER (ORDER BY run_id ASC) AS recovery_rank\n                 FROM agent_runs WHERE user_id = ")
+            .push_bind(user_id)
+            .push(" AND session_id = ")
+            .push_bind(session_id)
+            .push(" AND status IN (")
+            .push_bind(STATUS_RUNNING)
+            .push(", ")
+            .push_bind(STATUS_WAITING)
+            .push(", ")
+            .push_bind(STATUS_PAUSED)
+            .push(") AND cancellation_requested_at IS NOT NULL");
+        if let Some(after_run_id) = after_run_id {
+            recovery_query
+                .push(" AND run_id > ")
+                .push_bind(after_run_id);
+        }
+        recovery_query
+            .push(") ranked_active WHERE recovery_rank <= ")
+            .push_bind(session_run_query_limit(recovery_limit as u32));
+        if let Some(after_run_id) = after_run_id
+            && !page_run_ids.is_empty()
+        {
+            recovery_query.push(" UNION ALL SELECT ");
+            recovery_query
+                .push(AGENT_RUN_RECOVERY_COLUMNS)
+                .push(", 2 AS recovery_kind FROM agent_runs WHERE user_id = ")
                 .push_bind(user_id)
                 .push(" AND session_id = ")
                 .push_bind(session_id)
-                .push(" AND cancellation_requested_at IS NOT NULL AND run_id <= ")
-                .push_bind(cursor)
+                .push(" AND status IN (")
+                .push_bind(STATUS_RUNNING)
+                .push(", ")
+                .push_bind(STATUS_WAITING)
+                .push(", ")
+                .push_bind(STATUS_PAUSED)
+                .push(") AND cancellation_requested_at IS NOT NULL AND run_id <= ")
+                .push_bind(after_run_id)
                 .push(" AND run_id IN (");
             {
-                let mut ids = processed.separated(",");
-                for run in &page.runs {
-                    ids.push_bind(run.run_id.as_str());
+                let mut ids = recovery_query.separated(",");
+                for run_id in &page_run_ids {
+                    ids.push_bind(run_id);
                 }
             }
-            processed.push(")");
-            let processed_run_ids = processed
-                .build_query_scalar::<String>()
-                .fetch_all(self.pool.get())
-                .await
-                .map_err(|source| {
-                    db_error(
-                        "load_session_agent_processed_cancellation_recovery",
-                        session_id,
-                        source,
-                    )
-                    .to_string()
-                })?
-                .into_iter()
-                .collect::<HashSet<_>>();
-            page.runs
-                .retain(|run| !processed_run_ids.contains(&run.run_id));
+            recovery_query.push(")");
         }
-        // A generic session page can be saturated by newer active runs, so
-        // select a separate bounded cancellation marker batch.
-        let recovery_limit = validate_run_list_limit(limit) as usize;
-        let mut cancellation_query = format!(
-            "SELECT {AGENT_RUN_RECOVERY_COLUMNS} FROM agent_runs
-             WHERE user_id = ? AND session_id = ?
-               AND status IN (?, ?, ?)
-               AND cancellation_requested_at IS NOT NULL"
-        );
-        if after_run_id.is_some() {
-            cancellation_query.push_str(" AND run_id > ?");
+        if !page_run_ids.is_empty() {
+            recovery_query.push(" UNION ALL SELECT ");
+            recovery_query
+                .push(AGENT_RUN_RECOVERY_COLUMNS)
+                .push(", 3 AS recovery_kind");
+            recovery_query
+                .push(" FROM agent_runs WHERE user_id = ")
+                .push_bind(user_id)
+                .push(" AND session_id = ")
+                .push_bind(session_id)
+                .push(" AND status NOT IN (")
+                .push_bind(STATUS_RUNNING)
+                .push(", ")
+                .push_bind(STATUS_WAITING)
+                .push(", ")
+                .push_bind(STATUS_PAUSED)
+                .push(") AND run_id IN (");
+            {
+                let mut ids = recovery_query.separated(",");
+                for run_id in &page_run_ids {
+                    ids.push_bind(run_id);
+                }
+            }
+            recovery_query.push(")");
         }
-        cancellation_query.push_str(" ORDER BY run_id ASC LIMIT ?");
-        let mut cancellation_query = sqlx::query(&cancellation_query)
-            .bind(user_id)
-            .bind(session_id)
-            .bind(STATUS_RUNNING)
-            .bind(STATUS_WAITING)
-            .bind(STATUS_PAUSED);
-        if let Some(after_run_id) = after_run_id {
-            cancellation_query = cancellation_query.bind(after_run_id);
-        }
-        let mut cancellation_runs = cancellation_query
-            .bind(session_run_query_limit(recovery_limit as u32))
+        let recovery_runs = recovery_query
+            .push(" ORDER BY run_id ASC, recovery_kind ASC")
+            .build()
             .fetch_all(self.pool.get())
             .await
             .map_err(|source| {
@@ -21675,31 +21773,67 @@ impl RunStateStore for DatabaseRunStateStore {
                 .to_string()
             })?
             .into_iter()
-            .map(run_record_from_row)
+            .map(|row| {
+                let recovery_kind: i64 = row.try_get("recovery_kind").map_err(|source| {
+                    db_error("decode_session_agent_recovery_kind", session_id, source)
+                })?;
+                let run = run_record_from_row(row)?;
+                Ok((recovery_kind, run))
+            })
             .collect::<DbStoreResult<Vec<_>>>()
             .map_err(|error| error.to_string())?;
+        let mut cancellation_runs = Vec::new();
+        let mut retry_cancellation_runs = Vec::new();
+        let mut terminal_refresh_runs = Vec::new();
+        for (recovery_kind, run) in recovery_runs {
+            match recovery_kind {
+                1 => cancellation_runs.push(run),
+                2 => retry_cancellation_runs.push(run),
+                3 => terminal_refresh_runs.push(run),
+                other => unreachable!("unknown session agent recovery kind {other}"),
+            }
+        }
         if cancellation_runs.len() > recovery_limit {
             page.truncated = true;
             cancellation_runs.truncate(recovery_limit);
         }
         page.recovery_cancellation_run_ids = cancellation_runs
             .iter()
+            .chain(retry_cancellation_runs.iter())
             .map(|run| run.run_id.clone())
             .collect();
-        page.recovery_next_cursor = cancellation_runs.last().map(|run| run.run_id.clone());
+        page.recovery_next_cursor = cancellation_runs
+            .last()
+            .map(|run| run.run_id.clone())
+            .or_else(|| {
+                after_run_id
+                    .filter(|_| !retry_cancellation_runs.is_empty())
+                    .map(str::to_string)
+            });
         let mut included = page
             .runs
             .iter()
             .map(|run| run.run_id.clone())
             .collect::<HashSet<_>>();
-        for run in cancellation_runs {
-            if included.insert(run.run_id.clone()) {
+        for run in cancellation_runs
+            .into_iter()
+            .chain(retry_cancellation_runs)
+            .chain(terminal_refresh_runs)
+        {
+            if let Some(existing) = page
+                .runs
+                .iter_mut()
+                .find(|existing| existing.run_id == run.run_id)
+            {
+                *existing = run;
+            } else if included.insert(run.run_id.clone()) {
                 page.runs.push(run);
             }
         }
         // Keep the possible direct parents as event-query identities. We only
         // load their run rows below if the bounded event query actually finds
-        // a fanout cancellation; ordinary child recovery stays one read wave.
+        // the parent-owned spawn or fanout-cancellation envelope; ordinary
+        // child recovery stays one read wave.
         let parent_run_ids = page
             .runs
             .iter()
@@ -21826,22 +21960,25 @@ impl RunStateStore for DatabaseRunStateStore {
                 .or_default()
                 .push((event_idx, payload));
         }
-        // Group cancellation events live on the parent run, but a bounded
-        // cancellation page can select only a child. Read missing direct
-        // parents only when that event query proves the parent owns a group
-        // cancellation. A normal recovery refresh therefore pays no extra
-        // parent-row SQL round trip.
-        let parents_with_group_cancellations = parent_run_ids
+        // Spawn and group-cancellation events live on the parent run, but a
+        // bounded cancellation page can select only a child. Read missing
+        // direct parents only when the event query proves the parent owns one
+        // of those envelopes. A normal recovery refresh therefore pays no
+        // extra parent-row SQL round trip.
+        let parents_with_recovery_events = parent_run_ids
             .into_iter()
             .filter(|parent_run_id| {
                 events_by_run.get(parent_run_id).is_some_and(|events| {
-                    events
-                        .iter()
-                        .any(|(_, event)| extract_event_type(event) == "fanout_group_cancelled")
+                    events.iter().any(|(_, event)| {
+                        matches!(
+                            extract_event_type(event).as_str(),
+                            "agent_spawned" | "fanout_group_cancelled"
+                        )
+                    })
                 })
             })
             .collect::<Vec<_>>();
-        if !parents_with_group_cancellations.is_empty() {
+        if !parents_with_recovery_events.is_empty() {
             let mut parent_query = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
                 "SELECT {AGENT_RUN_RECOVERY_COLUMNS} FROM agent_runs WHERE user_id = "
             ));
@@ -21852,7 +21989,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 .push(" AND run_id IN (");
             {
                 let mut ids = parent_query.separated(",");
-                for run_id in &parents_with_group_cancellations {
+                for run_id in &parents_with_recovery_events {
                     ids.push_bind(run_id);
                 }
             }
@@ -30023,8 +30160,15 @@ mod tests {
             .load_session_agent_recovery_after(&user_id, &session_id, 2, Some(&child_id))
             .await
             .expect("MatrixOne cancellation recovery seek");
-        assert!(after_page.recovery_next_cursor.is_none());
-        assert!(after_page.runs.iter().all(|run| run.run_id != child_id));
+        assert_eq!(
+            after_page.recovery_next_cursor.as_deref(),
+            Some(child_id.as_str())
+        );
+        assert_eq!(
+            after_page.recovery_cancellation_run_ids,
+            vec![child_id.clone()]
+        );
+        assert!(after_page.runs.iter().any(|run| run.run_id == child_id));
 
         assert!(
             store
@@ -30067,6 +30211,166 @@ mod tests {
         for run_id in [&root_id, &child_id].into_iter().chain(noise_ids.iter()) {
             cleanup_database_run_fixture(&pool, &user_id, run_id).await;
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_agent_recovery_loads_spawn_only_fanout_parent_on_matrixone() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("runs-it-spawn-parent-user-{}", Uuid::new_v4());
+        let session_id = format!("spawn-parent-session-{}", Uuid::new_v4());
+        let parent_id = format!("runs-it-spawn-parent-{}", Uuid::new_v4());
+        let child_id = format!("runs-it-spawn-child-{}", Uuid::new_v4());
+        let noise_id = format!("runs-it-spawn-noise-{}", Uuid::new_v4());
+        for run_id in [&parent_id, &child_id, &noise_id] {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+        }
+        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+
+        let mut parent = durable_run_record(&parent_id);
+        parent.user_id = user_id.clone();
+        parent.session_id = session_id.clone();
+        store.insert_run(parent).await.unwrap();
+
+        let mut child = durable_run_record(&child_id);
+        child.user_id = user_id.clone();
+        child.session_id = session_id.clone();
+        child.parent_run_id = Some(parent_id.clone());
+        child.root_run_id = Some(parent_id.clone());
+        child.ancestor_path = Some(format!("{parent_id}/{child_id}"));
+        child.depth = 1;
+        child.agent_id = Some("reviewer".into());
+        store.insert_run(child).await.unwrap();
+
+        let mut noise = durable_run_record(&noise_id);
+        noise.user_id = user_id.clone();
+        noise.session_id = session_id.clone();
+        noise.status = STATUS_COMPLETED.to_string();
+        store.insert_run(noise).await.unwrap();
+        store
+            .append_events_batch(
+                &user_id,
+                &session_id,
+                &parent_id,
+                &[serde_json::json!({
+                    "type": "agent_spawned",
+                    "run_id": child_id,
+                    "agent_id": "reviewer",
+                    "agent_type": "code-review",
+                    "description": "recover spawn metadata without group cancellation"
+                })],
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .request_run_cancellation(&user_id, &child_id)
+                .await
+                .unwrap()
+        );
+        sqlx::query(
+            "UPDATE agent_runs
+             SET updated_at = DATE_SUB(NOW(6), INTERVAL 1 DAY)
+             WHERE user_id = ? AND run_id IN (?, ?)",
+        )
+        .bind(&user_id)
+        .bind(&parent_id)
+        .bind(&child_id)
+        .execute(pool.get())
+        .await
+        .expect("make the parent and child fall outside the ordinary page");
+
+        let page = store
+            .load_session_agent_recovery(&user_id, &session_id, 1)
+            .await
+            .expect("spawn-only parent recovery");
+        let parent = page
+            .runs
+            .iter()
+            .find(|run| run.run_id == parent_id)
+            .expect("recovery must load the missing direct parent");
+        assert_eq!(parent.events.len(), 1);
+        assert_eq!(extract_event_type(&parent.events[0]), "agent_spawned");
+        assert!(page.runs.iter().any(|run| run.run_id == child_id));
+
+        for run_id in [&parent_id, &child_id, &noise_id] {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_agent_recovery_refreshes_terminal_race_on_matrixone() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("runs-it-terminal-race-user-{}", Uuid::new_v4());
+        let session_id = format!("terminal-race-session-{}", Uuid::new_v4());
+        let run_id = format!("runs-it-terminal-race-{}", Uuid::new_v4());
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user_id.clone();
+        run.session_id = session_id.clone();
+        store.insert_run(run).await.unwrap();
+        assert!(
+            store
+                .request_run_cancellation(&user_id, &run_id)
+                .await
+                .unwrap()
+        );
+
+        let page_loaded = std::sync::Arc::new(tokio::sync::Notify::new());
+        let page_continue = std::sync::Arc::new(tokio::sync::Notify::new());
+        let recovery_store = store
+            .clone()
+            .with_recovery_page_pause(page_loaded.clone(), page_continue.clone());
+        let recovery_user_id = user_id.clone();
+        let recovery_session_id = session_id.clone();
+        let recovery = tokio::spawn(async move {
+            recovery_store
+                .load_session_agent_recovery(&recovery_user_id, &recovery_session_id, 1)
+                .await
+        });
+        page_loaded.notified().await;
+        assert!(
+            store
+                .update_run_status_with_events_if_current(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    &[STATUS_RUNNING],
+                    None,
+                    STATUS_CANCELLED,
+                    None,
+                    None,
+                    &[serde_json::json!({
+                        "event_type": "run_finished",
+                        "data": {
+                            "run_id": run_id,
+                            "status": STATUS_CANCELLED,
+                            "cancelled": true,
+                            "cancellation_origin": "user"
+                        }
+                    })],
+                )
+                .await
+                .unwrap()
+        );
+        page_continue.notify_one();
+
+        let page = recovery
+            .await
+            .expect("recovery task join")
+            .expect("terminal race recovery");
+        let recovered = page
+            .runs
+            .iter()
+            .find(|run| run.run_id == run_id)
+            .expect("ordinary page row remains addressable");
+        assert_eq!(recovered.status, STATUS_CANCELLED);
+        assert_eq!(recovered.events.len(), 1);
+        assert!(page.recovery_cancellation_run_ids.is_empty());
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
     }
 
     #[tokio::test]
