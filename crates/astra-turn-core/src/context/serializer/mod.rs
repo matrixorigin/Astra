@@ -373,15 +373,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_path_emits_single_system_marker_to_preserve_message_budget() {
-        // Anthropic allows at most 4 cache_control entries per request. The
-        // runtime splits the budget as:
-        //   1 × system  +  1 × tools  +  2 × messages (rolling historical+tail)
-        // So the system serializer MUST emit at most 1 marker even when
-        // multiple candidate blocks exist. The message-level pair is the
-        // load-bearing one; dropping a system marker costs ~200 cached
-        // tokens while dropping a message marker costs the entire
-        // conversation-history prefix (thousands of tokens).
+    fn legacy_path_emits_single_system_marker_for_stable_prefix() {
+        // Anthropic allows at most 4 cache_control entries per request.
+        // Current requests use at most one each for system, tools, and the
+        // latest message, leaving one slot unused. The system serializer
+        // marks only the deepest stable block even when several qualify.
         let sections = vec![
             make_section("global 1", CacheScope::Global),
             make_section("global 2", CacheScope::Global),
@@ -398,8 +394,7 @@ mod tests {
             .count();
         assert_eq!(
             cached_count, 1,
-            "system must emit exactly 1 marker — the remaining budget is \
-             spent on the rolling message-history pair"
+            "system must emit exactly 1 marker at the deepest stable block"
         );
         assert_eq!(result.cache_markers.len(), 1);
         // Preference: last Session block (index 3) over last Global (index 1),
