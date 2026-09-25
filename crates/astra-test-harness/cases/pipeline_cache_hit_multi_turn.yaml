@@ -1,12 +1,13 @@
 name: pipeline_cache_hit_multi_turn
 description: |
   **What**: Four ACK-only turns measure cache reuse and inclusive input cost.
-  **Tests**: Demonstrated cached reads, bounded cache creation, and exact responses
-  without unrelated tools. Preserve primary and auxiliary costs in the report.
-  **Pass means**: Four exact ACK responses, no tools, at least 10000 cumulative
-  cached input tokens and at most 25000 cache-creation tokens.
-  **Limits**: These cumulative bounds catch severe reuse loss or repeated creation;
-  they do not prove exact request-prefix continuity or every local cache regression.
+  **Tests**: Demonstrated cached reads and exact responses without unrelated
+  tools. Report cache creation separately when the provider exposes it.
+  **Pass means**: Four exact ACK responses, no tools, and at least 10000
+  cumulative cached input tokens.
+  **Limits**: The read floor catches severe reuse loss; the creation ceiling is
+  diagnostic when exact creation usage is available. Neither proves exact
+  request-prefix continuity or every local cache regression.
   New conversation input and necessary auxiliary calls can produce reasonable fresh
   cost despite stable system/tool identities. There is no universal percentage SLO
   in this case; inspect absolute costs and request evidence before assigning a bug.
@@ -40,7 +41,10 @@ criteria:
       - type: prompt_cache_tokens
         min_read: 10000
         min_creation: 0
-        max_creation: 25000
       - type: tools_count_between
         min: 0
         max: 0
+  - type: prompt_cache_tokens
+    min_read: 0
+    min_creation: 0
+    max_creation: 25000

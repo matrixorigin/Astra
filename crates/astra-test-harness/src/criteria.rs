@@ -7277,6 +7277,48 @@ mod tests {
     }
 
     #[test]
+    fn shipped_multi_turn_cache_case_gates_reads_without_exact_creation_usage() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("cases/pipeline_cache_hit_multi_turn.yaml");
+        let case = crate::case::Case::from_path(&path).expect("load shipped cache case");
+        let gate = case
+            .criteria
+            .iter()
+            .find(|criterion| matches!(criterion, Criterion::AllOf { .. }))
+            .expect("cache-read hard gate");
+        let diagnostic = case
+            .criteria
+            .iter()
+            .find(|criterion| {
+                matches!(
+                    criterion,
+                    Criterion::PromptCacheTokens {
+                        max_creation: Some(_),
+                        ..
+                    }
+                )
+            })
+            .expect("cache-creation diagnostic");
+        assert_eq!(criterion_severity(gate), CriterionSeverity::Hard);
+        assert_eq!(criterion_severity(diagnostic), CriterionSeverity::Soft);
+
+        let partial = |read| {
+            let mut outcome = cache_request_outcome("run", "turn", &[(100, read, 0)]);
+            for event in &mut outcome.explain_capture.as_mut().unwrap().events {
+                if let Some(usage) = &mut event.usage {
+                    usage.basis = astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderPartial;
+                    usage.cache_creation_tokens = None;
+                }
+            }
+            outcome
+        };
+        let strong = partial(10_000);
+        assert!(evaluate_one(gate, &strong, None).passed);
+        assert!(!evaluate_one(diagnostic, &strong, None).passed);
+        assert!(!evaluate_one(gate, &partial(9_999), None).passed);
+    }
+
+    #[test]
     fn required_prompt_cache_scope_reports_one_witness_after_full_coverage_validation() {
         let many = cache_request_outcome("r1", "t1", &[(0, 0, 0); 3]);
         let witness = cache_request_outcome("r2", "t2", &[(0, 0, 0), (0, 300, 0)]);
