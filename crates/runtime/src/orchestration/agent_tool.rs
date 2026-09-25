@@ -807,8 +807,10 @@ pub async fn recover_agent_fanout_tool_result(
         .map(str::trim)
         .filter(|id| !id.is_empty());
     if let Some(group_id) = requested_group_id
-        && let Some(group) = ctx.spawner.fanout_group(group_id).await
-        && group.parent_run_id.as_deref() == Some(ctx.run_id.as_str())
+        && let Some(group) = ctx
+            .spawner
+            .fanout_group_for_parent_run_and_id(&ctx.run_id, group_id)
+            .await
     {
         return render_agent_fanout_results(
             ctx,
@@ -1337,12 +1339,15 @@ async fn handle_agent_fanout_start_action_with_deadline(
     let tool_call_id = input._tool_call_id.clone();
     if let Err(error) = ctx
         .spawner
-        .declare_fanout_group(
+        .declare_fanout_group_with_owner(
             &group_id,
             &title,
             input.target_count,
             tool_call_id.as_deref(),
             &ctx.run_id,
+            ctx.trace_context
+                .as_ref()
+                .map(|trace| (trace.user_id.as_str(), trace.session_id.as_str())),
         )
         .await
     {
@@ -1399,7 +1404,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
                 .to_string();
             let _ = ctx
                 .spawner
-                .cancel_fanout_group_for_deadline(&group_id, &reason)
+                .cancel_fanout_group_for_deadline_in_parent(&ctx.run_id, &group_id, &reason)
                 .await;
             return render_agent_fanout_results(
                 ctx,
@@ -2104,13 +2109,18 @@ async fn handle_agent_fanout_stop_group_action(
 
     let cancelled = ctx
         .spawner
-        .cancel_fanout_group_for_runtime(group_id, "parent agent stopped fanout group")
+        .cancel_fanout_group_for_runtime_in_parent(
+            &ctx.run_id,
+            group_id,
+            "parent agent stopped fanout group",
+        )
         .await
         // The group was confirmed immediately above; a concurrent cleanup can
         // only make it terminal, never turn it into an unknown target.
         .unwrap_or_else(|| crate::orchestration::FanoutGroupCancellation {
             group,
             cancellation_pending_agent_ids: Vec::new(),
+            group_cancellation_pending: false,
             stopped_agent_ids: Vec::new(),
             not_stopped_agent_ids: Vec::new(),
             already_terminal_count: 0,
@@ -2118,12 +2128,13 @@ async fn handle_agent_fanout_stop_group_action(
         });
     let updated = cancelled.group;
     let cancellation_pending_agent_ids = cancelled.cancellation_pending_agent_ids;
+    let group_cancellation_pending = cancelled.group_cancellation_pending;
     let stopped_agent_ids = cancelled.stopped_agent_ids;
     let not_stopped_agent_ids = cancelled.not_stopped_agent_ids;
     let already_terminal_count = cancelled.already_terminal_count;
     let non_stoppable_count = cancelled.non_stoppable_count;
     let has_issues = !not_stopped_agent_ids.is_empty() || non_stoppable_count > 0;
-    let stop_outcome = if !cancellation_pending_agent_ids.is_empty() {
+    let stop_outcome = if group_cancellation_pending || !cancellation_pending_agent_ids.is_empty() {
         "cancellation_pending"
     } else if has_issues {
         "partially_stopped"
@@ -2146,6 +2157,7 @@ async fn handle_agent_fanout_stop_group_action(
         "stopped_agent_ids": stopped_agent_ids,
         "cancellation_pending_count": cancellation_pending_agent_ids.len(),
         "cancellation_pending_agent_ids": cancellation_pending_agent_ids,
+        "group_cancellation_pending": group_cancellation_pending,
         "already_terminal_count": already_terminal_count,
         "non_stoppable_count": non_stoppable_count,
         "not_stopped_agent_ids": not_stopped_agent_ids,
@@ -2262,7 +2274,9 @@ async fn find_fanout_group(
     ctx: &AgentToolContext,
     group_id: &str,
 ) -> Option<AgentFanoutGroupProjection> {
-    ctx.spawner.fanout_group(group_id).await
+    ctx.spawner
+        .fanout_group_for_parent_run_and_id(&ctx.run_id, group_id)
+        .await
 }
 
 fn fanout_group_to_json(group: &AgentFanoutGroupProjection) -> Value {
@@ -2274,6 +2288,7 @@ fn fanout_group_to_json(group: &AgentFanoutGroupProjection) -> Value {
         "target_count": summary.target_count,
         "revision": group.revision,
         "status": group.status.as_str(),
+        "admission_closed": group.spawn_admission_closed(),
         "summary": group.summary_sentence(),
         "accepted": summary.accepted,
         "active": summary.active,

@@ -7502,6 +7502,7 @@ impl AgenticRunLifecycleService {
         for spawner in spawners {
             if spawner.background_task_count() != 0
                 || spawner.has_in_flight_cancellation_owners().await
+                || spawner.has_pending_fanout_group_cancellations()
                 || !spawner.list_all_agents().await.is_empty()
             {
                 return false;
@@ -21517,36 +21518,42 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         target_count: usize,
         reason: &str,
         origin: CancellationOrigin,
+        owner_user_id: Option<&str>,
+        owner_session_id: Option<&str>,
     ) -> Result<(), String> {
         let Some(run_engine) = self.run_engine.as_ref() else {
-            return Ok(());
+            return Err("durable run engine is unavailable".to_string());
         };
-        let context = {
+        let context_identity = {
             let registry = self.runtime_context_registry.read().await;
             registry
                 .current_context_id_by_run
                 .get(parent_run_id)
                 .and_then(|context_id| registry.contexts_by_id.get(context_id))
-                .cloned()
+                .map(|context| (context.user_id.clone(), context.session_id.clone()))
         };
-        let Some(context) = context else {
+        let (user_id, owner_session_id) = match (
+            owner_user_id.filter(|value| !value.trim().is_empty()),
+            owner_session_id.filter(|value| !value.trim().is_empty()),
+        ) {
+            (Some(user_id), Some(session_id)) => (user_id.to_string(), session_id.to_string()),
+            _ => context_identity.ok_or_else(|| {
+                format!("no durable owner identity for fanout parent run {parent_run_id}")
+            })?,
+        };
+        let Some(snapshot) = run_engine
+            .load_run_status_snapshot(&user_id, parent_run_id)
+            .await?
+        else {
             return Err(format!(
-                "no live runtime context for fanout parent run {parent_run_id}"
+                "fanout parent run {parent_run_id} no longer exists"
             ));
         };
-        let owner_generation = match context
-            .execution_owner_generation
-            .wait_until_published_or_stopped()
-            .await
-        {
-            ExecutionOwnerGenerationPublication::Acquired(generation) => generation,
-            ExecutionOwnerGenerationPublication::Preparing { .. }
-            | ExecutionOwnerGenerationPublication::StoppedBeforeAcquisition { .. } => {
-                // The parent cannot admit another child after its owner was
-                // stopped; there is no durable group admission to preserve.
-                return Ok(());
-            }
-        };
+        if snapshot.session_id != owner_session_id {
+            return Err(format!(
+                "fanout parent run {parent_run_id} belongs to a different session"
+            ));
+        }
         let idempotency_key = format!("fanout-group-cancelled:{group_id}");
         let event = json!({
             "event_type": FANOUT_GROUP_CANCELLED_EVENT_TYPE,
@@ -21559,86 +21566,48 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
                 "cancellation_origin": origin.as_str(),
             }
         });
-        let appended = run_engine
-            .append_events_if_current_generation_and_status(
-                &context.user_id,
-                &context.session_id,
-                parent_run_id,
-                owner_generation,
-                &[STATUS_RUNNING, STATUS_WAITING, STATUS_PAUSED],
-                &[event],
-            )
-            .await?;
-        if appended {
-            return Ok(());
-        }
-        // A terminal parent already prevents a later child admission. If the
-        // parent is still active, report the lost fence instead of claiming a
-        // restart-safe cancellation that was never recorded.
-        if run_engine
-            .load_run_event_by_idempotency_key(
-                &context.user_id,
-                parent_run_id,
-                FANOUT_GROUP_CANCELLED_EVENT_TYPE,
-                &idempotency_key,
-            )
-            .await?
-            .is_some()
-        {
-            // A retry after a committed append can return `false` from the
-            // generation fence because the append is idempotent. The durable
-            // event itself is the authoritative success signal.
-            return Ok(());
-        }
-        match run_engine
-            .load_run_status_snapshot(&context.user_id, parent_run_id)
-            .await?
-        {
-            Some(run)
-                if matches!(
-                    run.status.as_str(),
-                    STATUS_COMPLETED | STATUS_FAILED | STATUS_CANCELLED | STATUS_DELEGATED
-                ) =>
+        if matches!(
+            snapshot.status.as_str(),
+            STATUS_RUNNING | STATUS_WAITING | STATUS_PAUSED
+        ) {
+            let appended = run_engine
+                .append_events_if_current_generation_and_status(
+                    &user_id,
+                    &snapshot.session_id,
+                    parent_run_id,
+                    snapshot.run_generation,
+                    &[STATUS_RUNNING, STATUS_WAITING, STATUS_PAUSED],
+                    std::slice::from_ref(&event),
+                )
+                .await?;
+            if appended
+                || run_engine
+                    .load_run_event_by_idempotency_key(
+                        &user_id,
+                        parent_run_id,
+                        FANOUT_GROUP_CANCELLED_EVENT_TYPE,
+                        &idempotency_key,
+                    )
+                    .await?
+                    .is_some()
             {
-                Ok(())
+                return Ok(());
             }
-            Some(run) => Err(format!(
-                "fanout group cancellation lost parent owner fence for {parent_run_id} at generation {} (current status {})",
-                run.run_generation, run.status
-            )),
-            None => Ok(()),
+            return Err(format!(
+                "fanout group cancellation lost parent generation fence for {parent_run_id}"
+            ));
         }
-    }
-
-    async fn fanout_group_cancellation_is_durable(
-        &self,
-        group_id: &str,
-        parent_run_id: &str,
-    ) -> Result<bool, String> {
-        let Some(run_engine) = self.run_engine.as_ref() else {
-            return Ok(false);
-        };
-        let context = {
-            let registry = self.runtime_context_registry.read().await;
-            registry
-                .current_context_id_by_run
-                .get(parent_run_id)
-                .and_then(|context_id| registry.contexts_by_id.get(context_id))
-                .cloned()
-        };
-        let Some(context) = context else {
-            return Ok(false);
-        };
-        let idempotency_key = format!("fanout-group-cancelled:{group_id}");
-        Ok(run_engine
-            .load_run_event_by_idempotency_key(
-                &context.user_id,
+        // A terminal parent has retired its live context, but its event log is
+        // still the durable authority. Append the idempotent fence rather than
+        // silently treating the missing context as success.
+        run_engine
+            .append_events_batch(
+                &user_id,
+                &snapshot.session_id,
                 parent_run_id,
-                FANOUT_GROUP_CANCELLED_EVENT_TYPE,
-                &idempotency_key,
+                std::slice::from_ref(&event),
             )
-            .await?
-            .is_some())
+            .await
     }
 
     async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
