@@ -6327,6 +6327,7 @@ mod tests {
         spawner: Arc<astra_runtime::orchestration::DynamicAgentSpawner>,
     ) -> astra_runtime::orchestration::AgentToolContext {
         astra_runtime::orchestration::AgentToolContext {
+            fanout_admission: spawner.fanout_parent("run-parent"),
             run_id: "run-parent".into(),
             agent_id: "root-agent".into(),
             delegation_chain: Vec::new(),

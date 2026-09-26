@@ -104,9 +104,10 @@ use crate::MatrixOneSettings;
 use crate::observability::ObservabilityHub;
 use crate::orchestration::{
     AgentProgressEvent, AgentToolContext, AgentTranscriptLocation, CancellationOrigin,
-    DurableAgentReconciler, DynamicAgentSpawner, InheritedPermissions, PermissionMode,
-    PermissionSyncContext, ProgressBroadcaster, ProgressEventType, SpawnAgentExecutor,
-    SpawnRunCancellationDurability, SpawnRunConfig, SpawnRunResult, SpawnedAgentState,
+    DurableAgentReconciler, DynamicAgentSpawner, FANOUT_GROUP_CANCELLED_EVENT_TYPE,
+    InheritedPermissions, PermissionMode, PermissionSyncContext, ProgressBroadcaster,
+    ProgressEventType, SpawnAgentExecutor, SpawnRunCancellationDurability, SpawnRunConfig,
+    SpawnRunResult, SpawnedAgentState,
 };
 use crate::server::run::cloud_workspace_provisioning::CloudWorkspaceProvisioner;
 use crate::server::run::workspace_provisioning::{
@@ -4445,6 +4446,7 @@ impl ServerAgentSpawnerEntry {
         !self.spawner.has_lifecycle_activity()
             && self.spawner.background_task_count() == 0
             && !self.spawner.has_in_flight_cancellation_owners().await
+            && !self.spawner.has_pending_fanout_group_cancellations()
             && self.spawner.list_all_agents().await.is_empty()
             && !self.spawner.has_lifecycle_activity()
             && self.spawner.activity_epoch() == activity_epoch
@@ -4480,7 +4482,7 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
         let cancellation_cursor = state.cancellation_cursor.clone();
         let mut next_cancellation_cursor = None;
         let result = async {
-            let page = self
+            let mut page = self
                 .run_engine
                 .load_session_agent_recovery_after(
                     &self.user_id,
@@ -4490,82 +4492,114 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
                 )
                 .await?;
             next_cancellation_cursor = page.recovery_next_cursor.clone();
-            let mut must_reload = false;
+            let recovery_cancellation_run_ids = page
+                .recovery_cancellation_run_ids
+                .iter()
+                .collect::<HashSet<_>>();
             let mut failed_run_ids = Vec::new();
-            let active_runs = page
+            let cancellation_run_ids = page
                 .runs
                 .iter()
-                .filter(|run| {
-                    matches!(
-                        run.status.as_str(),
-                        STATUS_RUNNING | STATUS_WAITING | STATUS_PAUSED
-                    )
-                })
+                .filter(|run| recovery_cancellation_run_ids.contains(&run.run_id))
+                .map(|run| run.run_id.clone())
                 .collect::<Vec<_>>();
-            // Control records are narrow and independent. Bound each read
-            // wave so a large session does not serialize 200 MatrixOne RTTs
-            // or issue an unbounded burst through the shared pool.
-            for chunk in active_runs.chunks(16) {
-                let controls = futures_util::future::join_all(chunk.iter().map(|run| {
-                    self.run_engine
-                        .load_run_control(&run.user_id, &run.run_id)
-                }))
-                .await;
-                for (run, control) in chunk.iter().copied().zip(controls) {
-                    let cancellation_requested = match control {
-                        Ok(Some(control)) => control.cancellation_requested,
-                        Ok(None) => false,
-                        Err(error) => {
-                            failed_run_ids.push(run.run_id.clone());
-                            tracing::warn!(
-                                user_id = %run.user_id,
-                                session_id = %run.session_id,
-                                run_id = %run.run_id,
-                                %error,
-                                "durable child User cancellation marker lookup failed"
-                            );
-                            false
-                        }
-                    };
-                    if !cancellation_requested {
-                        continue;
+            // The recovery query already selected these rows from the
+            // durable cancellation lane. Re-reading one control row per
+            // active run only repeats the same predicate and can turn one
+            // refresh into hundreds of database round trips.
+            for run_id in cancellation_run_ids {
+                let Some(run) = page.runs.iter().find(|run| run.run_id == run_id) else {
+                    continue;
+                };
+                let user_id = run.user_id.clone();
+                let session_id = run.session_id.clone();
+                let run_id = run.run_id.clone();
+                let event = json!({
+                    "event_type": "run_finished",
+                    "data": {
+                        "run_id": &run_id,
+                        "status": STATUS_CANCELLED,
+                        "cancelled": true,
+                        "reason": "recovered durable child User cancellation request",
+                        "source": "agent_cancellation_reconciler",
+                        "cancellation_origin": CancellationOrigin::User,
                     }
-                    let event = json!({
-                        "event_type": "run_finished",
-                        "data": {
-                            "run_id": run.run_id,
-                            "status": STATUS_CANCELLED,
-                            "cancelled": true,
-                            "reason": "recovered durable child User cancellation request",
-                            "source": "agent_cancellation_reconciler",
-                            "cancellation_origin": CancellationOrigin::User,
+                });
+                match self
+                    .run_engine
+                    .transition_status_with_event_if_current(
+                        &user_id,
+                        &session_id,
+                        &run_id,
+                        &[STATUS_RUNNING, STATUS_WAITING, STATUS_PAUSED],
+                        STATUS_CANCELLED,
+                        None,
+                        None,
+                        event.clone(),
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        if let Some(run) = page.runs.iter_mut().find(|run| run.run_id == run_id) {
+                            run.status = STATUS_CANCELLED.to_string();
+                            run.waiting_for = None;
+                            // The transition may also append interaction and
+                            // intent-closure events in the same transaction.
+                            // This page is a read-only projection with sparse
+                            // event payloads, so do not fabricate a high-water
+                            // mark from the one event supplied by the caller.
+                            run.events.push(event);
                         }
-                    });
-                    match self
-                        .run_engine
-                        .transition_status_with_event_if_current(
-                            &run.user_id,
-                            &run.session_id,
-                            &run.run_id,
-                            &[STATUS_RUNNING, STATUS_WAITING, STATUS_PAUSED],
-                            STATUS_CANCELLED,
-                            None,
-                            None,
-                            event,
-                        )
-                        .await
-                    {
-                        Ok(_) => must_reload = true,
-                        Err(error) => {
-                            failed_run_ids.push(run.run_id.clone());
-                            tracing::warn!(
-                                user_id = %run.user_id,
-                                session_id = %run.session_id,
-                                run_id = %run.run_id,
-                                %error,
-                                "durable child User cancellation recovery failed; retaining the shared marker for retry"
-                            );
+                    }
+                    Ok(false) => {
+                        // A concurrent terminal winner is not an invitation
+                        // to publish the stale active snapshot. This is a
+                        // conflict-only read: the normal path still has zero
+                        // per-run control queries, while the rare CAS loser
+                        // refreshes its exact durable record for convergence.
+                        match self.run_engine.load_run(&user_id, &run_id).await {
+                            Ok(Some(fresh)) => {
+                                if let Some(snapshot) =
+                                    page.runs.iter_mut().find(|run| run.run_id == run_id)
+                                {
+                                    *snapshot = fresh;
+                                }
+                            }
+                            Ok(None) => page.runs.retain(|run| run.run_id != run_id),
+                            Err(error) => {
+                                // The CAS already lost, so the page snapshot
+                                // is no longer authoritative. If the exact
+                                // winner read is unavailable, omit this run
+                                // rather than publishing a stale active
+                                // state; the durable cancellation marker and
+                                // the periodic safety sweep retain retry
+                                // responsibility.
+                                page.runs.retain(|run| run.run_id != run_id);
+                                failed_run_ids.push(run_id.clone());
+                                tracing::warn!(
+                                    user_id = %user_id,
+                                    session_id = %session_id,
+                                    run_id = %run_id,
+                                    %error,
+                                    "durable child cancellation CAS lost and exact winner read failed"
+                                );
+                            }
                         }
+                    }
+                    Err(error) => {
+                        // A failed terminal transition leaves the prior
+                        // snapshot unverified. Do not let an active-looking
+                        // row escape after an ambiguous COMMIT; the durable
+                        // marker remains available for the next sweep.
+                        page.runs.retain(|run| run.run_id != run_id);
+                        failed_run_ids.push(run_id.clone());
+                        tracing::warn!(
+                            user_id = %user_id,
+                            session_id = %session_id,
+                            run_id = %run_id,
+                            %error,
+                            "durable child User cancellation recovery failed; retaining the shared marker for retry"
+                        );
                     }
                 }
             }
@@ -4577,21 +4611,14 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
                     "one or more durable child cancellation recoveries remain pending"
                 );
             }
-            if must_reload {
-                self.run_engine
-                    .load_session_agent_recovery(&self.user_id, &self.session_id, 200)
-                    .await
-                    .map(|page| page.runs)
-            } else {
-                Ok(page.runs)
-            }
+            Ok(page.runs)
         }
         .await;
         state.last_attempt = Some(Instant::now());
-        // An empty seek page wraps the next refresh to the beginning. Poison
-        // rows therefore delay at most one bounded cycle and cannot occupy a
-        // permanent front page.
-        state.cancellation_cursor = next_cancellation_cursor;
+        if result.is_ok() {
+            // An empty seek page wraps the cancellation lane to the beginning.
+            state.cancellation_cursor = next_cancellation_cursor;
+        }
         state.cached = Some(result.clone());
         result
     }
@@ -7059,6 +7086,7 @@ impl AgenticRunLifecycleService {
             .unwrap_or_else(|| "root-agent".to_string());
         let active_work_registry = entry.active_work_registry.clone();
         executor.set_agent_tool_context(AgentToolContext {
+            fanout_admission: entry.spawner.fanout_parent(run_id),
             run_id: run_id.to_string(),
             agent_id,
             delegation_chain: Vec::new(),
@@ -7500,6 +7528,7 @@ impl AgenticRunLifecycleService {
         for spawner in spawners {
             if spawner.background_task_count() != 0
                 || spawner.has_in_flight_cancellation_owners().await
+                || spawner.has_pending_fanout_group_cancellations()
                 || !spawner.list_all_agents().await.is_empty()
             {
                 return false;
@@ -15653,6 +15682,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let agent_spawner_entry = self
                 .server_agent_spawner_for_session(&user_id, &session_id)
                 .await;
+            let _fanout_admission = agent_spawner_entry.spawner.fanout_parent(&run_id);
             let durable_agent_restore = self
                 .restore_server_dynamic_agents(&agent_spawner_entry, &user_id, &session_id)
                 .await;
@@ -16516,6 +16546,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // admission are independent database reads. Restore them together so
         // first-turn recovery does not add another full round trip chain to
         // SSE response-header latency.
+        let _fanout_admission = stream_agent_spawner_entry.spawner.fanout_parent(&run_id);
         let (canonical_turn, mut durable_agent_restore) = tokio::join!(
             self.prepare_canonical_turn(
                 &user_id,
@@ -20740,8 +20771,12 @@ impl ServerSpawnAgentExecutor {
             };
             match run_engine.load_run(user_id, run_id).await? {
                 None => {
-                    self.retire_authoritative_runtime_run(run_id).await;
-                    return Ok(SpawnRunCancellationDurability::Terminal);
+                    if let Some(token) = local_cancel_token.as_ref() {
+                        token.cancel();
+                    }
+                    return Ok(SpawnRunCancellationDurability::PreDurable {
+                        expected_initial_generation: Some(expected_initial_generation),
+                    });
                 }
                 Some(durable)
                     if matches!(
@@ -20790,8 +20825,12 @@ impl ServerSpawnAgentExecutor {
             match run_engine.load_run(user_id, run_id).await? {
                 Some(durable) => resolved_session_id = Some(durable.session_id),
                 None => {
-                    self.retire_authoritative_runtime_run(run_id).await;
-                    return Ok(SpawnRunCancellationDurability::Terminal);
+                    if let Some(token) = local_cancel_token.as_ref() {
+                        token.cancel();
+                    }
+                    return Ok(SpawnRunCancellationDurability::PreDurable {
+                        expected_initial_generation: None,
+                    });
                 }
             }
         }
@@ -20825,10 +20864,9 @@ impl ServerSpawnAgentExecutor {
                         crate::orchestration::spawner::durable_agent_status(&durable),
                     ))
                 }
-                None => {
-                    self.retire_authoritative_runtime_run(run_id).await;
-                    Ok(SpawnRunCancellationDurability::Terminal)
-                }
+                None => Ok(SpawnRunCancellationDurability::PreDurable {
+                    expected_initial_generation: None,
+                }),
             };
         }
         let mut local_run_retired = false;
@@ -20958,12 +20996,16 @@ impl ServerSpawnAgentExecutor {
                             SpawnRunCancellationDurability::Terminal
                         }
                         AtomicExecutionOwnerCancellation::Missing => {
-                            SpawnRunCancellationDurability::Terminal
+                            SpawnRunCancellationDurability::PreDurable {
+                                expected_initial_generation: Some(generation),
+                            }
                         }
                         AtomicExecutionOwnerCancellation::SupersededTerminal { .. }
                         | AtomicExecutionOwnerCancellation::NotOwnedActive { .. } => {
                             match run_engine.load_run(user_id, run_id).await? {
-                                None => SpawnRunCancellationDurability::Terminal,
+                                None => SpawnRunCancellationDurability::PreDurable {
+                                    expected_initial_generation: Some(generation),
+                                },
                                 Some(durable)
                                     if matches!(
                                         durable.status.as_str(),
@@ -21018,7 +21060,8 @@ impl ServerSpawnAgentExecutor {
             .await;
         } else {
             match &durability {
-                SpawnRunCancellationDurability::RecoveryRecorded => {
+                SpawnRunCancellationDurability::RecoveryRecorded
+                | SpawnRunCancellationDurability::PreDurable { .. } => {
                     if let Some(token) = local_cancel_token.as_ref() {
                         token.cancel();
                     }
@@ -21506,6 +21549,253 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             origin,
         )
         .await
+    }
+
+    async fn persist_pre_durable_child_terminal(
+        &self,
+        receipt: &astra_services::runs::PreDurableChildTerminal,
+        expected_initial_generation: Option<u64>,
+    ) -> Result<SpawnRunCancellationDurability, String> {
+        use astra_services::runs::{
+            AtomicExecutionOwnerCancellation, DurableCancellationOrigin,
+            PreDurableChildTerminalCommit,
+        };
+        let run_engine = self
+            .run_engine
+            .as_ref()
+            .ok_or("durable run engine is unavailable")?;
+        match run_engine
+            .commit_pre_durable_child_terminal(receipt)
+            .await?
+        {
+            PreDurableChildTerminalCommit::ParentMissing => {
+                // The store checked the exact child before declaring the
+                // parent absent. No parent can recover this binding now.
+                self.remove_runtime_context(
+                    &receipt.child_run_id,
+                    Some(&receipt.cancellation_binding_id),
+                )
+                .await;
+                Ok(SpawnRunCancellationDurability::Terminal)
+            }
+            PreDurableChildTerminalCommit::Recorded { origin, reason } => {
+                if origin == receipt.origin && reason == receipt.reason {
+                    self.remove_runtime_context(
+                        &receipt.child_run_id,
+                        Some(&receipt.cancellation_binding_id),
+                    )
+                    .await;
+                    return Ok(SpawnRunCancellationDurability::Terminal);
+                }
+                self.remove_runtime_context(
+                    &receipt.child_run_id,
+                    Some(&receipt.cancellation_binding_id),
+                )
+                .await;
+                let status = match origin {
+                    DurableCancellationOrigin::User => {
+                        crate::orchestration::AgentStatus::cancelled_by_user(&reason)
+                    }
+                    DurableCancellationOrigin::Runtime => {
+                        crate::orchestration::AgentStatus::Cancelled {
+                            by_user: false,
+                            reason,
+                        }
+                    }
+                    DurableCancellationOrigin::Unverified => {
+                        crate::orchestration::AgentStatus::Interrupted {
+                            partial_result: String::new(),
+                            finish_reason:
+                                crate::orchestration::spawner::CANCELLATION_ORIGIN_UNVERIFIED
+                                    .to_string(),
+                        }
+                    }
+                };
+                Ok(SpawnRunCancellationDurability::Superseded(status))
+            }
+            PreDurableChildTerminalCommit::ChildPresent => {
+                let origin = match receipt.origin {
+                    DurableCancellationOrigin::User => CancellationOrigin::User,
+                    DurableCancellationOrigin::Runtime => CancellationOrigin::Runtime,
+                    DurableCancellationOrigin::Unverified => CancellationOrigin::Unverified,
+                };
+                let outcome = if origin == CancellationOrigin::User {
+                    match self
+                        .cancel_spawned_run_with_durability(
+                            &receipt.child_run_id,
+                            Some(&receipt.cancellation_binding_id),
+                            Some(&receipt.user_id),
+                            &receipt.reason,
+                            origin,
+                        )
+                        .await?
+                    {
+                        SpawnRunCancellationDurability::PreDurable { .. } => {
+                            SpawnRunCancellationDurability::RecoveryRecorded
+                        }
+                        result => result,
+                    }
+                } else if let Some(generation) = expected_initial_generation {
+                    let result = run_engine
+                        .cancel_if_exact_live_owner(
+                            &receipt.user_id,
+                            &receipt.session_id,
+                            &receipt.child_run_id,
+                            generation,
+                            &[STATUS_RUNNING, STATUS_WAITING, STATUS_PAUSED],
+                            origin,
+                            &receipt.reason,
+                        )
+                        .await?;
+                    if result == AtomicExecutionOwnerCancellation::Committed {
+                        SpawnRunCancellationDurability::Terminal
+                    } else if let Some(durable) = run_engine
+                        .load_run(&receipt.user_id, &receipt.child_run_id)
+                        .await?
+                    {
+                        let status = crate::orchestration::spawner::durable_agent_status(&durable);
+                        if status.is_terminal() {
+                            SpawnRunCancellationDurability::Superseded(status)
+                        } else {
+                            SpawnRunCancellationDurability::NotOwned(status)
+                        }
+                    } else {
+                        SpawnRunCancellationDurability::RecoveryRecorded
+                    }
+                } else {
+                    let durable = run_engine
+                        .load_run(&receipt.user_id, &receipt.child_run_id)
+                        .await?
+                        .ok_or_else(|| {
+                            format!(
+                                "pre-durable child {} disappeared during reconciliation",
+                                receipt.child_run_id
+                            )
+                        })?;
+                    let status = crate::orchestration::spawner::durable_agent_status(&durable);
+                    if status.is_terminal() {
+                        SpawnRunCancellationDurability::Superseded(status)
+                    } else {
+                        SpawnRunCancellationDurability::NotOwned(status)
+                    }
+                };
+                if !matches!(outcome, SpawnRunCancellationDurability::RecoveryRecorded) {
+                    self.remove_runtime_context(
+                        &receipt.child_run_id,
+                        Some(&receipt.cancellation_binding_id),
+                    )
+                    .await;
+                }
+                Ok(outcome)
+            }
+        }
+    }
+
+    async fn persist_fanout_group_cancellation(
+        &self,
+        group_id: &str,
+        parent_run_id: &str,
+        target_count: usize,
+        unassigned_slots: &[usize],
+        reason: &str,
+        origin: CancellationOrigin,
+        owner_user_id: Option<&str>,
+        owner_session_id: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(run_engine) = self.run_engine.as_ref() else {
+            return Err("durable run engine is unavailable".to_string());
+        };
+        let context_identity = {
+            let registry = self.runtime_context_registry.read().await;
+            registry
+                .current_context_id_by_run
+                .get(parent_run_id)
+                .and_then(|context_id| registry.contexts_by_id.get(context_id))
+                .map(|context| (context.user_id.clone(), context.session_id.clone()))
+        };
+        let (user_id, owner_session_id) = match (
+            owner_user_id.filter(|value| !value.trim().is_empty()),
+            owner_session_id.filter(|value| !value.trim().is_empty()),
+        ) {
+            (Some(user_id), Some(session_id)) => (user_id.to_string(), session_id.to_string()),
+            _ => context_identity.ok_or_else(|| {
+                format!("no durable owner identity for fanout parent run {parent_run_id}")
+            })?,
+        };
+        let Some(control) = run_engine.load_run_control(&user_id, parent_run_id).await? else {
+            // A deleted parent cannot later admit a child. Treat the local
+            // admission fence as converged instead of retrying a write that
+            // can never have a durable owner. Database/transport errors still
+            // use the retry path above; a successful "not found" is a stable
+            // authority result.
+            tracing::warn!(
+                target: "fanout",
+                %parent_run_id,
+                %user_id,
+                "fanout group cancellation parent no longer exists; durable admission is already closed"
+            );
+            return Ok(());
+        };
+        if control.session_id != owner_session_id {
+            return Err(format!(
+                "fanout parent run {parent_run_id} belongs to a different session"
+            ));
+        }
+        let idempotency_key = format!("fanout-group-cancelled:{group_id}");
+        let event = json!({
+            "event_type": FANOUT_GROUP_CANCELLED_EVENT_TYPE,
+            "idempotency_key": &idempotency_key,
+            "data": {
+                "group_id": group_id,
+                "parent_run_id": parent_run_id,
+                "target_count": target_count,
+                "unassigned_slots": unassigned_slots,
+                "reason": reason,
+                "cancellation_origin": origin.as_str(),
+            }
+        });
+        if matches!(
+            control.status.as_str(),
+            STATUS_RUNNING | STATUS_WAITING | STATUS_PAUSED
+        ) {
+            let appended = run_engine
+                .append_events_if_current_generation_and_status(
+                    &user_id,
+                    &control.session_id,
+                    parent_run_id,
+                    control.run_generation,
+                    &[STATUS_RUNNING, STATUS_WAITING, STATUS_PAUSED],
+                    std::slice::from_ref(&event),
+                )
+                .await?;
+            if appended
+                || run_engine
+                    .load_run_event_by_idempotency_key(
+                        &user_id,
+                        parent_run_id,
+                        FANOUT_GROUP_CANCELLED_EVENT_TYPE,
+                        &idempotency_key,
+                    )
+                    .await?
+                    .is_some()
+            {
+                return Ok(());
+            }
+            return Err(format!(
+                "fanout group cancellation lost parent generation fence for {parent_run_id}"
+            ));
+        }
+        // A terminal parent has retired its live context, but its event log is
+        // still the durable authority. Append the idempotent fence rather than
+        // silently treating the missing context as success.
+        run_engine
+            .append_events_batch(
+                &user_id,
+                &control.session_id,
+                parent_run_id,
+                std::slice::from_ref(&event),
+            )
+            .await
     }
 
     async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
@@ -23669,6 +23959,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     crate::orchestration::WorkspaceMutationAuthority::default();
                 workspace_mutation.set(inherited_workspace_mutation);
                 executor.set_agent_tool_context(AgentToolContext {
+                    fanout_admission: spawner.fanout_parent(&config.run_id),
                     run_id: config.run_id.clone(),
                     agent_id: config.agent_profile.agent_id.clone(),
                     delegation_chain: config.delegation_chain.clone(),

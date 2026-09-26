@@ -4248,6 +4248,13 @@ impl RunEngine {
             .await
     }
 
+    pub async fn commit_pre_durable_child_terminal(
+        &self,
+        receipt: &astra_services::runs::PreDurableChildTerminal,
+    ) -> Result<astra_services::runs::PreDurableChildTerminalCommit, String> {
+        self.store.commit_pre_durable_child_terminal(receipt).await
+    }
+
     /// Access the underlying store (for advanced queries).
     pub fn store(&self) -> &Arc<dyn RunStateStore> {
         &self.store

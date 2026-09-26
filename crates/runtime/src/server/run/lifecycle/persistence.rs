@@ -503,9 +503,14 @@ impl PostLoopPersistContext {
             self.model_name.as_deref(),
             turn_started_at,
         );
-        let outcome = DatabaseTraceEventWriter::write_many_in_tx(&mut tx, events)
-            .await
-            .map_err(|error| error.to_string())?;
+        let outcome = DatabaseTraceEventWriter::write_many_in_admitted_tx(
+            &mut tx,
+            &self.user_id,
+            &self.session_id,
+            events,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         if let Some((delta, last_event_id)) = outcome
             .session_event_deltas
             .get(&(self.user_id.clone(), self.session_id.clone()))
@@ -1189,7 +1194,14 @@ async fn persist_server_loop_canonical_append_inner(
         append.model_name,
         execution_started_at,
     ));
-    let capture_outcome = match DatabaseTraceEventWriter::write_many_in_tx(&mut tx, events).await {
+    let capture_outcome = match DatabaseTraceEventWriter::write_many_in_admitted_tx(
+        &mut tx,
+        append.user_id,
+        append.session_id,
+        events,
+    )
+    .await
+    {
         Ok(outcome) => outcome,
         Err(error) => {
             let msg = format!("canonical events tx failed: {}", error);
@@ -3243,46 +3255,29 @@ async fn persist_server_loop_hook_events(
     user_message: &str,
     state: &AgenticLoopState,
 ) -> Result<(), String> {
-    // Use the telemetry accumulator — state.telemetry.all_tools_used tracks every
-    // tool name across all rounds.  state.messages does NOT carry assistant
-    // tool_call objects in the server loop path.
-    let tool_call_names: Vec<String> = state.telemetry.all_tools_used.iter().cloned().collect();
+    // Skill selection is an explicit judgment, not an inference from ordinary
+    // tool execution. Tool lifecycle and result facts are already persisted by
+    // the canonical trace path; duplicating tool names as skill selections
+    // adds a write and corrupts skill metrics.
     let selected_skills = state.telemetry.all_selected_skills.clone();
-    let skill_selection = if let Some(first_skill) = selected_skills.first() {
-        Some(TurnSkillSelectionRecord {
+    let Some(skill_name) = selected_skills.first().cloned() else {
+        return Ok(());
+    };
+    let plan = TurnHookDbPersistPlan {
+        skill_selection: Some(TurnSkillSelectionRecord {
             event_id: Uuid::now_v7().to_string(),
             session_id: session_id.to_string(),
             user_id: user_id.to_string(),
             agent_id: None,
             user_query: truncate_for_audit(user_message, 2000),
-            selected_skills: selected_skills.clone(),
-            skill_name: first_skill.clone(),
+            selected_skills,
+            skill_name,
             skill_version: None,
             selection_method: "llm_skill_choice".to_string(),
             execution_success: Some(1),
             execution_time_ms: None,
-        })
-    } else {
-        tool_call_names
-            .first()
-            .map(|first_tool| TurnSkillSelectionRecord {
-                event_id: Uuid::now_v7().to_string(),
-                session_id: session_id.to_string(),
-                user_id: user_id.to_string(),
-                agent_id: None,
-                user_query: truncate_for_audit(user_message, 2000),
-                selected_skills: tool_call_names.clone(),
-                skill_name: first_tool.clone(),
-                skill_version: None,
-                selection_method: "llm_tool_choice".to_string(),
-                execution_success: Some(1),
-                execution_time_ms: None,
-            })
+        }),
     };
-    if skill_selection.is_none() {
-        return Ok(());
-    }
-    let plan = TurnHookDbPersistPlan { skill_selection };
 
     hook_db_writer
         .persist(plan)
@@ -3755,10 +3750,14 @@ mod tests {
         let writer = CaptureHookDbWriter::default();
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.final_text = "Ordinary answer".into();
+        state.telemetry.all_tools_used.insert("read_file".into());
         persist_server_loop_hook_events(&writer, "user-1", "session-1", "work", &state)
             .await
-            .expect("empty hook succeeds");
-        assert!(writer.plans.lock().expect("capture lock").is_empty());
+            .expect("ordinary tools do not need a hook write");
+        assert!(
+            writer.plans.lock().expect("capture lock").is_empty(),
+            "ordinary tools must not be persisted as skill selection"
+        );
 
         state.telemetry.all_selected_skills.push("review".into());
         persist_server_loop_hook_events(&writer, "user-1", "session-1", "work", &state)

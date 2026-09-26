@@ -8866,6 +8866,7 @@ esac
             std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
         let spawner = std::sync::Arc::new(crate::orchestration::DynamicAgentSpawner::new(router));
         AgentToolContext {
+            fanout_admission: spawner.fanout_parent("test-run"),
             run_id: "test-run".into(),
             agent_id: "test-agent".into(),
             delegation_chain: Vec::new(),

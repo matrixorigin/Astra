@@ -186,11 +186,8 @@ pub(crate) fn format_primary_usage_summary(
 
 /// Shared CLI/TUI cache presentation.
 ///
-/// A complete attribution can report the whole-turn cache rate. A partial
-/// attribution still has useful information when both fresh input and cache
-/// reads are known: show the rate over the observed input lanes and scope it
-/// explicitly to `known input`. This keeps the useful percentage visible
-/// without presenting an incomplete turn as an exact whole-turn measurement.
+/// Only a complete attribution can report a whole-turn cache rate. Partial
+/// counters remain useful as lower bounds, but their ratio is misleading.
 pub(crate) fn format_cache_usage_summary(
     fresh: Option<u64>,
     cache_read: Option<u64>,
@@ -208,18 +205,17 @@ pub(crate) fn format_cache_usage_summary(
     let known_input = u128::from(fresh)
         .saturating_add(u128::from(cache_read))
         .saturating_add(u128::from(cache_creation.unwrap_or(0)));
-    if let Some(percent) = (u128::from(cache_read) * 100).checked_div(known_input) {
-        if complete && cache_creation.is_some() {
-            return Some(format!("{percent}% cached"));
-        }
-        return Some(format!(
-            "{} cached · {percent}% of known input",
-            format_usage_count(cache_read, complete)
-        ));
+    if complete
+        && cache_creation.is_some()
+        && let Some(percent) = (u128::from(cache_read) * 100).checked_div(known_input)
+    {
+        return Some(format!("{percent}% cached"));
     }
-
+    if complete && cache_creation.is_some() && known_input == 0 {
+        return Some("0 cached".to_string());
+    }
     Some(format!(
-        "{} cached",
+        "{} cached · usage incomplete",
         format_usage_count(cache_read, complete)
     ))
 }
@@ -338,17 +334,7 @@ pub(crate) fn interruption_status_notice(result: &StreamResult) -> Option<String
         .map(str::trim)
         .filter(|message| !message.is_empty())
     {
-        let has_distinct_answer =
-            !result.full_text.trim().is_empty() && result.full_text.trim() != user_message;
-        return Some(
-            if result.interruption_kind.as_deref() == Some("execution_incomplete")
-                && has_distinct_answer
-            {
-                format!("Partial answer shown. {user_message}")
-            } else {
-                user_message.to_string()
-            },
-        );
+        return Some(user_message.to_string());
     }
 
     let kind = result
@@ -544,7 +530,7 @@ mod tests {
         }));
 
         let notice = interruption_status_notice(&result).expect("notice");
-        assert!(notice.starts_with("Partial answer shown."));
+        assert!(!notice.starts_with("Partial answer shown."));
         assert!(notice.contains("verified terminal state"));
         assert_eq!(result.full_text, "partial answer");
     }
@@ -597,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_primary_metrics_show_a_scoped_cache_rate() {
+    fn incomplete_primary_metrics_do_not_claim_a_cache_rate() {
         let state = crate::cli::session::session_state::SessionState::default();
         let mut result = crate::tests::stub_stream_result("answer");
         result.usage_attribution.primary =
@@ -610,11 +596,11 @@ mod tests {
         result.usage_attribution.primary_complete = false;
 
         let parts = compact_completion_parts(&state, &result, Duration::from_millis(5_200));
-        assert!(parts.contains(&"≥1.0k tokens · ≥900 cached · 90% of known input".to_string()));
+        assert!(parts.contains(&"≥1.0k tokens · ≥900 cached · usage incomplete".to_string()));
     }
 
     #[test]
-    fn observed_partial_usage_keeps_the_session_cache_rate_visible() {
+    fn observed_partial_usage_keeps_cache_count_without_rate() {
         assert_eq!(
             super::format_primary_usage_summary(
                 Some(10_392),
@@ -626,7 +612,7 @@ mod tests {
                 false,
             )
             .as_deref(),
-            Some("≥46.2k tokens · ≥34.9k cached · 77% of known input")
+            Some("≥46.2k tokens · ≥34.9k cached · usage incomplete")
         );
     }
 
@@ -695,7 +681,7 @@ mod tests {
                 Some(0),
                 None,
                 false,
-                Some("≥0 cached · 0% of known input"),
+                Some("≥0 cached · usage incomplete"),
             ),
             (None, Some(900), None, false, Some("≥900 cached")),
             (
@@ -703,7 +689,7 @@ mod tests {
                 Some(900),
                 Some(1000),
                 false,
-                Some("≥900 cached · 45% of known input"),
+                Some("≥900 cached · usage incomplete"),
             ),
             (Some(100), Some(900), Some(1000), true, Some("45% cached")),
             (Some(0), Some(0), Some(0), true, Some("0 cached")),
