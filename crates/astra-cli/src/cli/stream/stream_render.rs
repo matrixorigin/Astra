@@ -2125,6 +2125,8 @@ impl<'a> CliSseStreamHost<'a> {
         fields: Option<Map<String, Value>>,
     ) -> Map<String, Value> {
         let mut fields = fields.unwrap_or_default();
+        // MCP dispatch supplies the binding that admitted this invocation. A
+        // failed reconnect may have removed that route from the live manager.
         fields
             .entry("runtime_environment_advertisement".to_string())
             .or_insert_with(|| self.cli_runtime_environment_advertisement(tool));
@@ -9052,6 +9054,10 @@ fn append_skill_loaded_marker(result: &str, skill_name: &str) -> String {
     );
     format!("{result}\n\n<skill-loaded name=\"{safe_name}\"/>")
 }
+
+#[cfg(test)]
+#[path = "mcp_result_tests.rs"]
+mod mcp_result_tests;
 
 #[cfg(test)]
 mod tests {

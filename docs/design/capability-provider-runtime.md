@@ -542,6 +542,16 @@ MayHaveDispatched
 
 The runtime maps these facts into its durable outcome state. It does not infer
 failure from words such as `error` in output text.
+When a tool may have applied an effect but its acknowledgement is lost, the
+provider reports `tool_outcome_unknown` with `retryable=false`. Recovery
+guidance requires reconciliation of the provider state or invocation receipt
+before any new call that could repeat the effect, even if the connection has
+already recovered.
+An acknowledged JSON-RPC error remains a known failure with its error code and
+details; a successful RPC response with `isError=true` remains a tool failure.
+CLI result advertisements retain the MCP binding verified at dispatch time.
+Connection recovery changes availability for later invocations, not the binding
+or uncertainty of the result already being reported.
 
 The runtime result envelope preserves:
 

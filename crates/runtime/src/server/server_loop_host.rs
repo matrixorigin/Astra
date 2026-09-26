@@ -1516,6 +1516,7 @@ fn llm_main_error_outcome(error: &astra_core::ClassifiedError) -> &'static str {
         astra_core::ErrorKind::ToolTimeout => "error_tool_timeout",
         astra_core::ErrorKind::ToolUnavailable => "error_tool_unavailable",
         astra_core::ErrorKind::ToolBinding => "error_tool_binding",
+        astra_core::ErrorKind::ToolOutcomeUnknown => "error_tool_outcome_unknown",
         astra_core::ErrorKind::ResourceLimit => "error_resource_limit",
         astra_core::ErrorKind::DatabaseError => "error_database",
         astra_core::ErrorKind::Stall => "error_stall",

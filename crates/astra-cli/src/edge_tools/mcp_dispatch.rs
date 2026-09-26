@@ -7,6 +7,35 @@ use serde_json::Value;
 
 use super::{ToolExecutionOutcome, ToolExecutor};
 
+fn acknowledged_mcp_error_outcome(error: &astra_mcp::McpError) -> ToolExecutionOutcome {
+    let mut outcome = ToolExecutionOutcome::error(format!("Error: {error}"));
+    let mut fields = serde_json::Map::from_iter([
+        (
+            "dispatch_certainty".into(),
+            Value::String("dispatched".into()),
+        ),
+        ("execution_fact".into(), Value::String("failed".into())),
+        ("side_effects_maybe".into(), Value::Bool(false)),
+    ]);
+    if let astra_mcp::McpError::Service(rmcp::ServiceError::McpError(rpc_error)) = error {
+        let kind = match rpc_error.code {
+            rmcp::model::ErrorCode::INVALID_PARAMS => astra_core::ErrorKind::ToolInvalidArgs,
+            rmcp::model::ErrorCode::METHOD_NOT_FOUND => astra_core::ErrorKind::ToolNotFound,
+            rmcp::model::ErrorCode::INVALID_REQUEST | rmcp::model::ErrorCode::PARSE_ERROR => {
+                astra_core::ErrorKind::InvalidRequest
+            }
+            _ => astra_core::ErrorKind::Unknown,
+        };
+        fields.insert("error_kind".into(), Value::String(kind.as_str().into()));
+        fields.insert(
+            "mcp_rpc_error".into(),
+            serde_json::to_value(rpc_error).expect("MCP error is serializable"),
+        );
+    }
+    outcome.tool_result_fields = Some(fields);
+    outcome
+}
+
 fn mcp_result_to_tool_outcome(result: astra_mcp::McpToolCallResult) -> ToolExecutionOutcome {
     let mut fields = serde_json::Map::new();
     if let Some(content) = result.structured_content {
@@ -60,10 +89,14 @@ impl ToolExecutor {
             (srv, tool, c)
         };
 
+        let dispatch_advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+            Self::mcp_runtime_environment_binding(mcp_name, super::runtime_env_builtin_registry()),
+        );
+
         // Once call_tool starts, a transport error cannot prove that the MCP
         // server did not apply the operation. Reconnect may restore the server
         // for later invocations, but must never replay this invocation.
-        match conn.call_tool(&original_name, args.clone()).await {
+        let mut outcome = match conn.call_tool(&original_name, args.clone()).await {
             Ok(result) => {
                 mcp_result_to_tool_outcome(astra_mcp::extract_tool_call_result_with_limit(
                     &result,
@@ -87,25 +120,38 @@ impl ToolExecutor {
                             );
                         }
                     }
+                    let mut outcome = ToolExecutionOutcome::error(format!(
+                        "Error: MCP tool '{original_name}' on server '{server_name}' has an unknown outcome ({error}). Check the server state before deciding whether to call it again."
+                    ));
+                    outcome.tool_result_fields = Some(serde_json::Map::from_iter([
+                        (
+                            "error_kind".into(),
+                            Value::String(
+                                astra_core::ErrorKind::ToolOutcomeUnknown.as_str().into(),
+                            ),
+                        ),
+                        ("dispatch_certainty".into(), Value::String("unknown".into())),
+                        ("execution_fact".into(), Value::String("unknown".into())),
+                        ("side_effects_maybe".into(), Value::Bool(true)),
+                        ("retryable".into(), Value::Bool(false)),
+                        ("resumable".into(), Value::Bool(true)),
+                    ]));
+                    outcome
+                } else {
+                    // A JSON-RPC error is an acknowledgement, not a lost result.
+                    acknowledged_mcp_error_outcome(&error)
                 }
-
-                let mut outcome = ToolExecutionOutcome::error(format!(
-                    "Error: MCP tool '{original_name}' on server '{server_name}' has an unknown outcome ({error}). Check the server state before deciding whether to call it again."
-                ));
-                outcome.tool_result_fields = Some(serde_json::Map::from_iter([
-                    (
-                        "error_kind".into(),
-                        Value::String("mcp_outcome_unknown".into()),
-                    ),
-                    ("dispatch_certainty".into(), Value::String("unknown".into())),
-                    ("execution_fact".into(), Value::String("unknown".into())),
-                    ("side_effects_maybe".into(), Value::Bool(true)),
-                    ("retryable".into(), Value::Bool(false)),
-                    ("resumable".into(), Value::Bool(true)),
-                ]));
-                outcome
             }
-        }
+        };
+        outcome
+            .tool_result_fields
+            .get_or_insert_with(Default::default)
+            .insert(
+                "runtime_environment_advertisement".into(),
+                serde_json::to_value(dispatch_advertisement)
+                    .expect("MCP dispatch binding is serializable"),
+            );
+        outcome
     }
 }
 
@@ -192,7 +238,7 @@ mod tests {
         assert_eq!(metadata["side_effects_maybe"], true);
         assert_eq!(metadata["retryable"], false);
         assert_eq!(metadata["dispatch_certainty"], "unknown");
-        assert_eq!(metadata["error_kind"], "mcp_outcome_unknown");
+        assert_eq!(metadata["error_kind"], "tool_outcome_unknown");
         assert_eq!(
             std::fs::read_to_string(&counter).expect("durable fixture mutation"),
             "applied\n",

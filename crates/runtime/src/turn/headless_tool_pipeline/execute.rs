@@ -370,7 +370,7 @@ fn parse_execution_error_kind_tag(tag: &str) -> Option<astra_core::ErrorKind> {
 mod tests {
     use super::*;
 
-    use serde_json::{Map, Value};
+    use serde_json::{Map, Value, json};
 
     #[test]
     fn invocation_scope_rejects_partial_or_blank_identity() {
@@ -536,6 +536,68 @@ mod tests {
             evidence.recovery_actions,
             vec![astra_core::ToolRecoveryAction::SelectAvailableCapability]
         );
+    }
+
+    #[test]
+    fn uncertain_mcp_result_projects_reconciliation_guidance_to_model() {
+        let fields = Map::from_iter([
+            ("error_kind".to_string(), json!("tool_outcome_unknown")),
+            ("dispatch_certainty".to_string(), json!("unknown")),
+            ("side_effects_maybe".to_string(), json!(true)),
+            ("retryable".to_string(), json!(false)),
+        ]);
+        let kind = execution_error_kind(Some(&fields)).expect("shared error kind");
+        let evidence = execution_recovery_evidence(Some(&fields)).expect("typed recovery evidence");
+        assert_eq!(kind, astra_core::ErrorKind::ToolOutcomeUnknown);
+        assert_eq!(evidence.cause, astra_core::ToolFailureCause::OutcomeUnknown);
+        assert!(!evidence.retryable);
+
+        let mut turn_guard = TurnGuard::new();
+        let mut advisories = Vec::new();
+        let mut is_err = true;
+        enrich_headless_tool_output_for_errors_and_limits(
+            HeadlessOutputEnrichRequest {
+                name: "mcp__lost_ack__apply_then_drop_ack",
+                result_str: "Error: MCP tool has an unknown outcome",
+                is_err: &mut is_err,
+                source_error_kind: Some(kind),
+                source_recovery_evidence: Some(&evidence),
+                tool_already_restricted: false,
+                execution_disposition: HeadlessExecutionDisposition::Executed,
+            },
+            &mut HeadlessOutputEnrichCtx {
+                turn_guard: &mut turn_guard,
+                advisories: &mut advisories,
+            },
+            |_| {},
+        );
+        let mut model_message = json!({
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "Error: MCP tool has an unknown outcome"
+        });
+        astra_turn_core::tool::result::advisory::set_advisories(
+            model_message.as_object_mut().expect("tool message"),
+            &advisories,
+        );
+        astra_turn_core::tool::result::advisory::project_advisories(&mut model_message);
+        let content = model_message["content"]
+            .as_str()
+            .expect("model tool content");
+        assert!(
+            content.contains("First reconcile the provider's state"),
+            "{content}"
+        );
+        assert!(content.contains("Do NOT retry this operation"), "{content}");
+        assert!(
+            content.contains("switch tools to repeat its effect"),
+            "{content}"
+        );
+        assert!(
+            !content.contains("retry only with corrected arguments"),
+            "{content}"
+        );
+        assert!(!content.contains("capability-equivalent tool"), "{content}");
     }
 }
 

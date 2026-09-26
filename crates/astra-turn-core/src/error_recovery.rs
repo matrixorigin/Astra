@@ -132,6 +132,13 @@ pub fn build_recovery_message_with_evidence(
     avoidance_advised: &[&str],
     evidence: Option<&astra_core::ToolFailureEvidence>,
 ) -> String {
+    if category == ErrorCategory::ToolOutcomeUnknown
+        || evidence.is_some_and(|e| e.cause == astra_core::ToolFailureCause::OutcomeUnknown)
+    {
+        return format!(
+            "⚠ {tool_name} may have applied the operation, but its acknowledgement was lost. First reconcile the provider's state or invocation receipt. Do NOT retry this operation, change its arguments, or switch tools to repeat its effect while the outcome is unknown. If reconciliation is unavailable, report the uncertainty and ask for an explicit decision."
+        );
+    }
     if let Some(evidence) = evidence {
         if tool_name == "bash"
             && evidence.cause == astra_core::ToolFailureCause::ScopeTooBroad
@@ -790,6 +797,29 @@ mod tests {
     }
 
     // ── Retry: transient ──
+
+    #[test]
+    fn unknown_outcome_requires_reconciliation_with_or_without_typed_evidence() {
+        let evidence =
+            astra_core::ToolFailureEvidence::from_error_kind(ErrorCategory::ToolOutcomeUnknown);
+        for (category, evidence) in [
+            (ErrorCategory::ToolOutcomeUnknown, None),
+            (ErrorCategory::StreamTransport, Some(&evidence)),
+        ] {
+            let message = build_recovery_message_with_evidence(
+                "mcp__server__mutate",
+                "connection closed",
+                category,
+                &[],
+                evidence,
+            );
+            assert!(message.contains("First reconcile the provider's state"));
+            assert!(message.contains("Do NOT retry this operation"));
+            assert!(!message.contains("retry only with corrected arguments"));
+            assert!(!message.contains("capability-equivalent tool"));
+        }
+        assert_eq!(should_retry(ErrorCategory::ToolOutcomeUnknown, 0), None);
+    }
 
     #[test]
     fn retry_transient_first_second_exhausted() {

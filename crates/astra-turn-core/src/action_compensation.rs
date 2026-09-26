@@ -198,7 +198,7 @@ fn classify_error_kind_outcome(
         ErrorKind::MissingModelSelection | ErrorKind::ToolUnavailable | ErrorKind::ToolBinding => {
             (ExecutionOutcome::Failure, Some(FailureCategory::Unknown))
         }
-        ErrorKind::Unknown => return None,
+        ErrorKind::ToolOutcomeUnknown | ErrorKind::Unknown => return None,
     };
 
     Some(ExecutionOutcomeClassification {

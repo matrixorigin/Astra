@@ -79,6 +79,8 @@ pub enum ErrorKind {
     ToolUnavailable,
     /// Runtime advertised a tool but failed to bind an executor/transport for it.
     ToolBinding,
+    /// The tool may have applied an external effect, but its acknowledgement was lost.
+    ToolOutcomeUnknown,
     /// OOM, disk full, fork exhaustion, too many open files.
     ResourceLimit,
 
@@ -117,6 +119,8 @@ pub enum ToolFailureCause {
     PermissionBoundary,
     CapabilityUnavailable,
     TransientTransport,
+    /// Dispatch may have completed, so a new call requires outcome reconciliation first.
+    OutcomeUnknown,
     ResourceExhausted,
     /// The tool invocation itself was valid, but an invoked command returned
     /// a non-semantic failure status. This is deliberately distinct from
@@ -137,6 +141,7 @@ pub enum ToolRecoveryAction {
     RefreshCredentials,
     SelectAvailableCapability,
     WaitAndRetry,
+    ReconcileOutcome,
     ReduceResourcePressure,
     InspectStructuredFailure,
 }
@@ -189,6 +194,10 @@ impl ToolFailureEvidence {
                 ToolFailureCause::CapabilityUnavailable,
                 ToolRecoveryAction::SelectAvailableCapability,
             ),
+            ErrorKind::ToolOutcomeUnknown => (
+                ToolFailureCause::OutcomeUnknown,
+                ToolRecoveryAction::ReconcileOutcome,
+            ),
             ErrorKind::ResourceLimit | ErrorKind::ConnectionPoolExhausted => (
                 ToolFailureCause::ResourceExhausted,
                 ToolRecoveryAction::ReduceResourcePressure,
@@ -236,6 +245,7 @@ impl ErrorKind {
             Self::ToolTimeout => "tool_timeout",
             Self::ToolUnavailable => "tool_unavailable",
             Self::ToolBinding => "tool_binding",
+            Self::ToolOutcomeUnknown => "tool_outcome_unknown",
             Self::ResourceLimit => "resource_limit",
             Self::DatabaseError => "database_error",
             Self::Stall => "stall",
@@ -365,6 +375,10 @@ impl ErrorKind {
                  Do NOT retry the same tool call and do NOT assume a shell command \
                  is equivalent; continue degraded only after making the lost capability explicit."
             }
+            Self::ToolOutcomeUnknown => {
+                "The tool may have applied its operation, but the acknowledgement was lost. \
+                 Reconcile the provider's state before deciding whether any new call is safe."
+            }
             Self::ResourceLimit => {
                 "System resource limit reached (memory/disk/processes). \
                  This tool is BLOCKED for the rest of this session. \
@@ -473,6 +487,10 @@ impl ErrorKind {
                  executor or edge transport is bound for the turn, or wire the \
                  missing transport before activation."
             }
+            Self::ToolOutcomeUnknown => {
+                "Inspect the provider's state or invocation receipt to determine whether the \
+                 operation was applied. Do not replay an uncertain external effect."
+            }
             Self::ResourceLimit => {
                 "Check system limits: `ulimit -u` (max procs), `ulimit -n` (open files). \
                  Kill orphan processes: `ps aux | grep defunct`. May need to restart \
@@ -538,6 +556,7 @@ impl ErrorKind {
             "tool_timeout" => Some(Self::ToolTimeout),
             "tool_unavailable" => Some(Self::ToolUnavailable),
             "tool_binding" => Some(Self::ToolBinding),
+            "tool_outcome_unknown" => Some(Self::ToolOutcomeUnknown),
             "resource_limit" => Some(Self::ResourceLimit),
             "database_error" => Some(Self::DatabaseError),
             "stall" => Some(Self::Stall),
@@ -1151,6 +1170,7 @@ mod tests {
         ErrorKind::ToolTimeout,
         ErrorKind::ToolUnavailable,
         ErrorKind::ToolBinding,
+        ErrorKind::ToolOutcomeUnknown,
         ErrorKind::ResourceLimit,
         ErrorKind::DatabaseError,
         ErrorKind::Stall,
@@ -1739,6 +1759,14 @@ mod tests {
             !timeout.retryable,
             "local command timeouts are not automatic retries"
         );
+
+        let uncertain = ToolFailureEvidence::from_error_kind(ErrorKind::ToolOutcomeUnknown);
+        assert_eq!(uncertain.cause, ToolFailureCause::OutcomeUnknown);
+        assert_eq!(
+            uncertain.recovery_actions,
+            vec![ToolRecoveryAction::ReconcileOutcome]
+        );
+        assert!(!uncertain.retryable);
     }
 
     #[test]
