@@ -312,8 +312,11 @@ pub fn tool_outcome_requires_terminal_attention(
     let args = record
         .authoritative_args_full()
         .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
-    if normalize_validation_prefix(&record.name, record.authoritative_args_full().unwrap_or(""))
-        .is_some()
+    if normalize_validation_attempt_prefix(
+        &record.name,
+        record.authoritative_args_full().unwrap_or(""),
+    )
+    .is_some()
     {
         return true;
     }
@@ -1884,7 +1887,7 @@ impl ToolEvaluationFact {
                 ReadInvalidation::None
             },
             read_target: extract_read_target(&record.name, args),
-            validation_prefix: normalize_validation_prefix(&record.name, args)
+            validation_prefix: normalize_validation_attempt_prefix(&record.name, args)
                 .map(|prefix| EvaluationIdentity::new(b"validation", &prefix)),
             observation_request_identity,
             observation_result_identity,
@@ -2630,6 +2633,16 @@ fn top_level_shell_delimiters(
 /// a successful `python3 -m pytest`/`cargo test` receipt cannot be mistaken for
 /// an opaque, potentially mutating shell call.
 pub fn normalize_validation_prefix(name: &str, args: &str) -> Option<String> {
+    normalize_validation_prefix_kind(name, args, true)
+}
+
+/// A failed validator-shaped invocation retains debt even when its arguments
+/// cannot prove that a successful invocation actually validated the project.
+pub fn normalize_validation_attempt_prefix(name: &str, args: &str) -> Option<String> {
+    normalize_validation_prefix_kind(name, args, false)
+}
+
+fn normalize_validation_prefix_kind(name: &str, args: &str, require_proof: bool) -> Option<String> {
     if name != "bash" {
         return None;
     }
@@ -2638,25 +2651,79 @@ pub fn normalize_validation_prefix(name: &str, args: &str) -> Option<String> {
     if command.is_empty() {
         return None;
     }
-    bash_command_post_mutation_validation_prefix(command)
+    bash_command_post_mutation_validation_prefix_kind(command, require_proof)
 }
 
-fn normalized_validation_segment(segment: &str) -> Option<String> {
+struct ValidationCandidate {
+    operation: String,
+    proof_eligible: bool,
+}
+
+fn typescript_option_may_skip_validation(word: &str) -> bool {
+    let Some(name) = word.strip_prefix("--").or_else(|| word.strip_prefix('-')) else {
+        return false;
+    };
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "h" | "?"
+            | "help"
+            | "v"
+            | "version"
+            | "all"
+            | "showconfig"
+            | "listfilesonly"
+            | "init"
+            | "nocheck"
+            | "w"
+            | "watch"
+    )
+}
+
+fn typescript_args_prove_validation(words: &[String]) -> bool {
+    let mut index = 0;
+    while let Some(word) = words.get(index) {
+        if word.starts_with('@') {
+            return false;
+        }
+        if typescript_option_may_skip_validation(word) {
+            if words.get(index + 1).is_none_or(|value| value != "false") {
+                return false;
+            }
+            index += 1;
+        }
+        index += 1;
+    }
+    true
+}
+
+fn normalized_validation_segment(segment: &str) -> Option<ValidationCandidate> {
+    // Shell command names, subcommands and module names are case-sensitive.
+    // TypeScript's --noEmit option is not: canonicalize only that option for
+    // exact-operation recovery, preserving paths and other arguments.
+    let typescript = ["tsc ", "npx tsc "].into_iter().find_map(|prefix| {
+        let args = segment.strip_prefix(prefix)?;
+        let option_end = args.find(' ').unwrap_or(args.len());
+        if !args[..option_end].eq_ignore_ascii_case("--noEmit") {
+            return None;
+        }
+        let words = split_static_shell_words(args)?;
+        Some(ValidationCandidate {
+            operation: format!("{prefix}--noEmit{}", &args[option_end..]),
+            proof_eligible: typescript_args_prove_validation(&words[1..]),
+        })
+    });
+    if typescript.is_some() {
+        return typescript;
+    }
     if validation_segment_has_meta_option(segment) {
         return None;
     }
-    // Shell command names, subcommands and module names are case-sensitive.
-    // Preserve arbitrary argument spelling (paths, test filters) after each
-    // exact family prefix instead of lowercasing the entire invocation.
     let recognized = segment.starts_with("cargo check ")
         || segment == "cargo check"
         || segment.starts_with("cargo test ")
         || segment == "cargo test"
         || segment.starts_with("cargo build ")
         || segment == "cargo build"
-        || segment.starts_with("npx tsc --noEmit")
-        || segment == "tsc --noEmit"
-        || segment.starts_with("tsc --noEmit ")
         || segment == "pytest"
         || segment.starts_with("pytest ")
         || segment == "python -m pytest"
@@ -2685,7 +2752,10 @@ fn normalized_validation_segment(segment: &str) -> Option<String> {
         || segment.starts_with("npm run build ")
         || segment == "go test"
         || segment.starts_with("go test ");
-    recognized.then_some(segment.to_string())
+    recognized.then(|| ValidationCandidate {
+        operation: segment.to_string(),
+        proof_eligible: true,
+    })
 }
 
 /// A framework command's help/version mode is an informational query, not a
@@ -2742,6 +2812,13 @@ fn validation_segment_has_meta_option(segment: &str) -> bool {
 /// writer is deliberately not returned; callers must not combine an old
 /// project-wide prefix with a new, weaker observation.
 pub fn bash_command_post_mutation_validation_prefix(command: &str) -> Option<String> {
+    bash_command_post_mutation_validation_prefix_kind(command, true)
+}
+
+fn bash_command_post_mutation_validation_prefix_kind(
+    command: &str,
+    require_proof: bool,
+) -> Option<String> {
     let mut latest = None;
     let control_segments = split_shell_control_segments_with_ops(command)?;
     for (segment_index, (raw_segment, op_after)) in control_segments.iter().enumerate() {
@@ -2769,8 +2846,12 @@ pub fn bash_command_post_mutation_validation_prefix(command: &str) -> Option<Str
             if is_shell_control_segment(&normalized) {
                 continue;
             }
-            if let Some(prefix) = normalized_validation_segment(&normalized) {
-                pipeline_latest = Some(prefix);
+            if let Some(candidate) = normalized_validation_segment(&normalized) {
+                if require_proof && !candidate.proof_eligible {
+                    pipeline_blocked = true;
+                    break;
+                }
+                pipeline_latest = Some(candidate.operation);
                 continue;
             }
             if is_positive_validation_segment(&normalized)
@@ -2857,7 +2938,11 @@ pub fn bash_command_has_post_mutation_validation(command: &str) -> bool {
             if is_shell_control_segment(&normalized) {
                 continue;
             }
-            if normalized_validation_segment(&normalized).is_some() {
+            if let Some(candidate) = normalized_validation_segment(&normalized) {
+                if !candidate.proof_eligible {
+                    pipeline_blocked = true;
+                    break;
+                }
                 pipeline_validation = Some(true);
                 continue;
             }
@@ -7407,6 +7492,84 @@ mod tests {
         assert!(split_static_shell_words("cp $DEST source").is_none());
         assert!(split_static_shell_words("cp src 'unterminated").is_none());
         assert!(split_static_shell_words("cp src | tee out").is_none());
+    }
+
+    #[test]
+    fn typescript_validation_separates_attempt_from_positive_proof() {
+        for (command, operation) in [
+            ("tsc --noEmit", "tsc --noEmit"),
+            ("tsc --noemit false", "tsc --noEmit false"),
+            (
+                "npx tsc --NOEMIT src/CaseSensitive.ts",
+                "npx tsc --noEmit src/CaseSensitive.ts",
+            ),
+            ("tsc --noEmit --project .", "tsc --noEmit --project ."),
+            ("tsc --noEmit --strict", "tsc --noEmit --strict"),
+            ("tsc --noEmit --pretty false", "tsc --noEmit --pretty false"),
+            (
+                "tsc --noEmit --noCheck false",
+                "tsc --noEmit --noCheck false",
+            ),
+            ("tsc --noEmit --watch false", "tsc --noEmit --watch false"),
+            ("tsc --noEmit --HELP false", "tsc --noEmit --HELP false"),
+            (
+                "tsc --noEmit --outDir --help false",
+                "tsc --noEmit --outDir --help false",
+            ),
+        ] {
+            let args = serde_json::json!({"command": command}).to_string();
+            assert_eq!(
+                normalize_validation_attempt_prefix("bash", &args),
+                Some(operation.into())
+            );
+            assert_eq!(
+                normalize_validation_prefix("bash", &args),
+                Some(operation.into())
+            );
+        }
+        for (command, operation) in [
+            ("tsc --noemit --HELP null", "tsc --noEmit --HELP null"),
+            (
+                "tsc --noemit --help '-?' false",
+                "tsc --noEmit --help '-?' false",
+            ),
+            (
+                "tsc --noEmit --help --outDir --help false",
+                "tsc --noEmit --help --outDir --help false",
+            ),
+            ("tsc --noEmit --noCheck", "tsc --noEmit --noCheck"),
+            ("tsc --noEmit @args.rsp", "tsc --noEmit @args.rsp"),
+        ] {
+            let args = serde_json::json!({"command": command}).to_string();
+            assert_eq!(
+                normalize_validation_attempt_prefix("bash", &args),
+                Some(operation.into())
+            );
+            assert!(
+                normalize_validation_prefix("bash", &args).is_none(),
+                "{command}"
+            );
+            assert!(
+                !bash_command_has_post_mutation_validation(command),
+                "{command}"
+            );
+        }
+        for command in [
+            "TSC --noemit",
+            "npx TSC --noemit",
+            "tsc --noEmitExtra",
+            "tsc --noemit $FLAGS",
+        ] {
+            let args = serde_json::json!({"command": command}).to_string();
+            assert!(
+                normalize_validation_attempt_prefix("bash", &args).is_none(),
+                "{command}"
+            );
+            assert!(
+                normalize_validation_prefix("bash", &args).is_none(),
+                "{command}"
+            );
+        }
     }
 
     #[test]

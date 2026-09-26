@@ -194,6 +194,11 @@ Tool results retain their source status, exit semantics, output, and invocation
 identity. Classification uses supported evidence; an unknown cause stays unknown.
 The Agent interprets the impact on the user's task. A later unrelated success
 must not clear a failure, and changing a command does not prove equivalence.
+An executed validation-shaped command can retain exact-operation failure debt
+without proving a successful validation when its arguments have ambiguous
+execution semantics. An ambiguous success clears only its own failure debt;
+Work delivery still requires a proof-eligible validation, with one bounded
+direct revalidation opportunity or a truthful failed/blocked settlement.
 
 At completion, an unresolved failure with a later-round observation candidate,
 or the existing repeated-failure signal, permits one evidence-linked
