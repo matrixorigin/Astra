@@ -1,8 +1,8 @@
 //! Bounded semantic Work classification, shared by judgment and chat providers.
 use crate::turn_intent_judge::{
-    MUTATION_TARGET_SCOPE_POLICY, TurnIntentJudgeContext, TurnIntentJudgeError,
-    WorkAdmissionActivation, WorkAdmissionCapability, WorkAdmissionDecision, WorkExecutionTopology,
-    build_work_admission_prompt, work_admission_judge_messages,
+    MUTATION_TARGET_SCOPE_POLICY, TURN_ASSESSMENT_PROMPT, TurnIntentJudgeContext,
+    TurnIntentJudgeError, WorkAdmissionActivation, WorkAdmissionCapability, WorkAdmissionDecision,
+    WorkExecutionTopology, build_work_admission_prompt, work_admission_judge_messages,
 };
 use astra_config::user_profile::{
     MutationCompletionScope, TurnIntentDomain, WorkLifecycleIntent, WorkspaceMutationIntent,
@@ -10,7 +10,7 @@ use astra_config::user_profile::{
 use astra_turn_types::{
     JUDGMENT_SCHEMA_VERSION, JudgmentAnswer, JudgmentNoulDecision, JudgmentQuestion,
     JudgmentRequest, JudgmentResponseProvenance, NoulCriteria, judgment_messages,
-    normalize_judgment_response,
+    normalize_judgment_response, parse_unique_judgment_json,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -26,6 +26,8 @@ pub struct WorkAdmissionClassification {
     pub mutation_completion_scope: MutationCompletionScope,
     pub execution_topology: WorkExecutionTopology,
     pub required_capabilities: Vec<WorkAdmissionCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assessment: Option<astra_turn_types::TurnAssessment>,
 }
 
 /// Threshold decisions are not execution authority. Discrete model answers retain
@@ -139,7 +141,7 @@ pub fn work_admission_classification_request(ctx: &TurnIntentJudgeContext) -> Ju
     JudgmentRequest {
         schema_version: JUDGMENT_SCHEMA_VERSION,
         state: json!({
-            "policy": format!("{RULES} {MUTATION_TARGET_SCOPE_POLICY}"),
+            "policy": format!("{RULES} {MUTATION_TARGET_SCOPE_POLICY} {TURN_ASSESSMENT_PROMPT}"),
             "context": serde_json::from_str::<Value>(&build_work_admission_prompt(ctx)).expect("typed context"),
         }),
         questions,
@@ -148,7 +150,14 @@ pub fn work_admission_classification_request(ctx: &TurnIntentJudgeContext) -> Ju
 
 #[must_use]
 pub fn work_admission_classification_messages(request: &JudgmentRequest) -> Vec<Value> {
-    judgment_messages(request)
+    let mut messages = judgment_messages(request);
+    let system = messages[0]["content"]
+        .as_str()
+        .expect("judgment system prompt");
+    messages[0]["content"] = json!(format!(
+        "{system} For this Work classification only, `answers` may be accompanied by one optional top-level `assessment` object. The no-confidence rule applies to `answers`; `assessment` uses the categorical confidences described in state.policy. An absent assessment means unknown, and it never changes an admission answer."
+    ));
+    messages
 }
 
 fn malformed(raw: &str, detail: impl Into<String>) -> TurnIntentJudgeError {
@@ -191,23 +200,43 @@ fn field_evidence(
     Ok(WorkAdmissionFieldEvidence { value, truth })
 }
 
+type DecodedWorkAdmissionEvidence = (
+    BTreeMap<String, WorkAdmissionFieldEvidence>,
+    JudgmentResponseProvenance,
+    Option<astra_turn_types::TurnAssessment>,
+);
+
 fn decode_evidence(
     request: &JudgmentRequest,
     raw: &str,
     model: &str,
     provenance: Option<JudgmentResponseProvenance>,
-) -> Result<
-    (
-        BTreeMap<String, WorkAdmissionFieldEvidence>,
-        JudgmentResponseProvenance,
-    ),
-    TurnIntentJudgeError,
-> {
+) -> Result<DecodedWorkAdmissionEvidence, TurnIntentJudgeError> {
     let canonical = work_admission_classification_request(&TurnIntentJudgeContext::default());
     if request.questions != canonical.questions {
         return Err(malformed(raw, "noncanonical classification questions"));
     }
-    let normalized = normalize_judgment_response(request, raw, model, provenance)
+    let mut wire = parse_unique_judgment_json(raw.as_bytes())
+        .map_err(|error| malformed(raw, error.to_string()))?;
+    let assessment = wire
+        .as_object_mut()
+        .and_then(|object| object.remove("assessment"))
+        .and_then(|value| {
+            if value.is_null() {
+                return None;
+            }
+            match serde_json::from_value(value) {
+                Ok(assessment) => Some(assessment),
+                Err(_) => {
+                    tracing::warn!(
+                        "ignoring malformed observational assessment in Work classification"
+                    );
+                    None
+                }
+            }
+        });
+    let control_raw = serde_json::to_string(&wire).expect("judgment JSON serializes");
+    let normalized = normalize_judgment_response(request, &control_raw, model, provenance)
         .map_err(|e| malformed(raw, e.to_string()))?;
     Ok((
         normalized
@@ -221,6 +250,7 @@ fn decode_evidence(
             })
             .collect::<Result<_, _>>()?,
         normalized.provenance,
+        assessment,
     ))
 }
 
@@ -272,7 +302,7 @@ pub fn parse_work_admission_clarification(
             "clarification request does not match original evidence",
         ));
     }
-    let (evidence, _) = decode_evidence(request, raw, model, provenance)?;
+    let (evidence, _, _) = decode_evidence(request, raw, model, provenance)?;
     let changed = diagnostics
         .locked_fields
         .iter()
@@ -384,7 +414,7 @@ pub fn parse_work_admission_classification(
     model: &str,
     provenance: Option<JudgmentResponseProvenance>,
 ) -> Result<WorkAdmissionClassification, TurnIntentJudgeError> {
-    let (evidence, provenance) = decode_evidence(request, raw, model, provenance)?;
+    let (evidence, provenance, assessment) = decode_evidence(request, raw, model, provenance)?;
     validate_necessary_evidence(request, &evidence, provenance)?;
     // Necessary fields were validated together above. Optional descriptive
     // fields may remain unresolved without becoming fabricated parser errors.
@@ -457,6 +487,7 @@ pub fn parse_work_admission_classification(
             WorkExecutionTopology::Primary
         },
         required_capabilities,
+        assessment,
     })
 }
 
@@ -470,6 +501,7 @@ impl WorkAdmissionClassification {
         }
         Ok(WorkAdmissionDecision::NotRequired {
             domain: self.domain,
+            assessment: self.assessment,
             workspace_mutation: self.workspace_mutation,
             mutation_completion_scope: self.mutation_completion_scope,
             execution_topology: self.execution_topology,
@@ -638,6 +670,54 @@ mod tests {
     }
 
     #[test]
+    fn classification_carries_optional_assessment_without_changing_admission() {
+        let request = work_admission_classification_request(&Default::default());
+        let mut wire = serde_json::to_value(response(
+            &request,
+            &["mutation.read_only", "scope.unknown", "domain.none"],
+        ))
+        .unwrap();
+        wire["assessment"] = json!({
+            "satisfaction": "dissatisfied",
+            "feedback_relation": "previous_response",
+            "difficulty": "easy",
+            "difficulty_confidence": "high"
+        });
+        let parsed = parse_work_admission_classification(
+            &request,
+            &wire.to_string(),
+            "native-fixture",
+            Some(JudgmentResponseProvenance::ProviderProbability),
+        )
+        .unwrap();
+        assert_eq!(parsed.work_lifecycle, WorkLifecycleIntent::NotRequired);
+        assert_eq!(
+            parsed.assessment.unwrap().difficulty,
+            astra_turn_types::TaskDifficulty::Easy
+        );
+        assert_eq!(
+            parsed
+                .into_not_required()
+                .unwrap()
+                .assessment()
+                .unwrap()
+                .feedback_relation,
+            astra_turn_types::FeedbackResponseRelation::PreviousResponse
+        );
+
+        wire["assessment"] = json!({"difficulty": "invented"});
+        let invalid = parse_work_admission_classification(
+            &request,
+            &wire.to_string(),
+            "native-fixture",
+            Some(JudgmentResponseProvenance::ProviderProbability),
+        )
+        .unwrap();
+        assert_eq!(invalid.work_lifecycle, WorkLifecycleIntent::NotRequired);
+        assert_eq!(invalid.assessment, None);
+    }
+
+    #[test]
     fn mutation_target_fixed_prompt_budget_is_bounded() {
         let request = work_admission_classification_request(&Default::default());
         let request_bytes = serde_json::to_vec(&request).unwrap().len();
@@ -678,13 +758,13 @@ mod tests {
         );
         // Fixed-policy/schema overhead only; dynamic user context is not
         // replaced by scenario examples or silently truncated to meet this cap.
-        // Reserve 1.25 KiB for the shared policy plus four expanded questions
+        // Reserve 2 KiB for the shared policy plus four expanded questions
         // (each appears in instructions and both criteria). This is a byte
         // budget, not a tokenizer-dependent claim about provider token usage.
-        assert!(request_bytes <= baseline_bytes + 1_280);
-        assert!(messages_bytes <= baseline_messages_bytes + 1_280);
+        assert!(request_bytes <= baseline_bytes + 2_048);
+        assert!(messages_bytes <= baseline_messages_bytes + 2_048);
         assert!(
-            request_bytes < 12_000,
+            request_bytes < 13_000,
             "typed request: {request_bytes} bytes"
         );
         assert!(

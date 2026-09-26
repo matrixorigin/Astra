@@ -1203,7 +1203,7 @@ mod tests {
             None,
         );
         let mut canonical_current = json!({"role": "user", "content": "canonical current"});
-        astra_turn_types::mark_user_turn_semantics(&mut canonical_current, semantics);
+        astra_turn_types::mark_user_turn_semantics(&mut canonical_current, semantics.clone());
         let csl_messages = vec![
             canonical_current,
             json!({"role": "assistant", "content": "current answer"}),
@@ -1329,7 +1329,7 @@ mod tests {
             None,
         );
         let mut objective = json!({"role": "user", "content": "repair lifecycle"});
-        astra_turn_types::mark_user_turn_semantics(&mut objective, semantics);
+        astra_turn_types::mark_user_turn_semantics(&mut objective, semantics.clone());
 
         let result = super::sanitize_continuation_messages(vec![
             objective,

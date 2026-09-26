@@ -274,7 +274,7 @@ fn apply_judged_turn_intent_to_observability(
             );
     }
     if let Some(run_id) = state.current_run_id.as_deref() {
-        signal = signal.with_turn(run_id);
+        signal = signal.with_context("source_run_id", serde_json::json!(run_id));
     }
     if let Some(session_id) = state.current_session_id.as_deref() {
         signal = signal.with_context("session_id", serde_json::json!(session_id));
@@ -282,36 +282,49 @@ fn apply_judged_turn_intent_to_observability(
     hub.record_feedback(signal);
 }
 
-fn record_current_user_turn_semantics(state: &mut AgenticLoopState, intent: &TurnIntent) -> bool {
-    // A single submitted user turn owns one marker. The agentic loop may call
-    // this preparation phase more than once, and additional user guidance may
-    // arrive between rounds. Resolve the canonical owner from the submitted
-    // input rather than the mutable agent-loop counter or the latest user
-    // message, either of which can advance inside the same user turn.
-    let submitted_inputs = [state.user_intent.trim(), state.message.trim()];
-    let matching_owner = state
-        .messages
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(index, message)| {
-            if !astra_turn_types::is_human_user_message(message) {
-                return None;
-            }
-            let content = astra_turn_core::prompt_facing::extract_text_content(message)?;
-            submitted_inputs
-                .iter()
-                .any(|submitted| !submitted.is_empty() && content.trim() == *submitted)
-                .then_some(index)
-        });
-    let Some(index) = matching_owner else {
+/// Persist new semantics and return whether objective/feedback effects may be applied.
+/// Filling only a missing assessment must not replay previously applied effects.
+pub(crate) fn record_current_user_turn_semantics(
+    state: &mut AgenticLoopState,
+    intent: &TurnIntent,
+) -> bool {
+    crate::turn::agentic::turn_intent::capture_turn_intent_context(state);
+    let Some(source) = state
+        .telemetry
+        .turn_intent_context
+        .as_ref()
+        .and_then(|context| context.source.clone())
+    else {
         tracing::warn!("turn intent was judged without an exact canonical user-message owner");
         return false;
     };
-
-    let semantics =
+    let index = source.message_index;
+    // A compaction or rewrite while the judge was running invalidates this
+    // binding. Never relocate by text and accidentally label another turn.
+    if !state.messages.get(index).is_some_and(|message| {
+        astra_turn_types::is_human_user_message(message)
+            && astra_turn_core::prompt_facing::extract_text_content(message).as_deref()
+                == Some(source.message_text.as_str())
+    }) {
+        tracing::warn!("turn intent source changed after judgment began; omitting observation");
+        return false;
+    }
+    let mut semantics =
         astra_turn_types::UserTurnSemantics::new(intent.objective_relation, intent.feedback);
+    semantics.assessment = intent.assessment;
+    if let Some(assessment) = semantics.assessment.as_mut()
+        && assessment.feedback_relation
+            == astra_turn_types::FeedbackResponseRelation::PreviousResponse
+    {
+        semantics.feedback_response = source.feedback_response;
+        if semantics.feedback_response.is_none() {
+            assessment.feedback_relation = astra_turn_types::FeedbackResponseRelation::Unknown;
+            assessment.satisfaction = astra_turn_types::ResponseSatisfaction::Unknown;
+            assessment.satisfaction_confidence = astra_turn_types::AssessmentConfidence::Unknown;
+        }
+    }
 
+    let mut record_feedback = true;
     match astra_turn_types::user_turn_semantics(&state.messages[index]) {
         Ok(Some(current)) => {
             let advances_unknown = current.objective_relation
@@ -320,6 +333,17 @@ fn record_current_user_turn_semantics(state: &mut AgenticLoopState, intent: &Tur
                 && (intent.objective_relation != astra_turn_types::ObjectiveRelation::Unknown
                     || intent.feedback.is_some());
             if !advances_unknown {
+                semantics.objective_relation = current.objective_relation;
+                semantics.feedback = current.feedback;
+                record_feedback = false;
+            }
+            // Filling an unknown objective must not rewrite the earlier
+            // observational judgment or its causal response reference.
+            if current.assessment.is_some() {
+                semantics.assessment = current.assessment;
+                semantics.feedback_response = current.feedback_response.clone();
+            }
+            if semantics == current {
                 return false;
             }
         }
@@ -337,7 +361,7 @@ fn record_current_user_turn_semantics(state: &mut AgenticLoopState, intent: &Tur
     if !recorded {
         tracing::warn!("canonical turn-semantics owner was not a user message");
     }
-    recorded
+    recorded && record_feedback
 }
 
 fn allowed_requested_scenario(intent: &TurnIntent) -> Option<Scenario> {
@@ -3694,6 +3718,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 admission_started_at,
             );
         }
+        crate::turn::agentic::turn_intent::capture_turn_intent_context(state);
         let outcome = host.judge_turn_intent(state).await;
         // This is emitted before an unavailable admission can terminate the
         // turn, so a slow or unavailable decision remains visible.
@@ -7610,6 +7635,281 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn prepare_turn_persists_assessment_with_prior_response_reference_once() {
+        use astra_turn_types::{
+            AssessmentConfidence, FeedbackResponseRelation, ResponseSatisfaction, TaskDifficulty,
+            TurnAssessment,
+        };
+        let intent = TurnIntent {
+            assessment: Some(TurnAssessment {
+                satisfaction: ResponseSatisfaction::Dissatisfied,
+                satisfaction_confidence: AssessmentConfidence::High,
+                feedback_relation: FeedbackResponseRelation::PreviousResponse,
+                difficulty: TaskDifficulty::Easy,
+                difficulty_confidence: AssessmentConfidence::Medium,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut state = make_state();
+        state.message = "correct it".into();
+        state.user_intent = state.message.clone();
+        let prefix = vec![
+            json!({"role":"user","content":"first"}),
+            json!({"role":"assistant","content":"answer"}),
+        ];
+        state.messages = prefix.clone();
+        state
+            .messages
+            .push(json!({"role":"user","content":"correct it"}));
+        state
+            .messages
+            .push(json!({"role":"assistant","content":"later response"}));
+        let mut host = MockHost::new(Vec::new()).with_turn_intent(intent.clone());
+        prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .unwrap();
+        let recorded = astra_turn_types::user_turn_semantics(&state.messages[2])
+            .unwrap()
+            .unwrap();
+        assert_eq!(recorded.assessment, intent.assessment);
+        let target = recorded.feedback_response.as_ref().unwrap();
+        assert_eq!(target.message_count, 2);
+        assert_eq!(
+            target.prefix_root,
+            astra_turn_types::canonical_conversation_root(&prefix)
+        );
+        assert!(!record_current_user_turn_semantics(&mut state, &intent));
+        assert_eq!(
+            astra_turn_types::user_turn_semantics(&state.messages[2]).unwrap(),
+            Some(recorded)
+        );
+    }
+
+    #[test]
+    fn assessment_does_not_invent_missing_or_ambiguous_response_targets() {
+        use astra_turn_types::{FeedbackResponseRelation, ResponseSatisfaction, TurnAssessment};
+        for relation in [
+            FeedbackResponseRelation::PreviousResponse,
+            FeedbackResponseRelation::EarlierOrMultiple,
+            FeedbackResponseRelation::Unknown,
+        ] {
+            let mut state = make_state();
+            state.message = "feedback".into();
+            state.user_intent = state.message.clone();
+            state.messages = vec![json!({"role":"user","content":"feedback"})];
+            let intent = TurnIntent {
+                assessment: Some(TurnAssessment {
+                    feedback_relation: relation,
+                    satisfaction: ResponseSatisfaction::Dissatisfied,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            if relation != FeedbackResponseRelation::PreviousResponse {
+                state.messages.insert(
+                    0,
+                    json!({"role":"assistant","content":"available but not targeted"}),
+                );
+            }
+            assert!(record_current_user_turn_semantics(&mut state, &intent));
+            let recorded = astra_turn_types::user_turn_semantics(state.messages.last().unwrap())
+                .unwrap()
+                .unwrap();
+            assert!(recorded.feedback_response.is_none());
+            if relation == FeedbackResponseRelation::PreviousResponse {
+                assert_eq!(
+                    recorded.assessment.unwrap().satisfaction,
+                    ResponseSatisfaction::Unknown
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn assessment_uses_frozen_source_and_normalized_response() {
+        use astra_turn_types::{FeedbackResponseRelation, TurnAssessment};
+        for response in [
+            json!(" response B\n"),
+            json!([{"type":"text","text":"response B"}]),
+        ] {
+            let mut state = make_state();
+            state.user_intent = "correct it".into();
+            state.message =
+                "<project-instructions>context</project-instructions>\n\ncorrect it".into();
+            state.messages = vec![
+                json!({"role":"user","content":"first"}),
+                json!({"role":"assistant","content":"response A"}),
+                json!({"role":"user","content":"correct it"}),
+                json!({"role":"assistant","content":response}),
+                json!({"role":"user","content":state.message}),
+            ];
+            crate::turn::agentic::turn_intent::capture_turn_intent_context(&mut state);
+            let context = crate::turn::agentic::turn_intent::context_for_state(&state);
+            assert_eq!(
+                context.prior_assistant_message.as_deref(),
+                Some("response B")
+            );
+            assert_eq!(context.source.as_ref().unwrap().message_index, 4);
+            let expected = context.source.unwrap().feedback_response.unwrap();
+            state
+                .messages
+                .push(json!({"role":"assistant","content":"future response"}));
+            state
+                .messages
+                .push(json!({"role":"user","content":state.message}));
+            let intent = TurnIntent {
+                assessment: Some(TurnAssessment {
+                    feedback_relation: FeedbackResponseRelation::PreviousResponse,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert!(record_current_user_turn_semantics(&mut state, &intent));
+            let recorded = astra_turn_types::user_turn_semantics(&state.messages[4])
+                .unwrap()
+                .unwrap();
+            assert_eq!(recorded.feedback_response, Some(expected));
+            assert!(
+                astra_turn_types::user_turn_semantics(&state.messages[6])
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!record_current_user_turn_semantics(&mut state, &intent));
+        }
+    }
+
+    #[test]
+    fn changed_or_missing_assessment_source_is_never_relocated() {
+        let mut state = make_state();
+        state.message = "source".into();
+        state.user_intent = state.message.clone();
+        state.messages = vec![json!({"role":"user","content":"source"})];
+        crate::turn::agentic::turn_intent::capture_turn_intent_context(&mut state);
+        state.messages[0]["content"] = json!("rewritten");
+        state
+            .messages
+            .push(json!({"role":"user","content":"source"}));
+        assert!(!record_current_user_turn_semantics(
+            &mut state,
+            &TurnIntent::default()
+        ));
+        state.telemetry.turn_intent_context = None;
+        state.messages = vec![json!({"role":"assistant","content":"unowned later answer"})];
+        crate::turn::agentic::turn_intent::capture_turn_intent_context(&mut state);
+        let context = crate::turn::agentic::turn_intent::context_for_state(&state);
+        assert!(context.source.is_none());
+        assert!(context.prior_assistant_message.is_none());
+    }
+
+    #[test]
+    fn later_assessment_preserves_recorded_objective_and_feedback() {
+        use astra_turn_types::{
+            FeedbackResponseReference, FeedbackResponseRelation, ObjectiveRelation,
+            ResponseSatisfaction, TaskDifficulty, TurnAssessment, UserFeedback, UserFeedbackKind,
+            UserFeedbackTarget,
+        };
+        let feedback = UserFeedback {
+            kind: UserFeedbackKind::Correction,
+            target: UserFeedbackTarget::Approach,
+        };
+        for (objective_relation, feedback) in [
+            (ObjectiveRelation::Correct, None),
+            (ObjectiveRelation::Unknown, Some(feedback)),
+            (ObjectiveRelation::Correct, Some(feedback)),
+        ] {
+            let mut state = make_state();
+            state.message = "repair it".into();
+            state.user_intent = state.message.clone();
+            let prefix = vec![
+                json!({"role":"user","content":"first request"}),
+                json!({"role":"assistant","content":"previous answer"}),
+            ];
+            state.messages = prefix.clone();
+            state
+                .messages
+                .push(json!({"role":"user","content":state.message}));
+            assert!(record_current_user_turn_semantics(
+                &mut state,
+                &TurnIntent {
+                    objective_relation,
+                    feedback,
+                    ..Default::default()
+                }
+            ));
+            let assessment = TurnAssessment {
+                feedback_relation: FeedbackResponseRelation::PreviousResponse,
+                satisfaction: ResponseSatisfaction::Dissatisfied,
+                difficulty: TaskDifficulty::Easy,
+                ..Default::default()
+            };
+            let late_intent = TurnIntent {
+                assessment: Some(assessment),
+                ..Default::default()
+            };
+            assert!(
+                !record_current_user_turn_semantics(&mut state, &late_intent),
+                "an assessment fill must not replay objective/feedback effects"
+            );
+            let recorded = astra_turn_types::user_turn_semantics(&state.messages[2])
+                .unwrap()
+                .unwrap();
+            assert_eq!(recorded.objective_relation, objective_relation);
+            assert_eq!(recorded.feedback, feedback);
+            assert_eq!(recorded.assessment, Some(assessment));
+            assert_eq!(
+                recorded.feedback_response,
+                Some(FeedbackResponseReference::from_canonical_prefix(prefix))
+            );
+            for repeated in [
+                late_intent,
+                TurnIntent {
+                    objective_relation: ObjectiveRelation::Replace,
+                    assessment: Some(TurnAssessment::default()),
+                    ..Default::default()
+                },
+            ] {
+                assert!(!record_current_user_turn_semantics(&mut state, &repeated));
+                assert_eq!(
+                    astra_turn_types::user_turn_semantics(&state.messages[2]).unwrap(),
+                    Some(recorded.clone())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn known_assessment_survives_later_resolution_of_unknown_objective() {
+        let mut state = make_state();
+        state.message = "repair it".into();
+        state.user_intent = state.message.clone();
+        state.messages = vec![json!({"role":"user","content":"repair it"})];
+        let assessment = astra_turn_types::TurnAssessment {
+            difficulty: astra_turn_types::TaskDifficulty::Easy,
+            ..Default::default()
+        };
+        assert!(record_current_user_turn_semantics(
+            &mut state,
+            &TurnIntent {
+                assessment: Some(assessment),
+                ..Default::default()
+            }
+        ));
+        let correction = TurnIntent::default()
+            .with_objective_relation(astra_turn_types::ObjectiveRelation::Correct);
+        assert!(record_current_user_turn_semantics(&mut state, &correction));
+        let recorded = astra_turn_types::user_turn_semantics(&state.messages[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(recorded.assessment, Some(assessment));
+        assert_eq!(
+            recorded.objective_relation,
+            astra_turn_types::ObjectiveRelation::Correct
+        );
+        assert!(!record_current_user_turn_semantics(&mut state, &correction));
+    }
+
     #[test]
     fn turn_semantics_only_advance_from_explicit_unknown_once() {
         let mut state = make_state();
@@ -8671,6 +8971,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_turn_fills_assessment_without_replaying_feedback() {
+        let intent = TurnIntent::default()
+            .with_objective_relation(astra_turn_types::ObjectiveRelation::Correct)
+            .with_feedback(astra_turn_types::UserFeedback {
+                kind: astra_turn_types::UserFeedbackKind::Correction,
+                target: astra_turn_types::UserFeedbackTarget::Approach,
+            });
+        let mut host = MockHost::new(Vec::new()).with_turn_intent(intent.clone());
+        let mut state = make_state();
+        let hub = make_hub();
+        state.telemetry.observability_hub = Some(Arc::clone(&hub));
+        state.telemetry.observability_session = Some(make_session());
+        state.message = "repair it".into();
+        state.user_intent = state.message.clone();
+        state.messages = vec![json!({"role":"user","content":state.message})];
+        prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .unwrap();
+        let assessment = astra_turn_types::TurnAssessment {
+            difficulty: astra_turn_types::TaskDifficulty::Easy,
+            ..Default::default()
+        };
+        host = host.with_turn_intent(TurnIntent {
+            assessment: Some(assessment),
+            ..intent
+        });
+        state.turn_guard.nudge_count = 2;
+        prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.turn_guard.nudge_count, 2,
+            "assessment must not reanchor again"
+        );
+        assert_eq!(hub.recent_feedback_signals().len(), 1);
+        let recorded = astra_turn_types::user_turn_semantics(&state.messages[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(recorded.assessment, Some(assessment));
+    }
+
+    #[tokio::test]
     async fn prepare_turn_applies_structured_reanchor_from_judge() {
         let intent = TurnIntent::default()
             .with_objective_relation(astra_turn_types::ObjectiveRelation::Correct)
@@ -8680,6 +9022,7 @@ mod tests {
             });
         let mut host = MockHost::new(Vec::new()).with_turn_intent(intent);
         let mut state = make_state();
+        state.current_run_id = Some("feedback-source-run".into());
         let hub = make_hub();
         state.telemetry.observability_hub = Some(Arc::clone(&hub));
         state.telemetry.observability_session = Some(make_session());
@@ -8727,6 +9070,11 @@ mod tests {
                 .count(),
             1,
             "one user turn must emit one correction signal"
+        );
+        assert_eq!(correction.context["source_run_id"], "feedback-source-run");
+        assert_eq!(
+            correction.turn_id, None,
+            "the source run is not the rated response"
         );
         assert_eq!(correction.context["objective_relation"], "correct");
         assert_eq!(correction.context["feedback_kind"], "correction");

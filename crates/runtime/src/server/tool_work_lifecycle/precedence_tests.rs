@@ -34,6 +34,7 @@ fn required_decision(
     mutations: Vec<WorkAdmissionGraphMutation>,
 ) -> WorkAdmissionDecision {
     WorkAdmissionDecision::Required {
+        assessment: None,
         domain: None,
         workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
         mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,

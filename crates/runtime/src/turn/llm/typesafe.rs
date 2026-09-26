@@ -30,6 +30,8 @@ struct Response {
     model: String,
     answers: BTreeMap<String, JudgmentAnswer>,
     #[serde(default)]
+    assessment: Option<Value>,
+    #[serde(default)]
     usage: Option<Value>,
 }
 
@@ -67,6 +69,12 @@ pub(super) fn response(
             astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
         )
         .map_err(invalid)?;
+    let mut judgment = serde_json::to_value(&judgment).expect("validated judgment serialization");
+    // The caller owns optional observational validation. Preserve its payload
+    // without allowing it to bypass the typed answer validation above.
+    if let Some(assessment) = response.assessment {
+        judgment["assessment"] = assessment;
+    }
     // Billing metadata does not decide whether a valid judgment succeeded.
     // Preserve raw fields until the shared disjoint decoder qualifies them.
     let mut raw_usage = serde_json::Map::new();
@@ -190,6 +198,61 @@ mod tests {
             astra_services::InferenceUsageStatus::ProviderPartial
         );
         assert_eq!(result.model_used, "jev-1.13.0");
+    }
+
+    #[test]
+    fn work_admission_assessment_survives_adapter_and_remains_optional() {
+        let judgment = astra_services::work_admission_classification_request(&Default::default());
+        let req = request(
+            &astra_services::work_admission_classification_messages(&judgment),
+            "jev-1.13.0",
+        )
+        .unwrap();
+        let answers: serde_json::Map<String, Value> = judgment
+            .questions
+            .keys()
+            .map(|key| {
+                let yes = matches!(
+                    key.as_str(),
+                    "mutation.read_only" | "scope.unknown" | "domain.none"
+                );
+                (
+                    key.clone(),
+                    json!({"type":"noul", "noul": if yes { 1.0 } else { 0.0 }}),
+                )
+            })
+            .collect();
+        for (assessment, expected) in [
+            (
+                json!({"difficulty":"easy"}),
+                Some(astra_turn_types::TurnAssessment {
+                    difficulty: astra_turn_types::TaskDifficulty::Easy,
+                    ..Default::default()
+                }),
+            ),
+            (Value::Null, None),
+            (json!("invalid"), None),
+            (json!({"difficulty":"invalid"}), None),
+            (json!({"unexpected":true}), None),
+        ] {
+            let mut wire =
+                json!({"model":"jev-1.13.0", "answers":answers, "assessment":assessment});
+            let result = decode_response(&wire, &req).unwrap();
+            let classification = astra_services::parse_work_admission_classification(
+                &judgment,
+                &result.full_text,
+                &result.model_used,
+                result.judgment_provenance,
+            )
+            .unwrap();
+            assert_eq!(
+                classification.into_not_required().unwrap().assessment(),
+                expected
+            );
+
+            wire["answers"]["mutation.read_only"]["noul"] = json!(1.1);
+            assert!(decode_response(&wire, &req).is_err());
+        }
     }
 
     #[test]

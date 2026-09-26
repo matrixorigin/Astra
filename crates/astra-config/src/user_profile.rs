@@ -562,6 +562,9 @@ pub struct TurnIntent {
     /// the canonical user message; this field supplies kind and target only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback: Option<UserFeedback>,
+    /// Optional observational signals for feedback analysis and future routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assessment: Option<astra_turn_types::TurnAssessment>,
     /// Whether the current turn requires, permits, or forbids workspace
     /// mutation. Defaults to `Unknown` so judge failures fail closed.
     #[serde(default)]
