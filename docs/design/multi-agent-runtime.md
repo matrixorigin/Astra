@@ -7,7 +7,8 @@ The multi-agent runtime defines how multiple agents cooperate under the same bac
 
 ## Principles
 
-- Every child agent run is a durable run with lineage.
+- Every executing child agent run has durable lineage; an accepted child stopped
+  before run creation retains an exact durable parent-owned terminal receipt.
 - Parent and child share observation and audit semantics.
 - Delegation has explicit objective, scope, provider constraints, and result contract.
 - Parallelism is bounded and observable.
@@ -110,6 +111,49 @@ rejected before dispatch. Dynamic capabilities must be present in that explicit
 parent set. A legacy unrestricted parent context retains its existing behavior.
 
 ## Result integration
+
+Fanout cancellation closes admission, but is not proof that an accepted child
+has stopped. The existing cancellation event records the unassigned slot indexes
+under the admission lock. Recovery settles only those explicitly unassigned
+slots; a child absent from a recovery page remains unknown until exact durable
+evidence arrives. If an accepted child is stopped before its run row exists,
+the existing cancellation retry owner first waits for the exact aborted executor
+to finish, retaining its execution-generation binding across retries. It then
+commits one immutable parent-owned child terminal receipt. That exceptional
+transaction takes the same session execution
+fence as child creation, checks the exact child identity and row absence, and
+only then settles local durability. Recovery seeks these receipts by child run
+identity across pages; a missing page or row alone never settles a slot.
+The same no-row fence is read-only for a child without a fanout slot.
+Proven terminal state is published under the group lock before
+eviction is possible; rejected recovery must not mutate a different owner.
+After exact owner and group validation, a recovered cancellation closes the
+execution-owned parent admission fence before optional projection admission;
+projection capacity cannot reopen that parent. Spawn reservation rechecks the
+same fence after asynchronous preparation, so either admission or closure wins.
+Durable and workspace recovery apply each available group's child evidence as
+one batch; a child already archived without group membership stays eligible for
+later repair. Missing child pages never manufacture terminal slots.
+Nonterminal durable rows prove acceptance, not that a remote executor stopped;
+only terminal child evidence (a row or pre-durable receipt) settles a recovered slot.
+
+Each executing parent (including outstanding tool calls) owns its fanout admission
+fence and, after session-cache eviction, its complete terminal group receipt and
+rendered result cache.
+This preserves failed/unstarted slots and result addresses without reopening
+completed groups. Parent ownership expires with execution; historical cancellations
+must not permanently disable unrelated future parents. The session index is weak,
+and the live projection and persistence backlog remain bounded. No additional
+database operation is required for admission or reading an evicted receipt.
+Result observation may use another turn in the same session while the group is
+live or its owner receipt survives. Spawn/replay and stop actions still require
+the exact parent run. Historical reads use the owner's cache and do not emit a
+new parent collection event; a reused bare group ID is rejected when multiple
+owners remain visible, and evicted receipts are not made permanent.
+When a later durable child state corrects a terminal result, it refines the same
+parent-owned group receipt (live or evicted) and invalidates the rendered result;
+ordinary executor callbacks cannot overturn that durable terminal truth. Auto-ID
+result recovery and replay read the receipt through the same parent ownership.
 
 Parent should receive:
 

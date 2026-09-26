@@ -6796,7 +6796,7 @@ fn call_is_pending_canonical_validation(call: &Value) -> bool {
             other => other.to_string(),
         });
     raw_args.is_some_and(|args| {
-        astra_turn_core::evaluation::normalize_validation_prefix(name, &args).is_some()
+        astra_turn_core::evaluation::normalize_validation_attempt_prefix(name, &args).is_some()
     })
 }
 
@@ -7712,6 +7712,8 @@ impl ServerAgenticLoopHost {
                             "error": if retryable {
                                 if validation_pending_in_batch {
                                     "A canonical validation in this tool batch has not produced an outcome yet. The WorkItem cannot be recorded as delivered in the same batch; observe the validation result on the next boundary, then settle truthfully."
+                                } else if validation_state == WorkValidationState::Stale {
+                                    "The current WorkItem has no current, verified project-validation result. Run a direct standard build/test check and observe its result before recording delivery, or settle truthfully."
                                 } else {
                                     "The current WorkItem's latest canonical validation failed. It cannot be recorded as delivered. Repair and rerun proportionate validation, or settle with the truthful failed/blocked outcome."
                                 }
@@ -32165,6 +32167,7 @@ mod tests {
         let router = Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
         let spawner = Arc::new(crate::orchestration::DynamicAgentSpawner::new(router));
         executor.set_agent_tool_context(crate::orchestration::AgentToolContext {
+            fanout_admission: spawner.fanout_parent("run1"),
             run_id: "run1".into(),
             agent_id: "agent1".into(),
             delegation_chain: Vec::new(),
@@ -43815,7 +43818,11 @@ mod tests {
         state
             .stall
             .tool_call_records
-            .push(validation_record("python3 -m pytest tests", false));
+            .push(validation_record("tsc --noemit false", false));
+        assert_eq!(
+            current_work_validation_state(&state),
+            WorkValidationState::Failed
+        );
         let delivered = json!({
             "id": "call-delivered",
             "type": "function",
@@ -43956,7 +43963,7 @@ mod tests {
         repaired_with_broader_validation
             .stall
             .tool_call_records
-            .push(validation_record("cargo test -p focused", false));
+            .push(validation_record("npx tsc --NOEMIT --HELP null", false));
         repaired_with_broader_validation
             .stall
             .tool_call_records
@@ -43980,14 +43987,130 @@ mod tests {
         recovered
             .stall
             .tool_call_records
-            .push(validation_record("cargo test --workspace", false));
+            .push(validation_record("tsc --noemit", false));
         recovered
             .stall
             .tool_call_records
-            .push(validation_record("cargo test --workspace", true));
+            .push(validation_record("tsc --NOEMIT", true));
+        assert_eq!(
+            current_work_validation_state(&recovered),
+            WorkValidationState::Passed
+        );
         assert_eq!(
             host.admit_terminal_tool_calls_with_completion(
                 &mut recovered,
+                std::slice::from_ref(&delivered),
+                Some("tool_calls"),
+            ),
+            vec![delivered.clone()]
+        );
+        host.pending_tool_call_admission.take();
+
+        let mut scoped_types = create_test_state();
+        scoped_types.stall.tool_call_records.push(validation_record(
+            "tsc --noEmit --types @scope/custom index.ts",
+            true,
+        ));
+        assert_eq!(
+            current_work_validation_state(&scoped_types),
+            WorkValidationState::Passed
+        );
+        assert_eq!(
+            host.admit_terminal_tool_calls_with_completion(
+                &mut scoped_types,
+                std::slice::from_ref(&delivered),
+                Some("tool_calls"),
+            ),
+            vec![delivered.clone()],
+            "a consumed scoped types value must not be treated as a response file"
+        );
+        host.pending_tool_call_admission.take();
+
+        for unverified_command in [
+            "tsc --noEmit @args.rsp",
+            "tsc --noEmit --types --help",
+            "tsc --noEmit --types --strict @args.rsp",
+            "tsc --noEmit --types --outDir --types @args.rsp",
+        ] {
+            let mut unverified = create_test_state();
+            unverified
+                .stall
+                .tool_call_records
+                .push(validation_record(unverified_command, true));
+            assert_eq!(
+                current_work_validation_state(&unverified),
+                WorkValidationState::Stale,
+                "{unverified_command}"
+            );
+            assert!(
+                host.admit_terminal_tool_calls_with_completion(
+                    &mut unverified,
+                    std::slice::from_ref(&delivered),
+                    Some("tool_calls"),
+                )
+                .is_empty(),
+                "{unverified_command} cannot prove type-checking"
+            );
+            host.pending_tool_call_admission.take();
+        }
+
+        let ambiguous = "tsc --noEmit --help --outDir --help false";
+        let mut unverified = create_test_state();
+        unverified
+            .stall
+            .tool_call_records
+            .push(validation_record(ambiguous, false));
+        assert_eq!(
+            current_work_validation_state(&unverified),
+            WorkValidationState::Failed
+        );
+        unverified
+            .stall
+            .tool_call_records
+            .push(validation_record(ambiguous, true));
+        assert_eq!(
+            current_work_validation_state(&unverified),
+            WorkValidationState::Stale
+        );
+        assert!(
+            host.admit_terminal_tool_calls_with_completion(
+                &mut unverified,
+                std::slice::from_ref(&delivered),
+                Some("tool_calls"),
+            )
+            .is_empty()
+        );
+        let admission = AgenticLoopHost::admit_tool_calls(
+            &mut host,
+            std::slice::from_ref(&delivered),
+            Some("tool_calls"),
+        );
+        let rejection: Value = serde_json::from_str(
+            &admission
+                .rejected
+                .first()
+                .expect("rejected delivery")
+                .result,
+        )
+        .expect("typed rejection");
+        assert!(
+            rejection["error"]
+                .as_str()
+                .unwrap()
+                .contains("verified project-validation")
+        );
+        host.pending_tool_call_admission.take();
+        unverified
+            .stall
+            .tool_call_records
+            .push(validation_record("tsc --noEmit", true));
+        assert_eq!(
+            current_work_validation_state(&unverified),
+            WorkValidationState::Passed
+        );
+        assert_eq!(
+            host.admit_terminal_tool_calls_with_completion(
+                &mut unverified,
                 std::slice::from_ref(&delivered),
                 Some("tool_calls"),
             ),
@@ -44078,7 +44201,7 @@ mod tests {
             "type": "function",
             "function": {
                 "name": "bash",
-                "arguments": r#"{"command":"cargo test --workspace"}"#
+                "arguments": r#"{"command":"npx tsc --NOEMIT --HELP null"}"#
             }
         });
         let delivered = json!({
@@ -44125,7 +44248,7 @@ mod tests {
         state
             .stall
             .tool_call_records
-            .push(validation_record("cargo test -p focused", false));
+            .push(validation_record("tsc --noemit --help '-?' false", false));
         let delivered = json!({
             "id": "call-delivered",
             "type": "function",

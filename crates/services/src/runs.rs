@@ -1352,6 +1352,9 @@ pub struct DurableSessionRunPage {
     pub runs: Vec<DurableRunRecord>,
     pub limit: u32,
     pub truncated: bool,
+    /// Run IDs selected by the user-cancellation recovery lane. Event-only
+    /// parent rows must not trigger a control lookup in the reconciler.
+    pub recovery_cancellation_run_ids: Vec<String>,
     /// Seek cursor for the typed cancellation-recovery lane. Ordinary session
     /// working-set rows do not influence this value.
     pub recovery_next_cursor: Option<String>,
@@ -2594,6 +2597,129 @@ pub enum DurableCancellationOrigin {
     Unverified,
 }
 
+/// The exceptional terminal fact for an accepted fanout child whose executor
+/// stopped before its run row was committed. The parent owns the receipt;
+/// ordinary child creation and cancellation do not write one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreDurableChildTerminal {
+    pub user_id: String,
+    pub session_id: String,
+    pub parent_run_id: String,
+    pub child_run_id: String,
+    pub cancellation_binding_id: String,
+    pub agent_id: String,
+    pub agent_type: String,
+    pub description: String,
+    pub fanout_slot: Option<PreDurableFanoutSlot>,
+    pub origin: DurableCancellationOrigin,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreDurableFanoutSlot {
+    pub group_id: String,
+    pub target_count: usize,
+    pub slot_index: usize,
+    pub slot_id: Option<String>,
+}
+
+fn validate_pre_durable_child_terminal(receipt: &PreDurableChildTerminal) -> Result<(), String> {
+    if [
+        &receipt.user_id,
+        &receipt.session_id,
+        &receipt.parent_run_id,
+        &receipt.child_run_id,
+        &receipt.cancellation_binding_id,
+        &receipt.agent_id,
+    ]
+    .iter()
+    .any(|identity| identity.trim().is_empty())
+    {
+        return Err("pre-durable child terminal has an empty execution identity".into());
+    }
+    if receipt.fanout_slot.as_ref().is_some_and(|slot| {
+        slot.group_id.trim().is_empty()
+            || slot.target_count == 0
+            || slot.slot_index >= slot.target_count
+    }) {
+        return Err("pre-durable child terminal has an invalid fanout slot".into());
+    }
+    Ok(())
+}
+
+pub const PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE: &str = "pre_durable_child_terminal";
+
+fn pre_durable_child_terminal_event(
+    receipt: &PreDurableChildTerminal,
+) -> Option<serde_json::Value> {
+    let slot = receipt.fanout_slot.as_ref()?;
+    Some(serde_json::json!({
+        "event_type": PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE,
+        "idempotency_key": format!(
+            "pre-durable-child-terminal:{}:{}",
+            receipt.child_run_id, receipt.cancellation_binding_id
+        ),
+        "run_id": receipt.child_run_id,
+        "data": {
+            "parent_run_id": receipt.parent_run_id,
+            "agent_id": receipt.agent_id,
+            "agent_type": receipt.agent_type,
+            "description": receipt.description,
+            "group_id": slot.group_id,
+            "target_count": slot.target_count,
+            "slot_index": slot.slot_index,
+            "slot_id": slot.slot_id,
+            "cancellation_binding_id": receipt.cancellation_binding_id,
+            "cancellation_origin": receipt.origin.as_str(),
+            "reason": receipt.reason,
+        }
+    }))
+}
+
+fn existing_pre_durable_child_terminal(
+    receipt: &PreDurableChildTerminal,
+    existing: &serde_json::Value,
+) -> Result<PreDurableChildTerminalCommit, String> {
+    let origin = match existing
+        .pointer("/data/cancellation_origin")
+        .and_then(|v| v.as_str())
+    {
+        Some("user") => DurableCancellationOrigin::User,
+        Some("runtime") => DurableCancellationOrigin::Runtime,
+        Some("unverified") => DurableCancellationOrigin::Unverified,
+        _ => return Err("pre-durable child terminal has invalid origin".into()),
+    };
+    let reason = existing
+        .pointer("/data/reason")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("pre-durable child terminal has no reason")?
+        .to_string();
+    let mut expected = receipt.clone();
+    expected.origin = origin;
+    expected.reason = reason.clone();
+    if !run_events_have_same_immutable_payload(
+        existing,
+        &pre_durable_child_terminal_event(&expected)
+            .ok_or("pre-durable child terminal has no fanout identity")?,
+    ) {
+        return Err(format!(
+            "pre-durable child terminal identity conflict for {}",
+            receipt.child_run_id
+        ));
+    }
+    Ok(PreDurableChildTerminalCommit::Recorded { origin, reason })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreDurableChildTerminalCommit {
+    Recorded {
+        origin: DurableCancellationOrigin,
+        reason: String,
+    },
+    ChildPresent,
+    ParentMissing,
+}
+
 impl DurableCancellationOrigin {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -3093,6 +3219,18 @@ const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, roo
      ancestor_path, depth, delegation_id, agent_id, retry_of, retry_scope, status, waiting_for, \
      owner_pod_id, owner_lease_expires_at, cancellation_requested_at, run_generation, last_event_idx, checkpoint_version, \
      checkpoint_json, error_code, error_message, retry_count, total_prompt_tokens, \
+     total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
+     agent_binding_schema_version, model_offering_id, resolved_model_name, \
+     runtime_profile, start_request_fingerprint, work_id, \
+     work_branch_id, work_graph_revision, work_item_id, work_item_revision, \
+     work_item_attempt_id, created_at, updated_at";
+// Recovery only projects agent identity, lifecycle, and result metadata. A
+// checkpoint is never executed from this read-only path, so avoid pulling the
+// potentially large JSON column for cancellation/event candidates.
+const AGENT_RUN_RECOVERY_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, root_run_id, \
+     ancestor_path, depth, delegation_id, agent_id, retry_of, retry_scope, status, waiting_for, \
+     owner_pod_id, owner_lease_expires_at, cancellation_requested_at, run_generation, last_event_idx, checkpoint_version, \
+     CAST(NULL AS CHAR) AS checkpoint_json, error_code, error_message, retry_count, total_prompt_tokens, \
      total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
      agent_binding_schema_version, model_offering_id, resolved_model_name, \
      runtime_profile, start_request_fingerprint, work_id, \
@@ -4746,6 +4884,16 @@ pub trait RunStateStore: Send + Sync {
         run_id: &str,
     ) -> Result<Option<DurableRunRecord>, String>;
 
+    /// Order a no-row terminal receipt against child creation under the same
+    /// session execution fence. An absence read outside this method cannot
+    /// prove that an earlier insert will not still commit.
+    async fn commit_pre_durable_child_terminal(
+        &self,
+        _receipt: &PreDurableChildTerminal,
+    ) -> Result<PreDurableChildTerminalCommit, String> {
+        Err("pre-durable child terminal receipts are unsupported by this store".into())
+    }
+
     /// Load only the exact metadata needed to scope a Work interaction. The
     /// default is correct for process-local stores; database stores override
     /// it with their metadata-only indexed query.
@@ -5446,7 +5594,7 @@ pub trait RunStateStore: Send + Sync {
 
     /// Load the same bounded session working set plus only the lifecycle
     /// events required to reconstruct read-only agent/fanout results. The
-    /// database implementation overrides this with two batch queries; this
+    /// database implementation overrides this with bounded batch reads; this
     /// fallback is for deterministic test stores.
     async fn load_session_agent_recovery(
         &self,
@@ -7138,6 +7286,52 @@ impl RunStateStore for InMemoryRunStateStore {
         self.insert_run_record(record, false, None)
             .await
             .map(|_| ())
+    }
+
+    async fn commit_pre_durable_child_terminal(
+        &self,
+        receipt: &PreDurableChildTerminal,
+    ) -> Result<PreDurableChildTerminalCommit, String> {
+        validate_pre_durable_child_terminal(receipt)?;
+        let _child_fence = self
+            .action_fence_for(&receipt.user_id, &receipt.child_run_id)
+            .lock_owned()
+            .await;
+        let mut runs = self.runs.write().await;
+        if let Some(child) = runs.get(&receipt.child_run_id) {
+            return if child.user_id == receipt.user_id
+                && child.session_id == receipt.session_id
+                && child.parent_run_id.as_deref() == Some(&receipt.parent_run_id)
+                && child.agent_id.as_deref() == Some(&receipt.agent_id)
+            {
+                Ok(PreDurableChildTerminalCommit::ChildPresent)
+            } else {
+                Err("pre-durable child terminal conflicts with an existing run".into())
+            };
+        }
+        let Some(parent) = runs.get_mut(&receipt.parent_run_id).filter(|parent| {
+            parent.user_id == receipt.user_id && parent.session_id == receipt.session_id
+        }) else {
+            return Ok(PreDurableChildTerminalCommit::ParentMissing);
+        };
+        let Some(event) = pre_durable_child_terminal_event(receipt) else {
+            return Ok(PreDurableChildTerminalCommit::Recorded {
+                origin: receipt.origin,
+                reason: receipt.reason.clone(),
+            });
+        };
+        if let Some(existing) = parent.events.iter().find(|existing| {
+            extract_optional_string(existing, "idempotency_key")
+                == extract_optional_string(&event, "idempotency_key")
+        }) {
+            return existing_pre_durable_child_terminal(receipt, existing);
+        }
+        parent.last_event_idx = parent.last_event_idx.saturating_add(1);
+        parent.events.push(event);
+        Ok(PreDurableChildTerminalCommit::Recorded {
+            origin: receipt.origin,
+            reason: receipt.reason.clone(),
+        })
     }
 
     async fn claim_run_start(
@@ -9783,6 +9977,7 @@ impl RunStateStore for InMemoryRunStateStore {
             runs: session_runs,
             limit,
             truncated,
+            recovery_cancellation_run_ids: Vec::new(),
             recovery_next_cursor: None,
         })
     }
@@ -9797,12 +9992,11 @@ impl RunStateStore for InMemoryRunStateStore {
         let mut page = self.list_session_runs(user_id, session_id, limit).await?;
         let recovery_limit = validate_run_list_limit(limit) as usize;
         let cancellation_requests = self.cancellation_requests.read().await;
-        if let Some(cursor) = after_run_id {
-            page.runs.retain(|run| {
-                run.run_id.as_str() > cursor
-                    || !cancellation_requests.contains(&(user_id.to_string(), run.run_id.clone()))
-            });
-        }
+        let page_run_ids = page
+            .runs
+            .iter()
+            .map(|run| run.run_id.clone())
+            .collect::<HashSet<_>>();
         let runs = self.runs.read().await;
         let mut control = runs
             .values()
@@ -9818,19 +10012,90 @@ impl RunStateStore for InMemoryRunStateStore {
             })
             .cloned()
             .collect::<Vec<_>>();
-        control.sort_by(|left, right| left.run_id.cmp(&right.run_id));
-        if control.len() > recovery_limit {
+        let mut retry_control = runs
+            .values()
+            .filter(|run| {
+                run.user_id == user_id
+                    && run.session_id == session_id
+                    && matches!(
+                        run.status.as_str(),
+                        STATUS_RUNNING | STATUS_WAITING | STATUS_PAUSED
+                    )
+                    && after_run_id.is_some_and(|cursor| run.run_id.as_str() <= cursor)
+                    && page_run_ids.contains(&run.run_id)
+                    && cancellation_requests.contains(&(user_id.to_string(), run.run_id.clone()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut terminal_refresh = runs
+            .values()
+            .filter(|run| {
+                run.user_id == user_id
+                    && run.session_id == session_id
+                    && !matches!(
+                        run.status.as_str(),
+                        STATUS_RUNNING | STATUS_WAITING | STATUS_PAUSED
+                    )
+                    && page_run_ids.contains(&run.run_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut discovery = control
+            .drain(..)
+            .map(|run| (run.run_id.clone(), false, run))
+            .collect::<Vec<_>>();
+        discovery.extend(
+            runs.values()
+                .filter(|parent| parent.user_id == user_id && parent.session_id == session_id)
+                .flat_map(|parent| {
+                    parent.events.iter().filter_map(move |event| {
+                        (extract_event_type(event) == PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE)
+                            .then(|| extract_optional_string(event, "run_id"))
+                            .flatten()
+                            .filter(|subject| {
+                                after_run_id.is_none_or(|cursor| subject.as_str() > cursor)
+                            })
+                            .map(|subject| (subject, true, parent.clone()))
+                    })
+                }),
+        );
+        discovery.sort_by(|left, right| left.0.cmp(&right.0));
+        if discovery.len() > recovery_limit {
             page.truncated = true;
-            control.truncate(recovery_limit);
+            discovery.truncate(recovery_limit);
         }
-        page.recovery_next_cursor = control.last().map(|run| run.run_id.clone());
+        retry_control.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+        page.recovery_cancellation_run_ids = discovery
+            .iter()
+            .filter(|(_, receipt, _)| !*receipt)
+            .map(|(_, _, run)| run)
+            .chain(retry_control.iter())
+            .map(|run| run.run_id.clone())
+            .collect();
+        // The forward cursor owns discovery progress; retry rows are an
+        // independent reconciliation lane. Keeping `after_run_id` here when
+        // only retry rows are present can pin the scan forever on a full
+        // ordinary page of lower-ID poison rows and starve newer markers.
+        page.recovery_next_cursor = discovery.last().map(|(subject, _, _)| subject.clone());
         let mut included = page
             .runs
             .iter()
             .map(|run| run.run_id.clone())
             .collect::<HashSet<_>>();
-        for run in control {
-            if included.insert(run.run_id.clone()) {
+        terminal_refresh.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+        for run in discovery
+            .into_iter()
+            .map(|(_, _, run)| run)
+            .chain(retry_control)
+            .chain(terminal_refresh)
+        {
+            if let Some(existing) = page
+                .runs
+                .iter_mut()
+                .find(|existing| existing.run_id == run.run_id)
+            {
+                *existing = run;
+            } else if included.insert(run.run_id.clone()) {
                 page.runs.push(run);
             }
         }
@@ -10467,6 +10732,12 @@ pub struct DatabaseRunStateStore {
     orphan_cancellation_commit_ack_loss_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     cancellation_marker_commit_ack_loss_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    terminal_transition_commit_ack_loss_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    recovery_page_loaded: Option<std::sync::Arc<tokio::sync::Notify>>,
+    #[cfg(test)]
+    recovery_page_continue: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 const UNSETTLED_USER_INTENT_EVENTS_SELECT_SQL: &str =
@@ -10971,10 +11242,59 @@ impl DatabaseRunStateStore {
         } else {
             None
         };
-        tx.commit().await.map_err(|source| {
-            db_error("transition_run_status_with_events_commit", run_id, source).to_string()
-        })?;
-        connection.release();
+        let commit_error = match tx.commit().await {
+            Ok(()) => {
+                connection.release();
+                #[cfg(test)]
+                {
+                    self.terminal_transition_commit_ack_loss_once
+                        .swap(false, std::sync::atomic::Ordering::SeqCst)
+                        .then(|| {
+                            format!(
+                                "injected terminal transition commit acknowledgement loss for {run_id}"
+                            )
+                        })
+                }
+                #[cfg(not(test))]
+                {
+                    None
+                }
+            }
+            Err(source) => {
+                drop(connection);
+                Some(
+                    db_error("transition_run_status_with_events_commit", run_id, source)
+                        .to_string(),
+                )
+            }
+        };
+        if let Some(commit_error) = commit_error {
+            let exact = self
+                .transition_commit_is_durable(
+                    user_id,
+                    expected_session_id,
+                    run_id,
+                    status,
+                    next_last_event_idx,
+                    &event_rows,
+                )
+                .await
+                .map_err(|error| format!("{commit_error}; {error}"))?;
+            if !exact {
+                return Err(format!(
+                    "{commit_error}; durable transition acknowledgement remains ambiguous"
+                ));
+            }
+            tracing::warn!(
+                user_id,
+                session_id = expected_session_id,
+                run_id,
+                status,
+                event_count = event_rows.len(),
+                error = %commit_error,
+                "recovered terminal transition commit acknowledgement"
+            );
+        }
 
         self.repair_run_projection_after_status_for_user(user_id, expected_session_id, run_id)
             .await;
@@ -11051,6 +11371,14 @@ impl DatabaseRunStateStore {
             cancellation_marker_commit_ack_loss_once: std::sync::Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
             ),
+            #[cfg(test)]
+            terminal_transition_commit_ack_loss_once: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
+            #[cfg(test)]
+            recovery_page_loaded: None,
+            #[cfg(test)]
+            recovery_page_continue: None,
         }
     }
 
@@ -11066,6 +11394,17 @@ impl DatabaseRunStateStore {
 
     pub fn with_session_execution_slot_stale_after(mut self, stale_after: Duration) -> Self {
         self.session_execution_slot_stale_after = stale_after;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_recovery_page_pause(
+        mut self,
+        loaded: std::sync::Arc<tokio::sync::Notify>,
+        continue_: std::sync::Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.recovery_page_loaded = Some(loaded);
+        self.recovery_page_continue = Some(continue_);
         self
     }
 
@@ -11167,6 +11506,13 @@ impl DatabaseRunStateStore {
     #[cfg(test)]
     fn with_cancellation_marker_commit_ack_loss_once(self) -> Self {
         self.cancellation_marker_commit_ack_loss_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_terminal_transition_commit_ack_loss_once(self) -> Self {
+        self.terminal_transition_commit_ack_loss_once
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self
     }
@@ -12373,6 +12719,63 @@ impl DatabaseRunStateStore {
         load_run_metadata_for_exact_session_tx(tx, user_id, expected_session_id, run_id).await
     }
 
+    async fn transition_commit_is_durable(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+        expected_status: &str,
+        expected_last_event_idx: i64,
+        event_rows: &[RunEventInsertRow],
+    ) -> Result<bool, String> {
+        // An empty event batch has no immutable receipt. Matching only the
+        // status and event watermark can therefore mistake an already-present
+        // same-status row for this transition after an ambiguous COMMIT.
+        // Refuse to claim durability; the caller will surface the ambiguity
+        // instead of fabricating success. Non-empty batches are verified by
+        // their exact event IDs, indexes, and hashes below.
+        if event_rows.is_empty() {
+            return Ok(false);
+        }
+        let row = sqlx::query(
+            "SELECT session_id, status, last_event_idx
+             FROM agent_runs
+             WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| {
+            db_error("reconcile_transition_commit_run", run_id, source).to_string()
+        })?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let session_id: String = row.try_get("session_id").map_err(|source| {
+            db_error("decode_reconciled_transition_session", run_id, source).to_string()
+        })?;
+        let status: String = row.try_get("status").map_err(|source| {
+            db_error("decode_reconciled_transition_status", run_id, source).to_string()
+        })?;
+        let last_event_idx: i64 = row.try_get("last_event_idx").map_err(|source| {
+            db_error(
+                "decode_reconciled_transition_last_event_idx",
+                run_id,
+                source,
+            )
+            .to_string()
+        })?;
+        if session_id != expected_session_id
+            || status != expected_status
+            || last_event_idx != expected_last_event_idx
+        {
+            return Ok(false);
+        }
+        self.exact_run_event_rows_are_durable(event_rows, "reconcile_transition_commit_events")
+            .await
+    }
+
     async fn load_run_projection_metadata_for_user(
         &self,
         user_id: &str,
@@ -13571,6 +13974,56 @@ impl DatabaseRunStateStore {
             "insert_initial_run_events",
         )
         .await?;
+        let projection = build_run_display_projection(
+            &record,
+            initial_event_rows
+                .last()
+                .map(|event| event.event_type.clone()),
+            None,
+        );
+        let insert_projection_sql = matrixone_statement_with_null_shape(
+            "INSERT INTO run_display_projections
+             (run_id, user_id, session_id, status, waiting_for, error_message,
+              projection_event_idx, latest_event_type, latest_checkpoint_id,
+              latest_checkpoint_kind, latest_checkpoint_version, total_prompt_tokens,
+              total_completion_tokens, total_tool_calls, projection_hash, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, NOW(6))",
+            [
+                projection.waiting_for.is_some(),
+                projection.error_message.is_some(),
+                projection.latest_event_type.is_some(),
+            ],
+        );
+        sqlx::query(&insert_projection_sql)
+            .bind(&projection.run_id)
+            .bind(&projection.user_id)
+            .bind(&projection.session_id)
+            .bind(&projection.status)
+            .bind(&projection.waiting_for)
+            .bind(&projection.error_message)
+            .bind(projection.projection_event_idx)
+            .bind(&projection.latest_event_type)
+            .bind(i64::try_from(projection.total_prompt_tokens).map_err(|_| {
+                format!(
+                    "initial projection prompt tokens overflow for {}",
+                    record.run_id
+                )
+            })?)
+            .bind(
+                i64::try_from(projection.total_completion_tokens).map_err(|_| {
+                    format!(
+                        "initial projection completion tokens overflow for {}",
+                        record.run_id
+                    )
+                })?,
+            )
+            .bind(i64::from(projection.total_tool_calls))
+            .bind(&projection.projection_hash)
+            .execute(&mut *tx)
+            .await
+            .map_err(|source| {
+                db_error("insert_initial_run_projection", &record.run_id, source).to_string()
+            })?;
         let commit_error = match tx.commit().await {
             Ok(()) => {
                 connection.release();
@@ -13622,17 +14075,6 @@ impl DatabaseRunStateStore {
                 session_id = %record.session_id,
                 run_id = %record.run_id,
                 "recovered exact run create commit acknowledgement"
-            );
-        }
-        if let Err(error) = self
-            .sync_projection_for_user(&record.user_id, &record.session_id, &record.run_id)
-            .await
-        {
-            tracing::warn!(
-                user_id = %record.user_id,
-                run_id = %record.run_id,
-                error = %error,
-                "run create committed but projection refresh failed"
             );
         }
         Ok(DurableRunStartClaim::Started {
@@ -14697,6 +15139,199 @@ impl RunStateStore for DatabaseRunStateStore {
         self.insert_run_record(record, false, None)
             .await
             .map(|_| ())
+    }
+
+    async fn commit_pre_durable_child_terminal(
+        &self,
+        receipt: &PreDurableChildTerminal,
+    ) -> Result<PreDurableChildTerminalCommit, String> {
+        validate_pre_durable_child_terminal(receipt)?;
+        let parent_id = &receipt.parent_run_id;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|error| {
+                db_error("acquire_pre_durable_child_terminal", parent_id, error).to_string()
+            })?;
+        let mut tx = connection.begin().await.map_err(|error| {
+            db_error("begin_pre_durable_child_terminal", parent_id, error).to_string()
+        })?;
+        // This helper takes the same session fence as insert_run_record before
+        // locking the parent. A prior child COMMIT must become visible here.
+        let Some(parent) = self
+            .load_run_metadata_for_exact_session_tx(
+                &mut tx,
+                &receipt.user_id,
+                &receipt.session_id,
+                parent_id,
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            tx.rollback().await.map_err(|error| {
+                db_error("rollback_missing_pre_durable_parent", parent_id, error).to_string()
+            })?;
+            connection.release();
+            if let Some(child) = self
+                .load_run_metadata_for_user(&receipt.user_id, &receipt.child_run_id)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                return if child.session_id == receipt.session_id
+                    && child.parent_run_id.as_deref() == Some(parent_id)
+                    && child.agent_id.as_deref() == Some(&receipt.agent_id)
+                {
+                    Ok(PreDurableChildTerminalCommit::ChildPresent)
+                } else {
+                    Err("pre-durable child terminal conflicts with an existing run".into())
+                };
+            }
+            return match self
+                .load_run_metadata_for_user(&receipt.user_id, parent_id)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                None => Ok(PreDurableChildTerminalCommit::ParentMissing),
+                Some(_) => Err(format!(
+                    "pre-durable child terminal parent {parent_id} exists but its session write fence was not admitted"
+                )),
+            };
+        };
+        let child = sqlx::query(
+            "SELECT session_id, parent_run_id, agent_id FROM agent_runs
+             WHERE user_id = ? AND run_id = ? LIMIT 1 FOR UPDATE",
+        )
+        .bind(&receipt.user_id)
+        .bind(&receipt.child_run_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| {
+            db_error("check_pre_durable_child_row", &receipt.child_run_id, error).to_string()
+        })?;
+        if let Some(child) = child {
+            let session_id: String = child
+                .try_get("session_id")
+                .map_err(|error| error.to_string())?;
+            let child_parent: Option<String> = child
+                .try_get("parent_run_id")
+                .map_err(|error| error.to_string())?;
+            let agent_id: Option<String> = child
+                .try_get("agent_id")
+                .map_err(|error| error.to_string())?;
+            if session_id != receipt.session_id
+                || child_parent.as_deref() != Some(parent_id)
+                || agent_id.as_deref() != Some(&receipt.agent_id)
+            {
+                return Err("pre-durable child terminal conflicts with an existing run".into());
+            }
+            tx.rollback().await.map_err(|error| {
+                db_error("rollback_present_pre_durable_child", parent_id, error).to_string()
+            })?;
+            connection.release();
+            return Ok(PreDurableChildTerminalCommit::ChildPresent);
+        }
+        let Some(event) = pre_durable_child_terminal_event(receipt) else {
+            tx.rollback().await.map_err(|error| {
+                db_error("rollback_stopped_pre_durable_child", parent_id, error).to_string()
+            })?;
+            connection.release();
+            return Ok(PreDurableChildTerminalCommit::Recorded {
+                origin: receipt.origin,
+                reason: receipt.reason.clone(),
+            });
+        };
+        let key = extract_optional_string(&event, "idempotency_key")
+            .expect("pre-durable terminal event has a stable key");
+        let existing = sqlx::query(
+            "SELECT event_idx, payload_json FROM agent_run_events
+             WHERE user_id = ? AND run_id = ? AND idempotency_key = ? LIMIT 1",
+        )
+        .bind(&receipt.user_id)
+        .bind(parent_id)
+        .bind(&key)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| {
+            db_error("load_pre_durable_child_terminal", parent_id, error).to_string()
+        })?;
+        if let Some(existing) = existing {
+            let existing = decode_run_event_payload(&existing, parent_id)
+                .map_err(|error| error.to_string())?;
+            let recorded = existing_pre_durable_child_terminal(receipt, &existing)?;
+            tx.rollback().await.map_err(|error| {
+                db_error(
+                    "rollback_existing_pre_durable_child_terminal",
+                    parent_id,
+                    error,
+                )
+                .to_string()
+            })?;
+            connection.release();
+            return Ok(recorded);
+        }
+        let next_idx = parent
+            .last_event_idx
+            .checked_add(1)
+            .ok_or("pre-durable child terminal event counter overflow")?;
+        let row = build_run_event_insert_row(
+            &receipt.user_id,
+            parent_id,
+            &receipt.session_id,
+            parent.agent_id.as_deref(),
+            next_idx,
+            &self.owner_pod_id,
+            &event,
+        )
+        .map_err(|error| error.to_string())?;
+        let updated = sqlx::query(
+            "UPDATE agent_runs SET last_event_idx = ?
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND last_event_idx = ?",
+        )
+        .bind(next_idx)
+        .bind(&receipt.user_id)
+        .bind(&receipt.session_id)
+        .bind(parent_id)
+        .bind(parent.last_event_idx)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| {
+            db_error(
+                "advance_pre_durable_child_terminal_counter",
+                parent_id,
+                error,
+            )
+            .to_string()
+        })?;
+        if updated.rows_affected() != 1 {
+            return Err("pre-durable child terminal parent event counter changed".into());
+        }
+        Self::insert_run_event_rows_tx(
+            &mut tx,
+            parent_id,
+            std::slice::from_ref(&row),
+            "insert_pre_durable_child_terminal",
+        )
+        .await?;
+        match tx.commit().await {
+            Ok(()) => connection.release(),
+            Err(error) => {
+                drop(connection);
+                if !self
+                    .exact_run_event_rows_are_durable(
+                        std::slice::from_ref(&row),
+                        "reconcile_pre_durable_child_terminal",
+                    )
+                    .await?
+                {
+                    return Err(
+                        db_error("commit_pre_durable_child_terminal", parent_id, error).to_string(),
+                    );
+                }
+            }
+        }
+        Ok(PreDurableChildTerminalCommit::Recorded {
+            origin: receipt.origin,
+            reason: receipt.reason.clone(),
+        })
     }
 
     async fn claim_run_start(
@@ -21375,92 +22010,8 @@ impl RunStateStore for DatabaseRunStateStore {
         session_id: &str,
         limit: u32,
     ) -> Result<DurableSessionRunPage, String> {
-        let limit = validate_run_list_limit(limit);
-        let sql = format!(
-            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs \
-             WHERE user_id = ? AND session_id = ? \
-             ORDER BY CASE WHEN status IN (?, ?, ?, ?) THEN 1 ELSE 0 END ASC, \
-                      updated_at DESC, created_at DESC, run_id DESC \
-             LIMIT ?"
-        );
-        let rows = sqlx::query(&sql)
-            .bind(user_id)
-            .bind(session_id)
-            .bind(STATUS_COMPLETED)
-            .bind(STATUS_DELEGATED)
-            .bind(STATUS_FAILED)
-            .bind(STATUS_CANCELLED)
-            .bind(session_run_query_limit(limit))
-            .fetch_all(self.pool.get())
+        self.list_session_runs_with_columns(user_id, session_id, limit, AGENT_RUN_COLUMNS)
             .await
-            .map_err(|source| db_error("list_session_runs", session_id, source).to_string())?;
-        let mut runs = rows
-            .into_iter()
-            .map(run_record_from_row)
-            .collect::<DbStoreResult<Vec<_>>>()
-            .map_err(|error| error.to_string())?;
-        let truncated = runs.len() > limit as usize;
-        runs.truncate(limit as usize);
-
-        // Preserve the ancestry required to interpret every selected node.
-        // Fetch one parent level per round in a single batch; delegation depth
-        // is bounded, and the visited set also makes malformed cycles finite.
-        let mut included = runs
-            .iter()
-            .map(|run| run.run_id.clone())
-            .collect::<HashSet<_>>();
-        let mut frontier = runs
-            .iter()
-            .filter_map(|run| run.parent_run_id.clone())
-            .filter(|run_id| !included.contains(run_id))
-            .collect::<HashSet<_>>();
-        while !frontier.is_empty() {
-            let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
-                "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs WHERE user_id = "
-            ));
-            builder
-                .push_bind(user_id)
-                .push(" AND session_id = ")
-                .push_bind(session_id)
-                .push(" AND run_id IN (");
-            let mut separated = builder.separated(", ");
-            for run_id in &frontier {
-                separated.push_bind(run_id);
-            }
-            separated.push_unseparated(")");
-            let parent_rows =
-                builder
-                    .build()
-                    .fetch_all(self.pool.get())
-                    .await
-                    .map_err(|source| {
-                        db_error("list_session_run_ancestors", session_id, source).to_string()
-                    })?;
-            let parents = parent_rows
-                .into_iter()
-                .map(run_record_from_row)
-                .collect::<DbStoreResult<Vec<_>>>()
-                .map_err(|error| error.to_string())?;
-            frontier.clear();
-            for parent in parents {
-                if !included.insert(parent.run_id.clone()) {
-                    continue;
-                }
-                if let Some(grandparent_id) = parent.parent_run_id.clone()
-                    && !included.contains(&grandparent_id)
-                {
-                    frontier.insert(grandparent_id);
-                }
-                runs.push(parent);
-            }
-        }
-        sort_session_run_tree(&mut runs);
-        Ok(DurableSessionRunPage {
-            runs,
-            limit,
-            truncated,
-            recovery_next_cursor: None,
-        })
     }
 
     async fn list_active_session_runs_cursor(
@@ -21550,76 +22101,143 @@ impl RunStateStore for DatabaseRunStateStore {
         limit: u32,
         after_run_id: Option<&str>,
     ) -> Result<DurableSessionRunPage, String> {
-        let mut page = self.list_session_runs(user_id, session_id, limit).await?;
-        // The ordinary bounded session page can contain a cancellation run
-        // that the recovery cursor already consumed. Remove only exact,
-        // durable cancellation facts at or before the cursor; applying the
-        // lexical cursor to every run would discard unrelated agent state and
-        // ancestor context.
-        if let Some(cursor) = after_run_id
-            && !page.runs.is_empty()
+        // Fanout recovery never executes a checkpoint; keep the working-set
+        // projection narrow so each refresh avoids reading checkpoint JSON.
+        let mut page = self
+            .list_session_runs_with_columns(user_id, session_id, limit, AGENT_RUN_RECOVERY_COLUMNS)
+            .await?;
+        #[cfg(test)]
+        if let (Some(loaded), Some(continue_)) =
+            (&self.recovery_page_loaded, &self.recovery_page_continue)
         {
-            let mut processed = sqlx::QueryBuilder::<sqlx::MySql>::new(
-                "SELECT run_id FROM agent_runs WHERE user_id = ",
-            );
-            processed
+            loaded.notify_one();
+            continue_.notified().await;
+        }
+        // A generic session page can be saturated by newer active runs, so
+        // select a separate bounded cancellation marker batch. The terminal
+        // lane refreshes rows already present in the ordinary page in the
+        // same read wave. This makes a status transition between the two
+        // reads observable without a per-run read or a second transaction.
+        let recovery_limit = validate_run_list_limit(limit) as usize;
+        let page_run_ids = page
+            .runs
+            .iter()
+            .map(|run| run.run_id.clone())
+            .collect::<Vec<_>>();
+        let mut recovery_query = sqlx::QueryBuilder::<sqlx::MySql>::new("SELECT ");
+        recovery_query
+            .push(AGENT_RUN_RECOVERY_COLUMNS)
+            .push(", 1 AS recovery_kind, run_id AS recovery_subject FROM (SELECT ");
+        recovery_query
+            .push(AGENT_RUN_RECOVERY_COLUMNS)
+            .push(" FROM agent_runs WHERE user_id = ")
+            .push_bind(user_id)
+            .push(" AND session_id = ")
+            .push_bind(session_id)
+            .push(" AND status IN (")
+            .push_bind(STATUS_RUNNING)
+            .push(", ")
+            .push_bind(STATUS_WAITING)
+            .push(", ")
+            .push_bind(STATUS_PAUSED)
+            .push(") AND cancellation_requested_at IS NOT NULL");
+        if let Some(after_run_id) = after_run_id {
+            recovery_query
+                .push(" AND run_id > ")
+                .push_bind(after_run_id);
+        }
+        recovery_query
+            .push(" ORDER BY run_id ASC LIMIT ")
+            .push_bind(session_run_query_limit(recovery_limit as u32))
+            .push(") selected_active");
+        if let Some(after_run_id) = after_run_id
+            && !page_run_ids.is_empty()
+        {
+            recovery_query.push(" UNION ALL SELECT ");
+            recovery_query
+                .push(AGENT_RUN_RECOVERY_COLUMNS)
+                .push(", 2 AS recovery_kind, run_id AS recovery_subject FROM agent_runs WHERE user_id = ")
                 .push_bind(user_id)
                 .push(" AND session_id = ")
                 .push_bind(session_id)
-                .push(" AND cancellation_requested_at IS NOT NULL AND run_id <= ")
-                .push_bind(cursor)
+                .push(" AND status IN (")
+                .push_bind(STATUS_RUNNING)
+                .push(", ")
+                .push_bind(STATUS_WAITING)
+                .push(", ")
+                .push_bind(STATUS_PAUSED)
+                .push(") AND cancellation_requested_at IS NOT NULL AND run_id <= ")
+                .push_bind(after_run_id)
                 .push(" AND run_id IN (");
             {
-                let mut ids = processed.separated(",");
-                for run in &page.runs {
-                    ids.push_bind(run.run_id.as_str());
+                let mut ids = recovery_query.separated(",");
+                for run_id in &page_run_ids {
+                    ids.push_bind(run_id);
                 }
             }
-            processed.push(")");
-            let processed_run_ids = processed
-                .build_query_scalar::<String>()
-                .fetch_all(self.pool.get())
-                .await
-                .map_err(|source| {
-                    db_error(
-                        "load_session_agent_processed_cancellation_recovery",
-                        session_id,
-                        source,
-                    )
-                    .to_string()
-                })?
-                .into_iter()
-                .collect::<HashSet<_>>();
-            page.runs
-                .retain(|run| !processed_run_ids.contains(&run.run_id));
+            recovery_query.push(")");
         }
-        // User cancellation is one run-level control fact. A generic session
-        // page can be saturated by newer active runs, so select a separate
-        // bounded marker batch. Runtime/unverified cancellation never enters
-        // this recovery plane: its exact live owner commits terminal state in
-        // one transaction.
-        let recovery_limit = validate_run_list_limit(limit);
-        let mut cancellation_query = format!(
-            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
-             WHERE user_id = ? AND session_id = ?
-               AND status IN (?, ?, ?)
-               AND cancellation_requested_at IS NOT NULL"
-        );
-        if after_run_id.is_some() {
-            cancellation_query.push_str(" AND run_id > ?");
+        if !page_run_ids.is_empty() {
+            recovery_query.push(" UNION ALL SELECT ");
+            recovery_query
+                .push(AGENT_RUN_RECOVERY_COLUMNS)
+                .push(", 3 AS recovery_kind, run_id AS recovery_subject");
+            recovery_query
+                .push(" FROM agent_runs WHERE user_id = ")
+                .push_bind(user_id)
+                .push(" AND session_id = ")
+                .push_bind(session_id)
+                .push(" AND status NOT IN (")
+                .push_bind(STATUS_RUNNING)
+                .push(", ")
+                .push_bind(STATUS_WAITING)
+                .push(", ")
+                .push_bind(STATUS_PAUSED)
+                .push(") AND run_id IN (");
+            {
+                let mut ids = recovery_query.separated(",");
+                for run_id in &page_run_ids {
+                    ids.push_bind(run_id);
+                }
+            }
+            recovery_query.push(")");
         }
-        cancellation_query.push_str(" ORDER BY run_id ASC LIMIT ?");
-        let mut cancellation_query = sqlx::query(&cancellation_query)
-            .bind(user_id)
-            .bind(session_id)
-            .bind(STATUS_RUNNING)
-            .bind(STATUS_WAITING)
-            .bind(STATUS_PAUSED);
+        // A pre-durable terminal has no child row to anchor the ordinary
+        // working-set page. Seek its indexed subject identity in this same
+        // read wave, then return its parent row for typed event recovery.
+        recovery_query.push(" UNION ALL SELECT ");
+        recovery_query
+            .push(AGENT_RUN_RECOVERY_COLUMNS)
+            .push(", 4 AS recovery_kind, selected_receipts.receipt_subject_id AS recovery_subject")
+            .push(" FROM agent_runs JOIN (SELECT events.run_id AS event_parent_id,")
+            .push(" events.subject_run_id AS receipt_subject_id FROM agent_run_events AS events")
+            .push(" FORCE INDEX (idx_agent_run_events_owner_session_subject)")
+            .push(" JOIN agent_runs AS receipt_parents ON receipt_parents.user_id = events.user_id")
+            .push(" AND receipt_parents.session_id = events.session_id")
+            .push(" AND receipt_parents.run_id = events.run_id")
+            .push(" WHERE events.user_id = ")
+            .push_bind(user_id)
+            .push(" AND events.session_id = ")
+            .push_bind(session_id)
+            .push(" AND events.event_type = ")
+            .push_bind(PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE)
+            .push(" AND events.subject_run_id IS NOT NULL");
         if let Some(after_run_id) = after_run_id {
-            cancellation_query = cancellation_query.bind(after_run_id);
+            recovery_query
+                .push(" AND events.subject_run_id > ")
+                .push_bind(after_run_id);
         }
-        let cancellation_rows = cancellation_query
-            .bind(session_run_query_limit(recovery_limit))
+        recovery_query
+            .push(" ORDER BY events.subject_run_id ASC LIMIT ")
+            .push_bind(session_run_query_limit(recovery_limit as u32))
+            .push(") selected_receipts ON selected_receipts.event_parent_id = agent_runs.run_id")
+            .push(" WHERE agent_runs.user_id = ")
+            .push_bind(user_id)
+            .push(" AND agent_runs.session_id = ")
+            .push_bind(session_id);
+        let recovery_runs = recovery_query
+            .push(" ORDER BY recovery_subject ASC, recovery_kind ASC")
+            .build()
             .fetch_all(self.pool.get())
             .await
             .map_err(|source| {
@@ -21629,31 +22247,100 @@ impl RunStateStore for DatabaseRunStateStore {
                     source,
                 )
                 .to_string()
-            })?;
-        let mut cancellation_runs = cancellation_rows
+            })?
             .into_iter()
-            .map(run_record_from_row)
+            .map(|row| {
+                let recovery_kind: i64 = row.try_get("recovery_kind").map_err(|source| {
+                    db_error("decode_session_agent_recovery_kind", session_id, source)
+                })?;
+                let recovery_subject: String =
+                    row.try_get("recovery_subject").map_err(|source| {
+                        db_error("decode_session_agent_recovery_subject", session_id, source)
+                    })?;
+                let run = run_record_from_row(row)?;
+                Ok((recovery_kind, recovery_subject, run))
+            })
             .collect::<DbStoreResult<Vec<_>>>()
             .map_err(|error| error.to_string())?;
-        if cancellation_runs.len() > recovery_limit as usize {
-            page.truncated = true;
-            cancellation_runs.truncate(recovery_limit as usize);
+        let mut discovery = Vec::new();
+        let mut retry_cancellation_runs = Vec::new();
+        let mut terminal_refresh_runs = Vec::new();
+        for (recovery_kind, subject, run) in recovery_runs {
+            match recovery_kind {
+                1 | 4 => discovery.push((recovery_kind, subject, run)),
+                2 => retry_cancellation_runs.push(run),
+                3 => terminal_refresh_runs.push(run),
+                other => unreachable!("unknown session agent recovery kind {other}"),
+            }
         }
-        page.recovery_next_cursor = cancellation_runs.last().map(|run| run.run_id.clone());
+        discovery.sort_by(|left, right| left.1.cmp(&right.1));
+        if discovery.len() > recovery_limit {
+            page.truncated = true;
+            discovery.truncate(recovery_limit);
+        }
+        page.recovery_next_cursor = discovery.last().map(|(_, subject, _)| subject.clone());
+        let receipt_subject_ids = discovery
+            .iter()
+            .filter(|(kind, _, _)| *kind == 4)
+            .map(|(_, subject, _)| subject.clone())
+            .collect::<Vec<_>>();
+        page.recovery_cancellation_run_ids = discovery
+            .iter()
+            .filter(|(kind, _, _)| *kind == 1)
+            .map(|(_, _, run)| run)
+            .chain(retry_cancellation_runs.iter())
+            .map(|run| run.run_id.clone())
+            .collect();
+        // Retry rows must not hold the forward cursor. If discovery has no
+        // fresh row, returning no cursor deliberately wraps the forward lane
+        // while the retry lane is still reconciled from the ordinary page.
         let mut included = page
             .runs
             .iter()
             .map(|run| run.run_id.clone())
             .collect::<HashSet<_>>();
-        for run in cancellation_runs {
-            if included.insert(run.run_id.clone()) {
+        for run in discovery
+            .into_iter()
+            .map(|(_, _, run)| run)
+            .chain(retry_cancellation_runs)
+            .chain(terminal_refresh_runs)
+        {
+            if let Some(existing) = page
+                .runs
+                .iter_mut()
+                .find(|existing| existing.run_id == run.run_id)
+            {
+                *existing = run;
+            } else if included.insert(run.run_id.clone()) {
                 page.runs.push(run);
             }
         }
+        // Keep the possible direct parents as event-query identities. We only
+        // load their run rows below if the bounded event query actually finds
+        // the parent-owned spawn or fanout-cancellation envelope; ordinary
+        // child recovery stays one read wave.
+        let parent_run_ids = page
+            .runs
+            .iter()
+            .filter_map(|run| run.parent_run_id.as_deref())
+            .filter(|parent_run_id| !included.contains(*parent_run_id))
+            .map(ToString::to_string)
+            .collect::<HashSet<_>>();
         sort_session_run_tree(&mut page.runs);
         if page.runs.is_empty() {
             return Ok(page);
         }
+        // A fanout cancellation is recorded on the parent run, while the
+        // selected recovery page may contain only its child (for example when
+        // the parent fell outside the bounded active-run page). Include direct
+        // parent identities so the admission fence is not lost in that case.
+        let recovery_event_run_ids = page
+            .runs
+            .iter()
+            .flat_map(|run| {
+                std::iter::once(run.run_id.as_str()).chain(run.parent_run_id.as_deref())
+            })
+            .collect::<HashSet<_>>();
         // Recovery needs one exact spawn envelope per selected child plus the
         // latest terminal facts per selected run. `event_idx` is run-local, so
         // a global ORDER BY/LIMIT lets one noisy run starve every other run.
@@ -21705,8 +22392,64 @@ impl RunStateStore for DatabaseRunStateStore {
         }
         builder.push(
             ")
-               ) ranked_terminal WHERE recovery_rank = 1
-             ) recovery_events
+               ) ranked_terminal WHERE recovery_rank = 1",
+        );
+        if !recovery_event_run_ids.is_empty() {
+            builder.push(
+                "
+               UNION ALL
+               SELECT run_id, event_idx, payload_json FROM (
+                 SELECT run_id, event_idx, payload_json,
+                        ROW_NUMBER() OVER (
+                          PARTITION BY run_id ORDER BY event_idx DESC
+                        ) AS recovery_rank
+                 FROM agent_run_events
+                 WHERE user_id = ",
+            );
+            builder
+                .push_bind(user_id)
+                .push(" AND session_id = ")
+                .push_bind(session_id)
+                .push(" AND event_type = 'fanout_group_cancelled'")
+                .push(" AND JSON_TYPE(JSON_EXTRACT(payload_json, '$.data.group_id')) = 'STRING'")
+                .push(" AND TRIM(JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.data.group_id'))) <> ''")
+                .push(
+                    " AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.data.cancellation_origin')) IN ('user', 'runtime')",
+                )
+                .push(" AND run_id IN (");
+            {
+                let mut ids = builder.separated(",");
+                for run_id in &recovery_event_run_ids {
+                    ids.push_bind(*run_id);
+                }
+            }
+            builder.push(
+                ")
+               ) ranked_group_cancellations WHERE recovery_rank = 1",
+            );
+        }
+        if !receipt_subject_ids.is_empty() {
+            builder.push(
+                " UNION ALL SELECT run_id, event_idx, payload_json
+                  FROM agent_run_events WHERE user_id = ",
+            );
+            builder
+                .push_bind(user_id)
+                .push(" AND session_id = ")
+                .push_bind(session_id)
+                .push(" AND event_type = ")
+                .push_bind(PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE)
+                .push(" AND subject_run_id IN (");
+            {
+                let mut ids = builder.separated(",");
+                for run_id in &receipt_subject_ids {
+                    ids.push_bind(run_id);
+                }
+            }
+            builder.push(")");
+        }
+        builder.push(
+            ") recovery_events
              ORDER BY run_id, event_idx",
         );
         let rows = builder
@@ -21734,6 +22477,61 @@ impl RunStateStore for DatabaseRunStateStore {
                 .entry(run_id)
                 .or_default()
                 .push((event_idx, payload));
+        }
+        // Spawn and group-cancellation events live on the parent run, but a
+        // bounded cancellation page can select only a child. Read missing
+        // direct parents only when the event query proves the parent owns one
+        // of those envelopes. A normal recovery refresh therefore pays no
+        // extra parent-row SQL round trip.
+        let parents_with_recovery_events = parent_run_ids
+            .into_iter()
+            .filter(|parent_run_id| {
+                events_by_run.get(parent_run_id).is_some_and(|events| {
+                    events.iter().any(|(_, event)| {
+                        matches!(
+                            extract_event_type(event).as_str(),
+                            "agent_spawned"
+                                | "fanout_group_cancelled"
+                                | PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE
+                        )
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        if !parents_with_recovery_events.is_empty() {
+            let mut parent_query = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
+                "SELECT {AGENT_RUN_RECOVERY_COLUMNS} FROM agent_runs WHERE user_id = "
+            ));
+            parent_query
+                .push_bind(user_id)
+                .push(" AND session_id = ")
+                .push_bind(session_id)
+                .push(" AND run_id IN (");
+            {
+                let mut ids = parent_query.separated(",");
+                for run_id in &parents_with_recovery_events {
+                    ids.push_bind(run_id);
+                }
+            }
+            parent_query.push(")");
+            let parent_rows = parent_query
+                .build()
+                .fetch_all(self.pool.get())
+                .await
+                .map_err(|source| {
+                    db_error("load_session_agent_recovery_parents", session_id, source).to_string()
+                })?;
+            for parent in parent_rows
+                .into_iter()
+                .map(run_record_from_row)
+                .collect::<DbStoreResult<Vec<_>>>()
+                .map_err(|error| error.to_string())?
+            {
+                if included.insert(parent.run_id.clone()) {
+                    page.runs.push(parent);
+                }
+            }
+            sort_session_run_tree(&mut page.runs);
         }
         for run in &mut page.runs {
             if let Some(mut events) = events_by_run.remove(&run.run_id) {
@@ -22064,6 +22862,102 @@ impl RunStateStore for DatabaseRunStateStore {
 }
 
 impl DatabaseRunStateStore {
+    async fn list_session_runs_with_columns(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        limit: u32,
+        projection_columns: &str,
+    ) -> Result<DurableSessionRunPage, String> {
+        let limit = validate_run_list_limit(limit);
+        let sql = format!(
+            "SELECT {projection_columns} FROM agent_runs \
+             WHERE user_id = ? AND session_id = ? \
+             ORDER BY CASE WHEN status IN (?, ?, ?, ?) THEN 1 ELSE 0 END ASC, \
+                      updated_at DESC, created_at DESC, run_id DESC \
+             LIMIT ?"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(user_id)
+            .bind(session_id)
+            .bind(STATUS_COMPLETED)
+            .bind(STATUS_DELEGATED)
+            .bind(STATUS_FAILED)
+            .bind(STATUS_CANCELLED)
+            .bind(session_run_query_limit(limit))
+            .fetch_all(self.pool.get())
+            .await
+            .map_err(|source| db_error("list_session_runs", session_id, source).to_string())?;
+        let mut runs = rows
+            .into_iter()
+            .map(run_record_from_row)
+            .collect::<DbStoreResult<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        let truncated = runs.len() > limit as usize;
+        runs.truncate(limit as usize);
+
+        // Preserve the ancestry required to interpret every selected node.
+        // Fetch one parent level per round in a single batch; delegation depth
+        // is bounded, and the visited set also makes malformed cycles finite.
+        let mut included = runs
+            .iter()
+            .map(|run| run.run_id.clone())
+            .collect::<HashSet<_>>();
+        let mut frontier = runs
+            .iter()
+            .filter_map(|run| run.parent_run_id.clone())
+            .filter(|run_id| !included.contains(run_id))
+            .collect::<HashSet<_>>();
+        while !frontier.is_empty() {
+            let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
+                "SELECT {projection_columns} FROM agent_runs WHERE user_id = "
+            ));
+            builder
+                .push_bind(user_id)
+                .push(" AND session_id = ")
+                .push_bind(session_id)
+                .push(" AND run_id IN (");
+            let mut separated = builder.separated(", ");
+            for run_id in &frontier {
+                separated.push_bind(run_id);
+            }
+            separated.push_unseparated(")");
+            let parent_rows =
+                builder
+                    .build()
+                    .fetch_all(self.pool.get())
+                    .await
+                    .map_err(|source| {
+                        db_error("list_session_run_ancestors", session_id, source).to_string()
+                    })?;
+            let parents = parent_rows
+                .into_iter()
+                .map(run_record_from_row)
+                .collect::<DbStoreResult<Vec<_>>>()
+                .map_err(|error| error.to_string())?;
+            frontier.clear();
+            for parent in parents {
+                if !included.insert(parent.run_id.clone()) {
+                    continue;
+                }
+                if let Some(grandparent_id) = parent.parent_run_id.clone()
+                    && !included.contains(&grandparent_id)
+                {
+                    frontier.insert(grandparent_id);
+                }
+                runs.push(parent);
+            }
+        }
+        sort_session_run_tree(&mut runs);
+        Ok(DurableSessionRunPage {
+            runs,
+            limit,
+            truncated,
+            recovery_cancellation_run_ids: Vec::new(),
+            recovery_next_cursor: None,
+        })
+    }
+
     async fn reconcile_guidance_commit(
         &self,
         request: AtomicRunGuidanceAdmissionRequest<'_>,
@@ -24327,9 +25221,12 @@ fn build_run_event_insert_row(
             source,
         })?;
     let event_type = extract_event_type(event);
-    let subject_run_id = matches!(event_type.as_str(), "agent_spawned")
-        .then(|| extract_optional_string(event, "run_id"))
-        .flatten();
+    let subject_run_id = matches!(
+        event_type.as_str(),
+        "agent_spawned" | PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE
+    )
+    .then(|| extract_optional_string(event, "run_id"))
+    .flatten();
     let interaction_request_id = extract_interaction_request_id(event);
     let event_id = extract_optional_string(event, "event_id")
         .or_else(|| extract_optional_string(event, "id"))
@@ -25991,6 +26888,133 @@ mod tests {
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         }
+    }
+
+    #[tokio::test]
+    async fn pre_durable_child_terminal_is_exact_idempotent_and_recoverable_off_page() {
+        let store = InMemoryRunStateStore::new();
+        let mut parent = durable_run_record("receipt-parent");
+        parent.status = STATUS_COMPLETED.into();
+        parent.events.push(serde_json::json!({
+            "event_type": "fanout_group_cancelled",
+            "data": {
+                "group_id": "receipt-group", "parent_run_id": "receipt-parent",
+                "target_count": 1, "unassigned_slots": [],
+                "reason": "deadline", "cancellation_origin": "runtime"
+            }
+        }));
+        store.insert_run(parent).await.unwrap();
+        let mut noise = durable_run_record("noise-active");
+        noise.status = STATUS_RUNNING.into();
+        store.insert_run(noise).await.unwrap();
+        let receipt = PreDurableChildTerminal {
+            user_id: "u1".into(),
+            session_id: "s1".into(),
+            parent_run_id: "receipt-parent".into(),
+            child_run_id: "receipt-child".into(),
+            cancellation_binding_id: "binding-1".into(),
+            agent_id: "reviewer-1".into(),
+            agent_type: "code-review".into(),
+            description: "Review".into(),
+            fanout_slot: Some(PreDurableFanoutSlot {
+                group_id: "receipt-group".into(),
+                target_count: 1,
+                slot_index: 0,
+                slot_id: Some("review".into()),
+            }),
+            origin: DurableCancellationOrigin::Runtime,
+            reason: "deadline".into(),
+        };
+        let recorded = PreDurableChildTerminalCommit::Recorded {
+            origin: DurableCancellationOrigin::Runtime,
+            reason: "deadline".into(),
+        };
+        assert_eq!(
+            store
+                .commit_pre_durable_child_terminal(&receipt)
+                .await
+                .unwrap(),
+            recorded
+        );
+        let mut upgraded = receipt.clone();
+        upgraded.origin = DurableCancellationOrigin::User;
+        upgraded.reason = "user stop".into();
+        assert_eq!(
+            store
+                .commit_pre_durable_child_terminal(&upgraded)
+                .await
+                .unwrap(),
+            recorded
+        );
+        let mut invalid = receipt.clone();
+        invalid.fanout_slot.as_mut().unwrap().slot_index = 1;
+        assert!(
+            store
+                .commit_pre_durable_child_terminal(&invalid)
+                .await
+                .is_err()
+        );
+        let page = store
+            .load_session_agent_recovery_after("u1", "s1", 1, None)
+            .await
+            .unwrap();
+        assert!(page.runs.iter().any(|run| run.run_id == "receipt-parent"));
+        assert_eq!(page.recovery_next_cursor.as_deref(), Some("receipt-child"));
+        let parent = store
+            .load_run("u1", "receipt-parent")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.events.len(), 2);
+        assert_eq!(parent.events[1]["data"]["cancellation_origin"], "runtime");
+
+        let mut child = durable_run_record("already-durable-child");
+        child.status = STATUS_COMPLETED.into();
+        child.parent_run_id = Some("receipt-parent".into());
+        child.agent_id = Some("reviewer-1".into());
+        store.insert_run(child).await.unwrap();
+        let mut present = receipt.clone();
+        present.child_run_id = "already-durable-child".into();
+        assert_eq!(
+            store
+                .commit_pre_durable_child_terminal(&present)
+                .await
+                .unwrap(),
+            PreDurableChildTerminalCommit::ChildPresent
+        );
+        assert_eq!(
+            store
+                .load_run("u1", "receipt-parent")
+                .await
+                .unwrap()
+                .unwrap()
+                .events
+                .len(),
+            2
+        );
+        present.user_id = "other-user".into();
+        assert!(
+            store
+                .commit_pre_durable_child_terminal(&present)
+                .await
+                .is_err()
+        );
+
+        let mut orphan = durable_run_record("orphan-child");
+        orphan.parent_run_id = Some("deleted-parent".into());
+        orphan.agent_id = Some("reviewer-1".into());
+        store.insert_run(orphan).await.unwrap();
+        let mut missing_parent = receipt;
+        missing_parent.parent_run_id = "deleted-parent".into();
+        missing_parent.child_run_id = "orphan-child".into();
+        assert_eq!(
+            store
+                .commit_pre_durable_child_terminal(&missing_parent)
+                .await
+                .unwrap(),
+            PreDurableChildTerminalCommit::ChildPresent,
+            "a removed parent must not hide an existing child"
+        );
     }
 
     #[test]
@@ -29689,6 +30713,55 @@ mod tests {
                         "fanout_slot": {"group_id":"review","target_count":1,"slot_index":0,"slot_id":"correctness"}
                     }),
                     serde_json::json!({"type":"agent_progress","status":"noise"}),
+                    serde_json::json!({
+                        "type": "fanout_group_cancelled",
+                        "data": {
+                            "group_id": "review-a",
+                            "parent_run_id": root_id,
+                            "target_count": 2,
+                            "reason": "first group stopped",
+                            "cancellation_origin": "user"
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "fanout_group_cancelled",
+                        "data": {
+                            "group_id": "review-b",
+                            "parent_run_id": root_id,
+                            "target_count": 3,
+                            "reason": "second group stopped",
+                            "cancellation_origin": "runtime"
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "fanout_group_cancelled",
+                        "data": {
+                            "group_id": "malformed-latest",
+                            "parent_run_id": root_id,
+                            "target_count": 3,
+                            "reason": "missing trusted origin"
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "fanout_group_cancelled",
+                        "data": {
+                            "group_id": "   ",
+                            "parent_run_id": root_id,
+                            "target_count": 3,
+                            "reason": "blank group identity",
+                            "cancellation_origin": "runtime"
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "fanout_group_cancelled",
+                        "data": {
+                            "group_id": [],
+                            "parent_run_id": root_id,
+                            "target_count": 3,
+                            "reason": "non-string group identity",
+                            "cancellation_origin": "runtime"
+                        }
+                    }),
                 ],
             )
             .await
@@ -29747,10 +30820,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             root.events.len(),
-            1,
-            "unneeded progress events stay out of recovery"
+            2,
+            "recovery keeps the spawn envelope and newest group cancellation fence"
         );
         assert_eq!(root.events[0]["type"], "agent_spawned");
+        assert_eq!(root.events[1]["type"], "fanout_group_cancelled");
+        assert_eq!(root.events[1]["data"]["group_id"], "review-b");
         assert_eq!(child.status, STATUS_RUNNING);
         assert_eq!(child.events.len(), 1);
         assert_eq!(child.events[0]["data"]["attempt"], 39);
@@ -29762,8 +30837,21 @@ mod tests {
             .load_session_agent_recovery_after(&user_id, &session_id, 2, Some(&child_id))
             .await
             .expect("MatrixOne cancellation recovery seek");
-        assert!(after_page.recovery_next_cursor.is_none());
-        assert!(after_page.runs.iter().all(|run| run.run_id != child_id));
+        assert_eq!(after_page.recovery_next_cursor.as_deref(), None);
+        assert_eq!(
+            after_page.recovery_cancellation_run_ids,
+            vec![child_id.clone()]
+        );
+        assert!(after_page.runs.iter().any(|run| run.run_id == child_id));
+        let wrapped_page = store
+            .load_session_agent_recovery(&user_id, &session_id, 2)
+            .await
+            .expect("MatrixOne cancellation recovery wraps after retry-only page");
+        assert!(
+            wrapped_page
+                .recovery_cancellation_run_ids
+                .contains(&child_id)
+        );
 
         assert!(
             store
@@ -29806,6 +30894,293 @@ mod tests {
         for run_id in [&root_id, &child_id].into_iter().chain(noise_ids.iter()) {
             cleanup_database_run_fixture(&pool, &user_id, run_id).await;
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_pre_durable_child_terminal_orders_with_run_creation_and_recovers_off_page() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let suffix = Uuid::new_v4();
+        let user_id = format!("pre-durable-user-{suffix}");
+        let session_id = format!("pre-durable-session-{suffix}");
+        let parent_id = format!("pre-durable-parent-{suffix}");
+        let child_id = format!("pre-durable-child-{suffix}");
+        let noise_id = format!("pre-durable-noise-{suffix}");
+        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+        let mut parent = durable_run_record(&parent_id);
+        parent.user_id = user_id.clone();
+        parent.session_id = session_id.clone();
+        parent.status = STATUS_COMPLETED.into();
+        store.insert_run(parent).await.unwrap();
+        let mut noise = durable_run_record(&noise_id);
+        noise.user_id = user_id.clone();
+        noise.session_id = session_id.clone();
+        store.insert_run(noise).await.unwrap();
+        let receipt = PreDurableChildTerminal {
+            user_id: user_id.clone(),
+            session_id: session_id.clone(),
+            parent_run_id: parent_id.clone(),
+            child_run_id: child_id.clone(),
+            cancellation_binding_id: format!("binding-{suffix}"),
+            agent_id: format!("reviewer-{suffix}"),
+            agent_type: "code-review".into(),
+            description: "Review".into(),
+            fanout_slot: Some(PreDurableFanoutSlot {
+                group_id: format!("group-{suffix}"),
+                target_count: 1,
+                slot_index: 0,
+                slot_id: Some("review".into()),
+            }),
+            origin: DurableCancellationOrigin::Runtime,
+            reason: "deadline".into(),
+        };
+        let recorded = PreDurableChildTerminalCommit::Recorded {
+            origin: DurableCancellationOrigin::Runtime,
+            reason: "deadline".into(),
+        };
+        assert_eq!(
+            store
+                .commit_pre_durable_child_terminal(&receipt)
+                .await
+                .unwrap(),
+            recorded
+        );
+        let mut upgraded = receipt.clone();
+        upgraded.origin = DurableCancellationOrigin::User;
+        upgraded.reason = "user stop".into();
+        assert_eq!(
+            store
+                .commit_pre_durable_child_terminal(&upgraded)
+                .await
+                .unwrap(),
+            recorded
+        );
+        let page = store
+            .load_session_agent_recovery_after(&user_id, &session_id, 1, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.recovery_next_cursor.as_deref(),
+            Some(child_id.as_str())
+        );
+        assert!(page.runs.iter().any(|run| {
+            run.run_id == parent_id
+                && run
+                    .events
+                    .iter()
+                    .any(|event| extract_event_type(event) == PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE)
+        }));
+        let mut non_fanout = receipt.clone();
+        non_fanout.child_run_id = format!("pre-durable-single-{suffix}");
+        non_fanout.fanout_slot = None;
+        assert_eq!(
+            store
+                .commit_pre_durable_child_terminal(&non_fanout)
+                .await
+                .unwrap(),
+            recorded,
+            "non-fanout no-row settlement must also cross the session fence"
+        );
+        assert_eq!(
+            store
+                .load_run(&user_id, &parent_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| extract_event_type(event) == PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE)
+                .count(),
+            1,
+            "a non-fanout child must not write a receipt"
+        );
+        let orphan_id = format!("pre-durable-orphan-{suffix}");
+        let mut orphan = durable_run_record(&orphan_id);
+        orphan.user_id = user_id.clone();
+        orphan.session_id = session_id.clone();
+        orphan.parent_run_id = Some(parent_id.clone());
+        orphan.agent_id = Some(receipt.agent_id.clone());
+        store.insert_run(orphan).await.unwrap();
+        cleanup_database_run_fixture(&pool, &user_id, &parent_id).await;
+        let mut missing_parent = receipt;
+        missing_parent.child_run_id = orphan_id.clone();
+        missing_parent.fanout_slot = None;
+        assert_eq!(
+            store
+                .commit_pre_durable_child_terminal(&missing_parent)
+                .await
+                .unwrap(),
+            PreDurableChildTerminalCommit::ChildPresent
+        );
+        for run_id in [&orphan_id, &noise_id] {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+        }
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_agent_recovery_loads_spawn_only_fanout_parent_on_matrixone() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("runs-it-spawn-parent-user-{}", Uuid::new_v4());
+        let session_id = format!("spawn-parent-session-{}", Uuid::new_v4());
+        let parent_id = format!("runs-it-spawn-parent-{}", Uuid::new_v4());
+        let child_id = format!("runs-it-spawn-child-{}", Uuid::new_v4());
+        let noise_id = format!("runs-it-spawn-noise-{}", Uuid::new_v4());
+        for run_id in [&parent_id, &child_id, &noise_id] {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+        }
+        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+
+        let mut parent = durable_run_record(&parent_id);
+        parent.user_id = user_id.clone();
+        parent.session_id = session_id.clone();
+        store.insert_run(parent).await.unwrap();
+
+        let mut child = durable_run_record(&child_id);
+        child.user_id = user_id.clone();
+        child.session_id = session_id.clone();
+        child.parent_run_id = Some(parent_id.clone());
+        child.root_run_id = Some(parent_id.clone());
+        child.ancestor_path = Some(format!("{parent_id}/{child_id}"));
+        child.depth = 1;
+        child.agent_id = Some("reviewer".into());
+        store.insert_run(child).await.unwrap();
+
+        let mut noise = durable_run_record(&noise_id);
+        noise.user_id = user_id.clone();
+        noise.session_id = session_id.clone();
+        noise.status = STATUS_COMPLETED.to_string();
+        store.insert_run(noise).await.unwrap();
+        store
+            .append_events_batch(
+                &user_id,
+                &session_id,
+                &parent_id,
+                &[serde_json::json!({
+                    "type": "agent_spawned",
+                    "run_id": child_id,
+                    "agent_id": "reviewer",
+                    "agent_type": "code-review",
+                    "description": "recover spawn metadata without group cancellation"
+                })],
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .request_run_cancellation(&user_id, &child_id)
+                .await
+                .unwrap()
+        );
+        sqlx::query(
+            "UPDATE agent_runs
+             SET updated_at = DATE_SUB(NOW(6), INTERVAL 1 DAY)
+             WHERE user_id = ? AND run_id IN (?, ?)",
+        )
+        .bind(&user_id)
+        .bind(&parent_id)
+        .bind(&child_id)
+        .execute(pool.get())
+        .await
+        .expect("make the parent and child fall outside the ordinary page");
+
+        let page = store
+            .load_session_agent_recovery(&user_id, &session_id, 1)
+            .await
+            .expect("spawn-only parent recovery");
+        let parent = page
+            .runs
+            .iter()
+            .find(|run| run.run_id == parent_id)
+            .expect("recovery must load the missing direct parent");
+        assert_eq!(parent.events.len(), 1);
+        assert_eq!(extract_event_type(&parent.events[0]), "agent_spawned");
+        assert!(page.runs.iter().any(|run| run.run_id == child_id));
+
+        for run_id in [&parent_id, &child_id, &noise_id] {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_agent_recovery_refreshes_terminal_race_on_matrixone() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("runs-it-terminal-race-user-{}", Uuid::new_v4());
+        let session_id = format!("terminal-race-session-{}", Uuid::new_v4());
+        let run_id = format!("runs-it-terminal-race-{}", Uuid::new_v4());
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user_id.clone();
+        run.session_id = session_id.clone();
+        store.insert_run(run).await.unwrap();
+        assert!(
+            store
+                .request_run_cancellation(&user_id, &run_id)
+                .await
+                .unwrap()
+        );
+
+        let page_loaded = std::sync::Arc::new(tokio::sync::Notify::new());
+        let page_continue = std::sync::Arc::new(tokio::sync::Notify::new());
+        let recovery_store = store
+            .clone()
+            .with_recovery_page_pause(page_loaded.clone(), page_continue.clone());
+        let recovery_user_id = user_id.clone();
+        let recovery_session_id = session_id.clone();
+        let recovery = tokio::spawn(async move {
+            recovery_store
+                .load_session_agent_recovery(&recovery_user_id, &recovery_session_id, 1)
+                .await
+        });
+        page_loaded.notified().await;
+        assert!(
+            store
+                .update_run_status_with_events_if_current(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    &[STATUS_RUNNING],
+                    None,
+                    STATUS_CANCELLED,
+                    None,
+                    None,
+                    &[serde_json::json!({
+                        "event_type": "run_finished",
+                        "data": {
+                            "run_id": run_id,
+                            "status": STATUS_CANCELLED,
+                            "cancelled": true,
+                            "cancellation_origin": "user"
+                        }
+                    })],
+                )
+                .await
+                .unwrap()
+        );
+        page_continue.notify_one();
+
+        let page = recovery
+            .await
+            .expect("recovery task join")
+            .expect("terminal race recovery");
+        let recovered = page
+            .runs
+            .iter()
+            .find(|run| run.run_id == run_id)
+            .expect("ordinary page row remains addressable");
+        assert_eq!(recovered.status, STATUS_CANCELLED);
+        assert_eq!(recovered.events.len(), 1);
+        assert!(page.recovery_cancellation_run_ids.is_empty());
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
     }
 
     #[tokio::test]
@@ -30442,6 +31817,53 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_run_create_projection_conflict_rolls_back_run_and_initial_events_on_matrixone()
+     {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let nonce = Uuid::new_v4();
+        let user_id = format!("create-projection-u-{nonce}");
+        let session_id = format!("create-projection-s-{nonce}");
+        let run_id = format!("create-projection-r-{nonce}");
+        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+        sqlx::query(
+            "INSERT INTO run_display_projections
+             (run_id, user_id, session_id, status, projection_hash)
+             VALUES (?, ?, ?, 'completed', ?)",
+        )
+        .bind(&run_id)
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind("conflicting-projection")
+        .execute(pool.get())
+        .await
+        .expect("seed conflicting projection identity");
+
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user_id.clone();
+        run.session_id = session_id.clone();
+        assert!(store.insert_run(run).await.is_err());
+        assert!(store.load_run(&user_id, &run_id).await.unwrap().is_none());
+        let event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .fetch_one(pool.get())
+        .await
+        .expect("count rolled-back initial events");
+        assert_eq!(event_count, 0);
+
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup projection conflict session");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn database_run_create_commit_ack_loss_recovers_exact_run_slot_and_initial_events_on_matrixone()
      {
         let (_, pool) = setup_database_run_state_store_it().await;
@@ -30482,6 +31904,21 @@ mod tests {
         assert_eq!(durable.events.len(), 2);
         assert_eq!(durable.events[0]["index"], 0);
         assert_eq!(durable.events[1]["index"], 1);
+        let projection = store
+            .load_run_projection(&user_id, &run_id)
+            .await
+            .expect("load ACK-loss projection")
+            .expect("ACK-loss projection committed with run");
+        assert_eq!(projection.projection_event_idx, 1);
+        assert_eq!(
+            projection.latest_event_type.as_deref(),
+            Some("user_message")
+        );
+        assert_eq!(
+            projection.projection_hash,
+            build_run_display_projection(&durable, Some("user_message".into()), None)
+                .projection_hash
+        );
         assert_eq!(
             sqlx::query_scalar::<_, Option<String>>(
                 "SELECT run_id FROM agent_session_execution_slots
@@ -30507,6 +31944,162 @@ mod tests {
             .execute(pool.get())
             .await
             .expect("cleanup exact create session");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_terminal_transition_commit_ack_loss_reconciles_exact_status_and_events_on_matrixone()
+     {
+        let (_, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("transition-ack-u-{}", Uuid::new_v4());
+        let session_id = format!("transition-ack-s-{}", Uuid::new_v4());
+        let run_id = format!("transition-ack-r-{}", Uuid::new_v4());
+        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+        let store = DatabaseRunStateStore::new(pool.clone())
+            .with_owner_pod_id("transition-ack-owner")
+            .with_terminal_transition_commit_ack_loss_once();
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user_id.clone();
+        run.session_id = session_id.clone();
+        store
+            .insert_run(run)
+            .await
+            .expect("insert transition ACK-loss run");
+        assert!(
+            store
+                .request_run_cancellation(&user_id, &run_id)
+                .await
+                .expect("persist user cancellation marker")
+        );
+
+        let terminal_event = json!({
+            "event_type": "run_finished",
+            "data": {
+                "run_id": run_id,
+                "status": STATUS_CANCELLED,
+                "cancelled": true,
+                "reason": "test cancellation",
+                "source": "test",
+                "cancellation_origin": "user"
+            }
+        });
+        assert!(
+            store
+                .update_run_status_with_events_if_current(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    &[STATUS_RUNNING],
+                    None,
+                    STATUS_CANCELLED,
+                    None,
+                    None,
+                    &[terminal_event],
+                )
+                .await
+                .expect("exact terminal transition survives lost COMMIT acknowledgement")
+        );
+        let durable = store
+            .load_run(&user_id, &run_id)
+            .await
+            .expect("load reconciled transition")
+            .expect("reconciled transition exists");
+        assert_eq!(durable.status, STATUS_CANCELLED);
+        assert_eq!(
+            durable
+                .events
+                .iter()
+                .filter(|event| event["event_type"] == "run_finished")
+                .count(),
+            1
+        );
+
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup transition execution slot");
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup transition session");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_empty_terminal_transition_ack_loss_fails_closed_on_matrixone() {
+        let (_, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("transition-empty-ack-u-{}", Uuid::new_v4());
+        let session_id = format!("transition-empty-ack-s-{}", Uuid::new_v4());
+        let run_id = format!("transition-empty-ack-r-{}", Uuid::new_v4());
+        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+        let store = DatabaseRunStateStore::new(pool.clone())
+            .with_owner_pod_id("transition-empty-ack-owner");
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user_id.clone();
+        run.session_id = session_id.clone();
+        store
+            .insert_run(run)
+            .await
+            .expect("insert empty-batch ACK-loss run");
+        assert!(
+            store
+                .update_run_status_with_events_if_current(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    &[STATUS_RUNNING],
+                    None,
+                    STATUS_COMPLETED,
+                    None,
+                    None,
+                    &[],
+                )
+                .await
+                .expect("seed same-status empty transition")
+        );
+        let store = DatabaseRunStateStore::new(pool.clone())
+            .with_owner_pod_id("transition-empty-ack-owner")
+            .with_terminal_transition_commit_ack_loss_once();
+        let error = store
+            .update_run_status_with_events_if_current(
+                &user_id,
+                &session_id,
+                &run_id,
+                &[STATUS_COMPLETED],
+                None,
+                STATUS_COMPLETED,
+                None,
+                None,
+                &[],
+            )
+            .await
+            .expect_err("empty-batch ACK loss must not be reported as verified");
+        assert!(
+            error.contains("durable transition acknowledgement remains ambiguous"),
+            "unexpected empty-batch recovery error: {error}"
+        );
+        let durable = store
+            .load_run(&user_id, &run_id)
+            .await
+            .expect("load empty-batch ACK-loss run")
+            .expect("empty-batch ACK-loss run exists");
+        assert_eq!(durable.status, STATUS_COMPLETED);
+        assert_eq!(durable.last_event_idx, 0);
+
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup empty transition execution slot");
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup empty transition session");
     }
 
     #[tokio::test]
@@ -30541,6 +32134,13 @@ mod tests {
         assert_eq!(receipt["event_type"], "run_created");
         assert_eq!(receipt["data"]["run_id"], run_id);
         assert_eq!(receipt["data"]["session_id"], session_id);
+        let projection = store
+            .load_run_projection(&user_id, &run_id)
+            .await
+            .expect("load receipt projection")
+            .expect("receipt projection committed with run");
+        assert_eq!(projection.projection_event_idx, 0);
+        assert_eq!(projection.latest_event_type.as_deref(), Some("run_created"));
         assert!(
             receipt["data"]["receipt_id"]
                 .as_str()

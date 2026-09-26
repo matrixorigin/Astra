@@ -194,6 +194,14 @@ Tool results retain their source status, exit semantics, output, and invocation
 identity. Classification uses supported evidence; an unknown cause stays unknown.
 The Agent interprets the impact on the user's task. A later unrelated success
 must not clear a failure, and changing a command does not prove equivalence.
+An executed validation-shaped command can retain exact-operation failure debt
+without proving a successful validation when its arguments have ambiguous
+execution semantics. An ambiguous success clears only its own failure debt;
+Work delivery still requires a proof-eligible validation, with one bounded
+direct revalidation opportunity or a truthful failed/blocked settlement.
+Argument proof follows the tool's option/operand boundary: a TypeScript `@file`
+is opaque only when parsed as a top-level response-file argument, not when a
+known value-taking option consumes it as an ordinary path or package name.
 
 At completion, an unresolved failure with a later-round observation candidate,
 or the existing repeated-failure signal, permits one evidence-linked
@@ -205,8 +213,13 @@ state, unfinished child/fanout execution, or an invocation that cannot be
 rejoined to durable authority. Ordinary diagnostic probes remain in the full
 ledger and final explanation, but do not turn the answer into
 `ExecutionIncomplete` merely because a later observation exists. This keeps
-the rule semantic rather than tied to one command name. If the runtime cannot
-classify a failed invocation because its authority is missing, it fails closed
+the rule semantic rather than tied to one command name. For a failed opaque
+executable, read-only task intent alone does not prove no effect: the diagnostic
+exception requires an executor-owned unchanged-workspace receipt. Missing or
+weak observation remains an unresolved completion risk. An exploratory profile
+may report a failed known observation or validation, but cannot erase a failed
+opaque execution with unproven effects. If the runtime cannot classify a failed
+invocation because its authority is missing, it fails closed
 and retains the strict path. The full schema is supplied only in that
 boundary's hint, not added to resident tools. The proposal identifies the
 verification target, failed and later evidence calls,

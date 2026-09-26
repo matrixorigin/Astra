@@ -676,15 +676,28 @@ pub(crate) async fn stop_background_task_with_agents(
         Ok(()) => Ok(BackgroundTaskStopTarget::Shell),
         Err(BackgroundTaskError::NotFound { .. }) => {
             if let Some(spawner) = agent_spawner {
-                if spawner
-                    .cancel_fanout_group_for_user(
-                        task_id,
-                        "user-requested via background task control",
-                    )
-                    .await
-                    .is_some()
-                {
-                    return Ok(BackgroundTaskStopTarget::FanoutGroup);
+                // Resolve the owning parent from the displayed group, then
+                // recheck it atomically in the spawner's stop operation.
+                if let Some(group) = spawner.fanout_group(task_id).await {
+                    let Some(parent_run_id) = group.parent_run_id.as_deref() else {
+                        return Err(BackgroundTaskError::CannotStop {
+                            task_id: task_id.to_string(),
+                        });
+                    };
+                    if spawner
+                        .cancel_fanout_group_for_user_in_parent(
+                            parent_run_id,
+                            task_id,
+                            "user-requested via background task control",
+                        )
+                        .await
+                        .is_some()
+                    {
+                        return Ok(BackgroundTaskStopTarget::FanoutGroup);
+                    }
+                    return Err(BackgroundTaskError::CannotStop {
+                        task_id: task_id.to_string(),
+                    });
                 }
                 if spawner
                     .cancel_agent_for_user(task_id, "user-requested via background task control")

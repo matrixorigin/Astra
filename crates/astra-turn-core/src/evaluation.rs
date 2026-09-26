@@ -312,8 +312,11 @@ pub fn tool_outcome_requires_terminal_attention(
     let args = record
         .authoritative_args_full()
         .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
-    if normalize_validation_prefix(&record.name, record.authoritative_args_full().unwrap_or(""))
-        .is_some()
+    if normalize_validation_attempt_prefix(
+        &record.name,
+        record.authoritative_args_full().unwrap_or(""),
+    )
+    .is_some()
     {
         return true;
     }
@@ -1884,7 +1887,7 @@ impl ToolEvaluationFact {
                 ReadInvalidation::None
             },
             read_target: extract_read_target(&record.name, args),
-            validation_prefix: normalize_validation_prefix(&record.name, args)
+            validation_prefix: normalize_validation_attempt_prefix(&record.name, args)
                 .map(|prefix| EvaluationIdentity::new(b"validation", &prefix)),
             observation_request_identity,
             observation_result_identity,
@@ -2630,6 +2633,16 @@ fn top_level_shell_delimiters(
 /// a successful `python3 -m pytest`/`cargo test` receipt cannot be mistaken for
 /// an opaque, potentially mutating shell call.
 pub fn normalize_validation_prefix(name: &str, args: &str) -> Option<String> {
+    normalize_validation_prefix_kind(name, args, true)
+}
+
+/// A failed validator-shaped invocation retains debt even when its arguments
+/// cannot prove that a successful invocation actually validated the project.
+pub fn normalize_validation_attempt_prefix(name: &str, args: &str) -> Option<String> {
+    normalize_validation_prefix_kind(name, args, false)
+}
+
+fn normalize_validation_prefix_kind(name: &str, args: &str, require_proof: bool) -> Option<String> {
     if name != "bash" {
         return None;
     }
@@ -2638,52 +2651,181 @@ pub fn normalize_validation_prefix(name: &str, args: &str) -> Option<String> {
     if command.is_empty() {
         return None;
     }
-    bash_command_post_mutation_validation_prefix(command)
+    bash_command_post_mutation_validation_prefix_kind(command, require_proof)
 }
 
-fn normalized_validation_segment(segment: &str) -> Option<String> {
+struct ValidationCandidate {
+    operation: String,
+    proof_eligible: bool,
+}
+
+fn typescript_option_may_skip_validation(word: &str) -> bool {
+    let Some(name) = word.strip_prefix("--").or_else(|| word.strip_prefix('-')) else {
+        return false;
+    };
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "h" | "?"
+            | "help"
+            | "v"
+            | "version"
+            | "all"
+            | "showconfig"
+            | "listfilesonly"
+            | "init"
+            | "nocheck"
+            | "w"
+            | "watch"
+    )
+}
+
+/// TypeScript expands `@file` only at the top level of argv, after an option
+/// has had the chance to consume its operand. These are the CLI-admitted
+/// non-Boolean compiler/watch options; an unknown option does not grant proof.
+fn typescript_option_value_kind(word: &str) -> Option<bool> {
+    let name = word.strip_prefix("--").or_else(|| word.strip_prefix('-'))?;
+    let name = name.to_ascii_lowercase();
+    if matches!(
+        name.as_str(),
+        "lib"
+            | "typeroots"
+            | "types"
+            | "modulesuffixes"
+            | "customconditions"
+            | "excludedirectories"
+            | "excludefiles"
+    ) {
+        return Some(true); // List: a following switch is not consumed.
+    }
+    matches!(
+        name.as_str(),
+        "generatecpuprofile"
+            | "generatetrace"
+            | "locale"
+            | "project"
+            | "p"
+            | "target"
+            | "t"
+            | "module"
+            | "m"
+            | "jsx"
+            | "outfile"
+            | "outdir"
+            | "rootdir"
+            | "tsbuildinfofile"
+            | "importsnotusedasvalues"
+            | "moduleresolution"
+            | "baseurl"
+            | "sourceroot"
+            | "maproot"
+            | "jsxfactory"
+            | "jsxfragmentfactory"
+            | "jsximportsource"
+            | "out"
+            | "reactnamespace"
+            | "charset"
+            | "newline"
+            | "declarationdir"
+            | "maxnodemodulejsdepth"
+            | "moduledetection"
+            | "ignoredeprecations"
+            | "watchfile"
+            | "watchdirectory"
+            | "fallbackpolling"
+    )
+    .then_some(false)
+}
+
+fn typescript_args_prove_validation(words: &[String]) -> bool {
+    let mut index = 0;
+    while let Some(word) = words.get(index) {
+        if word.starts_with('@') {
+            return false;
+        }
+        if let Some(is_list) = typescript_option_value_kind(word) {
+            let Some(value) = words.get(index + 1) else {
+                return false;
+            };
+            // TypeScript leaves an option-looking token after a list option
+            // for the outer argv parser (e.g. `--types --help`).
+            index += if is_list && value.starts_with('-') {
+                1
+            } else {
+                2
+            };
+            continue;
+        }
+        if typescript_option_may_skip_validation(word) {
+            if words.get(index + 1).is_none_or(|value| value != "false") {
+                return false;
+            }
+            index += 1;
+        }
+        index += 1;
+    }
+    true
+}
+
+fn normalized_validation_segment(segment: &str) -> Option<ValidationCandidate> {
+    // Shell command names, subcommands and module names are case-sensitive.
+    // TypeScript's --noEmit option is not: canonicalize only that option for
+    // exact-operation recovery, preserving paths and other arguments.
+    let typescript = ["tsc ", "npx tsc "].into_iter().find_map(|prefix| {
+        let args = segment.strip_prefix(prefix)?;
+        let option_end = args.find(' ').unwrap_or(args.len());
+        if !args[..option_end].eq_ignore_ascii_case("--noEmit") {
+            return None;
+        }
+        let words = split_static_shell_words(args)?;
+        Some(ValidationCandidate {
+            operation: format!("{prefix}--noEmit{}", &args[option_end..]),
+            proof_eligible: typescript_args_prove_validation(&words[1..]),
+        })
+    });
+    if typescript.is_some() {
+        return typescript;
+    }
     if validation_segment_has_meta_option(segment) {
         return None;
     }
-    let lower = segment.to_ascii_lowercase();
-    let recognized = lower.starts_with("cargo check ")
-        || lower == "cargo check"
-        || lower.starts_with("cargo test ")
-        || lower == "cargo test"
-        || lower.starts_with("cargo build ")
-        || lower == "cargo build"
-        || lower.starts_with("npx tsc --noemit")
-        || lower == "tsc --noemit"
-        || lower.starts_with("tsc --noemit ")
-        || lower == "pytest"
-        || lower.starts_with("pytest ")
-        || lower == "python -m pytest"
-        || lower.starts_with("python -m pytest ")
-        || lower == "python3 -m pytest"
-        || lower.starts_with("python3 -m pytest ")
-        || lower == "python -m unittest"
-        || lower.starts_with("python -m unittest ")
-        || lower == "python3 -m unittest"
-        || lower.starts_with("python3 -m unittest ")
-        || lower == "python -m build"
-        || lower.starts_with("python -m build ")
-        || lower == "python3 -m build"
-        || lower.starts_with("python3 -m build ")
-        || lower.starts_with("python setup.py build ")
-        || lower == "python setup.py build"
-        || lower.starts_with("python setup.py build_ext ")
-        || lower == "python setup.py build_ext"
-        || lower.starts_with("python3 setup.py build ")
-        || lower == "python3 setup.py build"
-        || lower.starts_with("python3 setup.py build_ext ")
-        || lower == "python3 setup.py build_ext"
-        || lower == "npm test"
-        || lower.starts_with("npm test ")
-        || lower == "npm run build"
-        || lower.starts_with("npm run build ")
-        || lower == "go test"
-        || lower.starts_with("go test ");
-    recognized.then_some(segment.to_string())
+    let recognized = segment.starts_with("cargo check ")
+        || segment == "cargo check"
+        || segment.starts_with("cargo test ")
+        || segment == "cargo test"
+        || segment.starts_with("cargo build ")
+        || segment == "cargo build"
+        || segment == "pytest"
+        || segment.starts_with("pytest ")
+        || segment == "python -m pytest"
+        || segment.starts_with("python -m pytest ")
+        || segment == "python3 -m pytest"
+        || segment.starts_with("python3 -m pytest ")
+        || segment == "python -m unittest"
+        || segment.starts_with("python -m unittest ")
+        || segment == "python3 -m unittest"
+        || segment.starts_with("python3 -m unittest ")
+        || segment == "python -m build"
+        || segment.starts_with("python -m build ")
+        || segment == "python3 -m build"
+        || segment.starts_with("python3 -m build ")
+        || segment.starts_with("python setup.py build ")
+        || segment == "python setup.py build"
+        || segment.starts_with("python setup.py build_ext ")
+        || segment == "python setup.py build_ext"
+        || segment.starts_with("python3 setup.py build ")
+        || segment == "python3 setup.py build"
+        || segment.starts_with("python3 setup.py build_ext ")
+        || segment == "python3 setup.py build_ext"
+        || segment == "npm test"
+        || segment.starts_with("npm test ")
+        || segment == "npm run build"
+        || segment.starts_with("npm run build ")
+        || segment == "go test"
+        || segment.starts_with("go test ");
+    recognized.then(|| ValidationCandidate {
+        operation: segment.to_string(),
+        proof_eligible: true,
+    })
 }
 
 /// A framework command's help/version mode is an informational query, not a
@@ -2740,6 +2882,13 @@ fn validation_segment_has_meta_option(segment: &str) -> bool {
 /// writer is deliberately not returned; callers must not combine an old
 /// project-wide prefix with a new, weaker observation.
 pub fn bash_command_post_mutation_validation_prefix(command: &str) -> Option<String> {
+    bash_command_post_mutation_validation_prefix_kind(command, true)
+}
+
+fn bash_command_post_mutation_validation_prefix_kind(
+    command: &str,
+    require_proof: bool,
+) -> Option<String> {
     let mut latest = None;
     let control_segments = split_shell_control_segments_with_ops(command)?;
     for (segment_index, (raw_segment, op_after)) in control_segments.iter().enumerate() {
@@ -2767,8 +2916,12 @@ pub fn bash_command_post_mutation_validation_prefix(command: &str) -> Option<Str
             if is_shell_control_segment(&normalized) {
                 continue;
             }
-            if let Some(prefix) = normalized_validation_segment(&normalized) {
-                pipeline_latest = Some(prefix);
+            if let Some(candidate) = normalized_validation_segment(&normalized) {
+                if require_proof && !candidate.proof_eligible {
+                    pipeline_blocked = true;
+                    break;
+                }
+                pipeline_latest = Some(candidate.operation);
                 continue;
             }
             if is_positive_validation_segment(&normalized)
@@ -2855,7 +3008,11 @@ pub fn bash_command_has_post_mutation_validation(command: &str) -> bool {
             if is_shell_control_segment(&normalized) {
                 continue;
             }
-            if normalized_validation_segment(&normalized).is_some() {
+            if let Some(candidate) = normalized_validation_segment(&normalized) {
+                if !candidate.proof_eligible {
+                    pipeline_blocked = true;
+                    break;
+                }
                 pipeline_validation = Some(true);
                 continue;
             }
@@ -3092,6 +3249,21 @@ fn is_shell_control_segment(segment: &str) -> bool {
         || lower.starts_with("set -o pipefail ")
         || lower.starts_with("cd ")
         || lower == "cd"
+}
+
+/// A known shell control with no dynamic expansion or output redirection.
+/// Consumers may treat this as neutral while checking a compound diagnostic,
+/// but an unchecked `set`/`cd` prefix is not itself proof of no side effect.
+pub fn shell_control_segment_is_static_and_neutral(segment: &str) -> bool {
+    let segment = segment.trim();
+    let Some(words) = split_static_shell_words(segment) else {
+        return false;
+    };
+    words
+        .first()
+        .is_some_and(|command| command.chars().all(|ch| !ch.is_ascii_uppercase()))
+        && is_shell_control_segment(&words.join(" "))
+        && !shell_segment_has_non_benign_redirect(segment)
 }
 
 fn is_positive_validation_segment(segment: &str) -> bool {
@@ -7298,6 +7470,17 @@ mod tests {
             None
         );
         assert!(bash_command_post_mutation_validation_prefix("npx tsc --noEmit").is_some());
+        for command in [
+            "CARGO TEST",
+            "cargo TEST",
+            "python3 -m PYTEST",
+            "npm run BUILD",
+        ] {
+            assert!(
+                bash_command_post_mutation_validation_prefix(command).is_none(),
+                "case-sensitive executable or subcommand cannot prove validation: {command}"
+            );
+        }
         assert!(bash_command_post_mutation_validation_prefix("npm run build").is_some());
         assert!(
             bash_command_post_mutation_validation_prefix("python setup.py build_ext --inplace")
@@ -7379,6 +7562,118 @@ mod tests {
         assert!(split_static_shell_words("cp $DEST source").is_none());
         assert!(split_static_shell_words("cp src 'unterminated").is_none());
         assert!(split_static_shell_words("cp src | tee out").is_none());
+    }
+
+    #[test]
+    fn typescript_validation_separates_attempt_from_positive_proof() {
+        for (command, operation) in [
+            ("tsc --noEmit", "tsc --noEmit"),
+            ("tsc --noemit false", "tsc --noEmit false"),
+            (
+                "npx tsc --NOEMIT src/CaseSensitive.ts",
+                "npx tsc --noEmit src/CaseSensitive.ts",
+            ),
+            ("tsc --noEmit --project .", "tsc --noEmit --project ."),
+            ("tsc --noEmit --strict", "tsc --noEmit --strict"),
+            ("tsc --noEmit --pretty false", "tsc --noEmit --pretty false"),
+            (
+                "tsc --noEmit --noCheck false",
+                "tsc --noEmit --noCheck false",
+            ),
+            ("tsc --noEmit --watch false", "tsc --noEmit --watch false"),
+            ("tsc --noEmit --HELP false", "tsc --noEmit --HELP false"),
+            (
+                "tsc --noEmit --types @scope/custom index.ts",
+                "tsc --noEmit --types @scope/custom index.ts",
+            ),
+            (
+                "npx tsc --NOEMIT --typeRoots @scope/types index.ts",
+                "npx tsc --noEmit --typeRoots @scope/types index.ts",
+            ),
+            (
+                "tsc --noEmit --types --help false",
+                "tsc --noEmit --types --help false",
+            ),
+            (
+                "tsc --noEmit -p @config.json",
+                "tsc --noEmit -p @config.json",
+            ),
+            (
+                "tsc --noEmit --outDir --help false",
+                "tsc --noEmit --outDir --help false",
+            ),
+        ] {
+            let args = serde_json::json!({"command": command}).to_string();
+            assert_eq!(
+                normalize_validation_attempt_prefix("bash", &args),
+                Some(operation.into())
+            );
+            assert_eq!(
+                normalize_validation_prefix("bash", &args),
+                Some(operation.into())
+            );
+        }
+        for (command, operation) in [
+            ("tsc --noemit --HELP null", "tsc --noEmit --HELP null"),
+            (
+                "tsc --noemit --help '-?' false",
+                "tsc --noEmit --help '-?' false",
+            ),
+            (
+                "tsc --noEmit --help --outDir --help false",
+                "tsc --noEmit --help --outDir --help false",
+            ),
+            ("tsc --noEmit --noCheck", "tsc --noEmit --noCheck"),
+            ("tsc --noEmit --types --help", "tsc --noEmit --types --help"),
+            ("tsc --noEmit @args.rsp", "tsc --noEmit @args.rsp"),
+            (
+                "tsc --noEmit --strict @args.rsp",
+                "tsc --noEmit --strict @args.rsp",
+            ),
+            (
+                "tsc --noEmit --types @scope/custom @args.rsp",
+                "tsc --noEmit --types @scope/custom @args.rsp",
+            ),
+            (
+                "tsc --noEmit --types --strict @args.rsp",
+                "tsc --noEmit --types --strict @args.rsp",
+            ),
+            (
+                "tsc --noEmit --types --outDir --types @args.rsp",
+                "tsc --noEmit --types --outDir --types @args.rsp",
+            ),
+            ("tsc --noEmit --types", "tsc --noEmit --types"),
+        ] {
+            let args = serde_json::json!({"command": command}).to_string();
+            assert_eq!(
+                normalize_validation_attempt_prefix("bash", &args),
+                Some(operation.into())
+            );
+            assert!(
+                normalize_validation_prefix("bash", &args).is_none(),
+                "{command}"
+            );
+            assert!(
+                !bash_command_has_post_mutation_validation(command),
+                "{command}"
+            );
+        }
+        for command in [
+            "TSC --noemit",
+            "npx TSC --noemit",
+            "tsc --noEmitExtra",
+            "tsc --noemit $FLAGS",
+        ] {
+            let args = serde_json::json!({"command": command}).to_string();
+            assert!(
+                normalize_validation_attempt_prefix("bash", &args).is_none(),
+                "{command}"
+            );
+            assert!(
+                normalize_validation_prefix("bash", &args).is_none(),
+                "{command}"
+            );
+        }
     }
 
     #[test]

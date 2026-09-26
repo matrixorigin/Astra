@@ -1147,9 +1147,13 @@ pub(crate) fn advance_rejected_work_settlement_recovery_for_work_state(
         _ => None,
     }
     .or_else(|| work_validation_operation_for_recovery(state));
-    let Some(validation_operation) = validation_operation else {
+    // An attempt-only success has no proof-eligible exact operation to reuse.
+    // Its server-owned stale rejection still authorizes one bounded direct
+    // validator; the action matcher below requires positive-proof eligibility.
+    if validation_operation.is_none() && validation_state != WorkValidationState::Stale {
         return;
-    };
+    }
+    let needs_proven_validation = validation_operation.is_none();
 
     // Reserve the selected recovery action and truthful settlement. A matched
     // repair/revalidation transition reserves its dependent action only when
@@ -1169,7 +1173,7 @@ pub(crate) fn advance_rejected_work_settlement_recovery_for_work_state(
     state
         .hooks
         .completion_settlement
-        .canonical_validation_recovery_operation = Some(validation_operation);
+        .canonical_validation_recovery_operation = validation_operation;
     state.max_turns = state.max_turns.saturating_add(repair_headroom);
     state.remaining_turns = state.remaining_turns.saturating_add(repair_headroom);
     state.hooks.completion_settlement.work_settlement_only = false;
@@ -1192,6 +1196,8 @@ pub(crate) fn advance_rejected_work_settlement_recovery_for_work_state(
                 "canonical_validation_failed_repair_once"
             } else if failed_validation_requiring_revalidation.is_some() {
                 "canonical_validation_failed_before_workspace_change_revalidate_exact_operation"
+            } else if needs_proven_validation {
+                "canonical_validation_success_unverified_revalidate_once"
             } else {
                 "canonical_validation_repair_already_executed_revalidate_once"
             },
@@ -1205,6 +1211,8 @@ pub(crate) fn advance_rejected_work_settlement_recovery_for_work_state(
             },
             "instruction": if matches!(next_action, CompletionAction::CanonicalWorkRepair) {
                 "The owned WorkItem could not be delivered because the runtime-recognized project validation failed. Make one smallest workspace change that addresses it; the next boundary requires the same class of direct standard project build/test validation. Then settle the currently owned WorkItem truthfully. Do not resume broad exploration."
+            } else if needs_proven_validation {
+                "The last validation attempt completed, but its command arguments cannot prove that project validation ran. Run one direct standard project build/test validator with unambiguous arguments, then settle the owned WorkItem truthfully."
             } else if matches!(rejected_validation_state, Some(RejectedWorkValidationState::Stale)) {
                 "The owned WorkItem could not be delivered because the last canonical project validation is stale after later workspace changes. Rerun the same class of direct standard project build/test validation, then settle the currently owned WorkItem truthfully. Do not resume broad exploration."
             } else if failed_validation_requiring_revalidation.is_some() {
@@ -1369,7 +1377,7 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
                         && record.result_class.as_deref() == Some("test_failure")
                     {
                         record.authoritative_args_full().and_then(|args| {
-                            astra_turn_core::evaluation::normalize_validation_prefix(
+                            astra_turn_core::evaluation::normalize_validation_attempt_prefix(
                                 &record.name,
                                 args,
                             )
@@ -1725,6 +1733,67 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
                     "The bounded workspace action completed. Perform exactly one action matching the next typed completion obligation, then produce the final answer. Do not resume ordinary exploration or request an unrelated tool."
                 },
                 "authority": "typed_turn_intent_and_executed_tool_ledger",
+            }),
+        );
+        return;
+    }
+
+    if active_work_attempt
+        && window.matched
+        && matches!(window.action, CompletionAction::CanonicalWorkValidation)
+        && !workspace_observation_is_quarantined(state)
+        && current_work_validation_state(state) == WorkValidationState::Stale
+        && failed_work_validation_operation(state).is_none()
+        && round_records.is_some_and(|records| {
+            records.iter().any(|record| {
+                record.was_executed()
+                    && astra_turn_core::evaluation::tool_outcome_is_positive_success(record)
+                    && record.authoritative_args_full().is_some_and(|args| {
+                        astra_turn_core::evaluation::normalize_validation_attempt_prefix(
+                            &record.name,
+                            args,
+                        )
+                        .is_some()
+                            && astra_turn_core::evaluation::normalize_validation_prefix(
+                                &record.name,
+                                args,
+                            )
+                            .is_none()
+                    })
+            })
+        })
+    {
+        // The exact retry discharged its failure, but cannot certify that a
+        // project check ran. Reserve one dependent proof step before handing
+        // the WorkItem back to settlement-only authority.
+        state
+            .hooks
+            .completion_settlement
+            .canonical_validation_recovery_operation = None;
+        if let Some(window) = state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_mut()
+        {
+            window.consumed = false;
+            window.matched = false;
+            window.attempts_remaining = 1;
+        }
+        state.max_turns = state.max_turns.saturating_add(1);
+        state.remaining_turns = state.remaining_turns.saturating_add(1);
+        state.hooks.completion_settlement.text_only = false;
+        state.budget_wrapup_injected = false;
+        state.push_volatile_payload(
+            super::host::VolatileKind::FinalAnswerSettlement,
+            serde_json::json!({
+                "schema": "canonical_validation_recovery.v1",
+                "signal": "canonical_validation_exact_retry_unverified_revalidate_once",
+                "allowed_action": CompletionAction::CanonicalWorkValidation,
+                "attempts_remaining": 1,
+                "next_required_action": "settle_work_item",
+                "instruction": "The failed validation attempt has been retried successfully, but its arguments still cannot prove that project validation ran. Run one direct standard project build/test validator with unambiguous arguments, then settle the owned WorkItem truthfully.",
+                "authority": "canonical_work_validation_outcome",
             }),
         );
         return;
@@ -2509,7 +2578,7 @@ fn unresolved_tool_outcome_is_terminally_relevant(
         return true;
     };
 
-    if astra_turn_core::evaluation::normalize_validation_prefix(
+    if astra_turn_core::evaluation::normalize_validation_attempt_prefix(
         &record.name,
         record.authoritative_args_full().unwrap_or(""),
     )
@@ -2526,11 +2595,26 @@ fn unresolved_tool_outcome_is_terminally_relevant(
         state.hooks.workspace_root_hint.as_deref(),
         record,
     );
-    if astra_turn_core::evaluation::tool_outcome_requires_terminal_attention(
+    let admission_risk = astra_turn_core::evaluation::tool_outcome_requires_terminal_attention(
         record,
         &failure.result_class,
-    ) && !external_scratch
-    {
+    );
+    // Read-only intent describes the task, not the effects of an opaque
+    // executable. A failed diagnostic is advisory only when its executor
+    // proved the bound workspace unchanged under the same invocation owner.
+    // Missing or weak observation remains an unresolved completion risk.
+    let advisory_diagnostic = state.turn_intent.as_ref().is_some_and(|intent| {
+        intent.workspace_mutation == WorkspaceMutationIntent::ReadOnly
+            && !intent.browser_verification_required
+    }) && !state.task_profile.verification_required
+        && !requires_external_effect_completion(state)
+        && astra_turn_core::cloud_approval_policy::is_cloud_execute_tool(&record.name)
+        && super::lifecycle::is_authoritative_unchanged_bash_observation_record(record)
+        && !tool_record_may_have_mutated_bound_workspace(
+            state.hooks.workspace_root_hint.as_deref(),
+            record,
+        );
+    if admission_risk && !external_scratch && !advisory_diagnostic {
         return true;
     }
 
@@ -2679,12 +2763,9 @@ async fn task_resolution_covers_current_outcomes(
 /// Give a candidate final answer one bounded rewrite when the structured
 /// execution ledger still reports a persistent unresolved outcome.
 ///
-/// Read-only exploratory work (for example a code review or diagnosis) may
-/// legitimately contain a failed probe.  The probe remains durable evidence
-/// and the model must report it, but it is not an execution contract that can
-/// safely turn a normal answer into `ExecutionIncomplete`.  Mutating work and
-/// explicit verification contracts retain the stricter reconciliation path,
-/// including when their profile is also marked exploratory.
+/// Read-only exploratory work may contain failed observation or validation
+/// probes. Mutating and verification contracts are strict even before the
+/// execution ledger is available.
 fn outcome_reconciliation_required_for_profile(state: &AgenticLoopState) -> bool {
     !state.task_profile.exploratory_task
         || state.task_profile.mutates_workspace
@@ -2694,6 +2775,77 @@ fn outcome_reconciliation_required_for_profile(state: &AgenticLoopState) -> bool
             .turn_intent
             .as_ref()
             .is_some_and(|intent| intent.browser_verification_required)
+}
+
+/// An exploratory failure may be reported without an execution-incomplete
+/// boundary only when every executed shell segment is a known observation or
+/// validation. A recognized validator elsewhere in a compound command does
+/// not make an opaque earlier segment safe.
+fn exploratory_failure_is_known_diagnostic(
+    state: &AgenticLoopState,
+    failure: &astra_turn_core::evaluation::UnresolvedToolOutcome,
+) -> bool {
+    let Some(reference) = failure.invocation.as_ref() else {
+        return false;
+    };
+    let Some(record) = state
+        .stall
+        .tool_call_records
+        .iter()
+        .find(|record| record.execution_completion.as_ref() == Some(reference))
+    else {
+        return false;
+    };
+    if record.name != "bash"
+        || !record.was_executed()
+        || record.workspace_mutation_observed == Some(true)
+        || record.external_effect_scope.is_some()
+        || external_effect_scope_from_record(record).is_some()
+        || tool_record_may_have_mutated_bound_workspace(
+            state.hooks.workspace_root_hint.as_deref(),
+            record,
+        )
+    {
+        return false;
+    }
+    if super::lifecycle::is_authoritative_unchanged_bash_observation_record(record) {
+        return true;
+    }
+    let Some(args) = record
+        .authoritative_args_full()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+    else {
+        return false;
+    };
+    let Some(command) = astra_turn_core::tool_argument_hints::command_hint_from_args(&args) else {
+        return false;
+    };
+    astra_turn_core::evaluation::split_shell_control_segments(command).is_some_and(|controls| {
+        let mut saw_command = false;
+        let known = controls.into_iter().all(|control| {
+                astra_turn_core::evaluation::split_shell_pipeline_segments(control).is_some_and(
+                    |segments| {
+                        segments.into_iter().all(|segment| {
+                                let segment = segment.trim();
+                                if segment.is_empty() {
+                                    return true;
+                                }
+                                saw_command = true;
+                                astra_turn_core::cloud_approval_policy::bash_command_is_read_only(
+                                    segment,
+                                ) || astra_turn_core::evaluation::shell_control_segment_is_static_and_neutral(
+                                    segment,
+                                ) || astra_turn_core::evaluation::normalize_validation_prefix(
+                                    "bash",
+                                    &serde_json::json!({"command": segment}).to_string(),
+                                )
+                                .is_some()
+                            })
+                    },
+                )
+            });
+        known && saw_command
+    })
 }
 
 fn enforce_outcome_reconciliation_before_text_completion(
@@ -2730,7 +2882,10 @@ fn enforce_outcome_reconciliation_before_text_completion(
         .completion_settlement
         .outcome_reconciliation_retries
         > 0
-        || !outcome_reconciliation_required_for_profile(state)
+        || (!outcome_reconciliation_required_for_profile(state)
+            && terminal_failures
+                .values()
+                .all(|failure| exploratory_failure_is_known_diagnostic(state, failure)))
         || !has_reconciliation_signal
     {
         return false;
@@ -7213,6 +7368,7 @@ pub(crate) fn current_work_validation_state(state: &AgenticLoopState) -> WorkVal
     let unresolved_operations = unresolved_work_validation_operations(&records[attempt_start..]);
     let mut saw_validation = false;
     let mut saw_current_positive_validation = false;
+    let mut saw_unverified_validation_success = false;
     let mut validation_is_stale = false;
     for record in &records[attempt_start..] {
         if record.effective_disposition()
@@ -7227,11 +7383,15 @@ pub(crate) fn current_work_validation_state(state: &AgenticLoopState) -> WorkVal
             )
         {
             validation_is_stale = true;
+            saw_current_positive_validation = false;
+            saw_unverified_validation_success = false;
         }
         let Some(args) = record.authoritative_args_full() else {
             continue;
         };
-        if astra_turn_core::evaluation::normalize_validation_prefix(&record.name, args).is_some() {
+        if astra_turn_core::evaluation::normalize_validation_attempt_prefix(&record.name, args)
+            .is_some()
+        {
             saw_validation = true;
             // A canonical validator is fresh evidence about the current
             // workspace even when it fails.  Keeping an older pre-mutation
@@ -7239,15 +7399,23 @@ pub(crate) fn current_work_validation_state(state: &AgenticLoopState) -> WorkVal
             // failure debt and prevents the bounded repair/revalidation path
             // from opening.  Its outcome below still decides whether the
             // current state is Passed or Failed.
-            validation_is_stale = false;
+            if !astra_turn_core::evaluation::tool_outcome_is_positive_success(record) {
+                validation_is_stale = false;
+            }
             // Delivery requires affirmative validation, not merely a shell
             // invocation that completed. With `pipefail`, a compound
             // validator/filter pipeline can otherwise surface as an empty or
             // domain-negative final-stage result even though no passing
             // validation receipt exists. Keep that ambiguity fail-closed and
             // let a later canonical success clear it.
-            if astra_turn_core::evaluation::tool_outcome_is_positive_success(record) {
+            if astra_turn_core::evaluation::tool_outcome_is_positive_success(record)
+                && astra_turn_core::evaluation::normalize_validation_prefix(&record.name, args)
+                    .is_some()
+            {
+                validation_is_stale = false;
                 saw_current_positive_validation = true;
+            } else if astra_turn_core::evaluation::tool_outcome_is_positive_success(record) {
+                saw_unverified_validation_success = true;
             }
         }
     }
@@ -7257,6 +7425,8 @@ pub(crate) fn current_work_validation_state(state: &AgenticLoopState) -> WorkVal
         WorkValidationState::Failed
     } else if saw_current_positive_validation {
         WorkValidationState::Passed
+    } else if saw_unverified_validation_success {
+        WorkValidationState::Stale
     } else {
         WorkValidationState::None
     }
@@ -7280,7 +7450,7 @@ fn unresolved_work_validation_operations(
             continue;
         };
         let Some(operation) =
-            astra_turn_core::evaluation::normalize_validation_prefix(&record.name, args)
+            astra_turn_core::evaluation::normalize_validation_attempt_prefix(&record.name, args)
         else {
             continue;
         };
@@ -7336,7 +7506,7 @@ fn failed_work_validation_operation_requiring_revalidation(
                 return None;
             }
             let args = record.authoritative_args_full()?;
-            (astra_turn_core::evaluation::normalize_validation_prefix(&record.name, args)
+            (astra_turn_core::evaluation::normalize_validation_attempt_prefix(&record.name, args)
                 .as_deref()
                 == Some(operation.as_str()))
             .then_some(index)
@@ -7383,7 +7553,7 @@ fn failed_work_validation_operation_in_records(
                 return None;
             }
             let args = record.authoritative_args_full()?;
-            astra_turn_core::evaluation::normalize_validation_prefix(&record.name, args)
+            astra_turn_core::evaluation::normalize_validation_attempt_prefix(&record.name, args)
         })
         .rfind(|operation| {
             expected_operation.is_none_or(|expected| expected == operation)
@@ -7715,7 +7885,7 @@ pub(crate) fn completion_action_hint(action: &CompletionAction) -> serde_json::V
                 accepted_action_shapes.push(serde_json::json!({
                     "tool": "bash",
                     "evidence_source": "prior_runtime_recognized_project_validation",
-                    "constraint": "rerun one direct standard project build/test validation previously recognized in this Work attempt; do not substitute a custom inline program, reader/probe, workspace mutation, or settlement call; exact arguments are re-checked by the runtime",
+                    "constraint": "run one direct standard project build/test validator; repeat an exact operation when bound, otherwise use unambiguous arguments; do not substitute a custom inline program, reader/probe, workspace mutation, or settlement call; arguments are re-checked by the runtime",
                     "raw_arguments_projected": false,
                 }));
                 (
@@ -8032,7 +8202,9 @@ pub(crate) fn completion_action_match_label(
                     });
                 return raw_args
                     .and_then(|args| {
-                        astra_turn_core::evaluation::normalize_validation_prefix(name, &args)
+                        astra_turn_core::evaluation::normalize_validation_attempt_prefix(
+                            name, &args,
+                        )
                     })
                     .filter(|operation| operation == expected_operation)
                     .map(|_| "post_mutation_revalidation".to_string());
@@ -8120,7 +8292,13 @@ pub(crate) fn completion_action_match_label(
                 });
             raw_args
                 .and_then(|args| {
-                    astra_turn_core::evaluation::normalize_validation_prefix(name, &args)
+                    if expected_operation.is_some() {
+                        astra_turn_core::evaluation::normalize_validation_attempt_prefix(
+                            name, &args,
+                        )
+                    } else {
+                        astra_turn_core::evaluation::normalize_validation_prefix(name, &args)
+                    }
                 })
                 .filter(|operation| {
                     expected_operation
@@ -15340,6 +15518,236 @@ mod tests {
     }
 
     #[test]
+    fn unverified_validation_success_opens_one_proven_revalidation() {
+        let mut state = make_state();
+        let mut rejected = executed_record("settle_work_item", false, None);
+        rejected.disposition = Some(ToolCallDisposition::Rejected);
+        rejected.result_full = Some(
+            serde_json::json!({
+                "status": "rejected",
+                "error_kind": "unresolved_work_validation",
+                "validation_state": "stale"
+            })
+            .to_string(),
+        );
+        state.stall.tool_call_records = vec![
+            ToolCallRecord {
+                name: "run_next_work_item".into(),
+                ok: true,
+                disposition: Some(ToolCallDisposition::Executed),
+                result_full: Some(
+                    serde_json::json!({
+                        "status": "assigned",
+                        "execution": "primary_session",
+                        "attempt_id": "attempt-a"
+                    })
+                    .to_string(),
+                ),
+                ..Default::default()
+            },
+            validation_record("tsc --noEmit --help --outDir --help false", "success"),
+            rejected,
+        ];
+        state.remaining_turns = 1;
+        assert_eq!(
+            current_work_validation_state(&state),
+            WorkValidationState::Stale
+        );
+
+        advance_rejected_work_settlement_recovery_for_test(&mut state, 2);
+        assert!(matches!(
+            state
+                .hooks
+                .completion_settlement
+                .completion_action_window
+                .as_ref()
+                .map(|window| &window.action),
+            Some(CompletionAction::CanonicalWorkValidation)
+        ));
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .canonical_validation_recovery_operation
+                .is_none()
+        );
+        assert!(state.volatile_pending.iter().any(|entry| {
+            entry.payload["signal"] == "canonical_validation_success_unverified_revalidate_once"
+        }));
+        let call = |command| {
+            serde_json::json!({
+                "function": {"name": "bash", "arguments": serde_json::json!({"command": command}).to_string()}
+            })
+        };
+        assert!(!completion_action_matches_tool_call(
+            &state,
+            &CompletionAction::CanonicalWorkValidation,
+            &call("tsc --noEmit --help --outDir --help false")
+        ));
+        assert!(completion_action_matches_tool_call(
+            &state,
+            &CompletionAction::CanonicalWorkValidation,
+            &call("tsc --noEmit")
+        ));
+    }
+
+    #[test]
+    fn attempt_only_retry_does_not_revive_proof_from_before_workspace_change() {
+        let mut state = make_state();
+        let ambiguous = "tsc --noEmit @args.rsp";
+        state.stall.tool_call_records = vec![
+            validation_record("tsc --noEmit", "success"),
+            executed_record("write_file", true, None),
+            validation_record(ambiguous, "test_failure"),
+        ];
+        assert_eq!(
+            current_work_validation_state(&state),
+            WorkValidationState::Failed
+        );
+        state
+            .stall
+            .tool_call_records
+            .push(validation_record(ambiguous, "success"));
+        assert_eq!(
+            current_work_validation_state(&state),
+            WorkValidationState::Stale
+        );
+        state
+            .stall
+            .tool_call_records
+            .push(validation_record("tsc --noEmit", "success"));
+        assert_eq!(
+            current_work_validation_state(&state),
+            WorkValidationState::Passed
+        );
+    }
+
+    #[test]
+    fn repaired_attempt_only_failure_can_reach_proven_work_settlement() {
+        let mut state = make_state();
+        state.task_profile.mutates_workspace = false;
+        let ambiguous = "tsc --noEmit @args.rsp";
+        state.stall.tool_call_records = vec![
+            validation_record(ambiguous, "test_failure"),
+            executed_record("write_file", true, None),
+            validation_record(ambiguous, "success"),
+        ];
+        state
+            .hooks
+            .completion_settlement
+            .canonical_validation_recovery_retries = 1;
+        state
+            .hooks
+            .completion_settlement
+            .canonical_validation_recovery_operation = Some(ambiguous.into());
+        state.hooks.completion_settlement.completion_action_window =
+            Some(super::super::host::CompletionActionWindow {
+                action: CompletionAction::CanonicalWorkValidation,
+                attempts_remaining: 0,
+                mismatch_corrections_remaining: 1,
+                consumed: true,
+                matched: true,
+            });
+        assert_eq!(
+            current_work_validation_state(&state),
+            WorkValidationState::Stale
+        );
+        advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
+            &mut state, true, 2, None,
+        );
+        let window = state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_ref()
+            .expect("proof step remains available");
+        assert_eq!(window.action, CompletionAction::CanonicalWorkValidation);
+        assert!(!window.consumed);
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .canonical_validation_recovery_operation
+                .is_none()
+        );
+        let call = |command| {
+            serde_json::json!({
+                "function": {"name": "bash", "arguments": serde_json::json!({"command": command}).to_string()}
+            })
+        };
+        assert!(!completion_action_matches_tool_call(
+            &state,
+            &CompletionAction::CanonicalWorkValidation,
+            &call(ambiguous)
+        ));
+        assert!(completion_action_matches_tool_call(
+            &state,
+            &CompletionAction::CanonicalWorkValidation,
+            &call("tsc --noEmit")
+        ));
+        state
+            .stall
+            .tool_call_records
+            .push(validation_record("tsc --noEmit", "success"));
+        let window = state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_mut()
+            .expect("proof step");
+        window.consumed = true;
+        window.matched = true;
+        assert_eq!(
+            current_work_validation_state(&state),
+            WorkValidationState::Passed
+        );
+        advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
+            &mut state, true, 3, None,
+        );
+        assert!(state.hooks.completion_settlement.work_settlement_only);
+    }
+
+    #[test]
+    fn quarantined_attempt_only_retry_cannot_reopen_proof_window() {
+        let mut state = make_state();
+        let ambiguous = "tsc --noEmit @args.rsp";
+        state.stall.tool_call_records = vec![
+            validation_record(ambiguous, "test_failure"),
+            validation_record(ambiguous, "success"),
+        ];
+        state.stall.workspace_observation_quarantine = Some(
+            astra_pipeline::step_protocol::WorkspaceObservationQuarantineV1::partial_workspace_mutation(
+                Some("unsettled-call".into()),
+            ),
+        );
+        state
+            .hooks
+            .completion_settlement
+            .canonical_validation_recovery_operation = Some(ambiguous.into());
+        state.hooks.completion_settlement.completion_action_window =
+            Some(super::super::host::CompletionActionWindow {
+                action: CompletionAction::CanonicalWorkValidation,
+                attempts_remaining: 0,
+                mismatch_corrections_remaining: 1,
+                consumed: true,
+                matched: true,
+            });
+        state.remaining_turns = 2;
+        advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
+            &mut state, true, 1, None,
+        );
+        assert!(state.hooks.completion_settlement.text_only);
+        assert_eq!(state.remaining_turns, 2);
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .canonical_validation_recovery_operation
+                .is_some()
+        );
+    }
+
+    #[test]
     fn rejected_work_settlement_does_not_expand_existing_repair_headroom() {
         let mut state = make_state();
         let mut rejected_settlement = executed_record("settle_work_item", false, None);
@@ -18495,6 +18903,199 @@ mod tests {
             0,
             "an incidental read-only probe must not block a strict task"
         );
+    }
+
+    #[test]
+    fn explicit_read_only_diagnostic_does_not_inherit_shell_admission_risk() {
+        use astra_config::user_profile::{TurnIntent, WorkspaceMutationIntent};
+        use astra_turn_types::ToolInvocationIdentity;
+        use astra_turn_types::task_resolution::{
+            EdgeDispatchCompletionRef, ToolExecutionEvidenceRef,
+        };
+        for exploratory in [false, true] {
+            let reference = ToolExecutionEvidenceRef::EdgeDispatch(EdgeDispatchCompletionRef {
+                identity: ToolInvocationIdentity::new("user", "session", "run", "chain", "probe")
+                    .unwrap(),
+                edge_agent_id: "edge-1".into(),
+                result_hash: "failed-probe".into(),
+            });
+            let mut state = make_state();
+            state.task_profile =
+                astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                    false,
+                    exploratory,
+                    astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+                );
+            state.turn_intent = Some(
+                TurnIntent::default().with_workspace_mutation(WorkspaceMutationIntent::ReadOnly),
+            );
+            let unchanged =
+            astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
+                astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
+            );
+            state.stall.tool_call_records.push(ToolCallRecord {
+                name: "bash".into(),
+                ok: false,
+                args_full: Some(
+                    serde_json::json!({"command":"python3 -c 'print(1 / 0)'"}).to_string(),
+                ),
+                round: Some(1),
+                execution_completion: Some(reference),
+                disposition: Some(ToolCallDisposition::Executed),
+                workspace_mutation_scope: unchanged
+                    .get(astra_tools::workspace_observation::OBSERVATION_SCOPE_FIELD)
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string),
+                workspace_mutation_receipt: unchanged
+                    .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+                    .cloned(),
+                ..Default::default()
+            });
+            crate::turn::runtime_policy::evaluate_tool_boundary_with_thresholds(
+                &mut state.stall.runtime_policy_evaluation,
+                astra_turn_core::context_feedback::RuntimePolicySubject::Run,
+                &state.stall.tool_call_records,
+                1,
+                astra_turn_core::evaluation::EvaluationThresholds::default(),
+                None,
+            )
+            .unwrap();
+            state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
+            "state": "evaluated",
+            "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+            "recovery": null,
+            "revision": 1,
+            "evaluated_at_round": 1,
+            "subject": {"kind": "run"},
+            "entries": [{
+                "signal": "unresolved_tool_outcomes",
+                "stage": "converge",
+                "observed_at_round": 1,
+                "evidence_count": 1,
+                "recommendation": "diagnose_tool_outcomes"
+            }]
+        }))
+        .expect("unresolved outcome feedback");
+            let failure = state
+                .stall
+                .runtime_policy_evaluation
+                .unresolved_tool_outcomes()
+                .into_values()
+                .next()
+                .expect("failed diagnostic remains in ledger");
+            assert!(!unresolved_tool_outcome_is_terminally_relevant(
+                &state, &failure
+            ));
+            assert!(!enforce_outcome_reconciliation_before_text_completion(
+                &mut state, None
+            ));
+            assert!(state.interruption.is_none());
+
+            if exploratory {
+                state.stall.tool_call_records[0].workspace_mutation_receipt = None;
+                state.stall.tool_call_records[0].args_full =
+                    Some(serde_json::json!({"command":"cargo test"}).to_string());
+                assert!(exploratory_failure_is_known_diagnostic(&state, &failure));
+                assert!(!enforce_outcome_reconciliation_before_text_completion(
+                    &mut state, None,
+                ));
+                for command in [
+                    "set -e; cargo test",
+                    "set  -e; cargo test",
+                    "cargo test\n",
+                    "cargo test; # diagnostic",
+                ] {
+                    state.stall.tool_call_records[0].args_full =
+                        Some(serde_json::json!({"command":command}).to_string());
+                    assert!(
+                        exploratory_failure_is_known_diagnostic(&state, &failure),
+                        "{command} is a known diagnostic"
+                    );
+                }
+                for command in [
+                    "set -e > changed; cargo test",
+                    "set -e $(opaque); cargo test",
+                    "SET -e; cargo test",
+                    "CARGO TEST",
+                    "cargo TEST",
+                    "python3 -m PYTEST",
+                    "python3 opaque.py; cargo test",
+                ] {
+                    state.stall.tool_call_records[0].args_full =
+                        Some(serde_json::json!({"command":command}).to_string());
+                    assert!(
+                        !exploratory_failure_is_known_diagnostic(&state, &failure),
+                        "{command} must not hide an opaque or writing segment"
+                    );
+                }
+                state.stall.tool_call_records[0].args_full =
+                    Some(serde_json::json!({"command":"python3 -c 'print(1 / 0)'"}).to_string());
+            }
+
+            state.stall.tool_call_records[0].workspace_mutation_receipt = None;
+            assert!(
+                unresolved_tool_outcome_is_terminally_relevant(&state, &failure),
+                "missing executor observation is unknown effect, not proven read-only"
+            );
+            assert!(enforce_outcome_reconciliation_before_text_completion(
+                &mut state, None,
+            ));
+            assert_eq!(
+                state
+                    .hooks
+                    .completion_settlement
+                    .outcome_reconciliation_retries,
+                1
+            );
+            assert!(
+                !enforce_outcome_reconciliation_before_text_completion(&mut state, None),
+                "a missing receipt must not cause unbounded recovery rounds"
+            );
+            state.stall.tool_call_records[0].workspace_mutation_receipt = unchanged
+                .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+                .cloned();
+            state.stall.tool_call_records[0]
+                .workspace_mutation_receipt
+                .as_mut()
+                .unwrap()["ownership"] = serde_json::json!(
+                astra_tools::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP
+            );
+            assert!(
+                unresolved_tool_outcome_is_terminally_relevant(&state, &failure),
+                "a weak process group can leave a writer behind"
+            );
+            state.stall.tool_call_records[0].workspace_mutation_receipt = unchanged
+                .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+                .cloned();
+
+            state.turn_intent = None;
+            assert!(
+                unresolved_tool_outcome_is_terminally_relevant(&state, &failure),
+                "unknown intent must remain conservative"
+            );
+            state.turn_intent = Some(
+                TurnIntent::default().with_workspace_mutation(WorkspaceMutationIntent::ReadOnly),
+            );
+            state.stall.tool_call_records[0].args_full =
+                Some(serde_json::json!({"command":"echo changed > file.txt"}).to_string());
+            assert!(
+                unresolved_tool_outcome_is_terminally_relevant(&state, &failure),
+                "positive writer shape must remain strict even under read-only intent"
+            );
+            state.stall.tool_call_records[0].execution_completion = None;
+            assert!(
+                unresolved_tool_outcome_is_terminally_relevant(&state, &failure),
+                "missing execution reference must remain strict"
+            );
+            assert!(enforce_persistent_unresolved_outcome_terminal(
+                &mut state,
+                &TaskResolutionCoverage::NoAssessment,
+            ));
+            assert_eq!(
+                state.interruption.as_ref().map(|record| record.kind),
+                Some(InterruptionKind::ExecutionIncomplete),
+            );
+        }
     }
 
     #[test]

@@ -1999,7 +1999,6 @@ struct MockToolScenario {
     edge_tools: Vec<&'static str>,
     steps: Vec<MockToolScenarioStep>,
     final_text: &'static str,
-    expected_query_fragments: Vec<&'static str>,
 }
 
 async fn execute_mock_tool_turn(
@@ -2125,38 +2124,6 @@ async fn run_mock_tool_scenario(case: MockToolScenario) {
         case.final_text,
     )
     .await;
-
-    let hw = hook_writer.clone();
-    poll_until(
-        move || {
-            let hw = hw.clone();
-            async move { !hw.plans.lock().await.is_empty() }
-        },
-        5,
-    )
-    .await;
-
-    let plans = hook_writer.plans.lock().await;
-    let plan = plans.last().expect("tool hook plan");
-    let skill = plan.skill_selection.as_ref().expect("tool skill selection");
-    let selected_skills: std::collections::HashSet<&str> =
-        skill.selected_skills.iter().map(String::as_str).collect();
-    for step in &case.steps {
-        assert!(
-            selected_skills.contains(step.tool_name),
-            "{}: missing selected skill {}",
-            case.name,
-            step.tool_name
-        );
-    }
-    for fragment in &case.expected_query_fragments {
-        assert!(
-            skill.user_query.contains(fragment),
-            "{}: user_query should contain {:?}",
-            case.name,
-            fragment
-        );
-    }
 }
 
 /// Poll run status until it reaches the expected value (with timeout).
@@ -3060,7 +3027,7 @@ async fn empty_test_llm_rounds_completes_gracefully() {
 #[tokio::test]
 async fn skill_tool_call_is_intercepted_without_edge_tool_request() {
     init_env();
-    let (app, _hook_writer, observer_worker) = build_test_app_with_hooks_and_skills();
+    let (app, hook_writer, observer_worker) = build_test_app_with_hooks_and_skills();
 
     let payload = json!({
         "message": "Use the test skill",
@@ -3115,6 +3082,28 @@ async fn skill_tool_call_is_intercepted_without_edge_tool_request() {
             .any(|event| event["content"].as_str() == Some("I used the skill instructions.")),
         "final LLM round should continue after skill interception"
     );
+
+    poll_until(
+        || {
+            let hook_writer = hook_writer.clone();
+            async move { !hook_writer.plans.lock().await.is_empty() }
+        },
+        5,
+    )
+    .await;
+    let plans = hook_writer.plans.lock().await;
+    assert_eq!(
+        plans.len(),
+        1,
+        "an intercepted skill must persist exactly one selection"
+    );
+    let skill = plans
+        .first()
+        .and_then(|plan| plan.skill_selection.as_ref())
+        .expect("an intercepted skill must persist its explicit selection");
+    assert_eq!(skill.skill_name, "test-skill");
+    assert_eq!(skill.selected_skills, vec!["test-skill".to_string()]);
+    assert_eq!(skill.selection_method, "llm_skill_choice");
 }
 
 #[tokio::test]
@@ -5723,63 +5712,6 @@ async fn hook_db_text_only_skips_writer() {
     assert!(!requests[0].messages.is_empty());
 }
 
-/// Tool selection retains the existing skill-selection record.
-#[tokio::test]
-async fn hook_db_skill_selection_with_tools() {
-    let (app, hook_writer, _observer) = build_test_app_with_hooks();
-
-    let resp = chat_stream_start(
-        &app,
-        json!({
-            "message": "list files",
-            "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [tool_call("tc1", "list_dir", json!({"path": "."}))]
-                    },
-                    { "full_text": "Here are the files." }
-                ],
-                "edge_tools": [tool_schema("list_dir"), tool_schema("read_file")]
-            }
-        }),
-    )
-    .await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    // Deliver tool results for tc1.
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    post_tool_result(&app, "tc1", "file1.txt\nfile2.txt", "completed").await;
-
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
-        .await
-        .expect("stream timed out")
-        .expect("reader task failed");
-    assert!(!events.is_empty());
-    let hw = hook_writer.clone();
-    poll_until(
-        || {
-            let hw = hw.clone();
-            async move { !hw.plans.lock().await.is_empty() }
-        },
-        5,
-    )
-    .await;
-
-    let plans = hook_writer.plans.lock().await;
-    assert_eq!(plans.len(), 1);
-    let plan = &plans[0];
-
-    let skill = plan
-        .skill_selection
-        .as_ref()
-        .expect("skill_selection present");
-    assert_eq!(skill.skill_name, "list_dir");
-    assert_eq!(skill.selection_method, "llm_tool_choice");
-    assert!(skill.selected_skills.contains(&"list_dir".to_string()));
-    assert_eq!(skill.user_query, "list files");
-    assert_eq!(skill.execution_success, Some(1));
-}
-
 /// Observer receives correct session_id and turn_count.
 #[tokio::test]
 async fn observer_fired_with_correct_metadata() {
@@ -5816,74 +5748,6 @@ async fn observer_fired_with_correct_metadata() {
     assert!(requests[0].turn_count >= 1, "at least one turn completed");
 }
 
-/// Multiple tool calls across rounds produce a skill selection with all tool names.
-#[tokio::test]
-async fn hook_db_multiple_tools_selected() {
-    let (app, hook_writer, _observer) = build_test_app_with_hooks();
-
-    // Two rounds of approval-free tools (read_file, list_dir) + final text.
-    let resp = chat_stream_start(
-        &app,
-        json!({
-            "message": "do stuff",
-            "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [
-                            tool_call("tc1", "read_file", json!({"path": "a.txt"}))
-                        ]
-                    },
-                    {
-                        "tool_calls": [
-                            tool_call("tc2", "list_dir", json!({"path": "/src"}))
-                        ]
-                    },
-                    { "full_text": "Done!" }
-                ],
-                "edge_tools": [
-                    tool_schema("read_file"),
-                    tool_schema("list_dir")
-                ]
-            }
-        }),
-    )
-    .await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    // Deliver tool results for round 1 (tc1).
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    post_tool_result(&app, "tc1", "contents of a.txt", "completed").await;
-
-    // Deliver tool results for round 2 (tc2).
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    post_tool_result(&app, "tc2", "main.rs\nlib.rs", "completed").await;
-
-    let events = tokio::time::timeout(std::time::Duration::from_secs(15), reader)
-        .await
-        .expect("stream timed out")
-        .expect("reader task failed");
-    assert!(!events.is_empty());
-
-    // Wait for async persistence.
-    let hw = hook_writer.clone();
-    poll_until(
-        || {
-            let hw = hw.clone();
-            async move { !hw.plans.lock().await.is_empty() }
-        },
-        5,
-    )
-    .await;
-
-    let plans = hook_writer.plans.lock().await;
-    assert_eq!(plans.len(), 1);
-
-    let skill = plans[0].skill_selection.as_ref().expect("skill_selection");
-    // All unique tool names should be captured.
-    assert!(skill.selected_skills.contains(&"read_file".to_string()));
-    assert!(skill.selected_skills.contains(&"list_dir".to_string()));
-}
-
 #[tokio::test]
 async fn mock_llm_tool_flow_scenario_matrix() {
     let cases = [
@@ -5893,7 +5757,6 @@ async fn mock_llm_tool_flow_scenario_matrix() {
             edge_tools: vec![],
             steps: vec![],
             final_text: "Hi there!",
-            expected_query_fragments: vec![],
         },
         MockToolScenario {
             name: "read_file",
@@ -5907,7 +5770,6 @@ async fn mock_llm_tool_flow_scenario_matrix() {
                 requires_approval: false,
             }],
             final_text: "Read the README.",
-            expected_query_fragments: vec!["read the README"],
         },
         MockToolScenario {
             name: "write_file_with_approval",
@@ -5921,7 +5783,6 @@ async fn mock_llm_tool_flow_scenario_matrix() {
                 requires_approval: true,
             }],
             final_text: "Created the file.",
-            expected_query_fragments: vec!["create a new file named notes.txt"],
         },
         MockToolScenario {
             name: "search_with_grep",
@@ -5935,7 +5796,6 @@ async fn mock_llm_tool_flow_scenario_matrix() {
                 requires_approval: false,
             }],
             final_text: "Found TODO matches.",
-            expected_query_fragments: vec!["search the repo for TODO"],
         },
         MockToolScenario {
             name: "memory_store",
@@ -5949,7 +5809,6 @@ async fn mock_llm_tool_flow_scenario_matrix() {
                 requires_approval: false,
             }],
             final_text: "I stored that preference.",
-            expected_query_fragments: vec!["记住我喜欢 Rust"],
         },
         MockToolScenario {
             name: "memory_search",
@@ -5963,7 +5822,6 @@ async fn mock_llm_tool_flow_scenario_matrix() {
                 requires_approval: false,
             }],
             final_text: "You said you like Rust.",
-            expected_query_fragments: vec!["我之前说过我喜欢什么语言?"],
         },
         MockToolScenario {
             name: "multi_tool_batch",
@@ -5986,7 +5844,6 @@ async fn mock_llm_tool_flow_scenario_matrix() {
                 },
             ],
             final_text: "Inspected the project files.",
-            expected_query_fragments: vec!["inspect the project files"],
         },
     ];
 
@@ -6000,8 +5857,8 @@ async fn mock_llm_tool_flow_scenario_matrix() {
 }
 
 #[tokio::test]
-async fn mock_llm_memory_followup_preserves_session_binding_without_observer_relearning() {
-    let (app, hook_writer, observer_worker) = build_test_app_with_hooks();
+async fn mock_llm_memory_followup_preserves_session_binding() {
+    let (app, _hook_writer, _observer_worker) = build_test_app_with_hooks();
     let sid = format!("memory-state-{}", uuid::Uuid::new_v4());
 
     let store_events = execute_mock_tool_turn(
@@ -6074,45 +5931,28 @@ async fn mock_llm_memory_followup_preserves_session_binding_without_observer_rel
         Some(sid.as_str())
     );
 
-    let hw = hook_writer.clone();
-    poll_until(
-        move || {
-            let hw = hw.clone();
-            async move { hw.plans.lock().await.len() >= 2 }
-        },
-        5,
+    // A later ordinary turn verifies that the same session remains bound after
+    // memory operations. Filtering memory-operation turns for the asynchronous
+    // observer is covered by the deterministic lifecycle unit test; this E2E
+    // test must not depend on background observer scheduling order.
+    let ordinary_events = execute_mock_tool_turn(
+        &app,
+        json!({
+            "session_id": &sid,
+            "message": "What is two plus two?",
+            "context": {
+                "test_llm_rounds": [{ "full_text": "Two plus two is four." }]
+            }
+        }),
+        "ordinary_followup_turn",
+        &[],
+        "Two plus two is four.",
     )
     .await;
-
-    let requests = observer_worker.requests.lock().await;
-    // Memory operations are already handled by the dedicated memory tool.
-    // Sending their user-turn segments to the cross-session observer would
-    // re-learn the request, tool result, and confirmation as new knowledge.
-    // Keep this at zero so the test protects the shared anti-feedback-loop
-    // boundary while the hook assertions below prove both turns stayed
-    // durable and attributable to this session.
-    assert!(
-        requests.is_empty(),
-        "structural memory operation turns must not reach the observer"
+    assert_eq!(
+        find_event(&ordinary_events, "session_info").and_then(|event| event["session_id"].as_str()),
+        Some(sid.as_str())
     );
-    drop(requests);
-
-    let hook_plans = hook_writer.plans.lock().await;
-    assert_eq!(hook_plans.len(), 2, "expected one hook persist per turn");
-    let store_skill = hook_plans[0]
-        .skill_selection
-        .as_ref()
-        .expect("store turn skill selection");
-    assert_eq!(store_skill.session_id, sid);
-    assert!(store_skill.selected_skills.contains(&"memory".to_string()));
-    assert!(store_skill.user_query.contains("记住我喜欢 Rust"));
-    let search_skill = hook_plans[1]
-        .skill_selection
-        .as_ref()
-        .expect("search turn skill selection");
-    assert_eq!(search_skill.session_id, sid);
-    assert!(search_skill.selected_skills.contains(&"memory".to_string()));
-    assert!(search_skill.user_query.contains("我刚才让你记住了什么?"));
 }
 
 #[tokio::test]

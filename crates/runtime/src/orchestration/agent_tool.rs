@@ -435,6 +435,8 @@ pub struct AgentToolContext {
     pub working_dir: PathBuf,
     /// Shared lifecycle owner for dynamic child agents.
     pub spawner: Arc<DynamicAgentSpawner>,
+    /// Keeps this parent admission fence alive across projection eviction.
+    pub fanout_admission: Arc<super::spawner::FanoutParentAdmission>,
     /// Effective permissions inherited by children spawned from this agent.
     pub inherited_permissions: InheritedPermissions,
     /// Product-optional capabilities enabled on the current request.
@@ -807,8 +809,10 @@ pub async fn recover_agent_fanout_tool_result(
         .map(str::trim)
         .filter(|id| !id.is_empty());
     if let Some(group_id) = requested_group_id
-        && let Some(group) = ctx.spawner.fanout_group(group_id).await
-        && group.parent_run_id.as_deref() == Some(ctx.run_id.as_str())
+        && let Some(group) = ctx
+            .spawner
+            .fanout_group_for_parent_run_and_id(&ctx.run_id, group_id)
+            .await
     {
         return render_agent_fanout_results(
             ctx,
@@ -1337,12 +1341,15 @@ async fn handle_agent_fanout_start_action_with_deadline(
     let tool_call_id = input._tool_call_id.clone();
     if let Err(error) = ctx
         .spawner
-        .declare_fanout_group(
+        .declare_fanout_group_with_owner(
             &group_id,
             &title,
             input.target_count,
             tool_call_id.as_deref(),
             &ctx.run_id,
+            ctx.trace_context
+                .as_ref()
+                .map(|trace| (trace.user_id.as_str(), trace.session_id.as_str())),
         )
         .await
     {
@@ -1399,7 +1406,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
                 .to_string();
             let _ = ctx
                 .spawner
-                .cancel_fanout_group_for_deadline(&group_id, &reason)
+                .cancel_fanout_group_for_deadline_in_parent(&ctx.run_id, &group_id, &reason)
                 .await;
             return render_agent_fanout_results(
                 ctx,
@@ -1571,22 +1578,50 @@ async fn render_agent_fanout_results(
     read_options: FanoutResultReadOptions,
     reconcile_durable: bool,
 ) -> String {
+    let mut resolved = ctx
+        .spawner
+        .fanout_group_for_session_result(&ctx.fanout_admission, group_id)
+        .await;
+    let mut reconciled = false;
+    if resolved.is_none() && reconcile_durable {
+        if let Err(error) = reconcile_durable_agent_runs_for_tool(ctx.spawner.as_ref()).await {
+            tracing::warn!(target: "fanout", %group_id, %error,
+                "durable fanout reconciliation failed before result discovery");
+        }
+        reconciled = true;
+        resolved = ctx
+            .spawner
+            .fanout_group_for_session_result(&ctx.fanout_admission, group_id)
+            .await;
+    }
+    let Some((owner, initial_group)) = resolved else {
+        return render_agent_tool_error(None, &format!("Unknown fanout group_id: {group_id}"));
+    };
+    let owner_run_id = owner.parent_run_id();
     if read_options.is_default()
-        && let Some(cached) = ctx.spawner.cached_terminal_fanout_result(group_id).await
+        && let Some(cached) = ctx
+            .spawner
+            .cached_terminal_fanout_result(owner_run_id, group_id)
+            .await
     {
         return cached;
     }
-    if reconcile_durable && let Err(error) = ctx.spawner.reconcile_durable_agent_runs().await {
-        tracing::warn!(
-            target: "fanout",
-            %group_id,
-            %error,
-            "durable fanout reconciliation failed; returning the last confirmed observation"
-        );
+    if reconcile_durable && !reconciled {
+        if let Err(error) = reconcile_durable_agent_runs_for_tool(ctx.spawner.as_ref()).await {
+            tracing::warn!(
+                target: "fanout",
+                %group_id,
+                %error,
+                "durable fanout reconciliation failed; returning the last confirmed observation"
+            );
+        }
     }
-    let Some(group) = find_fanout_group(ctx, group_id).await else {
-        return render_agent_tool_error(None, &format!("Unknown fanout group_id: {group_id}"));
-    };
+    let result_generation = ctx.spawner.fanout_result_generation(owner_run_id);
+    let group = ctx
+        .spawner
+        .fanout_group_for_parent_run_and_id(owner_run_id, group_id)
+        .await
+        .unwrap_or(initial_group);
     if let Some(slot_index) = read_options.slot_index
         && !group.slots.iter().any(|slot| slot.slot_index == slot_index)
     {
@@ -1771,7 +1806,11 @@ async fn render_agent_fanout_results(
         }
     }
 
-    let updated = find_fanout_group(ctx, group_id).await.unwrap_or(group);
+    let updated = ctx
+        .spawner
+        .fanout_group_for_parent_run_and_id(owner_run_id, group_id)
+        .await
+        .unwrap_or(group);
     let summary = updated.summary();
     let all_slots_delivered =
         read_options.slot_index.is_none() && complete_deliverables == summary.target_count;
@@ -1890,10 +1929,24 @@ async fn render_agent_fanout_results(
     let rendered = serde_json::to_string_pretty(&response).unwrap_or_else(|_| response.to_string());
     if read_options.is_default() && updated.is_terminal() && incomplete_result_count == 0 {
         ctx.spawner
-            .cache_terminal_fanout_result(group_id, rendered.clone())
+            .cache_terminal_fanout_result(
+                owner_run_id,
+                group_id,
+                result_generation,
+                rendered.clone(),
+            )
             .await;
     }
     rendered
+}
+
+/// Durable reconciliation builds a large async state machine. Keep its frame
+/// off the small worker stack when a result tool is already nested inside the
+/// agent tool pipeline (fanout can invoke this once per parent turn).
+async fn reconcile_durable_agent_runs_for_tool(
+    spawner: &DynamicAgentSpawner,
+) -> Result<usize, String> {
+    Box::pin(spawner.reconcile_durable_agent_runs()).await
 }
 
 async fn handle_agent_fanout_stop_slot_action(
@@ -1940,7 +1993,7 @@ async fn handle_agent_fanout_stop_slot_action(
     // it. Refresh remotely-owned durable observations before deciding whether
     // a slot is stoppable; otherwise a run already cancelled by an ancestor
     // can remain locally `Waiting` until the session registry expires.
-    if let Err(error) = ctx.spawner.reconcile_durable_agent_runs().await {
+    if let Err(error) = reconcile_durable_agent_runs_for_tool(ctx.spawner.as_ref()).await {
         tracing::warn!(
             target: "fanout",
             %group_id,
@@ -2076,7 +2129,7 @@ async fn handle_agent_fanout_stop_group_action(
     // the last in-memory fanout projection. In particular, ancestor
     // cancellation can terminalize a remotely-owned child without a local
     // executor callback.
-    if let Err(error) = ctx.spawner.reconcile_durable_agent_runs().await {
+    if let Err(error) = reconcile_durable_agent_runs_for_tool(ctx.spawner.as_ref()).await {
         tracing::warn!(
             target: "fanout",
             %group_id,
@@ -2090,13 +2143,18 @@ async fn handle_agent_fanout_stop_group_action(
 
     let cancelled = ctx
         .spawner
-        .cancel_fanout_group_for_runtime(group_id, "parent agent stopped fanout group")
+        .cancel_fanout_group_for_runtime_in_parent(
+            &ctx.run_id,
+            group_id,
+            "parent agent stopped fanout group",
+        )
         .await
         // The group was confirmed immediately above; a concurrent cleanup can
         // only make it terminal, never turn it into an unknown target.
         .unwrap_or_else(|| crate::orchestration::FanoutGroupCancellation {
             group,
             cancellation_pending_agent_ids: Vec::new(),
+            group_cancellation_pending: false,
             stopped_agent_ids: Vec::new(),
             not_stopped_agent_ids: Vec::new(),
             already_terminal_count: 0,
@@ -2104,12 +2162,13 @@ async fn handle_agent_fanout_stop_group_action(
         });
     let updated = cancelled.group;
     let cancellation_pending_agent_ids = cancelled.cancellation_pending_agent_ids;
+    let group_cancellation_pending = cancelled.group_cancellation_pending;
     let stopped_agent_ids = cancelled.stopped_agent_ids;
     let not_stopped_agent_ids = cancelled.not_stopped_agent_ids;
     let already_terminal_count = cancelled.already_terminal_count;
     let non_stoppable_count = cancelled.non_stoppable_count;
     let has_issues = !not_stopped_agent_ids.is_empty() || non_stoppable_count > 0;
-    let stop_outcome = if !cancellation_pending_agent_ids.is_empty() {
+    let stop_outcome = if group_cancellation_pending || !cancellation_pending_agent_ids.is_empty() {
         "cancellation_pending"
     } else if has_issues {
         "partially_stopped"
@@ -2132,6 +2191,7 @@ async fn handle_agent_fanout_stop_group_action(
         "stopped_agent_ids": stopped_agent_ids,
         "cancellation_pending_count": cancellation_pending_agent_ids.len(),
         "cancellation_pending_agent_ids": cancellation_pending_agent_ids,
+        "group_cancellation_pending": group_cancellation_pending,
         "already_terminal_count": already_terminal_count,
         "non_stoppable_count": non_stoppable_count,
         "not_stopped_agent_ids": not_stopped_agent_ids,
@@ -2248,7 +2308,9 @@ async fn find_fanout_group(
     ctx: &AgentToolContext,
     group_id: &str,
 ) -> Option<AgentFanoutGroupProjection> {
-    ctx.spawner.fanout_group(group_id).await
+    ctx.spawner
+        .fanout_group_for_parent_run_and_id(&ctx.run_id, group_id)
+        .await
 }
 
 fn fanout_group_to_json(group: &AgentFanoutGroupProjection) -> Value {
@@ -2260,6 +2322,7 @@ fn fanout_group_to_json(group: &AgentFanoutGroupProjection) -> Value {
         "target_count": summary.target_count,
         "revision": group.revision,
         "status": group.status.as_str(),
+        "admission_closed": group.spawn_admission_closed(),
         "summary": group.summary_sentence(),
         "accepted": summary.accepted,
         "active": summary.active,
@@ -2489,19 +2552,23 @@ async fn handle_agent_spawn_action_with_deadline(
         delegation_chain: child_delegation_chain,
     };
 
-    // Allocate the outer async state before constructing the dynamically sized
-    // spawn supervisor future. This keeps its first construction and poll off
-    // the already-deep generic tool pipeline stack on debug Tokio workers.
-    // Yield once before invoking the supervisor so this handler is polled from
-    // a fresh scheduler boundary; dynamic child startup must not inherit the
-    // parent tool pipeline's large synchronous stack.
+    // The spawner future contains the complete child-preparation and
+    // execution state machine. Heap-box it before handing it to Tokio: a
+    // fanout constructs several child spawns while already nested in the
+    // generic tool pipeline, and constructing that large future inline can
+    // exhaust a debug worker's small stack before Tokio gets to poll it.
+    // Yield once as well so child startup is polled from a fresh scheduler
+    // boundary rather than inheriting the parent tool pipeline's stack.
     tokio::task::yield_now().await;
     let spawner = Arc::clone(&ctx.spawner);
-    let spawn = AbortOnDropJoinHandle::new(tokio::spawn(async move {
+    let fanout_admission = ctx.fanout_admission.clone();
+    let spawn_future = Box::pin(async move {
+        let _fanout_admission = fanout_admission;
         spawner
             .spawn_with_execution_deadline(input, &spawn_ctx, execution_deadline)
             .await
-    }));
+    });
+    let spawn = AbortOnDropJoinHandle::new(tokio::spawn(spawn_future));
     match spawn.await {
         Ok(Ok(output)) => render_spawn_agent_output(output, ctx.transcript_location),
         Ok(Err(SpawnError::ExecutorUnavailable)) => {
@@ -2756,7 +2823,9 @@ async fn handle_agent_get_result_action_inner(
         );
     }
 
-    if reconcile_durable && let Err(error) = ctx.spawner.reconcile_durable_agent_runs().await {
+    if reconcile_durable
+        && let Err(error) = reconcile_durable_agent_runs_for_tool(ctx.spawner.as_ref()).await
+    {
         tracing::warn!(
             target: "fanout",
             %agent_id,
@@ -3555,6 +3624,7 @@ mod tests {
         current_model: Option<&str>,
     ) -> AgentToolContext {
         AgentToolContext {
+            fanout_admission: spawner.fanout_parent("run-parent"),
             run_id: "run-parent".into(),
             agent_id: "root-agent".into(),
             delegation_chain: Vec::new(),
@@ -4206,6 +4276,7 @@ mod tests {
 
         let mut next_ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
         next_ctx.run_id = "run-next-parent".to_string();
+        next_ctx.fanout_admission = next_ctx.spawner.fanout_parent(&next_ctx.run_id);
         let allowed = handle_agent_spawn_action(
             &json!({
                 "description": "Fresh analysis",
@@ -4223,6 +4294,45 @@ mod tests {
             executor.take_captured_model().as_deref(),
             Some("MiniMax-M2.7")
         );
+    }
+
+    #[tokio::test]
+    async fn next_turn_reads_session_fanout_but_cannot_control_its_parent() {
+        let spawner = test_spawner(Arc::new(CapturingModelExecutor::new()));
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+        let started = handle_agent_fanout_tool(
+            &json!({"action":"start", "group_id":"prior-results", "target_count":1,
+                "slots":[{"id":"review", "description":"Review", "prompt":"Review the change."}]}),
+            Some(&ctx),
+        )
+        .await;
+        let original = collect_fanout_start(&started, &ctx).await;
+        assert_eq!(original["status"], "completed");
+        let mut next = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+        next.run_id = "next-root-turn".into();
+        next.fanout_admission = spawner.fanout_parent(&next.run_id);
+        let args = json!({"action":"get_results", "group_id":"prior-results"});
+        let first = handle_agent_fanout_tool(&args, Some(&next)).await;
+        let value: Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["results"][0]["result"]["status"], "completed");
+        assert_eq!(handle_agent_fanout_tool(&args, Some(&next)).await, first);
+        let stopped = handle_agent_fanout_tool(
+            &json!({"action":"stop_group", "group_id":"prior-results"}),
+            Some(&next),
+        )
+        .await;
+        assert!(stopped.contains("Unknown fanout group_id"), "{stopped}");
+        let other = test_spawn_context(
+            test_spawner(Arc::new(CapturingModelExecutor::new())),
+            Some("MiniMax-M2.7"),
+        );
+        let unknown = handle_agent_fanout_tool(&args, Some(&other)).await;
+        assert!(unknown.contains("Unknown fanout group_id"), "{unknown}");
+        let mut foreign_owner = other;
+        foreign_owner.fanout_admission = ctx.fanout_admission.clone();
+        let unknown = handle_agent_fanout_tool(&args, Some(&foreign_owner)).await;
+        assert!(unknown.contains("Unknown fanout group_id"), "{unknown}");
     }
 
     #[tokio::test]
@@ -4488,6 +4598,10 @@ mod tests {
                 .count(),
             1,
             "only the straggler is cancelled by the settlement deadline"
+        );
+        assert!(
+            spawner.list_all_agents().await.is_empty(),
+            "a timed-out real child must not remain active after fanout settlement"
         );
     }
 
@@ -5629,6 +5743,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_id_start_recovery_and_replay_survive_group_eviction() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+        let args = json!({
+            "action": "start", "_tool_call_id": "original-start", "target_count": 1,
+            "slots": [{"description": "Review", "prompt": "Review changes"}]
+        });
+        let started = handle_agent_fanout_tool(&args, Some(&ctx)).await;
+        let initial = collect_fanout_start(&started, &ctx).await;
+        assert_eq!(initial["completed"], 1);
+        let group_id = initial["group_id"].as_str().unwrap();
+        for index in 0..16 {
+            let mut other = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+            other.run_id = format!("other-parent-{index}");
+            other.fanout_admission = spawner.fanout_parent(&other.run_id);
+            let started = handle_agent_fanout_tool(&args, Some(&other)).await;
+            assert_eq!(collect_fanout_start(&started, &other).await["completed"], 1);
+        }
+        assert!(spawner.fanout_group(group_id).await.is_none());
+        let explicit = handle_agent_fanout_tool(
+            &json!({"action": "get_results", "group_id": group_id}),
+            Some(&ctx),
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&explicit).unwrap()["completed"],
+            1
+        );
+        let recovered =
+            recover_agent_fanout_tool_result(&args, Some("original-start"), Some(&ctx)).await;
+        let replay = handle_agent_fanout_tool(&args, Some(&ctx)).await;
+        assert_eq!(
+            executor.spawn_count(),
+            17,
+            "readback must not start replacement children"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&recovered).unwrap()["completed"],
+            1,
+            "{recovered}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&replay).unwrap()["completed"],
+            1,
+            "{replay}"
+        );
+    }
+
+    #[tokio::test]
     async fn recover_agent_fanout_start_uses_existing_group_without_respawn() {
         let executor = Arc::new(CapturingModelExecutor::new());
         let spawner = test_spawner(executor.clone());
@@ -6531,7 +6695,7 @@ mod tests {
         assert_eq!(value["incomplete_results"], 1);
         assert!(
             spawner
-                .cached_terminal_fanout_result("empty-result")
+                .cached_terminal_fanout_result(&ctx.run_id, "empty-result")
                 .await
                 .is_none(),
             "an unavailable result must remain re-readable after durable convergence"
