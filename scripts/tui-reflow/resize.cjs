@@ -12,7 +12,7 @@ const { Terminal } = require('@xterm/headless');
 const binary = path.resolve(process.env.ASTRA_TEST_BINARY || '../../target/debug/astra');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-async function journey(sizes, draft = false, rapid = false) {
+async function journey(sizes, draft = false, rapid = false, displacedCursor = false) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'astra-reflow-'));
   const terminal = new Terminal({ cols: 100, rows: 30, scrollback: 2000, allowProposedApi: true });
   const child = spawn('python3', ['-u', path.join(__dirname, 'pty_bridge.py'), binary, root], {
@@ -58,7 +58,7 @@ async function journey(sizes, draft = false, rapid = false) {
     const b = terminal.buffer.active;
     trace.push({label, size: [terminal.cols, terminal.rows], base: b.baseY,
       cursor: [b.cursorX, b.cursorY],
-      ui: lines().map((v, row) => ({row, v})).filter(x => /Message Astra|resize-model.*Ask/.test(x.v))});
+      ui: lines().map((v, row) => ({row, v})).filter(x => /DRAFT_SENTINEL|Message Astra|resize-model.*Ask/.test(x.v))});
   }
   async function waitFor(predicate) {
     const deadline = Date.now() + 15000;
@@ -108,6 +108,11 @@ async function journey(sizes, draft = false, rapid = false) {
       const reportsBeforeResize = cursorReports;
       if (rapid && index === 0) holdCursorReply = true;
       terminal.resize(cols, rows);
+      if (displacedCursor && index === sizes.length - 1) {
+        // Reflow can move the cursor below cells it retained. Reproduce that
+        // geometry before the final cursor query instead of relying on CI timing.
+        await new Promise(resolve => terminal.write('\x1b[2B', resolve));
+      }
       send({ resize: [cols, rows] });
       if (rapid) snapshot('resize');
       if (rapid && index === 1) {
@@ -128,7 +133,7 @@ async function journey(sizes, draft = false, rapid = false) {
     }
     if (rapid) {
       await settle();
-      check('rapid resize round trips');
+      check(displacedCursor ? 'rapid resize with cursor displacement' : 'rapid resize round trips');
     }
   } catch (error) {
     if (rapid) console.error(JSON.stringify(trace, null, 2));
@@ -149,4 +154,5 @@ async function journey(sizes, draft = false, rapid = false) {
   const rapidSizes = Array.from({ length: 3 }, () => [[40, 30], [160, 30], [100, 15], [100, 30]]).flat();
   await journey(rapidSizes, false, true);
   await journey(rapidSizes, true, true);
+  await journey(rapidSizes, true, true, true);
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -290,8 +290,19 @@ impl TerminalGuard {
         let mut area = self.terminal.viewport_area;
         area.y =
             (i32::from(area.y) + offset).clamp(0, i32::from(size.height.saturating_sub(1))) as u16;
+        // A coalesced resize can return to the last drawn dimensions while
+        // leaving the old frame at its original rows. If the cursor moved down,
+        // clearing only from the recovered origin would leave that frame above
+        // the repaint. On an actual width change, the old origin can now hold
+        // reflowed history, so keep clearing from the recovered origin there.
+        let clear_y = if size == self.terminal.last_known_screen_size {
+            self.terminal.viewport_area.y.min(area.y)
+        } else {
+            area.y
+        };
         self.terminal.set_viewport_area(area);
-        self.terminal.clear()?;
+        self.terminal
+            .clear_after_position(ratatui::layout::Position { x: 0, y: clear_y })?;
         self.terminal.resize(size)?;
         Ok(())
     }
