@@ -2679,11 +2679,81 @@ fn typescript_option_may_skip_validation(word: &str) -> bool {
     )
 }
 
+/// TypeScript expands `@file` only at the top level of argv, after an option
+/// has had the chance to consume its operand. These are the CLI-admitted
+/// non-Boolean compiler/watch options; an unknown option does not grant proof.
+fn typescript_option_value_kind(word: &str) -> Option<bool> {
+    let name = word.strip_prefix("--").or_else(|| word.strip_prefix('-'))?;
+    let name = name.to_ascii_lowercase();
+    if matches!(
+        name.as_str(),
+        "lib"
+            | "typeroots"
+            | "types"
+            | "modulesuffixes"
+            | "customconditions"
+            | "excludedirectories"
+            | "excludefiles"
+    ) {
+        return Some(true); // List: a following switch is not consumed.
+    }
+    matches!(
+        name.as_str(),
+        "generatecpuprofile"
+            | "generatetrace"
+            | "locale"
+            | "project"
+            | "p"
+            | "target"
+            | "t"
+            | "module"
+            | "m"
+            | "jsx"
+            | "outfile"
+            | "outdir"
+            | "rootdir"
+            | "tsbuildinfofile"
+            | "importsnotusedasvalues"
+            | "moduleresolution"
+            | "baseurl"
+            | "sourceroot"
+            | "maproot"
+            | "jsxfactory"
+            | "jsxfragmentfactory"
+            | "jsximportsource"
+            | "out"
+            | "reactnamespace"
+            | "charset"
+            | "newline"
+            | "declarationdir"
+            | "maxnodemodulejsdepth"
+            | "moduledetection"
+            | "ignoredeprecations"
+            | "watchfile"
+            | "watchdirectory"
+            | "fallbackpolling"
+    )
+    .then_some(false)
+}
+
 fn typescript_args_prove_validation(words: &[String]) -> bool {
     let mut index = 0;
     while let Some(word) = words.get(index) {
         if word.starts_with('@') {
             return false;
+        }
+        if let Some(is_list) = typescript_option_value_kind(word) {
+            let Some(value) = words.get(index + 1) else {
+                return false;
+            };
+            // TypeScript leaves an option-looking token after a list option
+            // for the outer argv parser (e.g. `--types --help`).
+            index += if is_list && value.starts_with('-') {
+                1
+            } else {
+                2
+            };
+            continue;
         }
         if typescript_option_may_skip_validation(word) {
             if words.get(index + 1).is_none_or(|value| value != "false") {
@@ -7513,6 +7583,22 @@ mod tests {
             ("tsc --noEmit --watch false", "tsc --noEmit --watch false"),
             ("tsc --noEmit --HELP false", "tsc --noEmit --HELP false"),
             (
+                "tsc --noEmit --types @scope/custom index.ts",
+                "tsc --noEmit --types @scope/custom index.ts",
+            ),
+            (
+                "npx tsc --NOEMIT --typeRoots @scope/types index.ts",
+                "npx tsc --noEmit --typeRoots @scope/types index.ts",
+            ),
+            (
+                "tsc --noEmit --types --help false",
+                "tsc --noEmit --types --help false",
+            ),
+            (
+                "tsc --noEmit -p @config.json",
+                "tsc --noEmit -p @config.json",
+            ),
+            (
                 "tsc --noEmit --outDir --help false",
                 "tsc --noEmit --outDir --help false",
             ),
@@ -7538,7 +7624,25 @@ mod tests {
                 "tsc --noEmit --help --outDir --help false",
             ),
             ("tsc --noEmit --noCheck", "tsc --noEmit --noCheck"),
+            ("tsc --noEmit --types --help", "tsc --noEmit --types --help"),
             ("tsc --noEmit @args.rsp", "tsc --noEmit @args.rsp"),
+            (
+                "tsc --noEmit --strict @args.rsp",
+                "tsc --noEmit --strict @args.rsp",
+            ),
+            (
+                "tsc --noEmit --types @scope/custom @args.rsp",
+                "tsc --noEmit --types @scope/custom @args.rsp",
+            ),
+            (
+                "tsc --noEmit --types --strict @args.rsp",
+                "tsc --noEmit --types --strict @args.rsp",
+            ),
+            (
+                "tsc --noEmit --types --outDir --types @args.rsp",
+                "tsc --noEmit --types --outDir --types @args.rsp",
+            ),
+            ("tsc --noEmit --types", "tsc --noEmit --types"),
         ] {
             let args = serde_json::json!({"command": command}).to_string();
             assert_eq!(

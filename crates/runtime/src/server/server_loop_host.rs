@@ -44006,6 +44006,54 @@ mod tests {
         );
         host.pending_tool_call_admission.take();
 
+        let mut scoped_types = create_test_state();
+        scoped_types.stall.tool_call_records.push(validation_record(
+            "tsc --noEmit --types @scope/custom index.ts",
+            true,
+        ));
+        assert_eq!(
+            current_work_validation_state(&scoped_types),
+            WorkValidationState::Passed
+        );
+        assert_eq!(
+            host.admit_terminal_tool_calls_with_completion(
+                &mut scoped_types,
+                std::slice::from_ref(&delivered),
+                Some("tool_calls"),
+            ),
+            vec![delivered.clone()],
+            "a consumed scoped types value must not be treated as a response file"
+        );
+        host.pending_tool_call_admission.take();
+
+        for unverified_command in [
+            "tsc --noEmit @args.rsp",
+            "tsc --noEmit --types --help",
+            "tsc --noEmit --types --strict @args.rsp",
+            "tsc --noEmit --types --outDir --types @args.rsp",
+        ] {
+            let mut unverified = create_test_state();
+            unverified
+                .stall
+                .tool_call_records
+                .push(validation_record(unverified_command, true));
+            assert_eq!(
+                current_work_validation_state(&unverified),
+                WorkValidationState::Stale,
+                "{unverified_command}"
+            );
+            assert!(
+                host.admit_terminal_tool_calls_with_completion(
+                    &mut unverified,
+                    std::slice::from_ref(&delivered),
+                    Some("tool_calls"),
+                )
+                .is_empty(),
+                "{unverified_command} cannot prove type-checking"
+            );
+            host.pending_tool_call_admission.take();
+        }
+
         let ambiguous = "tsc --noEmit --help --outDir --help false";
         let mut unverified = create_test_state();
         unverified

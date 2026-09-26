@@ -199,6 +199,9 @@ without proving a successful validation when its arguments have ambiguous
 execution semantics. An ambiguous success clears only its own failure debt;
 Work delivery still requires a proof-eligible validation, with one bounded
 direct revalidation opportunity or a truthful failed/blocked settlement.
+Argument proof follows the tool's option/operand boundary: a TypeScript `@file`
+is opaque only when parsed as a top-level response-file argument, not when a
+known value-taking option consumes it as an ordinary path or package name.
 
 At completion, an unresolved failure with a later-round observation candidate,
 or the existing repeated-failure signal, permits one evidence-linked
