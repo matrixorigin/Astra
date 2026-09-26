@@ -181,7 +181,7 @@ impl InterruptionKind {
             Self::HarnessBlocked => "The execution harness blocked the run.",
             Self::HarnessPaused => "The execution harness paused the run.",
             Self::Interrupted => "The run stopped before it completed.",
-            Self::ExecutionIncomplete => "Execution did not reach a verified terminal state.",
+            Self::ExecutionIncomplete => "Some work remains unverified.",
             Self::ExecutorDropped => "The execution worker stopped before returning a result.",
         }
     }
@@ -384,30 +384,16 @@ impl InterruptionRecord {
         } else {
             ""
         };
-        let tool_note = if summary.tool_calls_completed > 0 {
-            if matches!(
-                kind,
-                InterruptionKind::ExecutionIncomplete | InterruptionKind::ExecutorDropped
-            ) {
-                format!(
-                    " {} tool call(s) were processed before the interruption.",
-                    summary.tool_calls_completed
-                )
-            } else {
-                format!(" {} tool call(s) completed.", summary.tool_calls_completed)
+        let tool_note = match (kind, summary.tool_calls_completed) {
+            (InterruptionKind::ExecutorDropped, count) if count > 0 => {
+                format!(" {count} tool call(s) were processed before the interruption.")
             }
-        } else {
-            String::new()
+            (InterruptionKind::ExecutionIncomplete, _) | (_, 0) => String::new(),
+            (_, count) => format!(" {count} tool call(s) completed."),
         };
         let action_note = match (kind, action) {
             (InterruptionKind::ExecutionIncomplete, ResumeAction::ContinueImmediately) => {
-                if summary.has_checkpoint {
-                    " Review the saved progress, then continue to reconcile the unfinished work."
-                        .to_string()
-                } else {
-                    " Review the available execution evidence, then continue to reconcile the unfinished work."
-                        .to_string()
-                }
+                " Continue this session to resolve what remains.".to_string()
             }
             (InterruptionKind::ExecutorDropped, ResumeAction::ContinueImmediately) => {
                 if summary.has_checkpoint {
@@ -440,23 +426,21 @@ impl InterruptionRecord {
                 .as_deref()
                 .and_then(summarize_stall_signal_for_user)
                 .map(|s| format!(" Cause: {}.", s.cause)),
-            InterruptionKind::ExecutionIncomplete
-            | InterruptionKind::ExecutorDropped
-            | InterruptionKind::Interrupted => summary.error_detail.as_ref().map(|_| {
-                let cause = match kind {
-                    InterruptionKind::ExecutionIncomplete => {
-                        "the runtime could not verify the final execution state"
-                    }
-                    InterruptionKind::ExecutorDropped => {
-                        "the execution worker stopped before terminal evidence was delivered"
-                    }
-                    InterruptionKind::Interrupted => {
-                        "the run ended while its terminal state was being reconciled"
-                    }
-                    _ => unreachable!("kind constrained by match arm"),
-                };
-                format!(" Cause: {cause}.")
-            }),
+            InterruptionKind::ExecutionIncomplete => None,
+            InterruptionKind::ExecutorDropped | InterruptionKind::Interrupted => {
+                summary.error_detail.as_ref().map(|_| {
+                    let cause = match kind {
+                        InterruptionKind::ExecutorDropped => {
+                            "the execution worker stopped before terminal evidence was delivered"
+                        }
+                        InterruptionKind::Interrupted => {
+                            "the run ended while its terminal state was being reconciled"
+                        }
+                        _ => unreachable!("kind constrained by match arm"),
+                    };
+                    format!(" Cause: {cause}.")
+                })
+            }
             _ => None,
         }
         .unwrap_or_default();
@@ -1210,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_incomplete_message_distinguishes_partial_evidence_from_saved_checkpoint() {
+    fn execution_incomplete_message_avoids_internal_boilerplate() {
         let record = InterruptionRecord::new(
             InterruptionKind::ExecutionIncomplete,
             ResumeAction::ContinueImmediately,
@@ -1230,25 +1214,17 @@ mod tests {
         assert!(
             record
                 .user_message
-                .starts_with("Execution did not reach a verified terminal state.")
+                .starts_with("Some work remains unverified.")
         );
+        assert!(!record.user_message.contains("43 tool call(s)"));
         assert!(
             record
                 .user_message
-                .contains("43 tool call(s) were processed")
-        );
-        assert!(
-            record
-                .user_message
-                .contains("Review the available execution evidence")
+                .contains("Continue this session to resolve what remains")
         );
         assert!(!record.user_message.contains("Progress is saved"));
         assert!(!record.user_message.contains("internal detail"));
-        assert!(
-            record
-                .user_message
-                .contains("runtime could not verify the final execution state")
-        );
+        assert!(!record.user_message.contains("runtime could not verify"));
     }
 
     #[test]

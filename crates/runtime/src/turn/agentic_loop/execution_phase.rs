@@ -2526,11 +2526,26 @@ fn unresolved_tool_outcome_is_terminally_relevant(
         state.hooks.workspace_root_hint.as_deref(),
         record,
     );
-    if astra_turn_core::evaluation::tool_outcome_requires_terminal_attention(
+    let admission_risk = astra_turn_core::evaluation::tool_outcome_requires_terminal_attention(
         record,
         &failure.result_class,
-    ) && !external_scratch
-    {
+    );
+    // Permission admission must conservatively treat an opaque executable as
+    // a potential writer. Completion has stronger, executed evidence: when
+    // the typed task is explicitly read-only and no positive mutation or
+    // verification obligation exists, its failed diagnostic remains advisory.
+    // Unknown intent, direct writers, and observed mutation stay strict.
+    let advisory_diagnostic = state.turn_intent.as_ref().is_some_and(|intent| {
+        intent.workspace_mutation == WorkspaceMutationIntent::ReadOnly
+            && !intent.browser_verification_required
+    }) && !state.task_profile.verification_required
+        && !requires_external_effect_completion(state)
+        && astra_turn_core::cloud_approval_policy::is_cloud_execute_tool(&record.name)
+        && !tool_record_may_have_mutated_bound_workspace(
+            state.hooks.workspace_root_hint.as_deref(),
+            record,
+        );
+    if admission_risk && !external_scratch && !advisory_diagnostic {
         return true;
     }
 
@@ -18494,6 +18509,81 @@ mod tests {
                 .outcome_reconciliation_retries,
             0,
             "an incidental read-only probe must not block a strict task"
+        );
+    }
+
+    #[test]
+    fn explicit_read_only_diagnostic_does_not_inherit_shell_admission_risk() {
+        use astra_config::user_profile::{TurnIntent, WorkspaceMutationIntent};
+        use astra_turn_types::ToolInvocationIdentity;
+        use astra_turn_types::task_resolution::{
+            EdgeDispatchCompletionRef, ToolExecutionEvidenceRef,
+        };
+        let reference = ToolExecutionEvidenceRef::EdgeDispatch(EdgeDispatchCompletionRef {
+            identity: ToolInvocationIdentity::new("user", "session", "run", "chain", "probe")
+                .unwrap(),
+            edge_agent_id: "edge-1".into(),
+            result_hash: "failed-probe".into(),
+        });
+        let mut state = make_state();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                false,
+                false,
+                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+            );
+        state.turn_intent =
+            Some(TurnIntent::default().with_workspace_mutation(WorkspaceMutationIntent::ReadOnly));
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: false,
+            args_full: Some(serde_json::json!({"command":"python3 -c 'print(1 / 0)'"}).to_string()),
+            round: Some(1),
+            execution_completion: Some(reference),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+        crate::turn::runtime_policy::evaluate_tool_boundary_with_thresholds(
+            &mut state.stall.runtime_policy_evaluation,
+            astra_turn_core::context_feedback::RuntimePolicySubject::Run,
+            &state.stall.tool_call_records,
+            1,
+            astra_turn_core::evaluation::EvaluationThresholds::default(),
+            None,
+        )
+        .unwrap();
+        let failure = state
+            .stall
+            .runtime_policy_evaluation
+            .unresolved_tool_outcomes()
+            .into_values()
+            .next()
+            .expect("failed diagnostic remains in ledger");
+        assert!(!unresolved_tool_outcome_is_terminally_relevant(
+            &state, &failure
+        ));
+        assert!(!enforce_outcome_reconciliation_before_text_completion(
+            &mut state, None
+        ));
+        assert!(state.interruption.is_none());
+
+        state.turn_intent = None;
+        assert!(
+            unresolved_tool_outcome_is_terminally_relevant(&state, &failure),
+            "unknown intent must remain conservative"
+        );
+        state.turn_intent =
+            Some(TurnIntent::default().with_workspace_mutation(WorkspaceMutationIntent::ReadOnly));
+        state.stall.tool_call_records[0].args_full =
+            Some(serde_json::json!({"command":"echo changed > file.txt"}).to_string());
+        assert!(
+            unresolved_tool_outcome_is_terminally_relevant(&state, &failure),
+            "positive writer shape must remain strict even under read-only intent"
+        );
+        state.stall.tool_call_records[0].execution_completion = None;
+        assert!(
+            unresolved_tool_outcome_is_terminally_relevant(&state, &failure),
+            "missing execution reference must remain strict"
         );
     }
 

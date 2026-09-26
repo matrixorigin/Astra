@@ -219,11 +219,7 @@ pub(crate) fn partial_interruption_notice(result: &StreamResult) -> Option<Strin
     if assistant_text.is_empty() || assistant_text == notice.trim() {
         return None;
     }
-    if result.interruption_kind.as_deref() == Some("execution_incomplete") {
-        Some(format!("Partial answer shown. {notice}"))
-    } else {
-        Some(notice)
-    }
+    Some(notice)
 }
 
 pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
@@ -582,7 +578,7 @@ mod tests {
         assert_eq!(
             partial_interruption_notice(&result).as_deref(),
             Some(
-                "Partial answer shown. Execution did not reach a verified terminal state. Progress is saved. Review the saved progress, then continue to reconcile the unfinished work."
+                "Execution did not reach a verified terminal state. Progress is saved. Review the saved progress, then continue to reconcile the unfinished work."
             )
         );
         assert!(!result.full_text.contains("persistent unresolved"));
