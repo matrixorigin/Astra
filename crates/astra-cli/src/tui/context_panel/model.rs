@@ -45,6 +45,35 @@ pub(crate) struct ContextBreakdown {
     pub session_summary: Option<SessionSummary>,
     pub decisions: Vec<DecisionItem>,
     pub compaction: CompactionSummary,
+    /// Per-step facts the CONTEXT PLAN block reports.
+    pub plan: AssemblyPlan,
+}
+
+/// What each context-assembly step did, in the shape `EXPLAIN` uses: the
+/// estimate the assembler worked from, and — where the runtime measured
+/// the step — what it actually cost.
+///
+/// Only the request total is measured today (`total_measured`); every
+/// per-step figure is an estimate. The panel says so rather than
+/// presenting an estimate as a measurement.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AssemblyPlan {
+    pub skills_injected: u32,
+    pub repository_memories: u32,
+    pub session_snapshot: bool,
+    pub tools_available: u32,
+    pub deferred_available: u32,
+    /// Sum of the per-tool schema costs the trace lists. This is a second
+    /// opinion on the same quantity as the Tools category; when the two
+    /// disagree the panel shows both rather than picking one.
+    pub tool_tokens_sum: u32,
+    pub tool_surface_latency_ms: u64,
+    pub memory_candidates: u32,
+    pub memory_selected: u32,
+    pub memory_latency_ms: u64,
+    /// True when `total_used` came back from the provider for this request
+    /// rather than from the assembler's own estimate.
+    pub total_measured: bool,
 }
 
 /// Compaction stats sourced from two places:
@@ -727,6 +756,7 @@ impl ContextBreakdown {
             session_summary: None,
             decisions: Vec::new(),
             compaction: CompactionSummary::default(),
+            plan: AssemblyPlan::default(),
         }
     }
 
@@ -803,6 +833,7 @@ impl ContextBreakdown {
                 compressed_turns: snap.compressed_turns.clone(),
                 ..Default::default()
             },
+            plan: AssemblyPlan::default(),
         }
     }
 
@@ -997,6 +1028,27 @@ impl ContextBreakdown {
         let decisions = build_decisions(trace);
         let session_summary = snap.session.clone();
         let compaction = build_compaction_summary(trace, snap);
+        let plan = AssemblyPlan {
+            skills_injected: trace.system_prompt.skills_injected.len() as u32,
+            repository_memories: trace.system_prompt.repository_memories.len() as u32,
+            session_snapshot: trace.system_prompt.session_memory_injected.is_some(),
+            tools_available: trace.tools.tools_available,
+            deferred_available: trace.tools.deferred_available,
+            tool_tokens_sum: trace
+                .tools
+                .visible_tools
+                .iter()
+                .map(|t: &VisibleTool| t.tokens)
+                .sum(),
+            tool_surface_latency_ms: trace.tools.surface_latency_ms,
+            memory_candidates: trace.memory.candidates_considered,
+            memory_selected: trace.memory.memories_selected.len() as u32,
+            memory_latency_ms: trace.memory.retrieval_latency_ms,
+            total_measured: matches!(
+                budget.usage_source,
+                astra_turn_types::ContextWindowUsageSource::ProviderReported
+            ),
+        };
 
         Self {
             total_used: budget.total_used,
@@ -1015,6 +1067,7 @@ impl ContextBreakdown {
             session_summary,
             decisions,
             compaction,
+            plan,
         }
     }
 
