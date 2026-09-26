@@ -127,7 +127,11 @@ async fn stream_chat_sse_sends_active_work_as_authoritative_server_context() {
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
     let unified_skill_registry = astra_runtime::skills::empty_unified_registry().clone();
+    let mcp_manager = std::sync::Arc::new(tokio::sync::RwLock::new(
+        crate::mcp_client::McpClientManager::new(),
+    ));
     let context = BasicCliChatContext {
+        mcp_manager: Some(mcp_manager.clone()),
         api: &api,
         auth_profile: None,
         message: "What is still running?",
@@ -176,6 +180,13 @@ async fn stream_chat_sse_sends_active_work_as_authoritative_server_context() {
         &mut skill_quality_tracker,
     );
     params.input_work_unit_observations = &observations;
+    assert!(std::sync::Arc::ptr_eq(
+        params
+            .mcp_manager
+            .as_ref()
+            .expect("basic CLI must retain MCP bindings"),
+        &mcp_manager,
+    ));
 
     let result = stream_chat_sse(params).await.unwrap();
 

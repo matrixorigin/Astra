@@ -1231,6 +1231,7 @@ fn severity_for(kind: astra_core::ErrorKind, count: i64) -> &'static str {
         (K::Stall, n) if n >= 3 => "warning",
         (K::Stall, _) => "info",
         (K::MissingModelSelection, _) => "warning",
+        (K::ToolOutcomeUnknown, _) => "warning",
         // Generic count-based escalation
         (_, n) if n >= 5 => "critical",
         (_, n) if n >= 3 => "warning",
@@ -1278,6 +1279,9 @@ fn summary_for(kind: astra_core::ErrorKind, tool: &str, count: i64) -> String {
                 "Tool binding mismatch ({tool}): advertised without executor/transport — {count} occurrences"
             )
         }
+        K::ToolOutcomeUnknown => format!(
+            "Tool outcome unknown ({tool}): reconcile provider state before any replay — {count} occurrences"
+        ),
         K::ContextWindow => format!(
             "Prompt exceeded context window ({tool}): compact history or switch model — {count} occurrences"
         ),

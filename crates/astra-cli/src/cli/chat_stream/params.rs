@@ -724,6 +724,8 @@ pub(crate) struct ChatTurnParams<'a> {
 /// Used via [`ChatTurnParams::basic_cli`] to avoid repeating ~30 default fields
 /// at each retry site in `command_router.rs`.
 pub(crate) struct BasicCliChatContext<'a> {
+    /// Connected CLI MCP providers must survive the basic-turn adapter.
+    pub mcp_manager: Option<Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
     pub api: &'a astra_thin_client::ThinClient,
     pub auth_profile: Option<&'a str>,
     pub message: &'a str,
@@ -834,7 +836,7 @@ impl<'a> ChatTurnParams<'a> {
             approval_request_tx: None,
             ask_user_request_tx: None,
             plan_review_request_tx: None,
-            mcp_manager: None,
+            mcp_manager: ctx.mcp_manager.clone(),
             skill_quality_tracker,
             discovered_skills: None,
             messaging_metrics: None,

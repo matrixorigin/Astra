@@ -1027,6 +1027,20 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     let eligible_provider_schemas = ctx
         .executor
         .runtime_bound_provider_owned_schemas_excluding(ctx.restricted_tools);
+    // The CLI callback executor dispatches its public names directly; its MCP
+    // manager owns the subsequent mapping to the actual MCP server/tool.
+    // Publish this adapter identity explicitly alongside the full contracts.
+    let native_ids: std::collections::BTreeMap<String, String> = eligible_provider_schemas
+        .iter()
+        .filter_map(tool_schema_name)
+        .map(|name| (name.to_string(), name.to_string()))
+        .collect();
+    merge_edge_profile_extensions(
+        &mut payload,
+        &json!({
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_TOOL_NATIVE_IDS: native_ids,
+        }),
+    );
     attach_filtered_edge_tools_to_payload(&mut payload, turn_schemas, ctx.restricted_tools);
     // Sync the executor guard from the final payload, after capability
     // restrictions and interaction-mode filtering have all been applied. The

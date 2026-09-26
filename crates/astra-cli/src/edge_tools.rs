@@ -1943,6 +1943,9 @@ impl ToolExecutor {
         if self.runtime_environment_tool_denial(name, args).is_some() {
             return false;
         }
+        if astra_runtime_env::is_mcp_namespaced_tool_name(name) {
+            return self.mcp_tool_has_runtime_binding(name);
+        }
 
         let Some(meta) = astra_turn_core::tool::registry::meta::tool_meta(name) else {
             return self.cli_declared_local_tool_has_name(name)
@@ -1968,7 +1971,7 @@ impl ToolExecutor {
             .err()
     }
 
-    fn runtime_environment_binding_for_tool(
+    pub(crate) fn runtime_environment_binding_for_tool(
         &self,
         name: &str,
         registry: &astra_runtime_env::ToolRegistry,
@@ -1976,29 +1979,38 @@ impl ToolExecutor {
         if astra_runtime_env::is_mcp_namespaced_tool_name(name)
             && self.mcp_tool_has_runtime_binding(name)
         {
-            let providers = vec![astra_runtime_env::mcp_provider(
-                "cli-mcp",
-                [name.to_string()],
-            )];
-            return astra_runtime_env::RunBinding::resolve_with_provider_declarations(
-                astra_runtime_env::WorkspaceBinding::none(),
-                astra_runtime_env::ExecutorBinding {
-                    kind: astra_runtime_env::ExecutorBindingKind::Mcp,
-                    executor_id: "cli-mcp".to_string(),
-                    display_name: "CLI MCP server".to_string(),
-                    transport: astra_runtime_env::ToolTransportKind::McpHttp,
-                    status: astra_runtime_env::ExecutorStatus::Online,
-                },
-                astra_runtime_env::RuntimeBinding::none(),
-                astra_runtime_env::PolicyIntent::cloud_control_plane(),
-                registry,
-                &providers,
-            );
+            return Self::mcp_runtime_environment_binding(name, registry);
         }
 
         astra_runtime_env::RunBinding::local_developer(
             self.project_root.display().to_string(),
             registry,
+        )
+    }
+
+    /// Describe a verified MCP route. Dispatch retains this binding in its result
+    /// even if connection recovery removes the route for future invocations.
+    fn mcp_runtime_environment_binding(
+        name: &str,
+        registry: &astra_runtime_env::ToolRegistry,
+    ) -> astra_runtime_env::RunBinding {
+        let providers = vec![astra_runtime_env::mcp_provider(
+            "cli-mcp",
+            [name.to_string()],
+        )];
+        astra_runtime_env::RunBinding::resolve_with_provider_declarations(
+            astra_runtime_env::WorkspaceBinding::none(),
+            astra_runtime_env::ExecutorBinding {
+                kind: astra_runtime_env::ExecutorBindingKind::Mcp,
+                executor_id: "cli-mcp".to_string(),
+                display_name: "CLI MCP server".to_string(),
+                transport: astra_runtime_env::ToolTransportKind::McpHttp,
+                status: astra_runtime_env::ExecutorStatus::Online,
+            },
+            astra_runtime_env::RuntimeBinding::none(),
+            astra_runtime_env::PolicyIntent::cloud_control_plane(),
+            registry,
+            &providers,
         )
     }
 

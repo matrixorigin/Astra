@@ -1516,6 +1516,7 @@ fn llm_main_error_outcome(error: &astra_core::ClassifiedError) -> &'static str {
         astra_core::ErrorKind::ToolTimeout => "error_tool_timeout",
         astra_core::ErrorKind::ToolUnavailable => "error_tool_unavailable",
         astra_core::ErrorKind::ToolBinding => "error_tool_binding",
+        astra_core::ErrorKind::ToolOutcomeUnknown => "error_tool_outcome_unknown",
         astra_core::ErrorKind::ResourceLimit => "error_resource_limit",
         astra_core::ErrorKind::DatabaseError => "error_database",
         astra_core::ErrorKind::Stall => "error_stall",
@@ -6080,12 +6081,43 @@ impl ServerAgenticLoopHostBuilder {
                 );
             }
         }
-        let runtime_declared_tool_native_ids = self
+        let mut runtime_declared_tool_native_ids = self
             .edge_provider_tool_native_ids
             .iter()
             .filter(|(name, _)| runtime_declared_tool_names.contains(*name))
             .map(|(name, native_id)| (name.clone(), native_id.clone()))
             .collect::<HashMap<_, _>>();
+        // The authenticated CLI carries native identities for its callback
+        // adapter in the same control-plane lane as the full tool contracts.
+        // Accept only explicitly declared, valid identities with a matching
+        // schema. A missing identity stays unbound; no alias parsing/fallback.
+        if let Some(native_ids) = self
+            .edge_profile
+            .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_TOOL_NATIVE_IDS)
+            .and_then(Value::as_object)
+        {
+            for (name, value) in native_ids {
+                if !runtime_declared_tool_names.contains(name) || registry.get(name).is_some() {
+                    continue;
+                }
+                let Some(native_id) = value.as_str() else {
+                    continue;
+                };
+                if astra_turn_types::NativeToolId::new(native_id.to_string()).is_err() {
+                    continue;
+                }
+                match runtime_declared_tool_native_ids.get(name) {
+                    Some(existing) if existing != native_id => {
+                        runtime_declared_tool_native_ids.remove(name);
+                    }
+                    Some(_) => {}
+                    None => {
+                        runtime_declared_tool_native_ids
+                            .insert(name.clone(), native_id.to_string());
+                    }
+                }
+            }
+        }
         let schema_admission_context = ToolAdmissionContext {
             server_service_provider_ready: self.server_service_tool_catalog_enabled,
             control_plane_provider_ready: self.control_plane_tool_catalog_enabled,
@@ -29593,6 +29625,36 @@ mod tests {
             json!(200_000),
         );
 
+        for native_ids in [json!({}), json!({tool_name: ""})] {
+            let mut unbound_profile = edge_profile.clone();
+            unbound_profile.insert(
+                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_TOOL_NATIVE_IDS
+                    .to_string(),
+                native_ids,
+            );
+            let unbound = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u-unbound".into(),
+                "s-unbound".into(),
+            )
+            .with_server_service_tool_catalog_enabled(false)
+            .with_edge_tools(sample_edge_tools())
+            .with_edge_profile(unbound_profile)
+            .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
+            .build();
+            assert!(
+                !unbound
+                    .tool_admission_snapshot_entries()
+                    .iter()
+                    .any(|entry| { entry.tool_name == tool_name && entry.visible }),
+                "missing/invalid native identity must stay unbound"
+            );
+        }
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_TOOL_NATIVE_IDS.to_string(),
+            json!({tool_name: tool_name}),
+        );
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -29601,10 +29663,6 @@ mod tests {
         )
         .with_server_service_tool_catalog_enabled(false)
         .with_edge_tools(sample_edge_tools())
-        .with_edge_tool_native_ids(HashMap::from([(
-            tool_name.to_string(),
-            tool_name.to_string(),
-        )]))
         .with_edge_profile(edge_profile)
         .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
         .build();

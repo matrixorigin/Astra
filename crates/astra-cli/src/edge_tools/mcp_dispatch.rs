@@ -1,11 +1,40 @@
-//! MCP (Model Context Protocol) tool dispatch with auto-reconnect.
+//! MCP (Model Context Protocol) tool dispatch with connection recovery.
 //!
 //! Routes tool calls to the appropriate MCP server, handling connection
-//! failures with automatic reconnect and retry.
+//! failures without replaying a call whose result may have been lost.
 
 use serde_json::Value;
 
 use super::{ToolExecutionOutcome, ToolExecutor};
+
+fn acknowledged_mcp_error_outcome(error: &astra_mcp::McpError) -> ToolExecutionOutcome {
+    let mut outcome = ToolExecutionOutcome::error(format!("Error: {error}"));
+    let mut fields = serde_json::Map::from_iter([
+        (
+            "dispatch_certainty".into(),
+            Value::String("dispatched".into()),
+        ),
+        ("execution_fact".into(), Value::String("failed".into())),
+        ("side_effects_maybe".into(), Value::Bool(false)),
+    ]);
+    if let astra_mcp::McpError::Service(rmcp::ServiceError::McpError(rpc_error)) = error {
+        let kind = match rpc_error.code {
+            rmcp::model::ErrorCode::INVALID_PARAMS => astra_core::ErrorKind::ToolInvalidArgs,
+            rmcp::model::ErrorCode::METHOD_NOT_FOUND => astra_core::ErrorKind::ToolNotFound,
+            rmcp::model::ErrorCode::INVALID_REQUEST | rmcp::model::ErrorCode::PARSE_ERROR => {
+                astra_core::ErrorKind::InvalidRequest
+            }
+            _ => astra_core::ErrorKind::Unknown,
+        };
+        fields.insert("error_kind".into(), Value::String(kind.as_str().into()));
+        fields.insert(
+            "mcp_rpc_error".into(),
+            serde_json::to_value(rpc_error).expect("MCP error is serializable"),
+        );
+    }
+    outcome.tool_result_fields = Some(fields);
+    outcome
+}
 
 fn mcp_result_to_tool_outcome(result: astra_mcp::McpToolCallResult) -> ToolExecutionOutcome {
     let mut fields = serde_json::Map::new();
@@ -60,71 +89,76 @@ impl ToolExecutor {
             (srv, tool, c)
         };
 
-        // Call tool (no lock held during await)
-        match conn.call_tool(&original_name, args.clone()).await {
-            Ok(result) => {
-                return mcp_result_to_tool_outcome(astra_mcp::extract_tool_call_result_with_limit(
-                    &result,
-                    crate::mcp_client::MAX_RESULT_CONTENT_LENGTH,
-                ));
-            }
-            Err(e) => {
-                eprintln!(
-                    "  ↻ MCP tool '{}' failed on '{}': {e}, attempting reconnect…",
-                    original_name, server_name
-                );
-            }
-        }
+        let dispatch_advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+            Self::mcp_runtime_environment_binding(mcp_name, super::runtime_env_builtin_registry()),
+        );
 
-        // Reconnect and retry — with tokio RwLock we can hold write lock across await
-        {
-            let mut mgr = manager_arc.write().await;
-            match mgr.reconnect(&server_name).await {
-                Ok(tool_count) => {
-                    eprintln!(
-                        "  ✓ Reconnected to '{}' ({} tools), retrying…",
-                        server_name, tool_count
-                    );
-                }
-                Err(e) => {
-                    return ToolExecutionOutcome::error(format!(
-                        "Error: MCP tool '{}' failed and reconnect to '{}' also failed: {e}",
-                        original_name, server_name
-                    ));
-                }
-            }
-        }
-
-        // Retry the call with fresh connection
-        let conn = {
-            let mgr = manager_arc.read().await;
-            match mgr.get(&server_name) {
-                Some(c) => c,
-                None => {
-                    return ToolExecutionOutcome::error(format!(
-                        "Error: MCP server '{server_name}' lost after reconnect."
-                    ));
-                }
-            }
-        };
-
-        match conn.call_tool(&original_name, args.clone()).await {
+        // Once call_tool starts, a transport error cannot prove that the MCP
+        // server did not apply the operation. Reconnect may restore the server
+        // for later invocations, but must never replay this invocation.
+        let mut outcome = match conn.call_tool(&original_name, args.clone()).await {
             Ok(result) => {
                 mcp_result_to_tool_outcome(astra_mcp::extract_tool_call_result_with_limit(
                     &result,
                     crate::mcp_client::MAX_RESULT_CONTENT_LENGTH,
                 ))
             }
-            Err(e) => ToolExecutionOutcome::error(format!(
-                "Error calling MCP tool '{original_name}' on server '{server_name}' after reconnect: {e}"
-            )),
-        }
+            Err(e) => {
+                let error = astra_mcp::McpError::Service(e);
+                if error.side_effects_maybe() {
+                    let mut mgr = manager_arc.write().await;
+                    // Another caller may already have replaced this connection.
+                    if mgr
+                        .get(&server_name)
+                        .is_some_and(|current| std::sync::Arc::ptr_eq(&current, &conn))
+                    {
+                        if let Err(reconnect_error) = mgr.reconnect(&server_name).await {
+                            tracing::warn!(
+                                server = %server_name,
+                                error = %reconnect_error,
+                                "MCP connection recovery failed after an uncertain call"
+                            );
+                        }
+                    }
+                    let mut outcome = ToolExecutionOutcome::error(format!(
+                        "Error: MCP tool '{original_name}' on server '{server_name}' has an unknown outcome ({error}). Check the server state before deciding whether to call it again."
+                    ));
+                    outcome.tool_result_fields = Some(serde_json::Map::from_iter([
+                        (
+                            "error_kind".into(),
+                            Value::String(
+                                astra_core::ErrorKind::ToolOutcomeUnknown.as_str().into(),
+                            ),
+                        ),
+                        ("dispatch_certainty".into(), Value::String("unknown".into())),
+                        ("execution_fact".into(), Value::String("unknown".into())),
+                        ("side_effects_maybe".into(), Value::Bool(true)),
+                        ("retryable".into(), Value::Bool(false)),
+                        ("resumable".into(), Value::Bool(true)),
+                    ]));
+                    outcome
+                } else {
+                    // A JSON-RPC error is an acknowledgement, not a lost result.
+                    acknowledged_mcp_error_outcome(&error)
+                }
+            }
+        };
+        outcome
+            .tool_result_fields
+            .get_or_insert_with(Default::default)
+            .insert(
+                "runtime_environment_advertisement".into(),
+                serde_json::to_value(dispatch_advertisement)
+                    .expect("MCP dispatch binding is serializable"),
+            );
+        outcome
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::edge_tools::ToolExecutor;
+    use serde_json::json;
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
@@ -165,6 +199,67 @@ mod tests {
         assert!(result.is_error);
         assert!(result.output.contains("not found on any connected server"));
         assert!(result.output.contains("mcp_nonexistent_tool"));
+    }
+
+    #[tokio::test]
+    async fn pr887_review_mcp_lost_ack_does_not_repeat_mutation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counter = dir.path().join("applied.txt");
+        let binary = crate::mcp_client::ensure_mock_mcp_server_binary();
+        let mut manager = crate::mcp_client::McpClientManager::new();
+        manager
+            .connect(crate::mcp_client::McpServerConfig {
+                name: "lost_ack".into(),
+                transport: crate::mcp_client::Transport::Stdio {
+                    command: vec![binary.to_string_lossy().into_owned()],
+                    args: vec![],
+                    env: Default::default(),
+                },
+                description: String::new(),
+                enabled: true,
+                retry: Default::default(),
+            })
+            .await
+            .expect("connect real stdio MCP process");
+        let schemas = manager.all_tool_schemas();
+        let mut executor = ToolExecutor::new(dir.path());
+        executor.install_mcp_bundle(Arc::new(RwLock::new(manager)), schemas.clone());
+        executor.set_current_visible_tool_schemas(&schemas);
+
+        let result = astra_tools::ToolExecutor::execute(
+            &executor,
+            "mcp__lost_ack__apply_then_drop_ack",
+            &json!({"path": counter}),
+        )
+        .await;
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains("unknown outcome"), "{result:?}");
+        let metadata = result.metadata.as_ref().expect("typed uncertainty");
+        assert_eq!(metadata["side_effects_maybe"], true);
+        assert_eq!(metadata["retryable"], false);
+        assert_eq!(metadata["dispatch_certainty"], "unknown");
+        assert_eq!(metadata["error_kind"], "tool_outcome_unknown");
+        assert_eq!(
+            std::fs::read_to_string(&counter).expect("durable fixture mutation"),
+            "applied\n",
+            "the lost acknowledgement must not cause a second physical execution"
+        );
+
+        let next = astra_tools::ToolExecutor::execute(
+            &executor,
+            "mcp__lost_ack__echo",
+            &json!({"message": "reconnected"}),
+        )
+        .await;
+        assert!(
+            !next.is_error,
+            "later MCP calls should use the recovered connection: {next:?}"
+        );
+        assert!(next.output.contains("reconnected"), "{next:?}");
+        assert_eq!(
+            std::fs::read_to_string(&counter).expect("durable fixture mutation"),
+            "applied\n"
+        );
     }
 
     #[test]

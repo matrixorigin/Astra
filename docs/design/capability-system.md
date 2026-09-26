@@ -5,6 +5,23 @@
 
 The capability system owns tools, skills, MCP, provider decisions, tool schema projection, admission, execution routing, fallback, and diagnostics.
 
+CLI-owned dynamic tools carry their full contracts plus an explicit
+`edge_profile.tool_native_ids` map on the authenticated CLI callback channel.
+The CLI adapter uses its dispatch name as the native identity and retains the
+MCP server/tool mapping locally. The Server accepts this map only for declared
+non-builtin contracts; missing, invalid, or conflicting identities remain
+unbound. Builtin identities remain registry-owned. One-shot CLI turns retain
+the same connected MCP manager as discovery instead of dropping it in the
+basic-turn adapter.
+CLI result advertisements use the actual per-tool executor binding: a tool
+owned by a connected MCP manager advertises that MCP provider, while shell
+tools retain the local CLI binding. The Server revalidates the result against
+this same executable surface; a disconnected MCP name cannot acquire an MCP
+advertisement from its prefix alone.
+The CLI invocation guard checks that same MCP manager as discovery and result
+advertisement. It must not fall back to the builtin catalog for a connected
+MCP name after successfully resolving its provider binding.
+
 This is the target contract for implementation. It is not a snapshot of the current tool code.
 
 The protocol-independent provider snapshot, internal tool identity, invocation,
