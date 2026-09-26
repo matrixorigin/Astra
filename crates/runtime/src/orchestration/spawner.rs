@@ -763,6 +763,88 @@ fn durable_fanout_group_cancellations(
         .collect()
 }
 
+fn durable_pre_durable_child_terminals(
+    runs: &[astra_services::runs::DurableRunRecord],
+) -> Vec<SpawnedAgentState> {
+    runs.iter()
+        .flat_map(|parent| {
+            parent.events.iter().filter_map(move |event| {
+                if astra_services::runs::extract_event_type(event)
+                    != astra_services::runs::PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE
+                    || event
+                        .pointer("/data/parent_run_id")
+                        .and_then(|v| v.as_str())
+                        != Some(parent.run_id.as_str())
+                {
+                    return None;
+                }
+                let child_run_id = event.get("run_id")?.as_str()?.trim();
+                let agent_id = event.pointer("/data/agent_id")?.as_str()?.trim();
+                let binding_id = event
+                    .pointer("/data/cancellation_binding_id")?
+                    .as_str()?
+                    .trim();
+                if child_run_id.is_empty() || agent_id.is_empty() || binding_id.is_empty() {
+                    return None;
+                }
+                let slot = AgentFanoutSlotIdentity::new(
+                    event.pointer("/data/group_id")?.as_str()?,
+                    usize::try_from(event.pointer("/data/target_count")?.as_u64()?).ok()?,
+                    usize::try_from(event.pointer("/data/slot_index")?.as_u64()?).ok()?,
+                    event
+                        .pointer("/data/slot_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                )
+                .ok()?;
+                let reason = event.pointer("/data/reason")?.as_str()?;
+                let status = match event.pointer("/data/cancellation_origin")?.as_str()? {
+                    "user" => AgentStatus::cancelled_by_user(reason),
+                    "runtime" => AgentStatus::Cancelled {
+                        by_user: false,
+                        reason: reason.to_string(),
+                    },
+                    "unverified" => AgentStatus::Interrupted {
+                        partial_result: String::new(),
+                        finish_reason: CANCELLATION_ORIGIN_UNVERIFIED.to_string(),
+                    },
+                    _ => return None,
+                };
+                Some(SpawnedAgentState {
+                    agent_id: agent_id.to_string(),
+                    run_id: child_run_id.to_string(),
+                    cancellation_binding_id: Some(binding_id.to_string()),
+                    parent_run_id: parent.run_id.clone(),
+                    agent_type: event
+                        .pointer("/data/agent_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("restored")
+                        .to_string(),
+                    description: event
+                        .pointer("/data/description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(agent_id)
+                        .to_string(),
+                    status,
+                    work_revision: 1,
+                    messaging_address: None,
+                    worktree_path: None,
+                    started_at: SystemTime::now(),
+                    ended_at: Some(SystemTime::now()),
+                    metrics: SpawnedAgentMetrics::default(),
+                    permission_summary: PermissionSummary::default(),
+                    parent_agent_id: "root".into(),
+                    trace_context: None,
+                    spawn_tool_call_id: None,
+                    run_in_background: true,
+                    fanout_slot: Some(slot),
+                    execution_metadata: None,
+                })
+            })
+        })
+        .collect()
+}
+
 fn durable_run_text(run: &astra_services::runs::DurableRunRecord) -> Option<String> {
     run.events.iter().rev().find_map(|event| {
         (event.get("event_type").and_then(serde_json::Value::as_str) == Some("text_done"))
@@ -1249,6 +1331,11 @@ pub struct SpawnRunConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpawnRunCancellationDurability {
     Terminal,
+    /// The exact executor stopped before a child row became authoritative.
+    /// Fanout cancellation still owes a parent-owned terminal receipt.
+    PreDurable {
+        expected_initial_generation: Option<u64>,
+    },
     RecoveryRecorded,
     /// A different durable terminal won the CAS. Cancellation is no longer
     /// pending; carry the exact winner so local projections cannot remain a
@@ -1413,6 +1500,17 @@ pub trait SpawnAgentExecutor: Send + Sync {
         Ok(SpawnRunCancellationDurability::Terminal)
     }
 
+    /// Fence an exceptional accepted-child/no-row settlement after the
+    /// spawner has observed the exact aborted executor finish. Fanout also
+    /// commits a durable parent-owned terminal receipt.
+    async fn persist_pre_durable_child_terminal(
+        &self,
+        _receipt: &astra_services::runs::PreDurableChildTerminal,
+        _expected_initial_generation: Option<u64>,
+    ) -> Result<SpawnRunCancellationDurability, String> {
+        Err("pre-durable child terminal persistence is unsupported".into())
+    }
+
     /// Persist the group-level admission fence independently of child
     /// terminal events. A cancelled group may have no accepted child, so
     /// deriving this fact from child status would reopen it after restart.
@@ -1465,6 +1563,13 @@ struct InFlightCancellation {
     parent_run_id: String,
     cancellation_binding_id: Option<String>,
     user_id: Option<String>,
+    /// Proof that an aborted executor cannot publish a child row after a
+    /// no-row check. A missing handle means admission was seized before task
+    /// installation, or an archived invocation has already returned.
+    executor_abort_handle: Option<tokio::task::AbortHandle>,
+    /// Once a no-row read is observed, avoid repeating it while the exact
+    /// executor is still stopping. A stronger User owner resets this gate.
+    pre_durable_waiting_for_abort: bool,
     /// Monotonic control-owner generation. A stronger cancellation request
     /// replaces this token so an already-cloned weaker durable future is
     /// dropped before it can publish a stale result.
@@ -2232,12 +2337,98 @@ impl DynamicAgentSpawner {
         }
     }
 
+    async fn pre_durable_child_terminal_receipt(
+        &self,
+        agent_id: &str,
+        job: &InFlightCancellation,
+    ) -> Result<astra_services::runs::PreDurableChildTerminal, String> {
+        use astra_services::runs::{
+            DurableCancellationOrigin, PreDurableChildTerminal, PreDurableFanoutSlot,
+        };
+        let state = self
+            .completed_agents
+            .read()
+            .await
+            .iter()
+            .rev()
+            .find(|state| state.agent_id == agent_id && state.run_id == job.run_id)
+            .cloned()
+            .ok_or_else(|| format!("cancelled child {agent_id} has not published its archive"))?;
+        if state.parent_run_id != job.parent_run_id {
+            return Err(format!(
+                "cancelled child {agent_id} changed parent identity"
+            ));
+        }
+        let owner = if let Some(slot) = state.fanout_slot.as_ref() {
+            self.fanout_group_owners
+                .read()
+                .await
+                .get(&(job.parent_run_id.clone(), slot.group_id.clone()))
+                .and_then(|owner| owner.durable.clone())
+        } else {
+            None
+        };
+        let user_id = job
+            .user_id
+            .clone()
+            .or_else(|| {
+                state
+                    .trace_context
+                    .as_ref()
+                    .map(|trace| trace.user_id.clone())
+            })
+            .or_else(|| owner.as_ref().map(|owner| owner.user_id.clone()))
+            .ok_or_else(|| format!("cancelled child {agent_id} has no durable user identity"))?;
+        let session_id = state
+            .trace_context
+            .as_ref()
+            .map(|trace| trace.session_id.clone())
+            .or_else(|| owner.as_ref().map(|owner| owner.session_id.clone()))
+            .or_else(|| self.current_session_id())
+            .ok_or_else(|| format!("cancelled child {agent_id} has no durable session identity"))?;
+        let cancellation_binding_id = job
+            .cancellation_binding_id
+            .clone()
+            .ok_or_else(|| format!("cancelled child {agent_id} has no execution binding"))?;
+        let origin = match job.origin {
+            CancellationOrigin::User => DurableCancellationOrigin::User,
+            CancellationOrigin::Runtime => DurableCancellationOrigin::Runtime,
+            CancellationOrigin::Unverified => DurableCancellationOrigin::Unverified,
+        };
+        Ok(PreDurableChildTerminal {
+            user_id,
+            session_id,
+            parent_run_id: job.parent_run_id.clone(),
+            child_run_id: job.run_id.clone(),
+            cancellation_binding_id,
+            agent_id: state.agent_id,
+            agent_type: state.agent_type,
+            description: state.description,
+            fanout_slot: state.fanout_slot.map(|slot| PreDurableFanoutSlot {
+                group_id: slot.group_id,
+                target_count: slot.target_count,
+                slot_index: slot.slot_index,
+                slot_id: slot.slot_id,
+            }),
+            origin,
+            reason: job.reason.clone(),
+        })
+    }
+
     async fn retry_in_flight_cancellation(
         &self,
         agent_id: &str,
         job: InFlightCancellation,
     ) -> DurableCancellationAttempt {
         let owner_changed = job.owner_changed.clone();
+        if job.pre_durable_waiting_for_abort
+            && job
+                .executor_abort_handle
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished())
+        {
+            return DurableCancellationAttempt::Pending;
+        }
         let capacity = self.cancellation_capacity();
         #[cfg(test)]
         let capacity_waiting_hook = {
@@ -2338,6 +2529,61 @@ impl DynamicAgentSpawner {
             Ok(SpawnRunCancellationDurability::Terminal)
         };
 
+        let outcome = match outcome {
+            Ok(SpawnRunCancellationDurability::PreDurable { .. })
+                if job
+                    .executor_abort_handle
+                    .as_ref()
+                    .is_some_and(|handle| !handle.is_finished()) =>
+            {
+                // abort() is asynchronous. Keep the durable cancellation
+                // owner, but do not record no-row terminality while the exact
+                // task can still finish an insert. Other cancellation paths
+                // must remain prompt even if an executor ignores abort.
+                let mut pending = self.in_flight_cancellations.write().await;
+                if let Some(current) = pending.get_mut(agent_id).filter(|current| {
+                    current.run_id == job.run_id && current.owner_version == job.owner_version
+                }) {
+                    current.pre_durable_waiting_for_abort = true;
+                }
+                return DurableCancellationAttempt::Pending;
+            }
+            Ok(SpawnRunCancellationDurability::PreDurable {
+                expected_initial_generation,
+            }) => match self
+                .pre_durable_child_terminal_receipt(agent_id, &job)
+                .await
+            {
+                Ok(receipt) => {
+                    let executor = self
+                        .executor
+                        .as_ref()
+                        .expect("pre-durable result has executor");
+                    tokio::select! {
+                        biased;
+                        _ = self.background_task_shutdown.cancelled() => {
+                            return DurableCancellationAttempt::Shutdown;
+                        }
+                        _ = owner_changed.cancelled() => {
+                            return DurableCancellationAttempt::OwnerChanged;
+                        }
+                        result = tokio::time::timeout(
+                            AGENT_DURABLE_CANCEL_TIMEOUT,
+                            executor.persist_pre_durable_child_terminal(
+                                &receipt,
+                                expected_initial_generation,
+                            ),
+                        ) => result.unwrap_or_else(|_| Err(format!(
+                            "pre-durable child terminal persistence exceeded {}ms",
+                            AGENT_DURABLE_CANCEL_TIMEOUT.as_millis(),
+                        ))),
+                    }
+                }
+                Err(error) => Err(error),
+            },
+            other => other,
+        };
+
         // `select!` may observe a ready executor result at the same instant as
         // an owner upgrade. The map generation is the linearization point;
         // never interpret or publish a result cloned by an older owner.
@@ -2377,6 +2623,10 @@ impl DynamicAgentSpawner {
                 (false, None)
             }
             Ok(SpawnRunCancellationDurability::RecoveryRecorded) => (false, None),
+            Ok(SpawnRunCancellationDurability::PreDurable { .. }) => {
+                tracing::error!(target: "fanout", %agent_id, "pre-durable cancellation was not reconciled");
+                (false, None)
+            }
             Err(error) => {
                 tracing::warn!(
                     target: "fanout",
@@ -2587,13 +2837,12 @@ impl DynamicAgentSpawner {
                     .map_err(SpawnError::InvalidInput)?;
             }
             let projection = project_agent_status_to_fanout_slot(&state.status);
-            let slot = &staged.slots[slot_identity.slot_index];
             // A nonterminal durable row only proves acceptance: another
             // executor may still be running it. Only terminal rows settle
             // the slot during recovery.
-            if !slot.status.is_terminal() && agent_status_is_terminal(&state.status) {
+            if agent_status_is_terminal(&state.status) {
                 staged
-                    .record_status_by_agent(
+                    .refine_durable_terminal_by_agent(
                         &state.agent_id,
                         projection.status,
                         projection.terminal_reason,
@@ -2795,6 +3044,11 @@ impl DynamicAgentSpawner {
         let _activity = self.begin_lifecycle_activity();
         let spawned = durable_agent_spawn_metadata(runs);
         let group_cancellations = durable_fanout_group_cancellations(runs);
+        let pre_durable_terminals = durable_pre_durable_child_terminals(runs);
+        let actual_run_ids = runs
+            .iter()
+            .map(|run| run.run_id.as_str())
+            .collect::<HashSet<_>>();
         let terminal_parent_run_ids = runs
             .iter()
             .filter(|run| durable_run_is_terminal(&run.status))
@@ -2861,6 +3115,61 @@ impl DynamicAgentSpawner {
                 .insert(state.agent_id.clone());
             self.publish_background_agent(&state);
             self.archive_state(state).await;
+            restored += 1;
+        }
+        for state in pre_durable_terminals {
+            // A row is a stronger lifecycle authority if both facts are ever
+            // observed; a bounded page's lack of a row is never used as proof.
+            if actual_run_ids.contains(state.run_id.as_str()) {
+                continue;
+            }
+            // The exact local cancellation owner must run the canonical
+            // finalizer after its durable ACK. A concurrent refresh may see
+            // the receipt first, but must not turn its pending archive into a
+            // terminal that makes that finalizer skip cleanup and delivery.
+            let local_owner = self.in_flight_cancellations.read().await;
+            if local_owner
+                .get(&state.agent_id)
+                .is_some_and(|job| job.run_id == state.run_id)
+            {
+                continue;
+            }
+            if let Some(existing) = self.get_agent_state_any(&state.agent_id).await {
+                if existing.run_id == state.run_id && existing.parent_run_id == state.parent_run_id
+                {
+                    if existing.status != state.status
+                        && !self
+                            .active_agents
+                            .read()
+                            .await
+                            .contains_key(&state.agent_id)
+                    {
+                        // Another refresh may have restored this accepted child
+                        // before the receipt committed. Replace its stale
+                        // archived projection without replaying terminal I/O.
+                        let mut archived = self.completed_agents.write().await;
+                        for prior in archived.iter_mut().filter(|prior| {
+                            prior.agent_id == state.agent_id && prior.run_id == state.run_id
+                        }) {
+                            prior.status = state.status.clone();
+                            prior.ended_at = state.ended_at;
+                            prior.work_revision = prior.work_revision.saturating_add(1);
+                        }
+                        drop(archived);
+                        drop(local_owner);
+                        self.publish_background_agent(&state);
+                        self.notify_completion(&state.agent_id).await;
+                        recovered.push(state);
+                    } else {
+                        recovered.push(existing);
+                    }
+                }
+                continue;
+            }
+            recovered.push(state.clone());
+            self.archive_state(state.clone()).await;
+            drop(local_owner);
+            self.publish_background_agent(&state);
             restored += 1;
         }
         self.restore_recovered_fanout_batches(
@@ -5997,6 +6306,7 @@ impl DynamicAgentSpawner {
         current.reason = reason.to_string();
         current.owner_version = current.owner_version.saturating_add(1);
         current.retry_count = 0;
+        current.pre_durable_waiting_for_abort = false;
         current.durable_ready = false;
         stale_owner.cancel();
         true
@@ -6067,6 +6377,8 @@ impl DynamicAgentSpawner {
                                 .trace_context
                                 .as_ref()
                                 .map(|trace| trace.user_id.clone()),
+                            executor_abort_handle: handle.clone(),
+                            pre_durable_waiting_for_abort: false,
                             owner_version: 1,
                             owner_changed: tokio_util::sync::CancellationToken::new(),
                             durable_ready: false,
@@ -6193,6 +6505,8 @@ impl DynamicAgentSpawner {
                             .trace_context
                             .as_ref()
                             .map(|trace| trace.user_id.clone()),
+                        executor_abort_handle: None,
+                        pre_durable_waiting_for_abort: false,
                         owner_version: 1,
                         owner_changed: tokio_util::sync::CancellationToken::new(),
                         durable_ready: false,
@@ -7680,6 +7994,7 @@ mod tests {
     use astra_messaging::transport::{MessageStream, MessageTransport};
     use astra_messaging::types::{AgentMessage, MessagePayload, MessageTarget};
     use serde_json::json;
+    use std::sync::atomic::Ordering;
     use tokio::time::{Duration, sleep};
 
     fn mock_router() -> Arc<AgentMailboxRouter> {
@@ -8079,6 +8394,265 @@ mod tests {
         assert_eq!(group.status, AgentFanoutStatus::Finished);
         assert_eq!(group.slots[0].run_id.as_deref(), Some("child-run"));
         assert_eq!(group.slots[0].status, AgentFanoutSlotStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn pre_durable_cancel_receipts_settle_many_recovered_groups_without_child_rows() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let parents = (0..=MAX_FANOUT_GROUPS)
+            .map(|index| {
+                let parent_id = format!("receipt-parent-{index:02}");
+                let child_id = format!("receipt-child-{index:02}");
+                let agent_id = format!("reviewer-{index:02}");
+                let group_id = format!("receipt-group-{index:02}");
+                let mut parent = durable_run(&parent_id, 0, astra_core::STATUS_COMPLETED);
+                parent.root_run_id = Some(parent_id.clone());
+                parent.ancestor_path = Some(parent_id.clone());
+                parent.events.push(json!({
+                    "event_type": FANOUT_GROUP_CANCELLED_EVENT_TYPE,
+                    "data": {
+                        "group_id": group_id,
+                        "parent_run_id": parent_id,
+                        "target_count": 1,
+                        "unassigned_slots": [],
+                        "reason": "deadline",
+                        "cancellation_origin": "runtime"
+                    }
+                }));
+                parent.events.push(json!({
+                    "event_type": astra_services::runs::PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE,
+                    "run_id": child_id,
+                    "data": {
+                        "parent_run_id": parent_id,
+                        "agent_id": agent_id,
+                        "agent_type": "code-review",
+                        "description": "Review",
+                        "group_id": group_id,
+                        "target_count": 1,
+                        "slot_index": 0,
+                        "slot_id": "review",
+                        "cancellation_binding_id": format!("binding-{index}"),
+                        "cancellation_origin": "runtime",
+                        "reason": "deadline"
+                    }
+                }));
+                parent
+            })
+            .collect::<Vec<_>>();
+        let mut early_projection = durable_pre_durable_child_terminals(&parents).remove(0);
+        early_projection.status = AgentStatus::Initializing;
+        early_projection.ended_at = None;
+        spawner.archive_state(early_projection).await;
+        assert_eq!(
+            spawner.restore_durable_agent_runs(&parents).await,
+            MAX_FANOUT_GROUPS
+        );
+        assert_eq!(spawner.restore_durable_agent_runs(&parents).await, 0);
+        assert!(
+            spawner
+                .get_agent_state_any("reviewer-00")
+                .await
+                .is_some_and(|state| state.status.is_terminal())
+        );
+        let group = spawner
+            .fanout_group_for_parent_run(&format!("receipt-parent-{MAX_FANOUT_GROUPS:02}"))
+            .await
+            .expect("latest recovered group");
+        assert_eq!(group.status, AgentFanoutStatus::Finished);
+        assert_eq!(
+            group.slots[0].status,
+            AgentFanoutSlotStatus::CancelledByRuntime
+        );
+        assert!(group.spawn_admission_closed());
+        assert!(spawner.fanout_groups.read().await.values().all(|group| {
+            matches!(
+                group.status,
+                AgentFanoutStatus::Finished | AgentFanoutStatus::Incomplete
+            )
+        }));
+
+        let correcting = DynamicAgentSpawner::new(mock_router());
+        let mut stale = durable_pre_durable_child_terminals(&parents[..1]).remove(0);
+        stale.status = AgentStatus::Completed {
+            result: "stale local projection".into(),
+            finish_reason: Some("normal".into()),
+        };
+        correcting.archive_state(stale.clone()).await;
+        correcting
+            .restore_recovered_fanout_batches(&[stale], &[], &HashSet::new())
+            .await;
+        assert_eq!(
+            correcting.restore_durable_agent_runs(&parents[..1]).await,
+            0
+        );
+        assert!(matches!(
+            correcting
+                .get_agent_state_any("reviewer-00")
+                .await
+                .unwrap()
+                .status,
+            AgentStatus::Cancelled { by_user: false, .. }
+        ));
+        assert_eq!(
+            correcting
+                .fanout_group_for_parent_run("receipt-parent-00")
+                .await
+                .unwrap()
+                .slots[0]
+                .status,
+            AgentFanoutSlotStatus::CancelledByRuntime
+        );
+
+        let pending = DynamicAgentSpawner::new(mock_router());
+        let mut provisional = durable_pre_durable_child_terminals(&parents[..1]).remove(0);
+        provisional.status = AgentStatus::Waiting {
+            reason: "durable cancellation acknowledgement pending".into(),
+        };
+        pending.archive_state(provisional).await;
+        pending.in_flight_cancellations.write().await.insert(
+            "reviewer-00".into(),
+            InFlightCancellation {
+                origin: CancellationOrigin::Runtime,
+                reason: "deadline".into(),
+                run_id: "receipt-child-00".into(),
+                parent_run_id: "receipt-parent-00".into(),
+                cancellation_binding_id: Some("binding-0".into()),
+                user_id: Some("user".into()),
+                executor_abort_handle: None,
+                pre_durable_waiting_for_abort: false,
+                owner_version: 1,
+                owner_changed: tokio_util::sync::CancellationToken::new(),
+                durable_ready: true,
+                finalizing: false,
+                retry_count: 0,
+            },
+        );
+        assert_eq!(pending.restore_durable_agent_runs(&parents[..1]).await, 0);
+        assert!(matches!(
+            pending
+                .get_agent_state_any("reviewer-00")
+                .await
+                .unwrap()
+                .status,
+            AgentStatus::Waiting { .. }
+        ));
+        pending
+            .in_flight_cancellations
+            .write()
+            .await
+            .remove("reviewer-00");
+        assert_eq!(pending.restore_durable_agent_runs(&parents[..1]).await, 0);
+        assert!(matches!(
+            pending
+                .get_agent_state_any("reviewer-00")
+                .await
+                .unwrap()
+                .status,
+            AgentStatus::Cancelled { by_user: false, .. }
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unfinished_abort_blocks_only_no_row_receipts_not_durable_cancellation() {
+        struct NoRowExecutor(std::sync::atomic::AtomicUsize);
+        #[async_trait]
+        impl SpawnAgentExecutor for NoRowExecutor {
+            async fn execute(&self, _: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+                std::future::pending().await
+            }
+
+            async fn cancel_spawned_run_durably(
+                &self,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: &str,
+                _: CancellationOrigin,
+            ) -> Result<SpawnRunCancellationDurability, String> {
+                self.0.fetch_add(1, Ordering::AcqRel);
+                Ok(SpawnRunCancellationDurability::PreDurable {
+                    expected_initial_generation: Some(0),
+                })
+            }
+        }
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let abort_handle = task.abort_handle();
+        abort_handle.abort();
+        assert!(!abort_handle.is_finished());
+        let job = InFlightCancellation {
+            origin: CancellationOrigin::Runtime,
+            reason: "deadline".into(),
+            run_id: "child".into(),
+            parent_run_id: "parent".into(),
+            cancellation_binding_id: Some("binding".into()),
+            user_id: Some("user".into()),
+            executor_abort_handle: Some(abort_handle),
+            pre_durable_waiting_for_abort: false,
+            owner_version: 1,
+            owner_changed: tokio_util::sync::CancellationToken::new(),
+            durable_ready: true,
+            finalizing: false,
+            retry_count: 0,
+        };
+        let no_row = Arc::new(NoRowExecutor(std::sync::atomic::AtomicUsize::new(0)));
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(Arc::clone(&no_row) as Arc<dyn SpawnAgentExecutor>);
+        spawner
+            .in_flight_cancellations
+            .write()
+            .await
+            .insert("child".into(), job.clone());
+        assert_eq!(
+            spawner
+                .retry_in_flight_cancellation("child", job.clone())
+                .await,
+            DurableCancellationAttempt::Pending
+        );
+        assert_eq!(no_row.0.load(Ordering::Acquire), 1);
+        let waiting = spawner
+            .in_flight_cancellations
+            .read()
+            .await
+            .get("child")
+            .unwrap()
+            .clone();
+        assert!(waiting.pre_durable_waiting_for_abort);
+        assert_eq!(
+            spawner.retry_in_flight_cancellation("child", waiting).await,
+            DurableCancellationAttempt::Pending
+        );
+        assert_eq!(no_row.0.load(Ordering::Acquire), 1);
+        let mut upgraded = spawner
+            .in_flight_cancellations
+            .read()
+            .await
+            .get("child")
+            .unwrap()
+            .clone();
+        let terminal = Arc::new(CountingTerminalCancellationExecutor {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let terminal_spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(Arc::clone(&terminal) as Arc<dyn SpawnAgentExecutor>);
+        let _ = terminal_spawner
+            .retry_in_flight_cancellation("child", job)
+            .await;
+        assert_eq!(terminal.attempts.load(Ordering::Acquire), 1);
+        assert!(DynamicAgentSpawner::upgrade_in_flight_cancellation(
+            &mut upgraded,
+            CancellationOrigin::User,
+            "user stop"
+        ));
+        assert!(!upgraded.pre_durable_waiting_for_abort);
+        release_tx.send(()).unwrap();
+        task.await.unwrap();
     }
 
     #[tokio::test]

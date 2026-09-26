@@ -20771,8 +20771,12 @@ impl ServerSpawnAgentExecutor {
             };
             match run_engine.load_run(user_id, run_id).await? {
                 None => {
-                    self.retire_authoritative_runtime_run(run_id).await;
-                    return Ok(SpawnRunCancellationDurability::Terminal);
+                    if let Some(token) = local_cancel_token.as_ref() {
+                        token.cancel();
+                    }
+                    return Ok(SpawnRunCancellationDurability::PreDurable {
+                        expected_initial_generation: Some(expected_initial_generation),
+                    });
                 }
                 Some(durable)
                     if matches!(
@@ -20821,8 +20825,12 @@ impl ServerSpawnAgentExecutor {
             match run_engine.load_run(user_id, run_id).await? {
                 Some(durable) => resolved_session_id = Some(durable.session_id),
                 None => {
-                    self.retire_authoritative_runtime_run(run_id).await;
-                    return Ok(SpawnRunCancellationDurability::Terminal);
+                    if let Some(token) = local_cancel_token.as_ref() {
+                        token.cancel();
+                    }
+                    return Ok(SpawnRunCancellationDurability::PreDurable {
+                        expected_initial_generation: None,
+                    });
                 }
             }
         }
@@ -20856,10 +20864,9 @@ impl ServerSpawnAgentExecutor {
                         crate::orchestration::spawner::durable_agent_status(&durable),
                     ))
                 }
-                None => {
-                    self.retire_authoritative_runtime_run(run_id).await;
-                    Ok(SpawnRunCancellationDurability::Terminal)
-                }
+                None => Ok(SpawnRunCancellationDurability::PreDurable {
+                    expected_initial_generation: None,
+                }),
             };
         }
         let mut local_run_retired = false;
@@ -20989,12 +20996,16 @@ impl ServerSpawnAgentExecutor {
                             SpawnRunCancellationDurability::Terminal
                         }
                         AtomicExecutionOwnerCancellation::Missing => {
-                            SpawnRunCancellationDurability::Terminal
+                            SpawnRunCancellationDurability::PreDurable {
+                                expected_initial_generation: Some(generation),
+                            }
                         }
                         AtomicExecutionOwnerCancellation::SupersededTerminal { .. }
                         | AtomicExecutionOwnerCancellation::NotOwnedActive { .. } => {
                             match run_engine.load_run(user_id, run_id).await? {
-                                None => SpawnRunCancellationDurability::Terminal,
+                                None => SpawnRunCancellationDurability::PreDurable {
+                                    expected_initial_generation: Some(generation),
+                                },
                                 Some(durable)
                                     if matches!(
                                         durable.status.as_str(),
@@ -21049,7 +21060,8 @@ impl ServerSpawnAgentExecutor {
             .await;
         } else {
             match &durability {
-                SpawnRunCancellationDurability::RecoveryRecorded => {
+                SpawnRunCancellationDurability::RecoveryRecorded
+                | SpawnRunCancellationDurability::PreDurable { .. } => {
                     if let Some(token) = local_cancel_token.as_ref() {
                         token.cancel();
                     }
@@ -21537,6 +21549,146 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             origin,
         )
         .await
+    }
+
+    async fn persist_pre_durable_child_terminal(
+        &self,
+        receipt: &astra_services::runs::PreDurableChildTerminal,
+        expected_initial_generation: Option<u64>,
+    ) -> Result<SpawnRunCancellationDurability, String> {
+        use astra_services::runs::{
+            AtomicExecutionOwnerCancellation, DurableCancellationOrigin,
+            PreDurableChildTerminalCommit,
+        };
+        let run_engine = self
+            .run_engine
+            .as_ref()
+            .ok_or("durable run engine is unavailable")?;
+        match run_engine
+            .commit_pre_durable_child_terminal(receipt)
+            .await?
+        {
+            PreDurableChildTerminalCommit::ParentMissing => {
+                // The store checked the exact child before declaring the
+                // parent absent. No parent can recover this binding now.
+                self.remove_runtime_context(
+                    &receipt.child_run_id,
+                    Some(&receipt.cancellation_binding_id),
+                )
+                .await;
+                Ok(SpawnRunCancellationDurability::Terminal)
+            }
+            PreDurableChildTerminalCommit::Recorded { origin, reason } => {
+                if origin == receipt.origin && reason == receipt.reason {
+                    self.remove_runtime_context(
+                        &receipt.child_run_id,
+                        Some(&receipt.cancellation_binding_id),
+                    )
+                    .await;
+                    return Ok(SpawnRunCancellationDurability::Terminal);
+                }
+                self.remove_runtime_context(
+                    &receipt.child_run_id,
+                    Some(&receipt.cancellation_binding_id),
+                )
+                .await;
+                let status = match origin {
+                    DurableCancellationOrigin::User => {
+                        crate::orchestration::AgentStatus::cancelled_by_user(&reason)
+                    }
+                    DurableCancellationOrigin::Runtime => {
+                        crate::orchestration::AgentStatus::Cancelled {
+                            by_user: false,
+                            reason,
+                        }
+                    }
+                    DurableCancellationOrigin::Unverified => {
+                        crate::orchestration::AgentStatus::Interrupted {
+                            partial_result: String::new(),
+                            finish_reason:
+                                crate::orchestration::spawner::CANCELLATION_ORIGIN_UNVERIFIED
+                                    .to_string(),
+                        }
+                    }
+                };
+                Ok(SpawnRunCancellationDurability::Superseded(status))
+            }
+            PreDurableChildTerminalCommit::ChildPresent => {
+                let origin = match receipt.origin {
+                    DurableCancellationOrigin::User => CancellationOrigin::User,
+                    DurableCancellationOrigin::Runtime => CancellationOrigin::Runtime,
+                    DurableCancellationOrigin::Unverified => CancellationOrigin::Unverified,
+                };
+                let outcome = if origin == CancellationOrigin::User {
+                    match self
+                        .cancel_spawned_run_with_durability(
+                            &receipt.child_run_id,
+                            Some(&receipt.cancellation_binding_id),
+                            Some(&receipt.user_id),
+                            &receipt.reason,
+                            origin,
+                        )
+                        .await?
+                    {
+                        SpawnRunCancellationDurability::PreDurable { .. } => {
+                            SpawnRunCancellationDurability::RecoveryRecorded
+                        }
+                        result => result,
+                    }
+                } else if let Some(generation) = expected_initial_generation {
+                    let result = run_engine
+                        .cancel_if_exact_live_owner(
+                            &receipt.user_id,
+                            &receipt.session_id,
+                            &receipt.child_run_id,
+                            generation,
+                            &[STATUS_RUNNING, STATUS_WAITING, STATUS_PAUSED],
+                            origin,
+                            &receipt.reason,
+                        )
+                        .await?;
+                    if result == AtomicExecutionOwnerCancellation::Committed {
+                        SpawnRunCancellationDurability::Terminal
+                    } else if let Some(durable) = run_engine
+                        .load_run(&receipt.user_id, &receipt.child_run_id)
+                        .await?
+                    {
+                        let status = crate::orchestration::spawner::durable_agent_status(&durable);
+                        if status.is_terminal() {
+                            SpawnRunCancellationDurability::Superseded(status)
+                        } else {
+                            SpawnRunCancellationDurability::NotOwned(status)
+                        }
+                    } else {
+                        SpawnRunCancellationDurability::RecoveryRecorded
+                    }
+                } else {
+                    let durable = run_engine
+                        .load_run(&receipt.user_id, &receipt.child_run_id)
+                        .await?
+                        .ok_or_else(|| {
+                            format!(
+                                "pre-durable child {} disappeared during reconciliation",
+                                receipt.child_run_id
+                            )
+                        })?;
+                    let status = crate::orchestration::spawner::durable_agent_status(&durable);
+                    if status.is_terminal() {
+                        SpawnRunCancellationDurability::Superseded(status)
+                    } else {
+                        SpawnRunCancellationDurability::NotOwned(status)
+                    }
+                };
+                if !matches!(outcome, SpawnRunCancellationDurability::RecoveryRecorded) {
+                    self.remove_runtime_context(
+                        &receipt.child_run_id,
+                        Some(&receipt.cancellation_binding_id),
+                    )
+                    .await;
+                }
+                Ok(outcome)
+            }
+        }
     }
 
     async fn persist_fanout_group_cancellation(

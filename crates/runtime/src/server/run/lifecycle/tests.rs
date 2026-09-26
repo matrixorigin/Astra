@@ -5628,7 +5628,7 @@ async fn server_spawn_execute_settlement_retains_only_resumable_runtime_contexts
 }
 
 #[tokio::test]
-async fn server_runtime_cancel_without_context_or_durable_row_is_clean_terminal() {
+async fn server_runtime_cancel_without_context_or_durable_row_requires_fanout_receipt() {
     let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
     let executor = ServerSpawnAgentExecutor::new(
         test_settings(),
@@ -5646,9 +5646,14 @@ async fn server_runtime_cancel_without_context_or_durable_row_is_clean_terminal(
             CancellationOrigin::Runtime,
         )
         .await
-        .expect("a child that never acquired local or durable identity is already settled");
+        .expect("a child with no durable row requires a fanout receipt if accepted");
 
-    assert_eq!(durability, SpawnRunCancellationDurability::Terminal);
+    assert_eq!(
+        durability,
+        SpawnRunCancellationDurability::PreDurable {
+            expected_initial_generation: None,
+        }
+    );
     assert!(
         executor
             .runtime_context_registry
@@ -5808,8 +5813,13 @@ async fn server_runtime_cancel_cannot_cross_stopped_child_generation() {
 }
 
 #[tokio::test]
-async fn server_user_cancel_of_stopped_child_without_row_is_clean_terminal() {
+async fn server_user_cancel_of_stopped_child_without_row_retains_exact_context_until_settled() {
+    use astra_services::runs::{DurableCancellationOrigin, PreDurableChildTerminal};
     let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+    engine
+        .start_run("non-fanout-parent", "user-a", "session-1")
+        .await
+        .unwrap();
     let executor = ServerSpawnAgentExecutor::new(
         test_settings(),
         test_encryptor(),
@@ -5829,10 +5839,46 @@ async fn server_user_cancel_of_stopped_child_without_row_is_clean_terminal() {
             CancellationOrigin::User,
         )
         .await
-        .expect("an absent stopped child is already terminal");
+        .expect("stopped child has no row but may still owe a fanout receipt");
 
-    assert_eq!(durability, SpawnRunCancellationDurability::Terminal);
+    assert_eq!(
+        durability,
+        SpawnRunCancellationDurability::PreDurable {
+            expected_initial_generation: Some(0),
+        }
+    );
     assert!(cancel_token.is_cancelled());
+    assert!(
+        executor
+            .runtime_context_registry
+            .read()
+            .await
+            .current_context_id_by_run
+            .contains_key("never-committed-child"),
+        "the exact generation must survive a failed receipt attempt"
+    );
+    assert_eq!(
+        executor
+            .persist_pre_durable_child_terminal(
+                &PreDurableChildTerminal {
+                    user_id: "user-a".into(),
+                    session_id: "session-1".into(),
+                    parent_run_id: "non-fanout-parent".into(),
+                    child_run_id: "never-committed-child".into(),
+                    cancellation_binding_id: "never-committed-child-binding".into(),
+                    agent_id: "child".into(),
+                    agent_type: "code-review".into(),
+                    description: "Review".into(),
+                    fanout_slot: None,
+                    origin: DurableCancellationOrigin::User,
+                    reason: "user cancelled before admission".into(),
+                },
+                Some(0),
+            )
+            .await
+            .unwrap(),
+        SpawnRunCancellationDurability::Terminal
+    );
     assert!(
         !executor
             .runtime_context_registry
@@ -5848,6 +5894,162 @@ async fn server_user_cancel_of_stopped_child_without_row_is_clean_terminal() {
             .expect("load absent child")
             .is_none(),
         "user cancellation must not create a row after admission stopped"
+    );
+}
+
+#[tokio::test]
+async fn server_pre_durable_fanout_receipt_converges_and_does_not_relabel_winner() {
+    use astra_services::runs::{
+        DurableCancellationOrigin, PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE, PreDurableChildTerminal,
+        PreDurableFanoutSlot,
+    };
+    let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+    engine
+        .start_run("receipt-parent", "user-a", "session-1")
+        .await
+        .unwrap();
+    let executor = ServerSpawnAgentExecutor::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+    )
+    .with_run_engine(engine.clone());
+    executor
+        .set_runtime_context(stopped_spawn_runtime_context("receipt-child", "user-a", 0))
+        .await;
+    let durability = executor
+        .cancel_spawned_run_durably(
+            "receipt-child",
+            Some("receipt-child-binding"),
+            Some("user-a"),
+            "deadline",
+            CancellationOrigin::Runtime,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        durability,
+        SpawnRunCancellationDurability::PreDurable {
+            expected_initial_generation: Some(0),
+        }
+    );
+    assert_eq!(
+        executor
+            .cancel_spawned_run_durably(
+                "receipt-child",
+                Some("receipt-child-binding"),
+                Some("user-a"),
+                "deadline",
+                CancellationOrigin::Runtime,
+            )
+            .await
+            .unwrap(),
+        durability,
+        "a lost receipt attempt must retain its execution-generation proof"
+    );
+    let receipt = PreDurableChildTerminal {
+        user_id: "user-a".into(),
+        session_id: "session-1".into(),
+        parent_run_id: "receipt-parent".into(),
+        child_run_id: "receipt-child".into(),
+        cancellation_binding_id: "receipt-child-binding".into(),
+        agent_id: "reviewer".into(),
+        agent_type: "code-review".into(),
+        description: "Review".into(),
+        fanout_slot: Some(PreDurableFanoutSlot {
+            group_id: "receipt-group".into(),
+            target_count: 1,
+            slot_index: 0,
+            slot_id: Some("review".into()),
+        }),
+        origin: DurableCancellationOrigin::Runtime,
+        reason: "deadline".into(),
+    };
+    assert_eq!(
+        executor
+            .persist_pre_durable_child_terminal(&receipt, Some(0))
+            .await
+            .unwrap(),
+        SpawnRunCancellationDurability::Terminal
+    );
+    let mut upgraded = receipt.clone();
+    upgraded.origin = DurableCancellationOrigin::User;
+    upgraded.reason = "user stop".into();
+    assert!(
+        matches!(executor.persist_pre_durable_child_terminal(&upgraded, None).await.unwrap(),
+        SpawnRunCancellationDurability::Superseded(crate::orchestration::AgentStatus::Cancelled {
+            by_user: false, reason,
+        }) if reason == "deadline")
+    );
+    let parent = engine
+        .load_run("user-a", "receipt-parent")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        parent
+            .events
+            .iter()
+            .filter(|event| astra_services::runs::extract_event_type(event)
+                == PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE)
+            .count(),
+        1
+    );
+    assert!(
+        engine
+            .load_run("user-a", "receipt-child")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    engine
+        .start_run_ext(
+            "committed-child",
+            "user-a",
+            "session-1",
+            Some("receipt-parent"),
+            None,
+            Some("reviewer-2"),
+            None,
+        )
+        .await
+        .unwrap();
+    executor
+        .set_runtime_context(stopped_spawn_runtime_context(
+            "committed-child",
+            "user-a",
+            0,
+        ))
+        .await;
+    let mut committed = receipt.clone();
+    committed.child_run_id = "committed-child".into();
+    committed.cancellation_binding_id = "committed-child-binding".into();
+    committed.agent_id = "reviewer-2".into();
+    committed.fanout_slot.as_mut().unwrap().group_id = "committed-group".into();
+    assert_eq!(
+        executor
+            .persist_pre_durable_child_terminal(&committed, Some(0))
+            .await
+            .unwrap(),
+        SpawnRunCancellationDurability::Terminal
+    );
+    assert_eq!(
+        engine
+            .load_run("user-a", "committed-child")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        STATUS_CANCELLED
+    );
+    assert!(
+        !executor
+            .runtime_context_registry
+            .read()
+            .await
+            .context_id_by_binding
+            .contains_key("committed-child-binding")
     );
 }
 

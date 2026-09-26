@@ -2597,6 +2597,129 @@ pub enum DurableCancellationOrigin {
     Unverified,
 }
 
+/// The exceptional terminal fact for an accepted fanout child whose executor
+/// stopped before its run row was committed. The parent owns the receipt;
+/// ordinary child creation and cancellation do not write one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreDurableChildTerminal {
+    pub user_id: String,
+    pub session_id: String,
+    pub parent_run_id: String,
+    pub child_run_id: String,
+    pub cancellation_binding_id: String,
+    pub agent_id: String,
+    pub agent_type: String,
+    pub description: String,
+    pub fanout_slot: Option<PreDurableFanoutSlot>,
+    pub origin: DurableCancellationOrigin,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreDurableFanoutSlot {
+    pub group_id: String,
+    pub target_count: usize,
+    pub slot_index: usize,
+    pub slot_id: Option<String>,
+}
+
+fn validate_pre_durable_child_terminal(receipt: &PreDurableChildTerminal) -> Result<(), String> {
+    if [
+        &receipt.user_id,
+        &receipt.session_id,
+        &receipt.parent_run_id,
+        &receipt.child_run_id,
+        &receipt.cancellation_binding_id,
+        &receipt.agent_id,
+    ]
+    .iter()
+    .any(|identity| identity.trim().is_empty())
+    {
+        return Err("pre-durable child terminal has an empty execution identity".into());
+    }
+    if receipt.fanout_slot.as_ref().is_some_and(|slot| {
+        slot.group_id.trim().is_empty()
+            || slot.target_count == 0
+            || slot.slot_index >= slot.target_count
+    }) {
+        return Err("pre-durable child terminal has an invalid fanout slot".into());
+    }
+    Ok(())
+}
+
+pub const PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE: &str = "pre_durable_child_terminal";
+
+fn pre_durable_child_terminal_event(
+    receipt: &PreDurableChildTerminal,
+) -> Option<serde_json::Value> {
+    let slot = receipt.fanout_slot.as_ref()?;
+    Some(serde_json::json!({
+        "event_type": PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE,
+        "idempotency_key": format!(
+            "pre-durable-child-terminal:{}:{}",
+            receipt.child_run_id, receipt.cancellation_binding_id
+        ),
+        "run_id": receipt.child_run_id,
+        "data": {
+            "parent_run_id": receipt.parent_run_id,
+            "agent_id": receipt.agent_id,
+            "agent_type": receipt.agent_type,
+            "description": receipt.description,
+            "group_id": slot.group_id,
+            "target_count": slot.target_count,
+            "slot_index": slot.slot_index,
+            "slot_id": slot.slot_id,
+            "cancellation_binding_id": receipt.cancellation_binding_id,
+            "cancellation_origin": receipt.origin.as_str(),
+            "reason": receipt.reason,
+        }
+    }))
+}
+
+fn existing_pre_durable_child_terminal(
+    receipt: &PreDurableChildTerminal,
+    existing: &serde_json::Value,
+) -> Result<PreDurableChildTerminalCommit, String> {
+    let origin = match existing
+        .pointer("/data/cancellation_origin")
+        .and_then(|v| v.as_str())
+    {
+        Some("user") => DurableCancellationOrigin::User,
+        Some("runtime") => DurableCancellationOrigin::Runtime,
+        Some("unverified") => DurableCancellationOrigin::Unverified,
+        _ => return Err("pre-durable child terminal has invalid origin".into()),
+    };
+    let reason = existing
+        .pointer("/data/reason")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("pre-durable child terminal has no reason")?
+        .to_string();
+    let mut expected = receipt.clone();
+    expected.origin = origin;
+    expected.reason = reason.clone();
+    if !run_events_have_same_immutable_payload(
+        existing,
+        &pre_durable_child_terminal_event(&expected)
+            .ok_or("pre-durable child terminal has no fanout identity")?,
+    ) {
+        return Err(format!(
+            "pre-durable child terminal identity conflict for {}",
+            receipt.child_run_id
+        ));
+    }
+    Ok(PreDurableChildTerminalCommit::Recorded { origin, reason })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreDurableChildTerminalCommit {
+    Recorded {
+        origin: DurableCancellationOrigin,
+        reason: String,
+    },
+    ChildPresent,
+    ParentMissing,
+}
+
 impl DurableCancellationOrigin {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -4760,6 +4883,16 @@ pub trait RunStateStore: Send + Sync {
         user_id: &str,
         run_id: &str,
     ) -> Result<Option<DurableRunRecord>, String>;
+
+    /// Order a no-row terminal receipt against child creation under the same
+    /// session execution fence. An absence read outside this method cannot
+    /// prove that an earlier insert will not still commit.
+    async fn commit_pre_durable_child_terminal(
+        &self,
+        _receipt: &PreDurableChildTerminal,
+    ) -> Result<PreDurableChildTerminalCommit, String> {
+        Err("pre-durable child terminal receipts are unsupported by this store".into())
+    }
 
     /// Load only the exact metadata needed to scope a Work interaction. The
     /// default is correct for process-local stores; database stores override
@@ -7153,6 +7286,52 @@ impl RunStateStore for InMemoryRunStateStore {
         self.insert_run_record(record, false, None)
             .await
             .map(|_| ())
+    }
+
+    async fn commit_pre_durable_child_terminal(
+        &self,
+        receipt: &PreDurableChildTerminal,
+    ) -> Result<PreDurableChildTerminalCommit, String> {
+        validate_pre_durable_child_terminal(receipt)?;
+        let _child_fence = self
+            .action_fence_for(&receipt.user_id, &receipt.child_run_id)
+            .lock_owned()
+            .await;
+        let mut runs = self.runs.write().await;
+        if let Some(child) = runs.get(&receipt.child_run_id) {
+            return if child.user_id == receipt.user_id
+                && child.session_id == receipt.session_id
+                && child.parent_run_id.as_deref() == Some(&receipt.parent_run_id)
+                && child.agent_id.as_deref() == Some(&receipt.agent_id)
+            {
+                Ok(PreDurableChildTerminalCommit::ChildPresent)
+            } else {
+                Err("pre-durable child terminal conflicts with an existing run".into())
+            };
+        }
+        let Some(parent) = runs.get_mut(&receipt.parent_run_id).filter(|parent| {
+            parent.user_id == receipt.user_id && parent.session_id == receipt.session_id
+        }) else {
+            return Ok(PreDurableChildTerminalCommit::ParentMissing);
+        };
+        let Some(event) = pre_durable_child_terminal_event(receipt) else {
+            return Ok(PreDurableChildTerminalCommit::Recorded {
+                origin: receipt.origin,
+                reason: receipt.reason.clone(),
+            });
+        };
+        if let Some(existing) = parent.events.iter().find(|existing| {
+            extract_optional_string(existing, "idempotency_key")
+                == extract_optional_string(&event, "idempotency_key")
+        }) {
+            return existing_pre_durable_child_terminal(receipt, existing);
+        }
+        parent.last_event_idx = parent.last_event_idx.saturating_add(1);
+        parent.events.push(event);
+        Ok(PreDurableChildTerminalCommit::Recorded {
+            origin: receipt.origin,
+            reason: receipt.reason.clone(),
+        })
     }
 
     async fn claim_run_start(
@@ -9861,14 +10040,35 @@ impl RunStateStore for InMemoryRunStateStore {
             })
             .cloned()
             .collect::<Vec<_>>();
-        control.sort_by(|left, right| left.run_id.cmp(&right.run_id));
-        if control.len() > recovery_limit {
+        let mut discovery = control
+            .drain(..)
+            .map(|run| (run.run_id.clone(), false, run))
+            .collect::<Vec<_>>();
+        discovery.extend(
+            runs.values()
+                .filter(|parent| parent.user_id == user_id && parent.session_id == session_id)
+                .flat_map(|parent| {
+                    parent.events.iter().filter_map(move |event| {
+                        (extract_event_type(event) == PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE)
+                            .then(|| extract_optional_string(event, "run_id"))
+                            .flatten()
+                            .filter(|subject| {
+                                after_run_id.is_none_or(|cursor| subject.as_str() > cursor)
+                            })
+                            .map(|subject| (subject, true, parent.clone()))
+                    })
+                }),
+        );
+        discovery.sort_by(|left, right| left.0.cmp(&right.0));
+        if discovery.len() > recovery_limit {
             page.truncated = true;
-            control.truncate(recovery_limit);
+            discovery.truncate(recovery_limit);
         }
         retry_control.sort_by(|left, right| left.run_id.cmp(&right.run_id));
-        page.recovery_cancellation_run_ids = control
+        page.recovery_cancellation_run_ids = discovery
             .iter()
+            .filter(|(_, receipt, _)| !*receipt)
+            .map(|(_, _, run)| run)
             .chain(retry_control.iter())
             .map(|run| run.run_id.clone())
             .collect();
@@ -9876,15 +10076,16 @@ impl RunStateStore for InMemoryRunStateStore {
         // independent reconciliation lane. Keeping `after_run_id` here when
         // only retry rows are present can pin the scan forever on a full
         // ordinary page of lower-ID poison rows and starve newer markers.
-        page.recovery_next_cursor = control.last().map(|run| run.run_id.clone());
+        page.recovery_next_cursor = discovery.last().map(|(subject, _, _)| subject.clone());
         let mut included = page
             .runs
             .iter()
             .map(|run| run.run_id.clone())
             .collect::<HashSet<_>>();
         terminal_refresh.sort_by(|left, right| left.run_id.cmp(&right.run_id));
-        for run in control
+        for run in discovery
             .into_iter()
+            .map(|(_, _, run)| run)
             .chain(retry_control)
             .chain(terminal_refresh)
         {
@@ -14938,6 +15139,199 @@ impl RunStateStore for DatabaseRunStateStore {
         self.insert_run_record(record, false, None)
             .await
             .map(|_| ())
+    }
+
+    async fn commit_pre_durable_child_terminal(
+        &self,
+        receipt: &PreDurableChildTerminal,
+    ) -> Result<PreDurableChildTerminalCommit, String> {
+        validate_pre_durable_child_terminal(receipt)?;
+        let parent_id = &receipt.parent_run_id;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|error| {
+                db_error("acquire_pre_durable_child_terminal", parent_id, error).to_string()
+            })?;
+        let mut tx = connection.begin().await.map_err(|error| {
+            db_error("begin_pre_durable_child_terminal", parent_id, error).to_string()
+        })?;
+        // This helper takes the same session fence as insert_run_record before
+        // locking the parent. A prior child COMMIT must become visible here.
+        let Some(parent) = self
+            .load_run_metadata_for_exact_session_tx(
+                &mut tx,
+                &receipt.user_id,
+                &receipt.session_id,
+                parent_id,
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            tx.rollback().await.map_err(|error| {
+                db_error("rollback_missing_pre_durable_parent", parent_id, error).to_string()
+            })?;
+            connection.release();
+            if let Some(child) = self
+                .load_run_metadata_for_user(&receipt.user_id, &receipt.child_run_id)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                return if child.session_id == receipt.session_id
+                    && child.parent_run_id.as_deref() == Some(parent_id)
+                    && child.agent_id.as_deref() == Some(&receipt.agent_id)
+                {
+                    Ok(PreDurableChildTerminalCommit::ChildPresent)
+                } else {
+                    Err("pre-durable child terminal conflicts with an existing run".into())
+                };
+            }
+            return match self
+                .load_run_metadata_for_user(&receipt.user_id, parent_id)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                None => Ok(PreDurableChildTerminalCommit::ParentMissing),
+                Some(_) => Err(format!(
+                    "pre-durable child terminal parent {parent_id} exists but its session write fence was not admitted"
+                )),
+            };
+        };
+        let child = sqlx::query(
+            "SELECT session_id, parent_run_id, agent_id FROM agent_runs
+             WHERE user_id = ? AND run_id = ? LIMIT 1 FOR UPDATE",
+        )
+        .bind(&receipt.user_id)
+        .bind(&receipt.child_run_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| {
+            db_error("check_pre_durable_child_row", &receipt.child_run_id, error).to_string()
+        })?;
+        if let Some(child) = child {
+            let session_id: String = child
+                .try_get("session_id")
+                .map_err(|error| error.to_string())?;
+            let child_parent: Option<String> = child
+                .try_get("parent_run_id")
+                .map_err(|error| error.to_string())?;
+            let agent_id: Option<String> = child
+                .try_get("agent_id")
+                .map_err(|error| error.to_string())?;
+            if session_id != receipt.session_id
+                || child_parent.as_deref() != Some(parent_id)
+                || agent_id.as_deref() != Some(&receipt.agent_id)
+            {
+                return Err("pre-durable child terminal conflicts with an existing run".into());
+            }
+            tx.rollback().await.map_err(|error| {
+                db_error("rollback_present_pre_durable_child", parent_id, error).to_string()
+            })?;
+            connection.release();
+            return Ok(PreDurableChildTerminalCommit::ChildPresent);
+        }
+        let Some(event) = pre_durable_child_terminal_event(receipt) else {
+            tx.rollback().await.map_err(|error| {
+                db_error("rollback_stopped_pre_durable_child", parent_id, error).to_string()
+            })?;
+            connection.release();
+            return Ok(PreDurableChildTerminalCommit::Recorded {
+                origin: receipt.origin,
+                reason: receipt.reason.clone(),
+            });
+        };
+        let key = extract_optional_string(&event, "idempotency_key")
+            .expect("pre-durable terminal event has a stable key");
+        let existing = sqlx::query(
+            "SELECT event_idx, payload_json FROM agent_run_events
+             WHERE user_id = ? AND run_id = ? AND idempotency_key = ? LIMIT 1",
+        )
+        .bind(&receipt.user_id)
+        .bind(parent_id)
+        .bind(&key)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| {
+            db_error("load_pre_durable_child_terminal", parent_id, error).to_string()
+        })?;
+        if let Some(existing) = existing {
+            let existing = decode_run_event_payload(&existing, parent_id)
+                .map_err(|error| error.to_string())?;
+            let recorded = existing_pre_durable_child_terminal(receipt, &existing)?;
+            tx.rollback().await.map_err(|error| {
+                db_error(
+                    "rollback_existing_pre_durable_child_terminal",
+                    parent_id,
+                    error,
+                )
+                .to_string()
+            })?;
+            connection.release();
+            return Ok(recorded);
+        }
+        let next_idx = parent
+            .last_event_idx
+            .checked_add(1)
+            .ok_or("pre-durable child terminal event counter overflow")?;
+        let row = build_run_event_insert_row(
+            &receipt.user_id,
+            parent_id,
+            &receipt.session_id,
+            parent.agent_id.as_deref(),
+            next_idx,
+            &self.owner_pod_id,
+            &event,
+        )
+        .map_err(|error| error.to_string())?;
+        let updated = sqlx::query(
+            "UPDATE agent_runs SET last_event_idx = ?
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND last_event_idx = ?",
+        )
+        .bind(next_idx)
+        .bind(&receipt.user_id)
+        .bind(&receipt.session_id)
+        .bind(parent_id)
+        .bind(parent.last_event_idx)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| {
+            db_error(
+                "advance_pre_durable_child_terminal_counter",
+                parent_id,
+                error,
+            )
+            .to_string()
+        })?;
+        if updated.rows_affected() != 1 {
+            return Err("pre-durable child terminal parent event counter changed".into());
+        }
+        Self::insert_run_event_rows_tx(
+            &mut tx,
+            parent_id,
+            std::slice::from_ref(&row),
+            "insert_pre_durable_child_terminal",
+        )
+        .await?;
+        match tx.commit().await {
+            Ok(()) => connection.release(),
+            Err(error) => {
+                drop(connection);
+                if !self
+                    .exact_run_event_rows_are_durable(
+                        std::slice::from_ref(&row),
+                        "reconcile_pre_durable_child_terminal",
+                    )
+                    .await?
+                {
+                    return Err(
+                        db_error("commit_pre_durable_child_terminal", parent_id, error).to_string(),
+                    );
+                }
+            }
+        }
+        Ok(PreDurableChildTerminalCommit::Recorded {
+            origin: receipt.origin,
+            reason: receipt.reason.clone(),
+        })
     }
 
     async fn claim_run_start(
@@ -21733,7 +22127,7 @@ impl RunStateStore for DatabaseRunStateStore {
         let mut recovery_query = sqlx::QueryBuilder::<sqlx::MySql>::new("SELECT ");
         recovery_query
             .push(AGENT_RUN_RECOVERY_COLUMNS)
-            .push(", 1 AS recovery_kind FROM (SELECT ");
+            .push(", 1 AS recovery_kind, run_id AS recovery_subject FROM (SELECT ");
         recovery_query
             .push(AGENT_RUN_RECOVERY_COLUMNS)
             .push(" FROM agent_runs WHERE user_id = ")
@@ -21762,7 +22156,7 @@ impl RunStateStore for DatabaseRunStateStore {
             recovery_query.push(" UNION ALL SELECT ");
             recovery_query
                 .push(AGENT_RUN_RECOVERY_COLUMNS)
-                .push(", 2 AS recovery_kind FROM agent_runs WHERE user_id = ")
+                .push(", 2 AS recovery_kind, run_id AS recovery_subject FROM agent_runs WHERE user_id = ")
                 .push_bind(user_id)
                 .push(" AND session_id = ")
                 .push_bind(session_id)
@@ -21787,7 +22181,7 @@ impl RunStateStore for DatabaseRunStateStore {
             recovery_query.push(" UNION ALL SELECT ");
             recovery_query
                 .push(AGENT_RUN_RECOVERY_COLUMNS)
-                .push(", 3 AS recovery_kind");
+                .push(", 3 AS recovery_kind, run_id AS recovery_subject");
             recovery_query
                 .push(" FROM agent_runs WHERE user_id = ")
                 .push_bind(user_id)
@@ -21808,8 +22202,41 @@ impl RunStateStore for DatabaseRunStateStore {
             }
             recovery_query.push(")");
         }
+        // A pre-durable terminal has no child row to anchor the ordinary
+        // working-set page. Seek its indexed subject identity in this same
+        // read wave, then return its parent row for typed event recovery.
+        recovery_query.push(" UNION ALL SELECT ");
+        recovery_query
+            .push(AGENT_RUN_RECOVERY_COLUMNS)
+            .push(", 4 AS recovery_kind, selected_receipts.receipt_subject_id AS recovery_subject")
+            .push(" FROM agent_runs JOIN (SELECT events.run_id AS event_parent_id,")
+            .push(" events.subject_run_id AS receipt_subject_id FROM agent_run_events AS events")
+            .push(" FORCE INDEX (idx_agent_run_events_owner_session_subject)")
+            .push(" JOIN agent_runs AS receipt_parents ON receipt_parents.user_id = events.user_id")
+            .push(" AND receipt_parents.session_id = events.session_id")
+            .push(" AND receipt_parents.run_id = events.run_id")
+            .push(" WHERE events.user_id = ")
+            .push_bind(user_id)
+            .push(" AND events.session_id = ")
+            .push_bind(session_id)
+            .push(" AND events.event_type = ")
+            .push_bind(PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE)
+            .push(" AND events.subject_run_id IS NOT NULL");
+        if let Some(after_run_id) = after_run_id {
+            recovery_query
+                .push(" AND events.subject_run_id > ")
+                .push_bind(after_run_id);
+        }
+        recovery_query
+            .push(" ORDER BY events.subject_run_id ASC LIMIT ")
+            .push_bind(session_run_query_limit(recovery_limit as u32))
+            .push(") selected_receipts ON selected_receipts.event_parent_id = agent_runs.run_id")
+            .push(" WHERE agent_runs.user_id = ")
+            .push_bind(user_id)
+            .push(" AND agent_runs.session_id = ")
+            .push_bind(session_id);
         let recovery_runs = recovery_query
-            .push(" ORDER BY run_id ASC, recovery_kind ASC")
+            .push(" ORDER BY recovery_subject ASC, recovery_kind ASC")
             .build()
             .fetch_all(self.pool.get())
             .await
@@ -21826,42 +22253,55 @@ impl RunStateStore for DatabaseRunStateStore {
                 let recovery_kind: i64 = row.try_get("recovery_kind").map_err(|source| {
                     db_error("decode_session_agent_recovery_kind", session_id, source)
                 })?;
+                let recovery_subject: String =
+                    row.try_get("recovery_subject").map_err(|source| {
+                        db_error("decode_session_agent_recovery_subject", session_id, source)
+                    })?;
                 let run = run_record_from_row(row)?;
-                Ok((recovery_kind, run))
+                Ok((recovery_kind, recovery_subject, run))
             })
             .collect::<DbStoreResult<Vec<_>>>()
             .map_err(|error| error.to_string())?;
-        let mut cancellation_runs = Vec::new();
+        let mut discovery = Vec::new();
         let mut retry_cancellation_runs = Vec::new();
         let mut terminal_refresh_runs = Vec::new();
-        for (recovery_kind, run) in recovery_runs {
+        for (recovery_kind, subject, run) in recovery_runs {
             match recovery_kind {
-                1 => cancellation_runs.push(run),
+                1 | 4 => discovery.push((recovery_kind, subject, run)),
                 2 => retry_cancellation_runs.push(run),
                 3 => terminal_refresh_runs.push(run),
                 other => unreachable!("unknown session agent recovery kind {other}"),
             }
         }
-        if cancellation_runs.len() > recovery_limit {
+        discovery.sort_by(|left, right| left.1.cmp(&right.1));
+        if discovery.len() > recovery_limit {
             page.truncated = true;
-            cancellation_runs.truncate(recovery_limit);
+            discovery.truncate(recovery_limit);
         }
-        page.recovery_cancellation_run_ids = cancellation_runs
+        page.recovery_next_cursor = discovery.last().map(|(_, subject, _)| subject.clone());
+        let receipt_subject_ids = discovery
             .iter()
+            .filter(|(kind, _, _)| *kind == 4)
+            .map(|(_, subject, _)| subject.clone())
+            .collect::<Vec<_>>();
+        page.recovery_cancellation_run_ids = discovery
+            .iter()
+            .filter(|(kind, _, _)| *kind == 1)
+            .map(|(_, _, run)| run)
             .chain(retry_cancellation_runs.iter())
             .map(|run| run.run_id.clone())
             .collect();
         // Retry rows must not hold the forward cursor. If discovery has no
         // fresh row, returning no cursor deliberately wraps the forward lane
         // while the retry lane is still reconciled from the ordinary page.
-        page.recovery_next_cursor = cancellation_runs.last().map(|run| run.run_id.clone());
         let mut included = page
             .runs
             .iter()
             .map(|run| run.run_id.clone())
             .collect::<HashSet<_>>();
-        for run in cancellation_runs
+        for run in discovery
             .into_iter()
+            .map(|(_, _, run)| run)
             .chain(retry_cancellation_runs)
             .chain(terminal_refresh_runs)
         {
@@ -21988,6 +22428,26 @@ impl RunStateStore for DatabaseRunStateStore {
                ) ranked_group_cancellations WHERE recovery_rank = 1",
             );
         }
+        if !receipt_subject_ids.is_empty() {
+            builder.push(
+                " UNION ALL SELECT run_id, event_idx, payload_json
+                  FROM agent_run_events WHERE user_id = ",
+            );
+            builder
+                .push_bind(user_id)
+                .push(" AND session_id = ")
+                .push_bind(session_id)
+                .push(" AND event_type = ")
+                .push_bind(PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE)
+                .push(" AND subject_run_id IN (");
+            {
+                let mut ids = builder.separated(",");
+                for run_id in &receipt_subject_ids {
+                    ids.push_bind(run_id);
+                }
+            }
+            builder.push(")");
+        }
         builder.push(
             ") recovery_events
              ORDER BY run_id, event_idx",
@@ -22030,7 +22490,9 @@ impl RunStateStore for DatabaseRunStateStore {
                     events.iter().any(|(_, event)| {
                         matches!(
                             extract_event_type(event).as_str(),
-                            "agent_spawned" | "fanout_group_cancelled"
+                            "agent_spawned"
+                                | "fanout_group_cancelled"
+                                | PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE
                         )
                     })
                 })
@@ -24759,9 +25221,12 @@ fn build_run_event_insert_row(
             source,
         })?;
     let event_type = extract_event_type(event);
-    let subject_run_id = matches!(event_type.as_str(), "agent_spawned")
-        .then(|| extract_optional_string(event, "run_id"))
-        .flatten();
+    let subject_run_id = matches!(
+        event_type.as_str(),
+        "agent_spawned" | PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE
+    )
+    .then(|| extract_optional_string(event, "run_id"))
+    .flatten();
     let interaction_request_id = extract_interaction_request_id(event);
     let event_id = extract_optional_string(event, "event_id")
         .or_else(|| extract_optional_string(event, "id"))
@@ -26423,6 +26888,133 @@ mod tests {
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         }
+    }
+
+    #[tokio::test]
+    async fn pre_durable_child_terminal_is_exact_idempotent_and_recoverable_off_page() {
+        let store = InMemoryRunStateStore::new();
+        let mut parent = durable_run_record("receipt-parent");
+        parent.status = STATUS_COMPLETED.into();
+        parent.events.push(serde_json::json!({
+            "event_type": "fanout_group_cancelled",
+            "data": {
+                "group_id": "receipt-group", "parent_run_id": "receipt-parent",
+                "target_count": 1, "unassigned_slots": [],
+                "reason": "deadline", "cancellation_origin": "runtime"
+            }
+        }));
+        store.insert_run(parent).await.unwrap();
+        let mut noise = durable_run_record("noise-active");
+        noise.status = STATUS_RUNNING.into();
+        store.insert_run(noise).await.unwrap();
+        let receipt = PreDurableChildTerminal {
+            user_id: "u1".into(),
+            session_id: "s1".into(),
+            parent_run_id: "receipt-parent".into(),
+            child_run_id: "receipt-child".into(),
+            cancellation_binding_id: "binding-1".into(),
+            agent_id: "reviewer-1".into(),
+            agent_type: "code-review".into(),
+            description: "Review".into(),
+            fanout_slot: Some(PreDurableFanoutSlot {
+                group_id: "receipt-group".into(),
+                target_count: 1,
+                slot_index: 0,
+                slot_id: Some("review".into()),
+            }),
+            origin: DurableCancellationOrigin::Runtime,
+            reason: "deadline".into(),
+        };
+        let recorded = PreDurableChildTerminalCommit::Recorded {
+            origin: DurableCancellationOrigin::Runtime,
+            reason: "deadline".into(),
+        };
+        assert_eq!(
+            store
+                .commit_pre_durable_child_terminal(&receipt)
+                .await
+                .unwrap(),
+            recorded
+        );
+        let mut upgraded = receipt.clone();
+        upgraded.origin = DurableCancellationOrigin::User;
+        upgraded.reason = "user stop".into();
+        assert_eq!(
+            store
+                .commit_pre_durable_child_terminal(&upgraded)
+                .await
+                .unwrap(),
+            recorded
+        );
+        let mut invalid = receipt.clone();
+        invalid.fanout_slot.as_mut().unwrap().slot_index = 1;
+        assert!(
+            store
+                .commit_pre_durable_child_terminal(&invalid)
+                .await
+                .is_err()
+        );
+        let page = store
+            .load_session_agent_recovery_after("u1", "s1", 1, None)
+            .await
+            .unwrap();
+        assert!(page.runs.iter().any(|run| run.run_id == "receipt-parent"));
+        assert_eq!(page.recovery_next_cursor.as_deref(), Some("receipt-child"));
+        let parent = store
+            .load_run("u1", "receipt-parent")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.events.len(), 2);
+        assert_eq!(parent.events[1]["data"]["cancellation_origin"], "runtime");
+
+        let mut child = durable_run_record("already-durable-child");
+        child.status = STATUS_COMPLETED.into();
+        child.parent_run_id = Some("receipt-parent".into());
+        child.agent_id = Some("reviewer-1".into());
+        store.insert_run(child).await.unwrap();
+        let mut present = receipt.clone();
+        present.child_run_id = "already-durable-child".into();
+        assert_eq!(
+            store
+                .commit_pre_durable_child_terminal(&present)
+                .await
+                .unwrap(),
+            PreDurableChildTerminalCommit::ChildPresent
+        );
+        assert_eq!(
+            store
+                .load_run("u1", "receipt-parent")
+                .await
+                .unwrap()
+                .unwrap()
+                .events
+                .len(),
+            2
+        );
+        present.user_id = "other-user".into();
+        assert!(
+            store
+                .commit_pre_durable_child_terminal(&present)
+                .await
+                .is_err()
+        );
+
+        let mut orphan = durable_run_record("orphan-child");
+        orphan.parent_run_id = Some("deleted-parent".into());
+        orphan.agent_id = Some("reviewer-1".into());
+        store.insert_run(orphan).await.unwrap();
+        let mut missing_parent = receipt;
+        missing_parent.parent_run_id = "deleted-parent".into();
+        missing_parent.child_run_id = "orphan-child".into();
+        assert_eq!(
+            store
+                .commit_pre_durable_child_terminal(&missing_parent)
+                .await
+                .unwrap(),
+            PreDurableChildTerminalCommit::ChildPresent,
+            "a removed parent must not hide an existing child"
+        );
     }
 
     #[test]
@@ -30302,6 +30894,133 @@ mod tests {
         for run_id in [&root_id, &child_id].into_iter().chain(noise_ids.iter()) {
             cleanup_database_run_fixture(&pool, &user_id, run_id).await;
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_pre_durable_child_terminal_orders_with_run_creation_and_recovers_off_page() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let suffix = Uuid::new_v4();
+        let user_id = format!("pre-durable-user-{suffix}");
+        let session_id = format!("pre-durable-session-{suffix}");
+        let parent_id = format!("pre-durable-parent-{suffix}");
+        let child_id = format!("pre-durable-child-{suffix}");
+        let noise_id = format!("pre-durable-noise-{suffix}");
+        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+        let mut parent = durable_run_record(&parent_id);
+        parent.user_id = user_id.clone();
+        parent.session_id = session_id.clone();
+        parent.status = STATUS_COMPLETED.into();
+        store.insert_run(parent).await.unwrap();
+        let mut noise = durable_run_record(&noise_id);
+        noise.user_id = user_id.clone();
+        noise.session_id = session_id.clone();
+        store.insert_run(noise).await.unwrap();
+        let receipt = PreDurableChildTerminal {
+            user_id: user_id.clone(),
+            session_id: session_id.clone(),
+            parent_run_id: parent_id.clone(),
+            child_run_id: child_id.clone(),
+            cancellation_binding_id: format!("binding-{suffix}"),
+            agent_id: format!("reviewer-{suffix}"),
+            agent_type: "code-review".into(),
+            description: "Review".into(),
+            fanout_slot: Some(PreDurableFanoutSlot {
+                group_id: format!("group-{suffix}"),
+                target_count: 1,
+                slot_index: 0,
+                slot_id: Some("review".into()),
+            }),
+            origin: DurableCancellationOrigin::Runtime,
+            reason: "deadline".into(),
+        };
+        let recorded = PreDurableChildTerminalCommit::Recorded {
+            origin: DurableCancellationOrigin::Runtime,
+            reason: "deadline".into(),
+        };
+        assert_eq!(
+            store
+                .commit_pre_durable_child_terminal(&receipt)
+                .await
+                .unwrap(),
+            recorded
+        );
+        let mut upgraded = receipt.clone();
+        upgraded.origin = DurableCancellationOrigin::User;
+        upgraded.reason = "user stop".into();
+        assert_eq!(
+            store
+                .commit_pre_durable_child_terminal(&upgraded)
+                .await
+                .unwrap(),
+            recorded
+        );
+        let page = store
+            .load_session_agent_recovery_after(&user_id, &session_id, 1, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.recovery_next_cursor.as_deref(),
+            Some(child_id.as_str())
+        );
+        assert!(page.runs.iter().any(|run| {
+            run.run_id == parent_id
+                && run
+                    .events
+                    .iter()
+                    .any(|event| extract_event_type(event) == PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE)
+        }));
+        let mut non_fanout = receipt.clone();
+        non_fanout.child_run_id = format!("pre-durable-single-{suffix}");
+        non_fanout.fanout_slot = None;
+        assert_eq!(
+            store
+                .commit_pre_durable_child_terminal(&non_fanout)
+                .await
+                .unwrap(),
+            recorded,
+            "non-fanout no-row settlement must also cross the session fence"
+        );
+        assert_eq!(
+            store
+                .load_run(&user_id, &parent_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| extract_event_type(event) == PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE)
+                .count(),
+            1,
+            "a non-fanout child must not write a receipt"
+        );
+        let orphan_id = format!("pre-durable-orphan-{suffix}");
+        let mut orphan = durable_run_record(&orphan_id);
+        orphan.user_id = user_id.clone();
+        orphan.session_id = session_id.clone();
+        orphan.parent_run_id = Some(parent_id.clone());
+        orphan.agent_id = Some(receipt.agent_id.clone());
+        store.insert_run(orphan).await.unwrap();
+        cleanup_database_run_fixture(&pool, &user_id, &parent_id).await;
+        let mut missing_parent = receipt;
+        missing_parent.child_run_id = orphan_id.clone();
+        missing_parent.fanout_slot = None;
+        assert_eq!(
+            store
+                .commit_pre_durable_child_terminal(&missing_parent)
+                .await
+                .unwrap(),
+            PreDurableChildTerminalCommit::ChildPresent
+        );
+        for run_id in [&orphan_id, &noise_id] {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+        }
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
