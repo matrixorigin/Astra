@@ -104,7 +104,7 @@ jobs:
           shared-key: ci-test
           save-cache: ${{ github.event_name == 'push' && matrix.segment == 'non-edge' }}
       - name: Prebuild mock MCP server
-        if: env.RUN_TESTS == 'true' && matrix.segment == 'non-edge'
+        if: env.RUN_TESTS == 'true' && (matrix.segment == 'non-edge' || matrix.segment == 'edge-rest')
         run: cargo build --manifest-path Cargo.toml -p astra-cli --bin mock_mcp_server
       - name: "Test astra-cli (${{ matrix.segment }})"
         if: env.RUN_TESTS == 'true'
