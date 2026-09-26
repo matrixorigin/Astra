@@ -2645,44 +2645,46 @@ fn normalized_validation_segment(segment: &str) -> Option<String> {
     if validation_segment_has_meta_option(segment) {
         return None;
     }
-    let lower = segment.to_ascii_lowercase();
-    let recognized = lower.starts_with("cargo check ")
-        || lower == "cargo check"
-        || lower.starts_with("cargo test ")
-        || lower == "cargo test"
-        || lower.starts_with("cargo build ")
-        || lower == "cargo build"
-        || lower.starts_with("npx tsc --noemit")
-        || lower == "tsc --noemit"
-        || lower.starts_with("tsc --noemit ")
-        || lower == "pytest"
-        || lower.starts_with("pytest ")
-        || lower == "python -m pytest"
-        || lower.starts_with("python -m pytest ")
-        || lower == "python3 -m pytest"
-        || lower.starts_with("python3 -m pytest ")
-        || lower == "python -m unittest"
-        || lower.starts_with("python -m unittest ")
-        || lower == "python3 -m unittest"
-        || lower.starts_with("python3 -m unittest ")
-        || lower == "python -m build"
-        || lower.starts_with("python -m build ")
-        || lower == "python3 -m build"
-        || lower.starts_with("python3 -m build ")
-        || lower.starts_with("python setup.py build ")
-        || lower == "python setup.py build"
-        || lower.starts_with("python setup.py build_ext ")
-        || lower == "python setup.py build_ext"
-        || lower.starts_with("python3 setup.py build ")
-        || lower == "python3 setup.py build"
-        || lower.starts_with("python3 setup.py build_ext ")
-        || lower == "python3 setup.py build_ext"
-        || lower == "npm test"
-        || lower.starts_with("npm test ")
-        || lower == "npm run build"
-        || lower.starts_with("npm run build ")
-        || lower == "go test"
-        || lower.starts_with("go test ");
+    // Shell command names, subcommands and module names are case-sensitive.
+    // Preserve arbitrary argument spelling (paths, test filters) after each
+    // exact family prefix instead of lowercasing the entire invocation.
+    let recognized = segment.starts_with("cargo check ")
+        || segment == "cargo check"
+        || segment.starts_with("cargo test ")
+        || segment == "cargo test"
+        || segment.starts_with("cargo build ")
+        || segment == "cargo build"
+        || segment.starts_with("npx tsc --noEmit")
+        || segment == "tsc --noEmit"
+        || segment.starts_with("tsc --noEmit ")
+        || segment == "pytest"
+        || segment.starts_with("pytest ")
+        || segment == "python -m pytest"
+        || segment.starts_with("python -m pytest ")
+        || segment == "python3 -m pytest"
+        || segment.starts_with("python3 -m pytest ")
+        || segment == "python -m unittest"
+        || segment.starts_with("python -m unittest ")
+        || segment == "python3 -m unittest"
+        || segment.starts_with("python3 -m unittest ")
+        || segment == "python -m build"
+        || segment.starts_with("python -m build ")
+        || segment == "python3 -m build"
+        || segment.starts_with("python3 -m build ")
+        || segment.starts_with("python setup.py build ")
+        || segment == "python setup.py build"
+        || segment.starts_with("python setup.py build_ext ")
+        || segment == "python setup.py build_ext"
+        || segment.starts_with("python3 setup.py build ")
+        || segment == "python3 setup.py build"
+        || segment.starts_with("python3 setup.py build_ext ")
+        || segment == "python3 setup.py build_ext"
+        || segment == "npm test"
+        || segment.starts_with("npm test ")
+        || segment == "npm run build"
+        || segment.starts_with("npm run build ")
+        || segment == "go test"
+        || segment.starts_with("go test ");
     recognized.then_some(segment.to_string())
 }
 
@@ -3092,6 +3094,21 @@ fn is_shell_control_segment(segment: &str) -> bool {
         || lower.starts_with("set -o pipefail ")
         || lower.starts_with("cd ")
         || lower == "cd"
+}
+
+/// A known shell control with no dynamic expansion or output redirection.
+/// Consumers may treat this as neutral while checking a compound diagnostic,
+/// but an unchecked `set`/`cd` prefix is not itself proof of no side effect.
+pub fn shell_control_segment_is_static_and_neutral(segment: &str) -> bool {
+    let segment = segment.trim();
+    let Some(words) = split_static_shell_words(segment) else {
+        return false;
+    };
+    words
+        .first()
+        .is_some_and(|command| command.chars().all(|ch| !ch.is_ascii_uppercase()))
+        && is_shell_control_segment(&words.join(" "))
+        && !shell_segment_has_non_benign_redirect(segment)
 }
 
 fn is_positive_validation_segment(segment: &str) -> bool {
@@ -7298,6 +7315,17 @@ mod tests {
             None
         );
         assert!(bash_command_post_mutation_validation_prefix("npx tsc --noEmit").is_some());
+        for command in [
+            "CARGO TEST",
+            "cargo TEST",
+            "python3 -m PYTEST",
+            "npm run BUILD",
+        ] {
+            assert!(
+                bash_command_post_mutation_validation_prefix(command).is_none(),
+                "case-sensitive executable or subcommand cannot prove validation: {command}"
+            );
+        }
         assert!(bash_command_post_mutation_validation_prefix("npm run build").is_some());
         assert!(
             bash_command_post_mutation_validation_prefix("python setup.py build_ext --inplace")

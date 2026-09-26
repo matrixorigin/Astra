@@ -2530,17 +2530,17 @@ fn unresolved_tool_outcome_is_terminally_relevant(
         record,
         &failure.result_class,
     );
-    // Permission admission must conservatively treat an opaque executable as
-    // a potential writer. Completion has stronger, executed evidence: when
-    // the typed task is explicitly read-only and no positive mutation or
-    // verification obligation exists, its failed diagnostic remains advisory.
-    // Unknown intent, direct writers, and observed mutation stay strict.
+    // Read-only intent describes the task, not the effects of an opaque
+    // executable. A failed diagnostic is advisory only when its executor
+    // proved the bound workspace unchanged under the same invocation owner.
+    // Missing or weak observation remains an unresolved completion risk.
     let advisory_diagnostic = state.turn_intent.as_ref().is_some_and(|intent| {
         intent.workspace_mutation == WorkspaceMutationIntent::ReadOnly
             && !intent.browser_verification_required
     }) && !state.task_profile.verification_required
         && !requires_external_effect_completion(state)
         && astra_turn_core::cloud_approval_policy::is_cloud_execute_tool(&record.name)
+        && super::lifecycle::is_authoritative_unchanged_bash_observation_record(record)
         && !tool_record_may_have_mutated_bound_workspace(
             state.hooks.workspace_root_hint.as_deref(),
             record,
@@ -2694,12 +2694,9 @@ async fn task_resolution_covers_current_outcomes(
 /// Give a candidate final answer one bounded rewrite when the structured
 /// execution ledger still reports a persistent unresolved outcome.
 ///
-/// Read-only exploratory work (for example a code review or diagnosis) may
-/// legitimately contain a failed probe.  The probe remains durable evidence
-/// and the model must report it, but it is not an execution contract that can
-/// safely turn a normal answer into `ExecutionIncomplete`.  Mutating work and
-/// explicit verification contracts retain the stricter reconciliation path,
-/// including when their profile is also marked exploratory.
+/// Read-only exploratory work may contain failed observation or validation
+/// probes. Mutating and verification contracts are strict even before the
+/// execution ledger is available.
 fn outcome_reconciliation_required_for_profile(state: &AgenticLoopState) -> bool {
     !state.task_profile.exploratory_task
         || state.task_profile.mutates_workspace
@@ -2709,6 +2706,77 @@ fn outcome_reconciliation_required_for_profile(state: &AgenticLoopState) -> bool
             .turn_intent
             .as_ref()
             .is_some_and(|intent| intent.browser_verification_required)
+}
+
+/// An exploratory failure may be reported without an execution-incomplete
+/// boundary only when every executed shell segment is a known observation or
+/// validation. A recognized validator elsewhere in a compound command does
+/// not make an opaque earlier segment safe.
+fn exploratory_failure_is_known_diagnostic(
+    state: &AgenticLoopState,
+    failure: &astra_turn_core::evaluation::UnresolvedToolOutcome,
+) -> bool {
+    let Some(reference) = failure.invocation.as_ref() else {
+        return false;
+    };
+    let Some(record) = state
+        .stall
+        .tool_call_records
+        .iter()
+        .find(|record| record.execution_completion.as_ref() == Some(reference))
+    else {
+        return false;
+    };
+    if record.name != "bash"
+        || !record.was_executed()
+        || record.workspace_mutation_observed == Some(true)
+        || record.external_effect_scope.is_some()
+        || external_effect_scope_from_record(record).is_some()
+        || tool_record_may_have_mutated_bound_workspace(
+            state.hooks.workspace_root_hint.as_deref(),
+            record,
+        )
+    {
+        return false;
+    }
+    if super::lifecycle::is_authoritative_unchanged_bash_observation_record(record) {
+        return true;
+    }
+    let Some(args) = record
+        .authoritative_args_full()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+    else {
+        return false;
+    };
+    let Some(command) = astra_turn_core::tool_argument_hints::command_hint_from_args(&args) else {
+        return false;
+    };
+    astra_turn_core::evaluation::split_shell_control_segments(command).is_some_and(|controls| {
+        let mut saw_command = false;
+        let known = controls.into_iter().all(|control| {
+                astra_turn_core::evaluation::split_shell_pipeline_segments(control).is_some_and(
+                    |segments| {
+                        segments.into_iter().all(|segment| {
+                                let segment = segment.trim();
+                                if segment.is_empty() {
+                                    return true;
+                                }
+                                saw_command = true;
+                                astra_turn_core::cloud_approval_policy::bash_command_is_read_only(
+                                    segment,
+                                ) || astra_turn_core::evaluation::shell_control_segment_is_static_and_neutral(
+                                    segment,
+                                ) || astra_turn_core::evaluation::normalize_validation_prefix(
+                                    "bash",
+                                    &serde_json::json!({"command": segment}).to_string(),
+                                )
+                                .is_some()
+                            })
+                    },
+                )
+            });
+        known && saw_command
+    })
 }
 
 fn enforce_outcome_reconciliation_before_text_completion(
@@ -2745,7 +2813,10 @@ fn enforce_outcome_reconciliation_before_text_completion(
         .completion_settlement
         .outcome_reconciliation_retries
         > 0
-        || !outcome_reconciliation_required_for_profile(state)
+        || (!outcome_reconciliation_required_for_profile(state)
+            && terminal_failures
+                .values()
+                .all(|failure| exploratory_failure_is_known_diagnostic(state, failure)))
         || !has_reconciliation_signal
     {
         return false;
@@ -18519,72 +18590,190 @@ mod tests {
         use astra_turn_types::task_resolution::{
             EdgeDispatchCompletionRef, ToolExecutionEvidenceRef,
         };
-        let reference = ToolExecutionEvidenceRef::EdgeDispatch(EdgeDispatchCompletionRef {
-            identity: ToolInvocationIdentity::new("user", "session", "run", "chain", "probe")
-                .unwrap(),
-            edge_agent_id: "edge-1".into(),
-            result_hash: "failed-probe".into(),
-        });
-        let mut state = make_state();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
-                false,
-                false,
-                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+        for exploratory in [false, true] {
+            let reference = ToolExecutionEvidenceRef::EdgeDispatch(EdgeDispatchCompletionRef {
+                identity: ToolInvocationIdentity::new("user", "session", "run", "chain", "probe")
+                    .unwrap(),
+                edge_agent_id: "edge-1".into(),
+                result_hash: "failed-probe".into(),
+            });
+            let mut state = make_state();
+            state.task_profile =
+                astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                    false,
+                    exploratory,
+                    astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+                );
+            state.turn_intent = Some(
+                TurnIntent::default().with_workspace_mutation(WorkspaceMutationIntent::ReadOnly),
             );
-        state.turn_intent =
-            Some(TurnIntent::default().with_workspace_mutation(WorkspaceMutationIntent::ReadOnly));
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: false,
-            args_full: Some(serde_json::json!({"command":"python3 -c 'print(1 / 0)'"}).to_string()),
-            round: Some(1),
-            execution_completion: Some(reference),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        });
-        crate::turn::runtime_policy::evaluate_tool_boundary_with_thresholds(
-            &mut state.stall.runtime_policy_evaluation,
-            astra_turn_core::context_feedback::RuntimePolicySubject::Run,
-            &state.stall.tool_call_records,
-            1,
-            astra_turn_core::evaluation::EvaluationThresholds::default(),
-            None,
-        )
-        .unwrap();
-        let failure = state
-            .stall
-            .runtime_policy_evaluation
-            .unresolved_tool_outcomes()
-            .into_values()
-            .next()
-            .expect("failed diagnostic remains in ledger");
-        assert!(!unresolved_tool_outcome_is_terminally_relevant(
-            &state, &failure
-        ));
-        assert!(!enforce_outcome_reconciliation_before_text_completion(
-            &mut state, None
-        ));
-        assert!(state.interruption.is_none());
+            let unchanged =
+            astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
+                astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
+            );
+            state.stall.tool_call_records.push(ToolCallRecord {
+                name: "bash".into(),
+                ok: false,
+                args_full: Some(
+                    serde_json::json!({"command":"python3 -c 'print(1 / 0)'"}).to_string(),
+                ),
+                round: Some(1),
+                execution_completion: Some(reference),
+                disposition: Some(ToolCallDisposition::Executed),
+                workspace_mutation_scope: unchanged
+                    .get(astra_tools::workspace_observation::OBSERVATION_SCOPE_FIELD)
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string),
+                workspace_mutation_receipt: unchanged
+                    .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+                    .cloned(),
+                ..Default::default()
+            });
+            crate::turn::runtime_policy::evaluate_tool_boundary_with_thresholds(
+                &mut state.stall.runtime_policy_evaluation,
+                astra_turn_core::context_feedback::RuntimePolicySubject::Run,
+                &state.stall.tool_call_records,
+                1,
+                astra_turn_core::evaluation::EvaluationThresholds::default(),
+                None,
+            )
+            .unwrap();
+            state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
+            "state": "evaluated",
+            "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+            "recovery": null,
+            "revision": 1,
+            "evaluated_at_round": 1,
+            "subject": {"kind": "run"},
+            "entries": [{
+                "signal": "unresolved_tool_outcomes",
+                "stage": "converge",
+                "observed_at_round": 1,
+                "evidence_count": 1,
+                "recommendation": "diagnose_tool_outcomes"
+            }]
+        }))
+        .expect("unresolved outcome feedback");
+            let failure = state
+                .stall
+                .runtime_policy_evaluation
+                .unresolved_tool_outcomes()
+                .into_values()
+                .next()
+                .expect("failed diagnostic remains in ledger");
+            assert!(!unresolved_tool_outcome_is_terminally_relevant(
+                &state, &failure
+            ));
+            assert!(!enforce_outcome_reconciliation_before_text_completion(
+                &mut state, None
+            ));
+            assert!(state.interruption.is_none());
 
-        state.turn_intent = None;
-        assert!(
-            unresolved_tool_outcome_is_terminally_relevant(&state, &failure),
-            "unknown intent must remain conservative"
-        );
-        state.turn_intent =
-            Some(TurnIntent::default().with_workspace_mutation(WorkspaceMutationIntent::ReadOnly));
-        state.stall.tool_call_records[0].args_full =
-            Some(serde_json::json!({"command":"echo changed > file.txt"}).to_string());
-        assert!(
-            unresolved_tool_outcome_is_terminally_relevant(&state, &failure),
-            "positive writer shape must remain strict even under read-only intent"
-        );
-        state.stall.tool_call_records[0].execution_completion = None;
-        assert!(
-            unresolved_tool_outcome_is_terminally_relevant(&state, &failure),
-            "missing execution reference must remain strict"
-        );
+            if exploratory {
+                state.stall.tool_call_records[0].workspace_mutation_receipt = None;
+                state.stall.tool_call_records[0].args_full =
+                    Some(serde_json::json!({"command":"cargo test"}).to_string());
+                assert!(exploratory_failure_is_known_diagnostic(&state, &failure));
+                assert!(!enforce_outcome_reconciliation_before_text_completion(
+                    &mut state, None,
+                ));
+                for command in [
+                    "set -e; cargo test",
+                    "set  -e; cargo test",
+                    "cargo test\n",
+                    "cargo test; # diagnostic",
+                ] {
+                    state.stall.tool_call_records[0].args_full =
+                        Some(serde_json::json!({"command":command}).to_string());
+                    assert!(
+                        exploratory_failure_is_known_diagnostic(&state, &failure),
+                        "{command} is a known diagnostic"
+                    );
+                }
+                for command in [
+                    "set -e > changed; cargo test",
+                    "set -e $(opaque); cargo test",
+                    "SET -e; cargo test",
+                    "CARGO TEST",
+                    "cargo TEST",
+                    "python3 -m PYTEST",
+                    "python3 opaque.py; cargo test",
+                ] {
+                    state.stall.tool_call_records[0].args_full =
+                        Some(serde_json::json!({"command":command}).to_string());
+                    assert!(
+                        !exploratory_failure_is_known_diagnostic(&state, &failure),
+                        "{command} must not hide an opaque or writing segment"
+                    );
+                }
+                state.stall.tool_call_records[0].args_full =
+                    Some(serde_json::json!({"command":"python3 -c 'print(1 / 0)'"}).to_string());
+            }
+
+            state.stall.tool_call_records[0].workspace_mutation_receipt = None;
+            assert!(
+                unresolved_tool_outcome_is_terminally_relevant(&state, &failure),
+                "missing executor observation is unknown effect, not proven read-only"
+            );
+            assert!(enforce_outcome_reconciliation_before_text_completion(
+                &mut state, None,
+            ));
+            assert_eq!(
+                state
+                    .hooks
+                    .completion_settlement
+                    .outcome_reconciliation_retries,
+                1
+            );
+            assert!(
+                !enforce_outcome_reconciliation_before_text_completion(&mut state, None),
+                "a missing receipt must not cause unbounded recovery rounds"
+            );
+            state.stall.tool_call_records[0].workspace_mutation_receipt = unchanged
+                .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+                .cloned();
+            state.stall.tool_call_records[0]
+                .workspace_mutation_receipt
+                .as_mut()
+                .unwrap()["ownership"] = serde_json::json!(
+                astra_tools::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP
+            );
+            assert!(
+                unresolved_tool_outcome_is_terminally_relevant(&state, &failure),
+                "a weak process group can leave a writer behind"
+            );
+            state.stall.tool_call_records[0].workspace_mutation_receipt = unchanged
+                .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+                .cloned();
+
+            state.turn_intent = None;
+            assert!(
+                unresolved_tool_outcome_is_terminally_relevant(&state, &failure),
+                "unknown intent must remain conservative"
+            );
+            state.turn_intent = Some(
+                TurnIntent::default().with_workspace_mutation(WorkspaceMutationIntent::ReadOnly),
+            );
+            state.stall.tool_call_records[0].args_full =
+                Some(serde_json::json!({"command":"echo changed > file.txt"}).to_string());
+            assert!(
+                unresolved_tool_outcome_is_terminally_relevant(&state, &failure),
+                "positive writer shape must remain strict even under read-only intent"
+            );
+            state.stall.tool_call_records[0].execution_completion = None;
+            assert!(
+                unresolved_tool_outcome_is_terminally_relevant(&state, &failure),
+                "missing execution reference must remain strict"
+            );
+            assert!(enforce_persistent_unresolved_outcome_terminal(
+                &mut state,
+                &TaskResolutionCoverage::NoAssessment,
+            ));
+            assert_eq!(
+                state.interruption.as_ref().map(|record| record.kind),
+                Some(InterruptionKind::ExecutionIncomplete),
+            );
+        }
     }
 
     #[test]

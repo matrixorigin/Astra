@@ -205,8 +205,13 @@ state, unfinished child/fanout execution, or an invocation that cannot be
 rejoined to durable authority. Ordinary diagnostic probes remain in the full
 ledger and final explanation, but do not turn the answer into
 `ExecutionIncomplete` merely because a later observation exists. This keeps
-the rule semantic rather than tied to one command name. If the runtime cannot
-classify a failed invocation because its authority is missing, it fails closed
+the rule semantic rather than tied to one command name. For a failed opaque
+executable, read-only task intent alone does not prove no effect: the diagnostic
+exception requires an executor-owned unchanged-workspace receipt. Missing or
+weak observation remains an unresolved completion risk. An exploratory profile
+may report a failed known observation or validation, but cannot erase a failed
+opaque execution with unproven effects. If the runtime cannot classify a failed
+invocation because its authority is missing, it fails closed
 and retains the strict path. The full schema is supplied only in that
 boundary's hint, not added to resident tools. The proposal identifies the
 verification target, failed and later evidence calls,

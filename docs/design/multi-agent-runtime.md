@@ -117,6 +117,10 @@ under the admission lock. Recovery settles only those explicitly unassigned
 slots; a child absent from a recovery page remains unknown until its own durable
 state arrives. Proven terminal state is published under the group lock before
 eviction is possible; rejected recovery must not mutate a different owner.
+After exact owner and group validation, a recovered cancellation closes the
+execution-owned parent admission fence before optional projection admission;
+projection capacity cannot reopen that parent. Spawn reservation rechecks the
+same fence after asynchronous preparation, so either admission or closure wins.
 Durable and workspace recovery apply each available group's child evidence as
 one batch; a child already archived without group membership stays eligible for
 later repair. Missing child pages never manufacture terminal slots.

@@ -591,6 +591,7 @@ struct DurableFanoutGroupCancellation {
 enum FanoutAdmission {
     Live,
     Recovery,
+    RecoveryCancellation,
 }
 
 fn settle_recovered_cancelled_group(
@@ -649,6 +650,15 @@ impl FanoutParentAdmission {
 
     fn check(&self, group_id: Option<&str>, recovery: bool) -> Result<(), SpawnError> {
         let state = astra_core::sync_poison::recover_mutex_lock(&self.state);
+        self.check_state(&state, group_id, recovery)
+    }
+
+    fn check_state(
+        &self,
+        state: &FanoutParentState,
+        group_id: Option<&str>,
+        recovery: bool,
+    ) -> Result<(), SpawnError> {
         if state.closed && !recovery {
             return Err(SpawnError::Race(format!(
                 "parent run '{}' no longer accepts fanout child admissions after settlement or cancellation",
@@ -2528,12 +2538,13 @@ impl DynamicAgentSpawner {
                     .or_else(|| states.first().map(|state| state.description.as_str())),
                 None,
                 parent_run_id,
-                FanoutAdmission::Recovery,
+                if cancellation.is_some() {
+                    FanoutAdmission::RecoveryCancellation
+                } else {
+                    FanoutAdmission::Recovery
+                },
             )
             .await?;
-        if cancellation.is_some() {
-            self.fanout_parent(parent_run_id).close();
-        }
         let mut index = self.fanout_agent_index.write().await;
         for agent_id in evicted_agent_ids {
             index.remove(&agent_id);
@@ -3430,11 +3441,11 @@ impl DynamicAgentSpawner {
         let mut groups = self.fanout_groups.write().await;
         parent.check(
             Some(&identity.group_id),
-            matches!(admission, FanoutAdmission::Recovery),
+            !matches!(admission, FanoutAdmission::Live),
         )?;
         // Rejected recovery/admission must not mutate another parent's group
         // or consume a retired receipt with incompatible slot metadata.
-        let closed_by_parent = {
+        {
             let state = astra_core::sync_poison::recover_mutex_lock(&parent.state);
             if let Some(group) = groups
                 .get(&identity.group_id)
@@ -3455,10 +3466,9 @@ impl DynamicAgentSpawner {
                     )));
                 }
             }
-            state.closed
-        };
+        }
         let is_new = !groups.contains_key(&identity.group_id);
-        let evicted_agent_ids = if is_new {
+        if is_new {
             if let Some(existing) = groups
                 .values()
                 .find(|group| group.parent_run_id.as_deref() == Some(parent_run_id))
@@ -3481,6 +3491,14 @@ impl DynamicAgentSpawner {
                     limit: FANOUT_GROUP_PERSISTENCE_QUEUE_CAPACITY,
                 });
             }
+        }
+        // A valid durable cancellation closes the execution-owned fence even
+        // when this optional bounded projection has no room to recover.
+        if matches!(admission, FanoutAdmission::RecoveryCancellation) {
+            parent.close();
+        }
+        let closed_by_parent = astra_core::sync_poison::recover_mutex_lock(&parent.state).closed;
+        let evicted_agent_ids = if is_new {
             self.evict_terminal_fanout_group_if_full(&mut groups)
                 .await?
         } else {
@@ -4321,7 +4339,7 @@ impl DynamicAgentSpawner {
         execution_deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
     ) -> Result<SpawnAgentOutput, SpawnError> {
         let _activity = self.begin_lifecycle_activity();
-        let _parent = self.fanout_parent(&context.parent_run_id);
+        let parent = self.fanout_parent(&context.parent_run_id);
         if !*self
             .background_task_admission
             .lock()
@@ -4334,6 +4352,7 @@ impl DynamicAgentSpawner {
         let prepared = self.prepare_and_spawn(
             input,
             context,
+            parent,
             Arc::clone(&preparation_installed),
             execution_deadline,
         );
@@ -4355,6 +4374,7 @@ impl DynamicAgentSpawner {
         &self,
         input: SpawnAgentInput,
         context: &SpawnContext,
+        parent: Arc<FanoutParentAdmission>,
         preparation_installed: Arc<std::sync::atomic::AtomicBool>,
         execution_deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
     ) -> Result<SpawnAgentOutput, SpawnError> {
@@ -4407,8 +4427,7 @@ impl DynamicAgentSpawner {
                     group.group_id
                 )));
             }
-            self.fanout_parent(&context.parent_run_id)
-                .check(None, false)?;
+            parent.check(None, false)?;
         }
 
         // 1. Validate agent type
@@ -4579,8 +4598,7 @@ impl DynamicAgentSpawner {
             hook();
         }
         if let Some(identity) = fanout_slot.as_ref() {
-            self.fanout_parent(&context.parent_run_id)
-                .check(Some(&identity.group_id), false)?;
+            parent.check(Some(&identity.group_id), false)?;
             let closed_projection = self
                 .fanout_groups
                 .read()
@@ -4632,6 +4650,15 @@ impl DynamicAgentSpawner {
                 drop(cancellation_fence);
                 return Err(SpawnError::LifecycleShuttingDown);
             }
+            // Preparation may await after its earlier check. Hold the exact
+            // parent fence through reservation so cancellation and admission
+            // have one ordering, even without a live group projection.
+            let parent_state = astra_core::sync_poison::recover_mutex_lock(&parent.state);
+            parent.check_state(
+                &parent_state,
+                fanout_slot.as_ref().map(|slot| slot.group_id.as_str()),
+                false,
+            )?;
             // Preparation above can await on prefix resolution, group state,
             // and lifecycle locks. Recheck at the first side-effectful
             // admission point so an expired child never consumes capacity or
@@ -4648,6 +4675,7 @@ impl DynamicAgentSpawner {
             if !deadline_rejection && capacity_rejection.is_none() {
                 active_agents.insert(agent_id.clone(), state);
             }
+            drop(parent_state);
             drop(admission);
             drop(active_agents);
             drop(cancellation_fence);
@@ -8619,6 +8647,105 @@ mod tests {
             .declare_fanout_group("review", "current work", 1, None, "current-parent")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_parent_stays_fenced_when_recovery_projection_is_full() {
+        let executor = Arc::new(CountingSuccessExecutor {
+            starts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(executor.clone() as Arc<dyn SpawnAgentExecutor>);
+        let parent = spawner.fanout_parent("root");
+        for index in 0..MAX_FANOUT_GROUPS {
+            spawner
+                .declare_fanout_group(
+                    &format!("busy-{index}"),
+                    "unfinished",
+                    1,
+                    None,
+                    &format!("other-parent-{index}"),
+                )
+                .await
+                .unwrap();
+        }
+        let mut root = durable_run("root", 0, astra_core::STATUS_RUNNING);
+        root.events.push(json!({
+            "event_type": FANOUT_GROUP_CANCELLED_EVENT_TYPE,
+            "data": {"group_id":"cancelled-full", "parent_run_id":"root", "target_count":1,
+                "unassigned_slots":[0], "cancellation_origin":"user"}
+        }));
+        spawner.restore_durable_agent_runs(&[root]).await;
+
+        assert!(spawner.fanout_group("cancelled-full").await.is_none());
+        assert!(parent.check(None, false).is_err());
+        let result = spawner.spawn(make_sync_input(), &make_bg_context()).await;
+        assert!(matches!(result, Err(SpawnError::Race(_))), "{result:?}");
+        assert_eq!(executor.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            spawner
+                .fanout_parent("unrelated")
+                .check(None, false)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovered_cancellation_rejects_spawn_paused_before_reservation() {
+        let executor = Arc::new(CountingSuccessExecutor {
+            starts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let spawner = Arc::new(
+            DynamicAgentSpawner::new(mock_router())
+                .with_executor(executor.clone() as Arc<dyn SpawnAgentExecutor>),
+        );
+        let _parent = spawner.fanout_parent("root");
+        let (entered, release) = pause_before_spawn_reservation(&spawner);
+        let spawn_task = {
+            let spawner = Arc::clone(&spawner);
+            tokio::spawn(async move { spawner.spawn(make_sync_input(), &make_bg_context()).await })
+        };
+        wait_for_spawn_reservation(&entered, &release).await;
+        let mut root = durable_run("root", 0, astra_core::STATUS_RUNNING);
+        root.events.push(json!({
+            "event_type": FANOUT_GROUP_CANCELLED_EVENT_TYPE,
+            "data": {"group_id":"cancelled-during-prepare", "parent_run_id":"root", "target_count":1,
+                "unassigned_slots":[0], "cancellation_origin":"runtime"}
+        }));
+        spawner.restore_durable_agent_runs(&[root]).await;
+        release.send(()).unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), spawn_task)
+            .await
+            .expect("late spawn must settle")
+            .expect("spawn task must not panic");
+        assert!(matches!(result, Err(SpawnError::Race(_))), "{result:?}");
+        assert_eq!(executor.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_recovery_cancellation_does_not_close_parent() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let parent = spawner.fanout_parent("root");
+        spawner
+            .declare_fanout_group("foreign", "other work", 1, None, "other-parent")
+            .await
+            .unwrap();
+        let mut root = durable_run("root", 0, astra_core::STATUS_RUNNING);
+        root.events.push(json!({
+            "event_type": FANOUT_GROUP_CANCELLED_EVENT_TYPE,
+            "data": {"group_id":"foreign", "parent_run_id":"root", "target_count":1,
+                "unassigned_slots":[0], "cancellation_origin":"user"}
+        }));
+        spawner.restore_durable_agent_runs(&[root]).await;
+        assert!(parent.check(None, false).is_ok());
+        assert!(
+            !spawner
+                .fanout_group("foreign")
+                .await
+                .unwrap()
+                .spawn_admission_closed()
+        );
     }
 
     #[tokio::test]
