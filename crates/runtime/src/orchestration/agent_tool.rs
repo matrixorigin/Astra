@@ -1578,15 +1578,35 @@ async fn render_agent_fanout_results(
     read_options: FanoutResultReadOptions,
     reconcile_durable: bool,
 ) -> String {
+    let mut resolved = ctx
+        .spawner
+        .fanout_group_for_session_result(&ctx.fanout_admission, group_id)
+        .await;
+    let mut reconciled = false;
+    if resolved.is_none() && reconcile_durable {
+        if let Err(error) = reconcile_durable_agent_runs_for_tool(ctx.spawner.as_ref()).await {
+            tracing::warn!(target: "fanout", %group_id, %error,
+                "durable fanout reconciliation failed before result discovery");
+        }
+        reconciled = true;
+        resolved = ctx
+            .spawner
+            .fanout_group_for_session_result(&ctx.fanout_admission, group_id)
+            .await;
+    }
+    let Some((owner, initial_group)) = resolved else {
+        return render_agent_tool_error(None, &format!("Unknown fanout group_id: {group_id}"));
+    };
+    let owner_run_id = owner.parent_run_id();
     if read_options.is_default()
         && let Some(cached) = ctx
             .spawner
-            .cached_terminal_fanout_result(&ctx.run_id, group_id)
+            .cached_terminal_fanout_result(owner_run_id, group_id)
             .await
     {
         return cached;
     }
-    if reconcile_durable {
+    if reconcile_durable && !reconciled {
         if let Err(error) = reconcile_durable_agent_runs_for_tool(ctx.spawner.as_ref()).await {
             tracing::warn!(
                 target: "fanout",
@@ -1596,10 +1616,12 @@ async fn render_agent_fanout_results(
             );
         }
     }
-    let result_generation = ctx.spawner.fanout_result_generation(&ctx.run_id);
-    let Some(group) = find_fanout_group(ctx, group_id).await else {
-        return render_agent_tool_error(None, &format!("Unknown fanout group_id: {group_id}"));
-    };
+    let result_generation = ctx.spawner.fanout_result_generation(owner_run_id);
+    let group = ctx
+        .spawner
+        .fanout_group_for_parent_run_and_id(owner_run_id, group_id)
+        .await
+        .unwrap_or(initial_group);
     if let Some(slot_index) = read_options.slot_index
         && !group.slots.iter().any(|slot| slot.slot_index == slot_index)
     {
@@ -1784,7 +1806,11 @@ async fn render_agent_fanout_results(
         }
     }
 
-    let updated = find_fanout_group(ctx, group_id).await.unwrap_or(group);
+    let updated = ctx
+        .spawner
+        .fanout_group_for_parent_run_and_id(owner_run_id, group_id)
+        .await
+        .unwrap_or(group);
     let summary = updated.summary();
     let all_slots_delivered =
         read_options.slot_index.is_none() && complete_deliverables == summary.target_count;
@@ -1904,7 +1930,7 @@ async fn render_agent_fanout_results(
     if read_options.is_default() && updated.is_terminal() && incomplete_result_count == 0 {
         ctx.spawner
             .cache_terminal_fanout_result(
-                &ctx.run_id,
+                owner_run_id,
                 group_id,
                 result_generation,
                 rendered.clone(),
@@ -4268,6 +4294,45 @@ mod tests {
             executor.take_captured_model().as_deref(),
             Some("MiniMax-M2.7")
         );
+    }
+
+    #[tokio::test]
+    async fn next_turn_reads_session_fanout_but_cannot_control_its_parent() {
+        let spawner = test_spawner(Arc::new(CapturingModelExecutor::new()));
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+        let started = handle_agent_fanout_tool(
+            &json!({"action":"start", "group_id":"prior-results", "target_count":1,
+                "slots":[{"id":"review", "description":"Review", "prompt":"Review the change."}]}),
+            Some(&ctx),
+        )
+        .await;
+        let original = collect_fanout_start(&started, &ctx).await;
+        assert_eq!(original["status"], "completed");
+        let mut next = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+        next.run_id = "next-root-turn".into();
+        next.fanout_admission = spawner.fanout_parent(&next.run_id);
+        let args = json!({"action":"get_results", "group_id":"prior-results"});
+        let first = handle_agent_fanout_tool(&args, Some(&next)).await;
+        let value: Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["results"][0]["result"]["status"], "completed");
+        assert_eq!(handle_agent_fanout_tool(&args, Some(&next)).await, first);
+        let stopped = handle_agent_fanout_tool(
+            &json!({"action":"stop_group", "group_id":"prior-results"}),
+            Some(&next),
+        )
+        .await;
+        assert!(stopped.contains("Unknown fanout group_id"), "{stopped}");
+        let other = test_spawn_context(
+            test_spawner(Arc::new(CapturingModelExecutor::new())),
+            Some("MiniMax-M2.7"),
+        );
+        let unknown = handle_agent_fanout_tool(&args, Some(&other)).await;
+        assert!(unknown.contains("Unknown fanout group_id"), "{unknown}");
+        let mut foreign_owner = other;
+        foreign_owner.fanout_admission = ctx.fanout_admission.clone();
+        let unknown = handle_agent_fanout_tool(&args, Some(&foreign_owner)).await;
+        assert!(unknown.contains("Unknown fanout group_id"), "{unknown}");
     }
 
     #[tokio::test]

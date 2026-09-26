@@ -117,6 +117,11 @@ under the admission lock. Recovery settles only those explicitly unassigned
 slots; a child absent from a recovery page remains unknown until its own durable
 state arrives. Proven terminal state is published under the group lock before
 eviction is possible; rejected recovery must not mutate a different owner.
+Durable and workspace recovery apply each available group's child evidence as
+one batch; a child already archived without group membership stays eligible for
+later repair. Missing child pages never manufacture terminal slots.
+Nonterminal durable rows prove acceptance, not that a remote executor stopped;
+only terminal child evidence settles a recovered slot.
 
 Each executing parent (including outstanding tool calls) owns its fanout admission
 fence and, after session-cache eviction, its complete terminal group receipt and
@@ -126,6 +131,11 @@ completed groups. Parent ownership expires with execution; historical cancellati
 must not permanently disable unrelated future parents. The session index is weak,
 and the live projection and persistence backlog remain bounded. No additional
 database operation is required for admission or reading an evicted receipt.
+Result observation may use another turn in the same session while the group is
+live or its owner receipt survives. Spawn/replay and stop actions still require
+the exact parent run. Historical reads use the owner's cache and do not emit a
+new parent collection event; a reused bare group ID is rejected when multiple
+owners remain visible, and evicted receipts are not made permanent.
 When a later durable child state corrects a terminal result, it refines the same
 parent-owned group receipt (live or evicted) and invalidates the rendered result;
 ordinary executor callbacks cannot overturn that durable terminal truth. Auto-ID

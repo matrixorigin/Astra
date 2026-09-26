@@ -22,7 +22,7 @@ use futures_util::{FutureExt, StreamExt};
 
 use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -590,7 +590,7 @@ struct DurableFanoutGroupCancellation {
 #[derive(Clone, Copy)]
 enum FanoutAdmission {
     Live,
-    Recovery { parent_terminal: bool },
+    Recovery,
 }
 
 fn settle_recovered_cancelled_group(
@@ -643,6 +643,10 @@ struct FanoutParentState {
 }
 
 impl FanoutParentAdmission {
+    pub fn parent_run_id(&self) -> &str {
+        &self.parent_run_id
+    }
+
     fn check(&self, group_id: Option<&str>, recovery: bool) -> Result<(), SpawnError> {
         let state = astra_core::sync_poison::recover_mutex_lock(&self.state);
         if state.closed && !recovery {
@@ -2454,6 +2458,246 @@ impl DynamicAgentSpawner {
             })
     }
 
+    /// Recover a group as one observation. Child archival is independent:
+    /// capacity failure never turns an accepted child into missing evidence.
+    async fn restore_fanout_batch(
+        &self,
+        states: &[SpawnedAgentState],
+        cancellation: Option<&DurableFanoutGroupCancellation>,
+        parent_terminal: bool,
+    ) -> Result<(), SpawnError> {
+        let cancellation_identity;
+        let identity = if let Some(first) = states.first() {
+            first.fanout_slot.as_ref().expect("fanout recovery batch")
+        } else {
+            let Some(cancellation) = cancellation else {
+                return Ok(());
+            };
+            cancellation_identity = AgentFanoutSlotIdentity::new(
+                cancellation.group_id.clone(),
+                cancellation.target_count,
+                0,
+                None,
+            )
+            .map_err(SpawnError::InvalidInput)?;
+            &cancellation_identity
+        };
+        let parent_run_id = states
+            .first()
+            .map(|state| state.parent_run_id.as_str())
+            .or_else(|| cancellation.map(|receipt| receipt.parent_run_id.as_str()))
+            .expect("nonempty recovery batch");
+        if states.iter().any(|state| {
+            state.parent_run_id != parent_run_id
+                || state.fanout_slot.as_ref().is_none_or(|slot| {
+                    slot.group_id != identity.group_id || slot.target_count != identity.target_count
+                })
+        }) || cancellation.is_some_and(|receipt| {
+            receipt.parent_run_id != parent_run_id
+                || receipt.group_id != identity.group_id
+                || receipt.target_count != identity.target_count
+        }) {
+            return Err(SpawnError::InvalidInput(
+                "conflicting fanout recovery batch".into(),
+            ));
+        }
+        let mut slot_claims = HashMap::new();
+        let mut agent_claims = HashMap::new();
+        for state in states {
+            let slot = state.fanout_slot.as_ref().expect("validated fanout child");
+            if slot_claims
+                .insert(
+                    slot.slot_index,
+                    (&state.agent_id, &state.run_id, &slot.slot_id),
+                )
+                .is_some_and(|claim| claim != (&state.agent_id, &state.run_id, &slot.slot_id))
+                || agent_claims
+                    .insert(&state.agent_id, slot.slot_index)
+                    .is_some_and(|claim| claim != slot.slot_index)
+            {
+                return Err(SpawnError::InvalidInput(
+                    "conflicting fanout recovery slot".into(),
+                ));
+            }
+        }
+        let (mut groups, evicted_agent_ids) = self
+            .get_or_validate_fanout_group(
+                identity,
+                cancellation
+                    .map(|_| "Recovered fanout")
+                    .or_else(|| states.first().map(|state| state.description.as_str())),
+                None,
+                parent_run_id,
+                FanoutAdmission::Recovery,
+            )
+            .await?;
+        if cancellation.is_some() {
+            self.fanout_parent(parent_run_id).close();
+        }
+        let mut index = self.fanout_agent_index.write().await;
+        for agent_id in evicted_agent_ids {
+            index.remove(&agent_id);
+        }
+        let group = groups
+            .get_mut(&identity.group_id)
+            .expect("recovery admission installs group");
+        let mut staged = group.clone();
+        let active_before = staged.summary().active;
+        let revision = staged.revision;
+        if cancellation.is_some() || parent_terminal {
+            staged.close_spawn_admission();
+        }
+        for state in states {
+            let slot_identity = state.fanout_slot.as_ref().expect("fanout recovery child");
+            let slot = staged
+                .slots
+                .get(slot_identity.slot_index)
+                .ok_or_else(|| SpawnError::InvalidInput("fanout slot is out of range".into()))?;
+            if let Some(existing) = slot.agent_id.as_deref() {
+                if existing != state.agent_id
+                    || slot.run_id.as_deref() != Some(&state.run_id)
+                    || slot.slot_id != slot_identity.slot_id
+                {
+                    return Err(SpawnError::InvalidInput(format!(
+                        "fanout slot {} conflicts with recovered child {}",
+                        slot_identity.slot_index, state.agent_id,
+                    )));
+                }
+            } else {
+                staged
+                    .restore_spawn_accepted_with_run(
+                        slot_identity.slot_index,
+                        &state.agent_id,
+                        Some(state.run_id.clone()),
+                        slot_identity.slot_id.clone(),
+                        &state.agent_type,
+                        &state.description,
+                    )
+                    .map_err(SpawnError::InvalidInput)?;
+            }
+            let projection = project_agent_status_to_fanout_slot(&state.status);
+            let slot = &staged.slots[slot_identity.slot_index];
+            // A nonterminal durable row only proves acceptance: another
+            // executor may still be running it. Only terminal rows settle
+            // the slot during recovery.
+            if !slot.status.is_terminal() && agent_status_is_terminal(&state.status) {
+                staged
+                    .record_status_by_agent(
+                        &state.agent_id,
+                        projection.status,
+                        projection.terminal_reason,
+                    )
+                    .map_err(SpawnError::InvalidInput)?;
+            }
+        }
+        if let Some(receipt) = cancellation {
+            settle_recovered_cancelled_group(&mut staged, receipt);
+        }
+        if staged.revision != revision {
+            staged.touch();
+            self.invalidate_fanout_result(parent_run_id);
+            self.adjust_cached_active_fanout_slots(active_before, staged.summary().active);
+            self.publish_fanout_group(&staged);
+            *group = staged;
+        }
+        for state in states {
+            index.insert(state.agent_id.clone(), identity.group_id.clone());
+        }
+        Ok(())
+    }
+
+    async fn restore_recovered_fanout_batches(
+        &self,
+        states: &[SpawnedAgentState],
+        cancellations: &[DurableFanoutGroupCancellation],
+        terminal_parents: &HashSet<&str>,
+    ) {
+        let mut batches: BTreeMap<(String, String), Vec<SpawnedAgentState>> = BTreeMap::new();
+        for state in states {
+            if let Some(identity) = &state.fanout_slot {
+                batches
+                    .entry((state.parent_run_id.clone(), identity.group_id.clone()))
+                    .or_default()
+                    .push(state.clone());
+            }
+        }
+        for receipt in cancellations {
+            batches
+                .entry((receipt.parent_run_id.clone(), receipt.group_id.clone()))
+                .or_default();
+        }
+        // A later snapshot page may only supply the second child. An earlier
+        // child can already be archived even when capacity rejected its group.
+        // Reuse that in-memory evidence without another database read.
+        for state in self.completed_agents.read().await.iter() {
+            let Some(identity) = &state.fanout_slot else {
+                continue;
+            };
+            if let Some(batch) =
+                batches.get_mut(&(state.parent_run_id.clone(), identity.group_id.clone()))
+                && !batch.iter().any(|known| known.agent_id == state.agent_id)
+            {
+                batch.push(state.clone());
+            }
+        }
+        let receipts: HashMap<_, _> = cancellations
+            .iter()
+            .map(|receipt| {
+                (
+                    (receipt.parent_run_id.as_str(), receipt.group_id.as_str()),
+                    receipt,
+                )
+            })
+            .collect();
+        let live = self.fanout_groups.read().await;
+        let mut ordered = batches.into_iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|((parent, group_id), states)| {
+            let receipt = receipts.get(&(parent.as_str(), group_id.as_str())).copied();
+            let complete = states
+                .first()
+                .and_then(|state| state.fanout_slot.as_ref())
+                .map(|identity| {
+                    let terminal = states
+                        .iter()
+                        .filter(|state| agent_status_is_terminal(&state.status))
+                        .filter_map(|state| state.fanout_slot.as_ref().map(|slot| slot.slot_index))
+                        .collect::<HashSet<_>>();
+                    (0..identity.target_count).all(|slot| {
+                        terminal.contains(&slot)
+                            || receipt.is_some_and(|r| r.unassigned_slots.contains(&slot))
+                    })
+                })
+                .unwrap_or_else(|| {
+                    receipt.is_some_and(|r| r.unassigned_slots.len() == r.target_count)
+                });
+            (
+                if live
+                    .get(group_id)
+                    .is_some_and(|group| group.parent_run_id.as_deref() == Some(parent))
+                {
+                    0
+                } else if complete {
+                    1
+                } else {
+                    2
+                },
+                parent.clone(),
+                group_id.clone(),
+            )
+        });
+        drop(live);
+        for ((parent, group_id), states) in ordered {
+            let receipt = receipts.get(&(parent.as_str(), group_id.as_str())).copied();
+            if let Err(error) = self
+                .restore_fanout_batch(&states, receipt, terminal_parents.contains(parent.as_str()))
+                .await
+            {
+                tracing::warn!(target: "fanout", %parent, %group_id, %error,
+                    "could not restore fanout membership; retaining child evidence for retry");
+            }
+        }
+    }
+
     /// Rebuild read-only local agent/fanout results after a CLI or Edge
     /// process restart. Workspace rows provide immutable run lineage and
     /// lifecycle; the canonical journal supplies a complete final assistant
@@ -2470,10 +2714,8 @@ impl DynamicAgentSpawner {
             .and_then(|session_id| astra_services::session_journal::read_journal(session_id).ok())
             .unwrap_or_default();
         let mut restored = 0;
+        let mut recovered = Vec::new();
         for projection in projections {
-            if self.get_agent_state_any(&projection.id).await.is_some() {
-                continue;
-            }
             let exact_result =
                 restored_agent_result_from_journal(&journal_events, projection.run_id.as_str());
             let status = restored_agent_status(projection, exact_result);
@@ -2514,42 +2756,20 @@ impl DynamicAgentSpawner {
                 fanout_slot: fanout_slot.clone(),
                 execution_metadata: None,
             };
-            if let (Some(identity), Some(fanout)) =
-                (fanout_slot.as_ref(), projection.fanout.as_ref())
-            {
-                if let Err(error) = self
-                    .record_fanout_spawn_accepted(
-                        identity,
-                        Some(fanout.group_title.as_str()),
-                        &state.agent_id,
-                        &state.run_id,
-                        &state.agent_type,
-                        &state.description,
-                        None,
-                        &state.parent_run_id,
-                        None,
-                        FanoutAdmission::Recovery {
-                            parent_terminal: false,
-                        },
-                        None,
-                    )
-                    .await
+            if let Some(existing) = self.get_agent_state_any(&state.agent_id).await {
+                if existing.run_id == state.run_id && existing.parent_run_id == state.parent_run_id
                 {
-                    tracing::warn!(
-                        agent_id = %state.agent_id,
-                        run_id = %state.run_id,
-                        group_id = %identity.group_id,
-                        %error,
-                        "could not restore fanout membership; preserving the child result without group membership"
-                    );
-                } else {
-                    self.record_fanout_terminal_state(&state).await;
+                    recovered.push(existing);
                 }
+                continue;
             }
+            recovered.push(state.clone());
             self.publish_background_agent(&state);
             self.archive_state(state).await;
             restored += 1;
         }
+        self.restore_recovered_fanout_batches(&recovered, &[], &HashSet::new())
+            .await;
         restored
     }
 
@@ -2569,72 +2789,7 @@ impl DynamicAgentSpawner {
             .filter(|run| durable_run_is_terminal(&run.status))
             .map(|run| run.run_id.as_str())
             .collect::<HashSet<_>>();
-        let cancelled_groups = group_cancellations
-            .iter()
-            .map(|cancellation| {
-                (
-                    (
-                        cancellation.parent_run_id.as_str(),
-                        cancellation.group_id.as_str(),
-                    ),
-                    cancellation,
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        for cancellation in &group_cancellations {
-            let parent_terminal =
-                terminal_parent_run_ids.contains(cancellation.parent_run_id.as_str());
-            let parent = self.fanout_parent(&cancellation.parent_run_id);
-            parent.close();
-            let identity = AgentFanoutSlotIdentity::new(
-                cancellation.group_id.clone(),
-                cancellation.target_count,
-                0,
-                None,
-            );
-            let Ok(identity) = identity else {
-                tracing::warn!(
-                    target: "fanout",
-                    group_id = %cancellation.group_id,
-                    parent_run_id = %cancellation.parent_run_id,
-                    target_count = cancellation.target_count,
-                    "ignoring invalid durable fanout cancellation projection"
-                );
-                continue;
-            };
-            match self
-                .get_or_validate_fanout_group(
-                    &identity,
-                    Some("Recovered fanout"),
-                    None,
-                    &cancellation.parent_run_id,
-                    FanoutAdmission::Recovery { parent_terminal },
-                )
-                .await
-            {
-                Ok((mut groups, evicted_agent_ids)) => {
-                    let mut index = self.fanout_agent_index.write().await;
-                    for agent_id in evicted_agent_ids {
-                        index.remove(&agent_id);
-                    }
-                    if let Some(group) = groups.get_mut(&cancellation.group_id) {
-                        // Only proven unassigned slots settle here. Publish
-                        // under this lock before a terminal group can evict.
-                        if settle_recovered_cancelled_group(group, cancellation) {
-                            self.invalidate_fanout_result(&cancellation.parent_run_id);
-                        }
-                        self.publish_fanout_group(group);
-                    }
-                }
-                Err(error) => tracing::warn!(
-                    target: "fanout",
-                    group_id = %cancellation.group_id,
-                    parent_run_id = %cancellation.parent_run_id,
-                    %error,
-                    "could not restore durable fanout group cancellation projection"
-                ),
-            }
-        }
+        let mut recovered = Vec::new();
         let mut restored = 0;
         for run in runs.iter().filter(|run| run.depth > 0) {
             let Some(agent_id) = run.agent_id.as_deref().or_else(|| {
@@ -2644,9 +2799,6 @@ impl DynamicAgentSpawner {
             }) else {
                 continue;
             };
-            if self.get_agent_state_any(agent_id).await.is_some() {
-                continue;
-            }
             let spawn = spawned.get(run.run_id.as_str());
             let status = durable_agent_status(run);
             let state = SpawnedAgentState {
@@ -2684,33 +2836,14 @@ impl DynamicAgentSpawner {
                 fanout_slot: spawn.and_then(|spawn| spawn.fanout_slot.clone()),
                 execution_metadata: None,
             };
-            if let Some(identity) = state.fanout_slot.as_ref() {
-                if self
-                    .record_fanout_spawn_accepted(
-                        identity,
-                        Some(identity.group_id.as_str()),
-                        &state.agent_id,
-                        &state.run_id,
-                        &state.agent_type,
-                        &state.description,
-                        None,
-                        &state.parent_run_id,
-                        None,
-                        FanoutAdmission::Recovery {
-                            parent_terminal: terminal_parent_run_ids
-                                .contains(state.parent_run_id.as_str()),
-                        },
-                        cancelled_groups
-                            .get(&(state.parent_run_id.as_str(), identity.group_id.as_str()))
-                            .copied(),
-                    )
-                    .await
-                    .is_ok()
-                    && agent_status_is_terminal(&state.status)
+            if let Some(existing) = self.get_agent_state_any(&state.agent_id).await {
+                if existing.run_id == state.run_id && existing.parent_run_id == state.parent_run_id
                 {
-                    self.record_fanout_terminal_state(&state).await;
+                    recovered.push(existing);
                 }
+                continue;
             }
+            recovered.push(state.clone());
             self.durable_observed_agent_ids
                 .write()
                 .await
@@ -2719,19 +2852,12 @@ impl DynamicAgentSpawner {
             self.archive_state(state).await;
             restored += 1;
         }
-        // Groups first admitted during the child pass also need their explicit
-        // unassigned receipt. Absence from a page is never proof of termination.
-        let mut groups = self.fanout_groups.write().await;
-        for cancellation in &group_cancellations {
-            if let Some(group) = groups.get_mut(&cancellation.group_id)
-                && group.parent_run_id.as_deref() == Some(&cancellation.parent_run_id)
-            {
-                if settle_recovered_cancelled_group(group, cancellation) {
-                    self.invalidate_fanout_result(&cancellation.parent_run_id);
-                }
-                self.publish_fanout_group(group);
-            }
-        }
+        self.restore_recovered_fanout_batches(
+            &recovered,
+            &group_cancellations,
+            &terminal_parent_run_ids,
+        )
+        .await;
         restored
     }
 
@@ -2874,6 +3000,72 @@ impl DynamicAgentSpawner {
             .as_ref()
             .filter(|group| group.group_id == group_id)
             .cloned()
+    }
+
+    /// Result observation is session-scoped; admission and cancellation stay
+    /// bound to the exact parent run. Retain the owner through an async read so
+    /// an evicted terminal receipt and its cache cannot disappear mid-render.
+    pub async fn fanout_group_for_session_result(
+        &self,
+        current_parent: &Arc<FanoutParentAdmission>,
+        group_id: &str,
+    ) -> Option<(Arc<FanoutParentAdmission>, AgentFanoutGroupProjection)> {
+        if !astra_core::sync_poison::recover_mutex_lock(&self.fanout_parents)
+            .get(current_parent.parent_run_id())
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|owner| Arc::ptr_eq(&owner, current_parent))
+        {
+            return None;
+        }
+        if let Some(group) = astra_core::sync_poison::recover_mutex_lock(&current_parent.state)
+            .retired_group
+            .as_ref()
+            .filter(|group| group.group_id == group_id)
+            .cloned()
+        {
+            return Some((Arc::clone(current_parent), group));
+        }
+        let groups = self.fanout_groups.read().await;
+        let live = groups.get(group_id).cloned();
+        let mut found = if let Some(group) = live {
+            let owner = self
+                .fanout_group_owners
+                .read()
+                .await
+                .get(&(group.parent_run_id.clone()?, group_id.to_string()))
+                .map(|owner| Arc::clone(&owner._admission))?;
+            if Arc::ptr_eq(&owner, current_parent) {
+                return Some((owner, group));
+            }
+            Some((owner, group))
+        } else {
+            None
+        };
+        // A bare group_id is only a session address while it is unique. A
+        // reused ID must not silently redirect another turn to newer work.
+        // Keep the live-group guard through the retired scan so eviction
+        // cannot move one candidate between the two views mid-lookup.
+        let parents = astra_core::sync_poison::recover_mutex_lock(&self.fanout_parents);
+        for owner in parents.values().filter_map(std::sync::Weak::upgrade) {
+            let group = astra_core::sync_poison::recover_mutex_lock(&owner.state)
+                .retired_group
+                .as_ref()
+                .filter(|group| group.group_id == group_id)
+                .cloned();
+            if let Some(group) = group {
+                if found
+                    .as_ref()
+                    .is_some_and(|(known, _)| Arc::ptr_eq(known, &owner))
+                {
+                    continue;
+                }
+                if found.is_some() {
+                    return None;
+                }
+                found = Some((owner, group));
+            }
+        }
+        found
     }
 
     /// Snapshot every currently active fanout as producer-owned work truth.
@@ -3238,7 +3430,7 @@ impl DynamicAgentSpawner {
         let mut groups = self.fanout_groups.write().await;
         parent.check(
             Some(&identity.group_id),
-            matches!(admission, FanoutAdmission::Recovery { .. }),
+            matches!(admission, FanoutAdmission::Recovery),
         )?;
         // Rejected recovery/admission must not mutate another parent's group
         // or consume a retired receipt with incompatible slot metadata.
@@ -3371,8 +3563,6 @@ impl DynamicAgentSpawner {
         created_by_tool_use_id: Option<&str>,
         parent_run_id: &str,
         execution_deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
-        admission: FanoutAdmission,
-        recovered_cancellation: Option<&DurableFanoutGroupCancellation>,
     ) -> Result<(), SpawnError> {
         let (mut groups, evicted_agent_ids) = self
             .get_or_validate_fanout_group(
@@ -3380,7 +3570,7 @@ impl DynamicAgentSpawner {
                 group_title,
                 created_by_tool_use_id,
                 parent_run_id,
-                admission,
+                FanoutAdmission::Live,
             )
             .await?;
         // Acquire the index lock while still holding `groups` to close the
@@ -3400,16 +3590,6 @@ impl DynamicAgentSpawner {
                 identity.group_id
             ))
         })?;
-        if recovered_cancellation.is_some()
-            || matches!(
-                admission,
-                FanoutAdmission::Recovery {
-                    parent_terminal: true
-                }
-            )
-        {
-            group.close_spawn_admission();
-        }
         // Admission is the mutation below, not the earlier active-agent
         // reservation. Recheck after obtaining every admission lock so lock
         // contention cannot make an expired child look accepted.
@@ -3449,34 +3629,17 @@ impl DynamicAgentSpawner {
             return Err(SpawnError::ExecutionDeadlineElapsed);
         }
         let active_before = group.summary().active;
-        if matches!(admission, FanoutAdmission::Recovery { .. }) {
-            group
-                .restore_spawn_accepted_with_run(
-                    identity.slot_index,
-                    agent_id,
-                    Some(run_id.to_string()),
-                    identity.slot_id.clone(),
-                    agent_type,
-                    description,
-                )
-                .map_err(SpawnError::InvalidInput)?;
-        } else {
-            group
-                .set_slot_request(
-                    identity.slot_index,
-                    identity.slot_id.clone(),
-                    agent_type,
-                    description,
-                )
-                .map_err(SpawnError::InvalidInput)?;
-            group
-                .record_spawn_accepted_with_run(
-                    identity.slot_index,
-                    agent_id,
-                    Some(run_id.to_string()),
-                )
-                .map_err(SpawnError::InvalidInput)?;
-        }
+        group
+            .set_slot_request(
+                identity.slot_index,
+                identity.slot_id.clone(),
+                agent_type,
+                description,
+            )
+            .map_err(SpawnError::InvalidInput)?;
+        group
+            .record_spawn_accepted_with_run(identity.slot_index, agent_id, Some(run_id.to_string()))
+            .map_err(SpawnError::InvalidInput)?;
         let active_after = group.summary().active;
         group.touch();
         self.invalidate_fanout_result(parent_run_id);
@@ -4665,8 +4828,6 @@ impl DynamicAgentSpawner {
                     context.spawn_tool_call_id.as_deref(),
                     &context.parent_run_id,
                     execution_deadline,
-                    FanoutAdmission::Live,
-                    None,
                 )
                 .await
         {
@@ -6595,6 +6756,12 @@ impl DynamicAgentSpawner {
             return;
         };
         self.mark_fanout_result_collected(&state).await;
+        // Historical session reads are observations, not a collection action
+        // by the original parent. The read tool has its own invocation trace;
+        // do not write a child lifecycle event under a different parent run.
+        if parent_run_id != state.parent_run_id {
+            return;
+        }
         let Some(trace) = state.trace_context.as_ref() else {
             return;
         };
@@ -8361,6 +8528,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cold_next_turn_result_discovers_durable_group_once_then_hits_owner_cache() {
+        use crate::orchestration::{
+            AgentToolContext, AgentTranscriptLocation, InheritedPermissions,
+            WorkspaceMutationAuthority, handle_agent_fanout_tool,
+        };
+        struct CountingRecovery {
+            runs: Vec<astra_services::runs::DurableRunRecord>,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait]
+        impl DurableAgentReconciler for CountingRecovery {
+            async fn load_agent_recovery(
+                &self,
+            ) -> Result<Vec<astra_services::runs::DurableRunRecord>, String> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(self.runs.clone())
+            }
+        }
+        let mut parent = durable_run("cold-parent", 0, astra_core::STATUS_COMPLETED);
+        parent.events.push(json!({
+            "type":"agent_spawned", "run_id":"cold-child", "agent_id":"cold-agent",
+            "fanout_slot":{"group_id":"cold-group", "target_count":1, "slot_index":0}
+        }));
+        let mut child = durable_run("cold-child", 1, astra_core::STATUS_COMPLETED);
+        child.parent_run_id = Some("cold-parent".into());
+        child.agent_id = Some("cold-agent".into());
+        child
+            .events
+            .push(json!({"event_type":"text_done", "data":{"full_text":"cold result"}}));
+        let recovery = Arc::new(CountingRecovery {
+            runs: vec![parent, child],
+            calls: Default::default(),
+        });
+        let spawner = Arc::new(DynamicAgentSpawner::new(mock_router()));
+        spawner.set_durable_agent_reconciler(recovery.clone()).await;
+        let ctx = AgentToolContext {
+            fanout_admission: spawner.fanout_parent("next-turn"),
+            run_id: "next-turn".into(),
+            agent_id: "root-agent".into(),
+            delegation_chain: Vec::new(),
+            current_model: None,
+            recursion_depth: 0,
+            is_fork_child: false,
+            working_dir: PathBuf::from("."),
+            spawner,
+            inherited_permissions: InheritedPermissions::auto_approve(),
+            enabled_tools: None,
+            active_skills: Vec::new(),
+            live_event_sink: None,
+            client_tool_delivery_tx: None,
+            trace_context: None,
+            execution_metadata: None,
+            execution_deadline: None,
+            workspace_mutation: WorkspaceMutationAuthority::default(),
+            transcript_location: AgentTranscriptLocation::DurableServer,
+        };
+        let args = json!({"action":"get_results", "group_id":"cold-group"});
+        let first = handle_agent_fanout_tool(&args, Some(&ctx)).await;
+        let value: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(value["completed"], 1, "{first}");
+        assert_eq!(handle_agent_fanout_tool(&args, Some(&ctx)).await, first);
+        assert_eq!(recovery.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn completed_history_does_not_close_another_parents_same_named_group() {
         let spawner = DynamicAgentSpawner::new(mock_router());
         let _current = spawner.fanout_parent("current-parent");
@@ -8387,6 +8619,63 @@ mod tests {
             .declare_fanout_group("review", "current work", 1, None, "current-parent")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cross_turn_result_rejects_reused_group_id_without_an_exact_owner() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let old_parent = spawner.fanout_parent("old-parent");
+        spawner
+            .declare_fanout_group("review", "old work", 1, None, "old-parent")
+            .await
+            .unwrap();
+        spawner
+            .record_fanout_spawn_rejected(
+                &AgentFanoutSlotIdentity::new("review", 1, 0, None).unwrap(),
+                None,
+                "reviewer",
+                "review",
+                "rejected",
+                None,
+                "old-parent",
+            )
+            .await
+            .unwrap();
+        {
+            let mut groups = spawner.fanout_groups.write().await;
+            for index in 1..MAX_FANOUT_GROUPS {
+                let mut filler = AgentFanoutGroupProjection::new(format!("filler-{index}"), "", 1);
+                filler
+                    .record_unassigned_terminal(0, AgentFanoutSlotStatus::SpawnRejected, "done")
+                    .unwrap();
+                filler.last_touched = SystemTime::now() + Duration::from_secs(60);
+                groups.insert(filler.group_id.clone(), filler);
+            }
+        }
+        spawner
+            .declare_fanout_group("new-slot", "new", 1, None, "new-slot-parent")
+            .await
+            .unwrap();
+        let new_parent = spawner.fanout_parent("new-parent");
+        spawner
+            .declare_fanout_group("review", "new work", 1, None, "new-parent")
+            .await
+            .unwrap();
+        let third_parent = spawner.fanout_parent("third-parent");
+        assert!(
+            spawner
+                .fanout_group_for_session_result(&third_parent, "review")
+                .await
+                .is_none(),
+            "a bare reused ID must not select the unrelated live owner"
+        );
+        for (parent, expected) in [(&old_parent, "old-parent"), (&new_parent, "new-parent")] {
+            let (_, group) = spawner
+                .fanout_group_for_session_result(parent, "review")
+                .await
+                .unwrap();
+            assert_eq!(group.parent_run_id.as_deref(), Some(expected));
+        }
     }
 
     #[tokio::test]
@@ -8419,30 +8708,32 @@ mod tests {
             "data": {"group_id":"unpublished", "parent_run_id":"root-run", "target_count":1,
                 "unassigned_slots":[0], "cancellation_origin":"user"}
         }));
-        let mut child = durable_run("unrelated-child", 1, astra_core::STATUS_COMPLETED);
-        child.agent_id = Some("unrelated-agent".into());
-        // Gate the real read between the receipt pass and publication pass.
-        let gate = spawner.active_agents.write().await;
+        // Hold the membership index while recovery owns the group lock. An
+        // eviction contender must not see a terminal group before its work
+        // observation is published by the same recovery transaction.
+        let gate = spawner.fanout_agent_index.write().await;
         let restore = tokio::spawn({
             let spawner = spawner.clone();
-            async move { spawner.restore_durable_agent_runs(&[root, child]).await }
+            async move { spawner.restore_durable_agent_runs(&[root]).await }
         });
         tokio::time::timeout(Duration::from_secs(2), async {
-            while !spawner
-                .fanout_group("unpublished")
-                .await
-                .unwrap()
-                .is_terminal()
-            {
+            while spawner.fanout_groups.try_read().is_ok() {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
-        spawner
-            .declare_fanout_group("new-group", "new work", 1, None, "new-parent")
-            .await
-            .unwrap();
+        let evict = tokio::spawn({
+            let spawner = spawner.clone();
+            async move {
+                spawner
+                    .declare_fanout_group("new-group", "new work", 1, None, "new-parent")
+                    .await
+            }
+        });
+        drop(gate);
+        restore.await.unwrap();
+        evict.await.unwrap().unwrap();
         assert!(spawner.fanout_group("unpublished").await.is_none());
         assert!(
             spawner
@@ -8451,8 +8742,6 @@ mod tests {
                 .unwrap()
                 .is_terminal()
         );
-        drop(gate);
-        restore.await.unwrap();
         assert!(
             registry
                 .terminal_observation("unpublished", "agent_fanout")
@@ -8698,6 +8987,128 @@ mod tests {
             .declare_fanout_group("fresh-group", "fresh", 1, None, "fresh-parent")
             .await
             .expect("optional completed history must not set sticky overflow");
+    }
+
+    #[tokio::test]
+    async fn interleaved_completed_history_restores_whole_groups_before_eviction() {
+        let registry = Arc::new(astra_core::work_unit::ActiveWorkRegistry::default());
+        let spawner =
+            DynamicAgentSpawner::new(mock_router()).with_active_work_registry(registry.clone());
+        let mut runs = Vec::new();
+        let group_count = MAX_FANOUT_GROUPS * 2;
+        for index in 0..group_count {
+            let parent_id = format!("history-parent-{index}");
+            let mut parent = durable_run(&parent_id, 0, astra_core::STATUS_COMPLETED);
+            for slot in 0..2 {
+                parent.events.push(json!({
+                    "type":"agent_spawned", "run_id":format!("history-child-{index}-{slot}"),
+                    "agent_id":format!("history-agent-{index}-{slot}"),
+                    "fanout_slot":{"group_id":format!("history-group-{index}"),
+                        "target_count":2,"slot_index":slot}
+                }));
+            }
+            runs.push(parent);
+        }
+        // The bounded DB snapshot can interleave all first slots before any
+        // second slot. Per-child restoration used to fill the 16-group map
+        // with nonterminal prefixes and silently archive the other children.
+        for slot in 0..2 {
+            for index in 0..group_count {
+                let mut child = durable_run(
+                    &format!("history-child-{index}-{slot}"),
+                    1,
+                    astra_core::STATUS_COMPLETED,
+                );
+                child.parent_run_id = Some(format!("history-parent-{index}"));
+                child.agent_id = Some(format!("history-agent-{index}-{slot}"));
+                runs.push(child);
+            }
+        }
+        assert_eq!(
+            spawner.restore_durable_agent_runs(&runs).await,
+            group_count * 2
+        );
+        assert_eq!(spawner.list_fanout_groups().await.len(), MAX_FANOUT_GROUPS);
+        for index in 0..group_count {
+            let observation =
+                registry.terminal_observation(&format!("history-group-{index}"), "agent_fanout");
+            assert!(
+                observation.is_some(),
+                "group {index} never published terminal truth"
+            );
+        }
+        spawner
+            .declare_fanout_group("new-live-group", "new", 1, None, "new-live-parent")
+            .await
+            .expect("completed history must not exhaust live admission");
+    }
+
+    #[tokio::test]
+    async fn rejected_partial_membership_repairs_from_archived_child_on_later_page() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let mut first_page = Vec::new();
+        let mut second_page = Vec::new();
+        for index in 0..=MAX_FANOUT_GROUPS {
+            let parent_id = format!("paged-parent-{index}");
+            let mut parent = durable_run(&parent_id, 0, astra_core::STATUS_RUNNING);
+            for slot in 0..2 {
+                let child_id = format!("paged-child-{index}-{slot}");
+                let agent_id = format!("paged-agent-{index}-{slot}");
+                let spawn_event = json!({
+                    "type":"agent_spawned", "run_id":child_id, "agent_id":agent_id,
+                    "fanout_slot":{"group_id":format!("paged-group-{index}"),
+                        "target_count":2,"slot_index":slot}
+                });
+                parent.events.push(spawn_event.clone());
+                let mut child = durable_run(&child_id, 1, astra_core::STATUS_COMPLETED);
+                child.parent_run_id = Some(parent_id.clone());
+                child.agent_id = Some(agent_id);
+                child.events.push(spawn_event);
+                if slot == 0 {
+                    first_page.push(child);
+                } else {
+                    second_page.push(child);
+                }
+            }
+            first_page.push(parent);
+        }
+        assert_eq!(
+            spawner.restore_durable_agent_runs(&first_page).await,
+            MAX_FANOUT_GROUPS + 1
+        );
+        let mut missing = None;
+        for index in 0..=MAX_FANOUT_GROUPS {
+            if spawner
+                .fanout_group(&format!("paged-group-{index}"))
+                .await
+                .is_none()
+            {
+                missing = Some(index);
+                break;
+            }
+        }
+        let missing = missing.expect("one incomplete group must be rejected at capacity");
+        assert_eq!(
+            spawner.restore_durable_agent_runs(&second_page).await,
+            MAX_FANOUT_GROUPS + 1
+        );
+        assert!(
+            spawner
+                .list_fanout_groups()
+                .await
+                .iter()
+                .all(|group| group.is_terminal())
+        );
+        assert!(
+            spawner
+                .get_agent_state_any(&format!("paged-agent-{missing}-0"))
+                .await
+                .is_some()
+        );
+        spawner
+            .declare_fanout_group("page-fresh", "new", 1, None, "page-fresh-parent")
+            .await
+            .expect("repaired membership must free capacity");
     }
 
     #[tokio::test]
@@ -8955,8 +9366,6 @@ mod tests {
                 "Review correctness",
                 None,
                 "root-run",
-                None,
-                FanoutAdmission::Live,
                 None,
             )
             .await
@@ -12846,9 +13255,7 @@ mod tests {
                     None,
                     None,
                     "owner-0",
-                    FanoutAdmission::Recovery {
-                        parent_terminal: false
-                    }
+                    FanoutAdmission::Recovery
                 )
                 .await
                 .is_err()
@@ -13374,8 +13781,6 @@ mod tests {
                 Some("call-1"),
                 "parent-123",
                 None,
-                FanoutAdmission::Live,
-                None,
             )
             .await
             .unwrap();
@@ -13729,8 +14134,6 @@ mod tests {
                         None,
                         "root",
                         Some(deadline),
-                        FanoutAdmission::Live,
-                        None,
                     )
                     .await
             })
@@ -17166,6 +17569,61 @@ mod tests {
             0,
             "recovery must be idempotent"
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_restore_interleaved_history_does_not_fill_capacity_with_prefixes() {
+        use astra_services::session_workspace::{
+            BackgroundLocalAgentFanoutProjection, BackgroundLocalAgentTaskProjection,
+        };
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let mut projections = Vec::new();
+        for slot in 0..2 {
+            for index in 0..MAX_FANOUT_GROUPS * 2 {
+                projections.push(BackgroundLocalAgentTaskProjection {
+                    id: format!("local-agent-{index}-{slot}"),
+                    run_id: format!("local-child-{index}-{slot}"),
+                    parent_run_id: format!("local-parent-{index}"),
+                    status: "interrupted".into(),
+                    title: "Local review".into(),
+                    started_at_ms: 42,
+                    ended_at_ms: Some(43),
+                    output_tail: Some("retained partial".into()),
+                    terminal_reason: Some("executor stopped".into()),
+                    fanout: Some(BackgroundLocalAgentFanoutProjection {
+                        group_id: format!("local-group-{index}"),
+                        group_title: "Local group".into(),
+                        target_count: 2,
+                        slot_index: slot,
+                        slot_label: format!("slot-{slot}"),
+                    }),
+                });
+            }
+        }
+        assert_eq!(
+            spawner
+                .restore_workspace_agent_projections(&projections)
+                .await,
+            projections.len()
+        );
+        assert_eq!(spawner.list_fanout_groups().await.len(), MAX_FANOUT_GROUPS);
+        assert!(
+            spawner
+                .list_fanout_groups()
+                .await
+                .iter()
+                .all(|group| group.is_terminal() && group.summary().interrupted == 2)
+        );
+        assert_eq!(
+            spawner
+                .restore_workspace_agent_projections(&projections)
+                .await,
+            0
+        );
+        spawner
+            .declare_fanout_group("new-local", "new", 1, None, "new-local-parent")
+            .await
+            .expect("terminal workspace history must not block live groups");
     }
 
     #[tokio::test]
