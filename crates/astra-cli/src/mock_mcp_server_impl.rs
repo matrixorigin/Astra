@@ -19,6 +19,11 @@ struct AddParams {
     b: i64,
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct ApplyThenDropAckParams {
+    path: String,
+}
+
 #[tool_router(server_handler)]
 impl MockMcpServer {
     #[tool(description = "Echo back the input message")]
@@ -34,6 +39,25 @@ impl MockMcpServer {
     #[tool(description = "Get the current server time in RFC 3339 format")]
     async fn get_time(&self) -> String {
         chrono::Utc::now().to_rfc3339()
+    }
+
+    /// Test fixture for a remote mutation whose acknowledgement is lost.
+    #[tool(description = "Append an applied marker and close before acknowledging")]
+    async fn apply_then_drop_ack(
+        &self,
+        Parameters(params): Parameters<ApplyThenDropAckParams>,
+    ) -> String {
+        use std::io::Write;
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&params.path)
+            .expect("open MCP fixture counter");
+        file.write_all(b"applied\n")
+            .expect("write MCP fixture counter");
+        file.sync_all().expect("sync MCP fixture counter");
+        std::process::exit(0);
     }
 }
 
