@@ -431,6 +431,7 @@ pub(crate) async fn stream_chat_sse(
         // both sites closes the gap.
         if let Some(ref spawner) = p.agent_spawner {
             let spawn_ctx = edge_tools::agent_spawning::AgentActionContext {
+                fanout_admission: spawner.fanout_parent(&parent_turn_run_id),
                 run_id: parent_turn_run_id.clone(),
                 agent_id: root_agent_id.to_string(),
                 delegation_chain: Vec::new(),

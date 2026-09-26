@@ -3614,6 +3614,70 @@ async fn agent_progress_stream_bridge_drains_progress_on_stop() {
     );
 }
 
+#[tokio::test]
+async fn fanout_parent_receipts_are_isolated_by_user_and_session() {
+    let service = test_service();
+    let first = service
+        .server_agent_spawner_for_session("user-a", "session-a")
+        .await;
+    let same = service
+        .server_agent_spawner_for_session("user-a", "session-a")
+        .await;
+    assert!(Arc::ptr_eq(&first.spawner, &same.spawner));
+    first
+        .spawner
+        .declare_fanout_group("review", "first", 1, None, "parent")
+        .await
+        .unwrap();
+    first
+        .spawner
+        .cancel_fanout_group_for_runtime_in_parent("parent", "review", "done")
+        .await
+        .unwrap();
+    first
+        .spawner
+        .cache_terminal_fanout_result(
+            "parent",
+            "review",
+            first.spawner.fanout_result_generation("parent"),
+            "private result".into(),
+        )
+        .await;
+    for (user, session) in [("user-b", "session-a"), ("user-a", "session-b")] {
+        let other = service
+            .server_agent_spawner_for_session(user, session)
+            .await;
+        assert!(!Arc::ptr_eq(&first.spawner, &other.spawner));
+        assert!(
+            other
+                .spawner
+                .cached_terminal_fanout_result("parent", "review")
+                .await
+                .is_none()
+        );
+        other
+            .spawner
+            .declare_fanout_group("review", "other", 1, None, "parent")
+            .await
+            .unwrap();
+        assert!(
+            !other
+                .spawner
+                .fanout_group("review")
+                .await
+                .unwrap()
+                .spawn_admission_closed()
+        );
+    }
+    assert_eq!(
+        same.spawner
+            .cached_terminal_fanout_result("parent", "review")
+            .await
+            .as_deref(),
+        Some("private result")
+    );
+}
+
 struct ImmediateLifecycleExecutor;
 
 #[async_trait]

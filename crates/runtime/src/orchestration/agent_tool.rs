@@ -435,6 +435,8 @@ pub struct AgentToolContext {
     pub working_dir: PathBuf,
     /// Shared lifecycle owner for dynamic child agents.
     pub spawner: Arc<DynamicAgentSpawner>,
+    /// Keeps this parent admission fence alive across projection eviction.
+    pub fanout_admission: Arc<super::spawner::FanoutParentAdmission>,
     /// Effective permissions inherited by children spawned from this agent.
     pub inherited_permissions: InheritedPermissions,
     /// Product-optional capabilities enabled on the current request.
@@ -1594,6 +1596,7 @@ async fn render_agent_fanout_results(
             );
         }
     }
+    let result_generation = ctx.spawner.fanout_result_generation(&ctx.run_id);
     let Some(group) = find_fanout_group(ctx, group_id).await else {
         return render_agent_tool_error(None, &format!("Unknown fanout group_id: {group_id}"));
     };
@@ -1900,7 +1903,12 @@ async fn render_agent_fanout_results(
     let rendered = serde_json::to_string_pretty(&response).unwrap_or_else(|_| response.to_string());
     if read_options.is_default() && updated.is_terminal() && incomplete_result_count == 0 {
         ctx.spawner
-            .cache_terminal_fanout_result(&ctx.run_id, group_id, rendered.clone())
+            .cache_terminal_fanout_result(
+                &ctx.run_id,
+                group_id,
+                result_generation,
+                rendered.clone(),
+            )
             .await;
     }
     rendered
@@ -2527,7 +2535,9 @@ async fn handle_agent_spawn_action_with_deadline(
     // boundary rather than inheriting the parent tool pipeline's stack.
     tokio::task::yield_now().await;
     let spawner = Arc::clone(&ctx.spawner);
+    let fanout_admission = ctx.fanout_admission.clone();
     let spawn_future = Box::pin(async move {
+        let _fanout_admission = fanout_admission;
         spawner
             .spawn_with_execution_deadline(input, &spawn_ctx, execution_deadline)
             .await
@@ -3588,6 +3598,7 @@ mod tests {
         current_model: Option<&str>,
     ) -> AgentToolContext {
         AgentToolContext {
+            fanout_admission: spawner.fanout_parent("run-parent"),
             run_id: "run-parent".into(),
             agent_id: "root-agent".into(),
             delegation_chain: Vec::new(),
@@ -4239,6 +4250,7 @@ mod tests {
 
         let mut next_ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
         next_ctx.run_id = "run-next-parent".to_string();
+        next_ctx.fanout_admission = next_ctx.spawner.fanout_parent(&next_ctx.run_id);
         let allowed = handle_agent_spawn_action(
             &json!({
                 "description": "Fresh analysis",

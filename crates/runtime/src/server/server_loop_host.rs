@@ -32165,6 +32165,7 @@ mod tests {
         let router = Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
         let spawner = Arc::new(crate::orchestration::DynamicAgentSpawner::new(router));
         executor.set_agent_tool_context(crate::orchestration::AgentToolContext {
+            fanout_admission: spawner.fanout_parent("run1"),
             run_id: "run1".into(),
             agent_id: "agent1".into(),
             delegation_chain: Vec::new(),

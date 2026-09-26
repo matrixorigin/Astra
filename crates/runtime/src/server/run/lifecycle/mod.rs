@@ -7086,6 +7086,7 @@ impl AgenticRunLifecycleService {
             .unwrap_or_else(|| "root-agent".to_string());
         let active_work_registry = entry.active_work_registry.clone();
         executor.set_agent_tool_context(AgentToolContext {
+            fanout_admission: entry.spawner.fanout_parent(run_id),
             run_id: run_id.to_string(),
             agent_id,
             delegation_chain: Vec::new(),
@@ -15681,6 +15682,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let agent_spawner_entry = self
                 .server_agent_spawner_for_session(&user_id, &session_id)
                 .await;
+            let _fanout_admission = agent_spawner_entry.spawner.fanout_parent(&run_id);
             let durable_agent_restore = self
                 .restore_server_dynamic_agents(&agent_spawner_entry, &user_id, &session_id)
                 .await;
@@ -16544,6 +16546,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // admission are independent database reads. Restore them together so
         // first-turn recovery does not add another full round trip chain to
         // SSE response-header latency.
+        let _fanout_admission = stream_agent_spawner_entry.spawner.fanout_parent(&run_id);
         let (canonical_turn, mut durable_agent_restore) = tokio::join!(
             self.prepare_canonical_turn(
                 &user_id,
@@ -21541,6 +21544,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         group_id: &str,
         parent_run_id: &str,
         target_count: usize,
+        unassigned_slots: &[usize],
         reason: &str,
         origin: CancellationOrigin,
         owner_user_id: Option<&str>,
@@ -21593,6 +21597,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
                 "group_id": group_id,
                 "parent_run_id": parent_run_id,
                 "target_count": target_count,
+                "unassigned_slots": unassigned_slots,
                 "reason": reason,
                 "cancellation_origin": origin.as_str(),
             }
@@ -23802,6 +23807,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     crate::orchestration::WorkspaceMutationAuthority::default();
                 workspace_mutation.set(inherited_workspace_mutation);
                 executor.set_agent_tool_context(AgentToolContext {
+                    fanout_admission: spawner.fanout_parent(&config.run_id),
                     run_id: config.run_id.clone(),
                     agent_id: config.agent_profile.agent_id.clone(),
                     delegation_chain: config.delegation_chain.clone(),

@@ -111,6 +111,22 @@ parent set. A legacy unrestricted parent context retains its existing behavior.
 
 ## Result integration
 
+Fanout cancellation closes admission, but is not proof that an accepted child
+has stopped. The existing cancellation event records the unassigned slot indexes
+under the admission lock. Recovery settles only those explicitly unassigned
+slots; a child absent from a recovery page remains unknown until its own durable
+state arrives. Proven terminal state is published under the group lock before
+eviction is possible; rejected recovery must not mutate a different owner.
+
+Each executing parent (including outstanding tool calls) owns its fanout admission
+fence and, after session-cache eviction, its complete terminal group receipt and
+rendered result cache.
+This preserves failed/unstarted slots and result addresses without reopening
+completed groups. Parent ownership expires with execution; historical cancellations
+must not permanently disable unrelated future parents. The session index is weak,
+and the live projection and persistence backlog remain bounded. No additional
+database operation is required for admission or reading an evicted receipt.
+
 Parent should receive:
 
 - child summary;
