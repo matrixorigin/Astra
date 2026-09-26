@@ -2031,7 +2031,8 @@ impl DynamicAgentSpawner {
         for state in &changed {
             self.publish_background_agent(state);
             if agent_status_is_terminal(&state.status) {
-                self.record_fanout_terminal_state(state).await;
+                self.record_fanout_terminal_state_with_authority(state, true)
+                    .await;
                 self.notify_completion(&state.agent_id).await;
             }
         }
@@ -3563,13 +3564,29 @@ impl DynamicAgentSpawner {
         parent_run_id: &str,
     ) -> Option<AgentFanoutGroupProjection> {
         let groups = self.fanout_groups.read().await;
-        groups
+        if let Some(group) = groups
             .values()
             .find(|group| group.parent_run_id.as_deref() == Some(parent_run_id))
             .cloned()
+        {
+            return Some(group);
+        }
+        let parent = self.fanout_parent(parent_run_id);
+        astra_core::sync_poison::recover_mutex_lock(&parent.state)
+            .retired_group
+            .clone()
     }
 
     async fn record_fanout_terminal_state(&self, state: &SpawnedAgentState) {
+        self.record_fanout_terminal_state_with_authority(state, false)
+            .await;
+    }
+
+    async fn record_fanout_terminal_state_with_authority(
+        &self,
+        state: &SpawnedAgentState,
+        durable_authority: bool,
+    ) {
         let Some(identity) = state.fanout_slot.as_ref() else {
             return;
         };
@@ -3578,17 +3595,39 @@ impl DynamicAgentSpawner {
         let reason = projection.terminal_reason;
         let terminal_reason_label = reason.as_deref().unwrap_or("").to_string();
         let mut groups = self.fanout_groups.write().await;
-        let Some(group) = groups.get_mut(&identity.group_id) else {
+        let parent = self.fanout_parent(&state.parent_run_id);
+        let mut parent_state = astra_core::sync_poison::recover_mutex_lock(&parent.state);
+        if durable_authority {
+            parent_state.result_generation = parent_state.result_generation.wrapping_add(1);
+            parent_state.terminal_result = None;
+        }
+        let live = groups
+            .get(&identity.group_id)
+            .is_some_and(|group| group.parent_run_id.as_deref() == Some(&state.parent_run_id));
+        let group = if live {
+            groups.get_mut(&identity.group_id)
+        } else {
+            parent_state
+                .retired_group
+                .as_mut()
+                .filter(|group| group.group_id == identity.group_id)
+        };
+        let Some(group) = group else {
             tracing::warn!(
                 target: "fanout",
                 agent_id = %state.agent_id,
                 group_id = %identity.group_id,
-                "record fanout terminal skipped: group evicted before terminal update",
+                "record fanout terminal skipped: parent owns no matching group",
             );
             return;
         };
         let active_before = group.summary().active;
-        if let Err(error) = group.record_status_by_agent(&state.agent_id, status, reason) {
+        let recorded = if durable_authority && status.is_terminal() {
+            group.refine_durable_terminal_by_agent(&state.agent_id, status, reason)
+        } else {
+            group.record_status_by_agent(&state.agent_id, status, reason)
+        };
+        if let Err(error) = recorded {
             tracing::warn!(
                 target: "fanout",
                 agent_id = %state.agent_id,
@@ -3601,7 +3640,10 @@ impl DynamicAgentSpawner {
         let active_after = group.summary().active;
         group.touch();
         self.publish_fanout_group(group);
-        self.invalidate_fanout_result(&state.parent_run_id);
+        if !durable_authority {
+            parent_state.result_generation = parent_state.result_generation.wrapping_add(1);
+            parent_state.terminal_result = None;
+        }
         tracing::info!(
             target: "fanout",
             group_id = %identity.group_id,
@@ -3616,8 +3658,9 @@ impl DynamicAgentSpawner {
             active_after,
             "fanout slot reached terminal state"
         );
-        drop(groups);
-        self.adjust_cached_active_fanout_slots(active_before, active_after);
+        if live {
+            self.adjust_cached_active_fanout_slots(active_before, active_after);
+        }
     }
 
     /// Apply the exact durable status after cancellation reconciliation. The
@@ -8053,6 +8096,7 @@ mod tests {
             AgentToolContext, AgentTranscriptLocation, InheritedPermissions,
             WorkspaceMutationAuthority, handle_agent_fanout_tool,
         };
+        use astra_core::work_unit::{ActiveWorkRegistry, WorkUnitStatus};
 
         struct CountingRecovery {
             runs: Vec<astra_services::runs::DurableRunRecord>,
@@ -8071,13 +8115,34 @@ mod tests {
                 Ok(self.runs.clone())
             }
         }
-        for (group_count, cancelled_slot) in [
-            (MAX_FANOUT_GROUPS, false),
-            (MAX_FANOUT_GROUPS + 1, false),
-            (MAX_FANOUT_GROUPS, true),
-            (MAX_FANOUT_GROUPS + 1, true),
+        for (group_count, cancelled_slot, durable_update) in [
+            (MAX_FANOUT_GROUPS, false, None),
+            (MAX_FANOUT_GROUPS + 1, false, None),
+            (MAX_FANOUT_GROUPS, true, None),
+            (MAX_FANOUT_GROUPS + 1, true, None),
+            (MAX_FANOUT_GROUPS, false, Some(astra_core::STATUS_COMPLETED)),
+            (
+                MAX_FANOUT_GROUPS + 1,
+                false,
+                Some(astra_core::STATUS_COMPLETED),
+            ),
+            (MAX_FANOUT_GROUPS, false, Some(astra_core::STATUS_FAILED)),
+            (
+                MAX_FANOUT_GROUPS + 1,
+                false,
+                Some(astra_core::STATUS_FAILED),
+            ),
+            (MAX_FANOUT_GROUPS, false, Some(astra_core::STATUS_CANCELLED)),
+            (
+                MAX_FANOUT_GROUPS + 1,
+                false,
+                Some(astra_core::STATUS_CANCELLED),
+            ),
         ] {
-            let spawner = Arc::new(DynamicAgentSpawner::new(mock_router()));
+            let registry = Arc::new(ActiveWorkRegistry::default());
+            let spawner = Arc::new(
+                DynamicAgentSpawner::new(mock_router()).with_active_work_registry(registry.clone()),
+            );
             let admission = spawner.fanout_parent("result-parent-0");
             let mut runs = Vec::new();
             for index in 0..group_count {
@@ -8191,6 +8256,107 @@ mod tests {
                 if cancelled_slot { 3 } else { 1 },
                 "cache behavior changed after eviction: groups={group_count}, cancelled_slot={cancelled_slot}"
             );
+            if let Some(durable_update) = durable_update {
+                let before = ctx
+                    .spawner
+                    .fanout_group_for_parent_run_and_id("result-parent-0", "result-group-0")
+                    .await
+                    .unwrap();
+                let stale_child = ctx
+                    .spawner
+                    .get_agent_state_any("result-agent-0")
+                    .await
+                    .unwrap();
+                let old_generation = ctx.spawner.fanout_result_generation("result-parent-0");
+                let mut winner = durable_run("result-child-0", 1, durable_update);
+                winner.parent_run_id = Some("result-parent-0".into());
+                winner.agent_id = Some("result-agent-0".into());
+                match durable_update {
+                    astra_core::STATUS_COMPLETED => winner.events.push(json!({
+                        "event_type": "text_done",
+                        "data": {"full_text": "New authoritative terminal text"}
+                    })),
+                    astra_core::STATUS_FAILED => {
+                        winner.error_message = Some("authoritative provider failure".into());
+                    }
+                    astra_core::STATUS_CANCELLED => winner.events.push(json!({
+                        "event_type": "run_finished",
+                        "data": {"reason": "runtime stopped child", "cancellation_origin": "runtime"}
+                    })),
+                    _ => unreachable!(),
+                }
+                ctx.spawner
+                    .set_durable_agent_reconciler(Arc::new(StaticDurableReconciler {
+                        runs: vec![winner],
+                    }))
+                    .await;
+                assert_eq!(ctx.spawner.reconcile_durable_agent_runs().await.unwrap(), 1);
+                let after = ctx
+                    .spawner
+                    .fanout_group_for_parent_run_and_id("result-parent-0", "result-group-0")
+                    .await
+                    .unwrap();
+                ctx.spawner.record_fanout_terminal_state(&stale_child).await;
+                assert_eq!(
+                    ctx.spawner
+                        .fanout_group_for_parent_run_and_id("result-parent-0", "result-group-0")
+                        .await
+                        .unwrap()
+                        .summary(),
+                    after.summary(),
+                    "a late executor callback cannot undo durable correction"
+                );
+                if durable_update != astra_core::STATUS_COMPLETED {
+                    assert_eq!(after.revision, before.revision + 1);
+                    assert_eq!(after.summary().completed, 0);
+                    assert_eq!(after.summary().terminal, 1);
+                    assert_eq!(after.summary().active, 0);
+                    assert_eq!(
+                        registry
+                            .terminal_observation("result-group-0", "agent_fanout")
+                            .unwrap()
+                            .status,
+                        WorkUnitStatus::CompletedWithIssues
+                    );
+                }
+                ctx.spawner
+                    .cache_terminal_fanout_result(
+                        "result-parent-0",
+                        "result-group-0",
+                        old_generation,
+                        "stale render".into(),
+                    )
+                    .await;
+                assert!(
+                    ctx.spawner
+                        .cached_terminal_fanout_result("result-parent-0", "result-group-0")
+                        .await
+                        .is_none(),
+                    "durable correction must discard the previous cached response"
+                );
+                let output = handle_agent_fanout_tool(
+                    &json!({"action": "get_results", "group_id": "result-group-0"}),
+                    Some(&ctx),
+                )
+                .await;
+                let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+                if durable_update == astra_core::STATUS_COMPLETED {
+                    assert_eq!(
+                        value["results"][0]["result"]["result"],
+                        "New authoritative terminal text"
+                    );
+                } else {
+                    assert_eq!(value["completed"], 0, "{output}");
+                    assert_eq!(
+                        value["failed"],
+                        usize::from(durable_update == astra_core::STATUS_FAILED)
+                    );
+                    assert_eq!(
+                        value["cancelled_by_runtime"],
+                        usize::from(durable_update == astra_core::STATUS_CANCELLED)
+                    );
+                }
+            }
         }
     }
 
@@ -12795,7 +12961,7 @@ mod tests {
 
         let bare_result = spawner.spawn(make_bg_input(), &make_bg_context()).await;
         assert!(
-            matches!(bare_result, Err(SpawnError::Race(ref message)) if message.contains("no longer accepts")),
+            matches!(bare_result, Err(SpawnError::InvalidInput(ref message)) if message.contains("already used agent_fanout")),
             "a bare child cannot bypass a closed parent fence: {bare_result:?}"
         );
         assert_eq!(
@@ -13223,7 +13389,18 @@ mod tests {
 
         let mut state = completed_test_state(1);
         state.agent_id = "storage@run-1".to_string();
+        state.parent_run_id = "parent-123".to_string();
         state.fanout_slot = Some(identity);
+        let mut foreign = state.clone();
+        foreign.parent_run_id = "another-parent".to_string();
+        spawner.record_fanout_terminal_state(&foreign).await;
+        assert_eq!(
+            spawner
+                .cached_active_fanout_slots
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a foreign parent's callback cannot settle this slot"
+        );
         spawner.record_fanout_terminal_state(&state).await;
         assert_eq!(
             spawner

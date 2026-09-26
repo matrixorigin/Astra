@@ -573,6 +573,28 @@ impl AgentFanoutGroupProjection {
         status: AgentFanoutSlotStatus,
         reason: Option<String>,
     ) -> Result<(), String> {
+        self.record_terminal_by_agent_with_authority(agent_id, status, reason, false)
+    }
+
+    /// Refine an accepted slot from the durable run's terminal truth. Ordinary
+    /// executor notifications cannot revise a terminal slot; a later durable
+    /// winner can, without reopening admission or changing result collection.
+    pub fn refine_durable_terminal_by_agent(
+        &mut self,
+        agent_id: &str,
+        status: AgentFanoutSlotStatus,
+        reason: Option<String>,
+    ) -> Result<(), String> {
+        self.record_terminal_by_agent_with_authority(agent_id, status, reason, true)
+    }
+
+    fn record_terminal_by_agent_with_authority(
+        &mut self,
+        agent_id: &str,
+        status: AgentFanoutSlotStatus,
+        reason: Option<String>,
+        durable_authority: bool,
+    ) -> Result<(), String> {
         if !status.is_terminal() {
             return Err("fanout terminal update requires a terminal slot status".to_string());
         }
@@ -586,16 +608,18 @@ impl AgentFanoutGroupProjection {
         if slot.status.is_terminal() {
             // Terminal lifecycle delivery is at-least-once across the child
             // executor, completion waiter, and durable reconciliation paths.
-            // An exact replay is a successful no-op; a conflicting terminal
-            // fact remains an invariant violation. This keeps summary counts
-            // monotonic without turning normal reconciliation into a warning.
+            // An exact replay is a successful no-op. Only durable recovery
+            // may correct a conflicting terminal fact; ordinary callbacks
+            // cannot overturn the accepted slot's terminal truth.
             if slot.status == status && slot.terminal_reason == reason {
                 return Ok(());
             }
-            return Err(format!(
-                "fanout agent {agent_id} already recorded terminal status {:?}",
-                slot.status
-            ));
+            if !durable_authority {
+                return Err(format!(
+                    "fanout agent {agent_id} already recorded terminal status {:?}",
+                    slot.status
+                ));
+            }
         }
         let (old_status, result_collected) = {
             let old_status = slot.status;
@@ -1384,6 +1408,65 @@ mod tests {
         assert_eq!(summary.terminal, 2);
         assert_eq!(summary.spawn_rejected, 1);
         assert_eq!(summary.uncollected, 1);
+    }
+
+    #[test]
+    fn durable_terminal_refinement_keeps_slot_and_collection_ownership() {
+        let mut group = AgentFanoutGroupProjection::new("review", "Review", 1);
+        group
+            .record_spawn_accepted_with_run(0, "child", Some("run".into()))
+            .unwrap();
+        group
+            .record_terminal_by_agent("child", AgentFanoutSlotStatus::Completed, None)
+            .unwrap();
+        assert!(group.mark_result_collected("child"));
+        let revision = group.revision;
+
+        group
+            .refine_durable_terminal_by_agent(
+                "child",
+                AgentFanoutSlotStatus::Failed,
+                Some("provider failed".into()),
+            )
+            .unwrap();
+        assert_eq!(group.revision, revision + 1);
+        let summary = group.summary();
+        assert_eq!(
+            (
+                summary.active,
+                summary.terminal,
+                summary.completed,
+                summary.failed
+            ),
+            (0, 1, 0, 1)
+        );
+        assert_eq!((summary.collected, summary.uncollected), (1, 0));
+        assert_eq!(group.slots[0].agent_id.as_deref(), Some("child"));
+        assert_eq!(group.slots[0].run_id.as_deref(), Some("run"));
+        assert_eq!(
+            group.work_unit_status(),
+            WorkUnitStatus::CompletedWithIssues
+        );
+
+        group
+            .refine_durable_terminal_by_agent(
+                "child",
+                AgentFanoutSlotStatus::Failed,
+                Some("provider failed".into()),
+            )
+            .unwrap();
+        assert_eq!(group.revision, revision + 1);
+        assert!(
+            group
+                .record_terminal_by_agent("child", AgentFanoutSlotStatus::Completed, None)
+                .is_err()
+        );
+        assert!(
+            group
+                .refine_durable_terminal_by_agent("child", AgentFanoutSlotStatus::Running, None)
+                .is_err()
+        );
+        assert_eq!(group.summary(), summary);
     }
 
     #[test]

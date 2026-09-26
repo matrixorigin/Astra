@@ -126,6 +126,10 @@ completed groups. Parent ownership expires with execution; historical cancellati
 must not permanently disable unrelated future parents. The session index is weak,
 and the live projection and persistence backlog remain bounded. No additional
 database operation is required for admission or reading an evicted receipt.
+When a later durable child state corrects a terminal result, it refines the same
+parent-owned group receipt (live or evicted) and invalidates the rendered result;
+ordinary executor callbacks cannot overturn that durable terminal truth. Auto-ID
+result recovery and replay read the receipt through the same parent ownership.
 
 Parent should receive:
 

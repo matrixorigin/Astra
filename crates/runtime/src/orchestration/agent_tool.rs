@@ -5678,6 +5678,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_id_start_recovery_and_replay_survive_group_eviction() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+        let args = json!({
+            "action": "start", "_tool_call_id": "original-start", "target_count": 1,
+            "slots": [{"description": "Review", "prompt": "Review changes"}]
+        });
+        let started = handle_agent_fanout_tool(&args, Some(&ctx)).await;
+        let initial = collect_fanout_start(&started, &ctx).await;
+        assert_eq!(initial["completed"], 1);
+        let group_id = initial["group_id"].as_str().unwrap();
+        for index in 0..16 {
+            let mut other = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+            other.run_id = format!("other-parent-{index}");
+            other.fanout_admission = spawner.fanout_parent(&other.run_id);
+            let started = handle_agent_fanout_tool(&args, Some(&other)).await;
+            assert_eq!(collect_fanout_start(&started, &other).await["completed"], 1);
+        }
+        assert!(spawner.fanout_group(group_id).await.is_none());
+        let explicit = handle_agent_fanout_tool(
+            &json!({"action": "get_results", "group_id": group_id}),
+            Some(&ctx),
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&explicit).unwrap()["completed"],
+            1
+        );
+        let recovered =
+            recover_agent_fanout_tool_result(&args, Some("original-start"), Some(&ctx)).await;
+        let replay = handle_agent_fanout_tool(&args, Some(&ctx)).await;
+        assert_eq!(
+            executor.spawn_count(),
+            17,
+            "readback must not start replacement children"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&recovered).unwrap()["completed"],
+            1,
+            "{recovered}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&replay).unwrap()["completed"],
+            1,
+            "{replay}"
+        );
+    }
+
+    #[tokio::test]
     async fn recover_agent_fanout_start_uses_existing_group_without_respawn() {
         let executor = Arc::new(CapturingModelExecutor::new());
         let spawner = test_spawner(executor.clone());
