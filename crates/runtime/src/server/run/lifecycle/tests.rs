@@ -11153,7 +11153,8 @@ async fn durable_event_pressure_case(
                     "stream replay failed for {run_id}: {:?}: {}",
                     response.0, response.1.0.detail
                 )
-            })?;
+            })?
+            .events;
         if replay_events.len() > budget.row_budget {
             return Err(format!(
                 "{run_id}: replay returned {} rows above durable batch budget",
@@ -19290,7 +19291,8 @@ async fn stream_chat_tracks_run_for_status_and_replay() {
     .expect("timeout waiting for stream_chat status to finish");
     let replay = ok(svc
         .stream_run(stream.run_id.clone(), "user-1".into(), 0)
-        .await);
+        .await)
+    .events;
 
     assert_eq!(status.run_id, stream.run_id);
     assert!(status.events_count > 0);
@@ -22214,11 +22216,15 @@ async fn cancel_run_hides_foreign_run() {
 async fn stream_run_returns_events_from_offset() {
     let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
-    let events = ok(svc.stream_run(run.run_id.clone(), "user-1".into(), 0).await);
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["event_type"], "run_started");
-    let events = ok(svc.stream_run(run.run_id, "user-1".into(), 1).await);
-    assert!(events.is_empty());
+    let first = ok(svc.stream_run(run.run_id.clone(), "user-1".into(), 0).await);
+    assert_eq!(first.events.len(), 1);
+    assert_eq!(first.events[0]["event_type"], "run_started");
+    assert_eq!(first.last_event_idx, 0);
+    let caught_up = ok(svc.stream_run(run.run_id, "user-1".into(), 1).await);
+    assert!(caught_up.events.is_empty());
+    assert_eq!(caught_up.last_event_idx, first.last_event_idx);
+    assert_eq!(caught_up.status, first.status);
+    assert_eq!(caught_up.session_id, first.session_id);
 }
 
 #[tokio::test]
@@ -22227,6 +22233,14 @@ async fn stream_run_not_found() {
     let e = err(svc
         .stream_run("nonexistent".into(), "user-1".into(), 0)
         .await);
+    assert_eq!(e.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn stream_run_hides_foreign_run() {
+    let svc = test_service();
+    let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+    let e = err(svc.stream_run(run.run_id, "user-2".into(), 0).await);
     assert_eq!(e.0, StatusCode::NOT_FOUND);
 }
 
@@ -25927,7 +25941,7 @@ async fn db_durable_event_budget_bounds_large_stream_persistence() {
         );
     }
 
-    let replay_events = ok(svc.stream_run(run_id.clone(), user_id.to_string(), 1).await);
+    let replay_events = ok(svc.stream_run(run_id.clone(), user_id.to_string(), 1).await).events;
     assert!(replay_events.len() <= budget.row_budget);
     assert!(replay_events.iter().all(|event| {
         event.get("type").and_then(Value::as_str) != Some("text_delta")
@@ -26198,7 +26212,7 @@ async fn pause_resume_round_trip_preserves_events() {
         .get_run_status(run.run_id.clone(), "user-1".into())
         .await);
     assert_eq!(status.events_count, 3); // run_started + run_paused + run_resumed
-    let events = ok(svc.stream_run(run.run_id, "user-1".into(), 0).await);
+    let events = ok(svc.stream_run(run.run_id, "user-1".into(), 0).await).events;
     assert_eq!(events[0]["event_type"], "run_started");
     assert_eq!(events[1]["event_type"], "run_paused");
     assert_eq!(events[2]["event_type"], "run_resumed");
@@ -27559,7 +27573,8 @@ async fn stream_run_cache_miss_replays_durable_text_done() {
 
     let events = ok(svc
         .stream_run("run-durable-text".into(), "user-1".into(), 1)
-        .await);
+        .await)
+    .events;
 
     assert_eq!(events.len(), 2);
     assert_eq!(events[0]["event_type"], "text_done");
@@ -28322,7 +28337,8 @@ async fn stream_run_falls_back_to_durable_store_on_cache_miss() {
 
     let events = ok(svc
         .stream_run(stream.run_id.clone(), "user-1".into(), 1)
-        .await);
+        .await)
+    .events;
     assert_eq!(
         events,
         AgenticRunLifecycleService::format_run_events(&durable.events[1..], 1)

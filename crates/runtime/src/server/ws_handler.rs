@@ -1584,9 +1584,7 @@ async fn stream_run_over_websocket(
     let mut last_index = 0u32;
     let mut terminal_error: Option<String> = None;
     let mut stream_poll_error: Option<(StatusCode, String)> = None;
-    let mut status_poll_error: Option<(StatusCode, String)> = None;
     let mut consecutive_stream_retryable_errors = 0u32;
-    let mut consecutive_status_retryable_errors = 0u32;
     let metrics_registry = state.metrics_registry();
     register_ws_run_stream_poll_metrics(&metrics_registry);
 
@@ -1836,7 +1834,7 @@ async fn stream_run_over_websocket(
                     }
                 }
 
-                let events = match state
+                let delta = match state
                     .execution
                     .run_lifecycle_service
                     .stream_run(
@@ -1846,7 +1844,7 @@ async fn stream_run_over_websocket(
                     )
                     .await
                 {
-                    Ok(events) => {
+                    Ok(delta) => {
                         record_ws_run_stream_poll_attempt(
                             &metrics_registry,
                             "stream_run",
@@ -1854,8 +1852,8 @@ async fn stream_run_over_websocket(
                         );
                         stream_poll_error = None;
                         consecutive_stream_retryable_errors = 0;
-                        saw_poll_activity |= !events.is_empty();
-                        events
+                        saw_poll_activity |= !delta.events.is_empty();
+                        delta
                     }
                     Err((status, err)) => {
                         record_ws_run_stream_poll_attempt(
@@ -1933,6 +1931,7 @@ async fn stream_run_over_websocket(
                     }
                 };
 
+                let astra_services::runs::DurableRunEventDelta { status, events, .. } = delta;
                 let saw_stream_terminal = events
                     .iter()
                     .any(|event| event.get("event_type").and_then(Value::as_str) == Some("run_finished"));
@@ -1965,104 +1964,12 @@ async fn stream_run_over_websocket(
                     return;
                 }
 
-                let status = match state
-                    .execution
-                    .run_lifecycle_service
-                    .get_run_status(run_id.to_string(), conn.principal.user.user_id.clone())
-                    .await
-                {
-                    Ok(status) => {
-                        record_ws_run_stream_poll_attempt(
-                            &metrics_registry,
-                            "get_run_status",
-                            "ok",
-                        );
-                        status_poll_error = None;
-                        consecutive_status_retryable_errors = 0;
-                        status
-                    }
-                    Err((status, err)) => {
-                        record_ws_run_stream_poll_attempt(
-                            &metrics_registry,
-                            "get_run_status",
-                            "error",
-                        );
-                        record_ws_run_stream_poll_error(
-                            &metrics_registry,
-                            "get_run_status",
-                            lifecycle_poll_error_class(status),
-                        );
-                        let message = err.0.detail;
-                        let policy = lifecycle_poll_error_policy(status);
-                        if policy.continue_polling
-                            && retryable_poll_failure_limit_reached(
-                                &mut consecutive_status_retryable_errors,
-                            )
-                        {
-                            let terminal_message = format!(
-                                "get_run_status polling failed {MAX_CONSECUTIVE_RETRYABLE_POLL_ERRORS} consecutive times: {message}"
-                            );
-                            send_msg(
-                                socket,
-                                &WsServerMessage::Error {
-                                    message: terminal_message.clone(),
-                                    code: "UPSTREAM_ERROR".into(),
-                                    retryable: false,
-                                },
-                            )
-                            .await;
-                            best_effort_cancel_run(state, conn, run_id).await;
-                            send_msg(
-                                socket,
-                                &WsServerMessage::RunFinished {
-                                    run_id: run_id.to_string(),
-                                    status: STATUS_FAILED.to_string(),
-                                    error: Some(terminal_message),
-                                },
-                            )
-                            .await;
-                            return;
-                        }
-                        if !policy.continue_polling
-                            || should_emit_transient_poll_error(
-                                &mut status_poll_error,
-                                status,
-                                &message,
-                            )
-                        {
-                            send_msg(
-                                socket,
-                                &ws_error_from_status(status, message.clone()),
-                            )
-                            .await;
-                        }
-                        if policy.cancel_run {
-                            best_effort_cancel_run(state, conn, run_id).await;
-                        }
-                        if policy.emit_failed_terminal {
-                            send_msg(
-                                socket,
-                                &WsServerMessage::RunFinished {
-                                    run_id: run_id.to_string(),
-                                    status: STATUS_FAILED.to_string(),
-                                    error: Some(message.clone()),
-                                },
-                            )
-                            .await;
-                        }
-                        if policy.continue_polling {
-                            continue;
-                        }
-                        return;
-                    }
-                };
-
-                if durable_run_status_is_terminal(&status.status) {
+                if durable_run_status_is_terminal(&status) {
                     send_msg(
                         socket,
                         &WsServerMessage::RunFinished {
                             run_id: run_id.to_string(),
-                            status: status.status,
+                            status,
                             error: terminal_error,
                         },
                     )
@@ -3084,12 +2991,6 @@ mod tests {
             "stream_run",
             lifecycle_poll_error_class(StatusCode::SERVICE_UNAVAILABLE),
         );
-        record_ws_run_stream_poll_attempt(&registry, "get_run_status", "error");
-        record_ws_run_stream_poll_error(
-            &registry,
-            "get_run_status",
-            lifecycle_poll_error_class(StatusCode::NOT_FOUND),
-        );
 
         let rendered = registry.render_prometheus();
         assert!(
@@ -3108,12 +3009,7 @@ mod tests {
             ),
             "{rendered}"
         );
-        assert!(
-            rendered.contains(
-                "astra_ws_run_stream_poll_errors_total{class=\"access_or_missing\",operation=\"get_run_status\"} 1"
-            ),
-            "{rendered}"
-        );
+        assert!(!rendered.contains("get_run_status"), "{rendered}");
         assert!(!rendered.contains("run_id="), "{rendered}");
         assert!(!rendered.contains("session_id="), "{rendered}");
         assert!(!rendered.contains("user_id="), "{rendered}");

@@ -612,7 +612,7 @@ impl RunLifecycleService for JointRunLifecycle {
         run_id: String,
         user_id: String,
         last_index: u32,
-    ) -> Result<Vec<Value>, (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)> {
         let run = self
             .store()
             .await
@@ -623,7 +623,12 @@ impl RunLifecycleService for JointRunLifecycle {
         if run.user_id != user_id {
             return Err(forbidden("run belongs to another user"));
         }
-        Ok(run.events.into_iter().skip(last_index as usize).collect())
+        Ok(astra_services::runs::DurableRunEventDelta {
+            session_id: run.session_id,
+            status: run.status,
+            last_event_idx: run.last_event_idx,
+            events: run.events.into_iter().skip(last_index as usize).collect(),
+        })
     }
 
     async fn get_run_interaction_event(

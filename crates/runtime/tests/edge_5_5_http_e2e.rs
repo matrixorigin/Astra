@@ -279,7 +279,8 @@ impl RunLifecycleService for E2eRunLifecycle {
         _run_id: String,
         _user_id: String,
         _last_index: u32,
-    ) -> Result<Vec<serde_json::Value>, (StatusCode, axum::Json<ErrorResponse>)> {
+    ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, axum::Json<ErrorResponse>)>
+    {
         unreachable!("approval callback e2e does not stream runs")
     }
 

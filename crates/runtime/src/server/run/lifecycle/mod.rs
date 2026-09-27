@@ -182,6 +182,7 @@ const AGENT_BINDING_TURN_CONTEXT_MAX_BYTES: usize = 256 * 1024;
 const AGENT_BINDING_TURN_CONTEXT_MAX_TOKENS: usize = 64_000;
 const AGENT_BINDING_INSTRUCTION_MAX_BYTES: usize = 256 * 1024;
 const DURABLE_LIVE_ATTACH_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const DURABLE_LIVE_ATTACH_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 // A terminal run and its Explain Analyze publication are separate durable
 // facts. Keep an attached observer alive long enough to see the publication,
 // then close with an explicit unavailable outcome instead of waiting forever.
@@ -189,6 +190,7 @@ const DURABLE_LIVE_ATTACH_PUBLICATION_GRACE: Duration = Duration::from_secs(5);
 // Bound publication latency independently of terminal task completion.
 const EXPLAIN_ARTIFACT_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(2);
 const DURABLE_LIVE_ATTACH_STORAGE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const DURABLE_LIVE_ATTACH_FINAL_READ_TIMEOUT: Duration = Duration::from_secs(1);
 const DURABLE_LIVE_ATTACH_TERMINAL_DELIVERY_TIMEOUT: Duration = Duration::from_secs(1);
 const AGENT_PROGRESS_STREAM_DRAIN_GRACE: Duration = Duration::from_millis(25);
 const ATTACHED_INTERACTION_DELIVERY_GRACE: Duration = Duration::from_millis(250);
@@ -18794,13 +18796,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         run_id: String,
         user_id: String,
         last_index: u32,
-    ) -> Result<Vec<Value>, (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)> {
         let after_event_idx = i64::from(last_index).saturating_sub(1);
         self.run_engine
             .load_run_event_delta(&user_id, &run_id, after_event_idx)
             .await
             .map_err(|error| Self::durable_persist_error("stream run delta", error))?
-            .map(|delta| delta.events)
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))
     }
 
@@ -18919,11 +18920,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         return;
                     }
                 }
-                let mut interval = tokio::time::interval(DURABLE_LIVE_ATTACH_POLL_INTERVAL);
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                interval.tick().await;
+                let mut poll_delay = DURABLE_LIVE_ATTACH_POLL_INTERVAL;
                 loop {
-                    tokio::select! {
+                    let deadline_fired = tokio::select! {
                         _ = event_tx.closed() => return,
                         _ = async {
                             if let Some(deadline) = publication_deadline {
@@ -18931,41 +18930,22 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             } else {
                                 std::future::pending::<()>().await;
                             }
-                        } => {
-                            if !explain_requested || publication_seen {
-                                return;
-                            }
-                            let unavailable = explain_publication_unavailable_event(
-                                &poll_run_id,
-                                &turn_id,
-                                owner_generation,
-                                "publication_timeout",
-                                "The Explain Analyze run completed, but its publication did not arrive before the bounded wait expired.",
-                            );
-                            match tokio::time::timeout(
-                                DURABLE_LIVE_ATTACH_TERMINAL_DELIVERY_TIMEOUT,
-                                event_tx.send(unavailable),
-                            )
-                            .await
-                            {
-                                Ok(Ok(())) => {}
-                                Ok(Err(_)) => return,
-                                Err(_) => tracing::error!(
-                                    target: "astra_runtime::run_lifecycle",
-                                    run_id = %poll_run_id,
-                                    "timed out delivering Explain Analyze publication-unavailable outcome"
-                                ),
-                            }
-                            return;
-                        }
-                        _ = interval.tick() => {}
-                    }
+                        } => true,
+                        _ = tokio::time::sleep(poll_delay) => false,
+                    };
                     if event_tx.is_closed() {
                         return;
                     }
-                    let read_timeout = publication_deadline
-                        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-                        .unwrap_or(DURABLE_LIVE_ATTACH_STORAGE_READ_TIMEOUT);
+                    // Verify the durable tail once at the grace deadline. A
+                    // publication committed after the last idle poll must not
+                    // be replaced by a synthetic timeout outcome.
+                    let read_timeout = if deadline_fired {
+                        DURABLE_LIVE_ATTACH_FINAL_READ_TIMEOUT
+                    } else {
+                        publication_deadline
+                            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                            .unwrap_or(DURABLE_LIVE_ATTACH_STORAGE_READ_TIMEOUT)
+                    };
                     let delta_result: Result<Option<DurableRunEventDelta>, String> =
                         match tokio::time::timeout(
                             read_timeout,
@@ -19024,6 +19004,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             return;
                         }
                     };
+                    let received_events = !delta.events.is_empty();
+                    let delivery_deadline = if deadline_fired {
+                        Some(Instant::now() + DURABLE_LIVE_ATTACH_TERMINAL_DELIVERY_TIMEOUT)
+                    } else {
+                        publication_deadline
+                    };
                     for event in delta.events {
                         if let Some(index) = event.get("index").and_then(Value::as_i64) {
                             event_cursor = event_cursor.max(index);
@@ -19032,11 +19018,23 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         }
                         publication_seen |= durable_event_is_valid_explain_publication(&event);
                         settlement_finished |= durable_event_is_settlement_finished(&event);
-                        if !send_durable_live_attach_event(&event_tx, event, publication_deadline)
+                        if !send_durable_live_attach_event(&event_tx, event, delivery_deadline)
                             .await
                         {
                             return;
                         }
+                    }
+                    poll_delay = if received_events {
+                        DURABLE_LIVE_ATTACH_POLL_INTERVAL
+                    } else {
+                        poll_delay
+                            .saturating_mul(2)
+                            .min(DURABLE_LIVE_ATTACH_IDLE_POLL_INTERVAL)
+                    };
+                    if !Self::durable_live_attach_complete(&delta.status) {
+                        // A paused Explain run can resume during its prior
+                        // publication grace. Resume ends that terminal wait.
+                        publication_deadline = None;
                     }
                     if Self::durable_live_attach_complete(&delta.status) {
                         if !explain_requested || publication_seen {

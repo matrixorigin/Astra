@@ -811,7 +811,8 @@ mod tests {
             _run_id: String,
             _user_id: String,
             _last_index: u32,
-        ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+        ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)>
+        {
             unreachable!("stream_run is not used in shutdown tests")
         }
 

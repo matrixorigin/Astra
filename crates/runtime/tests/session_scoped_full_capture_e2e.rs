@@ -245,11 +245,16 @@ impl RunLifecycleService for RecordingLifecycle {
         run_id: String,
         _user_id: String,
         _last_index: u32,
-    ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-        Ok(vec![json!({
-            "event_type": "run_finished",
-            "data": {"run_id": run_id, "status": "completed"}
-        })])
+    ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)> {
+        Ok(astra_services::runs::DurableRunEventDelta {
+            session_id: String::new(),
+            status: "completed".into(),
+            last_event_idx: 0,
+            events: vec![json!({
+                "event_type": "run_finished",
+                "data": {"run_id": run_id, "status": "completed"}
+            })],
+        })
     }
 
     async fn cancel_run(

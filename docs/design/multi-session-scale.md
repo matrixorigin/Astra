@@ -1,7 +1,7 @@
 # Multi-session and multi-server scale
 
 > Status: staged implementation contract.
-> Last updated: 2026-09-15.
+> Last updated: 2026-09-27.
 
 This document owns the capacity and availability contract for deployments with
 many users, many sessions, and more than one Astra Server. It describes the
@@ -21,6 +21,8 @@ budgets also allow it.
 The target is measured with real workloads. “A thousand sessions” is not one
 number: idle connections, waiting runs, short turns, long contexts, slow tools,
 and active provider calls exercise different limits.
+Stored sessions and previously opened chats do not create run-stream polling;
+observer read load follows concurrently attached live runs and their subscribers.
 
 ## Capacity layers
 
@@ -63,6 +65,28 @@ Process-local maps and channels are delivery accelerators only. They may be
 lost on restart and must never be required to prove ownership, idempotency, or
 completion.
 
+Run observers read an owner-scoped status and event high watermark before
+fetching any event tail. A caught-up cursor needs no event-table scan. A tail
+read stops at the captured high watermark; a concurrent append is delivered
+on a later poll. SSE live attach polls promptly while events arrive and backs
+off to at most one second between reads when idle. The database remains the
+source of truth for reconnect and cross-pod delivery. This bounded display
+delay must not weaken durable event ordering, terminal status, or Explain
+publication outcomes.
+
+SSE observer demand follows the run lifecycle:
+
+| Run and client state | Durable observation behavior |
+| --- | --- |
+| Historical session without a live attachment | No recurring run read. |
+| Running or waiting run with an attached client | Follow its cursor; an empty tail backs off. |
+| SSE client disconnects | Stop that attachment; the run remains durable and can be reattached by cursor. |
+| Paused or ordinary terminal run | Deliver the captured tail and close the attachment. |
+| Terminal Explain run awaiting publication | Keep the bounded publication grace, perform a final durable check, then deliver the real publication or an explicit unavailable outcome. |
+
+Pod loss and reconnect use the same owner-scoped durable cursor. A local
+notification can shorten delivery latency but cannot replace that read.
+
 The existing owner lease and durable Edge dispatch relay own cross-pod
 execution. A new scheduler, sticky-session requirement, or process-local
 parallel state machine must not be introduced to make a scale test pass.
@@ -93,6 +117,12 @@ Every capacity change reports, per workload and per pod count:
 - run RSS and retained live-event bytes;
 - provider request rate, token rate, time to first token, and error rate;
 - durable event/control-plane QPS and end-to-end turn latency.
+
+Measure observer read QPS separately for idle, active, and terminal runs, with
+SSE and WebSocket attachments on both owner and other pods. Include event-tail
+bytes, poll-to-display delay, reconnect replay completeness, and Explain
+publication delay. The read optimization has no capacity claim until those
+measurements are taken under the required multi-user scenarios.
 
 ### Observation-ingestion capacity
 

@@ -345,7 +345,7 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
         run_id: String,
         user_id: String,
         last_index: u32,
-    ) -> Result<Vec<Value>, (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)> {
         let run = self
             .store()
             .await
@@ -369,7 +369,12 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
                 Json(ErrorResponse::new("access denied")),
             ));
         }
-        Ok(run.events.into_iter().skip(last_index as usize).collect())
+        Ok(astra_services::runs::DurableRunEventDelta {
+            session_id: run.session_id,
+            status: run.status,
+            last_event_idx: run.last_event_idx,
+            events: run.events.into_iter().skip(last_index as usize).collect(),
+        })
     }
 
     async fn cancel_run(

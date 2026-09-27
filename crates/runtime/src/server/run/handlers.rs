@@ -559,9 +559,10 @@ pub(crate) async fn stream_run_handler(
             .stream_run(run_id.clone(), principal.user.user_id, query.last_index)
             .await
         {
-            Ok(events) => {
-                sse_json_response(transform_stream_run_events_for_client(&run_id, events))
-            }
+            Ok(delta) => sse_json_response(transform_stream_run_events_for_client(
+                &run_id,
+                delta.events,
+            )),
             Err((status, error)) => sse_error_response_from_error_with_context(
                 status,
                 error.0,

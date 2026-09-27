@@ -200,7 +200,7 @@ impl RunLifecycleService for WorkTurnRecordingLifecycle {
         _run_id: String,
         _user_id: String,
         _last_index: u32,
-    ) -> Result<Vec<Value>, (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)> {
         unreachable!()
     }
 
