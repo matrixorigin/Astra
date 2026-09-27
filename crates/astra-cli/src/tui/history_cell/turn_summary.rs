@@ -422,7 +422,7 @@ mod tests {
             "known primary usage should remain visible: {out}"
         );
         assert!(
-            out.contains("≥98.8k cached · usage incomplete"),
+            out.contains("≥98.8k cached"),
             "known cache reads missing: {out}"
         );
         let restored = TurnSummaryCell::from_persist(c.to_persist().unwrap()).unwrap();

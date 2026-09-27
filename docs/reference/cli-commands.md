@@ -8,7 +8,9 @@ The completion line shows elapsed time, time to first token (`ttft`), primary
 model tokens, and cache usage when reported. Complete input accounting shows
 the cached-input percentage; incomplete accounting shows lower bounds such as
 `≥19.9k tokens · ≥17.9k cached`. Missing cache measurements are omitted, not
-reported as zero. Session totals remain separate in parentheses.
+reported as zero. The `≥` counts are reported lower bounds; no cache
+percentage is shown without a complete input total. Session totals remain
+separate in parentheses.
 
 ## Personal BYOK model setup
 

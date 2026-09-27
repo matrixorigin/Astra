@@ -195,6 +195,9 @@ pub(crate) fn format_cache_usage_summary(
     complete: bool,
 ) -> Option<String> {
     let cache_read = cache_read?;
+    if !complete && cache_read == 0 {
+        return None;
+    }
     let Some(fresh) = fresh else {
         return Some(format!(
             "{} cached",
@@ -215,7 +218,7 @@ pub(crate) fn format_cache_usage_summary(
         return Some("0 cached".to_string());
     }
     Some(format!(
-        "{} cached · usage incomplete",
+        "{} cached",
         format_usage_count(cache_read, complete)
     ))
 }
@@ -596,7 +599,7 @@ mod tests {
         result.usage_attribution.primary_complete = false;
 
         let parts = compact_completion_parts(&state, &result, Duration::from_millis(5_200));
-        assert!(parts.contains(&"≥1.0k tokens · ≥900 cached · usage incomplete".to_string()));
+        assert!(parts.contains(&"≥1.0k tokens · ≥900 cached".to_string()));
     }
 
     #[test]
@@ -612,7 +615,7 @@ mod tests {
                 false,
             )
             .as_deref(),
-            Some("≥46.2k tokens · ≥34.9k cached · usage incomplete")
+            Some("≥46.2k tokens · ≥34.9k cached")
         );
     }
 
@@ -676,21 +679,9 @@ mod tests {
         assert_eq!(super::format_usage_count(19_999, true), "20.0k");
         for (fresh, read, write, complete, expected) in [
             (Some(100), None, None, false, None),
-            (
-                Some(100),
-                Some(0),
-                None,
-                false,
-                Some("≥0 cached · usage incomplete"),
-            ),
+            (Some(100), Some(0), None, false, None),
             (None, Some(900), None, false, Some("≥900 cached")),
-            (
-                Some(100),
-                Some(900),
-                Some(1000),
-                false,
-                Some("≥900 cached · usage incomplete"),
-            ),
+            (Some(100), Some(900), Some(1000), false, Some("≥900 cached")),
             (Some(100), Some(900), Some(1000), true, Some("45% cached")),
             (Some(0), Some(0), Some(0), true, Some("0 cached")),
             (
