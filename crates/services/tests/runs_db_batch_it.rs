@@ -4,6 +4,8 @@
 //!   --test runs_db_batch_it -- --ignored --test-threads=1
 
 mod common;
+#[path = "common/isolated_database.rs"]
+mod isolated_database;
 
 use astra_core::SharedPool;
 use astra_services::auth::session::{DatabaseSessionService, SessionService};
@@ -2174,10 +2176,7 @@ async fn auto_model_routing_memory_commit_is_atomic_and_fenced() {
 #[tokio::test]
 #[ignore = "requires disposable MatrixOne; set ASTRA_TEST_DB_IT=1"]
 async fn auto_model_routing_database_commit_is_atomic_and_fenced() {
-    let settings = common::require_db_it_env();
-    let db = std::env::var("ASTRA_TEST_DATABASE").expect("explicit test database");
-    assert!(db.starts_with("astra_test_router_") && db.len() > "astra_test_router_".len());
-    assert_eq!(settings.database, db);
+    isolated_database::require_isolated_database(&common::require_db_it_env().database);
     let (pool, store) = setup().await;
     let id = uuid::Uuid::new_v4().to_string();
     let mut run = durable_run_record(
