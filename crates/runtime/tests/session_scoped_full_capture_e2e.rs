@@ -174,11 +174,18 @@ impl SessionService for CaptureEnabledSessionService {
 #[derive(Clone, Default)]
 struct RecordingLifecycle {
     create_requests: Arc<Mutex<Vec<ChatRequestData>>>,
+    cancel_calls: Arc<Mutex<Vec<String>>>,
+    keep_run_active: Arc<Mutex<bool>>,
+    stream_error: Arc<Mutex<Option<StatusCode>>>,
 }
 
 impl RecordingLifecycle {
     async fn recorded_create_requests(&self) -> Vec<ChatRequestData> {
         self.create_requests.lock().await.clone()
+    }
+
+    async fn recorded_cancel_calls(&self) -> Vec<String> {
+        self.cancel_calls.lock().await.clone()
     }
 }
 
@@ -223,6 +230,7 @@ impl RunLifecycleService for RecordingLifecycle {
         run_id: String,
         _user_id: String,
     ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
+        let active = *self.keep_run_active.lock().await;
         Ok(RunStatusRecord {
             artifact_publication: None,
             root_run_id: Some(run_id.clone()),
@@ -230,7 +238,7 @@ impl RunLifecycleService for RecordingLifecycle {
             session_id: "capture-session".to_string(),
             parent_run_id: None,
             depth: 0,
-            status: "completed".to_string(),
+            status: if active { "running" } else { "completed" }.to_string(),
             waiting_for: None,
             events_count: 1,
             workspace: None,
@@ -246,23 +254,36 @@ impl RunLifecycleService for RecordingLifecycle {
         _user_id: String,
         _last_index: u32,
     ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)> {
+        if let Some(status) = *self.stream_error.lock().await {
+            return Err((status, Json(ErrorResponse::new("observer failed"))));
+        }
+        let active = *self.keep_run_active.lock().await;
         Ok(astra_services::runs::DurableRunEventDelta {
             session_id: String::new(),
-            status: "completed".into(),
+            status: if active { "running" } else { "completed" }.into(),
             last_event_idx: 0,
-            events: vec![json!({
-                "event_type": "run_finished",
-                "data": {"run_id": run_id, "status": "completed"}
-            })],
+            events: if active {
+                vec![]
+            } else {
+                vec![json!({
+                    "event_type": "run_finished",
+                    "data": {"run_id": run_id, "status": "completed"}
+                })]
+            },
         })
     }
 
     async fn cancel_run(
         &self,
-        _run_id: String,
+        run_id: String,
         _user_id: String,
     ) -> Result<astra_runtime::CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
-        unreachable!()
+        self.cancel_calls.lock().await.push(run_id.clone());
+        Ok(astra_runtime::CancelRunRecord {
+            run_id,
+            status: "cancellation_requested".into(),
+            execution_settled: false,
+        })
     }
 
     async fn list_runs_cursor(
@@ -305,12 +326,13 @@ async fn spawn_test_server() -> (
     (addr, lifecycle, handle)
 }
 
-#[tokio::test]
-async fn browser_ws_chat_propagates_session_scoped_full_capture_over_real_websocket() {
-    let (addr, lifecycle, server) = spawn_test_server().await;
-    let url = format!("ws://{addr}/chat/ws");
-    let (mut ws, _) = connect_async(&url).await.expect("WS connect");
-
+async fn start_browser_ws_run(
+    addr: std::net::SocketAddr,
+    content: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let (mut ws, _) = connect_async(format!("ws://{addr}/chat/ws"))
+        .await
+        .expect("WS connect");
     ws.send(Message::Text(
         json!({
             "type": "auth",
@@ -321,18 +343,16 @@ async fn browser_ws_chat_propagates_session_scoped_full_capture_over_real_websoc
         .into(),
     ))
     .await
-    .expect("auth send should succeed");
-
-    let auth_ok = ws.next().await.expect("auth response").expect("auth frame");
+    .expect("auth send");
+    let auth = ws.next().await.expect("auth response").expect("auth frame");
     let auth_json: serde_json::Value =
-        serde_json::from_str(&auth_ok.into_text().expect("auth text")).expect("auth json");
+        serde_json::from_str(&auth.into_text().unwrap()).expect("auth JSON");
     assert_eq!(auth_json["type"], "auth_ok");
     assert_eq!(auth_json["user_id"], "test-user-1");
-
     ws.send(Message::Text(
         json!({
             "type": "message",
-            "content": "hello over websocket",
+            "content": content,
             "session_id": "capture-session",
             "model_selection": {"offering_id": "offer-test-model"}
         })
@@ -340,7 +360,14 @@ async fn browser_ws_chat_propagates_session_scoped_full_capture_over_real_websoc
         .into(),
     ))
     .await
-    .expect("chat send should succeed");
+    .expect("chat send");
+    ws
+}
+
+#[tokio::test]
+async fn browser_ws_chat_propagates_session_scoped_full_capture_over_real_websocket() {
+    let (addr, lifecycle, server) = spawn_test_server().await;
+    let mut ws = start_browser_ws_run(addr, "hello over websocket").await;
 
     let mut seen_session_info = false;
     let mut seen_run_started = false;
@@ -383,6 +410,70 @@ async fn browser_ws_chat_propagates_session_scoped_full_capture_over_real_websoc
     assert_eq!(requests[0].session_id.as_deref(), Some("capture-session"));
     assert!(requests[0].full_llm_capture);
 
+    server.abort();
+}
+
+#[tokio::test]
+async fn browser_ws_disconnect_keeps_durable_run_active() {
+    let (addr, lifecycle, server) = spawn_test_server().await;
+    *lifecycle.keep_run_active.lock().await = true;
+    let mut ws = start_browser_ws_run(addr, "leave the run active").await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let frame = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .expect("run start timeout")
+            .expect("server frame")
+            .expect("valid frame");
+        if let Message::Text(text) = frame {
+            let payload: serde_json::Value = serde_json::from_str(&text).expect("WS JSON");
+            if payload["type"] == "run_started" {
+                break;
+            }
+        }
+    }
+    ws.close(None).await.expect("close WS");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("WS close failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("server did not finish WS close");
+    assert!(lifecycle.recorded_cancel_calls().await.is_empty());
+    server.abort();
+}
+
+#[tokio::test]
+async fn browser_ws_observer_error_closes_without_cancelling_run() {
+    let (addr, lifecycle, server) = spawn_test_server().await;
+    *lifecycle.stream_error.lock().await = Some(StatusCode::BAD_REQUEST);
+    let mut ws = start_browser_ws_run(addr, "observe a failing stream").await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut saw_error = false;
+    loop {
+        let frame = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .expect("observer close timeout")
+            .expect("server frame")
+            .expect("valid frame");
+        match frame {
+            Message::Text(text) => {
+                let payload: serde_json::Value = serde_json::from_str(&text).expect("WS JSON");
+                assert_ne!(payload["type"], "run_finished");
+                saw_error |= payload["type"] == "error";
+            }
+            Message::Close(_) => break,
+            Message::Ping(_) | Message::Pong(_) => {}
+            other => panic!("unexpected WS frame: {other:?}"),
+        }
+    }
+    assert!(saw_error, "observer failure must be visible before close");
+    assert!(lifecycle.recorded_cancel_calls().await.is_empty());
     server.abort();
 }
 

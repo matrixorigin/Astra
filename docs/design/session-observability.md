@@ -127,6 +127,10 @@ On reconnect, the client should rebuild from:
 - artifact manifest.
 
 Browser disconnect is not cancellation.
+An SSE or WebSocket send failure, malformed observation payload, or exhausted
+observer read retry closes that attachment without changing durable run status.
+Only an explicit authorized cancel request may cancel the run; the client can
+reattach using its durable event cursor.
 An internal CLI stream failure does not cancel the Server run. The local
 session execution lease covers local tool execution and canonical partial
 commit; after those finish, it is released with the request. A still-active

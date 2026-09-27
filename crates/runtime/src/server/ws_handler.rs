@@ -1380,35 +1380,6 @@ fn ws_error_from_status(status: StatusCode, message: impl Into<String>) -> WsSer
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LifecyclePollErrorPolicy {
-    cancel_run: bool,
-    emit_failed_terminal: bool,
-    continue_polling: bool,
-}
-
-fn lifecycle_poll_error_policy(status: StatusCode) -> LifecyclePollErrorPolicy {
-    if super::http_helpers::status_to_sse_retryable(status) {
-        LifecyclePollErrorPolicy {
-            cancel_run: false,
-            emit_failed_terminal: false,
-            continue_polling: true,
-        }
-    } else if matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) {
-        LifecyclePollErrorPolicy {
-            cancel_run: false,
-            emit_failed_terminal: true,
-            continue_polling: false,
-        }
-    } else {
-        LifecyclePollErrorPolicy {
-            cancel_run: true,
-            emit_failed_terminal: true,
-            continue_polling: false,
-        }
-    }
-}
-
 fn lifecycle_poll_error_class(status: StatusCode) -> &'static str {
     if super::http_helpers::status_to_sse_retryable(status) {
         "retryable"
@@ -1500,7 +1471,7 @@ fn run_stream_initial_poll_timer() -> tokio::time::Interval {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WsSendFailure {
-    Failed(String),
+    Failed,
     Disconnected,
 }
 
@@ -1525,14 +1496,6 @@ fn lifecycle_events_to_ws_payloads(
         .collect()
 }
 
-async fn best_effort_cancel_run(state: &AppState, conn: &WsConnection, run_id: &str) {
-    let _ = state
-        .execution
-        .run_lifecycle_service
-        .cancel_run(run_id.to_string(), conn.principal.user.user_id.clone())
-        .await;
-}
-
 async fn send_json_value(socket: &mut WebSocket, value: &Value) -> Result<(), WsSendFailure> {
     let text = match serde_json::to_string(value) {
         Ok(text) => text,
@@ -1541,13 +1504,13 @@ async fn send_json_value(socket: &mut WebSocket, value: &Value) -> Result<(), Ws
             send_msg(
                 socket,
                 &WsServerMessage::Error {
-                    message: message.clone(),
+                    message,
                     code: "INTERNAL_ERROR".into(),
                     retryable: false,
                 },
             )
             .await;
-            return Err(WsSendFailure::Failed(message));
+            return Err(WsSendFailure::Failed);
         }
     };
 
@@ -1556,13 +1519,13 @@ async fn send_json_value(socket: &mut WebSocket, value: &Value) -> Result<(), Ws
         send_msg(
             socket,
             &WsServerMessage::Error {
-                message: message.clone(),
+                message,
                 code: "INTERNAL_ERROR".into(),
                 retryable: false,
             },
         )
         .await;
-        return Err(WsSendFailure::Failed(message));
+        return Err(WsSendFailure::Failed);
     }
 
     socket
@@ -1660,12 +1623,10 @@ async fn stream_run_over_websocket(
                     }
                     Some(Ok(Message::Ping(data))) => {
                         if socket.send(Message::Pong(data)).await.is_err() {
-                            best_effort_cancel_run(state, conn, run_id).await;
                             return;
                         }
                     }
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                        best_effort_cancel_run(state, conn, run_id).await;
                         return;
                     }
                     Some(Ok(_)) => {}
@@ -1673,7 +1634,6 @@ async fn stream_run_over_websocket(
             }
             _ = heartbeat.tick() => {
                 if socket.send(Message::Ping(vec![].into())).await.is_err() {
-                    best_effort_cancel_run(state, conn, run_id).await;
                     return;
                 }
             }
@@ -1867,8 +1827,8 @@ async fn stream_run_over_websocket(
                             lifecycle_poll_error_class(status),
                         );
                         let message = err.0.detail;
-                        let policy = lifecycle_poll_error_policy(status);
-                        if policy.continue_polling
+                        let retryable = super::http_helpers::status_to_sse_retryable(status);
+                        if retryable
                             && retryable_poll_failure_limit_reached(
                                 &mut consecutive_stream_retryable_errors,
                             )
@@ -1879,25 +1839,16 @@ async fn stream_run_over_websocket(
                             send_msg(
                                 socket,
                                 &WsServerMessage::Error {
-                                    message: terminal_message.clone(),
+                                    message: terminal_message,
                                     code: "UPSTREAM_ERROR".into(),
-                                    retryable: false,
+                                    retryable: true,
                                 },
                             )
                             .await;
-                            best_effort_cancel_run(state, conn, run_id).await;
-                            send_msg(
-                                socket,
-                                &WsServerMessage::RunFinished {
-                                    run_id: run_id.to_string(),
-                                    status: STATUS_FAILED.to_string(),
-                                    error: Some(terminal_message),
-                                },
-                            )
-                            .await;
+                            let _ = socket.send(Message::Close(None)).await;
                             return;
                         }
-                        if !policy.continue_polling
+                        if !retryable
                             || should_emit_transient_poll_error(
                                 &mut stream_poll_error,
                                 status,
@@ -1910,23 +1861,10 @@ async fn stream_run_over_websocket(
                             )
                             .await;
                         }
-                        if policy.cancel_run {
-                            best_effort_cancel_run(state, conn, run_id).await;
-                        }
-                        if policy.emit_failed_terminal {
-                            send_msg(
-                                socket,
-                                &WsServerMessage::RunFinished {
-                                    run_id: run_id.to_string(),
-                                    status: STATUS_FAILED.to_string(),
-                                    error: Some(message.clone()),
-                                },
-                            )
-                            .await;
-                        }
-                        if policy.continue_polling {
+                        if retryable {
                             continue;
                         }
+                        let _ = socket.send(Message::Close(None)).await;
                         return;
                     }
                 };
@@ -1942,20 +1880,10 @@ async fn stream_run_over_websocket(
                     match send_json_value(socket, &payload).await {
                         Ok(()) => {}
                         Err(WsSendFailure::Disconnected) => {
-                            best_effort_cancel_run(state, conn, run_id).await;
                             return;
                         }
-                        Err(WsSendFailure::Failed(message)) => {
-                            best_effort_cancel_run(state, conn, run_id).await;
-                            send_msg(
-                                socket,
-                                &WsServerMessage::RunFinished {
-                                    run_id: run_id.to_string(),
-                                    status: STATUS_FAILED.to_string(),
-                                    error: Some(message.clone()),
-                                },
-                            )
-                            .await;
+                        Err(WsSendFailure::Failed) => {
+                            let _ = socket.send(Message::Close(None)).await;
                             return;
                         }
                     }
@@ -3211,40 +3139,6 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"run_cancellation_requested""#));
         assert!(json.contains(r#""run_id":"r1""#));
-    }
-
-    #[test]
-    fn lifecycle_poll_error_policy_retries_transient_errors() {
-        for status in [
-            StatusCode::SERVICE_UNAVAILABLE,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            StatusCode::TOO_MANY_REQUESTS,
-        ] {
-            let policy = lifecycle_poll_error_policy(status);
-            assert!(!policy.cancel_run);
-            assert!(!policy.emit_failed_terminal);
-            assert!(policy.continue_polling);
-        }
-    }
-
-    #[test]
-    fn lifecycle_poll_error_policy_fails_terminal_without_cancel_for_missing_or_forbidden_runs() {
-        for status in [StatusCode::NOT_FOUND, StatusCode::FORBIDDEN] {
-            let policy = lifecycle_poll_error_policy(status);
-            assert!(!policy.cancel_run);
-            assert!(policy.emit_failed_terminal);
-            assert!(!policy.continue_polling);
-        }
-    }
-
-    #[test]
-    fn lifecycle_poll_error_policy_cancels_run_for_other_non_retryable_errors() {
-        for status in [StatusCode::UNPROCESSABLE_ENTITY, StatusCode::BAD_REQUEST] {
-            let policy = lifecycle_poll_error_policy(status);
-            assert!(policy.cancel_run);
-            assert!(policy.emit_failed_terminal);
-            assert!(!policy.continue_polling);
-        }
     }
 
     #[test]
