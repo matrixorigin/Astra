@@ -85,8 +85,10 @@ reconnect can retry; a terminal rejection leaves the authenticated connection
 available for a different run. WebSocket terminal delivery follows the same
 bounded Explain publication reconciliation as SSE;
 the artifact publication or explicit unavailable outcome precedes the final
-`run_finished` frame. Clients accept that bound terminal at its original lower
-event index. Until it arrives, reconnect replay starts before the publication
+`run_finished` frame. A replayed terminal derives failure from its own durable
+error facts even when the preceding `run_error` is before the reconnect cursor.
+Clients accept that bound terminal at its original lower event index. Until it
+arrives, reconnect replay starts before the publication
 so the original terminal and its owner generation remain recoverable. The
 bounded run-status snapshot includes the root Explain request flag from the
 already-read `run_started` fact. Ordinary non-Explain WebSocket terminals,

@@ -192,6 +192,7 @@ struct RecordingLifecycle {
     live_attach_cursors: Arc<Mutex<Vec<u32>>>,
     replay_event_at_index: Arc<Mutex<Option<u32>>>,
     status_lookup_error_once: Arc<Mutex<Option<StatusCode>>>,
+    failed_terminal_replay: Arc<Mutex<bool>>,
 }
 
 impl RecordingLifecycle {
@@ -204,9 +205,9 @@ impl RecordingLifecycle {
     }
 }
 
-fn mock_explain_publication() -> serde_json::Value {
+fn mock_explain_publication(index: u32) -> serde_json::Value {
     json!({
-        "index": 1,
+        "index": index,
         "event_type": "artifact_publication",
         "data": {
             "schema_version": 1,
@@ -274,6 +275,7 @@ impl RunLifecycleService for RecordingLifecycle {
             ));
         }
         let active = *self.keep_run_active.lock().await;
+        let failed = *self.failed_terminal_replay.lock().await;
         Ok(RunStatusRecord {
             artifact_publication: None,
             explain_requested: *self.publication_after_terminal.lock().await
@@ -283,7 +285,14 @@ impl RunLifecycleService for RecordingLifecycle {
             session_id: "capture-session".to_string(),
             parent_run_id: None,
             depth: 0,
-            status: if active { "running" } else { "completed" }.to_string(),
+            status: if active {
+                "running"
+            } else if failed {
+                "failed"
+            } else {
+                "completed"
+            }
+            .to_string(),
             waiting_for: self.waiting_for.lock().await.clone(),
             events_count: 1,
             workspace: None,
@@ -303,12 +312,33 @@ impl RunLifecycleService for RecordingLifecycle {
             return Err((status, Json(ErrorResponse::new("observer failed"))));
         }
         let active = *self.keep_run_active.lock().await;
+        let failed = *self.failed_terminal_replay.lock().await;
         let replay_at = *self.replay_event_at_index.lock().await;
         Ok(astra_services::runs::DurableRunEventDelta {
             session_id: String::new(),
-            status: if active { "running" } else { "completed" }.into(),
-            last_event_idx: 0,
-            events: if active && replay_at.is_some_and(|index| last_index <= index) {
+            status: if active {
+                "running"
+            } else if failed {
+                "failed"
+            } else {
+                "completed"
+            }
+            .into(),
+            last_event_idx: if failed { 11 } else { 0 },
+            events: if failed && last_index <= 11 {
+                vec![json!({
+                    "index": 11,
+                    "event_type": "run_finished",
+                    "data": {
+                        "run_id": run_id,
+                        "owner_generation": 7,
+                        "error": "boom",
+                        "error_code": "network",
+                        "prompt_tokens": 2,
+                        "completion_tokens": 1
+                    }
+                })]
+            } else if active && replay_at.is_some_and(|index| last_index <= index) {
                 vec![json!({
                     "index": replay_at.unwrap(),
                     "event_type": "text_delta",
@@ -334,10 +364,15 @@ impl RunLifecycleService for RecordingLifecycle {
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
         self.live_attach_cursors.lock().await.push(last_index);
         if *self.publication_in_live_replay.lock().await {
+            let publication_index = if *self.failed_terminal_replay.lock().await {
+                12
+            } else {
+                1
+            };
             return Ok(ChatStreamRecord {
                 session_id: "capture-session".into(),
                 run_id,
-                events: vec![mock_explain_publication()],
+                events: vec![mock_explain_publication(publication_index)],
                 event_rx: None,
             });
         }
@@ -345,7 +380,7 @@ impl RunLifecycleService for RecordingLifecycle {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                let _ = tx.send(mock_explain_publication()).await;
+                let _ = tx.send(mock_explain_publication(1)).await;
             });
             return Ok(ChatStreamRecord {
                 session_id: "capture-session".into(),
@@ -588,6 +623,65 @@ async fn browser_ws_attached_ordinary_terminal_skips_history_reconciliation() {
     assert_eq!(next_ws_json(&mut ws).await["type"], "run_finished");
     assert!(lifecycle.live_attach_cursors.lock().await.is_empty());
     server.abort();
+}
+
+async fn assert_failed_terminal_replay_after_usage(explain: bool) {
+    let (addr, lifecycle, server) = spawn_test_server().await;
+    *lifecycle.failed_terminal_replay.lock().await = true;
+    *lifecycle.publication_in_live_replay.lock().await = explain;
+
+    let mut first = connect_authenticated_ws(addr, "test-capture-token").await;
+    first
+        .send(Message::Text(
+            json!({"type": "attach_run", "run_id": "run-capture-ws", "last_index": 10})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send initial attach");
+    assert_eq!(next_ws_json(&mut first).await["type"], "session_info");
+    let usage = next_ws_json(&mut first).await;
+    assert_eq!(usage["type"], "usage");
+    assert_eq!(usage["index"], 11);
+    first.close(None).await.expect("disconnect after usage");
+
+    let mut recovered = connect_authenticated_ws(addr, "test-capture-token").await;
+    recovered
+        .send(Message::Text(
+            json!({"type": "attach_run", "run_id": "run-capture-ws", "last_index": 11})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send replay attach");
+    assert_eq!(next_ws_json(&mut recovered).await["type"], "session_info");
+    assert_eq!(next_ws_json(&mut recovered).await["type"], "usage");
+    if explain {
+        let publication = next_ws_json(&mut recovered).await;
+        assert_eq!(publication["type"], "artifact_publication");
+        assert_eq!(publication["index"], 12);
+        assert_eq!(lifecycle.live_attach_cursors.lock().await.last(), Some(&12));
+    } else {
+        assert!(lifecycle.live_attach_cursors.lock().await.is_empty());
+    }
+    let terminal = next_ws_json(&mut recovered).await;
+    assert_eq!(terminal["type"], "run_finished");
+    assert_eq!(terminal["index"], 11);
+    assert_eq!(terminal["status"], "failed");
+    assert_eq!(terminal["error"], "boom");
+    assert_eq!(terminal["error_code"], "network");
+    assert_eq!(terminal["owner_generation"], 7);
+    server.abort();
+}
+
+#[tokio::test]
+async fn browser_ws_replays_failed_terminal_after_usage_disconnect() {
+    assert_failed_terminal_replay_after_usage(false).await;
+}
+
+#[tokio::test]
+async fn browser_ws_replays_failed_explain_terminal_after_usage_disconnect() {
+    assert_failed_terminal_replay_after_usage(true).await;
 }
 
 #[tokio::test]

@@ -46,6 +46,19 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
             .and_then(serde_json::Value::as_object)
             .and_then(|data| data.get("owner_generation"))
             .cloned();
+        let run_finished_has_failure_facts = event_type == "run_finished"
+            && event
+                .get("data")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|data| {
+                    data.get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some()
+                        || data
+                            .get("error_code")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some()
+                });
 
         let event_belongs_to_root = producer_run_id
             .as_deref()
@@ -230,7 +243,7 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
                 Some("cancelled")
             } else if run_finished_interrupted {
                 Some("paused")
-            } else if pending_run_error.is_some() {
+            } else if run_finished_has_failure_facts || pending_run_error.is_some() {
                 Some("failed")
             } else {
                 Some("completed")
@@ -1334,6 +1347,41 @@ mod tests {
         assert_eq!(
             transformed[4],
             json!({"type": "run_finished", "run_id": "run-123", "status": "cancelled", "index": 12})
+        );
+    }
+
+    #[test]
+    fn failed_terminal_replay_does_not_require_the_preceding_run_error() {
+        // An inclusive cursor at index 11 can replay this durable event after
+        // the client has already received its usage projection, while the
+        // preceding run_error at index 10 is outside the replay tail.
+        let projected = transform_stream_run_events_for_client(
+            "run-failed",
+            vec![json!({
+                "event_type": "run_finished",
+                "index": 11,
+                "data": {
+                    "error": "boom",
+                    "error_code": "network",
+                    "owner_generation": 7,
+                    "prompt_tokens": 2,
+                    "completion_tokens": 1
+                }
+            })],
+        );
+        assert_eq!(projected[0]["type"], "usage");
+        assert_eq!(projected[0]["index"], 11);
+        assert_eq!(
+            projected[1],
+            json!({
+                "type": "run_finished",
+                "run_id": "run-failed",
+                "index": 11,
+                "status": "failed",
+                "error": "boom",
+                "error_code": "network",
+                "owner_generation": 7
+            })
         );
     }
 
