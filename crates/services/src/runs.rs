@@ -1180,6 +1180,8 @@ pub struct ChatStreamRecord {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunStatusRecord {
     pub artifact_publication: Option<serde_json::Value>,
+    /// Durable root run-start intent, available from the bounded status read.
+    pub explain_requested: bool,
     pub run_id: String,
     pub session_id: String,
     /// Durable run-tree identity. A missing parent identifies the root
@@ -3056,6 +3058,7 @@ pub struct DurableRunStatusSnapshot {
     pub parent_run_id: Option<String>,
     pub root_run_id: Option<String>,
     pub depth: u32,
+    pub explain_requested: bool,
     pub status: String,
     pub waiting_for: Option<String>,
     pub run_generation: u64,
@@ -24350,6 +24353,7 @@ fn run_status_snapshot_from_run(run: &DurableRunRecord) -> DurableRunStatusSnaps
         parent_run_id: run.parent_run_id.clone(),
         root_run_id: run.root_run_id.clone(),
         depth: run.depth,
+        explain_requested: run_requested_explain_analyze(run),
         status: run.status.clone(),
         waiting_for: run.waiting_for.clone(),
         run_generation: run.run_generation,
@@ -43664,6 +43668,23 @@ mod tests {
         assert_eq!(snapshot.executor.unwrap()["kind"], "edge");
         assert_eq!(snapshot.transport.as_deref(), Some("edge"));
         assert_eq!(snapshot.accounting.unwrap()["prompt_tokens"], 11);
+    }
+
+    #[tokio::test]
+    async fn run_status_snapshot_carries_root_explain_intent() {
+        let store = InMemoryRunStateStore::new();
+        let mut run = durable_run_record("status-explain-intent");
+        run.events = vec![make_event(
+            "run_started",
+            json!({"explain_analyze_requested": true}),
+        )];
+        store.insert_run(run).await.unwrap();
+        let snapshot = store
+            .load_run_status_snapshot("u1", "status-explain-intent")
+            .await
+            .unwrap()
+            .expect("status snapshot");
+        assert!(snapshot.explain_requested);
     }
 
     #[test]

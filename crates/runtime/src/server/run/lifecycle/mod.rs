@@ -13216,6 +13216,7 @@ impl AgenticRunLifecycleService {
             });
         RunStatusRecord {
             artifact_publication: None,
+            explain_requested: astra_services::runs::run_requested_explain_analyze(run),
             run_id: run.run_id.clone(),
             session_id: run.session_id.clone(),
             parent_run_id: run.parent_run_id.clone(),
@@ -13234,6 +13235,7 @@ impl AgenticRunLifecycleService {
     fn durable_status_snapshot_record(snapshot: DurableRunStatusSnapshot) -> RunStatusRecord {
         RunStatusRecord {
             artifact_publication: None,
+            explain_requested: snapshot.explain_requested,
             run_id: snapshot.run_id,
             session_id: snapshot.session_id,
             parent_run_id: snapshot.parent_run_id,

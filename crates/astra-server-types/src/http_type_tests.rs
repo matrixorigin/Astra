@@ -1095,6 +1095,7 @@ fn run_list_record_to_response_preserves_optional_total_and_cursor() {
     let record = RunListRecord {
         runs: vec![RunStatusRecord {
             artifact_publication: None,
+            explain_requested: false,
             run_id: "run-1".into(),
             session_id: "session-1".into(),
             parent_run_id: None,
@@ -1164,6 +1165,7 @@ fn run_status_record_to_response() {
     // with waiting_for
     let record = RunStatusRecord {
         artifact_publication: None,
+        explain_requested: false,
         run_id: "r1".into(),
         session_id: "s1".into(),
         parent_run_id: Some("root".into()),
@@ -1188,6 +1190,7 @@ fn run_status_record_to_response() {
     // without waiting_for
     let record = RunStatusRecord {
         artifact_publication: None,
+        explain_requested: false,
         run_id: "r2".into(),
         session_id: "s2".into(),
         parent_run_id: None,

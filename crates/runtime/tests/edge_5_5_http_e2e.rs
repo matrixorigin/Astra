@@ -201,6 +201,7 @@ impl RunLifecycleService for E2eRunLifecycle {
         };
         Ok(RunStatusRecord {
             artifact_publication: None,
+            explain_requested: false,
             root_run_id: Some(run_id.clone()),
             run_id,
             session_id,

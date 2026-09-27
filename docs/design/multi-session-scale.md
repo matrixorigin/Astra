@@ -79,10 +79,19 @@ Browser WebSocket clients authenticate in the first frame, then may send
 disconnect. The server verifies run ownership before binding the connection
 for event replay and durable approval or ask_user responses. Clients replay
 the last seen event index because one durable event may produce several wire
-frames, and suppress frames they already displayed. WebSocket terminal
-delivery follows the same bounded Explain publication reconciliation as SSE;
+frames, and suppress frames they already displayed. The `session_info` frame
+accepts an attachment. A retryable lookup failure closes the socket so bounded
+reconnect can retry; a terminal rejection leaves the authenticated connection
+available for a different run. WebSocket terminal delivery follows the same
+bounded Explain publication reconciliation as SSE;
 the artifact publication or explicit unavailable outcome precedes the final
-`run_finished` frame.
+`run_finished` frame. Clients accept that bound terminal at its original lower
+event index. Until it arrives, reconnect replay starts before the publication
+so the original terminal and its owner generation remain recoverable. The
+bounded run-status snapshot includes the root Explain request flag from the
+already-read `run_started` fact. Ordinary non-Explain WebSocket terminals,
+including reattachments, deliver directly from the captured tail without
+hydrating the full run history for publication reconciliation.
 
 SSE observer demand follows the run lifecycle:
 

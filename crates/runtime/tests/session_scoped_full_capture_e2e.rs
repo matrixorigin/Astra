@@ -191,6 +191,7 @@ struct RecordingLifecycle {
     resolved_interactions: Arc<Mutex<Vec<String>>>,
     live_attach_cursors: Arc<Mutex<Vec<u32>>>,
     replay_event_at_index: Arc<Mutex<Option<u32>>>,
+    status_lookup_error_once: Arc<Mutex<Option<StatusCode>>>,
 }
 
 impl RecordingLifecycle {
@@ -232,12 +233,13 @@ impl RunLifecycleService for RecordingLifecycle {
             .session_id
             .clone()
             .unwrap_or_else(|| "capture-session".to_string());
+        let explain = request.explain;
         self.create_requests.lock().await.push(request);
         Ok(ChatRunRecord {
             session_id,
             run_id: "run-capture-ws".to_string(),
             status: "queued".to_string(),
-            explain: None,
+            explain: explain.then(|| json!({"mode": "background"})),
         })
     }
 
@@ -262,6 +264,9 @@ impl RunLifecycleService for RecordingLifecycle {
         run_id: String,
         user_id: String,
     ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
+        if let Some(status) = self.status_lookup_error_once.lock().await.take() {
+            return Err((status, Json(ErrorResponse::new("status lookup failed"))));
+        }
         if run_id != "run-capture-ws" || user_id != "test-user-1" {
             return Err((
                 StatusCode::NOT_FOUND,
@@ -271,6 +276,8 @@ impl RunLifecycleService for RecordingLifecycle {
         let active = *self.keep_run_active.lock().await;
         Ok(RunStatusRecord {
             artifact_publication: None,
+            explain_requested: *self.publication_after_terminal.lock().await
+                || *self.publication_in_live_replay.lock().await,
             root_run_id: Some(run_id.clone()),
             run_id,
             session_id: "capture-session".to_string(),
@@ -460,6 +467,7 @@ async fn start_browser_ws_run(
         json!({
             "type": "message",
             "content": content,
+            "explain": content == "explain",
             "session_id": "capture-session",
             "model_selection": {"offering_id": "offer-test-model"}
         })
@@ -560,7 +568,25 @@ async fn browser_ws_chat_propagates_session_scoped_full_capture_over_real_websoc
     assert_eq!(requests.len(), 1, "one WS run request expected");
     assert_eq!(requests[0].session_id.as_deref(), Some("capture-session"));
     assert!(requests[0].full_llm_capture);
+    assert!(lifecycle.live_attach_cursors.lock().await.is_empty());
 
+    server.abort();
+}
+
+#[tokio::test]
+async fn browser_ws_attached_ordinary_terminal_skips_history_reconciliation() {
+    let (addr, lifecycle, server) = spawn_test_server().await;
+    let mut ws = connect_authenticated_ws(addr, "test-capture-token").await;
+    ws.send(Message::Text(
+        json!({"type": "attach_run", "run_id": "run-capture-ws", "last_index": 0})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("send attach");
+    assert_eq!(next_ws_json(&mut ws).await["type"], "session_info");
+    assert_eq!(next_ws_json(&mut ws).await["type"], "run_finished");
+    assert!(lifecycle.live_attach_cursors.lock().await.is_empty());
     server.abort();
 }
 
@@ -595,6 +621,43 @@ async fn browser_ws_reconciles_publication_appended_after_terminal_tail_read() {
 }
 
 #[tokio::test]
+async fn browser_ws_retryable_attach_lookup_closes_for_reconnect() {
+    let (addr, lifecycle, server) = spawn_test_server().await;
+    *lifecycle.keep_run_active.lock().await = true;
+    *lifecycle.status_lookup_error_once.lock().await = Some(StatusCode::SERVICE_UNAVAILABLE);
+    let mut failed = connect_authenticated_ws(addr, "test-capture-token").await;
+    failed
+        .send(Message::Text(
+            json!({"type": "attach_run", "run_id": "run-capture-ws", "last_index": 0})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send failed attach");
+    let error = next_ws_json(&mut failed).await;
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["retryable"], true);
+    let close = tokio::time::timeout(std::time::Duration::from_secs(2), failed.next())
+        .await
+        .expect("attach close timeout")
+        .expect("close frame")
+        .expect("valid close frame");
+    assert!(matches!(close, Message::Close(_)));
+
+    let mut recovered = connect_authenticated_ws(addr, "test-capture-token").await;
+    recovered
+        .send(Message::Text(
+            json!({"type": "attach_run", "run_id": "run-capture-ws", "last_index": 0})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send recovered attach");
+    assert_eq!(next_ws_json(&mut recovered).await["type"], "session_info");
+    server.abort();
+}
+
+#[tokio::test]
 async fn browser_ws_reconnect_replays_cursor_and_resolves_waiting_interactions() {
     let (addr, lifecycle, server) = spawn_test_server().await;
     *lifecycle.keep_run_active.lock().await = true;
@@ -618,6 +681,16 @@ async fn browser_ws_reconnect_replays_cursor_and_resolves_waiting_interactions()
     wrong_owner.close(None).await.expect("close other owner");
 
     let mut ws = connect_authenticated_ws(addr, "test-capture-token").await;
+    ws.send(Message::Text(
+        json!({
+            "type": "attach_run", "run_id": "missing", "last_index": 0
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send missing attach");
+    assert_eq!(next_ws_json(&mut ws).await["type"], "error");
     *lifecycle.replay_event_at_index.lock().await = Some(7);
     ws.send(Message::Text(
         json!({

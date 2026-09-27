@@ -592,6 +592,7 @@ impl RunLifecycleService for JointRunLifecycle {
         }
         Ok(RunStatusRecord {
             artifact_publication: None,
+            explain_requested: false,
             run_id,
             session_id: run.session_id,
             parent_run_id: run.parent_run_id,

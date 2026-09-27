@@ -863,7 +863,8 @@ async fn handle_chat_message(
             )
             .await;
 
-            stream_run_over_websocket(socket, state, conn, &run.run_id, 0).await;
+            stream_run_over_websocket(socket, state, conn, &run.run_id, 0, run.explain.is_some())
+                .await;
             conn.active_run_id = None;
         }
         Err((status, err)) => {
@@ -888,6 +889,11 @@ async fn handle_attach_run(
         Ok(record) => record,
         Err((status, err)) => {
             send_msg(socket, &ws_error_from_status(status, err.0.detail)).await;
+            // A retryable lookup cannot leave an authenticated socket idle
+            // with no observer. Closing drives the client's bounded reconnect.
+            if super::http_helpers::status_to_sse_retryable(status) {
+                let _ = socket.send(Message::Close(None)).await;
+            }
             return;
         }
     };
@@ -899,7 +905,15 @@ async fn handle_attach_run(
         &session_info_message(record.session_id, Some(record.run_id.clone())),
     )
     .await;
-    stream_run_over_websocket(socket, state, conn, &record.run_id, last_index).await;
+    stream_run_over_websocket(
+        socket,
+        state,
+        conn,
+        &record.run_id,
+        last_index,
+        record.explain_requested,
+    )
+    .await;
     conn.active_run_id = None;
 }
 
@@ -1580,6 +1594,7 @@ async fn stream_run_over_websocket(
     conn: &mut WsConnection,
     run_id: &str,
     mut last_index: u32,
+    explain_requested: bool,
 ) {
     let mut poll_cadence = RunStreamPollCadence::new();
     let mut poll = run_stream_initial_poll_timer();
@@ -1945,6 +1960,18 @@ async fn stream_run_over_websocket(
                     }
                 }
                 if saw_stream_terminal || durable_run_status_is_terminal(&status) {
+                    if !explain_requested {
+                        let terminal_payload = terminal_payload.unwrap_or_else(|| {
+                            serde_json::to_value(WsServerMessage::RunFinished {
+                                run_id: run_id.to_string(),
+                                status,
+                                error: terminal_error,
+                            })
+                            .expect("run_finished is serializable")
+                        });
+                        let _ = send_json_value(socket, &terminal_payload).await;
+                        return;
+                    }
                     finish_ws_run_after_publication(
                         socket,
                         state,
