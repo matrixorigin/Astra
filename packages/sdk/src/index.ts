@@ -544,7 +544,7 @@ export {
   readAstraErrorDetail,
 } from "./http";
 export { AstraWebSocket } from "./websocket";
-export type { AstraWebSocketOptions, ToolApproval } from "./websocket";
+export type { AstraWebSocketOptions, ToolApproval, UserPromptAnswer } from "./websocket";
 
 export { layoutExplainAnalyzeGraph } from "./explain-analyze-layout";
 export type { ExplainAnalyzeLayoutNodeV1, ExplainAnalyzeLayoutEdgeKindV1, ExplainAnalyzeLayoutEdgeV1, ExplainAnalyzeLayoutDomainV1, ExplainAnalyzeLayoutV1, ExplainAnalyzeLayoutOptionsV1 } from "./explain-analyze-layout";

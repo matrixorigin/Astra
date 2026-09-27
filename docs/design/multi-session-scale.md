@@ -74,6 +74,16 @@ source of truth for reconnect and cross-pod delivery. This bounded display
 delay must not weaken durable event ordering, terminal status, or Explain
 publication outcomes.
 
+Browser WebSocket clients authenticate in the first frame, then may send
+`attach_run` with an owned `run_id` and inclusive `last_index` cursor after a
+disconnect. The server verifies run ownership before binding the connection
+for event replay and durable approval or ask_user responses. Clients replay
+the last seen event index because one durable event may produce several wire
+frames, and suppress frames they already displayed. WebSocket terminal
+delivery follows the same bounded Explain publication reconciliation as SSE;
+the artifact publication or explicit unavailable outcome precedes the final
+`run_finished` frame.
+
 SSE observer demand follows the run lifecycle:
 
 | Run and client state | Durable observation behavior |

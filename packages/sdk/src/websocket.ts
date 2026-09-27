@@ -1,5 +1,6 @@
 import type { StreamEvent, StreamEventType, ConnectionState } from "./types";
 import { modelSelectionToWire } from "./wire";
+import { ASTRA_AGENT_INTERACTION_API_MAJOR } from "./paths";
 
 // ─── Event Emitter Types ────────────────────────────────────────────
 
@@ -21,7 +22,7 @@ export type AstraWebSocketOptions = {
   /** WebSocket URL (e.g. `ws://localhost:17001/chat/ws`). */
   url: string;
   /** JWT access token for authentication. */
-  token?: string;
+  token: string;
   /** WebSocket sub-protocols. */
   protocols?: string[];
 
@@ -39,6 +40,13 @@ export type ToolApproval = {
   callId: string;
   approved: boolean;
   reason?: string;
+};
+
+export type UserPromptAnswer = {
+  question: string;
+  answers: string[];
+  multi_select: boolean;
+  annotation?: { notes?: string; preview?: string };
 };
 
 // ─── AstraWebSocket ─────────────────────────────────────────────────
@@ -71,6 +79,10 @@ export class AstraWebSocket {
     AstraWebSocketOptions;
   private reconnectAttempts = 0;
   private closed = false;
+  // Replay the last event inclusively: one durable event can project to
+  // multiple frames, and the socket can close between those frames.
+  private replayEventIndex = 0;
+  private seenReplayFrames = new Set<string>();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private listeners = new Map<string, Set<Listener<any>>>();
 
@@ -133,37 +145,74 @@ export class AstraWebSocket {
   // ─── Connection ───────────────────────────────────────────────────
 
   /**
-   * Connect to the WebSocket server. Resolves when the connection is open
-   * (or rejects on immediate failure).
+   * Connect to the WebSocket server. Resolves after authentication and after
+   * sending any active run's reattach request at its last durable cursor.
    */
   connect(): Promise<void> {
+    if (!this.opts.token) {
+      return Promise.reject(new Error("WebSocket authentication token is required"));
+    }
     this.closed = false;
     this.setConnectionState("connecting");
 
     return new Promise<void>((resolve, reject) => {
-      const url = new URL(this.opts.url);
-      if (this.opts.token) {
-        url.searchParams.set("token", this.opts.token);
-      }
+      const socket = new WebSocket(this.opts.url, this.opts.protocols);
+      this.ws = socket;
+      let authenticated = false;
 
-      this.ws = new WebSocket(url.toString(), this.opts.protocols);
-
-      this.ws.onopen = () => {
-        this.reconnectAttempts = 0;
-        this.setConnectionState("connected");
-        resolve();
+      socket.onopen = () => {
+        socket.send(JSON.stringify({
+          type: "auth",
+          token: this.opts.token.startsWith("Bearer ")
+            ? this.opts.token
+            : `Bearer ${this.opts.token}`,
+          interaction_api_major: ASTRA_AGENT_INTERACTION_API_MAJOR,
+        }));
       };
 
-      this.ws.onmessage = (msg) => {
+      socket.onmessage = (msg) => {
         try {
-          const data = JSON.parse(msg.data as string) as StreamEvent;
-          this.processEvent(data);
+          const data = JSON.parse(msg.data as string) as {
+            type: string;
+            interaction_api_major?: string;
+            message?: string;
+          };
+          if (!authenticated) {
+            if (data.type === "auth_error") {
+              this.closed = true;
+              socket.close();
+              reject(new Error(data.message ?? "WebSocket authentication failed"));
+              return;
+            }
+            if (data.type !== "auth_ok") return;
+            if (data.interaction_api_major !== ASTRA_AGENT_INTERACTION_API_MAJOR) {
+              this.closed = true;
+              socket.close();
+              reject(new Error("WebSocket interaction contract mismatch"));
+              return;
+            }
+            authenticated = true;
+            if (this.runId) {
+              socket.send(JSON.stringify({
+                type: "attach_run",
+                run_id: this.runId,
+                last_index: this.replayEventIndex,
+              }));
+            }
+            this.reconnectAttempts = 0;
+            this.setConnectionState("connected");
+            resolve();
+            return;
+          }
+          this.processEvent(data as StreamEvent);
         } catch {
           // Ignore malformed messages
         }
       };
 
-      this.ws.onclose = () => {
+      socket.onclose = () => {
+        if (this.ws !== socket) return;
+        if (!authenticated) reject(new Error("WebSocket closed before authentication"));
         if (this.closed) {
           this.setConnectionState("disconnected");
           return;
@@ -172,10 +221,9 @@ export class AstraWebSocket {
         this.maybeReconnect();
       };
 
-      this.ws.onerror = () => {
+      socket.onerror = () => {
         this.setConnectionState("error");
-        // Only reject on initial connect; reconnects don't have a promise
-        if (this.reconnectAttempts === 0) {
+        if (!authenticated) {
           reject(new Error("WebSocket connection failed"));
         }
       };
@@ -233,6 +281,31 @@ export class AstraWebSocket {
     this.send({ type: "resume_run", ...(runId && { run_id: runId }) });
   }
 
+  /** Attach to an owned run, replaying durable events from lastIndex. */
+  attachRun(runId: string, lastIndex = 0): void {
+    if (!runId) throw new Error("runId is required");
+    if (!Number.isSafeInteger(lastIndex) || lastIndex < 0 || lastIndex > 0xffffffff) {
+      throw new Error("lastIndex must be a nonnegative 32-bit integer");
+    }
+    if (this.isConnected && this.runId) {
+      throw new Error("a run is already attached");
+    }
+    this.runId = runId;
+    this.replayEventIndex = lastIndex;
+    this.seenReplayFrames.clear();
+    this.send({ type: "attach_run", run_id: runId, last_index: lastIndex });
+  }
+
+  /** Resolve an ask_user prompt on the attached run. */
+  respondToUserPrompt(requestId: string, answers: UserPromptAnswer[]): void {
+    this.send({ type: "user_prompt", request_id: requestId, answers: { answers } });
+  }
+
+  /** Cancel an ask_user prompt on the attached run. */
+  cancelUserPrompt(requestId: string): void {
+    this.send({ type: "user_prompt", request_id: requestId, cancelled: true });
+  }
+
   // ─── Getters ──────────────────────────────────────────────────────
 
   get readyState(): number {
@@ -240,14 +313,14 @@ export class AstraWebSocket {
   }
 
   get isConnected(): boolean {
-    return this.ws?.readyState === WebSocket.OPEN;
+    return this.connectionState === "connected" && this.ws?.readyState === WebSocket.OPEN;
   }
 
   // ─── Internals ────────────────────────────────────────────────────
 
   private send(payload: unknown): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(payload));
+    if (this.isConnected) {
+      this.ws?.send(JSON.stringify(payload));
     }
   }
 
@@ -263,12 +336,37 @@ export class AstraWebSocket {
     // Track session/run state from events
     if (event.type === "session_info" && "session_id" in event) {
       this.sessionId = (event as { session_id: string }).session_id;
+      const runId = (event as { run_id?: string }).run_id;
+      if (runId) {
+        if (runId !== this.runId) {
+          this.replayEventIndex = 0;
+          this.seenReplayFrames.clear();
+        }
+        this.runId = runId;
+      }
     }
     if (event.type === "run_started" && "run_id" in event) {
-      this.runId = (event as { run_id: string }).run_id;
+      const runId = (event as { run_id: string }).run_id;
+      if (runId !== this.runId) {
+        this.replayEventIndex = 0;
+        this.seenReplayFrames.clear();
+      }
+      this.runId = runId;
+    }
+    if (typeof event.index === "number" && Number.isSafeInteger(event.index)) {
+      if (event.index < this.replayEventIndex) return;
+      if (event.index > this.replayEventIndex) {
+        this.replayEventIndex = event.index;
+        this.seenReplayFrames.clear();
+      }
+      const frame = JSON.stringify(event);
+      if (this.seenReplayFrames.has(frame)) return;
+      this.seenReplayFrames.add(frame);
     }
     if (event.type === "run_finished" || event.type === "run_cancelled") {
       this.runId = null;
+      this.replayEventIndex = 0;
+      this.seenReplayFrames.clear();
     }
 
     // Legacy callback

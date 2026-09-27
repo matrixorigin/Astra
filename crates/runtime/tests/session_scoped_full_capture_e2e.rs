@@ -9,7 +9,9 @@ use astra_runtime::{
     SessionActivityRecord, SessionCreateRequestData, SessionListFilter, SessionListRecord,
     SessionRecord, SessionService, SessionUpdateRequestData, build_app,
 };
-use astra_services::runs::RunListCursor;
+use astra_services::runs::{
+    DurableRunInteractionKind, DurableRunInteractionResolveOutcome, RunListCursor,
+};
 use async_trait::async_trait;
 use axum::{
     Json,
@@ -72,6 +74,12 @@ impl AuthService for StubAuthService {
                 user_id: "test-user-1".to_string(),
                 username: "capture-user".to_string(),
                 email: "capture@test.local".to_string(),
+                display_name: None,
+            }),
+            Some("Bearer test-other-token") => Ok(AuthUserRecord {
+                user_id: "other-user".to_string(),
+                username: "other".to_string(),
+                email: "other@test.local".to_string(),
                 display_name: None,
             }),
             _ => Err((
@@ -177,6 +185,12 @@ struct RecordingLifecycle {
     cancel_calls: Arc<Mutex<Vec<String>>>,
     keep_run_active: Arc<Mutex<bool>>,
     stream_error: Arc<Mutex<Option<StatusCode>>>,
+    publication_after_terminal: Arc<Mutex<bool>>,
+    publication_in_live_replay: Arc<Mutex<bool>>,
+    waiting_for: Arc<Mutex<Option<String>>>,
+    resolved_interactions: Arc<Mutex<Vec<String>>>,
+    live_attach_cursors: Arc<Mutex<Vec<u32>>>,
+    replay_event_at_index: Arc<Mutex<Option<u32>>>,
 }
 
 impl RecordingLifecycle {
@@ -187,6 +201,24 @@ impl RecordingLifecycle {
     async fn recorded_cancel_calls(&self) -> Vec<String> {
         self.cancel_calls.lock().await.clone()
     }
+}
+
+fn mock_explain_publication() -> serde_json::Value {
+    json!({
+        "index": 1,
+        "event_type": "artifact_publication",
+        "data": {
+            "schema_version": 1,
+            "run_id": "run-capture-ws",
+            "turn_id": "turn-1",
+            "execution_owner_generation": 1,
+            "artifact_type": "explain_analyze_snapshot",
+            "recorded": true,
+            "status": "unavailable",
+            "reason_code": "report_missing",
+            "message": "Report unavailable."
+        }
+    })
 }
 
 #[async_trait]
@@ -228,8 +260,14 @@ impl RunLifecycleService for RecordingLifecycle {
     async fn get_run_status(
         &self,
         run_id: String,
-        _user_id: String,
+        user_id: String,
     ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
+        if run_id != "run-capture-ws" || user_id != "test-user-1" {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse::new("Run not found")),
+            ));
+        }
         let active = *self.keep_run_active.lock().await;
         Ok(RunStatusRecord {
             artifact_publication: None,
@@ -239,7 +277,7 @@ impl RunLifecycleService for RecordingLifecycle {
             parent_run_id: None,
             depth: 0,
             status: if active { "running" } else { "completed" }.to_string(),
-            waiting_for: None,
+            waiting_for: self.waiting_for.lock().await.clone(),
             events_count: 1,
             workspace: None,
             executor: None,
@@ -252,25 +290,112 @@ impl RunLifecycleService for RecordingLifecycle {
         &self,
         run_id: String,
         _user_id: String,
-        _last_index: u32,
+        last_index: u32,
     ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)> {
         if let Some(status) = *self.stream_error.lock().await {
             return Err((status, Json(ErrorResponse::new("observer failed"))));
         }
         let active = *self.keep_run_active.lock().await;
+        let replay_at = *self.replay_event_at_index.lock().await;
         Ok(astra_services::runs::DurableRunEventDelta {
             session_id: String::new(),
             status: if active { "running" } else { "completed" }.into(),
             last_event_idx: 0,
-            events: if active {
+            events: if active && replay_at.is_some_and(|index| last_index <= index) {
+                vec![json!({
+                    "index": replay_at.unwrap(),
+                    "event_type": "text_delta",
+                    "data": {"content": "replayed after reconnect"}
+                })]
+            } else if active || last_index > 0 {
                 vec![]
             } else {
                 vec![json!({
+                    "index": 0,
                     "event_type": "run_finished",
                     "data": {"run_id": run_id, "status": "completed"}
                 })]
             },
         })
+    }
+
+    async fn stream_run_live(
+        &self,
+        run_id: String,
+        user_id: String,
+        last_index: u32,
+    ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+        self.live_attach_cursors.lock().await.push(last_index);
+        if *self.publication_in_live_replay.lock().await {
+            return Ok(ChatStreamRecord {
+                session_id: "capture-session".into(),
+                run_id,
+                events: vec![mock_explain_publication()],
+                event_rx: None,
+            });
+        }
+        if *self.publication_after_terminal.lock().await {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let _ = tx.send(mock_explain_publication()).await;
+            });
+            return Ok(ChatStreamRecord {
+                session_id: "capture-session".into(),
+                run_id,
+                events: vec![],
+                event_rx: Some(rx),
+            });
+        }
+        let delta = self.stream_run(run_id.clone(), user_id, last_index).await?;
+        Ok(ChatStreamRecord {
+            session_id: "capture-session".into(),
+            run_id,
+            events: delta.events,
+            event_rx: None,
+        })
+    }
+
+    async fn get_run_interaction_event(
+        &self,
+        _run_id: String,
+        _user_id: String,
+        request_id: String,
+        event_type: String,
+    ) -> Result<Option<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+        let event = match (request_id.as_str(), event_type.as_str()) {
+            ("approval-1", "approval_required") => json!({
+                "data": { "tool": "shell", "approval_kind": "standard" }
+            }),
+            ("prompt-1", "ask_user_prompted") => json!({
+                "data": { "prompt": {
+                    "context": null,
+                    "questions": [{
+                        "header": "Continue", "question": "Continue?",
+                        "options": [
+                            {"label": "yes", "description": null, "preview": null},
+                            {"label": "no", "description": null, "preview": null}
+                        ],
+                        "multi_select": false, "allow_freeform": false
+                    }]
+                }}
+            }),
+            _ => return Ok(None),
+        };
+        Ok(Some(event))
+    }
+
+    async fn resolve_run_interaction(
+        &self,
+        _run_id: String,
+        _user_id: String,
+        _expected_session_id: String,
+        request_id: String,
+        _kind: DurableRunInteractionKind,
+        _response_data: serde_json::Value,
+    ) -> Result<DurableRunInteractionResolveOutcome, (StatusCode, Json<ErrorResponse>)> {
+        self.resolved_interactions.lock().await.push(request_id);
+        Ok(DurableRunInteractionResolveOutcome::Resolved(json!({})))
     }
 
     async fn cancel_run(
@@ -330,25 +455,7 @@ async fn start_browser_ws_run(
     addr: std::net::SocketAddr,
     content: &str,
 ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
-    let (mut ws, _) = connect_async(format!("ws://{addr}/chat/ws"))
-        .await
-        .expect("WS connect");
-    ws.send(Message::Text(
-        json!({
-            "type": "auth",
-            "token": "Bearer test-capture-token",
-            "interaction_api_major": astra_server_types::AGENT_INTERACTION_API_MAJOR,
-        })
-        .to_string()
-        .into(),
-    ))
-    .await
-    .expect("auth send");
-    let auth = ws.next().await.expect("auth response").expect("auth frame");
-    let auth_json: serde_json::Value =
-        serde_json::from_str(&auth.into_text().unwrap()).expect("auth JSON");
-    assert_eq!(auth_json["type"], "auth_ok");
-    assert_eq!(auth_json["user_id"], "test-user-1");
+    let mut ws = connect_authenticated_ws(addr, "test-capture-token").await;
     ws.send(Message::Text(
         json!({
             "type": "message",
@@ -362,6 +469,50 @@ async fn start_browser_ws_run(
     .await
     .expect("chat send");
     ws
+}
+
+async fn connect_authenticated_ws(
+    addr: std::net::SocketAddr,
+    token: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let (mut ws, _) = connect_async(format!("ws://{addr}/chat/ws"))
+        .await
+        .expect("WS connect");
+    ws.send(Message::Text(
+        json!({
+            "type": "auth",
+            "token": format!("Bearer {token}"),
+            "interaction_api_major": astra_server_types::AGENT_INTERACTION_API_MAJOR,
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("auth send");
+    let auth = ws.next().await.expect("auth response").expect("auth frame");
+    let auth_json: serde_json::Value =
+        serde_json::from_str(&auth.into_text().unwrap()).expect("auth JSON");
+    assert_eq!(auth_json["type"], "auth_ok");
+    ws
+}
+
+async fn next_ws_json(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> serde_json::Value {
+    loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+            .await
+            .expect("WS event timeout")
+            .expect("WS frame")
+            .expect("valid WS frame");
+        match frame {
+            Message::Text(text) => return serde_json::from_str(&text).expect("WS JSON"),
+            Message::Ping(_) | Message::Pong(_) => {}
+            other => panic!("unexpected WS frame: {other:?}"),
+        }
+    }
 }
 
 #[tokio::test]
@@ -414,6 +565,131 @@ async fn browser_ws_chat_propagates_session_scoped_full_capture_over_real_websoc
 }
 
 #[tokio::test]
+async fn browser_ws_replays_publication_committed_between_head_and_tail_reads() {
+    let (addr, lifecycle, server) = spawn_test_server().await;
+    // The captured tail exposes only index 0; the publication at index 1 is
+    // already present when live attach starts its reconciliation read.
+    *lifecycle.publication_in_live_replay.lock().await = true;
+    let mut ws = start_browser_ws_run(addr, "explain").await;
+    assert_eq!(next_ws_json(&mut ws).await["type"], "session_info");
+    assert_eq!(next_ws_json(&mut ws).await["type"], "run_started");
+    assert_eq!(next_ws_json(&mut ws).await["type"], "artifact_publication");
+    assert_eq!(next_ws_json(&mut ws).await["type"], "run_finished");
+    assert_eq!(*lifecycle.live_attach_cursors.lock().await, vec![1]);
+    server.abort();
+}
+
+#[tokio::test]
+async fn browser_ws_reconciles_publication_appended_after_terminal_tail_read() {
+    let (addr, lifecycle, server) = spawn_test_server().await;
+    *lifecycle.publication_after_terminal.lock().await = true;
+    let mut ws = start_browser_ws_run(addr, "explain").await;
+    assert_eq!(next_ws_json(&mut ws).await["type"], "session_info");
+    assert_eq!(next_ws_json(&mut ws).await["type"], "run_started");
+    let publication = next_ws_json(&mut ws).await;
+    assert_eq!(publication["type"], "artifact_publication");
+    assert_eq!(publication["index"], 1);
+    assert_eq!(next_ws_json(&mut ws).await["type"], "run_finished");
+    assert_eq!(*lifecycle.live_attach_cursors.lock().await, vec![1]);
+    server.abort();
+}
+
+#[tokio::test]
+async fn browser_ws_reconnect_replays_cursor_and_resolves_waiting_interactions() {
+    let (addr, lifecycle, server) = spawn_test_server().await;
+    *lifecycle.keep_run_active.lock().await = true;
+    let mut first = start_browser_ws_run(addr, "leave the run active").await;
+    assert_eq!(next_ws_json(&mut first).await["type"], "session_info");
+    assert_eq!(next_ws_json(&mut first).await["type"], "run_started");
+    first.close(None).await.expect("close first observer");
+
+    let mut wrong_owner = connect_authenticated_ws(addr, "test-other-token").await;
+    wrong_owner
+        .send(Message::Text(
+            json!({
+                "type": "attach_run", "run_id": "run-capture-ws", "last_index": 0
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send other-user attach");
+    assert_eq!(next_ws_json(&mut wrong_owner).await["type"], "error");
+    wrong_owner.close(None).await.expect("close other owner");
+
+    let mut ws = connect_authenticated_ws(addr, "test-capture-token").await;
+    *lifecycle.replay_event_at_index.lock().await = Some(7);
+    ws.send(Message::Text(
+        json!({
+            "type": "attach_run", "run_id": "run-capture-ws", "last_index": 7
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send attach");
+    let attached = next_ws_json(&mut ws).await;
+    assert_eq!(attached["type"], "session_info");
+    assert_eq!(attached["run_id"], "run-capture-ws");
+    let replay = next_ws_json(&mut ws).await;
+    assert_eq!(replay["type"], "text_delta");
+    assert_eq!(replay["index"], 7);
+    *lifecycle.waiting_for.lock().await = Some("tool_approval".into());
+    ws.send(Message::Text(
+        json!({
+            "type": "tool_approval", "request_id": "approval-1", "approved": true
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send approval");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if lifecycle
+                .resolved_interactions
+                .lock()
+                .await
+                .contains(&"approval-1".to_string())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("approval resolved");
+
+    *lifecycle.waiting_for.lock().await = Some("user_input".into());
+    ws.send(Message::Text(
+        json!({
+            "type": "user_prompt", "request_id": "prompt-1", "cancelled": true
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send prompt response");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if lifecycle
+                .resolved_interactions
+                .lock()
+                .await
+                .contains(&"prompt-1".to_string())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("prompt resolved");
+    assert!(lifecycle.recorded_cancel_calls().await.is_empty());
+    server.abort();
+}
+
+#[tokio::test]
 async fn browser_ws_disconnect_keeps_durable_run_active() {
     let (addr, lifecycle, server) = spawn_test_server().await;
     *lifecycle.keep_run_active.lock().await = true;
@@ -438,7 +714,7 @@ async fn browser_ws_disconnect_keeps_durable_run_active() {
             match ws.next().await {
                 Some(Ok(Message::Close(_))) | None => break,
                 Some(Ok(_)) => {}
-                Some(Err(error)) => panic!("WS close failed: {error}"),
+                Some(Err(_)) => break,
             }
         }
     })

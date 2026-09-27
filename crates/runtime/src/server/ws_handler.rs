@@ -13,7 +13,9 @@
 //! {"type": "cancel_run", "run_id": "..."}
 //! {"type": "pause_run", "run_id": "..."}
 //! {"type": "resume_run", "run_id": "..."}
+//! {"type": "attach_run", "run_id": "...", "last_index": 0}
 //! {"type": "tool_approval", "request_id": "...", "approved": true, "reason": "..."}
+//! {"type": "user_prompt", "request_id": "...", "answers": {"answers": [...]}}
 //! {"type": "ping"}
 //! ```
 //!
@@ -198,6 +200,10 @@ pub(super) enum WsClientMessage {
     /// Resume a paused run.
     #[serde(rename = "resume_run")]
     ResumeRun { run_id: String },
+
+    /// Reattach to an owned run and replay durable events from this cursor.
+    #[serde(rename = "attach_run")]
+    AttachRun { run_id: String, last_index: u32 },
 
     /// Respond to a tool approval request.
     #[serde(rename = "tool_approval")]
@@ -656,6 +662,9 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                             Ok(WsClientMessage::ResumeRun { run_id }) => {
                                 handle_resume_run(socket, state, &conn, &run_id, true).await;
                             }
+                            Ok(WsClientMessage::AttachRun { run_id, last_index }) => {
+                                handle_attach_run(socket, state, &mut conn, &run_id, last_index).await;
+                            }
                             Ok(WsClientMessage::ToolApproval {
                                 request_id,
                                 approved,
@@ -854,13 +863,44 @@ async fn handle_chat_message(
             )
             .await;
 
-            stream_run_over_websocket(socket, state, conn, &run.run_id).await;
+            stream_run_over_websocket(socket, state, conn, &run.run_id, 0).await;
             conn.active_run_id = None;
         }
         Err((status, err)) => {
             send_msg(socket, &ws_error_from_status(status, err.0.detail)).await;
         }
     }
+}
+
+async fn handle_attach_run(
+    socket: &mut WebSocket,
+    state: &AppState,
+    conn: &mut WsConnection,
+    run_id: &str,
+    last_index: u32,
+) {
+    let record = match state
+        .execution
+        .run_lifecycle_service
+        .get_run_status(run_id.to_string(), conn.principal.user.user_id.clone())
+        .await
+    {
+        Ok(record) => record,
+        Err((status, err)) => {
+            send_msg(socket, &ws_error_from_status(status, err.0.detail)).await;
+            return;
+        }
+    };
+    conn.session_id = Some(record.session_id.clone());
+    conn.pending_session_id = None;
+    conn.active_run_id = Some(record.run_id.clone());
+    send_msg(
+        socket,
+        &session_info_message(record.session_id, Some(record.run_id.clone())),
+    )
+    .await;
+    stream_run_over_websocket(socket, state, conn, &record.run_id, last_index).await;
+    conn.active_run_id = None;
 }
 
 async fn inject_ws_effective_runtime_context(
@@ -1539,12 +1579,12 @@ async fn stream_run_over_websocket(
     state: &AppState,
     conn: &mut WsConnection,
     run_id: &str,
+    mut last_index: u32,
 ) {
     let mut poll_cadence = RunStreamPollCadence::new();
     let mut poll = run_stream_initial_poll_timer();
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut last_index = 0u32;
     let mut terminal_error: Option<String> = None;
     let mut stream_poll_error: Option<(StatusCode, String)> = None;
     let mut consecutive_stream_retryable_errors = 0u32;
@@ -1591,6 +1631,17 @@ async fn stream_run_over_websocket(
                                     socket,
                                     &WsServerMessage::Error {
                                         message: "Run already in progress".into(),
+                                        code: "RUN_ACTIVE".into(),
+                                        retryable: false,
+                                    },
+                                )
+                                .await;
+                            }
+                            Ok(WsClientMessage::AttachRun { .. }) => {
+                                send_msg(
+                                    socket,
+                                    &WsServerMessage::Error {
+                                        message: "Run already attached".into(),
                                         code: "RUN_ACTIVE".into(),
                                         retryable: false,
                                     },
@@ -1876,7 +1927,12 @@ async fn stream_run_over_websocket(
                 for event in &events {
                     last_index = next_run_stream_index(event, last_index);
                 }
+                let mut terminal_payload = None;
                 for payload in lifecycle_events_to_ws_payloads(run_id, events, &mut terminal_error) {
+                    if payload.get("type").and_then(Value::as_str) == Some("run_finished") {
+                        terminal_payload = Some(payload);
+                        continue;
+                    }
                     match send_json_value(socket, &payload).await {
                         Ok(()) => {}
                         Err(WsSendFailure::Disconnected) => {
@@ -1888,18 +1944,16 @@ async fn stream_run_over_websocket(
                         }
                     }
                 }
-                if saw_stream_terminal {
-                    return;
-                }
-
-                if durable_run_status_is_terminal(&status) {
-                    send_msg(
+                if saw_stream_terminal || durable_run_status_is_terminal(&status) {
+                    finish_ws_run_after_publication(
                         socket,
-                        &WsServerMessage::RunFinished {
-                            run_id: run_id.to_string(),
-                            status,
-                            error: terminal_error,
-                        },
+                        state,
+                        conn,
+                        run_id,
+                        last_index,
+                        terminal_payload,
+                        status,
+                        &mut terminal_error,
                     )
                     .await;
                     return;
@@ -1913,6 +1967,71 @@ async fn stream_run_over_websocket(
             }
         }
     }
+}
+
+/// A durable terminal event can precede Explain artifact publication. Follow
+/// the canonical live attach cursor through its bounded publication outcome
+/// before showing the terminal frame to a WebSocket client.
+async fn finish_ws_run_after_publication(
+    socket: &mut WebSocket,
+    state: &AppState,
+    conn: &WsConnection,
+    run_id: &str,
+    last_index: u32,
+    mut terminal_payload: Option<Value>,
+    status: String,
+    terminal_error: &mut Option<String>,
+) {
+    let live = state
+        .execution
+        .run_lifecycle_service
+        .stream_run_live(
+            run_id.to_string(),
+            conn.principal.user.user_id.clone(),
+            last_index,
+        )
+        .await;
+    let mut live = match live {
+        Ok(live) => live,
+        Err((status, err)) => {
+            send_msg(socket, &ws_error_from_status(status, err.0.detail)).await;
+            let _ = socket.send(Message::Close(None)).await;
+            return;
+        }
+    };
+    let mut events = live.events;
+    loop {
+        for payload in lifecycle_events_to_ws_payloads(run_id, events, terminal_error) {
+            if payload.get("type").and_then(Value::as_str) == Some("run_finished") {
+                terminal_payload = Some(payload);
+            } else {
+                match send_json_value(socket, &payload).await {
+                    Ok(()) => {}
+                    Err(WsSendFailure::Disconnected) => return,
+                    Err(WsSendFailure::Failed) => {
+                        let _ = socket.send(Message::Close(None)).await;
+                        return;
+                    }
+                }
+            }
+        }
+        let Some(rx) = live.event_rx.as_mut() else {
+            break;
+        };
+        match rx.recv().await {
+            Some(event) => events = vec![event],
+            None => break,
+        }
+    }
+    let terminal_payload = terminal_payload.unwrap_or_else(|| {
+        serde_json::to_value(WsServerMessage::RunFinished {
+            run_id: run_id.to_string(),
+            status,
+            error: terminal_error.clone(),
+        })
+        .expect("run_finished is serializable")
+    });
+    let _ = send_json_value(socket, &terminal_payload).await;
 }
 
 fn session_info_message(session_id: String, run_id: Option<String>) -> WsServerMessage {
@@ -1961,6 +2080,22 @@ mod tests {
             }
             _ => panic!("expected Auth"),
         }
+    }
+
+    #[test]
+    fn attach_run_requires_an_explicit_replay_cursor() {
+        let message: WsClientMessage =
+            serde_json::from_str(r#"{"type":"attach_run","run_id":"run-1","last_index":12}"#)
+                .unwrap();
+        assert!(matches!(
+            message,
+            WsClientMessage::AttachRun { run_id, last_index }
+                if run_id == "run-1" && last_index == 12
+        ));
+        assert!(
+            serde_json::from_str::<WsClientMessage>(r#"{"type":"attach_run","run_id":"run-1"}"#)
+                .is_err()
+        );
     }
 
     #[test]
