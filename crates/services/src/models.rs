@@ -1528,76 +1528,6 @@ fn build_resolved_active_llm_from_row(
     })
 }
 
-/// Resolve a short / partial model name against the full list of
-/// active model names.
-///
-/// The LLM, when prompted to call `spawn_agent`, frequently produces
-/// the short family name (`claude-sonnet`, `qwen-flash`) rather than
-/// the fully-qualified registered name (`us.anthropic.claude-sonnet-4-6`).
-/// Rejecting those calls outright forces the case author to retrain
-/// the prompt. Instead, we do a **deterministic, unambiguous** alias
-/// lookup:
-///
-/// 1. **Exact match** — name equal (case-sensitive) → that name.
-/// 2. **Case-insensitive exact match** — unique match → that name.
-/// 3. **Substring match** — unique active row whose name contains the
-///    requested string (case-insensitive) → that name.
-/// 4. Otherwise → `Err` with the candidate list so the caller can
-///    surface a useful error. Ambiguity (2+ candidates) is also
-///    `Err` — picking arbitrarily would be worse than failing.
-///
-/// Pure function; the DB query path uses it by passing the names
-/// from `SELECT model_name FROM infra_llm_models WHERE is_active = 1`.
-/// Keeping it pure means the behavior is fully unit-testable without
-/// spinning up a pool.
-pub fn resolve_model_alias<'a>(
-    requested: &str,
-    active_names: &'a [String],
-) -> Result<&'a str, ModelAliasResolutionError> {
-    let trimmed = requested.trim();
-    if trimmed.is_empty() {
-        return Err(ModelAliasResolutionError::Empty);
-    }
-    // Level 1: exact match wins.
-    if let Some(hit) = active_names.iter().find(|n| n.as_str() == trimmed) {
-        return Ok(hit.as_str());
-    }
-    // Level 2: case-insensitive exact. Narrower than substring — a
-    // user typing "CLAUDE-HAIKU-4-5-20251001" should still resolve
-    // without needing to match case.
-    let requested_lower = trimmed.to_ascii_lowercase();
-    let ci_hits: Vec<&String> = active_names
-        .iter()
-        .filter(|n| n.to_ascii_lowercase() == requested_lower)
-        .collect();
-    match ci_hits.len() {
-        0 => {}
-        1 => return Ok(ci_hits[0].as_str()),
-        _ => {
-            return Err(ModelAliasResolutionError::Ambiguous {
-                requested: trimmed.into(),
-                candidates: ci_hits.iter().map(|s| s.to_string()).collect(),
-            });
-        }
-    }
-    // Level 3: substring (case-insensitive). Unique match only.
-    let sub_hits: Vec<&String> = active_names
-        .iter()
-        .filter(|n| n.to_ascii_lowercase().contains(&requested_lower))
-        .collect();
-    match sub_hits.len() {
-        0 => Err(ModelAliasResolutionError::NotFound {
-            requested: trimmed.into(),
-            candidates: active_names.iter().map(|s| s.to_string()).collect(),
-        }),
-        1 => Ok(sub_hits[0].as_str()),
-        _ => Err(ModelAliasResolutionError::Ambiguous {
-            requested: trimmed.into(),
-            candidates: sub_hits.iter().map(|s| s.to_string()).collect(),
-        }),
-    }
-}
-
 fn normalize_model_selector_for_resolution(requested: &str) -> &str {
     let trimmed = requested.trim();
     if !trimmed.ends_with(')') {
@@ -1622,112 +1552,6 @@ fn normalize_model_selector_for_resolution(requested: &str) -> &str {
         }
     }
     trimmed
-}
-
-/// Error surface for [`resolve_model_alias`]. Preserved so the
-/// DB-layer caller can distinguish "no such model" from "ambiguous"
-/// and render a helpful message to the LLM / user.
-///
-/// The `candidates` vector always carries the FULL list a caller
-/// might want to process programmatically. The `Display` impl
-/// truncates to [`MODEL_ALIAS_ERROR_CANDIDATE_CAP`] for readability
-/// — rendering 200 model names in a stderr line is a debugging
-/// anti-feature.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ModelAliasResolutionError {
-    Empty,
-    NotFound {
-        requested: String,
-        candidates: Vec<String>,
-    },
-    Ambiguous {
-        requested: String,
-        candidates: Vec<String>,
-    },
-}
-
-/// Max number of candidate names the `Display` impl will render
-/// inline. Beyond this, the rendered string shows the first
-/// `MODEL_ALIAS_ERROR_CANDIDATE_CAP` entries and suffixes
-/// `... and N more`. Chosen to keep a single-line log readable
-/// while still being useful (20 model names ≈ 400-600 chars,
-/// within most log collectors' line limits).
-pub const MODEL_ALIAS_ERROR_CANDIDATE_CAP: usize = 20;
-
-fn render_truncated_candidates(
-    candidates: &[String],
-    f: &mut std::fmt::Formatter<'_>,
-) -> std::fmt::Result {
-    if candidates.len() <= MODEL_ALIAS_ERROR_CANDIDATE_CAP {
-        return write!(f, "{candidates:?}");
-    }
-    let head = &candidates[..MODEL_ALIAS_ERROR_CANDIDATE_CAP];
-    let remaining = candidates.len() - MODEL_ALIAS_ERROR_CANDIDATE_CAP;
-    write!(f, "{head:?} ... and {remaining} more")
-}
-
-impl std::fmt::Display for ModelAliasResolutionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Empty => write!(f, "empty model name"),
-            Self::NotFound {
-                requested,
-                candidates,
-            } => {
-                write!(
-                    f,
-                    "Model '{requested}' is not configured on this server \
-                     (no exact or substring match in infra_llm_models). \
-                     Registered active models: "
-                )?;
-                render_truncated_candidates(candidates, f)?;
-                write!(
-                    f,
-                    ". Omit the model override or choose one of the registered names."
-                )
-            }
-            Self::Ambiguous {
-                requested,
-                candidates,
-            } => {
-                write!(
-                    f,
-                    "Model '{requested}' is ambiguous — matches multiple \
-                     registered models: "
-                )?;
-                render_truncated_candidates(candidates, f)?;
-                write!(f, ". Use a more specific name.")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ModelAliasResolutionError {}
-
-/// Format the error message for a requested model that was found
-/// (via exact or alias match) but has `is_active = 0`. If the alias
-/// resolver canonicalized the name, both forms are surfaced so the
-/// reader can see what happened; otherwise only one mention appears.
-///
-/// Extracted from [`resolve_active_llm_model`] so the message can
-/// be unit-tested without the DB path. The pre-alias behavior used
-/// the original requested name in the error even when the DB row
-/// was keyed on the resolved canonical form — misleading when the
-/// two disagree.
-pub fn format_inactive_model_error(requested: &str, canonical: &str) -> String {
-    if requested == canonical {
-        format!(
-            "Model '{canonical}' is inactive (connectivity failed or disabled). \
-             Run `astra admin model check {canonical}` or pick an active model; \
-             the server will not substitute another model."
-        )
-    } else {
-        format!(
-            "Model '{requested}' (resolved to canonical '{canonical}') is inactive \
-             (connectivity failed or disabled). Run `astra admin model check {canonical}` \
-             or pick an active model; the server will not substitute another model."
-        )
-    }
 }
 
 /// Shared columns for all model-resolution queries.
@@ -1756,9 +1580,9 @@ async fn require_pool(
 
 /// Resolve the active LLM model from the database for in-process / server-side callers.
 ///
-/// When `preferred` is `Some(name)`, the row **must** exist and be active — otherwise this
-/// returns an error (no silent fallback to another model). When `preferred` is `None`, returns
-/// an error instead of silently choosing an arbitrary active model.
+/// When `preferred` is `Some(name)`, the exact configured row **must** exist and be active —
+/// otherwise this returns an error (no aliasing or silent fallback to another model). When
+/// `preferred` is `None`, returns an error instead of silently choosing an arbitrary active model.
 ///
 /// Also extracts `fallback_chain` from the `quirks` JSON column (cloud-managed config).
 pub async fn resolve_active_llm_model(
@@ -1953,10 +1777,9 @@ fn validate_model_admission_batch(
 
 /// Resolve a client-visible effective Offering by durable ID.
 ///
-/// This path is deliberately stricter than [`resolve_active_llm_model`]: it
-/// performs one exact `model_id` lookup and never invokes model-name aliasing
-/// or first-active fallback. Until Offering definitions receive their own
-/// table, `infra_llm_models.model_id` is the canonical Phase 0 Offering ID.
+/// This path performs one exact `model_id` lookup and never invokes model-name
+/// matching or first-active fallback. Until Offering definitions receive their
+/// own table, `infra_llm_models.model_id` is the canonical Phase 0 Offering ID.
 pub async fn resolve_active_llm_offering(
     matrixone: &MatrixOneSettings,
     encryptor: &FernetTokenEncryptor,
@@ -2413,65 +2236,31 @@ async fn resolve_active_llm_model_uncached(
     name: &str,
     pool: &sqlx::Pool<sqlx::MySql>,
 ) -> Result<ResolvedActiveLlmModel, String> {
-    // Try exact match first — the fast path. If the LLM supplied
-    // the fully-qualified name it resolves in one query.
-    let exact_row = sqlx::query(&format!(
+    // Model identity is a configured name, not free-form text. Resolve it
+    // once and fail closed; candidate-aware selection belongs upstream.
+    let row = sqlx::query(&format!(
         "SELECT {RESOLVE_COLS}, is_active FROM infra_llm_models WHERE model_name = ? LIMIT 1"
     ))
     .bind(name)
     .fetch_optional(pool)
     .await
-    .map_err(|e| format!("DB query: {e}"))?;
-
-    // Legacy root-model selection may still arrive as a provider display
-    // name rather than an Offering id. Keep that compatibility inside the
-    // root selection adapter; child/skill/completion boundaries never call
-    // this alias resolver. Ambiguity still errors.
-    //
-    // Track canonical name separately so the `is_active` error
-    // message below can name BOTH the requested alias and the
-    // resolved form when they differ — without this, a reader
-    // would see "Model 'claude-sonnet' is inactive" even though
-    // the DB row is keyed on the full bedrock name.
-    let (row, canonical) = match exact_row {
-        Some(r) => (r, name.to_string()),
-        None => {
-            let active_names: Vec<String> = sqlx::query_scalar::<_, String>(
-                "SELECT model_name FROM infra_llm_models WHERE is_active = 1",
-            )
-            .fetch_all(pool)
-            .await
-            .map_err(|e| format!("DB query: {e}"))?;
-
-            match resolve_model_alias(name, &active_names) {
-                Ok(canonical_ref) => {
-                    let canonical = canonical_ref.to_string();
-                    let r = sqlx::query(&format!(
-                        "SELECT {RESOLVE_COLS}, is_active \
-                         FROM infra_llm_models WHERE model_name = ? LIMIT 1"
-                    ))
-                    .bind(&canonical)
-                    .fetch_optional(pool)
-                    .await
-                    .map_err(|e| format!("DB query: {e}"))?
-                    .ok_or_else(|| {
-                        format!(
-                            "alias resolver returned '{canonical}' but no row exists \
-                             — concurrent delete?"
-                        )
-                    })?;
-                    (r, canonical)
-                }
-                Err(e) => return Err(e.to_string()),
-            }
-        }
-    };
+    .map_err(|e| format!("DB query: {e}"))?
+    .ok_or_else(|| {
+        format!(
+            "Model '{name}' is not configured on this server; \
+             choose an exact configured model name."
+        )
+    })?;
 
     let is_active_int: i16 = row
         .try_get("is_active")
         .map_err(|e| format!("invalid infra_llm_models.is_active: {e}"))?;
     if is_active_int == 0 {
-        return Err(format_inactive_model_error(name, &canonical));
+        return Err(format!(
+            "Model '{name}' is inactive (connectivity failed or disabled). \
+             Run `astra admin model check {name}` or pick an active model; \
+             the server will not substitute another model."
+        ));
     }
 
     build_resolved_active_llm_from_row(&row, encryptor)
@@ -6855,135 +6644,6 @@ mod tests {
         assert!(debug.contains("completions_url_override_present: true"));
     }
 
-    // ── resolve_model_alias ──
-    //
-    // Class C regression: LLMs frequently produce short family names
-    // like `claude-sonnet` when calling `spawn_agent`, but the DB
-    // registers fully-qualified names like
-    // `us.anthropic.claude-sonnet-4-6`. Pre-alias behavior rejected
-    // these outright, breaking the three shipped fork-prefix /
-    // spawn-agent cases. The alias resolver deterministically maps
-    // short names to their unique registered form.
-
-    fn names(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn alias_exact_match_wins() {
-        let active = names(&[
-            "us.anthropic.claude-sonnet-4-6",
-            "us.anthropic.claude-haiku-4-5-20251001",
-        ]);
-        let hit = resolve_model_alias("us.anthropic.claude-sonnet-4-6", &active).unwrap();
-        assert_eq!(hit, "us.anthropic.claude-sonnet-4-6");
-    }
-
-    #[test]
-    fn alias_short_name_resolves_to_unique_substring_match() {
-        // The primary motivating case: model emits `claude-sonnet`,
-        // registered name is `us.anthropic.claude-sonnet-4-6`. No
-        // other active model contains that substring.
-        let active = names(&[
-            "us.anthropic.claude-sonnet-4-6",
-            "us.anthropic.claude-haiku-4-5-20251001",
-            "MiniMax-M2.7",
-            "qwen3.6-plus",
-        ]);
-        let hit = resolve_model_alias("claude-sonnet", &active).unwrap();
-        assert_eq!(hit, "us.anthropic.claude-sonnet-4-6");
-    }
-
-    #[test]
-    fn alias_short_name_qwen_flash_resolves() {
-        let active = names(&[
-            "qwen-flash",
-            "qwen3.6-plus",
-            "us.anthropic.claude-sonnet-4-6",
-        ]);
-        // Level 1 exact match.
-        let hit = resolve_model_alias("qwen-flash", &active).unwrap();
-        assert_eq!(hit, "qwen-flash");
-    }
-
-    #[test]
-    fn alias_case_insensitive_exact_match() {
-        let active = names(&["MiniMax-M2.7", "qwen-flash"]);
-        // `minimax-m2.7` (lowercased) should resolve to the
-        // mixed-case registered form.
-        let hit = resolve_model_alias("minimax-m2.7", &active).unwrap();
-        assert_eq!(hit, "MiniMax-M2.7");
-    }
-
-    #[test]
-    fn alias_exact_match_beats_deepseek_alias_substring_overlap() {
-        let active = names(&["deepseek-v4-flash", "deepseek-v4-flash-anthropic"]);
-        let hit = resolve_model_alias("deepseek-v4-flash", &active).unwrap();
-        assert_eq!(hit, "deepseek-v4-flash");
-    }
-
-    #[test]
-    fn alias_unknown_name_reports_not_found_with_candidates() {
-        let active = names(&["qwen-flash", "MiniMax-M2.7"]);
-        let err = resolve_model_alias("gpt-5", &active).unwrap_err();
-        match err {
-            ModelAliasResolutionError::NotFound {
-                requested,
-                candidates,
-            } => {
-                assert_eq!(requested, "gpt-5");
-                assert!(candidates.contains(&"qwen-flash".into()));
-                assert!(candidates.contains(&"MiniMax-M2.7".into()));
-            }
-            other => panic!("expected NotFound, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn alias_ambiguous_substring_fails_loudly_not_silently() {
-        // Both `claude-haiku-4-5` and `claude-haiku-4-5-20251001` are
-        // registered. A bare `claude-haiku` matches both — picking
-        // one arbitrarily would be worse than failing, because the
-        // caller's intent is unclear.
-        let active = names(&[
-            "us.anthropic.claude-haiku-4-5",
-            "us.anthropic.claude-haiku-4-5-20251001",
-            "MiniMax-M2.7",
-        ]);
-        let err = resolve_model_alias("claude-haiku", &active).unwrap_err();
-        match err {
-            ModelAliasResolutionError::Ambiguous {
-                requested,
-                candidates,
-            } => {
-                assert_eq!(requested, "claude-haiku");
-                assert_eq!(
-                    candidates.len(),
-                    2,
-                    "expected exactly two ambiguous candidates"
-                );
-            }
-            other => panic!("expected Ambiguous, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn alias_empty_string_is_error_not_first_model() {
-        // Guard: an empty preferred-name coming from a caller should
-        // NOT fall through to first-match. The upstream DB query
-        // handles `preferred = None` separately; an explicit empty
-        // string is a bug the caller should see.
-        let active = names(&["qwen-flash", "MiniMax-M2.7"]);
-        assert!(matches!(
-            resolve_model_alias("", &active),
-            Err(ModelAliasResolutionError::Empty)
-        ));
-        assert!(matches!(
-            resolve_model_alias("   ", &active),
-            Err(ModelAliasResolutionError::Empty)
-        ));
-    }
-
     #[tokio::test]
     async fn active_model_resolution_requires_explicit_model_selection() {
         let encryptor = FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=")
@@ -7160,141 +6820,6 @@ mod tests {
 
         assert_ne!(astra_key, staging_key);
         assert_ne!(astra_key, other_model_key);
-    }
-
-    #[test]
-    fn alias_exact_wins_even_when_substring_would_match_something_else() {
-        // Scenario: registered names `qwen-flash` and `qwen-flash-preview`.
-        // Requested = `qwen-flash`. Must pick exact match, not fail
-        // on substring ambiguity.
-        let active = names(&["qwen-flash", "qwen-flash-preview"]);
-        let hit = resolve_model_alias("qwen-flash", &active).unwrap();
-        assert_eq!(
-            hit, "qwen-flash",
-            "exact match must win over substring ambiguity"
-        );
-    }
-
-    #[test]
-    fn alias_not_found_truncates_large_candidate_lists() {
-        // Review nit: an error string listing 200 model names is a
-        // debugging nightmare. Cap at MODEL_ALIAS_ERROR_CANDIDATE_CAP
-        // with a "... N more" suffix in the Display form, so logs stay
-        // scannable but nothing is lost (the full list is still on
-        // the variant for programmatic callers).
-        let active: Vec<String> = (0..50).map(|i| format!("model-{i}")).collect();
-        let err = resolve_model_alias("nonexistent-xyz", &active).unwrap_err();
-        match &err {
-            ModelAliasResolutionError::NotFound { candidates, .. } => {
-                // The variant itself MUST carry every candidate —
-                // programmatic callers might want them all. Truncation
-                // is a rendering concern.
-                assert_eq!(
-                    candidates.len(),
-                    50,
-                    "variant preserves full list; truncation is Display-only"
-                );
-            }
-            other => panic!("expected NotFound, got {other:?}"),
-        }
-        let rendered = err.to_string();
-        // Render should cap the visible list and indicate truncation.
-        // Pick a threshold the caller can grep: \"...\" followed by a
-        // count. We don't pin the exact cap value here — that belongs
-        // in a separate assertion below — only that truncation happens
-        // and is disclosed.
-        assert!(
-            rendered.contains("...") && rendered.contains("more"),
-            "rendered NotFound with 50 candidates must disclose truncation: {rendered}"
-        );
-        // The rendered string must NOT contain `model-49` when the cap
-        // fires. `model-0`..`model-{CAP-1}` should be visible.
-        assert!(
-            !rendered.contains("model-49"),
-            "last entry must be truncated when exceeding cap: {rendered}"
-        );
-        assert!(
-            rendered.contains("model-0"),
-            "head of list must remain visible: {rendered}"
-        );
-    }
-
-    #[test]
-    fn inactive_error_names_both_requested_and_resolved_when_different() {
-        // Review nit: when alias resolution maps `claude-sonnet` →
-        // `us.anthropic.claude-sonnet-4-6` and the resolved row is
-        // later found inactive (e.g. admin deactivated between the
-        // alias query and the row refetch — a narrow TOCTOU window),
-        // the error message should name BOTH the requested alias and
-        // the canonical name so a reviewer can see what actually
-        // happened. The earlier message claimed the short form was
-        // inactive, which is misleading because the short form isn't
-        // what the DB row is keyed on.
-        let msg = format_inactive_model_error("claude-sonnet", "us.anthropic.claude-sonnet-4-6");
-        assert!(
-            msg.contains("claude-sonnet"),
-            "msg names the requested alias: {msg}"
-        );
-        assert!(
-            msg.contains("us.anthropic.claude-sonnet-4-6"),
-            "msg names the canonical: {msg}"
-        );
-        assert!(
-            msg.contains("inactive"),
-            "msg explains the failure mode: {msg}"
-        );
-        assert!(
-            msg.contains("astra admin model check"),
-            "msg points at the diagnostic command: {msg}"
-        );
-    }
-
-    #[test]
-    fn inactive_error_does_not_duplicate_when_requested_equals_canonical() {
-        // When no alias resolution happened (exact-match path) the
-        // `requested` and `canonical` arguments are equal. Don't
-        // pollute the message with "resolved to the same name".
-        let name = "us.anthropic.claude-sonnet-4-6";
-        let msg = format_inactive_model_error(name, name);
-        // Count occurrences — exactly one mention of the name.
-        let n = msg.matches(name).count();
-        assert_eq!(
-            n, 2,
-            "expected name twice (in the 'Model X' and 'astra admin model check X' parts), \
-             got {n}: {msg}"
-        );
-        assert!(
-            !msg.contains("resolved to"),
-            "no alias resolution happened, message must not claim one: {msg}"
-        );
-    }
-
-    #[test]
-    fn alias_not_found_below_cap_renders_full_list() {
-        // Inverse guard: if the candidate list fits under the cap, the
-        // render must not pretend truncation happened (that would be
-        // misleading).
-        let active = names(&[
-            "qwen-flash",
-            "MiniMax-M2.7",
-            "us.anthropic.claude-sonnet-4-6",
-        ]);
-        let err = resolve_model_alias("gpt-5", &active).unwrap_err();
-        let rendered = err.to_string();
-        assert!(
-            !rendered.contains("more"),
-            "under-cap list must not imply truncation: {rendered}"
-        );
-        for n in [
-            "qwen-flash",
-            "MiniMax-M2.7",
-            "us.anthropic.claude-sonnet-4-6",
-        ] {
-            assert!(
-                rendered.contains(n),
-                "under-cap list must include {n}: {rendered}"
-            );
-        }
     }
 
     #[test]

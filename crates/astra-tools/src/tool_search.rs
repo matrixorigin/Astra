@@ -114,6 +114,7 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
             "status": TOOL_RESULT_STATUS_COMPLETED,
             "selection_status": outcome,
             "query": query,
+            "invocation": "Selection never changes tools[]. Use a selected shape directly only when tools[] advertises it; otherwise call invoke_tool with the match name and arguments. Resident agent spawn accepts only action, description, and prompt; do not copy extra selected fields into that native call.",
             "requested": requested,
             "resolved": resolved,
             "matches": found,
@@ -618,6 +619,12 @@ mod tests {
         assert!(
             parsed["matches"][0].get("score").is_none(),
             "select mode must return schema entries, not relevance scores: {parsed}"
+        );
+        assert!(
+            parsed["invocation"].as_str().is_some_and(
+                |guidance| guidance.contains("invoke_tool") && guidance.contains("tools[]")
+            ),
+            "selection must explain the carrier path without changing native tools: {parsed}"
         );
     }
 
@@ -1179,12 +1186,10 @@ mod tests {
         let agent = &parsed["matches"][0];
         let desc = agent["description"].as_str().unwrap_or_default();
         assert!(
-            desc.contains("description+prompt")
-                && desc.contains("launched")
-                && desc.contains("parent continues")
-                && desc.contains("list: status")
-                && desc.contains("get_result: result"),
-            "selection summary must keep agent action constraints: {desc}"
+            desc.contains("Omit requested_model_policy")
+                && desc.contains("spawn->launched")
+                && desc.contains("runtime waits"),
+            "selection summary must keep the compact agent admission contract: {desc}"
         );
     }
 

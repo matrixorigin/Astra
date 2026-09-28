@@ -766,7 +766,7 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
             }
             (true, false) => {
                 if tool_visible(tool_names, "tool_search") {
-                    "`agent` spawn is directly callable with action=spawn, description, and prompt; select `agent` only for an action or field absent from its resident schema"
+                    "`agent` spawn is directly callable only with action=spawn, description, and prompt; select `agent` then use `invoke_tool` for an action or field absent from that resident schema"
                 } else {
                     "Use the visible `agent` schema directly for its permitted actions, including child messages and results when present"
                 }
@@ -782,7 +782,7 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
     }
     if agent_visible {
         body.push_str(
-            "         - For an ordinary independent child with a user-named model, call visible `agent` spawn directly and omit `requested_model_policy`; runtime admission resolves the authorized model. Use `agent_fanout` when group-wide preflight is required. `model_catalog` is for availability, comparison, or ambiguity, not a spawn prerequisite. Never inspect workspace configuration or credentials to identify or verify a delegated model, or silently substitute an unavailable or prohibited model.\n",
+            "         - For an ordinary independent child with a user-named model, call visible `agent` spawn directly and omit `requested_model_policy`; runtime admission resolves the authorized model. Use `agent_fanout` when group-wide preflight is required. `model_catalog` is only for availability/comparison or genuinely ambiguous model intent; concrete names are resolved during admission, not by a catalog call. Never inspect workspace configuration or credentials to identify or verify a delegated model, or silently substitute an unavailable or prohibited model.\n",
         );
         body.push_str(
             "         - After `agent.spawn`, continue only independent parent work needed for the user's request. If none remains, propose the final answer without polling or shell sleep: when this run owns pending direct children and continuation is available, the runtime waits for terminal results and gives another synthesis round. A `get_result` still-running snapshot is not a child failure.\n",
@@ -2305,7 +2305,8 @@ mod tests {
         let discoverable = tool_conditional_section(&["agent", "tool_search"]);
         assert!(discoverable.contains("agent` spawn is directly callable"));
         assert!(discoverable.contains("call visible `agent` spawn directly"));
-        assert!(discoverable.contains("not a spawn prerequisite"));
+        assert!(discoverable.contains("genuinely ambiguous model intent"));
+        assert!(discoverable.contains("resolved during admission"));
     }
 
     #[test]

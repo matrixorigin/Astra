@@ -417,7 +417,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
         ),
         "agent" => (
             &["action", "description", "prompt"][..],
-            "Spawn child: action=spawn; description=label; prompt=task. Runtime waits at final.",
+            "Spawn action=spawn; description+prompt only; advanced via invoke_tool.",
         ),
         "introspect" => (
             &[

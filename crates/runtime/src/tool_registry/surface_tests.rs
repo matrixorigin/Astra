@@ -223,7 +223,7 @@ fn models_discovery_is_easy_from_resident_and_selected_model_catalog() {
         contract["description"]
             .as_str()
             .unwrap()
-            .contains("Authorized Chat model catalog")
+            .contains("Authorized Chat model availability/comparison")
     );
     assert!(contract["parameters"]["properties"]["limit"].is_object());
     assert_eq!(contract["parameters"]["properties"]["limit"]["maximum"], 32);
