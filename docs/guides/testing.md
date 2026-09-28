@@ -160,11 +160,35 @@ npm ci --ignore-scripts --prefix scripts/tui-reflow
 ASTRA_TEST_BINARY="$PWD/target/debug/astra" npm test --prefix scripts/tui-reflow
 ```
 
-The `terminal-pty` CI lane runs it on Linux and macOS. The Rust terminal-reader
-PTY tests also verify that a resize cursor query preserves keyboard/paste
-input and times out when the terminal does not answer.
+CI runs the default terminal reader, `use-dev-tty` reader, and reflow binary in
+three parallel jobs on each of Linux and macOS. Separate builds keep dev-tty
+feature unification out of the default-reader checks. The existing
+`Test: terminal PTY (ubuntu-latest)` and `Test: terminal PTY (macos-15)` required
+checks aggregate the full terminal matrix; a failed, cancelled, or unexpectedly
+skipped shard cannot pass either gate. Unaffected changes skip the heavy jobs.
+Push runs populate the terminal dependency cache once per OS and the separate
+macOS workspace-coordination cache. The Rust terminal-reader PTY tests also
+verify that a resize cursor query preserves keyboard/paste input and times out
+when the terminal does not answer.
 
 ## Live MatrixOne system E2E
+
+CI runs four independent online jobs: `core-runtime`, `core-turn-core`,
+`core-services`, and `integration`. Each runner starts its own MatrixOne and
+Memoria stack and keeps `ASTRA_TEST_DB_IT_TEST_THREADS=1`. The core shards use
+distinct database suffixes as well. This parallelizes package builds and test
+execution without increasing contention on a shared database. The required
+`Test: online (core)` check aggregates all selected online jobs; the integration
+job retains `Test: online (integration)`.
+
+`make test-online` still runs the complete suite, and `ASTRA_ONLINE_LANE=core`
+still runs all three core groups. To reproduce a CI shard, choose
+`ASTRA_ONLINE_LANE=core-runtime`, `core-turn-core`, `core-services`, or
+`integration` and run `make test-online NEXTEST_ONLINE_PROFILE=strict-online-ci`
+with `ASTRA_TEST_DB_IT_TEST_THREADS=1`. Parallel CI isolation comes from separate
+service stacks; distinct database names alone do not remove shared-host load.
+All existing test selections, features, exclusions, and per-test deadlines are
+retained.
 
 Memoria identity/credential fixtures require `ASTRA_TEST_DB_IT=1` and an
 explicit `ASTRA_TEST_DATABASE` matching the effective database name. The normal

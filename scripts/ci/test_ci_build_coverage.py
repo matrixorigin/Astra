@@ -43,11 +43,17 @@ class BuildCoverageTests(unittest.TestCase):
         self.assertNotIn("/Cargo.lock", (ROOT / "vendor/crossterm/.gitignore").read_text().splitlines())
         pty = workflow.split("\n  terminal-pty:\n", 1)[1].split("\n  macos-workspace-coordination:", 1)[0]
         self.assertIn("os: [ubuntu-latest, macos-15]", pty)
-        commands = workflow_run_script(".github/workflows/test.yml", "Test real terminal readers through PTYs").splitlines()
-        self.assertEqual(commands, [
-            "cargo test --locked -p astra-cli --lib tui::terminal_startup -- --test-threads=2",
-            "cargo test --locked -p astra-cli --lib --features crossterm/use-dev-tty tui::terminal_startup -- --test-threads=2",
-        ])
+        self.assertIn("segment: [default-reader, dev-tty-reader, reflow]", pty)
+        for segment, step, features in (
+            ("default-reader", "Test default terminal reader through PTYs", ""),
+            ("dev-tty-reader", "Test dev-tty terminal reader through PTYs", "--features crossterm/use-dev-tty "),
+        ):
+            with self.subTest(segment=segment):
+                commands = workflow_run_script(".github/workflows/test.yml", step).strip()
+                self.assertEqual(commands,
+                    f"cargo test --locked -p astra-cli --lib {features}tui::terminal_startup -- --test-threads=2")
+                block = pty.split(f"      - name: {step}\n", 1)[1].split("      - ", 1)[0]
+                self.assertIn(f"if: matrix.segment == '{segment}'", block)
 
     def test_terminal_reflow_uses_real_binary_and_locked_emulator(self):
         commands = workflow_run_script(".github/workflows/test.yml", "Test inline terminal resize with xterm reflow")
