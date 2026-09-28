@@ -89,7 +89,7 @@ static NEXT_FANOUT_GROUP_ID: AtomicU64 = AtomicU64::new(1);
 /// caller-supplied agent_id — that value already appears in the
 /// structured `agent_id` JSON field, where serde escapes it safely.
 const UNKNOWN_AGENT_ID_ERROR: &str = "Unknown agent_id. Use the exact runtime-generated agent_id returned by the earlier spawn result. The optional spawn `name` is only for send_message addressing and cannot be used with get_result.";
-const CHILD_OUTCOME_GUIDANCE: &str = "If you have an outstanding direct child, continue relevant independent work; when none remains, propose a final answer. The runtime waits and presents its result before accepting that answer. Use get_result if needed now; do not shell-sleep or poll to wait.";
+const CHILD_OUTCOME_GUIDANCE: &str = "If you have an outstanding direct child, continue relevant independent work; when none remains, propose a final answer. For a foreground child, do not poll with get_result: the runtime waits and presents its result before accepting that answer. Use get_result only for explicitly background work; do not shell-sleep or poll to wait.";
 
 /// Keep preparation owned by the tool call while still polling the large
 /// spawner future from a fresh Tokio scheduler frame. Dropping the handler
