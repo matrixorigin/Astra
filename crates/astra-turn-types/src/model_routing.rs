@@ -2,6 +2,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const DETERMINISTIC_ROUTING_POLICY_VERSION: &str = "easy-read-only-v1";
+pub const LEARNED_CANARY_ROUTING_POLICY_VERSION: &str = "learned-canary-v1";
 pub const MODEL_ROUTING_FEATURE_VERSION: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +33,8 @@ pub struct AutoModelRoutingPolicy {
 #[serde(rename_all = "snake_case")]
 pub enum ModelRoutingReason {
     EasyReadOnly,
+    LearnedCanary,
+    LearnedAbstention,
     AssessmentUnavailable,
     InsufficientConfidence,
     StrongRequired,

@@ -1,5 +1,7 @@
 //! Local, versioned model-routing qualification records. These are review
 //! artifacts, not authenticated approvals or a production activation registry.
+pub mod rollout;
+
 use astra_turn_types::model_routing::ModelRoutingFeatures;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

@@ -560,3 +560,118 @@ fn known_over_ceiling_costs_reject_incomplete_and_nonrepresentative_pairs() {
         }
     }
 }
+
+#[test]
+fn live_rollout_requires_qualification_and_preserves_scope_and_session_assignment() {
+    use crate::model_routing::rollout::*;
+    use astra_services::tuning::rollout::*;
+    let input = data();
+    let now = Utc::now();
+    let owner = input.manifest.owner_id.clone();
+    let request = RouterPublishRequest {
+        expected_revision: 0,
+        authorization: auth(&input),
+        config: config(),
+        protocol: protocol(&input),
+        review: RolloutReview {
+            online_consent_reference: "consent-1".into(),
+            verifier_review_reference: "verifier-1".into(),
+            safety_review_reference: "safety-1".into(),
+            expires_at: input.manifest.expires_at,
+            minimum_shadow_sessions: 10,
+            maximum_routing_overhead_ms: 100,
+        },
+        input: input.clone(),
+    };
+    assert!(prepare_shadow(request.clone(), "another-owner", now).is_err());
+    let mut rejected = request.clone();
+    rejected.protocol.minimum_test_groups = 100_000;
+    assert!(prepare_shadow(rejected, &owner, now).is_err());
+    let d = prepare_shadow(request, &owner, now).unwrap();
+    let policy = input.sources[0].decision.policy.clone();
+    let features = input.sources[0].decision.features.unwrap();
+    let mut state = transition(
+        RouterRolloutState::default(),
+        &owner,
+        RolloutChange::Publish(Box::new(d)),
+        now,
+    )
+    .unwrap();
+    let shadow = score_live(&state, &owner, "session-1", &policy, features, now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(shadow.cohort, RolloutCohort::Shadow);
+    assert_eq!(shadow.proposed_offering_id, policy.economy_offering_id);
+    assert!(score_live(&state, "other-owner", "session-1", &policy, features, now).is_err());
+    assert!(
+        transition(
+            state.clone(),
+            &owner,
+            RolloutChange::Canary { basis_points: 1001 },
+            now
+        )
+        .is_err()
+    );
+    state = transition(
+        state,
+        &owner,
+        RolloutChange::Canary { basis_points: 1000 },
+        now,
+    )
+    .unwrap();
+    let restarted: RouterRolloutState =
+        serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+    let mut treatments = Vec::new();
+    let mut controls = 0;
+    for i in 0..2000 {
+        let session = format!("session-{i}");
+        let a = score_live(&state, &owner, &session, &policy, features, now)
+            .unwrap()
+            .unwrap();
+        let b = score_live(&restarted, &owner, &session, &policy, features, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(a, b);
+        if a.cohort == RolloutCohort::Treatment {
+            treatments.push(a);
+        } else {
+            controls += 1;
+        }
+    }
+    assert!(!treatments.is_empty() && controls > treatments.len());
+    let pinned = &treatments[0];
+    validate_pinned_treatment(&state, pinned, now).unwrap();
+    let mut unsupported = features;
+    unsupported.supported_input = false;
+    let abstain = score_live(&state, &owner, "session-1", &policy, unsupported, now)
+        .unwrap()
+        .unwrap();
+    assert!(abstain.abstained);
+    assert_eq!(abstain.proposed_offering_id, policy.strong_offering_id);
+    let revoked = state.deployment.as_ref().unwrap().tuning.source_ids[0].clone();
+    state = transition(
+        state,
+        &owner,
+        RolloutChange::Revoke {
+            source_ids: vec![revoked],
+        },
+        now,
+    )
+    .unwrap();
+    assert!(validate_pinned_treatment(&state, pinned, now).is_err());
+    assert!(
+        score_live(&state, &owner, "session-1", &policy, features, now)
+            .unwrap()
+            .is_none()
+    );
+    let expired = restarted.deployment.as_ref().unwrap().expires_at;
+    assert!(validate_pinned_treatment(&restarted, pinned, expired).is_err());
+    let mut tampered = restarted;
+    tampered
+        .deployment
+        .as_mut()
+        .unwrap()
+        .candidate_json
+        .push(' ');
+    assert!(score_live(&tampered, &owner, "session-1", &policy, features, now).is_err());
+}

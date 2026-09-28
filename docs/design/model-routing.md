@@ -387,3 +387,85 @@ the admitted deterministic policy. Representative paired collection, verifier
 calibration, safety/critical-task review, live shadow overhead, stable session
 canaries, authenticated activation, kill switch and rollback remain prerequisites
 for a later production rollout.
+
+## Controlled online rollout (stage 6)
+
+The authenticated `/admin/model-router/{owner}` boundary publishes a per-owner
+versioned deployment through `services::tuning::rollout`. Publication reruns the
+canonical offline qualification over explicitly uploaded reviewed evidence and
+current source authorization. A saved `ready_for_shadow` file alone cannot enable
+routing. The operator supplies separate online-consent, verifier-calibration and
+safety-review references with an expiry. These references are auditable operator
+attestations, not automated proof of those reviews or authenticated historical
+preregistration. No production corpus is read or replayed by the Server.
+
+Publication starts in **live shadow**. The shared Auto preparation scores the
+frozen features and checks the current owner-scoped Offering pair, billing scope
+and model contracts. It records the proposed choice, abstention and elapsed
+routing overhead (registry read, scorer and candidate admission) in the existing
+immutable routing event. Actual selection remains deterministic Auto. No second
+provider request is sent. The separate existing judge phase is not included in
+this routing-overhead measurement; episode metrics must include it.
+
+An admin can advance a current shadow deployment to a 1–1000 basis-point canary
+only after its prereviewed minimum independent shadow-session count, admission
+checks and p95 routing-overhead budget pass. The canary fraction is fixed for the
+deployment and always leaves a control group. A salted hash of owner and session
+assigns the cohort consistently across turns and host restarts. The durable run
+fact pins deployment ID, revision, candidate digest, cohort and cohort assignment
+probability; this probability is **not** a conditional model-action propensity.
+Control uses deterministic Auto; treatment uses the canonical learned scorer.
+Out-of-scope/unsupported/insufficient-evidence features abstain to strong. Current
+Offering admission and contract compatibility still constrain every choice.
+There is no promotion to unrestricted production or automatic savings claim.
+
+Deployment state and consent revocations occupy one owner-keyed C0 table,
+`model_router_deployments`. Compare-and-swap revisions reject stale operators;
+each mutation and its authenticated admin audit record commit in one transaction.
+Source revocations persist across replacements and stop deployments that depend
+on them. Expiry disables new treatment. Operators must propagate withdrawals via
+the revoke API and online-consent withdrawal via rollback; local authorization
+files are not watched by the Server.
+
+Rollback is an explicit terminal deployment state. New runs use deterministic
+Auto. Pinned treatment runs recheck current deployment state at recovery and each
+primary execution authorization, and stop if rolled back, expired, replaced or
+revoked. They do not silently change model or replay completed effects. Requests
+already authorized or in flight cannot be recalled. Control/shadow runs keep their
+pinned baseline. Treatment is limited to primary execution: child admission is
+rejected until child rollout provenance is implemented. This is separate from
+stage 3's ordinary Auto inheritance. Explicit model requests remain unaffected.
+
+The admin status endpoint projects an operational dashboard from canonical run
+facts. It reports first-run-per-session cohorts, selection/abstention/disagreement,
+and terminal completion. Admission failures, critical violations and routing
+overhead include all observed runs. The first representative run is
+chosen before looking at outcomes; repeated correction turns cannot overweight a
+session. Shadow and canary epochs are separate. A bounded 10,000-row scan exposes
+truncation and cannot satisfy the shadow promotion gate when truncated.
+
+Admin-reviewed terminal-run outcomes reference a versioned acceptance rubric and
+evidence, with separately optional correctness, correction, full-episode cost and
+latency. They append idempotently to the existing run ledger with reviewer/time
+provenance. Unknown quality and prices remain unknown; cost per acceptable task
+is null unless all session representatives have quality and complete prices.
+These operational comparisons are descriptive, not a powered online qualification
+or proof that unchosen models would succeed. A reported critical access/safety
+violation rolls back the same deployment under its database row lock before
+acknowledgment, even if its revision advanced concurrently. Other quality, cost,
+correction and latency regressions require operator review and rollback; the API
+does not continuously inspect production traces or invent missing labels.
+
+Offline stage-4/5 qualification rejects treatment decisions as deterministic Auto
+baseline evidence. Randomized canary analysis requires its own preregistered
+protocol; cohort assignment must not be mistaken for action propensity.
+
+See [the rollout workflow](../guides/model-router-rollout.md) for operator API
+requests, revocation, reporting and storage compatibility.
+
+Routing-budget failures retain their cohort, measured overhead and explicit failure
+reason in the canonical routing decision before the run fails. They remain in
+the dashboard and can receive reviewed outcomes; recovery cannot dispatch them.
+The decision also pins the review rubric. Delayed outcomes and identical retries
+remain valid after deployment replacement, using the original run's deployment
+and rubric. A historical critical report never stops a replacement deployment.

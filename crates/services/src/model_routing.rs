@@ -12,6 +12,8 @@ pub const DECISION_KEY: &str = "model-routing-v1";
 pub struct ModelRoutingDecision {
     pub schema_version: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout: Option<crate::tuning::rollout::RouterRolloutDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub features: Option<astra_turn_types::model_routing::ModelRoutingFeatures>,
     /// Full canonical semantic decision, including graph, topology and capabilities.
     pub work_admission: Option<crate::WorkAdmissionDecision>,
@@ -39,6 +41,29 @@ impl ModelRoutingDecision {
                 && self.selected_offering_id != self.policy.strong_offering_id)
         {
             return Err("Auto routing decision does not match its execution".into());
+        }
+        let treatment = self
+            .rollout
+            .as_ref()
+            .is_some_and(|r| r.cohort == crate::tuning::rollout::RolloutCohort::Treatment);
+        if treatment
+            != (self.policy_version
+                == astra_turn_types::model_routing::LEARNED_CANARY_ROUTING_POLICY_VERSION)
+        {
+            return Err("Routing algorithm differs from pinned rollout provenance".into());
+        }
+        if let Some(r) = &self.rollout
+            && (r.deployment_id.is_empty()
+                || !crate::tuning::rollout::opaque(&r.rubric_version)
+                || (r.routing_failure.is_some() && !treatment)
+                || r.candidate_sha256.len() != 64
+                || r.revision == 0
+                || r.cohort_probability_basis_points == 0
+                || r.cohort_probability_basis_points > 10_000
+                || (r.proposed_offering_id != self.policy.economy_offering_id
+                    && r.proposed_offering_id != self.policy.strong_offering_id))
+        {
+            return Err("Invalid rollout decision provenance".into());
         }
         crate::validate_model_offering_id(&self.selected_offering_id)
             .map(|_| ())

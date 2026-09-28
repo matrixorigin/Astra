@@ -672,3 +672,360 @@ async fn admin_audit_variants_match_shared_contract() {
         assert_contract_json(&json, &expected.json, label);
     }
 }
+
+#[tokio::test]
+async fn model_router_operations_require_admin_and_durable_storage() {
+    let app = build_app_with_admin();
+    for (headers, expected) in [
+        (vec![], StatusCode::UNAUTHORIZED),
+        (
+            vec![("authorization", "Bearer user-token")],
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            vec![("authorization", "Bearer admin-token")],
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+    ] {
+        let (status, _) = read_json(app.clone(), "/admin/model-router/owner-1", &headers).await;
+        assert_eq!(status, expected);
+        for (action, payload) in [
+            (
+                "rollback",
+                serde_json::json!({"expected_revision":1,"reason":"manual_kill"}),
+            ),
+            (
+                "revoke",
+                serde_json::json!({"expected_revision":1,"source_ids":["source-1"]}),
+            ),
+            (
+                "canary",
+                serde_json::json!({"expected_revision":1,"basis_points":100}),
+            ),
+        ] {
+            let (status, _) = post_json(
+                app.clone(),
+                &format!("/admin/model-router/owner-1/{action}"),
+                &headers,
+                payload,
+            )
+            .await;
+            assert_eq!(status, expected);
+        }
+    }
+}
+
+#[path = "../../services/tests/common/isolated_database.rs"]
+mod isolated_router_database;
+#[path = "../../services/tests/common/mod.rs"]
+mod rollout_db_common;
+#[path = "../../services/tests/common/router_deployment.rs"]
+mod rollout_db_fixture;
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and explicitly isolated ASTRA_TEST_DATABASE"]
+async fn model_router_http_dashboard_canary_outcome_and_rollback_on_matrixone() {
+    use astra_services::runs::{DatabaseRunStateStore, RunStateStore};
+    use astra_services::tuning::rollout::*;
+    isolated_router_database::require_isolated_database(
+        &rollout_db_common::require_db_it_env().database,
+    );
+    let pool = rollout_db_common::setup_pool().await;
+    let owner = format!("router-{}", Uuid::new_v4());
+    let session = Uuid::new_v4().to_string();
+    let run_id = Uuid::new_v4().to_string();
+    let mut d = rollout_db_fixture::deployment(&owner);
+    d.review.minimum_shadow_sessions = 1;
+    let deployment_id = d.deployment_id.clone();
+    let registry = DatabaseRouterRolloutStore(pool.clone());
+    registry
+        .change(
+            &owner,
+            0,
+            "admin-1",
+            RolloutChange::Publish(Box::new(d.clone())),
+        )
+        .await
+        .unwrap();
+    let app = build_app(
+        AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_admin_authorizer(Arc::new(StubAdminAuthorizer))
+            .with_shared_pool(pool.clone()),
+    );
+    let headers = [("authorization", "Bearer admin-token")];
+    let base = format!("/admin/model-router/{owner}");
+    // Missing shadow evidence cannot advance the deployment.
+    let (status, _) = post_json(
+        app.clone(),
+        &format!("{base}/canary"),
+        &headers,
+        serde_json::json!({"expected_revision":1,"basis_points":100}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    sqlx::query("INSERT INTO agent_sessions (user_id, session_id, status, created_at, updated_at, last_active_at) VALUES (?, ?, 'active', NOW(6), NOW(6), NOW(6))").bind(&owner).bind(&session).execute(pool.get()).await.unwrap();
+    let store = Arc::new(DatabaseRunStateStore::new(pool.clone()));
+    let engine = astra_runtime::server::run::engine::RunEngine::new(store.clone());
+    let mut context = astra_runtime::server::run::engine::RunStartContext::default();
+    context.model_selection = Some(astra_turn_types::ModelSelection {
+        offering_id: "strong".into(),
+    });
+    context.resolved_model_selection = Some(astra_services::runs::ResolvedModelSelection {
+        offering_id: "strong".into(),
+        model_name: "strong-model".into(),
+    });
+    let authority = engine
+        .start_run_with_context(&run_id, &owner, &session, context.clone())
+        .await
+        .unwrap();
+    let mut decision =
+        serde_json::from_str::<astra_services::evaluation::router::RouterDatasetInput>(
+            include_str!("../../../fixtures/contracts/model_router_offline.json"),
+        )
+        .unwrap()
+        .sources
+        .remove(0)
+        .decision;
+    decision.run_id = run_id.clone();
+    decision.session_id = session.clone();
+    decision.policy.strong_offering_id = "strong".into();
+    decision.policy.economy_offering_id = "economy".into();
+    decision.selected_offering_id = "strong".into();
+    decision.selected_model = "strong-model".into();
+    decision.rollout = Some(RouterRolloutDecision {
+        deployment_id: deployment_id.clone(),
+        revision: 1,
+        candidate_sha256: d.tuning.candidate_sha256,
+        rubric_version: "rubric-1".into(),
+        routing_failure: None,
+        cohort: RolloutCohort::Shadow,
+        cohort_probability_basis_points: 10_000,
+        proposed_offering_id: "economy".into(),
+        abstained: false,
+        admission_rejected: false,
+        routing_overhead_us: 500,
+    });
+    let event = serde_json::json!({"event_type":astra_services::model_routing::EVENT_TYPE,"idempotency_key":astra_services::model_routing::DECISION_KEY,"data":decision.clone()});
+    assert!(
+        store
+            .append_events_if_current_generation_and_status(
+                &owner,
+                &session,
+                &run_id,
+                authority.owner_generation,
+                &["running"],
+                &[event]
+            )
+            .await
+            .unwrap()
+    );
+    // Database event time may precede the host's deployment timestamp. Exact
+    // owner/deployment membership must survive clock skew.
+    sqlx::query("UPDATE agent_run_events SET created_at = ? WHERE user_id = ? AND run_id = ?")
+        .bind((chrono::Utc::now() - chrono::Duration::minutes(1)).naive_utc())
+        .bind(&owner)
+        .bind(&run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    let (status, dashboard) = read_json(app.clone(), &base, &headers).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(dashboard["cohorts"]["shadow"]["sessions"], 1);
+    assert_eq!(dashboard["cohorts"]["shadow"]["known_quality"], 0);
+    assert!(dashboard["cohorts"]["shadow"]["cost_per_acceptable_task"].is_null());
+    let (status, _) = post_json(
+        app.clone(),
+        &format!("{base}/canary"),
+        &headers,
+        serde_json::json!({"expected_revision":1,"basis_points":100}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let outcome = serde_json::json!({"rubric_version":"rubric-1","evidence_reference":"verifier-1","acceptable":false,"corrected":true,"full_episode_cost_usd":0.2,"episode_latency_ms":1000,"critical_violation":true});
+    let path = format!("{base}/outcomes/{run_id}");
+    assert_eq!(
+        post_json(app.clone(), &path, &headers, outcome.clone())
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    // The terminal row is owned by the existing run lifecycle. Only fixture
+    // settlement uses SQL here; outcome append still exercises its fenced API.
+    sqlx::query("UPDATE agent_runs SET status = 'completed' WHERE user_id = ? AND run_id = ?")
+        .bind(&owner)
+        .bind(&run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(build_request_with_json(
+            "POST",
+            &path,
+            &headers,
+            outcome.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        registry
+            .load(&owner)
+            .await
+            .unwrap()
+            .deployment
+            .unwrap()
+            .mode,
+        RolloutMode::RolledBack
+    );
+    let response = app
+        .clone()
+        .oneshot(build_request_with_json(
+            "POST",
+            &path,
+            &headers,
+            outcome.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut conflict_outcome = outcome.clone();
+    conflict_outcome["acceptable"] = serde_json::json!(true);
+    let response = app
+        .clone()
+        .oneshot(build_request_with_json(
+            "POST",
+            &path,
+            &headers,
+            conflict_outcome,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let (_, dashboard) = read_json(app.clone(), &base, &headers).await;
+    assert_eq!(dashboard["cohorts"]["shadow"]["known_quality"], 1);
+    assert_eq!(dashboard["cohorts"]["shadow"]["critical_violations"], 1);
+    // A failed treatment is still reviewable after its deployment is replaced.
+    let late_run_id = Uuid::new_v4().to_string();
+    let late_session = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO agent_sessions (user_id, session_id, status, created_at, updated_at, last_active_at) VALUES (?, ?, 'active', NOW(6), NOW(6), NOW(6))").bind(&owner).bind(&late_session).execute(pool.get()).await.unwrap();
+    let late_authority = engine
+        .start_run_with_context(&late_run_id, &owner, &late_session, context)
+        .await
+        .unwrap();
+    decision.run_id = late_run_id.clone();
+    decision.session_id = late_session.clone();
+    decision.policy_version =
+        astra_turn_types::model_routing::LEARNED_CANARY_ROUTING_POLICY_VERSION.into();
+    let rollout = decision.rollout.as_mut().unwrap();
+    rollout.cohort = RolloutCohort::Treatment;
+    rollout.cohort_probability_basis_points = 100;
+    rollout.routing_failure = Some(RouterRoutingFailure::OverheadBudgetExceeded);
+    rollout.routing_overhead_us = 200_000;
+    let late_event = serde_json::json!({"event_type":astra_services::model_routing::EVENT_TYPE,"idempotency_key":astra_services::model_routing::DECISION_KEY,"data":decision});
+    assert!(
+        store
+            .append_events_if_current_generation_and_status(
+                &owner,
+                &late_session,
+                &late_run_id,
+                late_authority.owner_generation,
+                &["running"],
+                &[late_event]
+            )
+            .await
+            .unwrap()
+    );
+    sqlx::query("UPDATE agent_runs SET status = 'failed' WHERE user_id = ? AND run_id = ?")
+        .bind(&owner)
+        .bind(&late_run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    let (_, report) = read_json(app.clone(), &base, &headers).await;
+    assert_eq!(report["cohorts"]["treatment"]["routing_failures"], 1);
+    assert_eq!(report["cohorts"]["treatment"]["known_quality"], 0);
+    let mut replacement = rollout_db_fixture::deployment(&owner);
+    replacement.rubric_version = "rubric-2".into();
+    let replacement_id = replacement.deployment_id.clone();
+    registry
+        .change(
+            &owner,
+            3,
+            "admin",
+            RolloutChange::Publish(Box::new(replacement)),
+        )
+        .await
+        .unwrap();
+    let late_path = format!("{base}/outcomes/{late_run_id}");
+    let mut wrong_rubric = outcome.clone();
+    wrong_rubric["rubric_version"] = serde_json::json!("rubric-2");
+    assert_eq!(
+        post_json(app.clone(), &late_path, &headers, wrong_rubric)
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    for (report_path, expected) in [
+        (&late_path, StatusCode::CREATED),
+        (&late_path, StatusCode::OK),
+        (&path, StatusCode::OK),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(build_request_with_json(
+                "POST",
+                report_path,
+                &headers,
+                outcome.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    let current = registry.load(&owner).await.unwrap();
+    assert_eq!(current.revision, 4);
+    assert_eq!(
+        current.deployment.as_ref().unwrap().deployment_id,
+        replacement_id
+    );
+    assert_eq!(
+        current.deployment.as_ref().unwrap().mode,
+        RolloutMode::Shadow
+    );
+    let late_saved = store
+        .load_run_event_by_idempotency_key(&owner, &late_run_id, OUTCOME_EVENT, OUTCOME_KEY)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(late_saved["data"]["deployment_id"], deployment_id);
+    assert_eq!(late_saved["data"]["outcome"]["rubric_version"], "rubric-1");
+    let (status, _) = post_json(
+        app,
+        &format!("{base}/revoke"),
+        &headers,
+        serde_json::json!({"expected_revision":4,"source_ids":["source-1"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    for table in [
+        "agent_run_events",
+        "agent_runs",
+        "agent_sessions",
+        "model_router_deployments",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
+            .bind(&owner)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "DELETE FROM auth_audit_logs WHERE resource_type = 'model_router' AND resource_id IN (?, ?)",
+    )
+    .bind(&replacement_id)
+    .bind(&deployment_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+}

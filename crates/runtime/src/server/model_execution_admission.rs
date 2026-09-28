@@ -525,6 +525,15 @@ where
     let decision: ModelRoutingDecision = serde_json::from_value(event["data"].clone())
         .map_err(|_| "Invalid durable Auto routing decision".to_string())?;
     decision.validate_identity(parent_run_id, session_id)?;
+    if decision
+        .rollout
+        .as_ref()
+        .is_some_and(|r| r.cohort == astra_services::tuning::rollout::RolloutCohort::Treatment)
+    {
+        return Err(
+            "Learned canary is limited to primary execution; child admission is unavailable".into(),
+        );
+    }
     let execution = resolve(decision.selected_offering_id).await?;
     if model_execution_contract_root(&execution) != decision.selected_contract_root {
         return Err("The inherited Auto model contract changed; start a new turn".into());

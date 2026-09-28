@@ -156,3 +156,13 @@ Archival should preserve allowed metadata while removing or redacting payloads a
 - debug bundles;
 - artifact manifests;
 - eval cases that include private payloads.
+
+## Router deployment state
+
+Fresh schema contract `2026-09-27-v90` adds `model_router_deployments`, keyed by
+owner, with a compare-and-swap revision and typed deployment/revocation JSON. This
+is C0 tuning control state. Mutations and existing `auth_audit_logs` entries share
+one transaction. Routing decisions and reviewed outcomes continue to use
+`agent_run_events`; dashboard queries are bounded projections of that ledger.
+As with the canonical bootstrap policy above, older schema markers are rejected;
+this change does not implement an in-place migration or backfill.

@@ -2019,6 +2019,7 @@ async fn assert_auto_model_routing_commit(store: &dyn RunStateStore, run: &Durab
     use astra_services::model_routing::{DECISION_KEY, EVENT_TYPE, ModelRoutingDecision};
     use astra_turn_types::model_routing::{AutoModelRoutingPolicy, ModelRoutingReason};
     let decision = ModelRoutingDecision {
+        rollout: None,
         schema_version: 1,
         features: None,
         policy_version: "easy-read-only-v1".into(),

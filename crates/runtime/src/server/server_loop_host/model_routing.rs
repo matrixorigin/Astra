@@ -1,7 +1,12 @@
 use super::*;
 use crate::server::run::engine::RunEngine;
+use astra_services::tuning::rollout::*;
 use astra_services::{AdmittedModelExecution, ModelExecutionPlacement, ModelService};
+use astra_turn_core::model_routing::rollout::{
+    deployment_candidate, score_live, validate_pinned_treatment,
+};
 use astra_turn_types::model_routing::{AutoModelRoutingPolicy, ModelRoutingReason};
+use chrono::Utc;
 
 use astra_services::model_routing::{DECISION_KEY, EVENT_TYPE, ModelRoutingDecision};
 
@@ -12,6 +17,16 @@ pub(super) struct AutoRoutingContext {
     supported_input: bool,
     decision: Option<ModelRoutingDecision>,
     applied: bool,
+    rollout_store: Option<Arc<dyn RouterRolloutStore>>,
+}
+
+async fn load_live_rollout(
+    store: &dyn RouterRolloutStore,
+    owner: &str,
+) -> Result<RouterRolloutState, String> {
+    tokio::time::timeout(std::time::Duration::from_secs(1), store.load(owner))
+        .await
+        .map_err(|_| "Router deployment lookup timed out".to_string())?
 }
 
 fn invalid(message: impl Into<String>) -> astra_core::ClassifiedError {
@@ -50,6 +65,9 @@ impl ServerAgenticLoopHost {
             supported_input,
             decision: None,
             applied: false,
+            rollout_store: self.shared_pool.clone().map(|pool| {
+                Arc::new(DatabaseRouterRolloutStore(pool)) as Arc<dyn RouterRolloutStore>
+            }),
         });
     }
 
@@ -86,8 +104,23 @@ impl ServerAgenticLoopHost {
         decision
             .validate_identity(run_id, &self.session_id)
             .map_err(invalid)?;
-        if decision.policy_version != astra_turn_core::model_routing::POLICY_VERSION {
+        if decision.policy_version != astra_turn_core::model_routing::POLICY_VERSION
+            && decision.policy_version
+                != astra_turn_types::model_routing::LEARNED_CANARY_ROUTING_POLICY_VERSION
+        {
             return Err(invalid("Unsupported Auto routing policy version"));
+        }
+        if let Some(pinned) = &decision.rollout
+            && pinned.cohort == RolloutCohort::Treatment
+        {
+            let store = routing
+                .rollout_store
+                .as_ref()
+                .ok_or_else(|| invalid("Router rollout store unavailable"))?;
+            let current = load_live_rollout(store.as_ref(), &self.user_id)
+                .await
+                .map_err(invalid)?;
+            validate_pinned_treatment(&current, pinned, Utc::now()).map_err(invalid)?;
         }
         let admission = decision.work_admission.clone();
         let skill_revision = decision.work_admission_skill_revision;
@@ -117,6 +150,7 @@ impl ServerAgenticLoopHost {
         let policy = routing.policy.clone();
         let supported_input = routing.supported_input;
         let saved = routing.decision.clone();
+        let rollout_store = routing.rollout_store.clone();
         let run_id = state
             .current_run_id
             .clone()
@@ -198,20 +232,46 @@ impl ServerAgenticLoopHost {
                 read_only,
                 supported_input && text_only_history && input_reference.is_some(),
             );
+            let routing_started = Instant::now();
+            let rollout_state = match &rollout_store {
+                Some(store) => load_live_rollout(store.as_ref(), &self.user_id)
+                    .await
+                    .map_err(invalid)?,
+                None => RouterRolloutState::default(),
+            };
+            let mut rollout = score_live(
+                &rollout_state,
+                &self.user_id,
+                &self.session_id,
+                &policy,
+                features,
+                Utc::now(),
+            )
+            .map_err(invalid)?;
             let mut reason =
                 astra_turn_core::model_routing::economy_eligibility_from_features(features);
             let mut execution = baseline.clone();
-            if reason == ModelRoutingReason::EasyReadOnly {
-                // The catalog is owner-scoped; retaining the same access id
-                // prevents a policy from silently changing billing ownership.
+            let treatment = rollout
+                .as_ref()
+                .is_some_and(|r| r.cohort == RolloutCohort::Treatment);
+            let wants_economy = if treatment {
+                rollout
+                    .as_ref()
+                    .is_some_and(|r| r.proposed_offering_id == policy.economy_offering_id)
+            } else {
+                reason == ModelRoutingReason::EasyReadOnly
+            };
+            // Shadow checks the actual admission/contract boundary too, without
+            // sending a second provider request or changing the baseline action.
+            if wants_economy || rollout.is_some() {
                 let catalog = service.list_models(self.user_id.clone(), false).await;
                 let same_access = catalog.as_ref().is_ok_and(|catalog| {
                     let strong = catalog.iter().find(|item| item.offering_id == policy.strong_offering_id && item.is_active);
                     let economy = catalog.iter().find(|item| item.offering_id == policy.economy_offering_id && item.is_active);
                     matches!((strong, economy), (Some(a), Some(b)) if a.access_id == b.access_id && a.access_kind == b.access_kind && a.execution_placement == b.execution_placement)
                 });
-                if same_access {
-                    match crate::server::model_execution_admission::admit_model_execution(
+                let admitted = if same_access {
+                    crate::server::model_execution_admission::admit_model_execution(
                         &service,
                         astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
                         &self.user_id,
@@ -223,23 +283,86 @@ impl ServerAgenticLoopHost {
                         None,
                     )
                     .await
-                    {
-                        Ok(candidate) if preserves_contract(&baseline, &candidate) => {
-                            execution = candidate
-                        }
-                        Ok(_) => reason = ModelRoutingReason::IncompatibleCandidate,
-                        Err(_) => reason = ModelRoutingReason::EconomyUnavailable,
-                    }
+                    .ok()
                 } else {
-                    reason = ModelRoutingReason::EconomyUnavailable;
+                    None
+                };
+                let compatible = admitted
+                    .as_ref()
+                    .is_some_and(|candidate| preserves_contract(&baseline, candidate));
+                let pinned_pair = if let Some(d) = rollout_state
+                    .deployment
+                    .as_ref()
+                    .filter(|_| rollout.is_some())
+                {
+                    let candidate = deployment_candidate(d).map_err(invalid)?;
+                    candidate.strong.contract_root == crate::server::model_execution_admission::model_execution_contract_root(&baseline)
+                        && admitted.as_ref().is_some_and(|e| candidate.economy.contract_root == crate::server::model_execution_admission::model_execution_contract_root(e))
+                } else {
+                    true
+                };
+                if compatible && (!treatment || pinned_pair) {
+                    if wants_economy {
+                        execution = admitted.expect("compatible candidate");
+                    }
+                } else if wants_economy {
+                    reason = if admitted.is_none() {
+                        ModelRoutingReason::EconomyUnavailable
+                    } else {
+                        ModelRoutingReason::IncompatibleCandidate
+                    };
+                }
+                // Observational admission can reject a deployment without
+                // changing deterministic Auto in either shadow or control.
+                if (!compatible || !pinned_pair)
+                    && let Some(r) = &mut rollout
+                {
+                    r.abstained = true;
+                    r.admission_rejected = true;
+                    r.proposed_offering_id = policy.strong_offering_id.clone();
+                }
+            }
+            if treatment
+                && !matches!(
+                    reason,
+                    ModelRoutingReason::EconomyUnavailable
+                        | ModelRoutingReason::IncompatibleCandidate
+                )
+            {
+                reason = if rollout.as_ref().is_some_and(|r| r.abstained) {
+                    ModelRoutingReason::LearnedAbstention
+                } else {
+                    ModelRoutingReason::LearnedCanary
+                };
+            }
+            if let Some(r) = &mut rollout {
+                r.routing_overhead_us =
+                    u64::try_from(routing_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                if treatment {
+                    let limit = rollout_state
+                        .deployment
+                        .as_ref()
+                        .expect("deployment")
+                        .review
+                        .maximum_routing_overhead_ms
+                        * 1000;
+                    if r.routing_overhead_us > limit {
+                        r.routing_failure = Some(RouterRoutingFailure::OverheadBudgetExceeded);
+                    }
                 }
             }
             let decision = ModelRoutingDecision {
                 schema_version: 1,
+                rollout,
                 features: Some(features),
                 work_admission: self.pending_work_admission.clone(),
                 work_admission_skill_revision: self.work_admission_skill_revision,
-                policy_version: astra_turn_core::model_routing::POLICY_VERSION.into(),
+                policy_version: if treatment {
+                    astra_turn_types::model_routing::LEARNED_CANARY_ROUTING_POLICY_VERSION
+                } else {
+                    astra_turn_core::model_routing::POLICY_VERSION
+                }
+                .into(),
                 policy,
                 run_id: run_id.clone(),
                 session_id: self.session_id.clone(),
@@ -270,6 +393,12 @@ impl ServerAgenticLoopHost {
             }
             (decision, execution)
         };
+
+        // Persist failed treatment assignment as well as successful decisions.
+        // Recovery must never turn a recorded routing failure into execution.
+        if let Some(rollout) = &decision.rollout {
+            rollout.ensure_dispatchable().map_err(invalid)?;
+        }
 
         // Everything model-dependent is repinned before prompt construction or
         // compaction. No endpoint or credential is included in the saved fact.
@@ -306,6 +435,19 @@ impl ServerAgenticLoopHost {
         let Some(routing) = self.model_routing.as_ref() else {
             return Ok(None);
         };
+        if let Some(pinned) = routing.decision.as_ref().and_then(|d| d.rollout.as_ref())
+            && pinned.cohort == RolloutCohort::Treatment
+        {
+            let store = routing
+                .rollout_store
+                .as_ref()
+                .ok_or("Router rollout store unavailable")?;
+            validate_pinned_treatment(
+                &load_live_rollout(store.as_ref(), &self.user_id).await?,
+                pinned,
+                Utc::now(),
+            )?;
+        }
         let offering_id = routing
             .decision
             .as_ref()

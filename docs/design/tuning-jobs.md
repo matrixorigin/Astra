@@ -141,3 +141,14 @@ remain valid. Later outcomes require source approval but do not change the plan.
 The registration timestamp records the actual roster seal after source decisions
 and before held-out replay starts or supplied outcomes arrive. The decision split
 remains a separate cutoff: fitting labels must mature before test decisions.
+
+## Implemented online router rollout
+
+Stage 6 extends this owner with a durable per-owner deployment registry and admin
+API. It recomputes offline qualification and records separate online review/consent
+attestations before live shadow, then gates a capped canary on observed shadow
+support/admission/overhead. Atomic revisions and audit records own publication,
+canary, rollback and persistent lineage revocation. Run decisions and reviewed
+outcomes remain in the existing run-event ledger. There is no parallel trace store
+or automatic unrestricted production activation. See the
+[rollout contract](model-routing.md#controlled-online-rollout-stage-6).

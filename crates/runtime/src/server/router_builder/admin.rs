@@ -2,6 +2,26 @@ use super::*;
 
 pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<AppState> {
     router
+        .route(
+            "/admin/model-router/{owner}",
+            get(router_rollout_handlers::status).post(router_rollout_handlers::publish),
+        )
+        .route(
+            "/admin/model-router/{owner}/canary",
+            post(router_rollout_handlers::canary),
+        )
+        .route(
+            "/admin/model-router/{owner}/rollback",
+            post(router_rollout_handlers::rollback),
+        )
+        .route(
+            "/admin/model-router/{owner}/revoke",
+            post(router_rollout_handlers::revoke),
+        )
+        .route(
+            "/admin/model-router/{owner}/outcomes/{run_id}",
+            post(router_rollout_handlers::outcome),
+        )
         .nest("/admin/harness", admin_harness_routes(state.clone()))
         .route(
             "/admin/register",

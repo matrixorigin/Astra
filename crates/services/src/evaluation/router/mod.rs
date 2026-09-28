@@ -292,6 +292,12 @@ pub fn build_router_dataset(
                 "Absent assessment contains inferred features",
             )?;
         }
+        require(
+            d.rollout
+                .as_ref()
+                .is_none_or(|r| r.cohort != crate::tuning::rollout::RolloutCohort::Treatment),
+            "Canary treatments cannot serve as deterministic Auto baseline evidence",
+        )?;
         let split = if source.decision_at < manifest.train_before {
             DatasetSplit::Train
         } else if source.decision_at < manifest.validation_before {

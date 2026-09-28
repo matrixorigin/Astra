@@ -51,6 +51,7 @@ mod reflect_handlers;
 mod request_trace;
 mod resource_handlers;
 mod router_builder;
+mod router_rollout_handlers;
 pub mod run;
 mod runtime_maintenance_sweeper;
 pub(crate) mod runtime_mcp;

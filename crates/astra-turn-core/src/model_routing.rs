@@ -4,6 +4,7 @@ use astra_turn_types::{AssessmentConfidence, TaskDifficulty, TurnAssessment};
 
 pub mod offline;
 pub mod qualification;
+pub mod rollout;
 
 pub use astra_turn_types::model_routing::DETERMINISTIC_ROUTING_POLICY_VERSION as POLICY_VERSION;
 

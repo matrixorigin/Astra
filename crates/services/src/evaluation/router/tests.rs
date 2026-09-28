@@ -40,6 +40,49 @@ fn builds_allowlisted_dataset_and_preserves_unknown_legacy_records() {
     assert!(dataset.examples[0].features.is_none());
 }
 #[test]
+fn rollout_provenance_keeps_treatment_out_of_deterministic_training_evidence() {
+    use crate::tuning::rollout::{RolloutCohort, RouterRolloutDecision};
+    let mut input = fixture();
+    let decision = &mut input.sources[0].decision;
+    decision.rollout = Some(RouterRolloutDecision {
+        deployment_id: "deployment".into(),
+        revision: 1,
+        candidate_sha256: "a".repeat(64),
+        rubric_version: "rubric-1".into(),
+        routing_failure: None,
+        cohort: RolloutCohort::Shadow,
+        cohort_probability_basis_points: 10_000,
+        proposed_offering_id: decision.policy.economy_offering_id.clone(),
+        abstained: false,
+        admission_rejected: false,
+        routing_overhead_us: 100,
+    });
+    build(input.clone()).unwrap();
+    let rollout = input.sources[0].decision.rollout.as_mut().unwrap();
+    rollout.cohort = RolloutCohort::Control;
+    rollout.cohort_probability_basis_points = 9000;
+    build(input.clone()).unwrap();
+
+    let rollout = input.sources[0].decision.rollout.as_mut().unwrap();
+    rollout.cohort = RolloutCohort::Treatment;
+    rollout.cohort_probability_basis_points = 1000;
+    assert_eq!(
+        build(input.clone()).unwrap_err(),
+        "Routing algorithm differs from pinned rollout provenance"
+    );
+    input.sources[0].decision.policy_version =
+        astra_turn_types::model_routing::LEARNED_CANARY_ROUTING_POLICY_VERSION.into();
+    assert_eq!(
+        build(input.clone()).unwrap_err(),
+        "Routing policy revision mismatch"
+    );
+    input.manifest.policy_version = input.sources[0].decision.policy_version.clone();
+    assert_eq!(
+        build(input).unwrap_err(),
+        "Unsupported logging policy; action probability is unknown"
+    );
+}
+#[test]
 fn consent_scope_hash_revocation_expiration_and_deletion_fail_closed() {
     let input = fixture();
     let approved = auth(&input);

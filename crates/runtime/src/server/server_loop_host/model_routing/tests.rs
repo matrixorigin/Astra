@@ -762,3 +762,346 @@ async fn auto_recovery_restores_required_work_before_first_primary_request() {
     assert_eq!(args["goal"], "Inspect the source");
     assert_eq!(args["tasks"][0]["objective"], "Inspect source");
 }
+
+#[derive(Default)]
+struct RolloutMemory(std::sync::Mutex<RouterRolloutState>);
+#[async_trait]
+impl RouterRolloutStore for RolloutMemory {
+    async fn load(&self, _: &str) -> Result<RouterRolloutState, String> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+    async fn change(
+        &self,
+        owner: &str,
+        expected: u64,
+        _: &str,
+        change: RolloutChange,
+    ) -> Result<RouterRolloutState, String> {
+        let mut state = self.0.lock().unwrap();
+        if state.revision != expected {
+            return Err("Rollout revision conflict".into());
+        }
+        *state = transition(state.clone(), owner, change, Utc::now())?;
+        Ok(state.clone())
+    }
+}
+fn deployment_for_test(catalog: &Catalog) -> RouterDeployment {
+    use astra_services::evaluation::router::{ModelProfile, content_sha256};
+    use astra_services::tuning::{
+        RouterQualificationProtocol, RouterQualificationStatus, RouterTuningRecord,
+    };
+    use astra_turn_core::model_routing::offline::{
+        OutcomeBucket, OutcomeEstimate, RouterCandidate, RouterTrainingConfig,
+    };
+    let profile = |id: &str| ModelProfile {
+        profile_id: id.into(),
+        offering_id: id.into(),
+        contract_root: crate::server::model_execution_admission::model_execution_contract_root(
+            &catalog.models.read().unwrap()[id],
+        ),
+    };
+    let features = astra_turn_types::model_routing::ModelRoutingFeatures::new(
+        Some(astra_turn_types::TurnAssessment {
+            difficulty: astra_turn_types::TaskDifficulty::Moderate,
+            difficulty_confidence: astra_turn_types::AssessmentConfidence::High,
+            ..Default::default()
+        }),
+        true,
+        true,
+    );
+    let config = RouterTrainingConfig::default();
+    let candidate = RouterCandidate {
+        schema_version: 1,
+        algorithm_version: "categorical-paired-outcomes-v1".into(),
+        feature_version: 1,
+        dataset_sha256: "data-digest".into(),
+        economy: profile("economy"),
+        strong: profile("strong"),
+        config: config.clone(),
+        threshold: Some(0.5),
+        buckets: [(
+            serde_json::to_string(&features).unwrap(),
+            OutcomeBucket {
+                economy: OutcomeEstimate {
+                    groups: 100,
+                    acceptable: 100,
+                    mean_cost_usd: 0.01,
+                },
+                strong: OutcomeEstimate {
+                    groups: 100,
+                    acceptable: 100,
+                    mean_cost_usd: 0.1,
+                },
+            },
+        )]
+        .into(),
+        activation: "offline_only".into(),
+    };
+    let now = Utc::now();
+    let expires = now + chrono::Duration::days(1);
+    let protocol = RouterQualificationProtocol {
+        schema_version: 1,
+        job_id: "job-1".into(),
+        owner_id: "router-user".into(),
+        dataset_id: "dataset".into(),
+        registered_at: now - chrono::Duration::days(1),
+        training_config_sha256: content_sha256(&config).unwrap(),
+        evaluation_plan_sha256: "plan-digest".into(),
+        minimum_test_groups: 100,
+        minimum_stratum_groups: 100,
+        minimum_pair_coverage: 0.95,
+        maximum_quality_regression: 0.01,
+        minimum_cost_saving_fraction: 0.2,
+        maximum_episode_cost_usd: 1.0,
+        maximum_p95_latency_ratio: 1.1,
+        confidence: 0.95,
+        required_strata: vec![features],
+    };
+    let tuning = RouterTuningRecord {
+        schema_version: 1,
+        job_id: protocol.job_id.clone(),
+        owner_id: "router-user".into(),
+        dataset_sha256: candidate.dataset_sha256.clone(),
+        candidate_sha256: content_sha256(&candidate).unwrap(),
+        protocol_sha256: content_sha256(&protocol).unwrap(),
+        evaluated_at: now,
+        expires_at: expires,
+        source_ids: vec!["source-1".into()],
+        status: RouterQualificationStatus::ReadyForShadow,
+        production_qualified: false,
+    };
+    let mut d = RouterDeployment {
+        deployment_id: "deployment-1".into(),
+        owner_id: "router-user".into(),
+        policy_revision: policy().revision,
+        rubric_version: "rubric-1".into(),
+        candidate_json: serde_json::to_string(&candidate).unwrap(),
+        tuning,
+        protocol,
+        review: RolloutReview {
+            online_consent_reference: "consent-1".into(),
+            verifier_review_reference: "verify-1".into(),
+            safety_review_reference: "safety-1".into(),
+            expires_at: expires,
+            minimum_shadow_sessions: 1,
+            maximum_routing_overhead_ms: 1000,
+        },
+        mode: RolloutMode::Shadow,
+        canary_basis_points: 0,
+        assignment_salt: "seed".into(),
+        created_at: now,
+        expires_at: expires,
+        stop_reason: None,
+    };
+    // Deterministically find a test seed selecting the test session at 10%.
+    for i in 0..1000 {
+        d.assignment_salt = format!("seed-{i}");
+        if astra_turn_core::model_routing::rollout::session_bucket(&d, "router-session") < 1000 {
+            break;
+        }
+    }
+    d
+}
+
+#[tokio::test]
+async fn live_rollout_shadow_canary_recovery_and_kill_switch_share_auto_entrypoint() {
+    for mode in [RolloutMode::Shadow, RolloutMode::Canary] {
+        let (catalog, engine, mut host, mut state) = fixture().await;
+        let mut d = deployment_for_test(&catalog);
+        d.mode = mode;
+        d.canary_basis_points = if mode == RolloutMode::Canary { 1000 } else { 0 };
+        let store = Arc::new(RolloutMemory(std::sync::Mutex::new(RouterRolloutState {
+            revision: 2,
+            deployment: Some(d),
+            ..Default::default()
+        })));
+        host.model_routing.as_mut().unwrap().rollout_store = Some(store.clone());
+        let admission = astra_services::parse_work_admission_response(r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"primary","assessment":{"difficulty":"moderate","difficulty_confidence":"high"}}"#).unwrap();
+        host.apply_work_admission_decision(admission);
+        crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .unwrap();
+        let expected = if mode == RolloutMode::Canary {
+            "economy"
+        } else {
+            "strong"
+        };
+        assert_eq!(
+            host.admitted_model_execution.as_ref().unwrap().offering_id,
+            expected
+        );
+        let saved = engine
+            .load_run_event_by_idempotency_key(
+                "router-user",
+                state.current_run_id.as_deref().unwrap(),
+                EVENT_TYPE,
+                DECISION_KEY,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved["data"]["rollout"]["proposed_offering_id"], "economy");
+        assert_eq!(saved["data"]["selected_offering_id"], expected);
+        let mut recovered = self::host(catalog.clone(), engine.clone());
+        recovered.model_routing.as_mut().unwrap().rollout_store = Some(store.clone());
+        recovered
+            .prepare_auto_model_selection(&mut state)
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered
+                .admitted_model_execution
+                .as_ref()
+                .unwrap()
+                .offering_id,
+            expected
+        );
+        recovered.revalidate_auto_execution().await.unwrap();
+        store
+            .change(
+                "router-user",
+                2,
+                "admin",
+                RolloutChange::Rollback {
+                    reason: "manual_kill".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered.revalidate_auto_execution().await.is_err(),
+            mode == RolloutMode::Canary
+        );
+        let mut after_kill = self::host(catalog.clone(), engine.clone());
+        after_kill.model_routing.as_mut().unwrap().rollout_store = Some(store);
+        assert_eq!(
+            after_kill
+                .prepare_auto_model_selection(&mut state)
+                .await
+                .is_err(),
+            mode == RolloutMode::Canary
+        );
+    }
+}
+
+#[tokio::test]
+async fn live_shadow_contract_drift_never_changes_deterministic_auto() {
+    let (catalog, _, mut host, mut state) = fixture().await;
+    let mut d = deployment_for_test(&catalog);
+    let mut candidate = deployment_candidate(&d).unwrap();
+    candidate.strong.contract_root = "old-strong-contract".into();
+    d.candidate_json = serde_json::to_string(&candidate).unwrap();
+    d.tuning.candidate_sha256 = candidate_json_sha256(&d.candidate_json);
+    host.model_routing.as_mut().unwrap().rollout_store = Some(Arc::new(RolloutMemory(
+        std::sync::Mutex::new(RouterRolloutState {
+            revision: 1,
+            deployment: Some(d),
+            ..Default::default()
+        }),
+    )));
+    crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        host.admitted_model_execution.as_ref().unwrap().offering_id,
+        "economy"
+    );
+    let decision = host
+        .model_routing
+        .as_ref()
+        .unwrap()
+        .decision
+        .as_ref()
+        .unwrap();
+    assert_eq!(decision.reason, ModelRoutingReason::EasyReadOnly);
+    let shadow = decision.rollout.as_ref().unwrap();
+    assert!(shadow.admission_rejected && shadow.abstained);
+}
+
+#[tokio::test]
+async fn over_budget_treatment_is_durable_reportable_and_cannot_resume() {
+    struct SlowRegistry(RouterRolloutState);
+    #[async_trait::async_trait]
+    impl RouterRolloutStore for SlowRegistry {
+        async fn load(&self, _: &str) -> Result<RouterRolloutState, String> {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            Ok(self.0.clone())
+        }
+        async fn change(
+            &self,
+            _: &str,
+            _: u64,
+            _: &str,
+            _: RolloutChange,
+        ) -> Result<RouterRolloutState, String> {
+            Err("read-only test registry".into())
+        }
+    }
+    let (catalog, engine, mut host, mut state) = fixture().await;
+    let mut d = deployment_for_test(&catalog);
+    d.mode = RolloutMode::Canary;
+    d.canary_basis_points = 1000;
+    d.review.maximum_routing_overhead_ms = 1;
+    let store = Arc::new(SlowRegistry(RouterRolloutState {
+        revision: 2,
+        deployment: Some(d),
+        ..Default::default()
+    }));
+    host.model_routing.as_mut().unwrap().rollout_store = Some(store.clone());
+    let admission = astra_services::parse_work_admission_response(r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"primary","assessment":{"difficulty":"moderate","difficulty_confidence":"high"}}"#).unwrap();
+    host.apply_work_admission_decision(admission);
+    assert!(
+        crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .is_err()
+    );
+    assert!(!host.model_routing.as_ref().unwrap().applied);
+    let saved = engine
+        .load_run_event_by_idempotency_key(
+            "router-user",
+            state.current_run_id.as_deref().unwrap(),
+            EVENT_TYPE,
+            DECISION_KEY,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let decision: ModelRoutingDecision = serde_json::from_value(saved["data"].clone()).unwrap();
+    let rollout = decision.rollout.unwrap();
+    assert_eq!(
+        rollout.routing_failure,
+        Some(RouterRoutingFailure::OverheadBudgetExceeded)
+    );
+    assert!(rollout.routing_overhead_us > 1000);
+    let report = dashboard(
+        &store.0,
+        &[RolloutRun {
+            run_id: decision.run_id,
+            session_id: decision.session_id,
+            status: "failed".into(),
+            selected_offering_id: decision.selected_offering_id,
+            economy_offering_id: decision.policy.economy_offering_id,
+            reason: decision.reason,
+            rollout,
+            outcome: None,
+        }],
+        false,
+    );
+    let cohort = &report.cohorts["treatment"];
+    assert_eq!(
+        (cohort.sessions, cohort.completed, cohort.routing_failures),
+        (1, 0, 1)
+    );
+    assert_eq!(cohort.known_quality, 0);
+    assert!(cohort.p95_routing_overhead_us.unwrap() > 1000);
+    assert!(cohort.cost_per_acceptable_task.is_none());
+    let mut recovered = self::host(catalog, engine);
+    recovered.model_routing.as_mut().unwrap().rollout_store = Some(store);
+    assert!(
+        recovered
+            .prepare_auto_model_selection(&mut state)
+            .await
+            .is_err()
+    );
+    assert!(!recovered.model_routing.as_ref().unwrap().applied);
+}
