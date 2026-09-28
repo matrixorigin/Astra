@@ -2836,6 +2836,17 @@ impl RuntimeToolExecutor {
         *astra_core::sync_poison::recover_rwlock_write(&self.agent_tool_context) = Some(ctx);
     }
 
+    pub fn set_reply_obligations(
+        &self,
+        obligations: std::sync::Arc<crate::messaging::reply_obligations::ReplyObligations>,
+    ) {
+        if let Some(context) =
+            astra_core::sync_poison::recover_rwlock_write(&self.agent_tool_context).as_mut()
+        {
+            context.reply_obligations = obligations;
+        }
+    }
+
     fn agent_tool_context_snapshot(&self) -> Option<AgentToolContext> {
         astra_core::sync_poison::recover_rwlock_read(&self.agent_tool_context).clone()
     }
@@ -9342,6 +9353,7 @@ esac
         let spawner = std::sync::Arc::new(crate::orchestration::DynamicAgentSpawner::new(router));
         AgentToolContext {
             fanout_admission: spawner.fanout_parent("test-run"),
+            reply_obligations: Arc::new(Default::default()),
             delegation_model_admission: None,
             run_id: "test-run".into(),
             agent_id: "test-agent".into(),

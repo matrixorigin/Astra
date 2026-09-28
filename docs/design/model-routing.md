@@ -67,10 +67,17 @@ Cost evaluation must respect the usage-coverage contract in
 An Auto routing decision that reuses a Work judgment also retains that
 judgment's child-model requirement and authenticated user-intent identity.
 Recovery may rebind it to a new run-owner generation and advanced event cursor
-only when the user, session, run, turn chain, and instruction digest still match. Missing or changed
-source evidence fails closed; a restored `not_applicable` answer cannot erase a
+only when the user, session, run, turn chain, and instruction digest still
+match. Missing or changed source evidence fails closed; a restored
+`not_applicable` answer cannot erase a
 previously positive child-model requirement. This remains one durable routing
 fact, not a second judgment or database projection.
+
+Decision schema v2 intentionally does not read v1 routing events: v1 did not
+retain the child-model judgment or its source. Existing v1 Auto runs cannot
+resume under this contract, and v1 decisions must not be treated as v2 offline
+training evidence. Deployments that need those records require an explicit
+separate migration decision; runtime does not guess the missing fields.
 
 ## Escalation
 

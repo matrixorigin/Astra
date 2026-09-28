@@ -59,6 +59,26 @@ summary
 
 ## Asynchronous agent messages
 
+The collaboration contract has two layers. The execution core owns run
+identity, authorized routing, message custody, correlation, input adoption,
+completion dependencies, cancellation, parking/wake, recovery, and trace. It
+must be testable with scripted model outputs and controlled transports, without
+a live LLM. Model prompts, tool schemas, candidate metadata, and tool results
+form the driving layer: they help the model choose an action and understand the
+runtime's authoritative outcome, but cannot manufacture lifecycle facts.
+
+For a send attempt, tool results distinguish `queued`, definite `rejected`,
+and `delivery_unknown`. An unknown attempt retains its original message ID and
+must not invite a new-ID retry. A correlated answer settles only the exact
+run-owned request from its authorized responder; unrelated text, wrong IDs,
+and wrong senders cannot clear a completion dependency. A proposed final answer
+with unresolved dependencies parks the execution under the same logical run.
+Parking releases execution capacity, and an authorized wake re-enters normal
+admission with the same budget. Accepted input must survive detachment and
+restart, be adopted once, and be visible in the next model request before the
+dependency is considered resolved. These are target invariants, not guarantees
+established by an in-process mailbox test alone.
+
 `agent.send_message` returns `queued` with a message ID after the routing/transport
 path accepts the envelope. The sender continues without waiting for the receiver
 or an application receipt. Parent, child, and peer messages use the same mailbox
@@ -67,6 +87,10 @@ Semantic messages can wake the waiting parent before a child completes; transien
 progress does not require another model round.
 Model-authored coordination messages are limited to 3,000 characters; larger
 content belongs in an artifact rather than an accepted-but-truncated message.
+The receiver sees a question's exact message ID. An `answer` must carry that
+ID as `request_id` and travels as a correlated response, not generic text.
+The completion obligation belongs to the run's execution state, not to the
+message envelope or the model's promise to wait.
 
 Communication evidence distinguishes acceptance (`Sent`) from target-runtime
 observation (`Received`). Neither proves model inclusion, compliance, or task
@@ -80,9 +104,32 @@ application ACK/NACK envelope, sender retry tracker, or in-memory dead-letter
 queue. Immediate routing/transport errors remain visible to the sender. Durable
 transport failure records belong to the transport; `/messaging` exposes observed
 metrics, without a separate application delivery/retry status.
-While the runtime remains alive, a cancelled registration or turn release retains
-ownership until accepted volatile messages reach the next mailbox. Durable
-messages keep their original database envelope and claim authority instead of
+In-process direct and parent messages share one bounded inbox per canonical
+address. The inbox retains original envelopes and capacity charges until ACK;
+detaching a stream returns unacknowledged deliveries to its head. A second
+consumer cannot replace an attached owner. A parent can receive messages while
+between turns, but only at an address that has already been registered; an
+unknown parent fails explicitly. A bound turn alias takes precedence over a
+turn-addressed registration when resolving the parent's sender and delivery
+identity. Delegation requires that caller-owned consumer; it does not create
+an unread parent inbox just to make `queued` succeed. Ending a turn detaches; ending a session or
+terminal child retires its address and turn aliases only after its existing
+durable outcome write or authoritative reread confirms a terminal status.
+A projected failure without durable evidence retains the mailbox for recovery.
+Terminal cleanup owns the whole unregister-and-retire transition even if its
+caller is cancelled. A mailbox-bearing child transfers reconciliation and its
+exact retirement capability to an owned task before the parent's shared wait
+deadline is checked. Even when that deadline is exhausted, the parent receives
+a recoverable Waiting result while durable authority can still be established.
+A recoverable Waiting child only detaches. The volatile transport rejects an
+oversized direct message or an exhausted per-inbox/global byte budget before
+acceptance (128 KiB/message, 4 MiB/inbox, 64 MiB/process, plus 4,096 envelopes
+per inbox and 8,192 retained addresses). Charges include unacknowledged
+deliveries and are released by ACK or terminal retirement; payloads remain
+shared in-process, with size measured without a second payload allocation.
+Broadcast remains a
+best-effort notification, not a durable direct-message receipt.
+Durable messages keep their original database envelope and claim authority instead of
 being resent as a new message.
 
 Acceptance is not an end-to-end delivery guarantee. In-process messages are

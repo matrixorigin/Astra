@@ -907,9 +907,9 @@ impl SessionState {
     pub async fn unregister_root_mailbox(&mut self) {
         if let Some(mailbox) = self.root_mailbox.take() {
             let addr = mailbox.address.clone();
-            if let Err(e) = mailbox.unregister().await {
+            if let Err(e) = mailbox.retire().await {
                 eprintln!(
-                    "astra: failed to unregister root mailbox run_id={} agent_id={}: {e}",
+                    "astra: failed to retire root mailbox run_id={} agent_id={}: {e}",
                     addr.run_id, addr.agent_id
                 );
             }

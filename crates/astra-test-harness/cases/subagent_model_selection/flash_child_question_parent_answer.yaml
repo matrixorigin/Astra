@@ -1,0 +1,59 @@
+name: flash_child_question_parent_answer
+description: |
+  A GLM child asks its parent a question, waits for the correlated answer,
+  and only then completes its work.
+prompt: |
+  Ask a GLM 5.2 subagent to produce a one-line handoff marker. It must first
+  ask you which format to use, wait for your answer, and then produce exactly
+  ASTRA-CHILD-ANSWERED-JSON if you answer JSON. Do not tell it the format in
+  its initial task. When it asks, answer JSON, continue your own brief
+  independent analysis, and report the child's final marker.
+debug_log: true
+capability: delegation
+timeout_seconds: 90
+criteria:
+  - type: exit_code
+    code: 0
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/model_configuration/prepared_selection/model_name
+      equals: glm-5.2
+  - type: session_event_count
+    event_type: LlmRoundCompleted
+    min: 1
+    json_match:
+      path: /payload/model
+      equals: glm-5.2
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+  - type: journal_tool_call_count
+    name: agent
+    min: 1
+    max: 1
+    ok: true
+    document: arguments
+    path: /message_type
+    equals: question
+  - type: journal_tool_call_count
+    name: agent
+    min: 1
+    max: 1
+    ok: true
+    document: arguments
+    path: /message_type
+    equals: answer
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /result
+    equals: ASTRA-CHILD-ANSWERED-JSON
+    where_match:
+      document: arguments
+      path: /action
+      equals: get_result
+  - type: text_contains
+    needle: ASTRA-CHILD-ANSWERED-JSON

@@ -455,6 +455,8 @@ pub struct AgentToolContext {
     pub spawner: Arc<DynamicAgentSpawner>,
     /// Keeps this parent admission fence alive across projection eviction.
     pub fanout_admission: Arc<super::spawner::FanoutParentAdmission>,
+    /// The current run's question obligations, shared with its receive loop.
+    pub reply_obligations: Arc<crate::messaging::reply_obligations::ReplyObligations>,
     /// Effective permissions inherited by children spawned from this agent.
     pub inherited_permissions: InheritedPermissions,
     /// Product-optional capabilities enabled on the current request.
@@ -638,7 +640,7 @@ fn agent_message_content(args: &Value) -> Result<String, String> {
 
 fn agent_message_payload(message_type: &str, content: &str) -> Result<MessagePayload, String> {
     match message_type {
-        "text" | "answer" | "instruction" | "shutdown_response" => Ok(MessagePayload::Text {
+        "text" | "instruction" | "shutdown_response" => Ok(MessagePayload::Text {
             content: content.to_string(),
             summary: Some(message_type.replace('_', " ")),
         }),
@@ -751,7 +753,14 @@ async fn handle_agent_send_message_action(args: &Value, ctx: Option<&AgentToolCo
         return render_agent_runtime_binding_error("agent", "send_message");
     };
     let router = ctx.spawner.mailbox_router();
-    handle_agent_send_message_with_router(args, router.as_ref(), &ctx.run_id, &ctx.agent_id).await
+    handle_agent_send_message_with_router(
+        args,
+        router.as_ref(),
+        &ctx.run_id,
+        &ctx.agent_id,
+        ctx.reply_obligations.as_ref(),
+    )
+    .await
 }
 
 /// Canonical mailbox-backed `agent.send_message` implementation. Callers
@@ -763,6 +772,7 @@ pub async fn handle_agent_send_message_with_router(
     router: &astra_messaging::router::AgentMailboxRouter,
     run_id: &str,
     agent_id: &str,
+    reply_obligations: &crate::messaging::reply_obligations::ReplyObligations,
 ) -> String {
     let content = match agent_message_content(args) {
         Ok(content) => content,
@@ -772,9 +782,25 @@ pub async fn handle_agent_send_message_with_router(
         .get("message_type")
         .and_then(Value::as_str)
         .unwrap_or("text");
-    let payload = match agent_message_payload(message_type, &content) {
-        Ok(payload) => payload,
-        Err(error) => return rejected_agent_message(error),
+    let request_id = args
+        .get("request_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|request_id| !request_id.is_empty());
+    let payload = if message_type == "answer" {
+        let Some(request_id) = request_id else {
+            return rejected_agent_message("answer requires the request_id of the question");
+        };
+        MessagePayload::Response {
+            request_id: request_id.to_string(),
+            accepted: true,
+            data: Some(json!({"content": content})),
+        }
+    } else {
+        match agent_message_payload(message_type, &content) {
+            Ok(payload) => payload,
+            Err(error) => return rejected_agent_message(error),
+        }
     };
     let recipient = match args.get("to").and_then(Value::as_str) {
         Some(recipient) => recipient,
@@ -794,17 +820,46 @@ pub async fn handle_agent_send_message_with_router(
         return rejected_agent_message("sender mailbox is not bound to this run");
     };
     let mut message = AgentMessage::new(from, target, payload);
-    if let Some(request_id) = args
-        .get("request_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|request_id| !request_id.is_empty())
-    {
+    if let Some(request_id) = request_id {
         message = message.with_correlation(request_id);
     }
     let message_id = message.id.clone();
+    if message_type == "question" {
+        let responder = match router.question_responder(run_id, &message.to).await {
+            Ok(responder) => responder,
+            Err(error) => return rejected_agent_message(error.to_string()),
+        };
+        if let Err(error) = reply_obligations.reserve(run_id, &message_id, responder) {
+            return rejected_agent_message(error);
+        }
+    }
     if let Err(error) = router.send(message).await {
-        return rejected_agent_message(format!("delivery rejected: {error}"));
+        let definitely_rejected = matches!(
+            error,
+            astra_messaging::types::MailboxError::AgentNotFound(_)
+                | astra_messaging::types::MailboxError::InvalidAddress(_)
+                | astra_messaging::types::MailboxError::NoParent
+                | astra_messaging::types::MailboxError::ChannelClosed
+                | astra_messaging::types::MailboxError::Protocol(_)
+                | astra_messaging::types::MailboxError::DeliveryRejected(_)
+        );
+        if message_type == "question" && definitely_rejected {
+            reply_obligations.reject(run_id, &message_id);
+        }
+        return if definitely_rejected {
+            rejected_agent_message(error.to_string())
+        } else {
+            json!({
+                "success": false,
+                "status": "delivery_unknown",
+                "message_id": message_id,
+                "target": target_display,
+                "message_type": message_type,
+                "reason": error.to_string(),
+                "instruction": "Do not resend this message with a new identity; delivery may already have occurred.",
+            })
+            .to_string()
+        };
     }
 
     json!({
@@ -3091,7 +3146,7 @@ async fn handle_agent_spawn_input_with_controls(
         .await
     {
         mailbox_router
-            .record_parent_delivery_alias(&ctx.run_id, &parent_mailbox)
+            .record_parent_delivery_alias(&ctx.run_id, &parent_mailbox, &ctx.agent_id)
             .await;
     }
 
@@ -4395,6 +4450,7 @@ mod tests {
     ) -> AgentToolContext {
         AgentToolContext {
             fanout_admission: spawner.fanout_parent("run-parent"),
+            reply_obligations: Arc::new(Default::default()),
             delegation_model_admission: None,
             parent_model_reasoning: None,
             run_id: "run-parent".into(),

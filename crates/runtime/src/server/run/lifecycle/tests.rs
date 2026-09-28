@@ -31011,6 +31011,67 @@ async fn run_semaphore_limit_two() {
     drop(p3);
 }
 
+/// A parked run does not monopolize execution capacity; waking is not a
+/// shortcut around the same semaphore used by independent runs.
+#[tokio::test]
+async fn parked_execution_releases_capacity_and_reenters_fair_admission() {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let initial = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+    let mut capacity = RunExecutionCapacity::new(
+        Arc::clone(&semaphore),
+        None,
+        CancellationToken::new(),
+        initial,
+    );
+    capacity.release();
+
+    let independent = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+    let mut waiter = tokio::spawn(async move {
+        capacity.reacquire().await.unwrap();
+        capacity
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), &mut waiter)
+            .await
+            .is_err(),
+        "woken run must not bypass another run's execution slot"
+    );
+    drop(independent);
+    let mut capacity = tokio::time::timeout(Duration::from_secs(2), waiter)
+        .await
+        .expect("woken run should re-enter admission")
+        .unwrap();
+    assert_eq!(semaphore.available_permits(), 0);
+    capacity.release();
+    assert_eq!(semaphore.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn server_root_mailbox_survives_profile_change_between_turns() {
+    let router = Arc::new(astra_messaging::AgentMailboxRouter::new(
+        Arc::new(astra_messaging::InProcessTransport::new()),
+        Arc::new(crate::server::delegation::engine::DelegationTracker::new()),
+    ));
+    let mut first = crate::turn::agentic_loop::host::make_test_loop_state();
+    install_server_root_mailbox(&mut first, &router, "session", "turn-plan", "planner").await;
+    let stable = first.messaging.mailbox.as_ref().unwrap().address.clone();
+    assert_eq!(stable.agent_id, "root-agent");
+    park_server_root_mailbox(&mut first).await;
+
+    let mut second = crate::turn::agentic_loop::host::make_test_loop_state();
+    install_server_root_mailbox(&mut second, &router, "session", "turn-review", "reviewer").await;
+    assert_eq!(second.messaging.mailbox.as_ref().unwrap().address, stable);
+    assert_eq!(
+        router.sender_address("turn-plan", "planner").await,
+        Some(stable.clone())
+    );
+    assert_eq!(
+        router.sender_address("turn-review", "reviewer").await,
+        Some(stable)
+    );
+    park_server_root_mailbox(&mut second).await;
+}
+
 /// Admission with timeout: `acquire_owned` + `timeout` rejects after
 /// the deadline while a short release window lets a waiter proceed.
 #[tokio::test]

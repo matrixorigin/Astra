@@ -1911,7 +1911,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `list`: REQUIRES `action`; optional exact `agent_id`. Read-only status of this agent's direct owned children in the current session's in-memory cache. No database query, terminal wait, or result collection. Missing entries are unknown, not completed.\n\
          - `get_result`: REQUIRES `action`, `agent_id`. Collect the child outcome when needed, including after an ordinary spawn. May briefly wait or reconcile durable state; use `list` for status only and do not busy-poll.\n\
          - `run_chain`: REQUIRES `action`, `name`, `description`, `steps`.\n\
-         - `send_message`: REQUIRES `action`, `to`, `message`; returns `queued` when the routing/transport path accepts the message. Receiver observation does not prove model inclusion, compliance, or task completion.\n\n\
+         - `send_message`: REQUIRES `action`, `to`, `message`; `message_type=answer` also requires the exact `request_id` shown on the incoming question. Returns `queued` when the routing/transport path accepts the message. Receiver observation does not prove model inclusion, compliance, or task completion.\n\n\
          For `spawn`, pass both non-empty fields: `description` (short UI summary) and `prompt` (full child brief). Do NOT pass a top-level `task` field. Do NOT pass `type`; use `agent_type`. Do NOT pass `inherit_context`. `agent_id` is for `list` and `get_result`; never prefill it on `spawn`. Astra generates that runtime id for you. Status filters and result calls must reuse the exact returned `agent_id`. If you need a mailbox label, use `name`, but `name` is not valid for `list` or `get_result`.\n\n\
          Model choice uses `requested_model_policy`, not a `model` field. When the user names a child model in natural language, omit this field: the server resolves the authenticated requirement against the authorized catalog. Do not read workspace configuration or credentials to translate the name. A fixed selector can use an exact configured model name (and optional exact source) without an Offering ID; never disguise that name as an Offering ID. Runtime resolves it to one authorized Offering before child admission.\n\n\
          ## Spawn example\n\
@@ -2007,7 +2007,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "to": {"type": "string", "description": "REQUIRED for action='send_message'. Active child/peer agent_id, related exact run_id within the current delegation boundary, 'parent', or '*' for broadcast."},
                         "message": {"description": "REQUIRED for action='send_message'. Concise coordination message (at most 3000 characters); share an artifact for larger content."},
                         "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"]},
-                        "request_id": {"type": "string", "description": "Optional correlation id when answering or following up on an earlier message."}
+                        "request_id": {"type": "string", "description": "Exact incoming question ID; required with message_type=answer. Optional correlation id for other follow-ups."}
                     },
                     "required": ["action"],
                     "additionalProperties": false,

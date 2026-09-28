@@ -1793,6 +1793,7 @@ fn wire_executor_into_state(
     executor: runtime_tool_executor::RuntimeToolExecutor,
     state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
 ) {
+    executor.set_reply_obligations(Arc::clone(&state.messaging.reply_obligations));
     let executor = std::sync::Arc::new(executor);
     state.runtime_tool_executor = Some(executor);
 }
@@ -3440,10 +3441,12 @@ async fn install_server_root_mailbox(
     if state.messaging.mailbox.is_some() {
         return;
     }
-    let address = astra_messaging::AgentAddress::new(session_id, agent_id);
+    let address = astra_messaging::AgentAddress::new(session_id, "root-agent");
     match router.register(address.clone(), None).await {
         Ok(mailbox) => {
-            router.record_parent_delivery_alias(run_id, &address).await;
+            router
+                .record_parent_delivery_alias(run_id, &address, agent_id)
+                .await;
             state.messaging.mailbox = Some(mailbox);
         }
         Err(error) => tracing::warn!(
@@ -5346,6 +5349,68 @@ impl Drop for CanonicalTurnAdmission {
     }
 }
 
+/// One run's admission slot. Ownership remains with the run while its scarce
+/// execution permit is released during mailbox/child waits; wake-up uses the
+/// same fair admission path as a new run, without a database poll.
+pub(crate) struct RunExecutionCapacity {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
+    cancellation: CancellationToken,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl RunExecutionCapacity {
+    fn new(
+        semaphore: Arc<tokio::sync::Semaphore>,
+        metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
+        cancellation: CancellationToken,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            semaphore,
+            metrics_registry,
+            cancellation,
+            permit: Some(permit),
+        }
+    }
+
+    pub(crate) fn release(&mut self) {
+        self.permit.take();
+    }
+
+    pub(crate) async fn reacquire(&mut self) -> Result<(), astra_core::ClassifiedError> {
+        if self.permit.is_some() {
+            return Ok(());
+        }
+        let result = AgenticRunLifecycleService::acquire_run_permit_with(
+            Arc::clone(&self.semaphore),
+            self.metrics_registry.clone(),
+            run_admission_timeout(),
+            Some(self.cancellation.clone()),
+        )
+        .await;
+        let permit = result.map_err(|error| {
+            let (kind, reason) = match error {
+                RunAdmissionError::Cancelled => (
+                    astra_core::ErrorKind::Cancelled,
+                    "run cancelled while waiting for execution capacity",
+                ),
+                RunAdmissionError::Timeout => (
+                    astra_core::ErrorKind::ResourceLimit,
+                    "execution capacity timed out after agent input arrived",
+                ),
+                RunAdmissionError::Closed => (
+                    astra_core::ErrorKind::ResourceLimit,
+                    "execution capacity closed after agent input arrived",
+                ),
+            };
+            astra_core::ClassifiedError::new(kind, reason)
+        })?;
+        self.permit = Some(permit);
+        Ok(())
+    }
+}
+
 pub struct AgenticRunLifecycleService {
     /// Process-local run handles (run_id -> state) for live cancellation, pause,
     /// and active SSE fanout. Durable state is the user-visible authority.
@@ -7157,6 +7222,7 @@ impl AgenticRunLifecycleService {
         let active_work_registry = entry.active_work_registry.clone();
         executor.set_agent_tool_context(AgentToolContext {
             fanout_admission: entry.spawner.attach_fanout_parent(run_id).await,
+            reply_obligations: Arc::new(Default::default()),
             delegation_model_admission: None,
             run_id: run_id.to_string(),
             agent_id,
@@ -14476,6 +14542,7 @@ impl AgenticRunLifecycleService {
                         "accepted turn audit projection could not be persisted"
                     );
                 }
+                let capacity_semaphore = Arc::clone(&bg_run_semaphore);
                 let permit = match Self::acquire_run_permit_with(
                     bg_run_semaphore,
                     bg_metrics_registry.clone(),
@@ -14553,7 +14620,12 @@ impl AgenticRunLifecycleService {
                         return;
                     }
                 };
-                let execution_permit = permit;
+                host.bind_execution_capacity(RunExecutionCapacity::new(
+                    capacity_semaphore,
+                    bg_metrics_registry.clone(),
+                    (*bg_llm_cancel_token).clone(),
+                    permit,
+                ));
 
                 // Pre-flight: check daily token budget before starting the agentic loop.
                 if let Some(ref gov) = bg_resource_governor {
@@ -14639,6 +14711,7 @@ impl AgenticRunLifecycleService {
 
                 let outcome =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut loop_state).await;
+                host.release_execution_capacity_for_wait();
                 if let Some(model) = loop_state.current_model_identity() {
                     persist_ctx.model_name = Some(model.to_owned());
                 }
@@ -14702,7 +14775,7 @@ impl AgenticRunLifecycleService {
                         // owner that rotated the generation is the only writer
                         // allowed to classify the run. Local cancellation exists
                         // solely to stop provider/tool work promptly.
-                        drop(execution_permit);
+                        host.release_execution_capacity_for_wait();
                         park_server_root_mailbox(&mut loop_state).await;
                         bg_approval_channels.lock().await.remove(&bg_run_id);
                         bg_user_prompt_channels.lock().await.remove(&bg_run_id);
@@ -14729,7 +14802,7 @@ impl AgenticRunLifecycleService {
                 // settlement. Holding it through trace writes, transcript
                 // materialization, workspace cleanup, and memory extraction
                 // turns post-loop I/O into a cross-user model queue.
-                drop(execution_permit);
+                host.release_execution_capacity_for_wait();
                 park_server_root_mailbox(&mut loop_state).await;
                 host.on_loop_terminal(&loop_state, &outcome).await;
                 let (outcome, events) = host.settle_loop_turn(outcome);
@@ -17767,6 +17840,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 // session/UI binding immediately instead of looking like a
                 // provider TTFT stall.  Cancellation wins this select and
                 // removes a queued turn without consuming a later permit.
+                let capacity_semaphore = Arc::clone(&bg_run_semaphore);
                 let permit = match Self::acquire_run_permit_with(
                     bg_run_semaphore,
                     bg_metrics_registry.clone(),
@@ -17885,7 +17959,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         return;
                     }
                 };
-                let execution_permit = permit;
+                host.bind_execution_capacity(RunExecutionCapacity::new(
+                    capacity_semaphore,
+                    bg_metrics_registry.clone(),
+                    (*bg_llm_cancel_token).clone(),
+                    permit,
+                ));
                 if let Some(ref gov) = bg_resource_governor {
                     use astra_services::resource_governor::LimitCheck;
                     if let LimitCheck::Denied { limit, reason } =
@@ -17965,6 +18044,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 );
                 let loop_result =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut state).await;
+                host.release_execution_capacity_for_wait();
                 if let Some(model) = state.current_model_identity() {
                     persist_ctx.model_name = Some(model.to_owned());
                 }
@@ -17996,7 +18076,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             run.live_tx = None;
                         }
                     } else {
-                        drop(execution_permit);
+                        host.release_execution_capacity_for_wait();
                         host.detach_event_tx();
                         host_event_bridge.abort();
                         let _ = host_event_bridge.await;
@@ -18026,7 +18106,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 .await;
                 // The execution budget ends with the loop.  Durable final
                 // state and cleanup must not occupy a scarce model slot.
-                drop(execution_permit);
+                host.release_execution_capacity_for_wait();
                 host.detach_event_tx();
                 match tokio::time::timeout(Duration::from_secs(2), &mut host_event_bridge).await {
                     Ok(Ok(())) => {}
@@ -25053,6 +25133,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 workspace_mutation.set(inherited_workspace_mutation);
                 executor.set_agent_tool_context(AgentToolContext {
                     fanout_admission: spawner.fanout_parent(&config.run_id),
+                    reply_obligations: Arc::clone(&loop_state.messaging.reply_obligations),
                     delegation_model_admission: None,
                     run_id: config.run_id.clone(),
                     agent_id: config.agent_profile.agent_id.clone(),

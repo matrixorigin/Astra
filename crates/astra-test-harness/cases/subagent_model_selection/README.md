@@ -22,7 +22,7 @@ rejects a stale Server. To run and keep the evidence locally:
 
 ```sh
 repo_dir="$(pwd -P)"
-run_dir="$(mktemp -d "${TMPDIR:-/tmp}/astra-subagent-selection.XXXXXX")"
+run_dir="$(mktemp -d "$repo_dir/target/astra-subagent-selection.XXXXXX")"
 mkdir -p "$run_dir/workspace"
 export ASTRA_EXPECTED_BUILD_GIT_SHA="$(git rev-parse HEAD)"
 "$repo_dir/target/debug/astra-test" \

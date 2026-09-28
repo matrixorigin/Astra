@@ -56,6 +56,7 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) -> Result<bool, astra_core::ClassifiedError> {
+    let reply_obligations = Arc::clone(&state.messaging.reply_obligations);
     let mut model_context_changed = false;
     let mut mailbox_batch_index: Option<usize> = None;
     const MAX_MAILBOX_DRAIN_PER_TURN: usize = 64;
@@ -145,7 +146,8 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
                         push_mailbox_model_preview(
                             &mut parts,
                             format!(
-                                "[{from_label} request]: {request_type:?}{}",
+                                "[{from_label} request id={}]: {request_type:?}{}",
+                                msg.id,
                                 data.as_deref().unwrap_or("")
                             ),
                         );
@@ -155,14 +157,19 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
                         accepted,
                         data,
                     } => {
-                        let data = data.as_ref().map(|data| format!(" · {data}"));
-                        push_mailbox_model_preview(
-                            &mut parts,
-                            format!(
-                                "[{from_label} response to {request_id}]: accepted={accepted}{}",
-                                data.as_deref().unwrap_or("")
-                            ),
-                        );
+                        if reply_obligations.should_expose_response(
+                            state.current_run_id.as_deref().unwrap_or_default(),
+                            &msg,
+                        ) {
+                            let data = data.as_ref().map(|data| format!(" · {data}"));
+                            push_mailbox_model_preview(
+                                &mut parts,
+                                format!(
+                                    "[{from_label} response to {request_id}]: accepted={accepted}{}",
+                                    data.as_deref().unwrap_or("")
+                                ),
+                            );
+                        }
                     }
                     astra_messaging::types::MessagePayload::Signal(sig) => {
                         push_mailbox_model_preview(
@@ -195,6 +202,11 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
                 mailbox_batch_index = Some(state.volatile_pending.len() - 1);
             }
             model_context_changed = true;
+        }
+        // The exact response is adopted only after its model context has been
+        // staged. A transport ACK or unrelated text is never completion proof.
+        if let Some(run_id) = state.current_run_id.as_deref() {
+            reply_obligations.observe_response(run_id, &msg);
         }
         if let Some(mailbox) = state.messaging.mailbox.as_ref()
             && let Err(error) = mailbox

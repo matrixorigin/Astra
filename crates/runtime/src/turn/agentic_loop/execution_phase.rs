@@ -68,6 +68,17 @@ fn record_direct_child_barrier<H: AgenticLoopHost>(
             })
         })
         .collect();
+    let replies = state.messaging.reply_obligations.pending(parent_run_id);
+    let reply_identities: Vec<_> = replies
+        .iter()
+        .map(|reply| {
+            serde_json::json!({
+                "request_id": reply.request_id,
+                "responder_run_id": reply.expected_responder.run_id,
+                "responder_agent_id": reply.expected_responder.agent_id,
+            })
+        })
+        .collect();
     let attrs = std::collections::HashMap::from([
         ("parent_run_id".to_string(), parent_run_id.to_string()),
         ("outcome".to_string(), outcome.to_string()),
@@ -76,13 +87,17 @@ fn record_direct_child_barrier<H: AgenticLoopHost>(
             serde_json::json!(identities).to_string(),
         ),
         (
+            "pending_replies".to_string(),
+            serde_json::json!(reply_identities).to_string(),
+        ),
+        (
             "round_index".to_string(),
             state.current_round_index.to_string(),
         ),
     ]);
     tracing::info!(target: "astra::direct_child_barrier", parent_run_id, outcome,
-        children = %serde_json::json!(identities), duration_ms = started.elapsed().as_millis() as u64,
-        "parent-child completion barrier");
+        children = %serde_json::json!(identities), pending_replies = %serde_json::json!(reply_identities),
+        duration_ms = started.elapsed().as_millis() as u64, "agent dependency boundary");
     host.on_direct_child_completion_boundary(state, outcome, children.len(), started);
     let end_us = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -93,7 +108,7 @@ fn record_direct_child_barrier<H: AgenticLoopHost>(
             .session_id(state.current_session_id.as_deref())
             .turn(Some(state.session_turn))
             .span_id(format!("direct_child_barrier_{}", Uuid::new_v4()))
-            .name("direct_child_completion_barrier".into())
+            .name("agent_dependency_boundary".into())
             .trace_id(Some(parent_run_id.to_string()))
             .start_us(end_us.saturating_sub(started.elapsed().as_micros() as u64))
             .end_us(end_us)
@@ -155,7 +170,7 @@ fn finish_direct_child_barrier_incomplete(state: &mut AgenticLoopState, reason: 
     // answer when it was composed without the required child evidence.
     state.hooks.completion_settlement.latest_provider_text = None;
     state.hooks.completion_settlement.deferred_candidate_text = None;
-    state.final_text = "The child work could not be collected and incorporated before this run stopped. Progress is preserved, but the request is incomplete.".into();
+    state.final_text = "Outstanding agent work or an unanswered agent question prevented this run from completing. Progress is preserved, but the request is incomplete.".into();
     state.final_text_streamed = false;
     if state.interruption.is_none() {
         state.interruption = Some(InterruptionRecord::new(
@@ -170,6 +185,14 @@ pub(crate) async fn fence_direct_child_finalization<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) {
+    let run_id = state.current_run_id.as_deref().unwrap_or_default();
+    if state.messaging.reply_obligations.has_pending(run_id) {
+        finish_direct_child_barrier_incomplete(
+            state,
+            "agent finalization reached an unanswered question",
+        );
+        return;
+    }
     let Some(owner) = host.direct_child_completion_owner(state) else {
         return;
     };
@@ -235,10 +258,14 @@ async fn await_direct_children_before_completion<H: AgenticLoopHost>(
     state: &mut AgenticLoopState,
     continuation: ContinuationAuthority,
 ) -> Result<bool, astra_core::ClassifiedError> {
-    let Some(owner) = host.direct_child_completion_owner(state) else {
-        return Ok(false);
-    };
-    if !owner.has_pending_direct_children() {
+    let owner = host.direct_child_completion_owner(state);
+    let run_id = state.current_run_id.clone().unwrap_or_default();
+    let replies = Arc::clone(&state.messaging.reply_obligations);
+    if !owner
+        .as_ref()
+        .is_some_and(|owner| owner.has_pending_direct_children())
+        && !replies.has_pending(&run_id)
+    {
         return Ok(false);
     }
     state.final_text.clear();
@@ -258,19 +285,18 @@ async fn await_direct_children_before_completion<H: AgenticLoopHost>(
     } else if no_synthesis_budget {
         "synthesis_budget_exhausted"
     } else {
-        let children = serde_json::json!(owner.pending_direct_children());
-        record_direct_child_barrier(
-            host,
-            state,
-            owner.parent_run_id(),
-            "wait_started",
-            &children,
-            started,
+        let children = serde_json::json!(
+            owner
+                .as_ref()
+                .map(|owner| owner.pending_direct_children())
+                .unwrap_or_default()
         );
+        record_direct_child_barrier(host, state, &run_id, "wait_started", &children, started);
         host.emit_headless_line(
             HeadlessStderrStyle::Dim,
-            "Waiting for child work before the final answer.".into(),
+            "Waiting for agent input before the final answer.".into(),
         );
+        host.release_execution_capacity_for_wait();
         let wait_budget = remaining.map_or(DIRECT_CHILD_WAIT_LIMIT, |remaining| {
             remaining.saturating_sub(
                 astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET,
@@ -292,10 +318,17 @@ async fn await_direct_children_before_completion<H: AgenticLoopHost>(
             // Keep remote reconciliation alive across presentation-only
             // messages. Recreate it only after a child fact was observed.
             let child_update = async {
-                if let Some(executor) = executor.as_ref() {
-                    executor.wait_for_direct_child_update(&owner).await;
+                if let Some(owner) = owner
+                    .as_ref()
+                    .filter(|owner| owner.has_pending_direct_children())
+                {
+                    if let Some(executor) = executor.as_ref() {
+                        executor.wait_for_direct_child_update(owner).await;
+                    } else {
+                        owner.wait_for_direct_child_update().await;
+                    }
                 } else {
-                    owner.wait_for_direct_child_update().await;
+                    std::future::pending::<()>().await;
                 }
             };
             tokio::pin!(child_update);
@@ -303,7 +336,7 @@ async fn await_direct_children_before_completion<H: AgenticLoopHost>(
                 let source = tokio::select! {
                     biased;
                     _ = direct_child_parent_cancelled(&cancellation) => {
-                        record_direct_child_barrier(host, state, owner.parent_run_id(), "cancelled", &children, started);
+                        record_direct_child_barrier(host, state, &run_id, "cancelled", &children, started);
                         return Err(astra_core::ClassifiedError::new(astra_core::ErrorKind::Cancelled,
                             "parent cancelled while waiting for direct children"));
                     }
@@ -353,20 +386,55 @@ async fn await_direct_children_before_completion<H: AgenticLoopHost>(
                         continue;
                     }
                 };
+                let readmission = tokio::select! {
+                    biased;
+                    _ = direct_child_parent_cancelled(&cancellation) => {
+                        record_direct_child_barrier(host, state, &run_id, "cancelled", &children, started);
+                        return Err(astra_core::ClassifiedError::new(astra_core::ErrorKind::Cancelled,
+                            "parent cancelled while waiting for execution capacity"));
+                    }
+                    _ = tokio::time::sleep_until(deadline) => break 'waiting "deadline",
+                    result = host.reacquire_execution_capacity_after_wait() => result,
+                };
+                if let Err(error) = readmission {
+                    record_direct_child_barrier(
+                        host,
+                        state,
+                        &run_id,
+                        "readmission_failed",
+                        &children,
+                        started,
+                    );
+                    return Err(error);
+                }
                 // The whole input transaction, including DB ACK/poll I/O, is
                 // inside the same absolute deadline and hard-cancel boundary.
                 let observed = tokio::select! {
                     biased;
                     _ = direct_child_parent_cancelled(&cancellation) => {
-                        record_direct_child_barrier(host, state, owner.parent_run_id(), "cancelled", &children, started);
+                        host.release_execution_capacity_for_wait();
+                        record_direct_child_barrier(host, state, &run_id, "cancelled", &children, started);
                         return Err(astra_core::ClassifiedError::new(astra_core::ErrorKind::Cancelled,
                             "parent cancelled while applying runtime input"));
                     }
-                    _ = tokio::time::sleep_until(deadline) => break 'waiting "deadline",
-                    result = runtime_input_boundary(host, state, boundary) => result?,
+                    _ = tokio::time::sleep_until(deadline) => {
+                        host.release_execution_capacity_for_wait();
+                        break 'waiting "deadline";
+                    }
+                    result = runtime_input_boundary(host, state, boundary) => match result {
+                        Ok(observed) => observed,
+                        Err(error) => {
+                            host.release_execution_capacity_for_wait();
+                            return Err(error);
+                        }
+                    },
                 };
                 if observed.model_context_changed
-                    || matches!(source, ReadySource::Child) && !owner.has_pending_direct_children()
+                    || matches!(source, ReadySource::Child)
+                        && !owner
+                            .as_ref()
+                            .is_some_and(|owner| owner.has_pending_direct_children())
+                        && !replies.has_pending(&run_id)
                 {
                     break 'waiting if matches!(source, ReadySource::Child) {
                         "synthesis_ready"
@@ -375,17 +443,24 @@ async fn await_direct_children_before_completion<H: AgenticLoopHost>(
                     };
                 }
                 if matches!(source, ReadySource::Child) {
+                    host.release_execution_capacity_for_wait();
                     continue 'waiting;
                 }
+                host.release_execution_capacity_for_wait();
             }
         }
     };
     record_direct_child_barrier(
         host,
         state,
-        owner.parent_run_id(),
+        &run_id,
         outcome,
-        &serde_json::json!(owner.pending_direct_children()),
+        &serde_json::json!(
+            owner
+                .as_ref()
+                .map(|owner| owner.pending_direct_children())
+                .unwrap_or_default()
+        ),
         started,
     );
     if outcome == "synthesis_ready" || outcome == "runtime_input_ready" {
@@ -393,6 +468,7 @@ async fn await_direct_children_before_completion<H: AgenticLoopHost>(
         // This barrier never extends a slice or a user-owned hard limit.
         return Ok(true);
     }
+    host.release_execution_capacity_for_wait();
     let _ = super::lifecycle::cancel_unfinished_child_agents(
         host,
         state,
@@ -6360,6 +6436,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             if host
                 .direct_child_completion_owner(state)
                 .is_some_and(|owner| owner.has_pending_direct_children())
+                || state
+                    .messaging
+                    .reply_obligations
+                    .has_pending(state.current_run_id.as_deref().unwrap_or_default())
             {
                 // Close provider timing before waiting. The wait is its own
                 // Explain interval, never part of model inference time.

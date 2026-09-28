@@ -1,8 +1,4 @@
-//! Tests for orchestrator mailbox registration in team delegations.
-//!
-//! Reproduces the bug where `/team run` child agents fail to send progress
-//! to the parent orchestrator because the orchestrator never registers its
-//! own mailbox with the router.
+//! Tests for owned parent mailboxes in team delegations.
 //!
 //! All tests are model-free: they use `SubRunExecutor` mocks that exercise
 //! the real `DelegationEngine`, `AgentMailboxRouter`, and `InProcessTransport`.
@@ -26,7 +22,7 @@ mod tests {
     };
     use crate::server::run::engine::RunEngine;
     use astra_messaging::in_process::InProcessTransport;
-    use astra_messaging::router::AgentMailboxRouter;
+    use astra_messaging::router::{AgentMailbox, AgentMailboxRouter};
     use astra_messaging::types::*;
 
     // ── Executor that records whether send_progress succeeds ────────────
@@ -148,6 +144,13 @@ mod tests {
     }
 
     impl TestHarness {
+        async fn register_parent(&self, run_id: &str) -> AgentMailbox {
+            self.router
+                .register(AgentAddress::new(run_id, "orch"), None)
+                .await
+                .unwrap()
+        }
+
         async fn persist_request_parent(&self, request: &DelegationRequest) {
             self.run_engine
                 .start_run(
@@ -216,16 +219,14 @@ mod tests {
         }
     }
 
-    // ── Core fix: engine auto-registers parent ──────────────────────────
+    // ── A caller-owned parent is a real message destination ─────────────
 
-    /// DelegationEngine auto-registers the parent mailbox so child agents
-    /// can send progress without the caller needing to register manually.
+    /// Fanout progress reaches the caller's mailbox, not an engine-owned sink.
     #[tokio::test]
-    async fn fanout_auto_registers_parent_for_child_progress() {
+    async fn fanout_uses_caller_owned_parent_for_child_progress() {
         let (executor, results) = ProgressReportingExecutor::new();
         let h = setup_harness(Arc::new(executor));
-
-        // Do NOT manually register the parent — the engine should do it.
+        let mut parent = h.register_parent("parent-run").await;
         let request = make_request(
             CoordinationPattern::FanOut {
                 agent_ids: vec!["worker-a".into(), "worker-b".into()],
@@ -244,16 +245,18 @@ mod tests {
         for (agent_id, send_result) in results.iter() {
             assert!(
                 send_result.is_ok(),
-                "agent {agent_id} should succeed sending progress (engine auto-registered parent): {send_result:?}"
+                "agent {agent_id} should reach the caller-owned parent: {send_result:?}"
             );
         }
+        assert!(parent.try_recv().is_some());
     }
 
-    /// Adversarial review also auto-registers parent across multiple rounds.
+    /// Adversarial review uses the same caller-owned parent across rounds.
     #[tokio::test]
-    async fn adversarial_auto_registers_parent_for_child_progress() {
+    async fn adversarial_review_uses_caller_owned_parent() {
         let (executor, results) = ProgressReportingExecutor::new();
         let h = setup_harness(Arc::new(executor));
+        let _parent = h.register_parent("parent-run").await;
 
         let request = make_request(
             CoordinationPattern::AdversarialReview {
@@ -283,11 +286,12 @@ mod tests {
         }
     }
 
-    /// Sequential pattern also auto-registers parent.
+    /// Sequential children share one caller-owned parent.
     #[tokio::test]
-    async fn sequential_auto_registers_parent() {
+    async fn sequential_uses_caller_owned_parent() {
         let (executor, results) = ProgressReportingExecutor::new();
         let h = setup_harness(Arc::new(executor));
+        let _parent = h.register_parent("parent-run").await;
 
         let request = make_request(
             CoordinationPattern::Sequential {
@@ -311,12 +315,13 @@ mod tests {
         }
     }
 
-    // ── Cleanup: parent unregistered after delegation ───────────────────
+    // ── No consumer must not manufacture successful delivery ────────────
 
-    /// Auto-registered parent mailbox is cleaned up after delegation completes.
+    /// Delegation may finish, but a child cannot queue to a parent with no
+    /// actual receiver; the engine must not create a fake mailbox for it.
     #[tokio::test]
-    async fn auto_registered_parent_cleaned_up_after_delegation() {
-        let (executor, _results) = ProgressReportingExecutor::new();
+    async fn missing_parent_consumer_rejects_child_progress() {
+        let (executor, results) = ProgressReportingExecutor::new();
         let h = setup_harness(Arc::new(executor));
 
         let request = make_request(
@@ -331,51 +336,8 @@ mod tests {
 
         let result = h.execute(request, None).await;
         assert!(result.is_ok());
-
-        // After delegation completes, the auto-registered parent should be
-        // unregistered so it doesn't leak resources or collide with future runs.
-        let registered = h
-            .router
-            .list_registered_agents("del-cleanup")
-            .await
-            .unwrap();
-        assert!(
-            !registered.iter().any(|address| address.agent_id == "orch"),
-            "parent should be unregistered after delegation, still registered: {registered:?}"
-        );
-    }
-
-    /// Children are also unregistered after delegation (no leaked mailboxes).
-    /// Note: child mailbox cleanup depends on the executor dropping the
-    /// SubRunConfig. The engine only guarantees parent cleanup.
-    #[tokio::test]
-    async fn parent_cleaned_up_even_when_children_linger() {
-        let (executor, _results) = ProgressReportingExecutor::new();
-        let h = setup_harness(Arc::new(executor));
-
-        let request = make_request(
-            CoordinationPattern::FanOut {
-                agent_ids: vec!["worker-a".into(), "worker-b".into()],
-                aggregation: AggregationStrategy::AllResults,
-                timeout_sec: 10,
-            },
-            "parent-run",
-            "del-all-cleanup",
-        );
-
-        let result = h.execute(request, None).await;
-        assert!(result.is_ok());
-
-        let registered = h
-            .router
-            .list_registered_agents("del-all-cleanup")
-            .await
-            .unwrap();
-        // Parent ("orch") must be cleaned up by the engine.
-        assert!(
-            !registered.iter().any(|address| address.agent_id == "orch"),
-            "parent should be unregistered after delegation, still registered: {registered:?}"
-        );
+        assert!(results.lock().await.iter().all(|(_, send)| send.is_err()));
+        assert!(!h.router.is_run_registered("parent-run").await);
     }
 
     // ── No-router path: graceful degradation ────────────────────────────
@@ -474,11 +436,11 @@ mod tests {
         }
     }
 
-    /// Parent forcibly unregistered while children are running → children
-    /// get AgentNotFound (not panic or hang). This simulates the race where
-    /// an external caller unregisters the parent (e.g., session cleanup).
+    /// A terminal parent retired while children are running rejects their
+    /// later progress without panicking or hanging. Ordinary turn detach
+    /// intentionally keeps the canonical parent route available.
     #[tokio::test]
-    async fn parent_forcibly_unregistered_mid_execution() {
+    async fn parent_terminal_retirement_mid_execution() {
         let (executor, barrier, results) = DelayedProgressExecutor::new(2);
         let h = setup_harness(Arc::new(executor));
 
@@ -507,8 +469,8 @@ mod tests {
         // Give the engine time to register parent and spawn agents.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        // Forcibly unregister the parent while agents are waiting.
-        parent_mailbox.unregister().await.unwrap();
+        // End the parent lifetime while agents are waiting.
+        parent_mailbox.retire().await.unwrap();
 
         // Release agents — they will now try to send progress.
         barrier.wait().await;
@@ -521,7 +483,7 @@ mod tests {
         for (agent_id, send_result) in results.iter() {
             assert!(
                 send_result.is_err(),
-                "agent {agent_id} should fail after parent forcibly unregistered"
+                "agent {agent_id} should fail after parent retirement"
             );
         }
     }
@@ -554,7 +516,7 @@ mod tests {
             "del-pre-reg",
         );
 
-        // Engine will attempt to re-register the same parent — should not panic.
+        // Delegation must use this receiver without changing its ownership.
         let result = h.execute(request, None).await;
         assert!(result.is_ok());
 
@@ -564,6 +526,34 @@ mod tests {
         assert!(
             send_result.is_ok(),
             "agent {agent_id} should succeed even with double-registration: {send_result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_parent_alias_receives_without_unused_turn_mailbox() {
+        let (executor, results) = ProgressReportingExecutor::new();
+        let h = setup_harness(Arc::new(executor));
+        let stable = AgentAddress::new("session-root", "orch");
+        let mut parent = h.router.register(stable.clone(), None).await.unwrap();
+        h.router
+            .record_parent_delivery_alias("parent-run", &stable, &stable.agent_id)
+            .await;
+        let request = make_request(
+            CoordinationPattern::FanOut {
+                agent_ids: vec!["worker-a".into()],
+                aggregation: AggregationStrategy::AllResults,
+                timeout_sec: 10,
+            },
+            "parent-run",
+            "del-session-parent",
+        );
+        assert!(h.execute(request, None).await.is_ok());
+        assert!(results.lock().await[0].1.is_ok());
+        assert!(!h.router.is_run_registered("parent-run").await);
+        assert!(h.router.is_run_registered("session-root").await);
+        assert!(
+            parent.try_recv().is_some(),
+            "the caller-owned consumer receives progress"
         );
     }
 
@@ -595,14 +585,11 @@ mod tests {
         let result = h.execute(request, None).await;
         assert!(result.is_ok());
 
-        // Child progress should still succeed (engine registered parent-run).
+        // A different run is not the parent receiver; it cannot make an
+        // unbound parent route look deliverable.
         let results = results.lock().await;
         assert_eq!(results.len(), 1);
-        assert!(
-            results[0].1.is_ok(),
-            "child should succeed: {:?}",
-            results[0].1
-        );
+        assert!(results[0].1.is_err());
 
         // Caller's mailbox should NOT have been clobbered — it should still
         // be functional (no messages expected, but not disconnected).
@@ -612,84 +599,13 @@ mod tests {
         );
     }
 
-    // ── Cancellation: parent cleaned up even on cancel ──────────────────
-
-    struct BlockingExecutor;
-
-    #[async_trait]
-    impl SubRunExecutor for BlockingExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
-            let agent_id = config.agent_profile.agent_id.clone();
-            let run_id = config.run_id.clone();
-
-            if let Some(ref token) = config.cancel_token {
-                token.cancelled().await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-
-            Ok(AgentResult {
-                agent_id,
-                run_id,
-                status: "completed".into(),
-                output: Some("cancelled".into()),
-                error: None,
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                tool_calls: 0,
-            })
-        }
-    }
-
-    /// When delegation is cancelled, parent mailbox is still cleaned up.
-    #[tokio::test]
-    async fn parent_cleaned_up_after_cancellation() {
-        let h = setup_harness(Arc::new(BlockingExecutor));
-
-        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
-        let request = make_request(
-            CoordinationPattern::FanOut {
-                agent_ids: vec!["worker-a".into()],
-                aggregation: AggregationStrategy::AllResults,
-                timeout_sec: 0, // no timeout, rely on cancel
-            },
-            "parent-run",
-            "del-cancel",
-        );
-        h.persist_request_parent(&request).await;
-
-        let cancel_clone = cancel.clone();
-        let engine_handle = {
-            let engine = h.engine;
-            tokio::spawn(async move { engine.execute(request, "orch", Some(cancel_clone)).await })
-        };
-
-        // Give engine time to register parent and spawn agents.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
-        // Verify parent is registered.
-        assert!(
-            h.router.is_run_registered("parent-run").await,
-            "parent should be registered before cancel"
-        );
-
-        // Cancel.
-        cancel.cancel();
-        let _ = engine_handle.await;
-
-        // Parent should be cleaned up even after cancellation.
-        assert!(
-            !h.router.is_run_registered("parent-run").await,
-            "parent should be unregistered after cancellation"
-        );
-    }
-
     // ── Fork pattern ────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn fork_auto_registers_parent() {
+    async fn fork_uses_caller_owned_parent() {
         let (executor, results) = ProgressReportingExecutor::new();
         let h = setup_harness(Arc::new(executor));
+        let _parent = h.register_parent("parent-run").await;
 
         let request = make_request(
             CoordinationPattern::Fork {
@@ -868,76 +784,6 @@ mod tests {
                 .all(|result| result.status == astra_core::STATUS_CANCELLED),
             "every force-aborted fork child must be represented as cancelled: {:?}",
             delegation.agent_results
-        );
-    }
-
-    // ── register_if_absent: no clobber on concurrent registration ───────
-
-    /// Verify register_if_absent returns None when run_id already registered.
-    #[tokio::test]
-    async fn register_if_absent_skips_existing() {
-        let _profiles = setup_profiles();
-        let store = Arc::new(InMemoryRunStateStore::new());
-        let _run_engine = Arc::new(RunEngine::new(store));
-        let tracker = Arc::new(DelegationTracker::new());
-        let transport = Arc::new(astra_messaging::in_process::InProcessTransport::new());
-        let router = Arc::new(AgentMailboxRouter::new(transport, tracker));
-
-        // First registration succeeds.
-        let addr = AgentAddress::new("run-1", "agent-1");
-        let _first_mailbox = router
-            .register_if_absent(addr.clone(), None)
-            .await
-            .unwrap()
-            .expect("first registration should return Some");
-
-        // Second registration with same run_id returns None (no clobber).
-        let addr2 = AgentAddress::new("run-1", "agent-1");
-        let result2 = router.register_if_absent(addr2, None).await;
-        assert!(result2.is_ok());
-        assert!(
-            result2.unwrap().is_none(),
-            "second registration should return None"
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_register_if_absent_has_one_owner() {
-        let tracker = Arc::new(DelegationTracker::new());
-        let transport = Arc::new(astra_messaging::in_process::InProcessTransport::new());
-        let router = Arc::new(AgentMailboxRouter::new(transport, tracker));
-        let address = AgentAddress::new("run-concurrent", "agent-concurrent");
-
-        let (left, right) = tokio::join!(
-            router.register_if_absent(address.clone(), Some("delegation".into())),
-            router.register_if_absent(address, Some("delegation".into())),
-        );
-        let owners = [left.unwrap(), right.unwrap()]
-            .into_iter()
-            .filter(Option::is_some)
-            .count();
-        assert_eq!(owners, 1);
-    }
-
-    /// register_if_absent with different run_id registers both.
-    #[tokio::test]
-    async fn register_if_absent_allows_different_run_ids() {
-        let _profiles = setup_profiles();
-        let store = Arc::new(InMemoryRunStateStore::new());
-        let _run_engine = Arc::new(RunEngine::new(store));
-        let tracker = Arc::new(DelegationTracker::new());
-        let transport = Arc::new(astra_messaging::in_process::InProcessTransport::new());
-        let router = Arc::new(AgentMailboxRouter::new(transport, tracker));
-
-        let addr1 = AgentAddress::new("run-1", "agent-1");
-        let r1 = router.register_if_absent(addr1, None).await.unwrap();
-        assert!(r1.is_some());
-
-        let addr2 = AgentAddress::new("run-2", "agent-1");
-        let r2 = router.register_if_absent(addr2, None).await.unwrap();
-        assert!(
-            r2.is_some(),
-            "different run_id should register successfully"
         );
     }
 }

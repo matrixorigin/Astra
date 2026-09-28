@@ -160,9 +160,9 @@ async fn finalize_root_mailbox(
 
     if let Some(mailbox) = mailbox.take() {
         let addr = mailbox.address.clone();
-        if let Err(e) = mailbox.unregister().await {
+        if let Err(e) = mailbox.retire().await {
             eprintln!(
-                "astra: failed to unregister mailbox for run_id={} agent_id={}: {e}",
+                "astra: failed to retire mailbox for run_id={} agent_id={}: {e}",
                 addr.run_id, addr.agent_id
             );
         }
@@ -431,6 +431,7 @@ pub(crate) async fn stream_chat_sse(
         if let Some(ref spawner) = p.agent_spawner {
             let spawn_ctx = edge_tools::agent_spawning::AgentActionContext {
                 fanout_admission: spawner.attach_fanout_parent(&parent_turn_run_id).await,
+                reply_obligations: Arc::new(Default::default()),
                 run_id: parent_turn_run_id.clone(),
                 agent_id: root_agent_id.to_string(),
                 delegation_chain: Vec::new(),
@@ -491,6 +492,7 @@ pub(crate) async fn stream_chat_sse(
             agent_id: root_agent_id.to_string(),
             run_id: parent_turn_run_id.clone(),
             router: spawner.mailbox_router(),
+            reply_obligations: Arc::new(Default::default()),
         }
     });
 
@@ -650,14 +652,22 @@ pub(crate) async fn stream_chat_sse(
                 None,
             )
             .await
-            .ok()
+            .map(Some)
+            .map_err(|error| crate::TurnFailure {
+                error: format!("cannot attach session mailbox: {error}"),
+                partial: Default::default(),
+            })?
     } else {
         None
     };
     if let (Some(spawner), Some(mailbox)) = (p.agent_spawner.as_ref(), root_mailbox.as_ref()) {
         spawner
             .mailbox_router()
-            .record_parent_delivery_alias(&parent_turn_run_id, &mailbox.address)
+            .record_parent_delivery_alias(
+                &parent_turn_run_id,
+                &mailbox.address,
+                &mailbox.address.agent_id,
+            )
             .await;
     }
     let task_profile = infer_task_execution_profile(p.message);

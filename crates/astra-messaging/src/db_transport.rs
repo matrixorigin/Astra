@@ -701,10 +701,6 @@ impl DatabaseTransport {
 
 #[async_trait]
 impl MessageTransport for DatabaseTransport {
-    fn recovers_unacknowledged_on_unregister(&self) -> bool {
-        true
-    }
-
     async fn register(
         &self,
         addr: AgentAddress,
@@ -833,6 +829,15 @@ impl MessageTransport for DatabaseTransport {
                 errors.join("; ")
             )))
         }
+    }
+
+    async fn forget_abandoned_route(
+        &self,
+        _subscription: &MailboxSubscription,
+    ) -> Result<bool, MailboxError> {
+        // unregister released this subscription's claims. Accepted envelopes
+        // remain in the durable queue, independent of the local router row.
+        Ok(true)
     }
 
     async fn subscribe(

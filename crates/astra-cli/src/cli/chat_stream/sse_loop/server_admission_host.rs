@@ -1204,6 +1204,9 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
             state.skills.execution.sandbox_policy.clone(),
             self.perm_manager.mode(),
         );
+        if let Some(context) = self.executor.spawn_context.as_ref() {
+            state.messaging.reply_obligations = Arc::clone(&context.reply_obligations);
+        }
         let send_message_context = state
             .messaging
             .mailbox
@@ -1216,6 +1219,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                         .clone()
                         .unwrap_or_else(|| mailbox.address.run_id.clone()),
                     router: mailbox.router(),
+                    reply_obligations: Arc::clone(&state.messaging.reply_obligations),
                 },
             )
             .or_else(|| self.root_send_message_context.clone())
@@ -1223,6 +1227,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                 if let Some(run_id) = state.current_run_id.clone() {
                     context.run_id = run_id;
                 }
+                context.reply_obligations = Arc::clone(&state.messaging.reply_obligations);
                 context
             });
         self.executor.set_send_message_context(send_message_context);

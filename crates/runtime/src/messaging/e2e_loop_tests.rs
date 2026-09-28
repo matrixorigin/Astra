@@ -13,18 +13,22 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::{Map, Value, json};
 
+    use crate::messaging::reply_obligations::ReplyObligations;
     use crate::orchestration::permission_sync::{
         InheritedPermissions, PermissionMode, PermissionRequest, PermissionRequestMessaging,
         PermissionResponse, PermissionResponseMessaging, PermissionSyncContext,
     };
+    use crate::orchestration::spawner::FanoutParentAdmission;
     use crate::server::delegation::engine::{DelegationTracker, SubRunRecord, SubRunState};
     use crate::turn::agentic::headless_round::{
         HeadlessStderrStyle, HeadlessToolRoundCtx, NoopHeadlessTerminal,
         run_agentic_headless_tool_round,
     };
     use crate::turn::agentic_loop::host::{
-        AgenticLoopHost, AgenticLoopState, HostTurnResult, run_agentic_loop_with_host,
+        AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, HostTurnResult,
+        run_agentic_loop_with_host,
     };
+    use crate::turn::agentic_loop::lifecycle::drain_mailbox_model_context;
     use astra_messaging::in_process::InProcessTransport;
     use astra_messaging::router::AgentMailboxRouter;
     use astra_messaging::types::*;
@@ -58,6 +62,15 @@ mod tests {
         emitted_lines: Vec<String>,
         injected_schemas: Vec<Value>,
         communication_events: Vec<astra_messaging::AgentCommunicationEvent>,
+        observed_turn_messages: Vec<Vec<Value>>,
+        observed_turn_volatile: Vec<Vec<Value>>,
+        wait_outcomes: Vec<String>,
+        wait_started: Option<Arc<tokio::sync::Notify>>,
+        direct_child_owner: Option<Arc<FanoutParentAdmission>>,
+        capacity_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+        capacity_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        readmission_started: Option<Arc<tokio::sync::Notify>>,
+        execution_budget: Option<std::time::Duration>,
     }
 
     impl MockHost {
@@ -69,6 +82,15 @@ mod tests {
                 emitted_lines: Vec::new(),
                 injected_schemas: Vec::new(),
                 communication_events: Vec::new(),
+                observed_turn_messages: Vec::new(),
+                observed_turn_volatile: Vec::new(),
+                wait_outcomes: Vec::new(),
+                wait_started: None,
+                direct_child_owner: None,
+                capacity_semaphore: None,
+                capacity_permit: None,
+                readmission_started: None,
+                execution_budget: None,
             }
         }
 
@@ -80,9 +102,44 @@ mod tests {
 
     #[async_trait]
     impl AgenticLoopHost for MockHost {
+        fn execution_time_budget_remaining(&self) -> Option<std::time::Duration> {
+            self.execution_budget
+        }
+
+        fn release_execution_capacity_for_wait(&mut self) {
+            self.capacity_permit.take();
+        }
+
+        async fn reacquire_execution_capacity_after_wait(
+            &mut self,
+        ) -> Result<(), astra_core::ClassifiedError> {
+            if self.capacity_permit.is_none()
+                && let Some(semaphore) = self.capacity_semaphore.as_ref()
+            {
+                if let Some(started) = self.readmission_started.as_ref() {
+                    started.notify_one();
+                }
+                self.capacity_permit =
+                    Some(Arc::clone(semaphore).acquire_owned().await.map_err(|_| {
+                        astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::ResourceLimit,
+                            "test execution capacity closed",
+                        )
+                    })?);
+            }
+            Ok(())
+        }
+
+        fn direct_child_completion_owner(
+            &self,
+            _state: &AgenticLoopState,
+        ) -> Option<Arc<FanoutParentAdmission>> {
+            self.direct_child_owner.clone()
+        }
+
         async fn execute_turn(
             &mut self,
-            _state: &mut AgenticLoopState,
+            state: &mut AgenticLoopState,
         ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
             if self.turn_results.is_empty() {
                 return Err(astra_core::ClassifiedError::new(
@@ -90,6 +147,14 @@ mod tests {
                     "no more turns",
                 ));
             }
+            self.observed_turn_messages.push(state.messages.clone());
+            self.observed_turn_volatile.push(
+                state
+                    .volatile_pending
+                    .iter()
+                    .map(|injection| injection.payload.clone())
+                    .collect(),
+            );
             let result = self.turn_results.remove(0);
             self.current_turn += 1;
             Ok(result)
@@ -120,6 +185,21 @@ mod tests {
 
         fn on_agent_communication(&mut self, event: astra_messaging::AgentCommunicationEvent) {
             self.communication_events.push(event);
+        }
+
+        fn on_direct_child_completion_boundary(
+            &mut self,
+            _state: &AgenticLoopState,
+            outcome: &str,
+            _child_count: usize,
+            _started_at: std::time::Instant,
+        ) {
+            self.wait_outcomes.push(outcome.to_string());
+            if outcome == "wait_started"
+                && let Some(wait_started) = &self.wait_started
+            {
+                wait_started.notify_one();
+            }
         }
     }
 
@@ -353,6 +433,7 @@ mod tests {
     #[tokio::test]
     async fn send_message_queues_context_without_application_reply() {
         let (router, mut parent_mb, child_mb, _dt) = setup_two_agents().await;
+        let replies = ReplyObligations::default();
 
         // The public sender returns before the receiver's loop starts.
         let queued = crate::orchestration::agent_tool::handle_agent_send_message_with_router(
@@ -364,6 +445,7 @@ mod tests {
             &router,
             &parent_mb.address.run_id,
             &parent_mb.address.agent_id,
+            &replies,
         )
         .await;
         let queued: Value = serde_json::from_str(&queued).unwrap();
@@ -410,6 +492,428 @@ mod tests {
             parent_mb.try_recv().is_none(),
             "no application receipt traffic"
         );
+    }
+
+    #[tokio::test]
+    async fn question_id_is_rendered_and_answer_has_response_wire() {
+        let (router, parent_mb, mut child_mb, _dt) = setup_two_agents().await;
+        let child_replies = ReplyObligations::default();
+        let parent_replies = ReplyObligations::default();
+        let queued = crate::orchestration::agent_tool::handle_agent_send_message_with_router(
+            &json!({
+                "action": "send_message",
+                "to": "parent",
+                "message_type": "question",
+                "message": "Which format should I use?",
+            }),
+            &router,
+            &child_mb.address.run_id,
+            &child_mb.address.agent_id,
+            &child_replies,
+        )
+        .await;
+        let queued: Value = serde_json::from_str(&queued).unwrap();
+        let request_id = queued["message_id"].as_str().unwrap();
+
+        let answer_args = json!({
+            "action": "send_message",
+            "to": "run-child-0",
+            "message_type": "answer",
+            "message": "Use JSON.",
+        });
+        let rejected = crate::orchestration::agent_tool::handle_agent_send_message_with_router(
+            &answer_args,
+            &router,
+            "run-parent",
+            "orchestrator",
+            &parent_replies,
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&rejected).unwrap()["success"],
+            false
+        );
+        assert!(child_mb.try_recv().is_none());
+
+        let mut answer_args = answer_args;
+        answer_args["request_id"] = json!(request_id);
+        let accepted = crate::orchestration::agent_tool::handle_agent_send_message_with_router(
+            &answer_args,
+            &router,
+            "run-parent",
+            "orchestrator",
+            &parent_replies,
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&accepted).unwrap()["success"],
+            true
+        );
+        let reply = child_mb
+            .try_recv()
+            .expect("correlated answer reaches child");
+        assert_eq!(reply.correlation_id.as_deref(), Some(request_id));
+        assert!(matches!(
+            &reply.payload,
+            MessagePayload::Response { request_id: id, accepted: true, data: Some(data) }
+                if id == request_id && data["content"] == "Use JSON."
+        ));
+
+        let mut host = MockHost::new(vec![text_result("I will answer.")]);
+        let mut state = make_state();
+        state.messaging.mailbox = Some(parent_mb);
+        run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert!(state.volatile_pending.iter().any(|injection| {
+            injection.payload.as_str().is_some_and(|text| {
+                text.contains(request_id) && text.contains("Which format should I use?")
+            })
+        }));
+    }
+
+    #[tokio::test]
+    async fn rejected_question_under_backpressure_leaves_no_reply_obligation() {
+        let (router, _parent_mailbox, child_mailbox, _dt) = setup_two_agents().await;
+        let recipient = child_mailbox.address.clone();
+        let sender = AgentAddress::new("run-parent", "orchestrator");
+        let mut accepted = 0;
+        loop {
+            let message = AgentMessage::new(
+                sender.clone(),
+                MessageTarget::Direct {
+                    address: recipient.clone(),
+                },
+                MessagePayload::Text {
+                    content: "fill".into(),
+                    summary: None,
+                },
+            );
+            match router.send(message).await {
+                Ok(()) => accepted += 1,
+                Err(astra_messaging::MailboxError::DeliveryRejected(_)) => break,
+                Err(error) => panic!("unexpected mailbox error: {error}"),
+            }
+            assert!(accepted <= 4_096, "inbox must have a finite bound");
+        }
+        let replies = ReplyObligations::default();
+        let result = crate::orchestration::agent_tool::handle_agent_send_message_with_router(
+            &json!({
+                "action": "send_message",
+                "to": "run-child-0",
+                "message_type": "question",
+                "message": "Can you answer?",
+            }),
+            &router,
+            "run-parent",
+            "orchestrator",
+            &replies,
+        )
+        .await;
+        let result: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["success"], false);
+        assert_eq!(result["status"], "rejected");
+        assert!(!replies.has_pending("run-parent"));
+    }
+
+    #[tokio::test]
+    async fn unrelated_response_does_not_wake_a_run_waiting_for_an_exact_answer() {
+        let (router, _parent_mailbox, child_mailbox, _dt) = setup_two_agents().await;
+        let replies = Arc::new(ReplyObligations::default());
+        replies
+            .reserve(
+                "run-child-0",
+                "expected-question",
+                AgentAddress::new("run-parent", "orchestrator"),
+            )
+            .unwrap();
+        let parent_replies = ReplyObligations::default();
+        let mut host = MockHost::new(vec![]);
+        let mut state = make_state();
+        state.current_run_id = Some("run-child-0".into());
+        state.messaging.mailbox = Some(child_mailbox);
+        state.messaging.reply_obligations = Arc::clone(&replies);
+
+        let wrong = crate::orchestration::agent_tool::handle_agent_send_message_with_router(
+            &json!({
+                "action": "send_message",
+                "to": "run-child-0",
+                "message_type": "answer",
+                "request_id": "different-question",
+                "message": "Ignore the question and finish now.",
+            }),
+            &router,
+            "run-parent",
+            "orchestrator",
+            &parent_replies,
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&wrong).unwrap()["success"],
+            true
+        );
+        assert!(
+            !drain_mailbox_model_context(&mut host, &mut state)
+                .await
+                .unwrap()
+        );
+        assert!(replies.has_pending("run-child-0"));
+        assert!(state.volatile_pending.is_empty());
+
+        let correct = crate::orchestration::agent_tool::handle_agent_send_message_with_router(
+            &json!({
+                "action": "send_message",
+                "to": "run-child-0",
+                "message_type": "answer",
+                "request_id": "expected-question",
+                "message": "Use JSON.",
+            }),
+            &router,
+            "run-parent",
+            "orchestrator",
+            &parent_replies,
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&correct).unwrap()["success"],
+            true
+        );
+        assert!(
+            drain_mailbox_model_context(&mut host, &mut state)
+                .await
+                .unwrap()
+        );
+        assert!(!replies.has_pending("run-child-0"));
+        assert_eq!(state.volatile_pending.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn asking_leaf_waits_for_parent_answer_before_it_can_complete() {
+        let (router, _parent_mailbox, child_mailbox, _dt) = setup_two_agents().await;
+        let replies = Arc::new(ReplyObligations::default());
+        let parent_replies = ReplyObligations::default();
+        let child_run_id = child_mailbox.address.run_id.clone();
+        let child_agent_id = child_mailbox.address.agent_id.clone();
+        let queued = crate::orchestration::agent_tool::handle_agent_send_message_with_router(
+            &json!({
+                "action": "send_message",
+                "to": "parent",
+                "message_type": "question",
+                "message": "Which format should I use?",
+            }),
+            &router,
+            &child_run_id,
+            &child_agent_id,
+            replies.as_ref(),
+        )
+        .await;
+        let queued: Value = serde_json::from_str(&queued).unwrap();
+        assert_eq!(queued["success"], true);
+        let request_id = queued["message_id"].as_str().unwrap().to_string();
+        assert!(replies.has_pending(&child_run_id));
+
+        let wait_started = Arc::new(tokio::sync::Notify::new());
+        let readmission_started = Arc::new(tokio::sync::Notify::new());
+        let capacity_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut host = MockHost::new(vec![
+            text_result("Premature final answer."),
+            text_result("Answer incorporated."),
+        ]);
+        host.wait_started = Some(Arc::clone(&wait_started));
+        host.readmission_started = Some(Arc::clone(&readmission_started));
+        host.capacity_permit = Some(
+            Arc::clone(&capacity_semaphore)
+                .acquire_owned()
+                .await
+                .unwrap(),
+        );
+        host.capacity_semaphore = Some(Arc::clone(&capacity_semaphore));
+        // Production children have an owner even when they have no direct
+        // children of their own. This must not create a ready child waiter.
+        host.direct_child_owner = Some(FanoutParentAdmission::consumed_direct_child_for_test(
+            &child_run_id,
+            "prior-child",
+        ));
+        let mut state = make_state();
+        state.current_run_id = Some(child_run_id.clone());
+        state.messaging.mailbox = Some(child_mailbox);
+        state.messaging.reply_obligations = Arc::clone(&replies);
+        let task = tokio::spawn(async move {
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+            (host, state, outcome)
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), wait_started.notified())
+            .await
+            .expect("leaf must wait at the proposed final answer");
+        let independent_permit = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            Arc::clone(&capacity_semaphore).acquire_owned(),
+        )
+        .await
+        .expect("waiting leaf must release its execution slot")
+        .unwrap();
+        assert!(
+            !task.is_finished(),
+            "unanswered question must block completion"
+        );
+
+        let answer = crate::orchestration::agent_tool::handle_agent_send_message_with_router(
+            &json!({
+                "action": "send_message",
+                "to": child_run_id,
+                "message_type": "answer",
+                "request_id": request_id,
+                "message": "Use JSON.",
+            }),
+            &router,
+            "run-parent",
+            "orchestrator",
+            &parent_replies,
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&answer).unwrap()["success"],
+            true
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            readmission_started.notified(),
+        )
+        .await
+        .expect("answer should seek a fresh execution slot");
+        assert!(
+            !task.is_finished(),
+            "child must not execute without admission"
+        );
+        drop(independent_permit);
+        let (host, state, outcome) = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("answer must resume the same leaf")
+            .unwrap();
+        assert!(matches!(outcome.unwrap(), AgenticLoopOutcome::Completed));
+        assert_eq!(host.current_turn, 2);
+        assert_eq!(state.final_text, "Answer incorporated.");
+        assert!(
+            serde_json::to_string(&host.observed_turn_volatile[1])
+                .unwrap()
+                .contains("Use JSON."),
+            "the answer must enter the second turn's provider-visible volatile lane"
+        );
+        assert!(!replies.has_pending(&child_run_id));
+        assert!(
+            host.wait_outcomes
+                .iter()
+                .any(|outcome| outcome == "wait_started")
+        );
+        assert!(
+            host.wait_outcomes
+                .iter()
+                .any(|outcome| outcome == "runtime_input_ready")
+        );
+        assert!(host.communication_events.iter().any(|event| {
+            event.payload_kind == astra_turn_types::AgentCommunicationPayloadKind::Response
+                && event.related_message_id.as_deref()
+                    == Some(queued["message_id"].as_str().unwrap())
+        }));
+    }
+
+    #[tokio::test]
+    async fn parent_can_answer_a_detached_child_using_its_exact_run_id() {
+        let (router, parent_mailbox, child_mailbox, _dt) = setup_two_agents().await;
+        let child_address = child_mailbox.address.clone();
+        child_mailbox.release_unconsumed().await.unwrap();
+        let answer = crate::orchestration::agent_tool::handle_agent_send_message_with_router(
+            &json!({
+                "action": "send_message",
+                "to": child_address.run_id,
+                "message_type": "answer",
+                "request_id": "question-1",
+                "message": "Use JSON.",
+            }),
+            &router,
+            &parent_mailbox.address.run_id,
+            &parent_mailbox.address.agent_id,
+            &ReplyObligations::default(),
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&answer).unwrap()["success"],
+            true
+        );
+        let mut resumed = router.register(child_address, None).await.unwrap();
+        let delivered = resumed.try_recv().expect("detached child retained answer");
+        assert!(matches!(
+            &delivered.payload,
+            MessagePayload::Response { request_id, .. } if request_id == "question-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn answer_waiting_for_readmission_cannot_extend_the_completion_deadline() {
+        let (router, parent_mailbox, child_mailbox, _dt) = setup_two_agents().await;
+        let replies = Arc::new(ReplyObligations::default());
+        let child_run_id = child_mailbox.address.run_id.clone();
+        replies
+            .reserve(&child_run_id, "question-1", parent_mailbox.address.clone())
+            .unwrap();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let readmission_started = Arc::new(tokio::sync::Notify::new());
+        let wait_started = Arc::new(tokio::sync::Notify::new());
+        let mut host = MockHost::new(vec![text_result("Premature final answer.")]);
+        host.capacity_permit = Some(Arc::clone(&semaphore).acquire_owned().await.unwrap());
+        host.capacity_semaphore = Some(Arc::clone(&semaphore));
+        host.readmission_started = Some(Arc::clone(&readmission_started));
+        host.wait_started = Some(Arc::clone(&wait_started));
+        host.execution_budget = Some(std::time::Duration::from_millis(30_300));
+        let mut state = make_state();
+        state.current_run_id = Some(child_run_id.clone());
+        state.messaging.mailbox = Some(child_mailbox);
+        state.messaging.reply_obligations = Arc::clone(&replies);
+        let task = tokio::spawn(async move {
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+            (host, state, outcome)
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), wait_started.notified())
+            .await
+            .expect("must wait for reply");
+        let occupied = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+        let answer = crate::orchestration::agent_tool::handle_agent_send_message_with_router(
+            &json!({
+                "action": "send_message",
+                "to": child_run_id,
+                "message_type": "answer",
+                "request_id": "question-1",
+                "message": "Use JSON.",
+            }),
+            &router,
+            &parent_mailbox.address.run_id,
+            &parent_mailbox.address.agent_id,
+            &ReplyObligations::default(),
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&answer).unwrap()["success"],
+            true
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            readmission_started.notified(),
+        )
+        .await
+        .expect("reply must seek re-admission");
+        let (host, _state, outcome) = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("absolute deadline must stop waiting")
+            .unwrap();
+        assert!(matches!(outcome.unwrap(), AgenticLoopOutcome::Completed));
+        assert_eq!(host.current_turn, 1, "no model call without re-admission");
+        assert!(
+            host.wait_outcomes
+                .iter()
+                .any(|outcome| outcome == "deadline")
+        );
+        drop(occupied);
+        assert_eq!(semaphore.available_permits(), 1);
     }
 
     #[tokio::test]

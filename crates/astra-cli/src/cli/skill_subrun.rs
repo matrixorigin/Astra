@@ -500,6 +500,7 @@ impl AgenticLoopHost for SubRunHost {
                     agent_id: mailbox.address.agent_id.clone(),
                     run_id,
                     router: mailbox.router(),
+                    reply_obligations: Arc::clone(&state.messaging.reply_obligations),
                 }
             }));
 

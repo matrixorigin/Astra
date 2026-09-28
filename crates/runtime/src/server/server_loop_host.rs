@@ -4072,6 +4072,7 @@ pub struct ServerAgenticLoopHost {
     model_service: Option<Arc<dyn astra_services::ModelService>>,
     model_routing: Option<model_routing::AutoRoutingContext>,
     execution_handoff: Option<ExecutionHandoffContext>,
+    execution_capacity: Option<crate::server::run::lifecycle::RunExecutionCapacity>,
     // ── LLM resolution ──
     matrixone: MatrixOneSettings,
     encryptor: Arc<FernetTokenEncryptor>,
@@ -6496,6 +6497,7 @@ impl ServerAgenticLoopHostBuilder {
             model_service: self.model_service,
             model_routing: None,
             execution_handoff: None,
+            execution_capacity: None,
             matrixone: self.matrixone,
             encryptor: self.encryptor,
             shared_pool: self.shared_pool,
@@ -7175,6 +7177,13 @@ fn project_retained_action_discovery_summary(schema: &mut Value) {
 }
 
 impl ServerAgenticLoopHost {
+    pub(crate) fn bind_execution_capacity(
+        &mut self,
+        capacity: crate::server::run::lifecycle::RunExecutionCapacity,
+    ) {
+        self.execution_capacity = Some(capacity);
+    }
+
     async fn recover_existing_or_block_new_delegation_calls(
         &mut self,
         state: &AgenticLoopState,
@@ -19447,6 +19456,21 @@ impl ServerAgenticLoopHost {
 
 #[async_trait]
 impl AgenticLoopHost for ServerAgenticLoopHost {
+    fn release_execution_capacity_for_wait(&mut self) {
+        if let Some(capacity) = self.execution_capacity.as_mut() {
+            capacity.release();
+        }
+    }
+
+    async fn reacquire_execution_capacity_after_wait(
+        &mut self,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        if let Some(capacity) = self.execution_capacity.as_mut() {
+            capacity.reacquire().await?;
+        }
+        Ok(())
+    }
+
     async fn prepare_model_selection(
         &mut self,
         state: &mut AgenticLoopState,
@@ -19548,20 +19572,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             return;
         };
         let (kind, label, terminal) = match outcome {
-            "wait_started" => (Kind::Wait, "Wait for child results", None),
-            "synthesis_ready" => (
+            "wait_started" => (Kind::Wait, "Wait for agent input", None),
+            "synthesis_ready" | "runtime_input_ready" => {
+                (Kind::Wait, "Wait for agent input", Some(Outcome::Resolved))
+            }
+            "cancelled" => (Kind::Wait, "Wait for agent input", Some(Outcome::Cancelled)),
+            "deadline" | "readmission_failed" => (
                 Kind::Wait,
-                "Wait for child results",
-                Some(Outcome::Resolved),
-            ),
-            "cancelled" => (
-                Kind::Wait,
-                "Wait for child results",
-                Some(Outcome::Cancelled),
-            ),
-            "deadline" => (
-                Kind::Wait,
-                "Wait for child results",
+                "Wait for agent input",
                 Some(Outcome::Interrupted),
             ),
             "results_adopted" => (
@@ -33878,6 +33896,7 @@ mod tests {
         let spawner = Arc::new(crate::orchestration::DynamicAgentSpawner::new(router));
         executor.set_agent_tool_context(crate::orchestration::AgentToolContext {
             fanout_admission: spawner.fanout_parent("run1"),
+            reply_obligations: Arc::new(Default::default()),
             delegation_model_admission: None,
             run_id: "run1".into(),
             agent_id: "agent1".into(),

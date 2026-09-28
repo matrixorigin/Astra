@@ -330,6 +330,8 @@ pub enum MailboxError {
     ChannelClosed,
     /// No parent agent found for `MessageTarget::Parent`.
     NoParent,
+    /// This send was rejected before the envelope entered transport custody.
+    DeliveryRejected(String),
     /// Transport-layer error.
     Transport(String),
     /// Request/response timeout (e.g., permission request).
@@ -354,6 +356,7 @@ impl std::fmt::Display for MailboxError {
             ),
             Self::ChannelClosed => write!(f, "message channel closed"),
             Self::NoParent => write!(f, "no parent agent in delegation hierarchy"),
+            Self::DeliveryRejected(msg) => write!(f, "delivery rejected: {msg}"),
             Self::Transport(msg) => write!(f, "transport error: {msg}"),
             Self::Timeout(msg) => write!(f, "request timeout: {msg}"),
             Self::Disconnected => write!(f, "mailbox disconnected"),

@@ -1,8 +1,8 @@
 //! Transport trait — abstracts the message delivery mechanism.
 //!
-//! Two implementations are planned:
-//! - [`InProcessTransport`](super::in_process::InProcessTransport): tokio channels (CLI, µs latency)
-//! - Future `DatabaseTransport`: existing RunEngine event log (Cloud, ~10ms latency)
+//! Implementations:
+//! - [`InProcessTransport`](super::in_process::InProcessTransport): retained local inboxes (CLI)
+//! - [`DatabaseTransport`](super::db_transport::DatabaseTransport): durable inboxes (Server)
 
 use std::sync::Arc;
 
@@ -63,9 +63,13 @@ pub trait MessageStream: Send {
     /// Non-blocking: return a message if one is already buffered.
     fn try_recv(&mut self) -> Option<Arc<AgentMessage>>;
 
+    /// Synchronously return volatile, unacknowledged deliveries before an
+    /// async mailbox cleanup can race with the next registration.
+    fn detach(&mut self) {}
+
     /// Confirm that a delivered message has been consumed by the runtime.
-    /// Durable transports override this; in-process delivery is already owned
-    /// by the receiver once dequeued and therefore uses the no-op default.
+    /// Durable and retained in-process transports override this. The default
+    /// is for streams that do not own an acknowledged delivery.
     async fn acknowledge(&mut self, _message: &AgentMessage) -> Result<(), MailboxError> {
         Ok(())
     }
@@ -85,26 +89,6 @@ pub trait MessageStream: Send {
         }
         msgs
     }
-
-    /// Drain up to `limit` buffered messages. Returns `true` if more remain.
-    fn drain_bounded(&mut self, limit: usize) -> (Vec<Arc<AgentMessage>>, bool) {
-        let mut msgs = Vec::with_capacity(limit);
-        while msgs.len() < limit {
-            match self.try_recv() {
-                Some(m) => msgs.push(m),
-                None => return (msgs, false),
-            }
-        }
-        // Check if there's at least one more (peek without consuming isn't
-        // available, but this single extra message is acceptable).
-        match self.try_recv() {
-            Some(m) => {
-                msgs.push(m);
-                (msgs, true) // limit+1 messages, more may exist
-            }
-            None => (msgs, false),
-        }
-    }
 }
 
 // ─── MessageTransport ───────────────────────────────────────────────────────
@@ -115,13 +99,6 @@ pub trait MessageStream: Send {
 /// (CLI impl vs Server impl).
 #[async_trait]
 pub trait MessageTransport: Send + Sync {
-    /// Whether unregistering a subscriber preserves its unacknowledged
-    /// deliveries for a later registration at the same logical address.
-    /// Volatile transports must hand off unread envelopes before closing.
-    fn recovers_unacknowledged_on_unregister(&self) -> bool {
-        false
-    }
-
     /// Register an agent so it can receive messages.
     ///
     /// `delegation_id` — if provided, the agent joins a broadcast group.
@@ -133,6 +110,23 @@ pub trait MessageTransport: Send + Sync {
 
     /// Close only this subscription. A stale handle is an idempotent no-op.
     async fn unregister(&self, subscription: &MailboxSubscription) -> Result<(), MailboxError>;
+
+    /// Explicitly retire a terminal volatile inbox. Durable transports own
+    /// their storage lifecycle and need no extra database operation.
+    async fn retire(&self, _subscription: &MailboxSubscription) -> Result<(), MailboxError> {
+        Ok(())
+    }
+
+    /// After successful unregister, whether a never-adopted router route can
+    /// be forgotten without losing accepted envelopes. Volatile transports
+    /// decide atomically with send; durable transports keep queue custody.
+    /// Normal send/receive never calls this cleanup hook.
+    async fn forget_abandoned_route(
+        &self,
+        _subscription: &MailboxSubscription,
+    ) -> Result<bool, MailboxError> {
+        Ok(false)
+    }
 
     /// Subscribe to messages for this agent.
     ///

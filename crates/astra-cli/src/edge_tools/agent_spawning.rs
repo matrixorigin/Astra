@@ -46,6 +46,7 @@ pub async fn handle_agent_send_message_action(
         mailbox_ctx.router.as_ref(),
         &mailbox_ctx.run_id,
         &mailbox_ctx.agent_id,
+        mailbox_ctx.reply_obligations.as_ref(),
     )
     .await
 }

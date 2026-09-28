@@ -525,6 +525,18 @@ pub use astra_turn_core::interaction_types::{
 /// streams SSE to client, executes tools via ledger.
 #[async_trait]
 pub trait AgenticLoopHost: Send {
+    /// Parking on external input must not occupy a scarce execution slot.
+    /// Hosts without run admission (CLI and scripted tests) are no-ops.
+    fn release_execution_capacity_for_wait(&mut self) {}
+
+    /// Re-enter the normal execution admission before applying a wake or
+    /// dispatching another model/tool round.
+    async fn reacquire_execution_capacity_after_wait(
+        &mut self,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        Ok(())
+    }
+
     /// Remaining wall-clock authority for this execution, when the host has a
     /// request-scoped deadline. The runtime uses this to stop exploration
     /// before the host's hard boundary, leaving time for safe settlement.
@@ -2295,6 +2307,9 @@ pub struct MessagingState {
     /// When set, incoming messages are drained at each turn start and
     /// progress updates are sent to the parent at turn end.
     pub mailbox: Option<astra_messaging::router::AgentMailbox>,
+    /// Run-owned question obligations shared with the sending tool. These
+    /// remain empty for ordinary turns and never trigger a database read.
+    pub reply_obligations: Arc<crate::messaging::reply_obligations::ReplyObligations>,
     /// Unified messaging metrics (optional, shared across agents in a delegation).
     pub metrics: Option<std::sync::Arc<astra_messaging::metrics::MessagingMetrics>>,
     /// Optional progress emitter for broadcasting turn events to UI/subscribers.

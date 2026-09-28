@@ -162,17 +162,19 @@ pub async fn check_tool_permission_with_provider_policy(
     match mailbox.request_permission(request, timeout).await {
         Ok(outcome) => {
             // Deserialize generic PermissionOutcome into PermissionResponse
-            let response: PermissionResponse = outcome
+            let response: Option<PermissionResponse> = outcome
                 .data
                 .as_ref()
                 .and_then(|d| serde_json::from_value(d.clone()).ok())
-                .unwrap_or_else(|| {
-                    if outcome.accepted {
-                        PermissionResponse::approve()
-                    } else {
-                        PermissionResponse::deny("Permission denied by parent")
-                    }
-                });
+                .filter(|response: &PermissionResponse| response.approved == outcome.accepted);
+            let Some(response) = response else {
+                let reason =
+                    "Parent permission response did not match the permission contract".to_string();
+                ctx.write()
+                    .await
+                    .record_blocked_tool_with_reason(tool_name, Some(&reason));
+                return PermissionCheckResult::Denied { reason };
+            };
             if response.approved {
                 // Apply any new rules to our context
                 let new_rules = response.updates.clone();
@@ -852,6 +854,75 @@ mod tests {
         let telemetry = ctx.read().await.telemetry();
         assert_eq!(telemetry.permission_requests, 1);
         assert_eq!(telemetry.permission_requests_approved, 1);
+    }
+
+    #[tokio::test]
+    async fn ordinary_agent_answer_cannot_approve_a_permission_request() {
+        use crate::server::delegation::engine::{DelegationTracker, SubRunRecord, SubRunState};
+        use astra_messaging::in_process::InProcessTransport;
+        use astra_messaging::router::AgentMailboxRouter;
+        use astra_messaging::types::AgentAddress;
+
+        let tracker = Arc::new(DelegationTracker::new());
+        let router = Arc::new(AgentMailboxRouter::new(
+            Arc::new(InProcessTransport::new()),
+            tracker.clone(),
+        ));
+        let parent = AgentAddress::new("parent-run", "orchestrator");
+        let child = AgentAddress::new("child-run", "worker");
+        let parent_mailbox = router.register(parent.clone(), None).await.unwrap();
+        let mut child_mailbox = router.register(child.clone(), None).await.unwrap();
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: child.run_id.clone(),
+                parent_run_id: parent.run_id.clone(),
+                delegation_id: "permission-test".into(),
+                agent_id: child.agent_id.clone(),
+                depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
+            })
+            .await;
+        let ctx = PermissionSyncContext::shared(InheritedPermissions {
+            mode: PermissionMode::Prompt,
+            ..Default::default()
+        });
+        let responder = tokio::spawn(async move {
+            let request = tokio::time::timeout(Duration::from_secs(1), parent_mailbox.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let request_id = request.correlation_id.as_deref().unwrap();
+            let answer = crate::orchestration::agent_tool::handle_agent_send_message_with_router(
+                &serde_json::json!({
+                    "action": "send_message",
+                    "to": child.run_id,
+                    "message_type": "answer",
+                    "request_id": request_id,
+                    "message": "yes",
+                }),
+                &router,
+                &parent.run_id,
+                &parent.agent_id,
+                &crate::messaging::reply_obligations::ReplyObligations::default(),
+            )
+            .await;
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&answer).unwrap()["success"],
+                true
+            );
+        });
+        let decision = check_tool_permission(
+            "bash",
+            Some(r#"{"command":"git commit"}"#),
+            Some(&ctx),
+            Some(&mut child_mailbox),
+            Duration::from_secs(2),
+        )
+        .await;
+        responder.await.unwrap();
+        assert!(matches!(decision, PermissionCheckResult::Denied { .. }));
+        assert_eq!(ctx.read().await.telemetry().permission_requests_approved, 0);
     }
 
     #[tokio::test]

@@ -1891,8 +1891,8 @@ pub struct SpawnedAgentState {
     pub status: AgentStatus,
     /// Producer-owned monotonic lifecycle revision for this agent work unit.
     pub work_revision: u64,
-    /// Routing address plus the original registration authority for cleanup.
-    pub messaging_address: Option<astra_messaging::transport::MailboxSubscription>,
+    /// Stable mailbox lifetime and this execution's exact attachment token.
+    pub messaging_address: Option<astra_messaging::router::MailboxRegistration>,
     pub worktree_path: Option<PathBuf>,
     pub started_at: SystemTime,
     pub ended_at: Option<SystemTime>,
@@ -7007,7 +7007,7 @@ impl DynamicAgentSpawner {
             }
         };
 
-        let messaging_address = mailbox.as_ref().map(|mb| mb.subscription().clone());
+        let messaging_address = mailbox.as_ref().map(|mb| mb.registration());
         // Publish cleanup ownership before any further await. If the fanout
         // deadline drops this spawn while run-depth bookkeeping is stalled,
         // cancellation can now unregister the mailbox from active state.
@@ -7020,7 +7020,9 @@ impl DynamicAgentSpawner {
                 })
             };
             if !published {
-                let _ = self.mailbox_router.unregister(address).await;
+                if let Some(mailbox) = mailbox {
+                    let _ = mailbox.retire().await;
+                }
                 self.record_fanout_spawn_rejected_for_input(
                     fanout_slot.as_ref(),
                     &input,
@@ -7058,8 +7060,8 @@ impl DynamicAgentSpawner {
                 Ok(path) => Some(path),
                 Err(e) => {
                     self.active_agents.write().await.remove(&agent_id);
-                    if let Some(addr) = messaging_address.as_ref() {
-                        let _ = self.mailbox_router.unregister(addr).await;
+                    if let Some(mailbox) = mailbox {
+                        let _ = mailbox.retire().await;
                     }
                     self.record_fanout_spawn_rejected_for_input(
                         fanout_slot.as_ref(),
@@ -7091,8 +7093,8 @@ impl DynamicAgentSpawner {
             })
         };
         let Some(spawned_state_for_trace) = spawned_state_for_trace else {
-            if let Some(addr) = messaging_address.as_ref() {
-                let _ = self.mailbox_router.unregister(addr).await;
+            if let Some(mailbox) = mailbox {
+                let _ = mailbox.retire().await;
             }
             self.record_fanout_spawn_rejected_for_input(
                 fanout_slot.as_ref(),
@@ -7108,8 +7110,8 @@ impl DynamicAgentSpawner {
         };
         if !foreground_child_has_work_time(execution_deadline) {
             self.active_agents.write().await.remove(&agent_id);
-            if let Some(address) = messaging_address.as_ref() {
-                let _ = self.mailbox_router.unregister(address).await;
+            if let Some(mailbox) = mailbox {
+                let _ = mailbox.retire().await;
             }
             self.record_fanout_spawn_rejected_for_input(
                 fanout_slot.as_ref(),
@@ -7139,8 +7141,8 @@ impl DynamicAgentSpawner {
                 .await
         {
             self.active_agents.write().await.remove(&agent_id);
-            if let Some(addr) = messaging_address.as_ref() {
-                let _ = self.mailbox_router.unregister(addr).await;
+            if let Some(mailbox) = mailbox {
+                let _ = mailbox.retire().await;
             }
             cleanup_agent_worktree(worktree_path.as_ref(), &agent_id);
             return Err(error);
@@ -8732,7 +8734,7 @@ impl DynamicAgentSpawner {
             if let Some(address) = messaging_address {
                 match tokio::time::timeout(
                     AGENT_MAILBOX_UNREGISTER_TIMEOUT,
-                    spawner.mailbox_router.unregister(&address),
+                    spawner.mailbox_router.unregister(address.subscription()),
                 )
                 .await
                 {
@@ -8829,10 +8831,8 @@ impl DynamicAgentSpawner {
         let agent_id = agent_id.to_string();
         let terminal_status = terminal_status.to_string();
         tokio::spawn(async move {
-            let cleanup = async {
-                // Worktree ownership is process-local and precedes all
-                // transport-backed best-effort observability.
-                spawner.cleanup_worktree(worktree_path, &agent_id).await;
+            let worktree_cleanup = spawner.cleanup_worktree(worktree_path, &agent_id);
+            let remote_cleanup = async {
                 match tokio::time::timeout(
                     AGENT_TERMINAL_JOURNAL_TIMEOUT,
                     spawner.persist_agent_terminated_state(
@@ -8867,12 +8867,20 @@ impl DynamicAgentSpawner {
                         ),
                     )
                     .await;
-                    match tokio::time::timeout(
-                        AGENT_MAILBOX_UNREGISTER_TIMEOUT,
-                        spawner.mailbox_router.unregister(&addr),
-                    )
-                    .await
-                    {
+                    let cleanup = if settled_state.status.is_terminal() {
+                        tokio::time::timeout(
+                            AGENT_MAILBOX_UNREGISTER_TIMEOUT,
+                            spawner.mailbox_router.retire_terminal(addr.lifetime()),
+                        )
+                        .await
+                    } else {
+                        tokio::time::timeout(
+                            AGENT_MAILBOX_UNREGISTER_TIMEOUT,
+                            spawner.mailbox_router.unregister(addr.subscription()),
+                        )
+                        .await
+                    };
+                    match cleanup {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => tracing::warn!(
                             target: "astra_runtime::messaging",
@@ -8896,6 +8904,9 @@ impl DynamicAgentSpawner {
                         error.as_deref(),
                     )
                     .await;
+            };
+            let cleanup = async {
+                tokio::join!(worktree_cleanup, remote_cleanup);
             };
             if tokio::time::timeout(AGENT_DEADLINE_CLEANUP_TIMEOUT, cleanup)
                 .await
@@ -8952,7 +8963,15 @@ impl DynamicAgentSpawner {
             state.status = status;
             state.work_revision = state.work_revision.saturating_add(1);
             state.ended_at = Some(SystemTime::now());
-            let messaging_address = state.messaging_address.take();
+            // Waiting remains resumable: the archive must retain the original
+            // subscription so a later authoritative terminal can retire this
+            // exact mailbox. Only a terminal transition transfers ownership
+            // to the asynchronous cleanup task.
+            let messaging_address = if state.status.is_terminal() {
+                state.messaging_address.take()
+            } else {
+                state.messaging_address.clone()
+            };
             (state.clone(), messaging_address)
         };
 
@@ -9005,14 +9024,8 @@ impl DynamicAgentSpawner {
         let output = output.map(ToString::to_string);
         let error = error.map(ToString::to_string);
         tokio::spawn(async move {
-            let cleanup = async {
-                // Local lifecycle ownership is correctness-critical; trace
-                // and journal persistence are best-effort observability. Do
-                // not let a blocking persistence backend retain these
-                // resources past terminal publication.
-                // Release the local filesystem resource first. Mailbox send
-                // and unregister may each cross a database-backed transport.
-                spawner.cleanup_worktree(worktree_path, &agent_id).await;
+            let worktree_cleanup = spawner.cleanup_worktree(worktree_path, &agent_id);
+            let remote_cleanup = async {
                 if let Some(addr) = messaging_address {
                     let _ = tokio::time::timeout(
                         AGENT_TERMINAL_DELIVERY_TIMEOUT,
@@ -9023,12 +9036,20 @@ impl DynamicAgentSpawner {
                         ),
                     )
                     .await;
-                    match tokio::time::timeout(
-                        AGENT_MAILBOX_UNREGISTER_TIMEOUT,
-                        spawner.mailbox_router.unregister(&addr),
-                    )
-                    .await
-                    {
+                    let cleanup = if settled_state.status.is_terminal() {
+                        tokio::time::timeout(
+                            AGENT_MAILBOX_UNREGISTER_TIMEOUT,
+                            spawner.mailbox_router.retire_terminal(addr.lifetime()),
+                        )
+                        .await
+                    } else {
+                        tokio::time::timeout(
+                            AGENT_MAILBOX_UNREGISTER_TIMEOUT,
+                            spawner.mailbox_router.unregister(addr.subscription()),
+                        )
+                        .await
+                    };
+                    match cleanup {
                         Ok(Ok(())) => {}
                         Ok(Err(err)) => tracing::warn!(
                             target: "astra_runtime::messaging",
@@ -9059,6 +9080,9 @@ impl DynamicAgentSpawner {
                         finish_reason.as_deref(),
                     )
                     .await;
+            };
+            let cleanup = async {
+                tokio::join!(worktree_cleanup, remote_cleanup);
             };
             if tokio::time::timeout(AGENT_DEADLINE_CLEANUP_TIMEOUT, cleanup)
                 .await
@@ -11990,6 +12014,7 @@ mod tests {
             spawner.set_durable_agent_reconciler(recovery.clone()).await;
             let ctx = AgentToolContext {
                 fanout_admission: admission,
+                reply_obligations: Arc::new(Default::default()),
                 delegation_model_admission: None,
                 run_id: "result-parent-0".into(),
                 agent_id: "root-agent".into(),
@@ -12186,6 +12211,7 @@ mod tests {
         spawner.set_durable_agent_reconciler(recovery.clone()).await;
         let ctx = AgentToolContext {
             fanout_admission: spawner.fanout_parent("next-turn"),
+            reply_obligations: Arc::new(Default::default()),
             delegation_model_admission: None,
             run_id: "next-turn".into(),
             agent_id: "root-agent".into(),
@@ -15273,10 +15299,12 @@ mod tests {
             other => panic!("expected archived waiting output, got {other:?}"),
         };
         assert!(spawner.active_agents.read().await.is_empty());
-        assert!(matches!(
-            spawner.get_agent_state_any(&agent_id).await.unwrap().status,
-            AgentStatus::Waiting { .. }
-        ));
+        let waiting = spawner.get_agent_state_any(&agent_id).await.unwrap();
+        assert!(matches!(waiting.status, AgentStatus::Waiting { .. }));
+        assert!(
+            waiting.messaging_address.is_some(),
+            "recoverable child must keep its original mailbox retirement authority"
+        );
 
         let cancelled = spawner
             .cancel_fanout_group_for_user("waiting-review", "user stopped group")
@@ -15286,10 +15314,15 @@ mod tests {
         assert_eq!(cancelled.stopped_agent_ids, vec![agent_id.clone()]);
         assert!(cancelled.not_stopped_agent_ids.is_empty());
         assert!(cancelled.group.is_terminal());
+        let terminal = spawner.get_agent_state_any(&agent_id).await.unwrap();
         assert!(matches!(
-            spawner.get_agent_state_any(&agent_id).await.unwrap().status,
+            terminal.status,
             AgentStatus::Cancelled { by_user: true, .. }
         ));
+        assert!(
+            terminal.messaging_address.is_none(),
+            "authoritative terminal must transfer mailbox cleanup authority"
+        );
     }
 
     #[tokio::test]
@@ -17411,8 +17444,9 @@ mod tests {
         let tracker = Arc::new(DelegationTracker::new());
         let router = Arc::new(AgentMailboxRouter::new(transport, tracker));
         let parent_addr = astra_messaging::AgentAddress::new("stable-root", "root-agent");
+        let _parent_mailbox = router.register(parent_addr.clone(), None).await.unwrap();
         router
-            .record_parent_delivery_alias("root", &parent_addr)
+            .record_parent_delivery_alias("root", &parent_addr, &parent_addr.agent_id)
             .await;
         router
             .record_sub_run(astra_messaging::SubRunInfo {
@@ -17441,7 +17475,7 @@ mod tests {
             )
             .await
             .unwrap();
-        state.messaging_address = Some(mailbox.subscription().clone());
+        state.messaging_address = Some(mailbox.registration());
         state.worktree_path = Some(worktree.clone());
         let agent_id = state.agent_id.clone();
         spawner

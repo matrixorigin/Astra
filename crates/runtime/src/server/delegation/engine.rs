@@ -53,8 +53,8 @@ use astra_services::delegated_findings::{
     truncate_chars,
 };
 use astra_services::runs::{
-    DurableRunStatusKind, RequestedTurnInteractionMode, durable_run_status_kind,
-    durable_run_status_to_subrun_state,
+    DurableRunStatusKind, RequestedTurnInteractionMode, durable_run_status_is_terminal,
+    durable_run_status_kind, durable_run_status_to_subrun_state,
 };
 use astra_services::{AdmittedModelExecution, BubbleUpTarget, DatabaseStateProjectionStore};
 
@@ -66,6 +66,7 @@ use astra_core::{
 
 use crate::server::run::engine::{RunEngine, RunExecutionAuthority};
 use astra_messaging::router::AgentMailboxRouter;
+use astra_messaging::router::MailboxLifetime;
 use astra_prompts::team_prompts;
 
 fn clone_delegation_context(
@@ -750,6 +751,71 @@ fn durable_reconciliation_pending_result(attempted: &AgentResult, operation: &st
     }
 }
 
+fn reconcile_preserving_mailbox_cleanup<'a>(
+    run_engine: &'a RunEngine,
+    user_id: &'a str,
+    expected_session_id: &'a str,
+    disposition: DurableLifecycleDisposition,
+    result: AgentResult,
+    mailbox: Option<&MailboxRetirement>,
+    operation: &'a str,
+) -> impl std::future::Future<Output = AgentResult> + Send + 'a {
+    enum Started {
+        Owned(tokio::task::JoinHandle<AgentResult>),
+        Inline(AgentResult),
+    }
+    let pending = durable_reconciliation_pending_result(&result, operation);
+    // Ownership transfer is eager: the shared observation deadline may
+    // already be exhausted, but a mailbox-bearing child still needs its
+    // existing durable reconciliation to establish terminal authority.
+    let started = match mailbox.cloned() {
+        Some(mailbox) => {
+            let run_engine = run_engine.clone();
+            let user_id = user_id.to_string();
+            let expected_session_id = expected_session_id.to_string();
+            Started::Owned(tokio::spawn(async move {
+                reconcile_agent_result_with_durable_authority(
+                    &run_engine,
+                    &user_id,
+                    &expected_session_id,
+                    disposition,
+                    result,
+                    Some(&mailbox),
+                )
+                .await
+            }))
+        }
+        None => Started::Inline(result),
+    };
+    async move {
+        match started {
+            Started::Owned(task) => match task.await {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::error!(
+                        target: "astra_runtime::delegation",
+                        operation,
+                        %error,
+                        "durable child reconciliation task failed; preserving an unfinished projection"
+                    );
+                    pending
+                }
+            },
+            Started::Inline(result) => {
+                reconcile_agent_result_with_durable_authority(
+                    run_engine,
+                    user_id,
+                    expected_session_id,
+                    disposition,
+                    result,
+                    None,
+                )
+                .await
+            }
+        }
+    }
+}
+
 /// Reconcile one result within the shared cleanup budget for its parent
 /// operation. Timeout means the durable winner is unknown, not failed; all
 /// writes are owner-fenced and a later recovery/read can observe the winner.
@@ -759,6 +825,7 @@ async fn reconcile_agent_result_with_shared_deadline(
     expected_session_id: &str,
     disposition: DurableLifecycleDisposition,
     result: AgentResult,
+    mailbox: Option<&MailboxRetirement>,
     deadline: &mut Option<tokio::time::Instant>,
     scope: &'static str,
     operation: &'static str,
@@ -768,12 +835,14 @@ async fn reconcile_agent_result_with_shared_deadline(
     match await_with_shared_deadline(
         deadline,
         DELEGATION_RECONCILIATION_TIMEOUT,
-        reconcile_agent_result_with_durable_authority(
+        reconcile_preserving_mailbox_cleanup(
             run_engine,
             user_id,
             expected_session_id,
             disposition,
             result,
+            mailbox,
+            operation,
         ),
     )
     .await
@@ -800,6 +869,7 @@ async fn reconcile_fork_result(
     session_id: String,
     disposition: DurableLifecycleDisposition,
     result: AgentResult,
+    mailbox: Option<&MailboxRetirement>,
 ) -> AgentResult {
     let mut deadline = None;
     let reconciled = reconcile_agent_result_with_shared_deadline(
@@ -808,6 +878,7 @@ async fn reconcile_fork_result(
         &session_id,
         disposition,
         result,
+        mailbox,
         &mut deadline,
         "fork",
         "child outcome",
@@ -883,6 +954,31 @@ fn durable_lifecycle_disposition_after_dispatch(
     }
 }
 
+#[derive(Clone)]
+struct MailboxRetirement {
+    router: Arc<AgentMailboxRouter>,
+    lifetime: MailboxLifetime,
+}
+
+impl MailboxRetirement {
+    fn from_mailbox(
+        router: &Option<Arc<AgentMailboxRouter>>,
+        mailbox: Option<&astra_messaging::router::AgentMailbox>,
+    ) -> Option<Self> {
+        Some(Self {
+            router: router.as_ref()?.clone(),
+            lifetime: mailbox?.lifetime().clone(),
+        })
+    }
+
+    fn request_if_terminal(&self, durable_status: &str) {
+        if durable_run_status_is_terminal(durable_status) {
+            // The router starts and owns cleanup before the observer is polled.
+            drop(self.router.retire_terminal(&self.lifetime));
+        }
+    }
+}
+
 /// Commit an executor result and return the outcome permitted by durable
 /// authority. A pause/cancel/terminal CAS winner must shape the result returned
 /// to the parent; otherwise the database, tracker, and aggregation can report
@@ -893,6 +989,7 @@ async fn reconcile_agent_result_with_durable_authority(
     expected_session_id: &str,
     disposition: DurableLifecycleDisposition,
     mut result: AgentResult,
+    mailbox: Option<&MailboxRetirement>,
 ) -> AgentResult {
     let attempted_status = durable_status_for_agent_result(&result.status);
     let persistence = match disposition {
@@ -918,6 +1015,9 @@ async fn reconcile_agent_result_with_durable_authority(
         }
     };
     if matches!(persistence, Ok(true)) {
+        if let Some(mailbox) = mailbox {
+            mailbox.request_if_terminal(attempted_status);
+        }
         return result;
     }
 
@@ -956,6 +1056,9 @@ async fn reconcile_agent_result_with_durable_authority(
             return result;
         }
     };
+    if let Some(mailbox) = mailbox {
+        mailbox.request_if_terminal(&durable.status);
+    }
 
     // A replay can lose its CAS because the exact same terminal fact is
     // already durable. Status equality alone is insufficient: a recovered
@@ -1027,6 +1130,7 @@ async fn reconcile_after_parent_cancellation_bounded(
     expected_session_id: &str,
     disposition: DurableLifecycleDisposition,
     result: AgentResult,
+    mailbox: Option<&MailboxRetirement>,
     deadline: &mut Option<tokio::time::Instant>,
     scope: &'static str,
 ) -> AgentResult {
@@ -1036,6 +1140,7 @@ async fn reconcile_after_parent_cancellation_bounded(
         expected_session_id,
         disposition,
         result,
+        mailbox,
         deadline,
         scope,
         "cancellation",
@@ -2927,16 +3032,17 @@ impl DelegationEngine {
     /// executor. Until execution starts, the delegation scheduler still owns
     /// the exact generation even when the configured executor normally owns
     /// terminal writes.
-    async fn settle_unlaunched_child(
-        &self,
-        user_id: &str,
-        session_id: &str,
+    fn settle_unlaunched_child<'a>(
+        &'a self,
+        user_id: &'a str,
+        session_id: &'a str,
         agent_id: &str,
         run_id: &str,
         owner_generation: u64,
         status: &str,
         error: &str,
-    ) -> AgentResult {
+        mailbox: Option<&MailboxRetirement>,
+    ) -> impl std::future::Future<Output = AgentResult> + Send + 'a {
         let attempted = AgentResult {
             agent_id: agent_id.to_string(),
             run_id: run_id.to_string(),
@@ -2947,23 +3053,29 @@ impl DelegationEngine {
             completion_tokens: 0,
             tool_calls: 0,
         };
-        let result = reconcile_agent_result_with_durable_authority(
+        let reconciliation = reconcile_preserving_mailbox_cleanup(
             &self.run_engine,
             user_id,
             session_id,
             DurableLifecycleDisposition::SchedulerOwned { owner_generation },
             attempted,
-        )
-        .await;
-        self.tracker
-            .apply_sub_run_result_state(
-                run_id,
-                agent_result_status_to_subrun_state(&result.status),
-                result.error.as_deref(),
-                None,
-            )
-            .await;
-        result
+            mailbox,
+            "unlaunched child",
+        );
+        let tracker = self.tracker.clone();
+        let run_id = run_id.to_string();
+        async move {
+            let result = reconciliation.await;
+            tracker
+                .apply_sub_run_result_state(
+                    &run_id,
+                    agent_result_status_to_subrun_state(&result.status),
+                    result.error.as_deref(),
+                    None,
+                )
+                .await;
+            result
+        }
     }
 
     async fn settle_unlaunched_child_with_shared_deadline(
@@ -2975,6 +3087,7 @@ impl DelegationEngine {
         owner_generation: u64,
         status: &str,
         error: &str,
+        mailbox: Option<&MailboxRetirement>,
         deadline: &mut Option<tokio::time::Instant>,
     ) -> AgentResult {
         let attempted = AgentResult {
@@ -2998,6 +3111,7 @@ impl DelegationEngine {
                 owner_generation,
                 status,
                 error,
+                mailbox,
             ),
         )
         .await
@@ -3696,6 +3810,7 @@ impl DelegationEngine {
                                 retry_authority.owner_generation,
                                 STATUS_CANCELLED,
                                 "verification retry cancelled before execution",
+                                None,
                                 &mut retry_reconciliation_deadline,
                             )
                             .await;
@@ -3718,6 +3833,7 @@ impl DelegationEngine {
                                 retry_authority.owner_generation,
                                 AGENT_RESULT_STATUS_TIMEOUT,
                                 "verification retry expired before execution",
+                                None,
                                 &mut retry_reconciliation_deadline,
                             )
                             .await;
@@ -3770,6 +3886,10 @@ impl DelegationEngine {
                             }
                         }
                     }
+                    let retry_mailbox_retirement = MailboxRetirement::from_mailbox(
+                        &self.mailbox_router,
+                        retry_config.mailbox.as_ref(),
+                    );
 
                     Self::write_journal_event(
                         user_id,
@@ -3869,6 +3989,7 @@ impl DelegationEngine {
                                     retry_authority.owner_generation,
                                 ),
                                 result,
+                                retry_mailbox_retirement.as_ref(),
                             )
                             .await;
                         }
@@ -3896,6 +4017,7 @@ impl DelegationEngine {
                                         retry_authority.owner_generation,
                                         status,
                                         &e,
+                                        retry_mailbox_retirement.as_ref(),
                                         &mut retry_reconciliation_deadline,
                                     )
                                     .await;
@@ -3905,7 +4027,7 @@ impl DelegationEngine {
                                     ..current
                                 };
                             }
-                            return reconcile_agent_result_with_durable_authority(
+                            let retry_result = reconcile_agent_result_with_durable_authority(
                                 &self.run_engine,
                                 user_id,
                                 expected_session_id,
@@ -3923,8 +4045,10 @@ impl DelegationEngine {
                                     completion_tokens: 0,
                                     tool_calls: 0,
                                 },
+                                retry_mailbox_retirement.as_ref(),
                             )
                             .await;
+                            return retry_result;
                         }
                     }
                 }
@@ -4188,42 +4312,6 @@ impl DelegationEngine {
             .init_progress(&request.delegation_id, &agent_ids_for_journal)
             .await;
 
-        // Register the parent/orchestrator with the mailbox router so child
-        // agents can send progress and messages to `MessageTarget::Parent`.
-        // Without this, `resolve_parent_addr` falls back to a synthetic address
-        // that has no inbox in the transport, causing `AgentNotFound` errors.
-        //
-        // Uses `register_if_absent` to atomically skip if the caller already
-        // registered this run_id (e.g., CLI layer or tests that pre-register
-        // a parent mailbox to receive messages).
-        let parent_mailbox = if let Some(router) = &self.mailbox_router {
-            let parent_addr = astra_messaging::types::AgentAddress {
-                run_id: request.parent_run_id.clone(),
-                agent_id: source_agent_id.to_string(),
-            };
-            match router
-                .register_if_absent(parent_addr, Some(request.delegation_id.clone()))
-                .await
-            {
-                Ok(mb) => mb, // Some(mailbox) if newly registered, None if already present
-                Err(e) => {
-                    tracing::warn!(
-                        target: "astra_runtime::delegation",
-                        parent_run_id = %request.parent_run_id,
-                        error = %e,
-                        "failed to register parent mailbox; child progress messages will be lost",
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        // Note: parent_mailbox cleanup on panic is handled by AgentMailbox's
-        // Drop impl, which spawns a background unregister task. On the normal
-        // path, we unregister explicitly below for proper error handling.
-
         let execution_started_at = std::time::Instant::now();
         let result = match &request.pattern {
             CoordinationPattern::FanOut {
@@ -4341,23 +4429,6 @@ impl DelegationEngine {
                 .await
             }
         };
-
-        // Unregister the parent mailbox now that all children have completed.
-        // This prevents resource leaks and address collisions with future runs.
-        if let Some(mb) = &parent_mailbox {
-            let addr = mb.address.clone();
-            if let Err(e) = mb.unregister().await {
-                tracing::warn!(
-                    target: "astra_runtime::delegation",
-                    parent_run_id = %addr.run_id,
-                    error = %e,
-                    "failed to unregister parent mailbox after delegation",
-                );
-            }
-        }
-        // Drop parent_mailbox explicitly before journal write so the Drop
-        // impl doesn't race with the explicit unregister above.
-        drop(parent_mailbox);
 
         // Journal: delegation completed
         if let Ok(ref dr) = result {
@@ -4549,7 +4620,10 @@ impl DelegationEngine {
                     break;
                 }
             };
-            owner_generations.insert(sub_run_id.clone(), execution_authority.owner_generation);
+            owner_generations.insert(
+                sub_run_id.clone(),
+                (execution_authority.owner_generation, None),
+            );
 
             self.tracker
                 .record_sub_run(SubRunRecord {
@@ -4628,6 +4702,10 @@ impl DelegationEngine {
             } else {
                 None
             };
+            owner_generations
+                .get_mut(&sub_run_id)
+                .expect("admitted child generation")
+                .1 = MailboxRetirement::from_mailbox(&self.mailbox_router, mailbox.as_ref());
 
             // Inject team coordination prompt into task
             let coordination_prompt = format!(
@@ -4706,24 +4784,19 @@ impl DelegationEngine {
             let cleanup_deadline = tokio::time::Instant::now() + FANOUT_CANCELLATION_DRAIN_TIMEOUT;
             let cleanup_tasks = FuturesUnordered::new();
             for (run_id, agent_id, owner_generation, _) in &started_children {
-                let user_id = request.user_id.clone();
-                let session_id = session_id.clone();
-                let agent_id = agent_id.clone();
-                let run_id = run_id.clone();
-                let error = error.clone();
-                let owner_generation = *owner_generation;
-                cleanup_tasks.push(async move {
-                    self.settle_unlaunched_child(
-                        &user_id,
-                        &session_id,
-                        &agent_id,
-                        &run_id,
-                        owner_generation,
-                        status,
-                        &error,
-                    )
-                    .await
-                });
+                let mailbox = owner_generations
+                    .get(run_id)
+                    .and_then(|(_, mailbox)| mailbox.as_ref());
+                cleanup_tasks.push(self.settle_unlaunched_child(
+                    &request.user_id,
+                    &session_id,
+                    agent_id,
+                    run_id,
+                    *owner_generation,
+                    status,
+                    &error,
+                    mailbox,
+                ));
             }
             let cleanup = drain_futures_before(cleanup_tasks, cleanup_deadline).await;
             for result in cleanup.completed {
@@ -5005,18 +5078,20 @@ impl DelegationEngine {
         for result in results {
             let disposition = owner_generations
                 .get(&result.run_id)
-                .copied()
-                .map(|owner_generation| {
+                .map(|(owner_generation, _)| {
                     let executor_entered = executor_entered_by_run_id
                         .get(&result.run_id)
                         .is_some_and(|entered| entered.load(Ordering::Acquire));
                     durable_lifecycle_disposition_after_dispatch(
                         self.executor.as_ref(),
-                        owner_generation,
+                        *owner_generation,
                         executor_entered,
                     )
                 })
                 .unwrap_or(DurableLifecycleDisposition::ReadOnly);
+            let mailbox = owner_generations
+                .get(&result.run_id)
+                .and_then(|(_, mailbox)| mailbox.as_ref());
             let result = if cancel_token.is_some_and(|token| token.is_cancelled()) {
                 reconcile_after_parent_cancellation_bounded(
                     &self.run_engine,
@@ -5024,6 +5099,7 @@ impl DelegationEngine {
                     &session_id,
                     disposition,
                     result,
+                    mailbox,
                     &mut cancellation_reconciliation_deadline,
                     "fanout",
                 )
@@ -5035,6 +5111,7 @@ impl DelegationEngine {
                     &session_id,
                     disposition,
                     result,
+                    mailbox,
                     &mut normal_reconciliation_deadline,
                     "fanout",
                     "child outcome",
@@ -5356,6 +5433,7 @@ impl DelegationEngine {
                         execution_authority.owner_generation,
                         status,
                         &error,
+                        None,
                         &mut cleanup_deadline,
                     )
                     .await,
@@ -5372,6 +5450,7 @@ impl DelegationEngine {
                         execution_authority.owner_generation,
                         AGENT_RESULT_STATUS_TIMEOUT,
                         "sequential stage deadline expired before execution",
+                        None,
                         &mut cleanup_deadline,
                     )
                     .await,
@@ -5409,6 +5488,8 @@ impl DelegationEngine {
             } else {
                 None
             };
+            let mailbox_retirement =
+                MailboxRetirement::from_mailbox(&self.mailbox_router, mailbox.as_ref());
 
             // Inject sequential/pipeline coordination prompt
             let has_prev = previous_output.is_some();
@@ -5502,6 +5583,7 @@ impl DelegationEngine {
                     execution_authority.owner_generation,
                 ),
                 result,
+                mailbox_retirement.as_ref(),
             )
             .await;
             // ── Verification gate with retry for sequential sub-runs ──
@@ -5748,6 +5830,7 @@ impl DelegationEngine {
                         prod_execution_authority.owner_generation,
                         AGENT_RESULT_STATUS_TIMEOUT,
                         "adversarial round deadline expired before producer execution",
+                        None,
                         &mut round_settlement_deadline,
                     )
                     .await,
@@ -5809,6 +5892,7 @@ impl DelegationEngine {
                         prod_execution_authority.owner_generation,
                         status,
                         &error,
+                        None,
                         &mut cleanup_deadline,
                     )
                     .await,
@@ -5849,6 +5933,7 @@ impl DelegationEngine {
                         prod_execution_authority.owner_generation,
                         &failure.status,
                         failure.error.as_deref().unwrap_or("producer round setup failed"),
+                        None,
                         &mut round_settlement_deadline,
                     )
                     .await,
@@ -5876,6 +5961,8 @@ impl DelegationEngine {
             } else {
                 None
             };
+            let prod_mailbox_retirement =
+                MailboxRetirement::from_mailbox(&self.mailbox_router, prod_mailbox.as_ref());
 
             // Inject adversarial producer coordination prompt
             let has_feedback = last_producer_output.is_some();
@@ -5968,6 +6055,7 @@ impl DelegationEngine {
                     prod_execution_authority.owner_generation,
                 ),
                 prod_result,
+                prod_mailbox_retirement.as_ref(),
             )
             .await;
             // ── Gate on producer output before reviewer sees it ──
@@ -6104,6 +6192,7 @@ impl DelegationEngine {
                         rev_execution_authority.owner_generation,
                         AGENT_RESULT_STATUS_TIMEOUT,
                         "adversarial round deadline expired before reviewer execution",
+                        None,
                         &mut round_settlement_deadline,
                     )
                     .await,
@@ -6165,6 +6254,7 @@ impl DelegationEngine {
                         rev_execution_authority.owner_generation,
                         status,
                         &error,
+                        None,
                         &mut cleanup_deadline,
                     )
                     .await,
@@ -6205,6 +6295,7 @@ impl DelegationEngine {
                         rev_execution_authority.owner_generation,
                         &failure.status,
                         failure.error.as_deref().unwrap_or("reviewer round setup failed"),
+                        None,
                         &mut round_settlement_deadline,
                     )
                     .await,
@@ -6232,6 +6323,8 @@ impl DelegationEngine {
             } else {
                 None
             };
+            let rev_mailbox_retirement =
+                MailboxRetirement::from_mailbox(&self.mailbox_router, rev_mailbox.as_ref());
 
             // Inject adversarial reviewer coordination prompt
             let rev_coordination =
@@ -6312,6 +6405,7 @@ impl DelegationEngine {
                     rev_execution_authority.owner_generation,
                 ),
                 rev_result,
+                rev_mailbox_retirement.as_ref(),
             )
             .await;
             let final_state = agent_result_status_to_subrun_state(&rev_result.status);
@@ -6401,6 +6495,7 @@ impl DelegationEngine {
                 watch::Receiver<Option<AgentResult>>,
             ),
         > = HashMap::new();
+        let mut mailbox_retirements = HashMap::new();
         let mut fork_child_cancellations: Vec<(String, Arc<tokio_util::sync::CancellationToken>)> =
             Vec::new();
         let mut launch_failure = None;
@@ -6579,6 +6674,11 @@ impl DelegationEngine {
             } else {
                 None
             };
+            let mailbox_retirement =
+                MailboxRetirement::from_mailbox(&self.mailbox_router, fork_mailbox.as_ref());
+            if let Some(retirement) = mailbox_retirement.as_ref() {
+                mailbox_retirements.insert(run_id.clone(), retirement.clone());
+            }
 
             // Build fork-specific context: parent messages + fork instruction
             let mut fork_context = Self::child_task_context(request);
@@ -6732,6 +6832,7 @@ impl DelegationEngine {
                     settlement_session_id,
                     disposition,
                     result,
+                    mailbox_retirement.as_ref(),
                 )
                 .await
             });
@@ -6777,6 +6878,7 @@ impl DelegationEngine {
                                 .error
                                 .as_deref()
                                 .unwrap_or("fork child was not launched"),
+                            None,
                         ),
                     );
                 }
@@ -6934,6 +7036,7 @@ impl DelegationEngine {
                                     tool_calls: 0,
                                 }
                             });
+                            let mailbox = mailbox_retirements.get(&result.run_id);
                             settlements.push(reconcile_fork_result(
                                 self.run_engine.clone(),
                                 self.tracker.clone(),
@@ -6941,6 +7044,7 @@ impl DelegationEngine {
                                 session_id.clone(),
                                 panic_disposition,
                                 result,
+                                mailbox,
                             ));
                         }
                     }
@@ -6957,6 +7061,7 @@ impl DelegationEngine {
                 }
                 let attempted = observed_fork_execution_result(execution_result)
                     .unwrap_or_else(|| cancelled_agent_result(agent_id, run_id));
+                let mailbox = mailbox_retirements.get(run_id);
                 settlements.push(reconcile_fork_result(
                     self.run_engine.clone(),
                     self.tracker.clone(),
@@ -6968,6 +7073,7 @@ impl DelegationEngine {
                         executor_entered.load(Ordering::Acquire),
                     ),
                     attempted,
+                    mailbox,
                 ));
             }
         }
@@ -7345,6 +7451,16 @@ mod tests {
         let tracker = Arc::new(DelegationTracker::new());
 
         (Arc::new(RwLock::new(reg)), engine, tracker)
+    }
+
+    async fn assert_terminal_mailboxes_retired(transport: &crate::messaging::InProcessTransport) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while transport.retained_inbox_count().await != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("durably terminal child mailboxes must retire");
     }
 
     fn selected_model_registry(agents: &[(&str, &str)]) -> Arc<RwLock<AgentProfileRegistry>> {
@@ -7878,6 +7994,7 @@ mod tests {
                 authority.owner_generation,
                 STATUS_CANCELLED,
                 "parent cancelled before execution started",
+                None,
             )
             .await;
 
@@ -8599,11 +8716,11 @@ mod tests {
     }
 
     #[test]
-    fn unspecified_child_inherits_resolved_auto_policy_from_parent_constraints() {
+    fn unspecified_child_inherits_fixed_policy_from_parent_constraints() {
         use astra_turn_types::{
             DelegationIntentRequirement, DelegationIntentRequirements,
             DelegationRequirementPropagation, DelegationRequirementStrength,
-            DelegationUserRequirementSource, ModelSelection, RequestedModelPolicy,
+            DelegationUserRequirementSource, ModelSelection, ModelSelector, RequestedModelPolicy,
         };
 
         let source = DelegationUserRequirementSource {
@@ -8617,12 +8734,14 @@ mod tests {
         let requirements = DelegationIntentRequirements::Requirements {
             source,
             requirements: vec![DelegationIntentRequirement {
-                requirement_id: "auto-descendant".into(),
+                requirement_id: "fixed-descendant".into(),
                 model_selection: Some(ModelSelection {
-                    offering_id: "auto-selected".into(),
+                    offering_id: "fixed-selected".into(),
                 }),
-                requested_model_policy: Some(RequestedModelPolicy::Auto {
-                    strategy: astra_turn_types::AutoModelStrategy::Balanced,
+                requested_model_policy: Some(RequestedModelPolicy::Fixed {
+                    selector: ModelSelector::OfferingId {
+                        offering_id: "fixed-selected".into(),
+                    },
                 }),
                 reasoning: None,
                 task_scope_quote: None,
@@ -8644,12 +8763,14 @@ mod tests {
 
         assert_eq!(
             profile.model_selection.unwrap().offering_id,
-            "auto-selected"
+            "fixed-selected"
         );
         assert_eq!(
             policy,
-            Some(RequestedModelPolicy::Auto {
-                strategy: astra_turn_types::AutoModelStrategy::Balanced,
+            Some(RequestedModelPolicy::Fixed {
+                selector: ModelSelector::OfferingId {
+                    offering_id: "fixed-selected".into(),
+                },
             })
         );
         assert_eq!(child_constraints.delegated_model_requirements, requirements);
@@ -9304,7 +9425,13 @@ mod tests {
     #[tokio::test]
     async fn sequential_spawns_ordered_sub_runs() {
         let (reg, engine, tracker) = setup();
-        let de = DelegationEngine::new(reg, engine.clone(), tracker.clone());
+        let transport = Arc::new(crate::messaging::InProcessTransport::new());
+        let router = Arc::new(crate::messaging::AgentMailboxRouter::new(
+            transport.clone(),
+            tracker.clone(),
+        ));
+        let de =
+            DelegationEngine::new(reg, engine.clone(), tracker.clone()).with_mailbox_router(router);
 
         let req = DelegationRequest {
             session_id: "test-session".into(),
@@ -9329,6 +9456,7 @@ mod tests {
         assert_eq!(result.agent_results.len(), 2);
         assert_eq!(result.agent_results[0].agent_id, "coder");
         assert_eq!(result.agent_results[1].agent_id, "reviewer");
+        assert_terminal_mailboxes_retired(&transport).await;
     }
 
     #[tokio::test]
@@ -9373,7 +9501,13 @@ mod tests {
     #[tokio::test]
     async fn adversarial_spawns_producer_reviewer_pairs() {
         let (reg, engine, tracker) = setup();
-        let de = DelegationEngine::new(reg, engine.clone(), tracker.clone());
+        let transport = Arc::new(crate::messaging::InProcessTransport::new());
+        let router = Arc::new(crate::messaging::AgentMailboxRouter::new(
+            transport.clone(),
+            tracker.clone(),
+        ));
+        let de =
+            DelegationEngine::new(reg, engine.clone(), tracker.clone()).with_mailbox_router(router);
 
         let req = DelegationRequest {
             session_id: "test-session".into(),
@@ -9408,6 +9542,7 @@ mod tests {
         assert_eq!(subs[1].agent_id, "reviewer");
         assert_eq!(subs[2].agent_id, "coder");
         assert_eq!(subs[3].agent_id, "reviewer");
+        assert_terminal_mailboxes_retired(&transport).await;
     }
 
     #[tokio::test]
@@ -11375,6 +11510,7 @@ mod tests {
                     completion_tokens: 5,
                     tool_calls: 1,
                 },
+                None,
             )
             .await;
 
@@ -11422,6 +11558,7 @@ mod tests {
                 completion_tokens: 5,
                 tool_calls: 1,
             },
+            None,
         )
         .await;
 
@@ -11483,6 +11620,7 @@ mod tests {
                 completion_tokens: 5,
                 tool_calls: 1,
             },
+            None,
         )
         .await;
 
@@ -11538,6 +11676,7 @@ mod tests {
                 completion_tokens: 13,
                 tool_calls: 2,
             },
+            None,
         )
         .await;
 
@@ -11587,6 +11726,7 @@ mod tests {
                     completion_tokens: 5,
                     tool_calls: 1,
                 },
+                None,
             )
             .await;
 
@@ -11642,6 +11782,7 @@ mod tests {
                 completion_tokens: 5,
                 tool_calls: 1,
             },
+            None,
         )
         .await;
 
@@ -12800,6 +12941,12 @@ mod tests {
     #[tokio::test]
     async fn fork_spawns_parallel_children() {
         let (_, _engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
+        let transport = Arc::new(crate::messaging::InProcessTransport::new());
+        let router = Arc::new(crate::messaging::AgentMailboxRouter::new(
+            transport.clone(),
+            tracker.clone(),
+        ));
+        let de = de.with_mailbox_router(router);
 
         let req = fork_request(
             "del-fork-spawn",
@@ -12825,6 +12972,7 @@ mod tests {
             assert_eq!(ar.status, "completed");
             assert!(ar.output.is_some());
         }
+        assert_terminal_mailboxes_retired(&transport).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -13938,8 +14086,9 @@ mod tests {
     async fn gate_retry_registers_mailbox_when_router_present() {
         let (reg, engine, tracker) = setup();
         let gate = Arc::new(FailThenPassGate::new(1));
+        let transport = Arc::new(crate::messaging::InProcessTransport::new());
         let router = Arc::new(crate::messaging::AgentMailboxRouter::new(
-            Arc::new(crate::messaging::InProcessTransport::new()),
+            transport.clone(),
             tracker.clone(),
         ));
         let de =
@@ -13954,6 +14103,183 @@ mod tests {
             result.agent_results[0].output.as_deref(),
             Some("mailbox=true")
         );
+        assert_terminal_mailboxes_retired(&transport).await;
+    }
+
+    #[tokio::test]
+    async fn mailbox_retirement_requires_confirmed_durable_terminal_status() {
+        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+        let transport = Arc::new(crate::messaging::InProcessTransport::new());
+        let router = Arc::new(crate::messaging::AgentMailboxRouter::new(
+            transport.clone(),
+            Arc::new(DelegationTracker::new()),
+        ));
+        let mailbox_for = |run_id: &str| astra_messaging::types::AgentAddress {
+            run_id: run_id.to_string(),
+            agent_id: "worker".into(),
+        };
+        let result_for = |run_id: &str, status: &str| AgentResult {
+            agent_id: "worker".into(),
+            run_id: run_id.into(),
+            status: status.into(),
+            output: None,
+            error: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            tool_calls: 0,
+        };
+        let router_option = Some(router.clone());
+
+        let completed = engine.start_run("completed", "u", "s").await.unwrap();
+        let mailbox = router
+            .register(mailbox_for("completed"), None)
+            .await
+            .unwrap();
+        let retirement = MailboxRetirement::from_mailbox(&router_option, Some(&mailbox)).unwrap();
+        drop(mailbox);
+        let result = reconcile_agent_result_with_durable_authority(
+            &engine,
+            "u",
+            "s",
+            DurableLifecycleDisposition::SchedulerOwned {
+                owner_generation: completed.owner_generation,
+            },
+            result_for("completed", STATUS_COMPLETED),
+            Some(&retirement),
+        )
+        .await;
+        assert_eq!(result.status, STATUS_COMPLETED);
+
+        let reread = engine.start_run("reread", "u", "s").await.unwrap();
+        engine
+            .persist_status("u", "s", "reread", STATUS_COMPLETED, None, None)
+            .await
+            .unwrap();
+        let mailbox = router.register(mailbox_for("reread"), None).await.unwrap();
+        let reread_retirement =
+            MailboxRetirement::from_mailbox(&router_option, Some(&mailbox)).unwrap();
+        drop(mailbox);
+        let result = reconcile_agent_result_with_durable_authority(
+            &engine,
+            "u",
+            "s",
+            DurableLifecycleDisposition::ExecutorOwned {
+                owner_generation: reread.owner_generation,
+            },
+            result_for("reread", STATUS_COMPLETED),
+            Some(&reread_retirement),
+        )
+        .await;
+        assert_eq!(result.status, STATUS_COMPLETED);
+
+        let waiting = engine.start_run("waiting", "u", "s").await.unwrap();
+        let mailbox = router.register(mailbox_for("waiting"), None).await.unwrap();
+        let waiting_retirement =
+            MailboxRetirement::from_mailbox(&router_option, Some(&mailbox)).unwrap();
+        drop(mailbox);
+        let result = reconcile_agent_result_with_durable_authority(
+            &engine,
+            "u",
+            "s",
+            DurableLifecycleDisposition::SchedulerOwned {
+                owner_generation: waiting.owner_generation,
+            },
+            result_for("waiting", STATUS_WAITING),
+            Some(&waiting_retirement),
+        )
+        .await;
+        assert_eq!(result.status, STATUS_WAITING);
+
+        let mailbox = router.register(mailbox_for("missing"), None).await.unwrap();
+        let missing_retirement =
+            MailboxRetirement::from_mailbox(&router_option, Some(&mailbox)).unwrap();
+        drop(mailbox);
+        let result = reconcile_agent_result_with_durable_authority(
+            &engine,
+            "u",
+            "s",
+            DurableLifecycleDisposition::ReadOnly,
+            result_for("missing", STATUS_FAILED),
+            Some(&missing_retirement),
+        )
+        .await;
+        assert_eq!(result.status, STATUS_FAILED);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while transport.retained_inbox_count().await != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("only unconfirmed or nonterminal mailboxes may remain");
+        let resumed_waiting = router.register(mailbox_for("waiting"), None).await.unwrap();
+        assert_eq!(resumed_waiting.lifetime(), &waiting_retirement.lifetime);
+        let resumed_missing = router.register(mailbox_for("missing"), None).await.unwrap();
+        assert_eq!(resumed_missing.lifetime(), &missing_retirement.lifetime);
+        drop(resumed_waiting);
+        drop(resumed_missing);
+        router
+            .retire_terminal(&waiting_retirement.lifetime)
+            .await
+            .unwrap();
+        router
+            .retire_terminal(&missing_retirement.lifetime)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_shared_deadline_still_reconciles_all_terminal_mailboxes() {
+        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+        let transport = Arc::new(crate::messaging::InProcessTransport::new());
+        let router = Arc::new(crate::messaging::AgentMailboxRouter::new(
+            transport.clone(),
+            Arc::new(DelegationTracker::new()),
+        ));
+        let router_option = Some(router.clone());
+        let mut deadline = Some(tokio::time::Instant::now());
+        for run_id in ["first", "second"] {
+            let authority = engine.start_run(run_id, "u", "s").await.unwrap();
+            engine
+                .persist_status("u", "s", run_id, STATUS_COMPLETED, None, None)
+                .await
+                .unwrap();
+            let mailbox = router
+                .register(
+                    astra_messaging::types::AgentAddress::new(run_id, "worker"),
+                    None,
+                )
+                .await
+                .unwrap();
+            let retirement =
+                MailboxRetirement::from_mailbox(&router_option, Some(&mailbox)).unwrap();
+            drop(mailbox);
+            let projected = reconcile_agent_result_with_shared_deadline(
+                &engine,
+                "u",
+                "s",
+                DurableLifecycleDisposition::ExecutorOwned {
+                    owner_generation: authority.owner_generation,
+                },
+                AgentResult {
+                    agent_id: "worker".into(),
+                    run_id: run_id.into(),
+                    status: STATUS_COMPLETED.into(),
+                    output: None,
+                    error: None,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                },
+                Some(&retirement),
+                &mut deadline,
+                "fanout",
+                "child outcome",
+            )
+            .await;
+            assert_eq!(projected.status, STATUS_WAITING);
+        }
+        assert_terminal_mailboxes_retired(&transport).await;
     }
 
     #[tokio::test(start_paused = true)]

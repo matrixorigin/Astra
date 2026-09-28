@@ -3,7 +3,7 @@
 //! Resolves high-level targets (`Parent`, `Broadcast`) into concrete delivery
 //! actions using the delegation tracker and the pluggable transport.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Weak};
 
@@ -35,12 +35,15 @@ pub struct AgentMailbox {
     /// Delegation group this agent belongs to (if any).
     pub delegation_id: Option<String>,
     subscription: MailboxSubscription,
+    lifetime: MailboxLifetime,
     /// Message receive stream (direct + broadcast), mutex-guarded for Sync.
     stream: tokio::sync::Mutex<Box<dyn MessageStream>>,
     /// Messages buffered while waiting for a correlated response.
     buffered: tokio::sync::Mutex<VecDeque<Arc<AgentMessage>>>,
     /// Router reference for sending.
     router: Arc<AgentMailboxRouter>,
+    /// Terminal cleanup owns the route; Drop must not start a second cleanup.
+    terminal_cleanup_started: bool,
 }
 
 /// The registration task retains both ownership and its run gate until the
@@ -49,6 +52,7 @@ pub struct AgentMailbox {
 struct RegistrationHandoff {
     mailbox: Option<AgentMailbox>,
     gate: Option<tokio::sync::OwnedMutexGuard<()>>,
+    fresh_lifetime: bool,
 }
 
 impl RegistrationHandoff {
@@ -65,9 +69,13 @@ impl Drop for RegistrationHandoff {
             return;
         };
         let gate = mailbox.router.registration_gate(&mailbox.address.run_id);
+        let fresh_lifetime = self.fresh_lifetime;
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                if let Err(error) = mailbox.release_unconsumed_owned(gate, Some(held)).await {
+                if let Err(error) = mailbox
+                    .release_unconsumed_owned(gate, Some(held), fresh_lifetime)
+                    .await
+                {
                     tracing::warn!(
                         target: "astra_runtime::messaging",
                         error = %error,
@@ -143,9 +151,30 @@ impl AgentMailbox {
         &self.subscription
     }
 
+    pub fn lifetime(&self) -> &MailboxLifetime {
+        &self.lifetime
+    }
+
+    pub fn registration(&self) -> MailboxRegistration {
+        MailboxRegistration {
+            lifetime: self.lifetime.clone(),
+            subscription: self.subscription.clone(),
+        }
+    }
+
     /// Explicit cleanup and Drop present exactly the same original authority.
     pub async fn unregister(&self) -> Result<(), MailboxError> {
         self.router.unregister(&self.subscription).await
+    }
+
+    /// End a session or terminal child, rather than merely ending one turn.
+    pub fn retire(mut self) -> impl Future<Output = Result<(), MailboxError>> + Send {
+        let router = Arc::clone(&self.router);
+        let lifetime = self.lifetime.clone();
+        self.stream.get_mut().detach();
+        self.terminal_cleanup_started = true;
+        drop(self);
+        router.retire_terminal(&lifetime)
     }
 
     /// End a turn without consuming its late messages. This completion task
@@ -156,7 +185,8 @@ impl AgentMailbox {
         // the run gate now when free so a new turn cannot overtake handoff.
         let gate = self.router.registration_gate(&self.address.run_id);
         let held = gate.clone().try_lock_owned().ok();
-        let task = tokio::spawn(async move { self.release_unconsumed_owned(gate, held).await });
+        let task =
+            tokio::spawn(async move { self.release_unconsumed_owned(gate, held, false).await });
         async move {
             task.await.map_err(|error| {
                 MailboxError::Transport(format!("mailbox release task: {error}"))
@@ -165,60 +195,38 @@ impl AgentMailbox {
     }
 
     async fn release_unconsumed_owned(
-        mut self,
+        self,
         gate: Arc<tokio::sync::Mutex<()>>,
         held: Option<tokio::sync::OwnedMutexGuard<()>>,
+        forget_abandoned: bool,
     ) -> Result<(), MailboxError> {
         let router = Arc::clone(&self.router);
         let run_id = self.address.run_id.clone();
+        let subscription = self.subscription.clone();
+        let lifetime = self.lifetime.clone();
         let _registration = match held {
             Some(held) => held,
             None => gate.lock_owned().await,
         };
         router.transport.unregister(&self.subscription).await?;
         let mut registry = router.address_registry.write().await;
-        if registry.get(&run_id) == Some(&self.subscription) {
-            registry.remove(&run_id);
+        if let Some(record) = registry.get_mut(&run_id)
+            && record.subscription == self.subscription
+        {
+            record.attached = false;
         }
-        let replacement = registry.get(&run_id).cloned();
         drop(registry);
-
-        if !router.transport.recovers_unacknowledged_on_unregister() {
-            // The detached release task owns this mailbox through handoff;
-            // caller cancellation cannot strand envelopes in a local Vec.
-            // The normal queue limit applies to *new* sends; already-accepted
-            // messages must not be discarded while ending a turn.
-            let unread = self.drain();
-            if !unread.is_empty() {
-                let mut retry = VecDeque::new();
-                let mut can_forward = replacement.is_some();
-                for message in unread {
-                    let mut message = (*message).clone();
-                    if can_forward && let Some(ref replacement) = replacement {
-                        message.to = MessageTarget::Direct {
-                            address: replacement.address().clone(),
-                        };
-                        if router
-                            .transport
-                            .send(Arc::new(message.clone()))
-                            .await
-                            .is_ok()
-                        {
-                            continue;
-                        }
-                        // Keep the failed envelope and its suffix together;
-                        // later sends cannot overtake an earlier failed one.
-                        can_forward = false;
-                    }
-                    retry.push_back(message);
-                }
-                if !retry.is_empty() {
-                    // This is the existing parent backlog, not another
-                    // receipt queue. Keep original IDs for later replay.
-                    let mut pending = router.pending_parent_messages.lock().await;
-                    pending.entry(run_id).or_default().extend(retry);
-                }
-            }
+        // Drop the stream while holding the run gate. Volatile transports
+        // restore unacknowledged deliveries to their retained inbox; durable
+        // transports release their original claims on unregister.
+        drop(self);
+        if forget_abandoned
+            && router
+                .transport
+                .forget_abandoned_route(&subscription)
+                .await?
+        {
+            router.retire_owned(&lifetime, _registration).await?;
         }
         Ok(())
     }
@@ -400,6 +408,10 @@ impl AgentMailbox {
     ) -> Result<PermissionOutcome, MailboxError> {
         use crate::types::{MessagePayload, RequestType};
 
+        let expected_responder = self
+            .router
+            .resolve_parent_addr(&self.address.run_id)
+            .await?;
         // Build and send the request message
         let request_id = uuid::Uuid::new_v4().to_string();
         let data = serde_json::to_value(&request)
@@ -441,10 +453,16 @@ impl AgentMailbox {
             match next_message {
                 Ok(Some(msg)) => {
                     // Check if this is our response
-                    if msg.correlation_id.as_deref() == Some(&request_id) {
+                    if msg.correlation_id.as_deref() == Some(&request_id)
+                        && msg.from == expected_responder
+                    {
                         pending.unconfirmed = Some(Arc::clone(&msg));
                         let outcome = match &msg.payload {
-                            MessagePayload::Response { data, accepted, .. } => PermissionOutcome {
+                            MessagePayload::Response {
+                                request_id: reply_id,
+                                data,
+                                accepted,
+                            } if reply_id == &request_id => PermissionOutcome {
                                 accepted: *accepted,
                                 data: data.clone(),
                             },
@@ -475,11 +493,9 @@ impl AgentMailbox {
     }
 }
 
-/// Safety-net cleanup: unregister the mailbox from the router on drop.
-///
-/// Explicit `mailbox.unregister()` calls at usage sites remain the primary
-/// cleanup mechanism. This Drop impl catches cases where a mailbox is
-/// dropped without explicit cleanup (e.g., child agents in delegation).
+/// Detach this turn's receiver without ending its mailbox lifetime.
+/// Terminal session/child settlement must explicitly retire the lifetime;
+/// otherwise late messages accepted between turns could be lost.
 ///
 /// Uses `tokio::task::spawn` because `unregister` is async and `Drop` is sync.
 /// The spawned task is fire-and-forget — if the runtime is shutting down,
@@ -487,6 +503,10 @@ impl AgentMailbox {
 /// is being torn down anyway.
 impl Drop for AgentMailbox {
     fn drop(&mut self) {
+        self.stream.get_mut().detach();
+        if self.terminal_cleanup_started {
+            return;
+        }
         let router = Arc::clone(&self.router);
         let subscription = self.subscription.clone();
         // Best-effort: spawn only if a tokio runtime is available.
@@ -507,28 +527,153 @@ impl Drop for AgentMailbox {
 
 // ─── AgentMailboxRouter ─────────────────────────────────────────────────────
 
+/// Index aliases by canonical address so turn reattachment and terminal
+/// retirement touch only one session's turns, not every active session.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MailboxLifetime {
+    address: AgentAddress,
+    id: String,
+}
+
+impl MailboxLifetime {
+    fn new(address: AgentAddress) -> Self {
+        Self {
+            address,
+            id: uuid::Uuid::new_v4().simple().to_string(),
+        }
+    }
+
+    pub fn address(&self) -> &AgentAddress {
+        &self.address
+    }
+}
+
+impl std::ops::Deref for MailboxLifetime {
+    type Target = AgentAddress;
+
+    fn deref(&self) -> &Self::Target {
+        &self.address
+    }
+}
+
+/// The lifecycle's stable mailbox identity and this execution's attachment
+/// token travel together. A later attachment may replace the token without
+/// changing the lifetime that terminal settlement must retire.
+#[derive(Clone, Debug)]
+pub struct MailboxRegistration {
+    lifetime: MailboxLifetime,
+    subscription: MailboxSubscription,
+}
+
+impl MailboxRegistration {
+    pub fn lifetime(&self) -> &MailboxLifetime {
+        &self.lifetime
+    }
+
+    pub fn subscription(&self) -> &MailboxSubscription {
+        &self.subscription
+    }
+
+    pub fn address(&self) -> &AgentAddress {
+        self.lifetime.address()
+    }
+}
+
+impl std::ops::Deref for MailboxRegistration {
+    type Target = AgentAddress;
+
+    fn deref(&self) -> &Self::Target {
+        self.address()
+    }
+}
+
+impl std::fmt::Display for MailboxRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.address().fmt(f)
+    }
+}
+
+#[derive(Clone)]
+struct MailboxRecord {
+    lifetime: MailboxLifetime,
+    subscription: MailboxSubscription,
+    attached: bool,
+}
+
+#[derive(Default)]
+struct ParentDeliveryAliases {
+    by_turn: HashMap<String, ParentDeliveryAlias>,
+    by_address: HashMap<AgentAddress, HashSet<String>>,
+}
+
+#[derive(Clone)]
+struct ParentDeliveryAlias {
+    lifetime: MailboxLifetime,
+    sender_agent_id: String,
+}
+
+impl ParentDeliveryAliases {
+    fn get(&self, turn: &str) -> Option<&ParentDeliveryAlias> {
+        self.by_turn.get(turn)
+    }
+
+    fn insert(&mut self, turn: String, owner: MailboxLifetime, sender_agent_id: String) {
+        if let Some(previous) = self.by_turn.insert(
+            turn.clone(),
+            ParentDeliveryAlias {
+                lifetime: owner.clone(),
+                sender_agent_id,
+            },
+        ) {
+            let previous_address = previous.lifetime.address();
+            if let Some(turns) = self.by_address.get_mut(previous_address) {
+                turns.remove(&turn);
+                if turns.is_empty() {
+                    self.by_address.remove(previous_address);
+                }
+            }
+        }
+        self.by_address
+            .entry(owner.address().clone())
+            .or_default()
+            .insert(turn);
+    }
+
+    fn retire(&mut self, owner: &MailboxLifetime) {
+        let by_turn = &mut self.by_turn;
+        if let Some(turns) = self.by_address.get_mut(owner.address()) {
+            turns.retain(|turn| {
+                if by_turn
+                    .get(turn)
+                    .is_some_and(|alias| &alias.lifetime == owner)
+                {
+                    by_turn.remove(turn);
+                    false
+                } else {
+                    true
+                }
+            });
+            if turns.is_empty() {
+                self.by_address.remove(owner.address());
+            }
+        }
+    }
+}
+
 /// Central message router that resolves targets and dispatches via a transport.
-///
-/// Transport-agnostic: works with `InProcessTransport` (CLI, µs latency)
-/// or a future `DatabaseTransport` (Cloud, ~10ms latency) interchangeably.
 pub struct AgentMailboxRouter {
     transport: Arc<dyn MessageTransport>,
     delegation_tracker: Arc<dyn DelegationLookup>,
-    /// run_id → registered AgentAddress (for resolving Parent targets).
-    address_registry: tokio::sync::RwLock<std::collections::HashMap<String, MailboxSubscription>>,
+    /// One canonical lifetime per run; detach only clears its receiver attachment.
+    address_registry: tokio::sync::RwLock<std::collections::HashMap<String, MailboxRecord>>,
     /// Causal/turn run_id → stable mailbox address. Interactive parents can
     /// launch children from a turn-scoped run while receiving their eventual
     /// results through a session-scoped mailbox.
-    parent_delivery_aliases: tokio::sync::RwLock<std::collections::HashMap<String, AgentAddress>>,
-    /// Match the run-keyed registry and deferred-parent queue, including when
+    parent_delivery_aliases: tokio::sync::RwLock<ParentDeliveryAliases>,
+    /// Match the run-keyed registry, including when
     /// a replacement changes agent labels. Only the same run waits on I/O.
     registration_gates:
         std::sync::Mutex<std::collections::HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
-    /// Bounded terminal/checkpoint delivery waiting for a temporarily idle
-    /// parent mailbox to register again. Direct guidance is never queued here:
-    /// a missing child target must remain an explicit rejection.
-    pending_parent_messages:
-        tokio::sync::Mutex<std::collections::HashMap<String, VecDeque<AgentMessage>>>,
 }
 
 impl AgentMailboxRouter {
@@ -540,9 +685,8 @@ impl AgentMailboxRouter {
             transport,
             delegation_tracker,
             address_registry: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-            parent_delivery_aliases: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            parent_delivery_aliases: tokio::sync::RwLock::new(ParentDeliveryAliases::default()),
             registration_gates: std::sync::Mutex::new(std::collections::HashMap::new()),
-            pending_parent_messages: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -568,29 +712,8 @@ impl AgentMailboxRouter {
         addr: AgentAddress,
         delegation_id: Option<String>,
     ) -> Result<AgentMailbox, MailboxError> {
-        Ok(self
-            .register_owned(addr, delegation_id, false)
-            .await?
-            .expect("unconditional registration returns a mailbox"))
-    }
-
-    async fn register_owned(
-        self: &Arc<Self>,
-        addr: AgentAddress,
-        delegation_id: Option<String>,
-        if_absent: bool,
-    ) -> Result<Option<AgentMailbox>, MailboxError> {
         let gate = self.registration_gate(&addr.run_id);
         let held = gate.lock_owned().await;
-        if if_absent
-            && self
-                .address_registry
-                .read()
-                .await
-                .contains_key(&addr.run_id)
-        {
-            return Ok(None);
-        }
 
         // Once transport mutation starts, caller cancellation must not leave
         // a published route without a live consumer. The handoff also owns
@@ -600,22 +723,37 @@ impl AgentMailboxRouter {
             router
                 .register_inner(addr, delegation_id)
                 .await
-                .map(|mailbox| RegistrationHandoff {
+                .map(|(mailbox, fresh_lifetime)| RegistrationHandoff {
                     mailbox: Some(mailbox),
                     gate: Some(held),
+                    fresh_lifetime,
                 })
         });
         let handoff = task.await.map_err(|error| {
             MailboxError::Transport(format!("mailbox registration task: {error}"))
         })??;
-        Ok(Some(handoff.accept()))
+        Ok(handoff.accept())
     }
 
     async fn register_inner(
         self: &Arc<Self>,
         addr: AgentAddress,
         delegation_id: Option<String>,
-    ) -> Result<AgentMailbox, MailboxError> {
+    ) -> Result<(AgentMailbox, bool), MailboxError> {
+        let previous = self
+            .address_registry
+            .read()
+            .await
+            .get(&addr.run_id)
+            .cloned();
+        if let Some(record) = &previous
+            && record.lifetime.address() != &addr
+        {
+            return Err(MailboxError::Protocol(format!(
+                "run '{}' is already bound to another mailbox address",
+                addr.run_id
+            )));
+        }
         let subscription = self
             .transport
             .register(addr.clone(), delegation_id.clone())
@@ -624,7 +762,8 @@ impl AgentMailboxRouter {
         let stream = match self.transport.subscribe(&subscription).await {
             Ok(stream) => stream,
             Err(err) => {
-                if let Err(unregister_err) = self.transport.unregister(&subscription).await {
+                let unregistered = self.transport.unregister(&subscription).await;
+                if let Err(unregister_err) = &unregistered {
                     tracing::warn!(
                         target: "astra_runtime::messaging",
                         addr = %addr,
@@ -632,43 +771,54 @@ impl AgentMailboxRouter {
                         "failed to roll back transport registration after subscribe error",
                     );
                 }
-                // The attempted replacement already displaced the old
-                // transport owner. Its prior route is no longer usable.
-                self.address_registry.write().await.remove(&addr.run_id);
+                if let Some(mut previous) = previous {
+                    // The transport may have replaced a detached attachment
+                    // before subscribe failed. Keep the same lifetime but use
+                    // its latest token for eventual terminal retirement.
+                    previous.subscription = subscription;
+                    previous.attached = false;
+                    self.address_registry
+                        .write()
+                        .await
+                        .insert(addr.run_id.clone(), previous);
+                } else if unregistered.is_ok()
+                    && let Err(error) = self.transport.forget_abandoned_route(&subscription).await
+                {
+                    tracing::warn!(
+                        target: "astra_runtime::messaging",
+                        addr = %addr,
+                        %error,
+                        "failed to reclaim empty failed mailbox registration"
+                    );
+                }
                 return Err(err);
             }
         };
 
-        let mut mailbox = AgentMailbox {
+        let fresh_lifetime = previous.is_none();
+        let lifetime = previous
+            .map(|record| record.lifetime)
+            .unwrap_or_else(|| MailboxLifetime::new(addr.clone()));
+
+        let mailbox = AgentMailbox {
             address: addr.clone(),
             delegation_id,
             subscription: subscription.clone(),
+            lifetime: lifetime.clone(),
             stream: tokio::sync::Mutex::new(stream),
             buffered: tokio::sync::Mutex::new(VecDeque::new()),
             router: Arc::clone(self),
+            terminal_cleanup_started: false,
         };
-        // Only volatile parents use this backlog. Move original envelopes
-        // ahead of new channel arrivals without replay I/O or channel limits.
-        let pending = self
-            .pending_parent_messages
-            .lock()
-            .await
-            .remove(&addr.run_id)
-            .unwrap_or_default();
-        for mut message in pending {
-            if message.is_expired() {
-                continue;
-            }
-            message.to = MessageTarget::Direct {
-                address: addr.clone(),
-            };
-            mailbox.buffered.get_mut().push_back(Arc::new(message));
-        }
-        self.address_registry
-            .write()
-            .await
-            .insert(addr.run_id, subscription);
-        Ok(mailbox)
+        self.address_registry.write().await.insert(
+            addr.run_id.clone(),
+            MailboxRecord {
+                lifetime,
+                subscription,
+                attached: true,
+            },
+        );
+        Ok((mailbox, fresh_lifetime))
     }
 
     /// Unregister the original subscription (typically on completion/failure).
@@ -683,15 +833,89 @@ impl AgentMailboxRouter {
         let subscription = subscription.clone();
         let task = tokio::spawn(async move {
             let _registration = held;
+            let attached = router
+                .address_registry
+                .read()
+                .await
+                .get(&subscription.run_id)
+                .is_some_and(|record| record.attached && record.subscription == subscription);
+            if !attached {
+                return Ok(());
+            }
             router.transport.unregister(&subscription).await?;
             let mut registry = router.address_registry.write().await;
-            if registry.get(&subscription.run_id) == Some(&subscription) {
-                registry.remove(&subscription.run_id);
+            if let Some(record) = registry.get_mut(&subscription.run_id)
+                && record.subscription == subscription
+            {
+                record.attached = false;
             }
             Ok(())
         });
         task.await
             .map_err(|error| MailboxError::Transport(format!("mailbox cleanup task: {error}")))?
+    }
+
+    async fn retire_owned(
+        &self,
+        lifetime: &MailboxLifetime,
+        _held: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<(), MailboxError> {
+        let Some(record) = self
+            .address_registry
+            .read()
+            .await
+            .get(&lifetime.run_id)
+            .filter(|record| record.lifetime == *lifetime)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        if record.attached {
+            self.transport.unregister(&record.subscription).await?;
+        }
+        self.transport.retire(&record.subscription).await?;
+        let mut registry = self.address_registry.write().await;
+        if registry
+            .get(&lifetime.run_id)
+            .is_some_and(|current| current.lifetime == *lifetime)
+        {
+            registry.remove(&lifetime.run_id);
+        }
+        drop(registry);
+        self.parent_delivery_aliases.write().await.retire(lifetime);
+        Ok(())
+    }
+
+    /// End a terminal mailbox lifetime and its aliases. Cleanup starts before
+    /// the returned future is polled, so cancelling a timeout cannot split
+    /// unregister from retirement. A different lifetime is fenced by the run gate.
+    pub fn retire_terminal(
+        self: &Arc<Self>,
+        lifetime: &MailboxLifetime,
+    ) -> impl Future<Output = Result<(), MailboxError>> + Send + use<> {
+        let router = Arc::clone(self);
+        let lifetime = lifetime.clone();
+        let task = tokio::spawn(async move {
+            let held = router
+                .registration_gate(&lifetime.run_id)
+                .lock_owned()
+                .await;
+            let result = router.retire_owned(&lifetime, held).await;
+            if let Err(error) = &result {
+                tracing::warn!(
+                    target: "astra_runtime::messaging",
+                    run_id = %lifetime.run_id,
+                    %error,
+                    "terminal mailbox cleanup failed"
+                );
+            }
+            result
+        });
+        async move {
+            task.await.map_err(|error| {
+                MailboxError::Transport(format!("mailbox terminal cleanup task: {error}"))
+            })?
+        }
     }
 
     /// Record a sub-run relationship for parent-target resolution.
@@ -720,29 +944,28 @@ impl AgentMailboxRouter {
         self.transport.resolve_agent(delegation_id, agent_id).await
     }
 
-    /// Resolve an exact run identity already owned by this router.
+    /// Resolve an exact run identity whose mailbox lifetime has not retired.
+    /// A detached run still owns its retained inbox and can be addressed.
     pub async fn registered_address(&self, run_id: &str) -> Option<AgentAddress> {
         self.address_registry
             .read()
             .await
             .get(run_id)
-            .map(|s| s.address().clone())
+            .map(|record| record.lifetime.address().clone())
     }
 
     /// Resolve the sender bound to this execution, never a process-global
     /// agent label shared by unrelated sessions.
     pub async fn sender_address(&self, run_id: &str, agent_id: &str) -> Option<AgentAddress> {
-        let registry = self.address_registry.read().await;
-        if let Some(subscription) = registry.get(run_id) {
-            return (subscription.agent_id == agent_id).then(|| subscription.address().clone());
+        if let Some(alias) = self.parent_delivery_aliases.read().await.get(run_id) {
+            return (alias.sender_agent_id == agent_id).then(|| alias.lifetime.address().clone());
         }
-        drop(registry);
-        self.parent_delivery_aliases
+        self.address_registry
             .read()
             .await
             .get(run_id)
-            .filter(|address| address.agent_id == agent_id)
-            .cloned()
+            .filter(|record| record.lifetime.agent_id == agent_id)
+            .map(|record| record.lifetime.address().clone())
     }
 
     /// Bind a turn-scoped parent run to the stable mailbox that should receive
@@ -751,17 +974,31 @@ impl AgentMailboxRouter {
         &self,
         parent_run_id: &str,
         mailbox_address: &AgentAddress,
+        sender_agent_id: &str,
     ) {
         if parent_run_id.is_empty()
             || mailbox_address.run_id.is_empty()
+            || sender_agent_id.is_empty()
             || parent_run_id == mailbox_address.run_id.as_str()
         {
             return;
         }
-        self.parent_delivery_aliases
-            .write()
+        let gate = self.registration_gate(&mailbox_address.run_id);
+        let _registration = gate.lock().await;
+        let owner = self
+            .address_registry
+            .read()
             .await
-            .insert(parent_run_id.to_string(), mailbox_address.clone());
+            .get(&mailbox_address.run_id)
+            .filter(|record| record.lifetime.address() == mailbox_address)
+            .map(|record| record.lifetime.clone());
+        if let Some(owner) = owner {
+            self.parent_delivery_aliases.write().await.insert(
+                parent_run_id.to_string(),
+                owner,
+                sender_agent_id.to_string(),
+            );
+        }
     }
 
     /// Return the canonical parent run identity for a child run.
@@ -771,21 +1008,11 @@ impl AgentMailboxRouter {
 
     /// Check whether a specific run_id is registered in the address registry.
     pub async fn is_run_registered(&self, run_id: &str) -> bool {
-        self.address_registry.read().await.contains_key(run_id)
-    }
-
-    /// Register an agent only if its run_id is not already registered.
-    ///
-    /// Returns `Ok(Some(mailbox))` if newly registered, `Ok(None)` if already
-    /// present (no-op), or `Err` on transport failure.
-    ///
-    /// This prevents clobbering a caller's pre-registered mailbox.
-    pub async fn register_if_absent(
-        self: &Arc<Self>,
-        addr: AgentAddress,
-        delegation_id: Option<String>,
-    ) -> Result<Option<AgentMailbox>, MailboxError> {
-        self.register_owned(addr, delegation_id, true).await
+        self.address_registry
+            .read()
+            .await
+            .get(run_id)
+            .is_some_and(|record| record.attached)
     }
 
     /// Resolve the address of a parent run.
@@ -796,54 +1023,52 @@ impl AgentMailboxRouter {
             .await
             .ok_or(MailboxError::NoParent)?;
 
-        let delivery_address = self
+        let aliased_lifetime = self
             .parent_delivery_aliases
             .read()
             .await
             .get(&parent_run_id)
-            .cloned();
-        let delivery_run_id = delivery_address
+            .map(|alias| alias.lifetime.clone());
+        let delivery_run_id = aliased_lifetime
             .as_ref()
-            .map(|address| address.run_id.as_str())
+            .map(|lifetime| lifetime.run_id.as_str())
             .unwrap_or(parent_run_id.as_str());
 
-        // Try address registry first (includes root agents and stable aliases).
-        if let Some(addr) = self.address_registry.read().await.get(delivery_run_id) {
-            return Ok(addr.address().clone());
+        // Both attached and detached adopted lifetimes are valid destinations.
+        // A stale alias must never route into a later lifetime at the same
+        // address, nor synthesize a durable queue for an unknown consumer.
+        if let Some(record) = self.address_registry.read().await.get(delivery_run_id)
+            && aliased_lifetime
+                .as_ref()
+                .is_none_or(|alias| alias == &record.lifetime)
+        {
+            return Ok(record.lifetime.address().clone());
         }
 
-        if let Some(delivery_address) = delivery_address {
-            // The alias remains useful while the stable root mailbox is idle:
-            // retain the full canonical identity. Durable transports route by
-            // both run_id and agent_id, so synthesizing either field here
-            // would persist the message to an address that never registers.
-            return Ok(delivery_address);
-        }
-
-        // Fall back to delegation tracker (for agents registered before router).
-        let agent_id = self
-            .delegation_tracker
-            .get_agent_id(&parent_run_id)
-            .await
-            .filter(|id| !id.is_empty());
-
-        match agent_id {
-            Some(id) => Ok(AgentAddress::new(&parent_run_id, &id)),
-            None => {
-                // A durable direct address includes both run and agent id.
-                // Guessing a root label here can report success while a DB
-                // transport persists the message for a mailbox that will
-                // never register. Reject explicitly and require callers to
-                // register/alias the canonical root mailbox first.
-                Err(MailboxError::Protocol(format!(
-                    "parent run '{parent_run_id}' has no canonical mailbox address (child '{child_run_id}')"
-                )))
-            }
-        }
+        // A tracker relationship proves lineage, not an active or resumable
+        // consumer. Guessing an address would let a durable transport accept
+        // messages for a mailbox that nobody ever registered.
+        Err(MailboxError::Protocol(format!(
+            "parent run '{parent_run_id}' has no canonical mailbox address (child '{child_run_id}')"
+        )))
     }
 
     /// Send a message, resolving `Parent` and `Broadcast` targets. Direct
     /// targets must already carry their canonical run identity.
+    pub async fn question_responder(
+        &self,
+        sender_run_id: &str,
+        target: &MessageTarget,
+    ) -> Result<AgentAddress, MailboxError> {
+        match target {
+            MessageTarget::Parent => self.resolve_parent_addr(sender_run_id).await,
+            MessageTarget::Direct { address } => Ok(address.clone()),
+            MessageTarget::Broadcast { .. } => Err(MailboxError::Protocol(
+                "a question needs one responder; broadcast questions are unsupported".into(),
+            )),
+        }
+    }
+
     pub async fn send(&self, msg: AgentMessage) -> Result<(), MailboxError> {
         let target = msg.to.clone();
         match target {
@@ -860,65 +1085,13 @@ impl AgentMailboxRouter {
             }
             MessageTarget::Parent => {
                 let parent_addr = self.resolve_parent_addr(&msg.from.run_id).await?;
-                let parent_run_id = parent_addr.run_id.clone();
                 let resolved_msg = AgentMessage {
                     to: MessageTarget::Direct {
                         address: parent_addr,
                     },
                     ..msg
                 };
-                match self.transport.send(Arc::new(resolved_msg.clone())).await {
-                    Ok(()) => Ok(()),
-                    Err(MailboxError::AgentNotFound(_)) => {
-                        // Close the send-failed → parent-registers → queue-late
-                        // race. Registration/unregistration use the same gate:
-                        // if registration already won, retry its canonical
-                        // address now; if this branch wins, registration will
-                        // flush the message after we enqueue it.
-                        let gate = self.registration_gate(&parent_run_id);
-                        let _registration = gate.lock().await;
-                        let current_addr = self
-                            .address_registry
-                            .read()
-                            .await
-                            .get(&parent_run_id)
-                            .cloned();
-                        let queued_message = if let Some(current_addr) = current_addr {
-                            let retry_message = AgentMessage {
-                                to: MessageTarget::Direct {
-                                    address: current_addr.address().clone(),
-                                },
-                                ..resolved_msg.clone()
-                            };
-                            match self.transport.send(Arc::new(retry_message.clone())).await {
-                                Ok(()) => return Ok(()),
-                                Err(MailboxError::AgentNotFound(_)) => retry_message,
-                                Err(error) => return Err(error),
-                            }
-                        } else {
-                            resolved_msg
-                        };
-                        const MAX_PENDING_PARENT_MESSAGES: usize = 256;
-                        const MAX_PENDING_PARENT_RUNS: usize = 256;
-                        let mut pending = self.pending_parent_messages.lock().await;
-                        if !pending.contains_key(&parent_run_id)
-                            && pending.len() >= MAX_PENDING_PARENT_RUNS
-                        {
-                            return Err(MailboxError::Transport(format!(
-                                "pending parent mailbox run capacity reached ({MAX_PENDING_PARENT_RUNS}); message was not accepted"
-                            )));
-                        }
-                        let queue = pending.entry(parent_run_id).or_default();
-                        if queue.len() >= MAX_PENDING_PARENT_MESSAGES {
-                            return Err(MailboxError::Transport(format!(
-                                "pending parent mailbox message capacity reached ({MAX_PENDING_PARENT_MESSAGES}); message was not accepted"
-                            )));
-                        }
-                        queue.push_back(queued_message);
-                        Ok(())
-                    }
-                    Err(error) => Err(error),
-                }
+                self.transport.send(Arc::new(resolved_msg)).await
             }
         }
     }
@@ -1030,25 +1203,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_unregister_and_drop_preserve_replacement_mailbox() {
+    async fn active_mailbox_rejects_replacement_and_stale_cleanup_preserves_successor() {
         let router = Arc::new(AgentMailboxRouter::new(
             Arc::new(InProcessTransport::new()),
             tracker(),
         ));
         let address = addr("same-run", "same-agent");
         let old = router.register(address.clone(), None).await.unwrap();
-        let mut replacement = router.register(address.clone(), None).await.unwrap();
-        assert_ne!(old.subscription(), replacement.subscription());
+        assert!(router.register(address.clone(), None).await.is_err());
         old.unregister().await.unwrap();
-        let owners_before_drop = Arc::strong_count(&router);
         drop(old);
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while Arc::strong_count(&router) >= owners_before_drop {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("old Drop cleanup finished");
+        let mut replacement = router.register(address.clone(), None).await.unwrap();
         assert_eq!(
             router.registered_address(&address.run_id).await,
             Some(address.clone())
@@ -1066,6 +1231,278 @@ mod tests {
         assert_eq!(replacement.try_recv().unwrap().id, id);
         replacement.unregister().await.unwrap();
         assert!(!router.is_run_registered("same-run").await);
+    }
+
+    #[tokio::test]
+    async fn cancelled_terminal_waiter_still_retires_address_and_alias() {
+        let transport = Arc::new(InProcessTransport::new());
+        let router = Arc::new(AgentMailboxRouter::new(transport.clone(), tracker()));
+        let address = addr("session", "root");
+        let mailbox = router.register(address.clone(), None).await.unwrap();
+        router
+            .record_parent_delivery_alias("prior-turn", &address, &address.agent_id)
+            .await;
+        let gate = router.registration_gate(&address.run_id);
+        let held = gate.lock_owned().await;
+        let cleanup = mailbox.retire();
+        drop(cleanup);
+        drop(held);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if router.sender_address("prior-turn", "root").await.is_none()
+                    && transport.agent_count().await == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal cleanup survives cancellation");
+        let late = Arc::new(AgentMessage::new(
+            addr("child", "worker"),
+            MessageTarget::Direct { address },
+            MessagePayload::Text {
+                content: "late".into(),
+                summary: None,
+            },
+        ));
+        assert!(transport.send(late).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stale_terminal_cleanup_keeps_successor_alias() {
+        let transport = Arc::new(InProcessTransport::new());
+        let router = Arc::new(AgentMailboxRouter::new(transport, tracker()));
+        let address = addr("session", "root");
+        let old = router.register(address.clone(), None).await.unwrap();
+        let old_lifetime = old.lifetime().clone();
+        old.retire().await.unwrap();
+        let replacement = router.register(address.clone(), None).await.unwrap();
+        router
+            .record_parent_delivery_alias("new-turn", &address, &address.agent_id)
+            .await;
+        router.retire_terminal(&old_lifetime).await.unwrap();
+        assert_eq!(
+            router.sender_address("new-turn", "root").await,
+            Some(address)
+        );
+        drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn terminal_children_reclaim_capacity_with_a_thousand_live_sessions() {
+        let transport = Arc::new(InProcessTransport::new());
+        let router = Arc::new(AgentMailboxRouter::new(transport.clone(), tracker()));
+        let mut roots = Vec::with_capacity(1_000);
+        for index in 0..1_000 {
+            roots.push(
+                router
+                    .register(addr(&format!("session-{index}"), "root"), None)
+                    .await
+                    .unwrap(),
+            );
+        }
+        for index in 0..8_200 {
+            let child = router
+                .register(addr(&format!("child-{index}"), "worker"), None)
+                .await
+                .unwrap();
+            child.retire().await.unwrap();
+        }
+        assert_eq!(transport.retained_inbox_count().await, roots.len());
+        for root in roots {
+            root.retire().await.unwrap();
+        }
+        assert_eq!(transport.retained_inbox_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_successor_retires_aliases_from_prior_turns() {
+        let transport = Arc::new(InProcessTransport::new());
+        let router = Arc::new(AgentMailboxRouter::new(transport, tracker()));
+        let address = addr("session", "root");
+        let first = router.register(address.clone(), None).await.unwrap();
+        router
+            .record_parent_delivery_alias("turn-one", &address, &address.agent_id)
+            .await;
+        first.release_unconsumed().await.unwrap();
+        let second = router.register(address.clone(), None).await.unwrap();
+        router
+            .record_parent_delivery_alias("turn-two", &address, &address.agent_id)
+            .await;
+        assert_eq!(
+            router.sender_address("turn-one", "root").await,
+            Some(address.clone())
+        );
+        second.retire().await.unwrap();
+        assert!(router.sender_address("turn-one", "root").await.is_none());
+        assert!(router.sender_address("turn-two", "root").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn different_turn_profiles_share_one_mailbox_without_sender_spoofing() {
+        let router = Arc::new(AgentMailboxRouter::new(
+            Arc::new(InProcessTransport::new()),
+            tracker(),
+        ));
+        let stable = addr("session", "root-agent");
+        let first = router.register(stable.clone(), None).await.unwrap();
+        router
+            .record_parent_delivery_alias("turn-plan", &stable, "planner")
+            .await;
+        first.release_unconsumed().await.unwrap();
+        let second = router.register(stable.clone(), None).await.unwrap();
+        router
+            .record_parent_delivery_alias("turn-review", &stable, "reviewer")
+            .await;
+        assert_eq!(
+            router.sender_address("turn-plan", "planner").await,
+            Some(stable.clone())
+        );
+        assert_eq!(
+            router.sender_address("turn-review", "reviewer").await,
+            Some(stable)
+        );
+        assert!(
+            router
+                .sender_address("turn-plan", "reviewer")
+                .await
+                .is_none()
+        );
+        assert!(
+            router
+                .sender_address("turn-review", "planner")
+                .await
+                .is_none()
+        );
+        second.retire().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn detached_nested_parent_retains_canonical_route_until_terminal() {
+        let router = Arc::new(AgentMailboxRouter::new(
+            Arc::new(InProcessTransport::new()),
+            tracker(),
+        ));
+        let address = addr("nested-parent", "planner");
+        let parent = router.register(address.clone(), None).await.unwrap();
+        router
+            .record_sub_run(SubRunInfo {
+                run_id: "nested-child".into(),
+                parent_run_id: address.run_id.clone(),
+                delegation_id: "group".into(),
+                agent_id: "worker".into(),
+                depth: 2,
+            })
+            .await;
+        parent.release_unconsumed().await.unwrap();
+
+        let message = AgentMessage::new(
+            addr("nested-child", "worker"),
+            MessageTarget::Parent,
+            MessagePayload::Text {
+                content: "need guidance".into(),
+                summary: None,
+            },
+        );
+        let id = message.id.clone();
+        router.send(message).await.unwrap();
+
+        let mut resumed = router.register(address, None).await.unwrap();
+        assert_eq!(resumed.try_recv().unwrap().id, id);
+        resumed.retire().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn detached_child_accepts_parent_answer_until_terminal_retirement() {
+        let router = Arc::new(AgentMailboxRouter::new(
+            Arc::new(InProcessTransport::new()),
+            tracker(),
+        ));
+        let parent_address = addr("parent-run", "orchestrator");
+        let child_address = addr("child-run", "worker");
+        let parent = router.register(parent_address.clone(), None).await.unwrap();
+        let child = router.register(child_address.clone(), None).await.unwrap();
+        router
+            .record_sub_run(SubRunInfo {
+                run_id: child_address.run_id.clone(),
+                parent_run_id: parent_address.run_id.clone(),
+                delegation_id: parent_address.run_id.clone(),
+                agent_id: child_address.agent_id.clone(),
+                depth: 1,
+            })
+            .await;
+        child.release_unconsumed().await.unwrap();
+        assert_eq!(
+            router.registered_address(&child_address.run_id).await,
+            Some(child_address.clone())
+        );
+        let answer = AgentMessage::new(
+            parent_address,
+            MessageTarget::Direct {
+                address: child_address.clone(),
+            },
+            MessagePayload::Response {
+                request_id: "question-1".into(),
+                accepted: true,
+                data: Some(serde_json::json!({"content": "Use JSON."})),
+            },
+        );
+        let answer_id = answer.id.clone();
+        router.send(answer.clone()).await.unwrap();
+        let mut resumed = router.register(child_address.clone(), None).await.unwrap();
+        assert_eq!(resumed.try_recv().unwrap().id, answer_id);
+        resumed.retire().await.unwrap();
+        assert!(
+            router
+                .registered_address(&child_address.run_id)
+                .await
+                .is_none()
+        );
+        assert!(router.send(answer).await.is_err());
+        parent.retire().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_alias_precedes_a_turn_address_for_sender_identity() {
+        let router = Arc::new(AgentMailboxRouter::new(
+            Arc::new(InProcessTransport::new()),
+            tracker(),
+        ));
+        let stable = addr("session", "root");
+        let _session = router.register(stable.clone(), None).await.unwrap();
+        router
+            .record_parent_delivery_alias("turn", &stable, &stable.agent_id)
+            .await;
+        let _obsolete_turn = router.register(addr("turn", "root"), None).await.unwrap();
+        assert_eq!(router.sender_address("turn", "root").await, Some(stable));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_mailbox_immediately_allows_same_address_to_attach() {
+        let router = Arc::new(AgentMailboxRouter::new(
+            Arc::new(InProcessTransport::new()),
+            tracker(),
+        ));
+        let address = addr("session", "root");
+        let old = router.register(address.clone(), None).await.unwrap();
+        let message = AgentMessage::new(
+            addr("child", "worker"),
+            MessageTarget::Direct {
+                address: address.clone(),
+            },
+            MessagePayload::Text {
+                content: "accepted".into(),
+                summary: None,
+            },
+        );
+        let id = message.id.clone();
+        router.send(message).await.unwrap();
+        drop(old);
+        let mut next = router.register(address, None).await.unwrap();
+        assert_eq!(next.try_recv().unwrap().id, id);
     }
 
     #[tokio::test]
@@ -1107,11 +1544,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_registration_releases_accepted_message_and_route() {
+    async fn cancelled_new_registration_reclaims_empty_provisional_inbox() {
+        let transport = Arc::new(InProcessTransport::new());
+        let router = Arc::new(AgentMailboxRouter::new(transport.clone(), tracker()));
+        let address = addr("empty-run", "root");
+        let registry = router.address_registry.read().await;
+        let registering = {
+            let router = Arc::clone(&router);
+            let address = address.clone();
+            tokio::spawn(async move { router.register(address, None).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while transport.agent_count().await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        registering.abort();
+        let _ = registering.await;
+        drop(registry);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while transport.retained_inbox_count().await != 0
+                || router.registered_address("empty-run").await.is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("empty provisional inbox must release its bounded address slot");
+    }
+
+    #[tokio::test]
+    async fn cancelled_new_registration_retains_accepted_message_for_retry() {
         let transport = Arc::new(InProcessTransport::new());
         let router = Arc::new(AgentMailboxRouter::new(transport.clone(), tracker()));
         let address = addr("run", "root");
-        let pending = router.pending_parent_messages.lock().await;
+        let registry = router.address_registry.read().await;
         let registering = {
             let router = router.clone();
             let address = address.clone();
@@ -1134,11 +1603,11 @@ mod tests {
                 summary: None,
             },
         );
-        let id = message.id.clone();
+        let message_id = message.id.clone();
         router.send(message).await.unwrap();
         registering.abort();
         let _ = registering.await;
-        drop(pending);
+        drop(registry);
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while transport.agent_count().await != 0 || router.is_run_registered("run").await {
@@ -1147,12 +1616,8 @@ mod tests {
         })
         .await
         .expect("abandoned registration must release transport and route");
-        let mut replacement = router
-            .register_if_absent(address, None)
-            .await
-            .unwrap()
-            .expect("abandoned registration cannot block replacement");
-        assert_eq!(replacement.try_recv().unwrap().id, id);
+        let mut replacement = router.register(address, None).await.unwrap();
+        assert_eq!(replacement.try_recv().unwrap().id, message_id);
     }
 
     #[tokio::test]
@@ -1178,16 +1643,16 @@ mod tests {
         drop(RegistrationHandoff {
             mailbox: Some(mailbox),
             gate: Some(held),
+            fresh_lifetime: false,
         });
 
         let mut next = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            router.register_if_absent(address, None),
+            router.register(address, None),
         )
         .await
         .expect("handoff cleanup must release the gate")
-        .unwrap()
-        .expect("abandoned handoff cannot reserve the run");
+        .unwrap();
         assert_eq!(next.try_recv().unwrap().id, id);
     }
 
@@ -1202,10 +1667,10 @@ mod tests {
         let _first_mailbox = router.register(first.clone(), None).await.unwrap();
         let _second_mailbox = router.register(second.clone(), None).await.unwrap();
         router
-            .record_parent_delivery_alias("turn-one", &first)
+            .record_parent_delivery_alias("turn-one", &first, &first.agent_id)
             .await;
         router
-            .record_parent_delivery_alias("turn-two", &second)
+            .record_parent_delivery_alias("turn-two", &second, &second.agent_id)
             .await;
 
         assert_eq!(
@@ -1246,7 +1711,9 @@ mod tests {
             ids.push(message.id.clone());
             router.send(message).await.unwrap();
         }
-        assert_eq!(mailbox.try_recv().unwrap().id, ids[0]);
+        let consumed = mailbox.try_recv().unwrap();
+        assert_eq!(consumed.id, ids[0]);
+        mailbox.acknowledge_received(&[consumed]).await.unwrap();
         // A read-ahead envelope and the channel backlog have the same owner.
         assert!(mailbox.wait_ready().await);
         mailbox.release_unconsumed().await.unwrap();
@@ -1280,6 +1747,65 @@ mod tests {
             lease.commit();
         }
         assert!(next.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn parent_messages_accepted_while_idle_keep_order_and_original_ids() {
+        let router = Arc::new(AgentMailboxRouter::new(
+            Arc::new(InProcessTransport::new()),
+            tracker(),
+        ));
+        let parent = addr("session", "root");
+        let child = addr("child-run", "worker");
+        let first = router.register(parent.clone(), None).await.unwrap();
+        router
+            .record_parent_delivery_alias("parent-turn", &parent, &parent.agent_id)
+            .await;
+        router
+            .record_sub_run(SubRunInfo {
+                run_id: child.run_id.clone(),
+                parent_run_id: "parent-turn".into(),
+                agent_id: child.agent_id.clone(),
+                depth: 1,
+                delegation_id: "test".into(),
+            })
+            .await;
+        let early = AgentMessage::new(
+            child.clone(),
+            MessageTarget::Parent,
+            MessagePayload::Text {
+                content: "early".into(),
+                summary: None,
+            },
+        );
+        let early_id = early.id.clone();
+        router.send(early).await.unwrap();
+        first.release_unconsumed().await.unwrap();
+
+        let idle = AgentMessage::new(
+            child.clone(),
+            MessageTarget::Parent,
+            MessagePayload::Text {
+                content: "idle".into(),
+                summary: None,
+            },
+        );
+        let idle_id = idle.id.clone();
+        router.send(idle).await.unwrap();
+        let mut next = router.register(parent, None).await.unwrap();
+        let fresh = AgentMessage::new(
+            child,
+            MessageTarget::Parent,
+            MessagePayload::Text {
+                content: "fresh".into(),
+                summary: None,
+            },
+        );
+        let fresh_id = fresh.id.clone();
+        router.send(fresh).await.unwrap();
+        for id in [early_id, idle_id, fresh_id] {
+            assert_eq!(next.try_recv().unwrap().id, id);
+        }
     }
 
     #[tokio::test]
@@ -1319,7 +1845,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_old_release_hands_unread_message_to_active_replacement() {
+    async fn release_before_replacement_retains_original_message() {
         let router = Arc::new(AgentMailboxRouter::new(
             Arc::new(InProcessTransport::new()),
             tracker(),
@@ -1340,10 +1866,10 @@ mod tests {
         let message_id = message.id.clone();
         router.send(message).await.unwrap();
 
-        // A new turn can register before the detached old release wins the
-        // run gate. The original message must reach that active receiver.
-        let mut next = router.register(root, None).await.unwrap();
+        // A second owner cannot attach while the old stream is live.
+        assert!(router.register(root.clone(), None).await.is_err());
         old.release_unconsumed().await.unwrap();
+        let mut next = router.register(root, None).await.unwrap();
         assert_eq!(next.try_recv().unwrap().id, message_id);
     }
 
@@ -1628,6 +2154,7 @@ mod tests {
         ));
         let mut mailbox = AgentMailbox {
             subscription: MailboxSubscription::new(addr("receiver", "receiver")),
+            lifetime: MailboxLifetime::new(addr("receiver", "receiver")),
             address: addr("receiver", "receiver"),
             delegation_id: None,
             stream: tokio::sync::Mutex::new(Box::new(BlockingAckStream {
@@ -1636,6 +2163,7 @@ mod tests {
             })),
             buffered: tokio::sync::Mutex::new(VecDeque::from([message.clone()])),
             router,
+            terminal_cleanup_started: false,
         };
         let lease = mailbox.lease_bounded(1);
         let mut ack = Box::pin(lease.mailbox().acknowledge_received(lease.messages()));
@@ -1679,6 +2207,7 @@ mod tests {
         ));
         let mailbox = AgentMailbox {
             subscription: MailboxSubscription::new(addr("run-review", "reviewer")),
+            lifetime: MailboxLifetime::new(addr("run-review", "reviewer")),
             address: addr("run-review", "reviewer"),
             delegation_id: None,
             stream: tokio::sync::Mutex::new(Box::new(AckRecordingStream {
@@ -1686,6 +2215,7 @@ mod tests {
             })),
             buffered: tokio::sync::Mutex::new(VecDeque::new()),
             router,
+            terminal_cleanup_started: false,
         };
         let message = Arc::new(AgentMessage::new(
             addr("run-code", "coder"),
@@ -1845,11 +2375,7 @@ mod tests {
         let old = router.register(address.clone(), None).await.unwrap();
         assert!(router.register(address.clone(), None).await.is_err());
         assert!(!router.is_run_registered(&address.run_id).await);
-        let next = router
-            .register_if_absent(address, None)
-            .await
-            .unwrap()
-            .expect("old route cannot suppress replacement after subscribe failure");
+        let next = router.register(address, None).await.unwrap();
         assert_ne!(old.subscription(), next.subscription());
     }
 }
