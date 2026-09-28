@@ -232,8 +232,34 @@ jobs:
           cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib --features event-stream
           cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib --features event-stream,use-dev-tty
 
+  # Preserve required check names while three builds run on separate runners.
+  # Both aggregate checks require the entire terminal matrix.
   terminal-pty:
     name: "Test: terminal PTY (${{ matrix.os }})"
+    needs: [scope, terminal-pty-shards]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    steps:
+      - name: Require terminal PTY shards
+        shell: bash
+        env:
+          SHARDS_RESULT: ${{ needs.terminal-pty-shards.result }}
+          SHARDS_REQUIRED: ${{ needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true' }}
+        run: |
+          set -euo pipefail
+          if [ "$SHARDS_REQUIRED" = true ]; then
+            test "$SHARDS_RESULT" = success
+          else
+            case "$SHARDS_RESULT" in success|skipped) ;; *) exit 1 ;; esac
+          fi
+
+  terminal-pty-shards:
+    name: "Terminal: ${{ matrix.segment }} (${{ matrix.os }})"
     needs: scope
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
     runs-on: ${{ matrix.os }}
@@ -242,6 +268,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-15]
+        segment: [default-reader, dev-tty-reader, reflow]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -249,17 +276,25 @@ jobs:
       - uses: ./.github/actions/rust-setup
         with:
           shared-key: ci-terminal-pty
+          # One writer per OS populates the shared dependency cache on pushes.
+          save-cache: ${{ github.event_name == 'push' && matrix.segment == 'default-reader' }}
           install-nextest: false
-      # Separate Cargo invocations prevent feature unification from silently
-      # selecting dev-tty for the nominal default-reader test run.
-      - name: Test real terminal readers through PTYs
+      # Separate runners keep dev-tty feature unification out of the default
+      # reader and avoid serializing two lib builds and the reflow binary build.
+      - name: Test default terminal reader through PTYs
+        if: matrix.segment == 'default-reader'
         run: |
           cargo test --locked -p astra-cli --lib tui::terminal_startup -- --test-threads=2
+      - name: Test dev-tty terminal reader through PTYs
+        if: matrix.segment == 'dev-tty-reader'
+        run: |
           cargo test --locked -p astra-cli --lib --features crossterm/use-dev-tty tui::terminal_startup -- --test-threads=2
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        if: matrix.segment == 'reflow'
         with:
           node-version-file: .nvmrc
       - name: Test inline terminal resize with xterm reflow
+        if: matrix.segment == 'reflow'
         run: |
           cargo build --locked -p astra-cli --bin astra
           npm ci --ignore-scripts --prefix scripts/tui-reflow
@@ -278,6 +313,7 @@ jobs:
       - uses: ./.github/actions/rust-setup
         with:
           shared-key: ci-test-macos-workspace-coordination
+          save-cache: ${{ github.event_name == 'push' }}
       - name: Lint macOS workspace coordination
         run: >-
           cargo clippy --locked --manifest-path Cargo.toml -p astra-tools
@@ -307,10 +343,25 @@ jobs:
           cargo test --locked --manifest-path Cargo.toml -p astra-cli
           --lib edge_tools::shell::tests::bash_echo_returns_output -- --exact
 
-  # Online tests run beside the offline shards instead of waiting for an
-  # unrelated compile-only job. CI keeps each live-DB lane serial; the
-  # Makefile assigns services to core and runtime/plan to integration so the
-  # two jobs share test-binary link and live-DB work more evenly.
+  # Preserve the required core check while its package groups run separately.
+  # The aggregate requires all selected online jobs, including integration.
+  test-online-core:
+    name: "Test: online (core)"
+    needs: test-online
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require online shards
+        shell: bash
+        env:
+          SHARDS_RESULT: ${{ needs.test-online.result }}
+        run: |
+          set -euo pipefail
+          test "$SHARDS_RESULT" = success
+
+  # Each online job owns a separate MatrixOne/Memoria stack. Keep tests serial
+  # within that stack; parallelism comes from isolated runners, not DB pressure.
   test-online:
     name: "Test: online (${{ matrix.lane }})"
     needs: scope
@@ -320,11 +371,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [core, integration]
+        lane: [core-runtime, core-turn-core, core-services, integration]
     env:
       RUN_TESTS: >-
         ${{ needs.scope.result != 'success' ||
-            (matrix.lane == 'core' && needs.scope.outputs.online_core == 'true') ||
+            (matrix.lane != 'integration' && needs.scope.outputs.online_core == 'true') ||
             (matrix.lane == 'integration' && needs.scope.outputs.online_integration == 'true') }}
       MATRIXONE_HOST: localhost
       MATRIXONE_PORT: "6001"
