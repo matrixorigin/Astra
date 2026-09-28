@@ -13985,7 +13985,11 @@ impl ServerAgenticLoopHost {
                 // attempt transaction at this boundary.  Keeping the lease
                 // semantics identical prevents tests from silently weakening
                 // failed-attempt replay or successful-attempt consumption.
-                state.commit_volatile_attempt_lease();
+                if result.accum.error_message.is_some() {
+                    state.restore_volatile_attempt_lease();
+                } else {
+                    state.commit_volatile_attempt_lease();
+                }
                 state.llm_rounds_completed = state.llm_rounds_completed.saturating_add(1);
                 Ok(result)
             }

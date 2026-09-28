@@ -619,7 +619,24 @@ pub(crate) fn decision_feedback_preamble_message(text: &str) -> Option<Value> {
 pub(crate) fn runtime_volatile_preamble_message(
     injection: &astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection,
 ) -> Option<Value> {
-    let text = if injection.kind == "mailbox"
+    let text = if injection.kind == "background_task_notification"
+        && injection.payload["schema"]
+            == crate::turn::agentic_loop::host::DIRECT_CHILD_RESULT_SCHEMA
+    {
+        // Delivery bookkeeping is control-plane state. Keeping it out of the
+        // rendered content makes the second bounded delivery byte-identical,
+        // so append-only providers can dedupe it against their canonical frame.
+        let mut display_injection = injection.clone();
+        // A terminal child outcome is one content-addressed fact, not a new
+        // round-specific observation. Its transport round must not change the
+        // append-only identity when the same fact is retried.
+        display_injection.round_index = 0;
+        if let Some(payload) = display_injection.payload.as_object_mut() {
+            payload.remove("delivery_count");
+            payload.remove("observed_by_provider");
+        }
+        display_injection.render_for_prompt()?
+    } else if injection.kind == "mailbox"
         && injection.payload["schema"]
             == crate::turn::agentic_loop::host::RETAINED_MAILBOX_CONTEXT_SCHEMA
     {
@@ -1831,9 +1848,6 @@ fn render_drained_volatile_messages(
 ) -> Vec<Value> {
     let mut out = Vec::new();
     for inj in drained {
-        if crate::turn::agentic_loop::host::is_observed_direct_child_result(inj) {
-            continue;
-        }
         let edge_injection = crate::turn::agentic_loop::host::volatile_injection_edge_profile(inj);
         if let Some(message) = runtime_volatile_preamble_message(&edge_injection) {
             out.push(message);
@@ -1926,18 +1940,29 @@ mod tests {
     }
 
     #[test]
-    fn observed_direct_child_result_stays_in_evidence_but_leaves_the_provider_wire() {
-        let injection = crate::turn::agentic_loop::host::VolatileInjection {
+    fn direct_child_result_wire_identity_is_stable_across_bounded_retry() {
+        let mut payload = json!({
+            "schema": crate::turn::agentic_loop::host::DIRECT_CHILD_RESULT_SCHEMA,
+            "children": [{"agent_id": "child", "status": "completed"}],
+        });
+        let first = crate::turn::agentic_loop::host::VolatileInjection {
             kind: crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
-            payload: json!({
-                "schema": crate::turn::agentic_loop::host::DIRECT_CHILD_RESULT_SCHEMA,
-                "observed_by_provider": true,
-                "children": [{"agent_id": "child", "status": "completed"}],
-            }),
+            payload: payload.clone(),
             round_index: 1,
-            attempt_leased: false,
+            attempt_leased: true,
         };
-        assert!(render_drained_volatile_messages(&[injection]).is_empty());
+        payload["delivery_count"] = json!(1);
+        payload["observed_by_provider"] = json!(true);
+        let second = crate::turn::agentic_loop::host::VolatileInjection {
+            kind: crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
+            payload,
+            round_index: 2,
+            attempt_leased: true,
+        };
+        let first_wire = render_drained_volatile_messages(&[first]);
+        let second_wire = render_drained_volatile_messages(&[second]);
+        assert_eq!(first_wire, second_wire);
+        assert!(message_text(&second_wire[0]).contains("child"));
     }
 
     #[test]

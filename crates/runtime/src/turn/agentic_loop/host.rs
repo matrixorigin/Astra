@@ -2811,10 +2811,9 @@ pub(crate) fn is_retained_mailbox_context(injection: &VolatileInjection) -> bool
         && injection.payload["schema"] == RETAINED_MAILBOX_CONTEXT_SCHEMA
 }
 
-pub(crate) fn is_observed_direct_child_result(injection: &VolatileInjection) -> bool {
+pub(crate) fn is_direct_child_result(injection: &VolatileInjection) -> bool {
     injection.kind == VolatileKind::BackgroundTaskNotification
         && injection.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
-        && injection.payload["observed_by_provider"] == true
 }
 
 impl VolatileKind {
@@ -4790,7 +4789,16 @@ impl AgenticLoopState {
                 injection.payload["observed_by_provider"] = Value::Bool(true);
                 injection.attempt_leased = false;
                 true
-            } else if is_observed_direct_child_result(injection) {
+            } else if is_direct_child_result(injection) {
+                let delivery_count = injection.payload["delivery_count"]
+                    .as_u64()
+                    .unwrap_or_default()
+                    .saturating_add(1);
+                if delivery_count >= 2 {
+                    return false;
+                }
+                injection.payload["delivery_count"] = Value::from(delivery_count);
+                injection.payload["observed_by_provider"] = Value::Bool(true);
                 injection.attempt_leased = false;
                 true
             } else {
@@ -14707,6 +14715,35 @@ mod parallel_execution_tests {
             state.volatile_pending.is_empty(),
             "mailbox context is retained through one intervening decision, then retired"
         );
+    }
+
+    #[test]
+    fn direct_child_result_is_retried_once_then_retired() {
+        let mut state = make_state();
+        state.push_volatile_payload(
+            VolatileKind::BackgroundTaskNotification,
+            serde_json::json!({
+                "schema": DIRECT_CHILD_RESULT_SCHEMA,
+                "children": [{"agent_id": "child", "status": "completed"}],
+            }),
+        );
+
+        state
+            .lease_volatile_pending()
+            .expect("first provider request");
+        state.commit_volatile_attempt_lease();
+        let retained = state
+            .volatile_pending
+            .first()
+            .expect("first delivery remains as evidence");
+        assert_eq!(retained.payload["delivery_count"], 1);
+        assert_eq!(retained.payload["observed_by_provider"], true);
+
+        state
+            .lease_volatile_pending()
+            .expect("bounded retry request");
+        state.commit_volatile_attempt_lease();
+        assert!(state.volatile_pending.is_empty());
     }
 
     #[test]

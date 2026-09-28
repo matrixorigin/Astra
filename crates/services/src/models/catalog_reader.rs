@@ -1,5 +1,6 @@
 //! One authenticated catalog boundary shared by HTTP and on-demand observation.
-//! Binding is inert: only `read` loads a catalog. It is never an execution grant.
+//! Binding is inert: only `read` loads a request-scoped catalog snapshot. It is
+//! never an execution grant.
 
 use std::sync::Arc;
 
@@ -39,6 +40,7 @@ pub struct AuthorizedModelCatalogReader {
     models: Arc<dyn ModelService>,
     auth: Arc<dyn AuthService>,
     principal: AuthPrincipal,
+    catalog: Arc<tokio::sync::OnceCell<UserModelCatalog>>,
 }
 
 impl AuthorizedModelCatalogReader {
@@ -51,6 +53,7 @@ impl AuthorizedModelCatalogReader {
             models,
             auth,
             principal,
+            catalog: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -67,8 +70,17 @@ impl AuthorizedModelCatalogReader {
     }
 
     pub async fn read(&self) -> Result<UserModelCatalog, (StatusCode, Json<ErrorResponse>)> {
-        read_authorized_model_catalog(self.models.as_ref(), self.auth.as_ref(), &self.principal)
+        self.catalog
+            .get_or_try_init(|| async {
+                read_authorized_model_catalog(
+                    self.models.as_ref(),
+                    self.auth.as_ref(),
+                    &self.principal,
+                )
+                .await
+            })
             .await
+            .cloned()
     }
 }
 

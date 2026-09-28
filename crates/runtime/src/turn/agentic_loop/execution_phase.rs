@@ -5601,19 +5601,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     llm_wall_start,
                 );
             }
-            state.commit_volatile_attempt_lease();
-            // Provider context is not guaranteed to be append-only. Retain
-            // child evidence across later tool/model rounds and checkpoint
-            // boundaries; one successful response is delivery, not durable
-            // conversation history or proof the model used the result.
-            for mut payload in delivered_children {
-                if !providerless_control_plane_turn && turn_result.accum.error_message.is_none() {
-                    payload["observed_by_provider"] = serde_json::Value::Bool(true);
-                }
-                state.push_volatile_payload(
-                    super::host::VolatileKind::BackgroundTaskNotification,
-                    payload,
-                );
+            // A providerless control-plane result or a provider response that
+            // carries an embedded error did not produce an assistant decision.
+            // Keep the exact leased authorities for the next real attempt.
+            if providerless_control_plane_turn || turn_result.accum.error_message.is_some() {
+                state.restore_volatile_attempt_lease();
+            } else {
+                state.commit_volatile_attempt_lease();
             }
             turn_result
         }
@@ -10240,6 +10234,11 @@ mod tests {
             "pending={:?}",
             state.volatile_pending
         );
+        // The lightweight mock only leases automatically when it owns a real
+        // child barrier; explicitly model the next provider boundary here.
+        state
+            .lease_volatile_pending()
+            .expect("bounded repeat provider request");
         let mut next = MockHost::new(vec![text_result("Done", 10, 5, Some(1))]);
         execute_turn_and_ingest_phase(&mut next, &mut state, 1, prep(false))
             .await
@@ -10254,8 +10253,8 @@ mod tests {
                 .iter()
                 .filter(|entry| entry.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA)
                 .count(),
-            1,
-            "observed child evidence must not be duplicated on later rounds"
+            0,
+            "the bounded repeat delivery must retire after the next provider decision"
         );
     }
 

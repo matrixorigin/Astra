@@ -2726,6 +2726,7 @@ impl std::fmt::Debug for UserModelUpdateRequestData {
 
 /// Request-scoped, credential-free catalog and its default policy. This is
 /// never a cached admission grant; execution still revalidates its Offering.
+#[derive(Clone)]
 pub struct UserModelCatalog {
     pub items: Vec<ModelListItem>,
     pub default_offering_id: Option<String>,
