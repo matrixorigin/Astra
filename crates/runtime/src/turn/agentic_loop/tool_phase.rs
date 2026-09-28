@@ -3313,6 +3313,28 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     if let Some(policy_feedback) = policy_update {
         state.stall.active_policy_feedback = policy_feedback;
     }
+
+    // A question is a synchronization edge, not ordinary progress text. Once
+    // the send has been accepted, do not start another provider round before
+    // the exact responder's answer is observed. Reuse the same bounded
+    // mailbox barrier used by finalization so a reply wakes this run without
+    // adding a second wait state or another storage path.
+    let run_id = state.current_run_id.as_deref().unwrap_or_default();
+    if state.messaging.reply_obligations.has_pending(run_id) {
+        let continue_after_reply = super::execution_phase::await_direct_children_before_completion(
+            host,
+            state,
+            super::host::ContinuationAuthority::Runtime,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        try_write_heavy_checkpoint(state);
+        return Ok(if continue_after_reply {
+            TurnToolPhaseControl::ContinueLoop
+        } else {
+            TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed)
+        });
+    }
     Ok(TurnToolPhaseControl::ContinueLoop)
 }
 

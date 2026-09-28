@@ -255,9 +255,10 @@ pub(crate) async fn fence_direct_child_finalization<H: AgenticLoopHost>(
     }
 }
 
-/// Wait only at a proposed final answer; ordinary tool/model work stays
-/// concurrent. Return true to enter one normal, accounted synthesis boundary.
-async fn await_direct_children_before_completion<H: AgenticLoopHost>(
+/// Wait at a proposed final answer or an explicit agent question; ordinary
+/// tool/model work stays concurrent until one of those synchronization edges.
+/// Return true to enter one normal, accounted synthesis boundary.
+pub(crate) async fn await_direct_children_before_completion<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
     continuation: ContinuationAuthority,
