@@ -165,11 +165,14 @@ through the tuning-job lifecycle.
 
 ## Qualify a candidate for offline shadow scoring
 
-Choose the evaluation protocol **before examining test outcomes**. Keep the
-protocol in your review system; the local command validates its claimed timestamp
-but cannot authenticate preregistration. Protocol changes or repeated candidate
-selection need a fresh holdout. The fitting configuration and threshold choices
-are pinned too:
+Collect the immutable test routing decisions, then seal their outcome-free roster
+and evaluation protocol **before starting any held-out replay or collecting its
+outcomes**. Set `registered_at` to the actual seal time, after all source decisions;
+it may follow the test decision split (`validation_before`). Keep the protocol in
+your review system; the local command checks the supplied timeline but cannot
+authenticate the seal or prove omitted outcomes were unseen. Protocol changes or
+repeated candidate selection need a fresh holdout. The fitting configuration and
+threshold choices are pinned too:
 
 ```bash
 astra-test router-config-hash --config training-config.json
@@ -187,6 +190,17 @@ Reordering sources or group keys does not change it. Complete evidence still
 needs independent source authorization when outcomes arrive. Changing the plan
 requires a new reviewed protocol and fresh holdout; do not move the split or drop
 incomplete cases under the old protocol. The hash command itself grants no access.
+
+For example, mature training/validation labels before March 1, collect test
+decisions on March 1, seal the roster on March 2, and start both replay arms on
+March 3. Use March 2 as `registered_at`. Plan the final evidence snapshot's
+`created_at` for March 5 so the example's one-day replay horizons have matured.
+At sealing, omit held-out paired/observed outcomes and feedback; add replay
+evidence later under renewed source authorization without changing the plan.
+Every supplied test replay must start strictly after the seal, including failed,
+incomplete and grouped-out pairs. Supplied test observed completions and follow-up
+feedback must also be strictly later. Backdated seals before source decisions
+and seals at or after replay start are rejected.
 
 ```json
 {

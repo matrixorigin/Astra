@@ -321,9 +321,14 @@ activation registry, or new database projection.
 A protocol pins owner, dataset, fitting configuration and evaluation-plan digests,
 test/stratum sample floors, coverage, quality margin, required cost reduction, episode cost bound,
 p95 latency ceiling, confidence and required structural feature strata. Its
-registration must precede the test period. Registration is an operator attestation;
-this local workflow does not prove that someone preregistered before inspecting
-outcomes. The services-owned evaluation-plan digest covers the full manifest
+`registered_at` is the outcome-free roster seal time, after all recorded routing
+decisions and strictly before every held-out replay begins. It is distinct from
+`validation_before`, which splits decisions into validation and test populations.
+Supplied held-out observed completions and follow-up feedback must also follow
+the seal. These checks include incomplete and nonrepresentative sources. The seal
+must precede the final evidence snapshot's `created_at`. Registration is an
+operator attestation; the workflow cannot prove that omitted outcomes were unseen.
+The services-owned evaluation-plan digest covers the full manifest
 (including split boundaries and outcome cutoff/horizon), source roster, grouping,
 canonical input references, frozen decision-time features and recorded selected
 Offering/contract identities used by the Auto baseline. It excludes replay

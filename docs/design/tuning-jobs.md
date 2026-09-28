@@ -138,3 +138,6 @@ services tuning owner and exposed as `astra-test router-plan-hash`. It seals the
 manifest, source population, grouping and decision features. Changed splits or
 sample membership cannot reuse a registered protocol even if the source grants
 remain valid. Later outcomes require source approval but do not change the plan.
+The registration timestamp records the actual roster seal after source decisions
+and before held-out replay starts or supplied outcomes arrive. The decision split
+remains a separate cutoff: fitting labels must mature before test decisions.

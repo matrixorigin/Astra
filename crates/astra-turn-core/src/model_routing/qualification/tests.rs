@@ -40,11 +40,13 @@ fn data() -> RouterDatasetInput {
             for (name, arm) in [("economy", &mut pair.economy), ("strong", &mut pair.strong)] {
                 arm.input_reference = s.decision.input_reference.clone().unwrap();
                 arm.episode.execution_id = format!("{id}-{name}");
-                arm.episode.started_at = s.decision_at + chrono::Duration::seconds(1);
-                arm.episode.completed_at = s.decision_at + chrono::Duration::seconds(5);
+                let replay_at =
+                    s.decision_at + chrono::Duration::days(i64::from(split == "test") * 2);
+                arm.episode.started_at = replay_at + chrono::Duration::seconds(1);
+                arm.episode.completed_at = replay_at + chrono::Duration::seconds(5);
                 let q = arm.episode.quality.as_mut().unwrap();
                 q.target_execution_id = arm.episode.execution_id.clone();
-                q.assessed_at = s.decision_at + chrono::Duration::seconds(6);
+                q.assessed_at = replay_at + chrono::Duration::seconds(6);
             }
             input.sources.push(s);
         }
@@ -72,7 +74,7 @@ fn protocol(input: &RouterDatasetInput) -> RouterQualificationProtocol {
         job_id: "qualification-1".into(),
         owner_id: input.manifest.owner_id.clone(),
         dataset_id: input.manifest.dataset_id.clone(),
-        registered_at: "2024-01-01T00:00:00Z".parse().unwrap(),
+        registered_at: "2024-03-02T00:00:00Z".parse().unwrap(),
         training_config_sha256: content_sha256(&config()).unwrap(),
         evaluation_plan_sha256: router_evaluation_plan_sha256(input).unwrap(),
         minimum_test_groups: 1000,
@@ -111,6 +113,90 @@ fn shadow_data(training: &RouterDatasetInput) -> RouterDatasetInput {
     s.paired = None;
     shadow
 }
+#[test]
+fn collected_trace_roster_can_be_sealed_before_held_out_replay() {
+    let mut planned = data();
+    planned.manifest.created_at = "2024-03-05T00:00:00Z".parse().unwrap();
+    let mut replays = BTreeMap::new();
+    for source in &mut planned.sources {
+        if source.decision_at >= planned.manifest.validation_before {
+            replays.insert(source.source_id.clone(), source.paired.take().unwrap());
+        }
+    }
+    // March 1: collect immutable decisions. March 2: seal their actual roster,
+    // with no held-out replay or outcomes yet. March 3: run paired replays.
+    let sealed = protocol(&planned);
+    assert!(
+        planned
+            .sources
+            .iter()
+            .all(|s| s.decision_at < sealed.registered_at)
+    );
+    for source in &mut planned.sources {
+        if let Some(pair) = replays.remove(&source.source_id) {
+            assert!(pair.economy.episode.started_at > sealed.registered_at);
+            assert!(pair.strong.episode.started_at > sealed.registered_at);
+            source.paired = Some(pair);
+        }
+    }
+    assert_eq!(
+        router_evaluation_plan_sha256(&planned).unwrap(),
+        sealed.evaluation_plan_sha256
+    );
+    // March 5: both replay outcome horizons have matured; renew source grants.
+    let result = qualify_router(
+        planned.clone(),
+        &auth(&planned),
+        planned.manifest.created_at,
+        config(),
+        sealed,
+    )
+    .unwrap();
+    assert_eq!(
+        result.tuning.status,
+        RouterQualificationStatus::ReadyForShadow
+    );
+}
+
+#[test]
+fn seal_rejects_future_decisions_and_preexisting_held_out_evidence() {
+    for mutation in 0..5 {
+        let mut input = data();
+        let mut sealed = protocol(&input);
+        let source = input.sources.last_mut().unwrap();
+        match mutation {
+            0 => sealed.registered_at = source.decision_at - chrono::Duration::seconds(1),
+            1 => sealed.registered_at = source.paired.as_ref().unwrap().economy.episode.started_at,
+            2 | 3 => {
+                if mutation == 3 {
+                    source.group_keys = vec!["test-0".into()];
+                }
+                let pair = source.paired.as_mut().unwrap();
+                pair.strong.episode.started_at = sealed.registered_at;
+                pair.strong.episode.quality = None;
+            }
+            _ => {
+                let mut observed = source.paired.as_ref().unwrap().strong.episode.clone();
+                observed.execution_id = "observed-before-seal".into();
+                observed.started_at = source.decision_at;
+                observed.completed_at = sealed.registered_at;
+                observed.quality = None;
+                source.observed = Some(observed);
+            }
+        }
+        sealed.evaluation_plan_sha256 = router_evaluation_plan_sha256(&input).unwrap();
+        let result = qualify_router(input.clone(), &auth(&input), Utc::now(), config(), sealed);
+        assert!(
+            result.unwrap_err().contains(if mutation == 0 {
+                "decisions after its registration seal"
+            } else {
+                "must follow the registration seal"
+            }),
+            "mutation {mutation}"
+        );
+    }
+}
+
 #[test]
 fn qualified_gate_is_reproducible_and_only_ready_for_shadow() {
     let input = data();
@@ -202,7 +288,7 @@ fn protocol_is_bound_to_scope_config_cutoff_and_required_strata() {
     for mutation in 0..7 {
         let mut p = protocol(&input);
         match mutation {
-            0 => p.registered_at = input.manifest.validation_before,
+            0 => p.registered_at = input.manifest.created_at,
             1 => p.training_config_sha256 = "wrong".into(),
             2 => p.owner_id = "wrong".into(),
             3 => p.required_strata.clear(),

@@ -329,11 +329,13 @@ fn public_qualification_and_shadow_workflow_scores_without_provider_io() {
             for (name, arm) in [("economy", &mut pair.economy), ("strong", &mut pair.strong)] {
                 arm.input_reference = source.decision.input_reference.clone().unwrap();
                 arm.episode.execution_id = format!("{}-{name}", source.source_id);
-                arm.episode.started_at = source.decision_at + chrono::Duration::seconds(1);
-                arm.episode.completed_at = source.decision_at + chrono::Duration::seconds(5);
+                let replay_at =
+                    source.decision_at + chrono::Duration::days(i64::from(split == "test") * 2);
+                arm.episode.started_at = replay_at + chrono::Duration::seconds(1);
+                arm.episode.completed_at = replay_at + chrono::Duration::seconds(5);
                 let quality = arm.episode.quality.as_mut().unwrap();
                 quality.target_execution_id = arm.episode.execution_id.clone();
-                quality.assessed_at = source.decision_at + chrono::Duration::seconds(6);
+                quality.assessed_at = replay_at + chrono::Duration::seconds(6);
             }
             input.sources.push(source);
         }
@@ -352,7 +354,7 @@ fn public_qualification_and_shadow_workflow_scores_without_provider_io() {
         job_id: "public-qualification".into(),
         owner_id: input.manifest.owner_id.clone(),
         dataset_id: input.manifest.dataset_id.clone(),
-        registered_at: "2024-01-01T00:00:00Z".parse().unwrap(),
+        registered_at: "2024-03-02T00:00:00Z".parse().unwrap(),
         training_config_sha256: content_sha256(&config).unwrap(),
         evaluation_plan_sha256: router_evaluation_plan_sha256(&input).unwrap(),
         minimum_test_groups: 1000,
@@ -518,6 +520,7 @@ fn public_qualification_and_shadow_workflow_scores_without_provider_io() {
         .unwrap();
     assert!(plan.status.success());
     let mut protocol = protocol;
+    protocol.registered_at = "2024-04-02T00:00:00Z".parse().unwrap();
     protocol.evaluation_plan_sha256 = String::from_utf8(plan.stdout).unwrap().trim().into();
     assert_eq!(
         protocol.evaluation_plan_sha256,

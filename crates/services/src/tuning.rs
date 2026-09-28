@@ -65,7 +65,8 @@ pub struct RouterQualificationProtocol {
     pub job_id: String,
     pub owner_id: String,
     pub dataset_id: String,
-    /// Operator-attested preregistration, strictly before the test split.
+    /// Operator-attested roster seal: after all recorded decisions and strictly
+    /// before held-out replay starts or supplied outcomes are collected.
     pub registered_at: DateTime<Utc>,
     /// Pins fitting and threshold selection as well as the evaluation criteria.
     pub training_config_sha256: String,

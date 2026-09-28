@@ -68,7 +68,7 @@ fn validate_protocol(
         || !opaque(&protocol.job_id)
         || protocol.owner_id != input.manifest.owner_id
         || protocol.dataset_id != input.manifest.dataset_id
-        || protocol.registered_at >= input.manifest.validation_before
+        || protocol.registered_at >= input.manifest.created_at
         || protocol.training_config_sha256 != content_sha256(config)?
         || protocol.minimum_test_groups == 0
         || protocol.minimum_stratum_groups == 0
@@ -94,6 +94,35 @@ fn validate_protocol(
             .any(|f| f.schema_version != FEATURE_VERSION)
     {
         return Err("Invalid or unregistered router qualification protocol".into());
+    }
+    // The roster contains real immutable routing events, so seal it after
+    // collection, but before any held-out replay or supplied outcome arrives.
+    // Inspect every source, including incomplete and nonrepresentative pairs.
+    for source in &input.sources {
+        if source.decision_at > protocol.registered_at {
+            return Err("Router roster contains decisions after its registration seal".into());
+        }
+        if source.decision_at >= input.manifest.validation_before {
+            let replay_started = source.paired.as_ref().is_some_and(|pair| {
+                [&pair.economy, &pair.strong]
+                    .iter()
+                    .any(|arm| arm.episode.started_at <= protocol.registered_at)
+            });
+            let outcome_collected = source
+                .observed
+                .as_ref()
+                .is_some_and(|episode| episode.completed_at <= protocol.registered_at)
+                || source
+                    .followup
+                    .as_ref()
+                    .is_some_and(|followup| followup.observed_at <= protocol.registered_at);
+            if replay_started || outcome_collected {
+                return Err(
+                    "Held-out replay or outcome collection must follow the registration seal"
+                        .into(),
+                );
+            }
+        }
     }
     Ok(())
 }
