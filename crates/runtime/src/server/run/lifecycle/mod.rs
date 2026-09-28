@@ -20599,15 +20599,22 @@ impl ServerSpawnAgentExecutor {
                     parent_run_id,
                     context.admitted_model_execution.as_ref(),
                     |id| async move {
-                        astra_services::revalidate_admitted_model_execution(
-                            &self.matrixone,
-                            self.encryptor.as_ref(),
-                            context_user_id,
-                            &id,
-                            self.shared_pool.as_ref().map(SharedPool::get),
-                        )
-                        .await
-                        .map_err(|error| error.to_string())
+                        if let Some(service) = &self.model_service {
+                            service
+                                .admit_model_offering(context_user_id.to_string(), id)
+                                .await
+                                .map_err(|(_, body)| body.0.detail)
+                        } else {
+                            astra_services::revalidate_admitted_model_execution(
+                                &self.matrixone,
+                                self.encryptor.as_ref(),
+                                context_user_id,
+                                &id,
+                                self.shared_pool.as_ref().map(SharedPool::get),
+                            )
+                            .await
+                            .map_err(|error| error.to_string())
+                        }
                     },
                 )
                 .await?;

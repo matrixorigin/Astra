@@ -531,3 +531,7 @@ where
     }
     Ok(Some(execution))
 }
+
+#[cfg(test)]
+#[path = "model_execution_admission_test_support.rs"]
+pub(crate) mod inheritance_test_support;

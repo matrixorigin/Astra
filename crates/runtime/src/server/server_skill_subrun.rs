@@ -227,6 +227,41 @@ pub struct ServerSkillSubRunExecutor {
 }
 
 impl ServerSkillSubRunExecutor {
+    async fn inherited_model_execution(
+        &self,
+        parent_run_id: &str,
+    ) -> Result<Option<AdmittedModelExecution>, String> {
+        let Some(engine) = &self.run_engine else {
+            return Ok(self.admitted_model_execution.clone());
+        };
+        crate::server::model_execution_admission::inherit_routed_execution(
+            engine,
+            &self.user_id,
+            &self.session_id,
+            parent_run_id,
+            self.admitted_model_execution.as_ref(),
+            |id| async move {
+                if let Some(service) = &self.model_service {
+                    service
+                        .admit_model_offering(self.user_id.clone(), id)
+                        .await
+                        .map_err(|(_, body)| body.0.detail)
+                } else {
+                    astra_services::revalidate_admitted_model_execution(
+                        &self.matrixone,
+                        self.encryptor.as_ref(),
+                        &self.user_id,
+                        &id,
+                        self.shared_pool.as_ref().map(SharedPool::get),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+                }
+            },
+        )
+        .await
+    }
+
     pub fn with_model_service(
         mut self,
         service: Option<Arc<dyn astra_services::ModelService>>,
@@ -901,16 +936,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         };
 
         let execution_result: Result<SubRunResult, String> = async {
-        let admitted_model_execution = if let Some(engine) = &self.run_engine {
-            crate::server::model_execution_admission::inherit_routed_execution(
-                engine, &self.user_id, &self.session_id, parent_run_id,
-                self.admitted_model_execution.as_ref(),
-                |id| async move { astra_services::revalidate_admitted_model_execution(
-                    &self.matrixone, self.encryptor.as_ref(), &self.user_id, &id,
-                    self.shared_pool.as_ref().map(SharedPool::get),
-                ).await.map_err(|error| error.to_string()) },
-            ).await?
-        } else { self.admitted_model_execution.clone() };
+        let admitted_model_execution = self.inherited_model_execution(parent_run_id).await?;
         let effective_model = admitted_model_execution.as_ref()
             .map(|execution| execution.model_name.clone()).or_else(|| self.default_model.clone());
         let compact_strategy = admitted_model_execution
@@ -1373,6 +1399,42 @@ mod tests {
             !executor.reflect_service.is_configured(),
             "skill sub-runs must fail closed until the parent reflect service is injected"
         );
+    }
+
+    #[tokio::test]
+    async fn auto_skill_fork_reauthorizes_service_backed_genesis_offering() {
+        use crate::server::model_execution_admission::inheritance_test_support::{
+            OFFERING_ID, SESSION_ID, ServiceBackedOffering, USER_ID, auto_parent_run,
+            genesis_execution,
+        };
+
+        let execution = genesis_execution();
+        let service = Arc::new(ServiceBackedOffering::new(execution.clone()));
+        let engine = auto_parent_run("auto-skill-parent", &execution).await;
+        let executor = ServerSkillSubRunExecutor::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            USER_ID.into(),
+            SESSION_ID.into(),
+        )
+        .with_model_service(Some(service.clone()))
+        .with_run_engine(engine)
+        .with_admitted_model_execution(Some(execution.clone()));
+
+        let inherited = executor
+            .inherited_model_execution("auto-skill-parent")
+            .await
+            .unwrap();
+        assert_eq!(inherited, Some(execution));
+        assert_eq!(service.calls(), vec![(USER_ID.into(), OFFERING_ID.into())]);
+
+        service.revoke();
+        let error = executor
+            .inherited_model_execution("auto-skill-parent")
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains("Genesis Offering unavailable"), "{error}");
     }
 
     #[test]
