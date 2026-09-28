@@ -11971,6 +11971,7 @@ impl AgenticRunLifecycleService {
         .with_initial_output_limit(generation_controls.first_output_max_tokens)
         .with_preserved_thinking(generation_controls.preserve_thinking)
         .with_model_service(Some(self.model_service.clone()))
+        .with_model_catalog_reader(request.model_catalog_reader.clone())
         .with_admitted_execution_deadline(request.admitted_execution_deadline)
         .with_admitted_model_execution(request.admitted_model_execution.clone())
         .with_inference_owner_pod_id(self.run_engine.execution_owner_pod_id().map(str::to_string))
@@ -24621,6 +24622,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         .with_initial_output_limit(generation_controls.first_output_max_tokens)
         .with_preserved_thinking(generation_controls.preserve_thinking)
         .with_model_service(self.model_service.clone())
+        .with_model_catalog_reader(self.model_catalog_reader.clone())
         .with_admitted_model_execution(admitted_model_execution)
         .with_admitted_execution_deadline(self.admitted_execution_deadline)
         .with_inference_owner_pod_id(

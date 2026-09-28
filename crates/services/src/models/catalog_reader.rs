@@ -1,6 +1,7 @@
 //! One authenticated catalog boundary shared by HTTP and on-demand observation.
-//! Binding is inert: only `read` loads a request-scoped catalog snapshot. It is
-//! never an execution grant.
+//! Binding is inert: `read_snapshot` loads one request-scoped catalog snapshot
+//! for internal admission, while `read` keeps fresh discovery semantics for
+//! paginated model-catalog calls. Neither is an execution grant.
 
 use std::sync::Arc;
 
@@ -70,6 +71,16 @@ impl AuthorizedModelCatalogReader {
     }
 
     pub async fn read(&self) -> Result<UserModelCatalog, (StatusCode, Json<ErrorResponse>)> {
+        read_authorized_model_catalog(self.models.as_ref(), self.auth.as_ref(), &self.principal)
+            .await
+    }
+
+    /// Read the authorized catalog once for model-dependent decisions in one
+    /// request and its descendants. Discovery callers must use `read` so a
+    /// cursor/revision check can observe catalog changes between pages.
+    pub async fn read_snapshot(
+        &self,
+    ) -> Result<UserModelCatalog, (StatusCode, Json<ErrorResponse>)> {
         self.catalog
             .get_or_try_init(|| async {
                 read_authorized_model_catalog(

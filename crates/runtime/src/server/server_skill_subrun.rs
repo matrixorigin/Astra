@@ -1000,6 +1000,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         )
         .with_model(effective_model.clone())
         .with_model_service(self.model_service.clone())
+        .with_model_catalog_reader(self.model_catalog_reader.clone())
         .with_admitted_model_execution(admitted_model_execution.clone())
         .with_inference_owner_pod_id(Some(parent_owner_pod_id.to_string()))
         .with_edge_tools(self.edge_tools.clone())

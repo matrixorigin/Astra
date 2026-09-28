@@ -235,8 +235,8 @@ impl ServerAgenticLoopHost {
             if reason == ModelRoutingReason::EasyReadOnly {
                 // The catalog is owner-scoped; retaining the same access id
                 // prevents a policy from silently changing billing ownership.
-                let catalog = service.list_models(self.user_id.clone(), false).await;
-                let same_access = catalog.as_ref().is_ok_and(|catalog| {
+                let catalog = self.read_authorized_model_catalog().await;
+                let same_access = catalog.as_ref().is_some_and(|catalog| {
                     let strong = catalog.iter().find(|item| item.offering_id == policy.strong_offering_id && item.is_active);
                     let economy = catalog.iter().find(|item| item.offering_id == policy.economy_offering_id && item.is_active);
                     matches!((strong, economy), (Some(a), Some(b)) if a.access_id == b.access_id && a.access_kind == b.access_kind && a.execution_placement == b.execution_placement)

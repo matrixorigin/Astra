@@ -288,3 +288,18 @@ async fn public_executor_pages_fresh_catalog_and_detects_change() {
     assert_eq!(value["error"]["error_kind"], "catalog_changed");
     assert_eq!(models.reads.load(Ordering::SeqCst), 3);
 }
+
+#[tokio::test]
+async fn admission_snapshot_is_shared_across_reader_clones() {
+    let models = Arc::new(CatalogSpy::default());
+    *models.items.lock().unwrap() = vec![fixture(0)];
+    let reader = AuthorizedModelCatalogReader::new(
+        models.clone(),
+        Arc::new(ScopedAuthSpy::default()),
+        principal(false),
+    );
+    let child = reader.clone();
+    assert_eq!(reader.read_snapshot().await.unwrap().items.len(), 1);
+    assert_eq!(child.read_snapshot().await.unwrap().items.len(), 1);
+    assert_eq!(models.reads.load(Ordering::SeqCst), 1);
+}

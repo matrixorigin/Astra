@@ -4070,6 +4070,7 @@ pub struct ServerAgenticLoopHost {
     preserve_thinking: bool,
     initial_output_limit: Option<u32>,
     model_service: Option<Arc<dyn astra_services::ModelService>>,
+    model_catalog_reader: Option<astra_services::models::AuthorizedModelCatalogReader>,
     model_routing: Option<model_routing::AutoRoutingContext>,
     execution_handoff: Option<ExecutionHandoffContext>,
     execution_capacity: Option<crate::server::run::lifecycle::RunExecutionCapacity>,
@@ -5717,6 +5718,7 @@ pub struct ServerAgenticLoopHostBuilder {
     preserve_thinking: bool,
     initial_output_limit: Option<u32>,
     model_service: Option<Arc<dyn astra_services::ModelService>>,
+    model_catalog_reader: Option<astra_services::models::AuthorizedModelCatalogReader>,
     matrixone: MatrixOneSettings,
     encryptor: Arc<FernetTokenEncryptor>,
     shared_pool: Option<SharedPool>,
@@ -5805,6 +5807,14 @@ impl ServerAgenticLoopHostBuilder {
         self.model_service = service;
         self
     }
+
+    pub fn with_model_catalog_reader(
+        mut self,
+        reader: Option<astra_services::models::AuthorizedModelCatalogReader>,
+    ) -> Self {
+        self.model_catalog_reader = reader;
+        self
+    }
     pub fn new(
         matrixone: MatrixOneSettings,
         encryptor: Arc<FernetTokenEncryptor>,
@@ -5813,6 +5823,7 @@ impl ServerAgenticLoopHostBuilder {
     ) -> Self {
         Self {
             model_service: None,
+            model_catalog_reader: None,
             preserve_thinking: false,
             initial_output_limit: None,
             matrixone,
@@ -6513,6 +6524,7 @@ impl ServerAgenticLoopHostBuilder {
 
         ServerAgenticLoopHost {
             model_service: self.model_service,
+            model_catalog_reader: self.model_catalog_reader,
             model_routing: None,
             execution_handoff: None,
             execution_capacity: None,
@@ -7414,19 +7426,12 @@ impl ServerAgenticLoopHost {
             reason: reason.to_string(),
             attempts: attempt,
         };
-        let catalog = match self.model_service.as_ref() {
-            Some(service) => service
-                .list_models(self.user_id.clone(), false)
-                .await
-                .ok()
-                .map(|items| {
-                    astra_services::models::model_catalog_for_purpose(
-                        items,
-                        astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
-                    )
-                }),
-            None => None,
-        };
+        let catalog = self.read_authorized_model_catalog().await.map(|items| {
+            astra_services::models::model_catalog_for_purpose(
+                items,
+                astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+            )
+        });
         let Some(catalog) = catalog else {
             return (
                 unavailable("The authorized model catalog is unavailable."),
@@ -7530,6 +7535,25 @@ impl ServerAgenticLoopHost {
             Err(reason) => return (unresolved(&reason), None),
         };
         (assessed, extracted.scope_binding)
+    }
+
+    /// Share the authenticated request snapshot with every model-dependent
+    /// decision in this run. The reader caches only within this request and
+    /// its descendants; a failed read is never replaced by an unscoped direct
+    /// query, and execution still revalidates the selected Offering.
+    async fn read_authorized_model_catalog(&self) -> Option<Vec<astra_services::ModelListItem>> {
+        if let Some(reader) = self.model_catalog_reader.as_ref() {
+            return tokio::time::timeout(Duration::from_secs(5), reader.read_snapshot())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .map(|catalog| catalog.items);
+        }
+        self.model_service
+            .as_ref()?
+            .list_models(self.user_id.clone(), false)
+            .await
+            .ok()
     }
 
     /// Enrich the existing journal/Explain lanes without consulting storage or
