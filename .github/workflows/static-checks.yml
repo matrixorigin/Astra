@@ -52,7 +52,7 @@ jobs:
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       # No registry credentials or publication: validate real COPY/.dockerignore
       # behavior and full dependency resolution on the real builder's base stage.
-      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile
@@ -131,7 +131,7 @@ jobs:
       - name: Check formatting
         if: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}
         run: make format-check
-      - uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff # v2
+      - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
         if: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}
         with:
           tool: cargo-audit@0.22.1
