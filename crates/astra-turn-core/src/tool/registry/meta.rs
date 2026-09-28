@@ -287,7 +287,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
     },
     ToolMeta {
         name: "model_catalog",
-        description: "Read the authenticated user's active Chat model catalog; exact identities, capabilities and prices, not an execution grant",
+        description: "Compare the authenticated user's active Chat models, capabilities and prices; an explicit user-named model is resolved by runtime, so do not call this merely to spawn it",
         triggers: &[
             "models",
             "model catalog",
