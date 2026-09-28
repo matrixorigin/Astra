@@ -17374,6 +17374,75 @@ async fn completed_direct_child_supersedes_launch_receipt_in_final_evaluation() 
 }
 
 #[tokio::test]
+async fn completed_direct_child_is_resolved_even_with_unrelated_interruption() {
+    use astra_turn_types::task_resolution::{EdgeDispatchCompletionRef, ToolExecutionEvidenceRef};
+
+    let svc = test_service();
+    let request = test_request("delegate one check");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "run-1",
+        None,
+        None,
+        None,
+    );
+    let completion = ToolExecutionEvidenceRef::EdgeDispatch(EdgeDispatchCompletionRef {
+        identity: astra_turn_types::ToolInvocationIdentity::new(
+            "test-user",
+            "session-1",
+            "run-1",
+            "chain-1",
+            "spawn-call",
+        )
+        .unwrap(),
+        edge_agent_id: "edge-1".into(),
+        result_hash: "sha256:test".into(),
+    });
+    state.stall.tool_call_records.push(ToolCallRecord {
+        name: "agent".into(),
+        ok: true,
+        disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+        execution_completion: Some(completion),
+        args_full: Some(r#"{"action":"spawn","description":"check","prompt":"check"}"#.into()),
+        result_full: Some(r#"{"status":"launched","agent_id":"child@run"}"#.into()),
+        ..Default::default()
+    });
+    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+        InterruptionKind::ExecutionIncomplete,
+        ResumeAction::ContinueImmediately,
+        Default::default(),
+    ));
+    state.push_volatile_payload(
+        crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
+        serde_json::json!({
+            "schema": "direct_child_completion.v1",
+            "parent_run_id": "run-1",
+            "observed_by_provider": true,
+            "children": [{"agent_id":"child@run","status":"completed"}]
+        }),
+    );
+    let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(vec![]);
+    host.direct_child_owner = Some(
+        crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+            "run-1",
+            "child@run",
+        ),
+    );
+
+    crate::turn::agentic_loop::execution_phase::fence_direct_child_finalization(
+        &mut host, &mut state,
+    )
+    .await;
+
+    assert!(
+        state.stall.terminal_child_evaluation_refs.is_some(),
+        "an unrelated interruption must not hide an already observed child completion"
+    );
+}
+
+#[tokio::test]
 async fn mismatched_child_owner_cannot_retire_terminal_notification() {
     let svc = test_service();
     let request = test_request("delegate one check");

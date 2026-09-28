@@ -284,6 +284,36 @@ pub(crate) fn workspace_path_mismatch_tool_result(message: String) -> astra_tool
             Value::String(TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH.to_string()),
         ),
         ("blocked".to_string(), Value::Bool(true)),
+        (
+            "disposition".to_string(),
+            Value::String("rejected".to_string()),
+        ),
+        ("execution_started".to_string(), Value::Bool(false)),
+        (
+            "execution_fact".to_string(),
+            Value::String("not_executed".to_string()),
+        ),
+    ]));
+    result
+}
+
+/// Return a typed result for an admission/preflight rejection. The executor
+/// did not own a process, so lifecycle evaluation must not treat this as a
+/// failed execution that needs reconciliation.
+pub(crate) fn pre_dispatch_rejection_tool_result(
+    message: impl Into<String>,
+) -> astra_tools::ToolResult {
+    let mut result = astra_tools::ToolResult::error(message.into());
+    result.metadata = Some(Map::from_iter([
+        (
+            "disposition".to_string(),
+            Value::String("rejected".to_string()),
+        ),
+        ("execution_started".to_string(), Value::Bool(false)),
+        (
+            "execution_fact".to_string(),
+            Value::String("not_executed".to_string()),
+        ),
     ]));
     result
 }

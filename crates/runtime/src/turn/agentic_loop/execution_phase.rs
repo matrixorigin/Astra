@@ -230,10 +230,13 @@ pub(crate) async fn fence_direct_child_finalization<H: AgenticLoopHost>(
         &serde_json::json!(children),
         Instant::now(),
     );
-    if !incomplete && state.interruption.is_none() {
+    if !incomplete {
         // The journal is evaluated after this fence. Snapshot only exact,
-        // observed receipt refs before removing provider context so recovery
-        // cannot replay the completed child message into another round.
+        // observed receipt refs even when an unrelated interruption already
+        // exists; otherwise the evaluator leaves a completed child launch
+        // unresolved and turns an unrelated failure into a false child
+        // failure. Removing provider context remains limited to the clean
+        // finalization path so resumable interruptions retain their evidence.
         state.stall.terminal_child_evaluation_refs = Some((
             owner.parent_run_id().to_string(),
             state
@@ -244,9 +247,11 @@ pub(crate) async fn fence_direct_child_finalization<H: AgenticLoopHost>(
                 .filter_map(|record| record.execution_completion.clone())
                 .collect(),
         ));
-        state
-            .volatile_pending
-            .retain(|injection| injection.payload["schema"] != DIRECT_CHILD_RESULT_SCHEMA);
+        if state.interruption.is_none() {
+            state
+                .volatile_pending
+                .retain(|injection| injection.payload["schema"] != DIRECT_CHILD_RESULT_SCHEMA);
+        }
     }
 }
 

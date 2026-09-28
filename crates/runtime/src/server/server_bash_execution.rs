@@ -6,7 +6,10 @@ use astra_tools::exit_semantics::{classify_command_result, classify_exit};
 use serde_json::Value;
 
 use super::tool_execution_binding::WorkspaceBinding;
-use super::tool_execution_result::{tool_timeout_tool_result, workspace_path_mismatch_tool_result};
+use super::tool_execution_result::{
+    pre_dispatch_rejection_tool_result, tool_timeout_tool_result,
+    workspace_path_mismatch_tool_result,
+};
 use super::tool_workspace_path_guard::server_sandbox_local_path_mismatch;
 use crate::tool_sandbox::{
     IsolatedOutput, IsolationConfig, IsolationLevel, SandboxPolicy, filter_environment,
@@ -43,7 +46,7 @@ pub(crate) async fn execute_server_bash(
         || args.get("ready_check").is_some()
         || args.get("background_ttl").is_some()
     {
-        return astra_tools::ToolResult::error(
+        return pre_dispatch_rejection_tool_result(
             "Error: managed background fields are unavailable on this server Bash executor; no command was run"
                 .to_string(),
         );
@@ -51,20 +54,18 @@ pub(crate) async fn execute_server_bash(
     let command = match args.get("command").and_then(|value| value.as_str()) {
         Some(command) => command,
         None => {
-            return astra_tools::ToolResult::error(
-                "Error: Missing 'command' parameter".to_string(),
-            );
+            return pre_dispatch_rejection_tool_result("Error: Missing 'command' parameter");
         }
     };
     let workdir = match astra_tools::shell_ops::resolve_bash_workdir(workspace_root, args) {
         Ok(workdir) => workdir,
-        Err(error) => return astra_tools::ToolResult::error(error),
+        Err(error) => return pre_dispatch_rejection_tool_result(error),
     };
     if let Err(reason) = astra_tools::shell_ops::validate_prepared_bash_command(command, &workdir) {
-        return astra_tools::ToolResult::error(reason);
+        return pre_dispatch_rejection_tool_result(reason);
     }
     if command.len() > MAX_COMMAND_LENGTH {
-        return astra_tools::ToolResult::error(format!(
+        return pre_dispatch_rejection_tool_result(format!(
             "Error: command exceeds maximum length of {} bytes",
             MAX_COMMAND_LENGTH
         ));
@@ -91,7 +92,7 @@ pub(crate) async fn execute_server_bash(
         workdir.inspection(),
     ) {
         Ok(plan) => plan,
-        Err(reason) => return astra_tools::ToolResult::error(format!("Error: {reason}")),
+        Err(reason) => return pre_dispatch_rejection_tool_result(format!("Error: {reason}")),
     };
     if source_preimages.is_none() && !explicit_source_artifacts {
         // This is intentionally advisory. A missing identity, ambiguous
@@ -137,7 +138,7 @@ pub(crate) async fn execute_server_bash(
             .get(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
             .is_some()
     {
-        return astra_tools::ToolResult::error(
+        return pre_dispatch_rejection_tool_result(
             "Error: external_state_paths requires a top-level foreground executor-owned observation window"
                 .to_string(),
         );
@@ -155,8 +156,8 @@ pub(crate) async fn execute_server_bash(
                 if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
                     return astra_tools::cancelled_tool_result("bash", false);
                 }
-                return astra_tools::ToolResult::error(
-                    "Error: workspace observation lease was unavailable or timed out; no bash command was run".into(),
+                return pre_dispatch_rejection_tool_result(
+                    "Error: workspace observation lease was unavailable or timed out; no bash command was run",
                 );
             }
         }
@@ -184,14 +185,16 @@ pub(crate) async fn execute_server_bash(
         args, workspace_root, cancel_token, Duration::from_secs_f64(timeout_secs.max(0.1)),
     ).await {
         Ok(lease) => lease,
-        Err(reason) => return astra_tools::ToolResult::error(format!("Error: external state observation was not admitted: {reason}")),
+        Err(reason) => return pre_dispatch_rejection_tool_result(format!("Error: external state observation was not admitted: {reason}")),
     };
     if args
         .get(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
         .is_some()
         && external_lease.is_none()
     {
-        return astra_tools::ToolResult::error("Error: external state observation lease is contended or unavailable; no command was run.".to_string());
+        return pre_dispatch_rejection_tool_result(
+            "Error: external state observation lease is contended or unavailable; no command was run.",
+        );
     }
     let external_before = {
         let root = workspace_root.to_path_buf();
@@ -205,12 +208,12 @@ pub(crate) async fn execute_server_bash(
         {
             Ok(Ok(before)) => before,
             Ok(Err(reason)) => {
-                return astra_tools::ToolResult::error(format!(
+                return pre_dispatch_rejection_tool_result(format!(
                     "Error: external state observation was not admitted: {reason}"
                 ));
             }
             Err(error) => {
-                return astra_tools::ToolResult::error(format!(
+                return pre_dispatch_rejection_tool_result(format!(
                     "Error: external state preimage worker failed: {error}"
                 ));
             }
@@ -771,6 +774,32 @@ mod tests {
         assert!(result.is_error);
         assert!(result.output.contains("unavailable"));
         assert!(!result.output.contains("should-not-run"));
+        let metadata = result.metadata.expect("typed pre-dispatch rejection");
+        assert_eq!(metadata["disposition"], "rejected");
+        assert_eq!(metadata["execution_started"], false);
+        assert_eq!(metadata["execution_fact"], "not_executed");
+    }
+
+    #[tokio::test]
+    async fn server_bash_policy_rejection_is_not_recorded_as_execution_failure() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let policy = SandboxPolicy::permissive(workspace.path());
+        let binding = WorkspaceBinding::server_sandbox(workspace.path());
+        let result = execute_server_bash(
+            &policy,
+            workspace.path(),
+            &binding,
+            None,
+            &serde_json::json!({"command": "rm -rf should-not-run"}),
+            None,
+        )
+        .await;
+
+        assert!(result.is_error);
+        let metadata = result.metadata.expect("typed policy rejection");
+        assert_eq!(metadata["disposition"], "rejected");
+        assert_eq!(metadata["execution_started"], false);
+        assert_eq!(metadata["execution_fact"], "not_executed");
     }
 
     #[tokio::test]
