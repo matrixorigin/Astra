@@ -151,7 +151,7 @@ child run, and the marker in the parent's final answer. It accepts either an
 exact `get_result` result for that sole child or the
 runtime's correlated adoption evidence: the same spawned and completed child
 has the expected result hash in a `results_adopted` trace, followed by its
-parent's `finalization_accepted` trace. A queued answer and terminal child
+parent’s `finalization_accepted` trace. A queued answer and terminal child
 event alone are insufficient. Even with a matching final answer, this proves
 delivery and observation, not that the parent's wording was causally derived
 from the child: the marker also appears in the user prompt. It is not a
@@ -159,7 +159,9 @@ process-restart test. The initial child task must include both possible marker
 outputs but not the chosen format; the later parent answer supplies only the
 choice. The journal checks that both outputs reached the spawned child brief;
 this keeps the information needed to produce the exact result available without
-letting the child skip the question.
+letting the child skip the question. The user request is explicitly read-only,
+and the spawn event must record that workspace scope; this exercises the
+delegated tool-discovery and communication surface under read-only authority.
 
 These cases deliberately do not call `reflect` or add model-request-ledger
 reads. The configured-name case proves provider-call identity from the existing
