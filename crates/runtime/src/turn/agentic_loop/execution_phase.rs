@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CompletionAction, ContinuationAuthority,
-    HostTurnResult, RejectedToolCall, RunControlProvider, TerminalExecutionAuthority,
-    ToolCallAdmission, TurnPhaseKind, TurnPhaseOutcome, UserIntentState,
-    WORK_SETTLEMENT_CONTRACT_FAILURE_TEXT, complete_turn_phase,
+    DIRECT_CHILD_RESULT_SCHEMA, HostTurnResult, RejectedToolCall, RunControlProvider,
+    TerminalExecutionAuthority, ToolCallAdmission, TurnPhaseKind, TurnPhaseOutcome,
+    UserIntentState, WORK_SETTLEMENT_CONTRACT_FAILURE_TEXT, complete_turn_phase,
     context_manifest_identity_from_result, finalize_and_render, finalize_turn_trace,
     try_write_heavy_checkpoint,
 };
@@ -41,7 +41,6 @@ const MAX_USER_INTENT_BOUNDARY_FACTS: usize = 4_096;
 const MAX_TEXTLESS_RESPONSE_RETRIES: u32 = 1;
 
 const DIRECT_CHILD_WAIT_LIMIT: Duration = Duration::from_secs(300);
-const DIRECT_CHILD_RESULT_SCHEMA: &str = "direct_child_completion.v1";
 
 /// Use the existing journal/trace sink, including its early-error flush. The
 /// digest joins the adopted evidence to the required-context payload without
@@ -5575,6 +5574,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 .filter(|injection| {
                     injection.attempt_leased
                         && injection.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+                        && injection.payload["observed_by_provider"] != true
                 })
                 .map(|injection| injection.payload.clone())
                 .collect();
@@ -10025,7 +10025,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mailbox_batches_accumulate_across_safe_boundaries_until_provider_delivery() {
+    async fn mailbox_messages_keep_distinct_identity_across_safe_boundaries() {
         use astra_messaging::in_process::InProcessTransport;
         use astra_messaging::router::AgentMailboxRouter;
         use astra_messaging::types::{AgentAddress, AgentMessage, MessagePayload, MessageTarget};
@@ -10072,11 +10072,12 @@ mod tests {
             .iter()
             .filter(|item| item.kind == VolatileKind::Mailbox)
             .collect::<Vec<_>>();
-        assert_eq!(
-            retained.len(),
-            2,
-            "a later drain cannot replace an earlier confirmed batch"
-        );
+        assert_eq!(retained.len(), 65, "each message keeps its own identity");
+        let ids = retained
+            .iter()
+            .map(|item| item.payload["message_id"].as_str().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 65, "no mailbox identity may be overwritten");
         let context = serde_json::to_string(&retained).unwrap();
         assert!(context.contains("message-0"));
         assert!(context.contains("message-64"));
@@ -10241,6 +10242,15 @@ mod tests {
             entry.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
                 && entry.payload["observed_by_provider"] == true
         }));
+        assert_eq!(
+            state
+                .volatile_pending
+                .iter()
+                .filter(|entry| entry.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA)
+                .count(),
+            1,
+            "observed child evidence must not be duplicated on later rounds"
+        );
     }
 
     #[test]

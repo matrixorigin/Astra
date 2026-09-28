@@ -6,6 +6,8 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+pub const MAX_AGENT_MESSAGE_CHARS: usize = 3_000;
+
 // ─── Agent Address ──────────────────────────────────────────────────────────
 
 /// Uniquely identifies an agent within a delegation hierarchy.

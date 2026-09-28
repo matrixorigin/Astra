@@ -619,7 +619,14 @@ pub(crate) fn decision_feedback_preamble_message(text: &str) -> Option<Value> {
 pub(crate) fn runtime_volatile_preamble_message(
     injection: &astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection,
 ) -> Option<Value> {
-    let text = if RuntimeAuthorityKind::instruction_field_for_wire_kind(&injection.kind)
+    let text = if injection.kind == "mailbox"
+        && injection.payload["schema"]
+            == crate::turn::agentic_loop::host::RETAINED_MAILBOX_CONTEXT_SCHEMA
+    {
+        let mut display_injection = injection.clone();
+        display_injection.payload = Value::String(injection.payload["display"].as_str()?.into());
+        display_injection.render_for_prompt()?
+    } else if RuntimeAuthorityKind::instruction_field_for_wire_kind(&injection.kind)
         == Some("/instruction")
     {
         match &injection.payload {
@@ -1824,15 +1831,10 @@ fn render_drained_volatile_messages(
 ) -> Vec<Value> {
     let mut out = Vec::new();
     for inj in drained {
-        let edge_injection = astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
-            kind: inj.kind.wire_kind(),
-            delivery_class: inj.kind.delivery_class(),
-            payload: inj.payload.clone(),
-            round_index: inj.round_index,
-            authority_lifetime: (inj.kind
-                == crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame)
-                .then_some(astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn),
-        };
+        if crate::turn::agentic_loop::host::is_observed_direct_child_result(inj) {
+            continue;
+        }
+        let edge_injection = crate::turn::agentic_loop::host::volatile_injection_edge_profile(inj);
         if let Some(message) = runtime_volatile_preamble_message(&edge_injection) {
             out.push(message);
         }
@@ -1844,6 +1846,99 @@ fn render_drained_volatile_messages(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn retained_mailbox_message_keeps_current_turn_lifetime_and_original_id_on_wire() {
+        let payload = json!({
+            "schema": crate::turn::agentic_loop::host::RETAINED_MAILBOX_CONTEXT_SCHEMA,
+            "message_id": "question-1",
+            "display": "📬 Message id=question-1 from child: Which format?",
+        });
+        let injection = crate::turn::agentic_loop::host::VolatileInjection {
+            kind: crate::turn::agentic_loop::host::VolatileKind::Mailbox,
+            payload,
+            round_index: 1,
+            attempt_leased: true,
+        };
+        let rendered = render_drained_volatile_messages(std::slice::from_ref(&injection));
+        let edge_wire =
+            crate::turn::agentic_loop::host::runtime_volatile_injections_edge_profile_value(
+                std::slice::from_ref(&injection),
+            )
+            .unwrap();
+        let edge: astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection =
+            serde_json::from_value(edge_wire[0].clone()).unwrap();
+        assert_eq!(
+            runtime_volatile_preamble_message(&edge),
+            Some(rendered[0].clone())
+        );
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(
+            rendered[0][RUNTIME_AUTHORITY_LIFETIME_MARKER],
+            "current_user_turn"
+        );
+        let content = rendered[0]["content"].as_str().unwrap();
+        assert!(content.contains("<runtime-required-context>"));
+        assert!(content.contains("Message id=question-1 from child: Which format?"));
+
+        let system = vec![json!({"role": "system", "content": "stable rules"})];
+        let mut history = vec![json!({"role": "user", "content": "coordinate the child"})];
+        let first = assemble_llm_messages_with_cache_capability_output(
+            system.clone(),
+            rendered.clone(),
+            Vec::new(),
+            history.clone(),
+            &PostCompactAttachments::default(),
+            "sid",
+            "openai",
+            "model",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            Some(append_only_required_capability()),
+            &cache_cfg(),
+        )
+        .unwrap();
+        assert_eq!(first.new_append_only_runtime_messages.len(), 1);
+        history.push(first.new_append_only_runtime_messages[0].clone());
+        for round in 0..20 {
+            history.push(json!({"role": "assistant", "content": format!("tool round {round}")}));
+            history.push(
+                json!({"role": "tool", "tool_call_id": format!("read-{round}"), "content": "ok"}),
+            );
+            let next = assemble_llm_messages_with_cache_capability_output(
+                system.clone(),
+                vec![runtime_volatile_preamble_message(&edge).unwrap()],
+                Vec::new(),
+                history.clone(),
+                &PostCompactAttachments::default(),
+                "sid",
+                "openai",
+                "model",
+                &astra_turn_core::thinking_config::ThinkingConfig::Off,
+                Some(append_only_required_capability()),
+                &cache_cfg(),
+            )
+            .unwrap();
+            assert!(
+                next.new_append_only_runtime_messages.is_empty(),
+                "round {round}"
+            );
+        }
+    }
+
+    #[test]
+    fn observed_direct_child_result_stays_in_evidence_but_leaves_the_provider_wire() {
+        let injection = crate::turn::agentic_loop::host::VolatileInjection {
+            kind: crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
+            payload: json!({
+                "schema": crate::turn::agentic_loop::host::DIRECT_CHILD_RESULT_SCHEMA,
+                "observed_by_provider": true,
+                "children": [{"agent_id": "child", "status": "completed"}],
+            }),
+            round_index: 1,
+            attempt_leased: false,
+        };
+        assert!(render_drained_volatile_messages(&[injection]).is_empty());
+    }
 
     #[test]
     fn artifact_recovery_guidance_is_current_bound_and_byte_stable() {

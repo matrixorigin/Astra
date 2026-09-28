@@ -617,7 +617,6 @@ fn rejected_agent_message(reason: impl Into<String>) -> String {
 fn agent_message_content(args: &Value) -> Result<String, String> {
     // Mailbox messages are coordination, not a bulk artifact channel. Keep
     // accepted model-authored guidance within the runtime's context preview.
-    const MAX_MESSAGE_CHARS: usize = 3_000;
     let message = args
         .get("message")
         .ok_or_else(|| "send_message requires `message`".to_string())?;
@@ -630,9 +629,10 @@ fn agent_message_content(args: &Value) -> Result<String, String> {
     if content.is_empty() {
         return Err("send_message requires a non-empty `message`".to_string());
     }
-    if content.chars().count() > MAX_MESSAGE_CHARS {
+    if content.chars().count() > astra_messaging::types::MAX_AGENT_MESSAGE_CHARS {
         return Err(format!(
-            "send_message `message` exceeds {MAX_MESSAGE_CHARS} characters; send a concise message or share an artifact"
+            "send_message `message` exceeds {} characters; send a concise message or share an artifact",
+            astra_messaging::types::MAX_AGENT_MESSAGE_CHARS
         ));
     }
     Ok(content.to_string())
@@ -3638,7 +3638,7 @@ mod tests {
     use std::time::Instant;
 
     #[test]
-    fn send_message_rejects_content_that_would_be_silently_previewed() {
+    fn send_message_rejects_oversized_semantic_content_before_enqueue() {
         assert!(agent_message_content(&json!({"message": "a".repeat(3_000)})).is_ok());
         let error = agent_message_content(&json!({"message": "a".repeat(3_001)})).unwrap_err();
         assert!(error.contains("3000 characters"), "{error}");

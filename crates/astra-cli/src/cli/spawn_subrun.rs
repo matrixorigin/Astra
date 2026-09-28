@@ -774,82 +774,94 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             "catalog_resolved"
         };
         let selections = if batch_admission {
-            let request = ModelAdmissionRequestV1 {
-                slots: inputs
-                    .iter()
-                    .zip(&requested_selectors)
-                    .zip(&thinking)
-                    .map(|((input, selector), thinking)| {
-                        let selector = selector
-                            .clone()
-                            .or_else(|| {
-                                parent_selection.map(|selection| {
-                                    astra_turn_types::ModelSelector::OfferingId {
-                                        offering_id: selection.offering_id.clone(),
-                                    }
-                                })
-                            })
-                            .ok_or_else(|| {
-                                "child has no admitted parent or default Offering".to_string()
-                            })?;
-                        let reasoning = ReasoningSelection::from(thinking.clone());
-                        let inherited_reasoning = if input.reasoning.is_none()
-                            && matches!(
-                                selector,
-                                astra_turn_types::ModelSelector::ConfiguredName { .. }
-                            ) {
-                            context
-                                .parent_model_reasoning
-                                .as_ref()
-                                .map(|parent| {
-                                    Ok::<_, String>(
-                                        astra_server_types::ModelAdmissionReasoningInheritanceV1 {
-                                            offering_id: parent.selection.offering_id.clone(),
-                                            reasoning: serde_json::to_value(
-                                                ReasoningSelection::from(parent.thinking.clone()),
-                                            )
-                                            .map_err(|error| error.to_string())?,
-                                        },
-                                    )
-                                })
-                                .transpose()?
-                        } else {
-                            None
-                        };
-                        Ok(ModelAdmissionSlotV1 {
-                            selector,
-                            max_output_tokens: input.max_output_tokens,
-                            reasoning: serde_json::to_value(reasoning)
-                                .map_err(|error| error.to_string())?,
-                            inherited_reasoning,
+            let mut slots = Vec::with_capacity(inputs.len());
+            let mut slot_indexes = Vec::with_capacity(inputs.len());
+            let mut distinct_slots = HashMap::<String, usize>::new();
+            for ((input, selector), child_thinking) in
+                inputs.iter().zip(&requested_selectors).zip(&thinking)
+            {
+                let selector = selector
+                    .clone()
+                    .or_else(|| {
+                        parent_selection.map(|selection| {
+                            astra_turn_types::ModelSelector::OfferingId {
+                                offering_id: selection.offering_id.clone(),
+                            }
                         })
                     })
-                    .collect::<Result<Vec<_>, String>>()?,
-            };
+                    .ok_or_else(|| {
+                        "child has no admitted parent or default Offering".to_string()
+                    })?;
+                let reasoning = ReasoningSelection::from(child_thinking.clone());
+                let inherited_reasoning = if input.reasoning.is_none()
+                    && matches!(
+                        selector,
+                        astra_turn_types::ModelSelector::ConfiguredName { .. }
+                    ) {
+                    context
+                        .parent_model_reasoning
+                        .as_ref()
+                        .map(|parent| {
+                            Ok::<_, String>(
+                                astra_server_types::ModelAdmissionReasoningInheritanceV1 {
+                                    offering_id: parent.selection.offering_id.clone(),
+                                    reasoning: serde_json::to_value(ReasoningSelection::from(
+                                        parent.thinking.clone(),
+                                    ))
+                                    .map_err(|error| error.to_string())?,
+                                },
+                            )
+                        })
+                        .transpose()?
+                } else {
+                    None
+                };
+                let slot = ModelAdmissionSlotV1 {
+                    selector,
+                    max_output_tokens: input.max_output_tokens,
+                    reasoning: serde_json::to_value(reasoning)
+                        .map_err(|error| error.to_string())?,
+                    inherited_reasoning,
+                };
+                let key = serde_json::to_string(&slot).map_err(|error| error.to_string())?;
+                let slot_index = if let Some(slot_index) = distinct_slots.get(&key) {
+                    *slot_index
+                } else {
+                    let slot_index = slots.len();
+                    slots.push(slot);
+                    distinct_slots.insert(key, slot_index);
+                    slot_index
+                };
+                slot_indexes.push(slot_index);
+            }
             let admitted = crate::cli::session::session_runtime::admit_server_model_slots(
                 &self.api,
                 token.as_deref().expect("batch admission requires token"),
-                request,
+                ModelAdmissionRequestV1 { slots },
             )
             .await?;
-            if admitted.len() != inputs.len() {
+            if admitted.len() != distinct_slots.len() {
                 return Err("batch model admission returned an incomplete Offering set".into());
             }
-            for (index, ((selector, model), input)) in requested_selectors
+            let mut selections = Vec::with_capacity(inputs.len());
+            for (index, ((selector, input), slot_index)) in requested_selectors
                 .iter()
-                .zip(&admitted)
                 .zip(inputs)
+                .zip(&slot_indexes)
                 .enumerate()
             {
+                let admitted = admitted.get(*slot_index).ok_or_else(|| {
+                    "batch model admission returned an invalid slot index".to_string()
+                })?;
                 match selector {
                     Some(astra_turn_types::ModelSelector::OfferingId { offering_id })
-                        if model.model.offering_id != *offering_id =>
+                        if admitted.model.offering_id != *offering_id =>
                     {
                         return Err("batch model admission returned a mismatched Offering".into());
                     }
                     Some(astra_turn_types::ModelSelector::ConfiguredName {
                         model_name, ..
-                    }) if !model.model.name.eq_ignore_ascii_case(model_name) => {
+                    }) if !admitted.model.name.eq_ignore_ascii_case(model_name) => {
                         return Err(
                             "batch model admission returned a mismatched configured name".into(),
                         );
@@ -859,16 +871,14 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 if input
                     .resolved_model_selection
                     .as_ref()
-                    .is_some_and(|prepared| prepared.offering_id != model.model.offering_id)
+                    .is_some_and(|prepared| prepared.offering_id != admitted.model.offering_id)
                 {
                     return Err("resolved child Offering changed during batch admission".into());
                 }
-                thinking[index] = model.thinking.clone();
+                thinking[index] = admitted.thinking.clone();
+                selections.push(admitted.model.clone());
             }
-            admitted
-                .into_iter()
-                .map(|admitted| admitted.model)
-                .collect()
+            selections
         } else if let Some((selection, model_name)) = parent_model_snapshot {
             vec![
                 crate::cli::session::session_runtime::ServerModelSelection {
@@ -2233,7 +2243,7 @@ mod tests {
                 description: "flash review".into(),
                 prompt: "review".into(),
                 fanout_group_id: Some("review".into()),
-                fanout_target_count: Some(2),
+                fanout_target_count: Some(3),
                 fanout_slot_index: Some(0),
                 ..Default::default()
             },
@@ -2252,8 +2262,27 @@ mod tests {
                     },
                 ),
                 fanout_group_id: Some("review".into()),
-                fanout_target_count: Some(2),
+                fanout_target_count: Some(3),
                 fanout_slot_index: Some(1),
+                ..Default::default()
+            },
+            SpawnAgentInput {
+                description: "glm second review".into(),
+                prompt: "review".into(),
+                requested_model_policy: Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                    selector: astra_turn_types::ModelSelector::ConfiguredName {
+                        model_name: "glm-5.2".into(),
+                        source: None,
+                    },
+                }),
+                reasoning: Some(
+                    astra_turn_core::orchestration_spawn_tool::ReasoningSelection::Adaptive {
+                        effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+                    },
+                ),
+                fanout_group_id: Some("review".into()),
+                fanout_target_count: Some(3),
+                fanout_slot_index: Some(2),
                 ..Default::default()
             },
         ];
@@ -2263,8 +2292,8 @@ mod tests {
         let prepared = Arc::clone(&executor)
             .prepare_batch(&inputs, &context, Some(&parent))
             .await
-            .expect("both slots admitted before launch");
-        assert_eq!(prepared.len(), 2);
+            .expect("all child slots admitted before launch");
+        assert_eq!(prepared.len(), 3);
         assert_eq!(
             prepared[0].model_identity().unwrap().offering_id,
             "offer-flash"
@@ -2276,6 +2305,10 @@ mod tests {
         assert_eq!(
             prepared[1].model_identity().unwrap().provenance,
             "admission_validated"
+        );
+        assert_eq!(
+            prepared[2].model_identity().unwrap().offering_id,
+            "offer-glm"
         );
         for (prepared, input) in prepared.into_iter().zip(&inputs) {
             let admitted_selection =
@@ -2317,7 +2350,7 @@ mod tests {
             .prepare_batch(&explicit_inputs, &context, None)
             .await
             .expect("all-explicit slots need no parent lookup");
-        assert_eq!(explicit.len(), 2);
+        assert_eq!(explicit.len(), 3);
         server.verify().await;
         let requests = server.received_requests().await.unwrap();
         assert_eq!(
@@ -2586,10 +2619,13 @@ mod tests {
                 ThinkingConfig::ModelDefault,
                 ThinkingConfig::ModelDefault,
             ];
-            let slots: Vec<_> = inputs
-                .iter()
-                .zip(&effective)
-                .map(|(input, thinking)| {
+            let slot_indexes = [0, 0, 1, 2];
+            let representatives = [0, 2, 3];
+            let slots: Vec<_> = representatives
+                .into_iter()
+                .map(|index| {
+                    let input = &inputs[index];
+                    let thinking = &effective[index];
                     json!({
                         "offering_id": astra_turn_types::resolve_requested_model_selection(
                             input.requested_model_policy.as_ref(), Some(&parent)
@@ -2619,7 +2655,7 @@ mod tests {
                 prepared.into_iter().zip(&inputs).zip(effective).enumerate()
             {
                 assert_eq!(
-                    body["slots"][index]["reasoning"],
+                    body["slots"][slot_indexes[index]]["reasoning"],
                     serde_json::to_value(ReasoningSelection::from(thinking.clone())).unwrap()
                 );
                 let error = prepared

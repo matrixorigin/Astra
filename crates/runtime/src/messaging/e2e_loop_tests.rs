@@ -148,9 +148,11 @@ mod tests {
                 ));
             }
             self.observed_turn_messages.push(state.messages.clone());
+            // Match the production request owner: a successful assistant
+            // decision commits only context that this attempt actually leased.
+            let leased = state.lease_volatile_pending()?;
             self.observed_turn_volatile.push(
-                state
-                    .volatile_pending
+                leased
                     .iter()
                     .map(|injection| injection.payload.clone())
                     .collect(),
@@ -463,11 +465,13 @@ mod tests {
         // Post-Task #45: drained mailbox rides the structured volatile
         // lane (Kind::Mailbox) instead of state.messages.
         let has_mailbox_msg = state.volatile_pending.iter().any(|inj| {
-            inj.payload.as_str().is_some_and(|text| {
-                text.contains("📬")
-                    && text.contains("orchestrator")
-                    && text.contains("Focus on auth module.")
-            })
+            inj.payload["schema"]
+                == crate::turn::agentic_loop::host::RETAINED_MAILBOX_CONTEXT_SCHEMA
+                && inj.payload["message_id"] == queued["message_id"]
+                && inj.payload["sender"]["agent_id"] == "orchestrator"
+                && inj.payload["display"]
+                    .as_str()
+                    .is_some_and(|display| display.contains("Focus on auth module."))
         });
         assert!(
             has_mailbox_msg,
@@ -491,6 +495,69 @@ mod tests {
         assert!(
             parent_mb.try_recv().is_none(),
             "no application receipt traffic"
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_guidance_remains_in_the_next_request_after_an_intervening_tool_round() {
+        let (_router, parent_mb, child_mb, _dt) = setup_two_agents().await;
+        let message = AgentMessage::new(
+            parent_mb.address.clone(),
+            MessageTarget::Direct {
+                address: child_mb.address.clone(),
+            },
+            MessagePayload::Text {
+                content: "Review cancellation cleanup before finishing.".into(),
+                summary: None,
+            },
+        );
+        parent_mb.send(message.clone()).await.unwrap();
+        let mut host = MockHost::new(vec![
+            HostTurnResult {
+                accum: ChatTurnSseAccum {
+                    has_tool_calls: true,
+                    has_usage: true,
+                    tool_calls: vec![json!({
+                        "id": "call-read-1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": r#"{"path":"note.txt"}"#}
+                    })],
+                    ..ChatTurnSseAccum::default()
+                },
+                ttft_ms: Some(10),
+                edge_tool_round: vec![EdgeToolExecResult {
+                    execution_completion: None,
+                    request_id: "call-read-1".into(),
+                    tool: "read_file".into(),
+                    args: json!({"path": "note.txt"}),
+                    output: "read-only evidence".into(),
+                    tool_result_fields: Some(edge_runtime_environment_fields()),
+                    status: "completed".into(),
+                    duration_ms: 1,
+                }],
+                error_kind: None,
+            },
+            text_result("Cleanup reviewed."),
+        ])
+        .with_valid_tools(&["read_file"]);
+        let mut state = make_state();
+        state.messaging.mailbox = Some(child_mb);
+        run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(host.observed_turn_volatile.len(), 2);
+        let first = &host.observed_turn_volatile[0][0];
+        assert_eq!(first["message_id"], message.id);
+        assert!(first["display"].as_str().is_some_and(|display| {
+            display.contains("Review cancellation cleanup before finishing.")
+        }));
+        assert_eq!(
+            host.observed_turn_volatile[1][0]["message_id"],
+            first["message_id"]
+        );
+        assert_eq!(
+            host.observed_turn_volatile[1][0]["display"],
+            first["display"]
         );
     }
 
@@ -570,10 +637,289 @@ mod tests {
             .await
             .unwrap();
         assert!(state.volatile_pending.iter().any(|injection| {
-            injection.payload.as_str().is_some_and(|text| {
-                text.contains(request_id) && text.contains("Which format should I use?")
-            })
+            injection.payload["message_id"] == request_id
+                && injection.payload["display"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Which format should I use?"))
         }));
+    }
+
+    #[tokio::test]
+    async fn semantic_mailbox_redelivery_keeps_one_context_and_rejects_conflicting_identity() {
+        let (_router, parent_mb, child_mb, _dt) = setup_two_agents().await;
+        let mut host = MockHost::new(vec![]);
+        let mut state = make_state();
+        state.messaging.mailbox = Some(child_mb);
+        let mut message = AgentMessage::new(
+            parent_mb.address.clone(),
+            MessageTarget::Direct {
+                address: state.messaging.mailbox.as_ref().unwrap().address.clone(),
+            },
+            MessagePayload::Text {
+                content: "Check the cancellation path.".into(),
+                summary: None,
+            },
+        );
+        parent_mb.send(message.clone()).await.unwrap();
+        assert!(
+            drain_mailbox_model_context(&mut host, &mut state)
+                .await
+                .unwrap()
+        );
+        assert_eq!(state.volatile_pending.len(), 1);
+
+        parent_mb.send(message.clone()).await.unwrap();
+        assert!(
+            !drain_mailbox_model_context(&mut host, &mut state)
+                .await
+                .unwrap()
+        );
+        assert_eq!(state.volatile_pending.len(), 1);
+
+        message.payload = MessagePayload::Text {
+            content: "A different instruction with the same ID.".into(),
+            summary: None,
+        };
+        parent_mb.send(message).await.unwrap();
+        let error = drain_mailbox_model_context(&mut host, &mut state)
+            .await
+            .expect_err("an immutable message identity cannot change content");
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+        assert_eq!(state.volatile_pending.len(), 1);
+        assert!(
+            state
+                .messaging
+                .mailbox
+                .as_mut()
+                .unwrap()
+                .try_recv()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn full_retained_mailbox_reports_overflow_without_poisoning_the_queue() {
+        let (_router, parent_mb, child_mb, _dt) = setup_two_agents().await;
+        let recipient = child_mb.address.clone();
+        let mut state = make_state();
+        state.messaging.mailbox = Some(child_mb);
+        for index in 0..128 {
+            state.push_volatile_payload(
+                crate::turn::agentic_loop::host::VolatileKind::Mailbox,
+                json!({
+                    "schema": crate::turn::agentic_loop::host::RETAINED_MAILBOX_CONTEXT_SCHEMA,
+                    "receiver": recipient,
+                    "sender": parent_mb.address,
+                    "message_id": format!("retained-{index}"),
+                    "display": "previously accepted semantic input",
+                }),
+            );
+        }
+        parent_mb
+            .send(AgentMessage::new(
+                parent_mb.address.clone(),
+                MessageTarget::Direct {
+                    address: recipient.clone(),
+                },
+                MessagePayload::Text {
+                    content: "New guidance".into(),
+                    summary: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let mut host = MockHost::new(vec![]);
+        assert!(
+            drain_mailbox_model_context(&mut host, &mut state)
+                .await
+                .expect("overflow is a recoverable delivery condition")
+        );
+        assert_eq!(
+            state
+                .volatile_pending
+                .iter()
+                .filter(|injection| {
+                    injection.kind == crate::turn::agentic_loop::host::VolatileKind::Mailbox
+                        && injection.payload["schema"]
+                            == crate::turn::agentic_loop::host::RETAINED_MAILBOX_CONTEXT_SCHEMA
+                })
+                .count(),
+            128
+        );
+        assert!(
+            state
+                .messaging
+                .mailbox
+                .as_mut()
+                .unwrap()
+                .try_recv()
+                .is_none()
+        );
+        assert!(state.volatile_pending.iter().any(|injection| {
+            injection.kind == crate::turn::agentic_loop::host::VolatileKind::ContextPressure
+                && injection
+                    .payload
+                    .as_str()
+                    .is_some_and(|text| text.contains("context budget"))
+        }));
+
+        for injection in &mut state.volatile_pending {
+            if injection.payload["schema"]
+                == crate::turn::agentic_loop::host::RETAINED_MAILBOX_CONTEXT_SCHEMA
+            {
+                injection.payload["observed_by_provider"] = json!(true);
+            }
+        }
+        parent_mb
+            .send(AgentMessage::new(
+                parent_mb.address.clone(),
+                MessageTarget::Direct { address: recipient },
+                MessagePayload::Text {
+                    content: "Replacement guidance".into(),
+                    summary: None,
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(
+            drain_mailbox_model_context(&mut host, &mut state)
+                .await
+                .unwrap()
+        );
+        assert!(state.volatile_pending.iter().any(|injection| {
+            injection.payload["message_id"] != json!(null)
+                && injection.payload["display"]
+                    .as_str()
+                    .is_some_and(|display| display.contains("Replacement guidance"))
+        }));
+        assert!(
+            state
+                .messaging
+                .mailbox
+                .as_mut()
+                .unwrap()
+                .try_recv()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_semantic_message_is_acknowledged_with_a_bounded_notice() {
+        let (_router, parent_mb, child_mb, _dt) = setup_two_agents().await;
+        let recipient = child_mb.address.clone();
+        parent_mb
+            .send(AgentMessage::new(
+                parent_mb.address.clone(),
+                MessageTarget::Direct { address: recipient },
+                MessagePayload::Text {
+                    content: "x".repeat(24_100),
+                    summary: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let mut state = make_state();
+        state.messaging.mailbox = Some(child_mb);
+        let mut host = MockHost::new(vec![]);
+        assert!(
+            drain_mailbox_model_context(&mut host, &mut state)
+                .await
+                .expect("oversized external input is a recoverable delivery condition")
+        );
+        assert!(state.volatile_pending.iter().any(|injection| {
+            injection.kind == crate::turn::agentic_loop::host::VolatileKind::ContextPressure
+                && injection
+                    .payload
+                    .as_str()
+                    .is_some_and(|text| text.contains("24000-character"))
+        }));
+        assert!(
+            state
+                .messaging
+                .mailbox
+                .as_mut()
+                .unwrap()
+                .try_recv()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_matching_response_does_not_clear_the_reply_obligation() {
+        let (_router, parent_mb, child_mb, _dt) = setup_two_agents().await;
+        let request_id = "question-that-needs-a-real-answer";
+        let mut state = make_state();
+        state.current_run_id = Some(child_mb.address.run_id.clone());
+        state
+            .messaging
+            .reply_obligations
+            .reserve(
+                &child_mb.address.run_id,
+                request_id,
+                parent_mb.address.clone(),
+            )
+            .unwrap();
+        parent_mb
+            .send(AgentMessage::new(
+                parent_mb.address.clone(),
+                MessageTarget::Direct {
+                    address: child_mb.address.clone(),
+                },
+                MessagePayload::Response {
+                    request_id: request_id.into(),
+                    accepted: true,
+                    data: Some(json!({"content": "x".repeat(24_100)})),
+                },
+            ))
+            .await
+            .unwrap();
+        state.messaging.mailbox = Some(child_mb);
+        let mut host = MockHost::new(vec![]);
+        assert!(
+            drain_mailbox_model_context(&mut host, &mut state)
+                .await
+                .unwrap()
+        );
+        assert!(state.messaging.reply_obligations.has_pending("run-child-0"));
+    }
+
+    #[tokio::test]
+    async fn admitted_escaped_question_reaches_the_receiver_without_false_overflow() {
+        let (router, _parent_mb, child_mb, _dt) = setup_two_agents().await;
+        let content = "\"".repeat(2_500);
+        let queued = crate::orchestration::agent_tool::handle_agent_send_message_with_router(
+            &json!({
+                "action": "send_message",
+                "to": "run-child-0",
+                "message_type": "question",
+                "message": content,
+            }),
+            &router,
+            "run-parent",
+            "orchestrator",
+            &ReplyObligations::default(),
+        )
+        .await;
+        let queued: Value = serde_json::from_str(&queued).unwrap();
+        assert_eq!(queued["success"], true);
+        let mut state = make_state();
+        state.messaging.mailbox = Some(child_mb);
+        let mut host = MockHost::new(vec![]);
+        assert!(
+            drain_mailbox_model_context(&mut host, &mut state)
+                .await
+                .unwrap()
+        );
+        assert_eq!(state.volatile_pending.len(), 1);
+        assert_eq!(
+            state.volatile_pending[0].payload["message_id"],
+            queued["message_id"]
+        );
+        assert!(
+            state.volatile_pending[0].payload["display"]
+                .as_str()
+                .is_some_and(|display| display.contains("Custom") && display.len() > content.len())
+        );
     }
 
     #[tokio::test]
@@ -1039,7 +1385,7 @@ mod tests {
     async fn parent_loop_handles_permission_request_before_llm_injection() {
         let (_router, parent_mb, mut child_mb, _dt) = setup_two_agents().await;
 
-        let request = PermissionRequest::new("bash", json!({"command": "echo hi"}))
+        let request = PermissionRequest::new("bash", json!({"command": "x".repeat(5_000)}))
             .to_message(&child_mb.address, &parent_mb.address)
             .with_correlation("perm-1");
         child_mb.send(request).await.unwrap();

@@ -33,21 +33,20 @@ use astra_turn_core::stall::CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG;
 const CHILD_AGENT_CANCEL_TIMEOUT: Duration = Duration::from_secs(3);
 const PAUSE_LOOP_LOCAL_CHECK_INTERVAL: Duration = Duration::from_millis(25);
 const PAUSED_RUN_DURABLE_CONTROL_POLL_INTERVAL: Duration = Duration::from_secs(2);
-const MAILBOX_MODEL_PREVIEW_CHARS: usize = 4_000;
+const MAX_MAILBOX_CONTEXT_CHARS: usize = 24_000;
+const MAX_RETAINED_MAILBOX_MESSAGES: usize = 128;
+const MAX_RETAINED_MAILBOX_BYTES: usize = 128 * 1024;
 
-fn push_mailbox_model_preview(parts: &mut Vec<String>, value: String) {
-    let mut chars = value.chars();
-    let preview = chars
-        .by_ref()
-        .take(MAILBOX_MODEL_PREVIEW_CHARS)
-        .collect::<String>();
-    if chars.next().is_some() {
-        parts.push(format!(
-            "{preview}… [message preview truncated; ask the sender for a concise follow-up if needed]"
-        ));
-    } else {
-        parts.push(preview);
-    }
+fn retained_mailbox_usage(pending: &[super::host::VolatileInjection]) -> (usize, usize) {
+    pending
+        .iter()
+        .filter(|injection| super::host::is_retained_mailbox_context(injection))
+        .fold((0, 0), |(count, bytes), injection| {
+            (
+                count + 1,
+                bytes.saturating_add(injection.payload.to_string().len()),
+            )
+        })
 }
 
 /// One mailbox consumption owner for ordinary turns and waits. A transport
@@ -58,8 +57,9 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
 ) -> Result<bool, astra_core::ClassifiedError> {
     let reply_obligations = Arc::clone(&state.messaging.reply_obligations);
     let mut model_context_changed = false;
-    let mut mailbox_batch_index: Option<usize> = None;
     const MAX_MAILBOX_DRAIN_PER_TURN: usize = 64;
+    let (mut retained_mailbox_messages, mut retained_mailbox_bytes) =
+        retained_mailbox_usage(&state.volatile_pending);
     for _ in 0..MAX_MAILBOX_DRAIN_PER_TURN {
         let Some(mailbox) = state.messaging.mailbox.as_mut() else {
             break;
@@ -135,22 +135,16 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
             if !handled_permission {
                 match &msg.payload {
                     astra_messaging::types::MessagePayload::Text { content, .. } => {
-                        push_mailbox_model_preview(
-                            &mut parts,
-                            format!("[{from_label}]: {content}"),
-                        );
+                        parts.push(format!("[{from_label}]: {content}"));
                     }
                     astra_messaging::types::MessagePayload::Progress { .. } => {}
                     astra_messaging::types::MessagePayload::Request { request_type, data } => {
                         let data = (!data.is_null()).then(|| format!(" · {data}"));
-                        push_mailbox_model_preview(
-                            &mut parts,
-                            format!(
-                                "[{from_label} request id={}]: {request_type:?}{}",
-                                msg.id,
-                                data.as_deref().unwrap_or("")
-                            ),
-                        );
+                        parts.push(format!(
+                            "[{from_label} request id={}]: {request_type:?}{}",
+                            msg.id,
+                            data.as_deref().unwrap_or("")
+                        ));
                     }
                     astra_messaging::types::MessagePayload::Response {
                         request_id,
@@ -162,50 +156,170 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
                             &msg,
                         ) {
                             let data = data.as_ref().map(|data| format!(" · {data}"));
-                            push_mailbox_model_preview(
-                                &mut parts,
-                                format!(
-                                    "[{from_label} response to {request_id}]: accepted={accepted}{}",
-                                    data.as_deref().unwrap_or("")
-                                ),
-                            );
+                            parts.push(format!(
+                                "[{from_label} response to {request_id}]: accepted={accepted}{}",
+                                data.as_deref().unwrap_or("")
+                            ));
                         }
                     }
                     astra_messaging::types::MessagePayload::Signal(sig) => {
-                        push_mailbox_model_preview(
-                            &mut parts,
-                            format!("[{from_label} signal]: {sig:?}"),
-                        );
+                        let signal = format!("[{from_label} signal]: {sig:?}");
+                        let preview = signal.chars().take(4_000).collect::<String>();
+                        parts.push(if preview.len() < signal.len() {
+                            format!("{preview}… [signal preview truncated]")
+                        } else {
+                            preview
+                        });
                     }
                 }
             }
         }
+        let (staged, response_context_adopted) = if parts.is_empty() {
+            (None, false)
+        } else {
+            let display = format!(
+                "📬 Message id={} from another agent:\n{}",
+                msg.id,
+                parts.join("\n")
+            );
+            if display.chars().count() > MAX_MAILBOX_CONTEXT_CHARS {
+                (
+                    Some((
+                        super::host::VolatileKind::ContextPressure,
+                        serde_json::Value::String(format!(
+                            "📬 Message id={} was received but not injected because it exceeds the {}-character model context limit; ask the sender for a concise follow-up or an artifact reference.",
+                            msg.id, MAX_MAILBOX_CONTEXT_CHARS
+                        )),
+                    )),
+                    false,
+                )
+            } else {
+                let semantic = matches!(
+                    msg.payload,
+                    astra_messaging::types::MessagePayload::Text { .. }
+                        | astra_messaging::types::MessagePayload::Request {
+                            request_type: astra_messaging::types::RequestType::Shutdown
+                                | astra_messaging::types::RequestType::ContextShare
+                                | astra_messaging::types::RequestType::Custom(_),
+                            ..
+                        }
+                        | astra_messaging::types::MessagePayload::Response { .. }
+                );
+                if semantic {
+                    let payload_digest = format!(
+                        "{:x}",
+                        Sha256::digest(
+                            serde_json::to_vec(&msg.payload)
+                                .expect("agent message payload must serialize"),
+                        )
+                    );
+                    let message_kind = match msg.payload {
+                        astra_messaging::types::MessagePayload::Text { .. } => "text",
+                        astra_messaging::types::MessagePayload::Request { .. } => "request",
+                        astra_messaging::types::MessagePayload::Response { .. } => "response",
+                        _ => unreachable!(
+                            "semantic mailbox payload must be text, request, or response"
+                        ),
+                    };
+                    let payload = serde_json::json!({
+                        "schema": super::host::RETAINED_MAILBOX_CONTEXT_SCHEMA,
+                        "receiver": address,
+                        "sender": msg.from,
+                        "message_id": msg.id,
+                        "correlation_id": msg.correlation_id,
+                        "message_kind": message_kind,
+                        "payload_digest": payload_digest,
+                        "delivery_count": 0,
+                        "display": display,
+                    });
+                    let prior = state.volatile_pending.iter().find(|injection| {
+                        injection.kind == super::host::VolatileKind::Mailbox
+                            && injection.payload["schema"]
+                                == super::host::RETAINED_MAILBOX_CONTEXT_SCHEMA
+                            && injection.payload["receiver"] == payload["receiver"]
+                            && injection.payload["sender"] == payload["sender"]
+                            && injection.payload["message_id"] == payload["message_id"]
+                    });
+                    if let Some(prior) = prior {
+                        if prior.payload["payload_digest"] != payload["payload_digest"]
+                            || prior.payload["display"] != payload["display"]
+                        {
+                            return Err(astra_core::ClassifiedError::new(
+                                astra_core::ErrorKind::ContractViolation,
+                                "mailbox message identity conflicts with retained semantic input",
+                            ));
+                        }
+                        (None, true)
+                    } else {
+                        let payload_bytes = payload.to_string().len();
+                        while retained_mailbox_messages >= MAX_RETAINED_MAILBOX_MESSAGES
+                            || retained_mailbox_bytes.saturating_add(payload_bytes)
+                                > MAX_RETAINED_MAILBOX_BYTES
+                        {
+                            let evict = state
+                                .volatile_pending
+                                .iter()
+                                .position(|injection| {
+                                    super::host::is_retained_mailbox_context(injection)
+                                        && injection.payload["observed_by_provider"] == true
+                                        && injection.payload["message_kind"] != "request"
+                                })
+                                .or_else(|| {
+                                    state.volatile_pending.iter().position(|injection| {
+                                        super::host::is_retained_mailbox_context(injection)
+                                            && injection.payload["observed_by_provider"] == true
+                                    })
+                                });
+                            let Some(index) = evict else {
+                                break;
+                            };
+                            let removed = state.volatile_pending.remove(index);
+                            retained_mailbox_messages = retained_mailbox_messages.saturating_sub(1);
+                            retained_mailbox_bytes = retained_mailbox_bytes
+                                .saturating_sub(removed.payload.to_string().len());
+                        }
+                        if retained_mailbox_messages >= MAX_RETAINED_MAILBOX_MESSAGES
+                            || retained_mailbox_bytes.saturating_add(payload_bytes)
+                                > MAX_RETAINED_MAILBOX_BYTES
+                        {
+                            (
+                                Some((
+                                    super::host::VolatileKind::ContextPressure,
+                                    serde_json::Value::String(format!(
+                                        "📬 Message id={} was received but not retained because the mailbox context budget is full; inspect the communication trace or ask the sender to resend only the essential detail.",
+                                        msg.id
+                                    )),
+                                )),
+                                false,
+                            )
+                        } else {
+                            retained_mailbox_messages += 1;
+                            retained_mailbox_bytes =
+                                retained_mailbox_bytes.saturating_add(payload_bytes);
+                            (Some((super::host::VolatileKind::Mailbox, payload)), true)
+                        }
+                    }
+                } else {
+                    (
+                        Some((
+                            super::host::VolatileKind::Mailbox,
+                            serde_json::Value::String(display),
+                        )),
+                        true,
+                    )
+                }
+            }
+        };
         lease.commit();
         // No await separates releasing process-local ownership from staging
         // this exact envelope for the next model request.
-        if !parts.is_empty() {
-            let content = parts.join("\n");
-            if let Some(index) = mailbox_batch_index {
-                if let serde_json::Value::String(batch) = &mut state.volatile_pending[index].payload
-                {
-                    batch.push('\n');
-                    batch.push_str(&content);
-                }
-            } else {
-                state.push_volatile(
-                    super::host::VolatileKind::Mailbox,
-                    format!(
-                        "📬 Message from another agent{}:\n{content}",
-                        if has_more { " (more queued)" } else { "" },
-                    ),
-                );
-                mailbox_batch_index = Some(state.volatile_pending.len() - 1);
-            }
+        if let Some((kind, payload)) = staged {
+            state.push_volatile_payload(kind, payload);
             model_context_changed = true;
         }
         // The exact response is adopted only after its model context has been
         // staged. A transport ACK or unrelated text is never completion proof.
-        if let Some(run_id) = state.current_run_id.as_deref() {
+        if response_context_adopted && let Some(run_id) = state.current_run_id.as_deref() {
             reply_obligations.observe_response(run_id, &msg);
         }
         if let Some(mailbox) = state.messaging.mailbox.as_ref()

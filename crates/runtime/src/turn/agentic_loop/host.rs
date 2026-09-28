@@ -2803,6 +2803,20 @@ pub enum VolatileKind {
     PlanModeMarker,
 }
 
+pub(crate) const RETAINED_MAILBOX_CONTEXT_SCHEMA: &str = "astra.mailbox_context.v1";
+pub(crate) const DIRECT_CHILD_RESULT_SCHEMA: &str = "direct_child_completion.v1";
+
+pub(crate) fn is_retained_mailbox_context(injection: &VolatileInjection) -> bool {
+    injection.kind == VolatileKind::Mailbox
+        && injection.payload["schema"] == RETAINED_MAILBOX_CONTEXT_SCHEMA
+}
+
+pub(crate) fn is_observed_direct_child_result(injection: &VolatileInjection) -> bool {
+    injection.kind == VolatileKind::BackgroundTaskNotification
+        && injection.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+        && injection.payload["observed_by_provider"] == true
+}
+
 impl VolatileKind {
     /// Snapshot-style kinds where only the most recent value is
     /// semantically meaningful. `push_volatile` replaces any prior
@@ -2902,6 +2916,21 @@ fn volatile_payload_is_empty(payload: &Value) -> bool {
     }
 }
 
+pub(crate) fn volatile_injection_edge_profile(
+    injection: &VolatileInjection,
+) -> astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
+    use astra_turn_types::RuntimeAuthorityLifetime;
+    astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
+        kind: injection.kind.wire_kind(),
+        delivery_class: injection.kind.delivery_class(),
+        payload: injection.payload.clone(),
+        round_index: injection.round_index,
+        authority_lifetime: (injection.kind == VolatileKind::ActiveTurnFrame
+            || is_retained_mailbox_context(injection))
+        .then_some(RuntimeAuthorityLifetime::CurrentUserTurn),
+    }
+}
+
 /// Serialize runtime-owned volatile injections for the CLI/server edge_profile
 /// boundary without flattening away their producer kind.
 #[must_use]
@@ -2914,29 +2943,10 @@ pub fn runtime_volatile_injections_edge_profile_value(
             if volatile_payload_is_empty(&injection.payload) {
                 return None;
             }
-            let mut object = serde_json::Map::new();
-            object.insert(
-                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_RUNTIME_VOLATILE_KIND
-                    .to_string(),
-                serde_json::Value::String(injection.kind.wire_kind()),
-            );
-            object.insert(
-                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_RUNTIME_VOLATILE_DELIVERY_CLASS
-                    .to_string(),
-                serde_json::to_value(injection.kind.delivery_class())
-                    .expect("volatile delivery class must serialize"),
-            );
-            object.insert(
-                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_RUNTIME_VOLATILE_PAYLOAD
-                    .to_string(),
-                injection.payload.clone(),
-            );
-            object.insert(
-                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_RUNTIME_VOLATILE_ROUND_INDEX
-                    .to_string(),
-                serde_json::json!(injection.round_index),
-            );
-            Some(serde_json::Value::Object(object))
+            Some(
+                serde_json::to_value(volatile_injection_edge_profile(injection))
+                    .expect("runtime volatile injection must serialize"),
+            )
         })
         .collect::<Vec<_>>();
     (!items.is_empty()).then_some(serde_json::Value::Array(items))
@@ -4764,8 +4774,29 @@ impl AgenticLoopState {
     /// Commit only the authorities actually leased to the completed attempt.
     /// Facts queued after request construction remain pending.
     pub fn commit_volatile_attempt_lease(&mut self) {
-        self.volatile_pending
-            .retain(|injection| !injection.attempt_leased);
+        self.volatile_pending.retain_mut(|injection| {
+            if !injection.attempt_leased {
+                return true;
+            }
+            if is_retained_mailbox_context(injection) {
+                let delivery_count = injection.payload["delivery_count"]
+                    .as_u64()
+                    .unwrap_or_default()
+                    .saturating_add(1);
+                if delivery_count >= 2 {
+                    return false;
+                }
+                injection.payload["delivery_count"] = Value::from(delivery_count);
+                injection.payload["observed_by_provider"] = Value::Bool(true);
+                injection.attempt_leased = false;
+                true
+            } else if is_observed_direct_child_result(injection) {
+                injection.attempt_leased = false;
+                true
+            } else {
+                !injection.attempt_leased
+            }
+        });
     }
 
     /// Release a failed provider attempt without consuming its authority.
@@ -14644,6 +14675,76 @@ mod parallel_execution_tests {
         assert_eq!(retry[0].payload, leased[0].payload);
         state.commit_volatile_attempt_lease();
         assert!(state.volatile_pending.is_empty());
+    }
+
+    #[test]
+    fn mailbox_context_survives_an_intervening_assistant_decision() {
+        let mut state = make_state();
+        state.push_volatile_payload(
+            VolatileKind::Mailbox,
+            serde_json::json!({
+                "schema": RETAINED_MAILBOX_CONTEXT_SCHEMA,
+                "message_id": "question-1",
+                "display": "message id=question-1 from child: Which format?",
+            }),
+        );
+        state.push_volatile(VolatileKind::PolicyAdvisory, "one-decision advice");
+
+        let first = state.lease_volatile_pending().expect("first model request");
+        assert_eq!(first.len(), 2);
+        state.commit_volatile_attempt_lease();
+
+        let second = state.lease_volatile_pending().expect("next model request");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].kind, VolatileKind::Mailbox);
+        assert_eq!(
+            second[0].payload["message_id"],
+            first[0].payload["message_id"]
+        );
+        assert_eq!(second[0].payload["display"], first[0].payload["display"]);
+        state.commit_volatile_attempt_lease();
+        assert!(
+            state.volatile_pending.is_empty(),
+            "mailbox context is retained through one intervening decision, then retired"
+        );
+    }
+
+    #[test]
+    fn commit_does_not_consume_mailbox_context_queued_after_the_attempt_started() {
+        let mut state = make_state();
+        state.push_volatile_payload(
+            VolatileKind::Mailbox,
+            serde_json::json!({
+                "schema": RETAINED_MAILBOX_CONTEXT_SCHEMA,
+                "message_id": "before-1",
+                "display": "before",
+                "delivery_count": 0,
+            }),
+        );
+        state.lease_volatile_pending().expect("first model request");
+        state.push_volatile_payload(
+            VolatileKind::Mailbox,
+            serde_json::json!({
+                "schema": RETAINED_MAILBOX_CONTEXT_SCHEMA,
+                "message_id": "after-1",
+                "display": "after",
+                "delivery_count": 0,
+            }),
+        );
+
+        state.commit_volatile_attempt_lease();
+
+        let after = state
+            .volatile_pending
+            .iter()
+            .find(|injection| injection.payload["message_id"] == "after-1")
+            .expect("new context must remain pending");
+        assert_eq!(after.payload["delivery_count"], 0);
+        assert!(
+            !after.payload["observed_by_provider"]
+                .as_bool()
+                .unwrap_or(false)
+        );
     }
 
     #[test]

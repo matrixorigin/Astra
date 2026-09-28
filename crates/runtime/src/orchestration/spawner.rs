@@ -6184,6 +6184,9 @@ impl DynamicAgentSpawner {
         if content.is_empty() {
             return Err("guidance cannot be empty".into());
         }
+        if content.chars().count() > astra_messaging::types::MAX_AGENT_MESSAGE_CHARS {
+            return Err("guidance is too long; send a concise message or share an artifact".into());
+        }
         let (parent_run_id, parent_agent_id, to) = {
             let active = self.active_agents.read().await;
             let state = active
@@ -19710,15 +19713,19 @@ mod tests {
         let executor = Arc::new(CaptureMailbox {
             sender: std::sync::Mutex::new(Some(mailbox_tx)),
         });
+        let router = mock_router();
+        let _parent_mailbox = router
+            .register(astra_messaging::AgentAddress::new("root", "root"), None)
+            .await
+            .expect("guidance sender must be the bound parent mailbox");
         let spawner = Arc::new(
-            DynamicAgentSpawner::new(mock_router())
-                .with_executor(executor as Arc<dyn SpawnAgentExecutor>),
+            DynamicAgentSpawner::new(router).with_executor(executor as Arc<dyn SpawnAgentExecutor>),
         );
         let spawn_task = {
             let spawner = Arc::clone(&spawner);
             tokio::spawn(async move { spawner.spawn(make_sync_input(), &make_bg_context()).await })
         };
-        let mailbox = tokio::time::timeout(Duration::from_secs(1), mailbox_rx)
+        let mut mailbox = tokio::time::timeout(Duration::from_secs(1), mailbox_rx)
             .await
             .expect("executor should receive mailbox")
             .expect("mailbox sender should stay alive");
@@ -19743,6 +19750,13 @@ mod tests {
             astra_messaging::MessagePayload::Text { content, summary }
                 if content == "inspect the storage race" && summary.as_deref() == Some("User guidance")
         ));
+        assert!(
+            spawner
+                .guide_agent(&agent_id, "guide-too-long", &"x".repeat(3_001))
+                .await
+                .is_err()
+        );
+        assert!(mailbox.try_recv().is_none());
 
         assert!(
             spawner
