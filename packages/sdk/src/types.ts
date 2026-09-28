@@ -1238,7 +1238,7 @@ export type ChatRequest = {
   agentId?: string;
   modelSelection: {
     offeringId: string;
-  };
+  } | "auto";
   agentBinding?: AgentBindingSelection;
   runtimeAuth?: {
     authorization: string;

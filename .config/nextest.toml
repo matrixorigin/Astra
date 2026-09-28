@@ -21,7 +21,8 @@ slow-timeout = { period = "15s", terminate-after = 1 }
 # because the live MatrixOne database is a shared external bottleneck.
 test-threads = 2
 
-# CI and strict profiles use a 30s per-test-case hard budget. TIMEOUT = FAIL;
+# Offline CI and strict profiles use a 30s per-test-case hard budget.
+# Online profiles allow 60s for live MatrixOne setup and queries. TIMEOUT = FAIL;
 # no per-test/per-binary carve-outs. The default local profile stays at 15s.
 # Tighten later when known contention such as the `session_sync_log` prune hot
 # path is fixed — ideally back toward 1–2s per case.
@@ -49,13 +50,13 @@ test-threads = "num-cpus"
 [profile.strict-online]
 fail-fast = false
 failure-output = "immediate"
-slow-timeout = { period = "30s", terminate-after = 1 }
+slow-timeout = { period = "60s", terminate-after = 1 }
 test-threads = 2
 
 [profile.strict-online-ci]
 fail-fast = false
 failure-output = "immediate"
-slow-timeout = { period = "30s", terminate-after = 1 }
+slow-timeout = { period = "60s", terminate-after = 1 }
 # Direct invocations retain bounded two-way concurrency. The CI workflow sets
 # ASTRA_TEST_DB_IT_TEST_THREADS=1, and test-online translates that into `-j 1`
 # for both lanes so shared-DB pressure cannot turn healthy tests into failures.

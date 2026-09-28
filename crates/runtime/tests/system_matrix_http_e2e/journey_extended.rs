@@ -610,9 +610,7 @@ pub async fn run_duplicate_approval_response_is_idempotent() {
 }
 
 pub async fn run_server_stream_partial_batch_failure() {
-    let b = tokio::time::timeout(std::time::Duration::from_secs(10), bootstrap())
-        .await
-        .expect("partial-batch bootstrap exceeded its bounded setup budget");
+    let b = bootstrap().await;
     let ctx = &b.ctx;
     let ok_output = "partial batch first ok";
     let err_output = "partial batch second failed";

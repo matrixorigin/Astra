@@ -72,6 +72,24 @@ Account identity, Work/history and Memoria memories are retained. This disconnec
 
 ---
 
+## Auto model routing for chat
+
+On `POST /chat` and `POST /chat/stream`, an authenticated Server-catalog user
+can opt into the configured economy/strong routing policy:
+
+```json
+{"message":"Explain this result", "execution_policy":{"model_routing":"auto"}}
+```
+
+Omit `model_selection` for Auto. Missing configuration returns
+`model_routing_unavailable`; explicit model state, provider model gateways,
+bound Work, or fixed-default semantic admission combined with Auto returns
+`model_routing_unsupported`. Existing Offering authorization still applies.
+With no Auto request, model selection behaves as before. The initial policy
+uses economy only for confidently easy, read-only tasks with compatible model
+contracts. See [model routing](../design/model-routing.md#deterministic-auto-selection-stage-3)
+for configuration, coverage, and persistence semantics.
+
 ## Active run permission mode
 
 ### POST /chat/runs/{run_id}/permission-mode

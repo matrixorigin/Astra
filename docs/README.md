@@ -50,6 +50,7 @@ operators, and kernel contributors to the level of detail they need.
 | [Developer setup](quickstart/development.md) | Prerequisites, repository layout, local loop, and code conventions |
 | [Development workflow](guides/development-workflow.md) | Server-only, Server + User Runner, and Docker development profiles |
 | [Testing guide](guides/testing.md) | Offline, contract, online, and system test lanes |
+| [Offline router workflow](guides/model-router-offline.md) | Approved trace datasets, isolated paired evidence, and offline candidate training |
 | [Makefile reference](reference/makefile-commands.md) | Build, validation, test, and development targets |
 | [Dependencies](reference/dependencies.md) | Required and optional development tools |
 | [Repository automation](guides/repository-automation.md) | Maintainer contract for Mergify, branch protection, and external-fork delivery |

@@ -1440,6 +1440,16 @@ describe("AstraClient — Errors", () => {
 // ─── chatRequestToWire ─────────────────────────────────────────────
 
 describe("chatRequestToWire", () => {
+  test("Auto opts into Server routing without an explicit Offering", () => {
+    expect(chatRequestToWire({ message: "explain this", modelSelection: "auto" })).toEqual({
+      message: "explain this",
+      execution_policy: { model_routing: "auto" },
+    });
+    expect(chatRequestToWire({ message: "explain this", modelSelection: { offeringId: "chosen" } })).toEqual({
+      message: "explain this",
+      model_selection: { offering_id: "chosen" },
+    });
+  });
   test("maps hard allowlists separately from optional tool enablement", () => {
     const body = chatRequestToWire({
       message: "hi",

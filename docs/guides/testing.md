@@ -285,7 +285,7 @@ cargo nextest run -p astra-services \
   -E 'test(collision_receipts_bound_distinct_hashes_and_isolate_owners) | test(canonical_transition_wal_is_linear_and_recoverable_across_many_rounds)'
 ```
 
-The scale mode retains the same 30-second hard deadline and fails on timeout;
+The scale mode retains the same 60-second online hard deadline and fails on timeout;
 it is not enabled by ordinary integration CI. Keep source, database, machine,
 test profile and workload identical for before/after comparisons. A same-row
 contention result is not a multi-session capacity result; batching does not

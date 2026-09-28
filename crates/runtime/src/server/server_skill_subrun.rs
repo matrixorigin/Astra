@@ -155,6 +155,7 @@ pub struct ServerSkillSubRunExecutor {
     user_id: String,
     /// Default model to use when the skill manifest doesn't specify one.
     default_model: Option<String>,
+    run_engine: Option<crate::server::run::engine::RunEngine>,
     /// Normalized execution material inherited from the admitted parent run.
     admitted_model_execution: Option<AdmittedModelExecution>,
     /// Edge tools available to sub-runs (inherited from parent host).
@@ -226,6 +227,41 @@ pub struct ServerSkillSubRunExecutor {
 }
 
 impl ServerSkillSubRunExecutor {
+    async fn inherited_model_execution(
+        &self,
+        parent_run_id: &str,
+    ) -> Result<Option<AdmittedModelExecution>, String> {
+        let Some(engine) = &self.run_engine else {
+            return Ok(self.admitted_model_execution.clone());
+        };
+        crate::server::model_execution_admission::inherit_routed_execution(
+            engine,
+            &self.user_id,
+            &self.session_id,
+            parent_run_id,
+            self.admitted_model_execution.as_ref(),
+            |id| async move {
+                if let Some(service) = &self.model_service {
+                    service
+                        .admit_model_offering(self.user_id.clone(), id)
+                        .await
+                        .map_err(|(_, body)| body.0.detail)
+                } else {
+                    astra_services::revalidate_admitted_model_execution(
+                        &self.matrixone,
+                        self.encryptor.as_ref(),
+                        &self.user_id,
+                        &id,
+                        self.shared_pool.as_ref().map(SharedPool::get),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+                }
+            },
+        )
+        .await
+    }
+
     pub fn with_model_service(
         mut self,
         service: Option<Arc<dyn astra_services::ModelService>>,
@@ -246,6 +282,7 @@ impl ServerSkillSubRunExecutor {
             shared_pool: None,
             user_id,
             default_model: None,
+            run_engine: None,
             admitted_model_execution: None,
             edge_tools: Vec::new(),
             edge_profile: Map::new(),
@@ -305,6 +342,11 @@ impl ServerSkillSubRunExecutor {
 
     pub fn with_pool(mut self, pool: Option<SharedPool>) -> Self {
         self.shared_pool = pool;
+        self
+    }
+
+    pub(crate) fn with_run_engine(mut self, engine: crate::server::run::engine::RunEngine) -> Self {
+        self.run_engine = Some(engine);
         self
     }
 
@@ -728,6 +770,7 @@ impl ServerSkillSubRunExecutor {
         task_profile: astra_turn_core::chat_turn_heuristics::TaskExecutionProfile,
         runtime_ceiling: Option<std::num::NonZeroUsize>,
         effective_model: Option<&str>,
+        admitted_model_execution: Option<&AdmittedModelExecution>,
     ) -> Result<
         (
             astra_turn_core::chat_turn_heuristics::AgenticTurnBudget,
@@ -741,8 +784,7 @@ impl ServerSkillSubRunExecutor {
                 task_profile,
                 runtime_ceiling,
             );
-        let admitted_context_window = self
-            .admitted_model_execution
+        let admitted_context_window = admitted_model_execution
             .as_ref()
             .and_then(|execution| execution.context_window);
         let max_turn_input_tokens =
@@ -894,9 +936,10 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         };
 
         let execution_result: Result<SubRunResult, String> = async {
-        let effective_model = self.default_model.clone();
-        let compact_strategy = self
-            .admitted_model_execution
+        let admitted_model_execution = self.inherited_model_execution(parent_run_id).await?;
+        let effective_model = admitted_model_execution.as_ref()
+            .map(|execution| execution.model_name.clone()).or_else(|| self.default_model.clone());
+        let compact_strategy = admitted_model_execution
             .as_ref()
             .map(|execution| {
                 crate::turn::llm::context::compact_strategy_from_model_metadata(
@@ -947,7 +990,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         )
         .with_model(effective_model.clone())
         .with_model_service(self.model_service.clone())
-        .with_admitted_model_execution(self.admitted_model_execution.clone())
+        .with_admitted_model_execution(admitted_model_execution.clone())
         .with_inference_owner_pod_id(Some(parent_owner_pod_id.to_string()))
         .with_edge_tools(self.edge_tools.clone())
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
@@ -1020,7 +1063,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
 
         let task_profile = infer_task_execution_profile(task_context);
         let (agentic_turn_budget, max_turn_input_tokens) =
-            self.resolve_execution_policy(task_profile, runtime_ceiling, effective_model.as_deref())?;
+            self.resolve_execution_policy(task_profile, runtime_ceiling, effective_model.as_deref(), admitted_model_execution.as_ref())?;
         let initial_turns = agentic_turn_budget.initial_turns;
         let workspace_root_hint = self
             .edge_profile
@@ -1111,7 +1154,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             hooks: StopHookState {
                 workspace_root_hint,
                 forward_headers: self.forward_headers.clone(),
-                admitted_model_execution: self.admitted_model_execution.clone(),
+                admitted_model_execution: admitted_model_execution.clone(),
                 ..Default::default()
             },
             cancellation: CancellationState {
@@ -1358,6 +1401,42 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn auto_skill_fork_reauthorizes_service_backed_genesis_offering() {
+        use crate::server::model_execution_admission::inheritance_test_support::{
+            OFFERING_ID, SESSION_ID, ServiceBackedOffering, USER_ID, auto_parent_run,
+            genesis_execution,
+        };
+
+        let execution = genesis_execution();
+        let service = Arc::new(ServiceBackedOffering::new(execution.clone()));
+        let engine = auto_parent_run("auto-skill-parent", &execution).await;
+        let executor = ServerSkillSubRunExecutor::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            USER_ID.into(),
+            SESSION_ID.into(),
+        )
+        .with_model_service(Some(service.clone()))
+        .with_run_engine(engine)
+        .with_admitted_model_execution(Some(execution.clone()));
+
+        let inherited = executor
+            .inherited_model_execution("auto-skill-parent")
+            .await
+            .unwrap();
+        assert_eq!(inherited, Some(execution));
+        assert_eq!(service.calls(), vec![(USER_ID.into(), OFFERING_ID.into())]);
+
+        service.revoke();
+        let error = executor
+            .inherited_model_execution("auto-skill-parent")
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains("Genesis Offering unavailable"), "{error}");
+    }
+
     #[test]
     fn server_skill_subrun_executor_with_builders() {
         let executor = ServerSkillSubRunExecutor::new(
@@ -1423,19 +1502,21 @@ mod tests {
             )
             .with_admitted_model_execution(Some(execution))
         };
-        let server = build(server_execution)
+        let server = build(server_execution.clone())
             .resolve_execution_policy(
                 astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default(),
                 None,
                 Some("test-model"),
+                Some(&server_execution),
             )
             .expect("Server execution policy");
-        let edge = build(edge_execution)
+        let edge = build(edge_execution.clone())
             .with_execution_binding_snapshot(edge_runtime_snapshot())
             .resolve_execution_policy(
                 astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default(),
                 None,
                 Some("test-model"),
+                Some(&edge_execution),
             )
             .expect("Edge+Server execution policy");
 
@@ -1452,6 +1533,7 @@ mod tests {
             astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default(),
             None,
             Some("test-model"),
+            None,
         );
         assert!(
             missing.is_err(),

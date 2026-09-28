@@ -922,7 +922,7 @@ pub struct RuntimeToolExecutor {
     /// selection and invocation and create a retry storm.
     current_discovery_deferred_tool_schemas: Arc<std::sync::RwLock<Vec<Value>>>,
     /// Shared dynamic-agent tool context for `agent(action='spawn'|'get_result')`.
-    agent_tool_context: Option<AgentToolContext>,
+    agent_tool_context: std::sync::RwLock<Option<AgentToolContext>>,
     /// When enabled, server-local execution rejects names outside the current
     /// capability-filtered server tool surface.
     enforce_server_tool_capabilities: bool,
@@ -1056,7 +1056,7 @@ impl RuntimeToolExecutor {
             current_discovery_deferred_tool_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
             mcp_manager: None,
             agent_binding_mcp: None,
-            agent_tool_context: None,
+            agent_tool_context: std::sync::RwLock::new(None),
             work_surface_events: WorkSurfaceEventEmitter::new(session_id.clone()),
             tool_route_observer: Arc::new(std::sync::RwLock::new(None)),
             execution_binding: ExecutionBindingState::none(),
@@ -2510,7 +2510,7 @@ impl RuntimeToolExecutor {
 
     fn capability_has_runtime_binding(&self, capability: Capability) -> bool {
         match capability {
-            Capability::AgentSpawner => self.agent_tool_context.is_some(),
+            Capability::AgentSpawner => self.agent_tool_context_snapshot().is_some(),
             Capability::MemoryService
             | Capability::Database
             | Capability::SkillsCatalog
@@ -2817,7 +2817,19 @@ impl RuntimeToolExecutor {
 
     /// Attach the shared dynamic-agent tool context.
     pub fn set_agent_tool_context(&mut self, ctx: AgentToolContext) {
-        self.agent_tool_context = Some(ctx);
+        *astra_core::sync_poison::recover_rwlock_write(&self.agent_tool_context) = Some(ctx);
+    }
+
+    fn agent_tool_context_snapshot(&self) -> Option<AgentToolContext> {
+        astra_core::sync_poison::recover_rwlock_read(&self.agent_tool_context).clone()
+    }
+
+    pub(super) fn set_agent_model(&self, model: &str) {
+        if let Some(context) =
+            astra_core::sync_poison::recover_rwlock_write(&self.agent_tool_context).as_mut()
+        {
+            context.current_model = Some(model.to_string());
+        }
     }
 
     /// Publish the root semantic effect boundary to the already-wired dynamic
@@ -2826,7 +2838,7 @@ impl RuntimeToolExecutor {
         &self,
         intent: astra_config::user_profile::WorkspaceMutationIntent,
     ) {
-        if let Some(context) = self.agent_tool_context.as_ref() {
+        if let Some(context) = self.agent_tool_context_snapshot() {
             context.workspace_mutation.set(intent);
         }
     }
@@ -2840,7 +2852,7 @@ impl RuntimeToolExecutor {
         reason: &str,
         origin: crate::orchestration::CancellationOrigin,
     ) -> Option<Vec<String>> {
-        let ctx = self.agent_tool_context.as_ref()?;
+        let ctx = self.agent_tool_context_snapshot()?;
         // Fanout children are represented by one parent tool record rather
         // than one `agent.spawn` record per slot. Cancel from the producer's
         // run tree as well: this catches fanout and nested descendants and

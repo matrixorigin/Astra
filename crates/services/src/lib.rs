@@ -35,6 +35,7 @@ pub mod marketplace;
 pub mod marketplace_stats;
 pub mod mcp_registry;
 pub mod model_request_context;
+pub mod model_routing;
 pub mod models;
 pub mod multi_agent;
 pub mod observation_capture;

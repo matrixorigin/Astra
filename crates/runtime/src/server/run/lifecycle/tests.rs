@@ -4889,6 +4889,45 @@ async fn server_spawn_runtime_context_is_keyed_by_parent_run() {
 }
 
 #[tokio::test]
+async fn auto_spawn_context_reauthorizes_service_backed_genesis_offering() {
+    use crate::server::model_execution_admission::inheritance_test_support::{
+        OFFERING_ID, SESSION_ID, ServiceBackedOffering, USER_ID, auto_parent_run, genesis_execution,
+    };
+
+    let execution = genesis_execution();
+    let service = Arc::new(ServiceBackedOffering::new(execution.clone()));
+    let engine = auto_parent_run("auto-parent", &execution).await;
+    let executor = ServerSpawnAgentExecutor::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+    )
+    .with_model_service(Some(service.clone()))
+    .with_run_engine(engine);
+    let mut parent = test_spawn_runtime_context("auto-parent", USER_ID);
+    parent.session_id = SESSION_ID.into();
+    parent.admitted_model_execution = Some(execution.clone());
+    assert!(executor.set_runtime_context(parent).await);
+
+    let mut config = test_spawn_run_config(vec!["*"], false);
+    config.parent_address = Some(astra_messaging::types::AgentAddress::new(
+        "auto-parent",
+        "root-agent",
+    ));
+    let inherited = executor.runtime_context_for_config(&config).await.unwrap();
+    assert_eq!(inherited.admitted_model_execution, Some(execution));
+    assert_eq!(service.calls(), vec![(USER_ID.into(), OFFERING_ID.into())]);
+
+    service.revoke();
+    let error = executor
+        .runtime_context_for_config(&config)
+        .await
+        .err()
+        .unwrap();
+    assert!(error.contains("Genesis Offering unavailable"), "{error}");
+}
+
+#[tokio::test]
 async fn root_none_binding_generations_are_all_indexed_and_retired() {
     let executor = ServerSpawnAgentExecutor::new(
         test_settings(),

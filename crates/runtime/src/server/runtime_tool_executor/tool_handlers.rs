@@ -700,7 +700,7 @@ impl ToolHandler<RuntimeToolExecutor> for AgentToolHandler {
         }
         execute_agent_tool(
             &context.default_executor,
-            context.agent_tool_context.as_ref(),
+            context.agent_tool_context_snapshot().as_ref(),
             args,
             invocation.tool_call_id,
         )
@@ -740,7 +740,7 @@ impl ToolHandler<RuntimeToolExecutor> for AgentFanoutToolHandler {
             return astra_tools::cancelled_tool_result("agent_fanout", false);
         }
         execute_agent_fanout_tool(
-            context.agent_tool_context.as_ref(),
+            context.agent_tool_context_snapshot().as_ref(),
             args,
             invocation.tool_call_id,
         )
