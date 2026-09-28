@@ -181,7 +181,8 @@ configuration and plan hashes in a reviewed `protocol.json`. The plan input uses
 the same manifest and source roster as the eventual evidence bundle; replay,
 quality, cost and feedback fields may be absent. The digest binds the full
 manifest (including split dates, outcome cutoff/horizon and model/rubric scope),
-source membership, grouping, canonical input references and frozen features.
+source membership, grouping, canonical input references, frozen features and the
+recorded selected Offering/contract used by the Auto baseline.
 Reordering sources or group keys does not change it. Complete evidence still
 needs independent source authorization when outcomes arrive. Changing the plan
 requires a new reviewed protocol and fresh holdout; do not move the split or drop
@@ -218,7 +219,8 @@ incomplete cases under the old protocol. The hash command itself grants no acces
 These are example product criteria, not calibrated defaults or a sufficient
 sample-size claim. The conservative confidence bounds can require far more than
 the specified sample floor, especially for a 1% quality margin. Declare all target
-structural feature categories. Missing or unexpected categories reject the gate.
+structural feature categories. Missing or unexpected categories anywhere in the
+test evidence reject the gate, including sources excluded by group selection.
 The episode cost bound must be defensible for your population before observing
 test spending; any known held-out replay cost exceeding it fails the gate,
 including costs from incomplete pairs, failed episodes, partial prices, and

@@ -336,7 +336,7 @@ fn later_training_labels_cannot_qualify_against_earlier_test_turns() {
 fn registered_plan_rejects_changed_splits_roster_groups_and_observation_scope() {
     let input = data();
     let registered = protocol(&input);
-    for mutation in 0..9 {
+    for mutation in 0..11 {
         let mut changed = input.clone();
         match mutation {
             0 => changed.manifest.validation_before += chrono::Duration::days(31),
@@ -349,7 +349,9 @@ fn registered_plan_rejects_changed_splits_roster_groups_and_observation_scope() 
             5 => changed.sources[0].group_keys.push("another-group".into()),
             6 => changed.sources[0].decision_at += chrono::Duration::seconds(1),
             7 => changed.sources[0].decision.features = None,
-            _ => changed.manifest.strong.contract_root = "another-contract".into(),
+            8 => changed.manifest.strong.contract_root = "another-contract".into(),
+            9 => changed.sources[0].decision.selected_offering_id = "economy".into(),
+            _ => changed.sources[0].decision.selected_contract_root = "another-contract".into(),
         }
         // Even renewed source authorization cannot amend a registered protocol.
         let result = qualify_router(
@@ -365,6 +367,58 @@ fn registered_plan_rejects_changed_splits_roster_groups_and_observation_scope() 
             "mutation {mutation}"
         );
     }
+}
+
+#[test]
+fn qualification_rejects_hidden_missing_and_out_of_scope_features() {
+    for missing in [false, true] {
+        let mut input = data();
+        let source = input.sources.last_mut().unwrap();
+        // test-0 represents this group, hiding this row from cohort metrics.
+        source.group_keys = vec!["test-0".into()];
+        if missing {
+            source.decision.features = None;
+        } else {
+            source.decision.features.as_mut().unwrap().difficulty = TaskDifficulty::Easy;
+            source.decision.assessment.as_mut().unwrap().difficulty = TaskDifficulty::Easy;
+            source.decision.reason = ModelRoutingReason::EconomyUnavailable;
+        }
+        let output = qualify(input);
+        assert_eq!(output.tuning.status, RouterQualificationStatus::Rejected);
+        assert!(
+            output
+                .failures
+                .contains(&"test_contains_missing_or_out_of_scope_features".into())
+        );
+        assert!(output.cohorts["overall"].failures.is_empty());
+    }
+}
+
+#[test]
+fn renewed_authorization_cannot_change_the_registered_auto_baseline() {
+    let mut input = data();
+    for source in &mut input.sources {
+        source.decision.features.as_mut().unwrap().difficulty = TaskDifficulty::Easy;
+        source.decision.assessment.as_mut().unwrap().difficulty = TaskDifficulty::Easy;
+        source.decision.reason = ModelRoutingReason::EconomyUnavailable;
+    }
+    let registered = protocol(&input);
+    assert_eq!(
+        qualify(input.clone()).tuning.status,
+        RouterQualificationStatus::ReadyForShadow
+    );
+    for source in &mut input.sources {
+        source.decision.selected_offering_id = input.manifest.economy.offering_id.clone();
+        source.decision.selected_contract_root = input.manifest.economy.contract_root.clone();
+        source.decision.selected_model = "synthetic-economy".into();
+        source.decision.reason = ModelRoutingReason::EasyReadOnly;
+    }
+    let renewed = auth(&input);
+    let result = qualify_router(input, &renewed, Utc::now(), config(), registered);
+    assert_eq!(
+        result.unwrap_err(),
+        "Router evaluation plan differs from the registered protocol"
+    );
 }
 
 #[test]

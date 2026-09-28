@@ -325,7 +325,8 @@ registration must precede the test period. Registration is an operator attestati
 this local workflow does not prove that someone preregistered before inspecting
 outcomes. The services-owned evaluation-plan digest covers the full manifest
 (including split boundaries and outcome cutoff/horizon), source roster, grouping,
-canonical input references and frozen decision-time features. It excludes replay
+canonical input references, frozen decision-time features and recorded selected
+Offering/contract identities used by the Auto baseline. It excludes replay
 outcomes, costs and feedback, so those may arrive after the plan is sealed under
 renewed source authorization. Source and group order are normalized. Changing
 splits, membership, grouping, model/rubric scope or features requires a new reviewed
@@ -337,7 +338,8 @@ the test period. Labels from later replays cannot qualify earlier test turns.
 Qualification rebuilds from current authorized evidence. Test groups are chosen
 before inspecting outcomes, using the same transitive grouping as training.
 Incomplete representatives reduce coverage, and missing/unexpected feature strata
-reject qualification. It compares the learned candidate with both always-strong
+anywhere in the test evidence reject qualification, including nonrepresentative
+members of related groups. It compares the learned candidate with both always-strong
 and deterministic Auto on the same complete paired cohort. Overall quality
 non-inferiority and cost improvement must pass, along with quality and descriptive
 p95 latency gates in every prespecified stratum. A stratum may keep the baseline's

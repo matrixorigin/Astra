@@ -291,7 +291,8 @@ pub fn qualify_router(
     if trained.candidate.threshold.is_none() {
         failures.push("candidate_has_no_validation_threshold".into());
     }
-    if test
+    // Group reduction must not hide missing or unexpected deployment strata.
+    if test_evidence
         .iter()
         .any(|e| e.features.is_none_or(|f| !keys.contains(&feature_key(f))))
     {

@@ -20,6 +20,8 @@ pub fn router_evaluation_plan_sha256(
         group_keys: Vec<&'a str>,
         input_reference: &'a Option<astra_turn_types::FeedbackResponseReference>,
         features: Option<ModelRoutingFeatures>,
+        selected_offering_id: &'a str,
+        selected_contract_root: &'a str,
     }
     let mut sources: Vec<_> = input
         .sources
@@ -37,6 +39,8 @@ pub fn router_evaluation_plan_sha256(
                 group_keys,
                 input_reference: &source.decision.input_reference,
                 features: source.decision.features,
+                selected_offering_id: &source.decision.selected_offering_id,
+                selected_contract_root: &source.decision.selected_contract_root,
             }
         })
         .collect();
@@ -65,7 +69,7 @@ pub struct RouterQualificationProtocol {
     pub registered_at: DateTime<Utc>,
     /// Pins fitting and threshold selection as well as the evaluation criteria.
     pub training_config_sha256: String,
-    /// Pins the complete manifest, source roster, grouping and decision features.
+    /// Pins the manifest, source roster, grouping, features and recorded Auto selection.
     pub evaluation_plan_sha256: String,
     pub minimum_test_groups: usize,
     pub minimum_stratum_groups: usize,
