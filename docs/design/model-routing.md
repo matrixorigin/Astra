@@ -226,8 +226,9 @@ harness supplies the explicit local file boundary.
 
 New decisions carry an optional version-1 `features` snapshot, frozen before
 primary inference: assessment presence, difficulty and its confidence,
-read-only primary execution, and supported input. The online baseline and its
-offline comparison share the same eligibility function. Missing historical
+read-only primary execution, and supported input. The offline Auto comparison
+uses the immutable recorded selection to choose a paired replay arm, preserving
+catalog and model-contract fallbacks beyond feature eligibility. Missing historical
 snapshots remain missing; they are not reconstructed from eventual outcomes.
 Old decisions remain readable. Older strict readers cannot read new feature
 fields, so mixed-version deployments require coordinated upgrades.

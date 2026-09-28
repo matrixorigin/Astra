@@ -121,6 +121,11 @@ failure can leave an incomplete directory without the marker. Existing outputs
 are never overwritten. On Unix, the output directory is private to its owner
 (mode 0700). Inputs are limited to 64 MiB each and 100,000 sources.
 
+The `deterministic_auto` comparison uses the immutable recorded Auto selection,
+including economy-unavailable and incompatible-candidate fallbacks, to select an
+arm from the same paired replay cohort. It reports replay outcomes for that
+choice; it does not reconstruct the online choice from feature eligibility alone.
+
 Policy cost per acceptable task includes spending on every case in the compared
 complete-pair cohort, including unacceptable answers, divided by acceptable
 answers. It is null when none passes. Incomplete prices, infrastructure failures

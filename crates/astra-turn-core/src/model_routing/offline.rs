@@ -1,7 +1,7 @@
 //! Reproducible categorical outcome baseline. This produces an offline candidate
 //! only; it cannot authorize an Offering or activate a runtime policy.
 use astra_services::evaluation::router::*;
-use astra_turn_types::model_routing::{ModelRoutingFeatures, ModelRoutingReason};
+use astra_turn_types::model_routing::ModelRoutingFeatures;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -191,13 +191,13 @@ fn representatives(examples: &[RouterExample]) -> Vec<&RouterExample> {
 }
 fn evaluate(
     examples: &[&RouterExample],
-    choice: impl Fn(ModelRoutingFeatures) -> CandidateChoice,
+    choice: impl Fn(&RouterExample) -> CandidateChoice,
 ) -> PolicyMetrics {
     let mut result = PolicyMetrics::default();
     let mut latencies = Vec::new();
     for example in examples {
         let pair = example.paired.as_ref().expect("complete pair");
-        let selection = choice(example.features.expect("frozen features"));
+        let selection = choice(example);
         let episode = match selection {
             CandidateChoice::Economy => {
                 result.economy_choices += 1;
@@ -242,8 +242,10 @@ fn comparisons(
         ),
         (
             "deterministic_auto".into(),
-            evaluate(examples, |f| {
-                if super::economy_eligibility_from_features(f) == ModelRoutingReason::EasyReadOnly {
+            evaluate(examples, |example| {
+                // Preserve the immutable online choice, including catalog and
+                // contract fallbacks that cannot be recovered from features.
+                if example.selected_profile_id == candidate.economy.profile_id {
                     CandidateChoice::Economy
                 } else {
                     CandidateChoice::Strong
@@ -252,7 +254,9 @@ fn comparisons(
         ),
         (
             "learned_candidate".into(),
-            evaluate(examples, |f| candidate.choose(f)),
+            evaluate(examples, |example| {
+                candidate.choose(example.features.expect("frozen features"))
+            }),
         ),
     ])
 }
@@ -324,7 +328,9 @@ pub fn train_router(
         // or threshold selection, including when test performance is worse.
         for threshold in thresholds.into_iter().rev() {
             candidate.threshold = Some(threshold);
-            let metrics = evaluate(&validation, |f| candidate.choose(f));
+            let metrics = evaluate(&validation, |example| {
+                candidate.choose(example.features.expect("frozen features"))
+            });
             if metrics.acceptable_rate.unwrap_or(0.0) + candidate.config.maximum_quality_regression
                 >= baseline.acceptable_rate.unwrap_or(0.0)
                 && metrics.total_cost_usd < best_cost
@@ -491,6 +497,7 @@ mod tests {
         let result = run(data());
         assert_eq!(result.candidate.threshold, Some(0.5));
         assert_eq!(result.report.test["learned_candidate"].economy_choices, 8);
+        assert_eq!(result.report.test["deterministic_auto"].economy_choices, 8);
         assert_eq!(result.report.test["always_strong"].groups, 8);
         assert!(
             (result.report.test["learned_candidate"]
@@ -504,6 +511,52 @@ mod tests {
         assert!(!result.report.production_qualified);
         assert_eq!(result.candidate.activation, "offline_only");
     }
+    #[test]
+    fn deterministic_auto_preserves_recorded_fallbacks_on_paired_evidence() {
+        use astra_turn_types::model_routing::ModelRoutingReason;
+
+        for reason in [
+            ModelRoutingReason::IncompatibleCandidate,
+            ModelRoutingReason::EconomyUnavailable,
+        ] {
+            let mut input = data();
+            for source in input
+                .sources
+                .iter_mut()
+                .filter(|source| !source.source_id.starts_with("train"))
+            {
+                source.decision.selected_offering_id = input.manifest.strong.offering_id.clone();
+                source.decision.selected_contract_root =
+                    input.manifest.strong.contract_root.clone();
+                source.decision.selected_model = "synthetic-strong".into();
+                source.decision.reason = reason;
+                source
+                    .paired
+                    .as_mut()
+                    .unwrap()
+                    .economy
+                    .episode
+                    .quality
+                    .as_mut()
+                    .unwrap()
+                    .verdict = Acceptability::Unacceptable;
+            }
+            let result = run(input);
+            for comparison in [&result.report.validation, &result.report.test] {
+                let auto = &comparison["deterministic_auto"];
+                assert_eq!(auto.groups, 8);
+                assert_eq!(auto.economy_choices, 0);
+                assert_eq!(auto.acceptable_rate, Some(1.0));
+                assert!((auto.total_cost_usd - 0.4).abs() < 1e-10);
+                assert_eq!(
+                    auto.total_cost_usd,
+                    comparison["always_strong"].total_cost_usd
+                );
+                assert_eq!(comparison["always_economy"].acceptable_rate, Some(0.0));
+            }
+        }
+    }
+
     #[test]
     fn held_out_test_labels_never_change_training_or_threshold() {
         let original = run(data());
