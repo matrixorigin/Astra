@@ -1972,7 +1972,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             }
                         },
                         "description": {"type": "string", "description": "Short operation description when required by the selected action."},
-                        "prompt": {"type": "string", "description": "Full child task brief for spawn. Non-empty and required with description."},
+                        "prompt": {"type": "string", "description": "Full self-contained child task brief for spawn. Include the constraints, conditional mappings, and expected output needed to finish; only a choice the child must ask about may be left unresolved. Non-empty and required with description."},
                         "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Sub-agent persona (spawn). Default: general-purpose."},
                         "requested_model_policy": requested_model_policy_schema(),
                         "reasoning": fanout_reasoning_schema(),
@@ -2773,6 +2773,11 @@ mod tests {
             assert!(description.contains("ask_user"));
             assert!(description.contains("runtime waits and presents the child"));
             let params = &agent["function"]["parameters"];
+            let child_brief = params["properties"]["prompt"]["description"]
+                .as_str()
+                .expect("spawn prompt description");
+            assert!(child_brief.contains("self-contained"));
+            assert!(child_brief.contains("conditional mappings"));
             assert!(
                 params["properties"]["action"]["enum"]
                     .as_array()

@@ -157,8 +157,9 @@ delivery and observation, not that the parent's wording was causally derived
 from the child: the marker also appears in the user prompt. It is not a
 process-restart test. The initial child task must include both possible marker
 outputs but not the chosen format; the later parent answer supplies only the
-choice. That keeps the information needed to produce the exact result available
-without letting the child skip the question.
+choice. The journal checks that both outputs reached the spawned child brief;
+this keeps the information needed to produce the exact result available without
+letting the child skip the question.
 
 These cases deliberately do not call `reflect` or add model-request-ledger
 reads. The configured-name case proves provider-call identity from the existing

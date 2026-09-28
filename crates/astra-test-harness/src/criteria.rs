@@ -5952,6 +5952,49 @@ mod tests {
     }
 
     #[test]
+    fn shipped_child_question_requires_both_outputs_in_the_child_brief() {
+        let case = crate::case::Case::from_path(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("cases/subagent_model_selection/flash_child_question_parent_answer.yaml"),
+        )
+        .expect("load shipped child question case");
+        let brief_checks: Vec<_> = case
+            .criteria
+            .iter()
+            .filter(|criterion| {
+                matches!(criterion, Criterion::JournalToolJsonContains { name, document: JournalToolDocument::Arguments, path, .. }
+                    if name == "agent" && path == "/prompt")
+            })
+            .cloned()
+            .collect();
+        assert_eq!(brief_checks.len(), 2);
+        let check = |brief: &str| {
+            let session = mk_session(&[(
+                "turn",
+                serde_json::json!({"tool_calls": [{
+                    "tool_call_id": "spawn-1", "name": "agent", "ok": true,
+                    "args_full": serde_json::json!({
+                        "action": "spawn", "prompt": brief
+                    }).to_string(),
+                    "result_full": serde_json::json!({"status": "launched"}).to_string()
+                }]}),
+            )]);
+            evaluate_deterministic_with_session(
+                &brief_checks,
+                &outcome_with_tools(&[]),
+                Some(&session),
+            )
+            .iter()
+            .all(|result| result.passed)
+        };
+        assert!(!check("Ask the parent for a format, then produce one line"));
+        assert!(!check("JSON => ASTRA-CHILD-ANSWERED-JSON"));
+        assert!(check(
+            "JSON => ASTRA-CHILD-ANSWERED-JSON; TEXT => ASTRA-CHILD-ANSWERED-TEXT"
+        ));
+    }
+
+    #[test]
     fn session_event_count_can_match_model_identity_in_spawn_metadata() {
         fn spawn_event(
             run_id: &str,
