@@ -766,7 +766,7 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
             }
             (true, false) => {
                 if tool_visible(tool_names, "tool_search") {
-                    "Use visible `agent` with action=spawn, description, and prompt for an ordinary child; fields/actions absent from its schema require tool_search select:agent and invoke_tool"
+                    "`agent` spawn is directly callable with action=spawn, description, and prompt; select `agent` only for an action or field absent from its resident schema"
                 } else {
                     "Use the visible `agent` schema directly for its permitted actions, including child messages and results when present"
                 }
@@ -1702,7 +1702,7 @@ mod tests {
         );
         assert!(!agent_surface.contains("tool_search select:agent"));
         let agent_with_discovery = build_main_system_prompt(&["agent", "tool_search"], "");
-        assert!(agent_with_discovery.contains("tool_search select:agent"));
+        assert!(agent_with_discovery.contains("agent` spawn is directly callable"));
         assert!(agent_surface.contains("the runtime waits for terminal results"));
         assert!(
             agent_surface.contains("only independent parent work needed for the user's request")
@@ -2303,7 +2303,7 @@ mod tests {
         assert!(!direct.contains("invoke_tool"));
 
         let discoverable = tool_conditional_section(&["agent", "tool_search"]);
-        assert!(discoverable.contains("tool_search select:agent"));
+        assert!(discoverable.contains("agent` spawn is directly callable"));
         assert!(discoverable.contains("call visible `agent` spawn directly"));
         assert!(discoverable.contains("not a spawn prerequisite"));
     }
