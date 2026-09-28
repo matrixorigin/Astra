@@ -1,8 +1,9 @@
-//! Deterministic selection only. No credentials, catalog access or provider I/O.
+//! Shared model selection and offline evaluation. No credentials, catalog or provider I/O.
 use astra_turn_types::model_routing::ModelRoutingReason;
 use astra_turn_types::{AssessmentConfidence, TaskDifficulty, TurnAssessment};
 
 pub mod offline;
+pub mod qualification;
 
 pub use astra_turn_types::model_routing::DETERMINISTIC_ROUTING_POLICY_VERSION as POLICY_VERSION;
 

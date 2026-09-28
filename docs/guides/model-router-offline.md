@@ -162,3 +162,139 @@ Local artifacts are not a remote managed store: the operator owns deletion of
 already exported files. No daemon or automatic production activation consumes
 them in this stage. Future activation must revalidate current consent and lineage
 through the tuning-job lifecycle.
+
+## Qualify a candidate for offline shadow scoring
+
+Collect the immutable test routing decisions, then seal their outcome-free roster
+and evaluation protocol **before starting any held-out replay or collecting its
+outcomes**. Set `registered_at` to the actual seal time, after all source decisions;
+it may follow the test decision split (`validation_before`). Keep the protocol in
+your review system; the local command checks the supplied timeline but cannot
+authenticate the seal or prove omitted outcomes were unseen. Protocol changes or
+repeated candidate selection need a fresh holdout. The fitting configuration and
+threshold choices are pinned too:
+
+```bash
+astra-test router-config-hash --config training-config.json
+astra-test router-plan-hash --input planned-evidence.json
+```
+
+For default training settings, omit `--config` on every command. Put the returned
+configuration and plan hashes in a reviewed `protocol.json`. The plan input uses
+the same manifest and source roster as the eventual evidence bundle; replay,
+quality, cost and feedback fields may be absent. The digest binds the full
+manifest (including split dates, outcome cutoff/horizon and model/rubric scope),
+source membership, grouping, canonical input references, frozen features and the
+recorded selected Offering/contract used by the Auto baseline.
+Reordering sources or group keys does not change it. Complete evidence still
+needs independent source authorization when outcomes arrive. Changing the plan
+requires a new reviewed protocol and fresh holdout; do not move the split or drop
+incomplete cases under the old protocol. The hash command itself grants no access.
+
+For example, mature training/validation labels before March 1, collect test
+decisions on March 1, seal the roster on March 2, and start both replay arms on
+March 3. Use March 2 as `registered_at`. Plan the final evidence snapshot's
+`created_at` for March 5 so the example's one-day replay horizons have matured.
+At sealing, omit held-out paired/observed outcomes and feedback; add replay
+evidence later under renewed source authorization without changing the plan.
+Every supplied test replay must start strictly after the seal, including failed,
+incomplete and grouped-out pairs. Supplied test observed completions and follow-up
+feedback must also be strictly later. Backdated seals before source decisions
+and seals at or after replay start are rejected.
+
+```json
+{
+  "schema_version": 1,
+  "job_id": "router-qualification-001",
+  "owner_id": "example-owner",
+  "dataset_id": "example-dataset",
+  "registered_at": "2026-01-01T00:00:00Z",
+  "training_config_sha256": "REPLACE_WITH_ROUTER_CONFIG_HASH",
+  "evaluation_plan_sha256": "REPLACE_WITH_ROUTER_PLAN_HASH",
+  "minimum_test_groups": 1000,
+  "minimum_stratum_groups": 1000,
+  "minimum_pair_coverage": 0.95,
+  "maximum_quality_regression": 0.01,
+  "minimum_cost_saving_fraction": 0.2,
+  "maximum_episode_cost_usd": 1.0,
+  "maximum_p95_latency_ratio": 1.1,
+  "confidence": 0.95,
+  "required_strata": [{
+    "schema_version": 1,
+    "assessment_present": true,
+    "difficulty": "moderate",
+    "difficulty_confidence": "high",
+    "read_only_primary": true,
+    "supported_input": true
+  }]
+}
+```
+
+These are example product criteria, not calibrated defaults or a sufficient
+sample-size claim. The conservative confidence bounds can require far more than
+the specified sample floor, especially for a 1% quality margin. Declare all target
+structural feature categories. Missing or unexpected categories anywhere in the
+test evidence reject the gate, including sources excluded by group selection.
+The episode cost bound must be defensible for your population before observing
+test spending; any known held-out replay cost exceeding it fails the gate,
+including costs from incomplete pairs, failed episodes, partial prices, and
+examples excluded by grouping. Unknown prices remain unknown. Never remove expensive or failed
+examples just to pass. The repository's tiny synthetic fixture will be rejected.
+
+```bash
+astra-test router-qualify \
+  --input reviewed-evidence.json \
+  --authorization authorization.json \
+  --config training-config.json \
+  --protocol protocol.json \
+  --output qualification-001
+```
+
+`qualification.json` includes the candidate, protocol, tuning record and overall/
+stratum metrics, bounds and rejection reasons. `complete.json` pins its digest,
+expiry and all evidence dependencies. Successful command execution means the
+report was produced, **not** that the gate passed: inspect `tuning.status` for
+`rejected` or `ready_for_shadow`. Invalid authorization or malformed protocols fail
+before publication. A changed evaluation plan also fails before publication;
+protocols missing `evaluation_plan_sha256` are rejected. Existing output
+directories are refused.
+
+The gate requires quality non-inferiority and cost improvement against both
+always-strong and deterministic Auto overall. Every required category must meet
+its quality, coverage, support and p95 latency limits; unchanged selections in
+one category need not save money themselves. Both model episodes are priced in
+full. The original training/validation labels must have matured before the test
+period, including labels obtained by replay.
+
+## Score later traces without changing model selection
+
+Prepare a separate evidence bundle and authorization with the same owner, model
+contracts, policy revision and rubric. Use fresh sessions/tasks/input prefixes;
+all decisions must follow the qualification dataset's creation timestamp. Obtain
+source approvals using the existing `router-source-hashes` workflow. Outcomes and
+paired replays may be absent; original decision horizons must still have matured.
+
+```bash
+astra-test router-shadow \
+  --input reviewed-evidence.json \
+  --authorization authorization.json \
+  --config training-config.json \
+  --protocol protocol.json \
+  --shadow-input later-reviewed-evidence.json \
+  --shadow-authorization later-authorization.json \
+  --output shadow-001
+```
+
+The command rebuilds qualification under current authorization instead of trusting
+a saved approval. It rejects a failed gate, changed model/scope, overlapping tasks,
+old decisions or revoked evidence. A revocation in either authorization also
+invalidates dependencies in the other dataset. `shadow.json` records historical
+and proposed profiles, abstentions, disagreements and local scorer timings;
+`complete.json` contains the union of training and shadow lineage and the earliest
+expiry. Use this union when invalidating/deleting derived bundles. Out-of-scope
+features abstain to strong. No provider requests or model changes occur.
+
+This is **offline shadow scoring** of later recorded decisions. It measures neither
+online routing overhead nor the unchosen model's success. There is no live canary,
+activation registry, kill switch or rollback implementation in this stage. All
+artifacts remain offline-only and production qualification remains false.

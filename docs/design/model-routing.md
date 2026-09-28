@@ -308,3 +308,82 @@ made from synthetic fixtures.
 
 See [the offline router workflow](../guides/model-router-offline.md) for commands,
 evidence preparation, outputs, and revocation handling.
+
+## Qualification and offline shadow scoring (stage 5)
+
+The local harness exposes `router-qualify`, `router-config-hash`,
+`router-plan-hash`, and `router-shadow`. Services owns the typed tuning protocol and record in `tuning`;
+`turn_core::model_routing::qualification` owns the pure evaluation gate and the
+observational scorer. Both use the existing trainer, eligibility policy, dataset
+builder, group representatives and lineage. There is no alternate online router,
+activation registry, or new database projection.
+
+A protocol pins owner, dataset, fitting configuration and evaluation-plan digests,
+test/stratum sample floors, coverage, quality margin, required cost reduction, episode cost bound,
+p95 latency ceiling, confidence and required structural feature strata. Its
+`registered_at` is the outcome-free roster seal time, after all recorded routing
+decisions and strictly before every held-out replay begins. It is distinct from
+`validation_before`, which splits decisions into validation and test populations.
+Supplied held-out observed completions and follow-up feedback must also follow
+the seal. These checks include incomplete and nonrepresentative sources. The seal
+must precede the final evidence snapshot's `created_at`. Registration is an
+operator attestation; the workflow cannot prove that omitted outcomes were unseen.
+The services-owned evaluation-plan digest covers the full manifest
+(including split boundaries and outcome cutoff/horizon), source roster, grouping,
+canonical input references, frozen decision-time features and recorded selected
+Offering/contract identities used by the Auto baseline. It excludes replay
+outcomes, costs and feedback, so those may arrive after the plan is sealed under
+renewed source authorization. Source and group order are normalized. Changing
+splits, membership, grouping, model/rubric scope or features requires a new reviewed
+protocol; a reused dataset ID is insufficient. `router-plan-hash` computes this
+digest without granting source authorization. Protocol files without the digest
+are rejected. Training/validation replay labels and their horizons must mature before
+the test period. Labels from later replays cannot qualify earlier test turns.
+
+Qualification rebuilds from current authorized evidence. Test groups are chosen
+before inspecting outcomes, using the same transitive grouping as training.
+Incomplete representatives reduce coverage, and missing/unexpected feature strata
+anywhere in the test evidence reject qualification, including nonrepresentative
+members of related groups. It compares the learned candidate with both always-strong
+and deterministic Auto on the same complete paired cohort. Overall quality
+non-inferiority and cost improvement must pass, along with quality and descriptive
+p95 latency gates in every prespecified stratum. A stratum may keep the baseline's
+selection without independently saving money.
+
+The statistical bounds are one-sided Hoeffding bounds over paired independent
+representatives, with Bonferroni correction across the two baselines, quality/cost
+statistics and all prespecified cohorts. Quality differences lie in `[-1, 1]`.
+The cost statistic is `(1 - required_saving) * baseline_cost - candidate_cost`;
+its lower bound must be positive overall. The episode cost ceiling is fixed in
+the protocol: every known held-out replay cost is checked before eligibility
+filtering, including failed/incomplete pairs, partial prices and examples excluded
+by group representative selection. An exceeded ceiling rejects the gate and
+disables its bounds, rather than clipping or dropping expensive failures. Missing
+prices remain unknown and still reduce complete-pair coverage. Unknowns, insufficient power,
+quality regressions, missing strata, excessive latency and absent validation
+thresholds fail closed. These are conservative bounds conditional on the supplied
+independence/grouping and bounded-cost assumptions, not evidence of production
+representativeness or guarantees about the router's task probabilities. Repeated
+protocol/model selection against the same test set invalidates that interpretation;
+use a fresh holdout for another candidate selection cycle.
+
+The tuning artifact binds candidate, dataset, protocol, source lineage, evaluation
+time and expiry, and ends in `rejected` or `ready_for_shadow`. It always retains
+`production_qualified: false`; the candidate remains `offline_only`.
+
+Offline shadow scoring requalifies the candidate, then imports a separate currently
+authorized dataset for the same owner, policy revision, rubric and model contracts.
+Its decisions must follow the qualification dataset's creation time and cannot
+share source IDs or supplied/implicit task groups with that dataset. Revocations
+from either authorization apply to both datasets. It emits each historical and
+proposed profile, frozen features, disagreement/abstention, scorer time and combined
+deletion lineage. Out-of-scope or absent features abstain to strong. Scoring does
+not require paired outcomes and does not read those outcomes to choose a model.
+
+This is retrospective observational scoring, not an online shadow deployment.
+Local scoring nanoseconds exclude admission, I/O and provider overhead. Disagreement
+cannot establish that an unchosen model would have succeeded. Runtime Auto remains
+the admitted deterministic policy. Representative paired collection, verifier
+calibration, safety/critical-task review, live shadow overhead, stable session
+canaries, authenticated activation, kill switch and rollback remain prerequisites
+for a later production rollout.

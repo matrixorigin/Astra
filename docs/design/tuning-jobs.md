@@ -117,3 +117,27 @@ Track:
 - provider fallback changes;
 - tool-call validity;
 - user correction rate after activation.
+
+## Implemented local model-router qualification
+
+`astra_services::tuning` owns the versioned router qualification protocol and
+review record. `astra-test router-qualify` rebuilds authorized sources and produces
+an immutable record ending in `rejected` or `ready_for_shadow`; `router-shadow`
+rechecks qualification and current source authorization before observational
+scoring. Records pin the dataset, candidate, protocol, expiry and deletion lineage.
+They are local review artifacts, not authenticated approvals or rows in an active
+policy registry. The production lifecycle above remains a target contract:
+passing this offline gate cannot create an `approved` or `active` policy.
+
+See [model routing](model-routing.md#qualification-and-offline-shadow-scoring-stage-5)
+for gate semantics and [the operator workflow](../guides/model-router-offline.md)
+for invocation and interpretation.
+
+Router protocols require an outcome-free evaluation-plan digest, computed by the
+services tuning owner and exposed as `astra-test router-plan-hash`. It seals the
+manifest, source population, grouping and decision features. Changed splits or
+sample membership cannot reuse a registered protocol even if the source grants
+remain valid. Later outcomes require source approval but do not change the plan.
+The registration timestamp records the actual roster seal after source decisions
+and before held-out replay starts or supplied outcomes arrive. The decision split
+remains a separate cutoff: fitting labels must mature before test decisions.

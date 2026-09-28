@@ -698,3 +698,12 @@ builds an offline-only candidate plus dataset and comparison report. These
 commands bypass live suite/preflight/provider execution. See the
 [offline router guide](../../docs/guides/model-router-offline.md) for the evidence
 contract, synthetic fixture, split controls, and revocation requirements.
+
+`astra-test router-config-hash`, `router-plan-hash`, `router-qualify`, and
+`router-shadow` extend the
+local router workflow with a pinned evaluation protocol and source roster, held-out quality/cost
+gates and observational scoring of separately authorized later decisions. They
+require no provider or runtime process. A qualification report can be rejected
+even when the command succeeds; inspect `tuning.status`. Passing permits only
+offline shadow scoring, never production activation. See
+[the operator guide](../../docs/guides/model-router-offline.md).

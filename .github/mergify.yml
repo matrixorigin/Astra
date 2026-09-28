@@ -4,7 +4,7 @@ queue_rules:
     # queue validate the same PR head. See docs/guides/repository-automation.md.
     batch_size: 1
     max_checks_retries: 0
-    update_method: merge
+    update_method: rebase
     branch_protection_injection_mode: queue
     merge_conditions: []
     checks_timeout: 4h
