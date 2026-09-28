@@ -9624,15 +9624,12 @@ impl DynamicAgentSpawner {
             let receiver = handoff_status
                 .as_mut()
                 .expect("handoff receiver was stored");
-            match tokio::time::timeout(
+            tokio::time::timeout(
                 cancellation_reserve,
                 Self::wait_for_fanout_handoff(receiver),
             )
             .await
-            {
-                Ok(complete) => complete,
-                Err(_) => false,
-            }
+            .unwrap_or_default()
         } else {
             // A task-side handle without the root supervisor cannot retain a
             // timed-out handoff. It normally has no owned JoinSet; complete
@@ -9974,7 +9971,7 @@ impl DynamicAgentSpawner {
                 .take(MAX_RECENT)
                 .cloned(),
         );
-        states.sort_by(|left, right| right.started_at.cmp(&left.started_at));
+        states.sort_by_key(|state| std::cmp::Reverse(state.started_at));
         states
     }
 

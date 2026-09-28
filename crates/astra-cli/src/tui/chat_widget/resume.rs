@@ -152,7 +152,7 @@ where
                 restored.publication = Some(outcome);
             }
             Some(Ok(astra_thin_client::StreamEvent::ExplainAnalyze(fact))) => {
-                restored.events.push(fact);
+                restored.events.push(*fact);
             }
             Some(Ok(astra_thin_client::StreamEvent::Other { event_type, raw }))
                 if event_type == "stream_gap"
@@ -572,7 +572,7 @@ mod tests {
 
         let event = replay_fact();
         let stream = futures_util::stream::iter(vec![
-            Ok(StreamEvent::ExplainAnalyze(event.clone())),
+            Ok(StreamEvent::ExplainAnalyze(Box::new(event.clone()))),
             Ok(StreamEvent::Other {
                 event_type: "stream_gap".into(),
                 raw: serde_json::json!({
@@ -623,7 +623,7 @@ mod tests {
 
         let delayed =
             futures_util::stream::iter(vec![Ok::<_, astra_thin_client::ThinClientError>(
-                StreamEvent::ExplainAnalyze(replay_fact()),
+                StreamEvent::ExplainAnalyze(Box::new(replay_fact())),
             )])
             .chain(futures_util::stream::once(async {
                 tokio::time::sleep(Duration::from_secs(5)).await;

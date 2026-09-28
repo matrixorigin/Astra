@@ -10127,7 +10127,7 @@ impl AgenticRunLifecycleService {
             {
                 return Err(error_response_coded(
                     StatusCode::BAD_REQUEST,
-                    &astra_turn_types::RequestedModelPolicyError::AutomaticRoutingUnavailable
+                    astra_turn_types::RequestedModelPolicyError::AutomaticRoutingUnavailable
                         .to_string(),
                     "model_routing_unavailable",
                 ));
