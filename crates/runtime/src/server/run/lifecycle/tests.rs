@@ -1216,7 +1216,13 @@ async fn exercise_primary_continuation_entry(
                     "completed" | "failed" | "cancelled" | "interrupted" | "paused"
                 ) {
                     assert_eq!(durable.status, "completed", "{durable:?}");
-                    break;
+                    // Terminal status precedes the canonical conversation
+                    // commit and writer release. Wait for this fixture's
+                    // lifecycle task before reusing the session or deleting
+                    // rows that post-loop persistence can still write.
+                    if service.background_task_count() == 0 {
+                        break;
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -1230,7 +1236,8 @@ async fn exercise_primary_continuation_entry(
                 .unwrap();
             eprintln!("latest tool feedback: {:?}", tool_feedback.lock().await);
             panic!(
-                "new turn did not settle: {durable:?}; observations={:?}; settlements={}",
+                "new turn did not settle: {durable:?}; background_tasks={}; observations={:?}; settlements={}",
+                service.background_task_count(),
                 observations.lock().await,
                 settlements.load(std::sync::atomic::Ordering::SeqCst)
             );
