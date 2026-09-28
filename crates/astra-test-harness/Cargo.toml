@@ -31,6 +31,7 @@ anyhow = "1"
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 regex = { workspace = true }
+sha2 = { workspace = true }
 futures = "0.3"
 chrono = { workspace = true }
 dotenvy.workspace = true

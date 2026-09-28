@@ -145,6 +145,18 @@ The offline admission test also verifies that a structured Auto tool request
 cannot bypass that boundary. This case makes no claim about router quality or
 savings.
 
+`flash_child_question_parent_answer` checks exactly one spawned child, one
+question and answer whose request/message IDs match, completion of that same
+child run, and the marker in the parent's final answer. It accepts either an
+exact `get_result` result for that sole child or the
+runtime's correlated adoption evidence: the same spawned and completed child
+has the expected result hash in a `results_adopted` trace, followed by its
+parent's `finalization_accepted` trace. A queued answer and terminal child
+event alone are insufficient. Even with a matching final answer, this proves
+delivery and observation, not that the parent's wording was causally derived
+from the child: the marker also appears in the user prompt. It is not a
+process-restart test.
+
 These cases deliberately do not call `reflect` or add model-request-ledger
 reads. The configured-name case proves provider-call identity from the existing
 typed step-event capture linked to the spawned child run. Save the report and

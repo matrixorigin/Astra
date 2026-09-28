@@ -89,6 +89,7 @@ static NEXT_FANOUT_GROUP_ID: AtomicU64 = AtomicU64::new(1);
 /// caller-supplied agent_id — that value already appears in the
 /// structured `agent_id` JSON field, where serde escapes it safely.
 const UNKNOWN_AGENT_ID_ERROR: &str = "Unknown agent_id. Use the exact runtime-generated agent_id returned by the earlier spawn result. The optional spawn `name` is only for send_message addressing and cannot be used with get_result.";
+const CHILD_OUTCOME_GUIDANCE: &str = "If you have an outstanding direct child, continue relevant independent work; when none remains, propose a final answer. The runtime waits and presents its result before accepting that answer. Use get_result if needed now; do not shell-sleep or poll to wait.";
 
 /// Keep preparation owned by the tool call while still polling the large
 /// spawner future from a fresh Tokio scheduler frame. Dropping the handler
@@ -239,10 +240,9 @@ fn render_spawn_agent_output(
         );
         object.insert(
             "instruction".to_string(),
-            Value::String(
-                "The child is running under this parent's ownership. Continue independent work; its terminal outcome will be available at the next model boundary. Use list for status or get_result when the outcome is needed now. Do not claim child work is complete before observing its result."
-                    .to_string(),
-            ),
+            Value::String(format!(
+                "The child is running under this parent's ownership. {CHILD_OUTCOME_GUIDANCE} Do not claim child work is complete before observing its result."
+            )),
         );
     }
     if object.get("status").and_then(Value::as_str) == Some("failed")
@@ -600,7 +600,7 @@ pub async fn handle_agent_list_action(args: &Value, ctx: Option<&AgentToolContex
         "observed_at_ms": observed_at_ms,
         "agent_id": requested_id,
         "agents": agents,
-        "instruction": "Use get_result only when the child result is needed. An absent in-memory snapshot is unknown, not evidence of completion."
+        "instruction": format!("An absent in-memory snapshot is unknown, not evidence of completion. {CHILD_OUTCOME_GUIDANCE}")
     })
     .to_string()
 }
@@ -862,15 +862,20 @@ pub async fn handle_agent_send_message_with_router(
         };
     }
 
-    json!({
+    let mut result = json!({
         "success": true,
         "status": "queued",
         "message_id": message_id,
         "target": target_display,
         "recipients": recipients,
         "message_type": message_type,
-    })
-    .to_string()
+    });
+    if message_type == "answer" {
+        result["instruction"] = json!(format!(
+            "The answer is queued, not applied or completed. {CHILD_OUTCOME_GUIDANCE}"
+        ));
+    }
+    result.to_string()
 }
 
 /// Handle the atomic `agent_fanout` tool.
@@ -3670,6 +3675,10 @@ mod tests {
         );
         let parsed: Value = serde_json::from_str(&rendered).expect("spawn output is JSON");
         assert_eq!(parsed["prepared_model"]["model_name"], "glm-5.2");
+        assert!(parsed["instruction"].as_str().is_some_and(|instruction| {
+            instruction.contains(CHILD_OUTCOME_GUIDANCE)
+                && instruction.contains("Do not claim child work is complete")
+        }));
         let observation: WorkUnitObservation =
             serde_json::from_value(parsed[WORK_UNIT_OBSERVATION_FIELD].clone())
                 .expect("spawn output carries a typed work observation");
@@ -8231,6 +8240,11 @@ mod tests {
         assert_eq!(list["agents"][0]["status"], "running");
         assert_eq!(list["agents"][0]["terminal"], false);
         assert!(list["agents"][0].get("result").is_none());
+        assert!(
+            list["instruction"]
+                .as_str()
+                .is_some_and(|instruction| instruction.contains(CHILD_OUTCOME_GUIDANCE))
+        );
         let mut later_turn = ctx.clone();
         later_turn.run_id = "later-parent-turn".into();
         let later: Value = serde_json::from_str(

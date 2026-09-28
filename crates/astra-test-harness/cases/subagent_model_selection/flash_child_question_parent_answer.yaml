@@ -22,6 +22,10 @@ criteria:
       path: /metadata/model_configuration/prepared_selection/model_name
       equals: glm-5.2
   - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+  - type: session_event_count
     event_type: LlmRoundCompleted
     min: 1
     json_match:
@@ -46,14 +50,52 @@ criteria:
     document: arguments
     path: /message_type
     equals: answer
-  - type: journal_tool_json
-    name: agent
-    document: result
-    path: /result
-    equals: ASTRA-CHILD-ANSWERED-JSON
-    where_match:
-      document: arguments
-      path: /action
-      equals: get_result
+  - type: journal_tool_value_flow_bound
+    producer: agent
+    producer_document: result
+    producer_path: /message_id
+    producer_filters:
+      - document: arguments
+        path: /action
+        equals: send_message
+      - document: arguments
+        path: /message_type
+        equals: question
+      - document: arguments
+        path: /to
+        equals: parent
+    consumer: agent
+    consumer_document: arguments
+    consumer_paths: [/request_id]
+    consumer_filters:
+      - document: arguments
+        path: /action
+        equals: send_message
+      - document: arguments
+        path: /message_type
+        equals: answer
+  - type: session_event_count
+    event_type: agent_terminated
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/status
+      equals: completed
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+  - type: any_of
+    criteria:
+      - type: journal_tool_json
+        name: agent
+        document: result
+        path: /result
+        equals: ASTRA-CHILD-ANSWERED-JSON
+        where_match:
+          document: arguments
+          path: /action
+          equals: get_result
+      - type: session_child_result_adopted
+        expected_result: ASTRA-CHILD-ANSWERED-JSON
   - type: text_contains
     needle: ASTRA-CHILD-ANSWERED-JSON

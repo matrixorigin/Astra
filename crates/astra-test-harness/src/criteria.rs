@@ -13,6 +13,7 @@
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::case::PromptCacheReuseScope;
@@ -186,6 +187,11 @@ pub enum Criterion {
         #[serde(default)]
         optional: bool,
     },
+
+    /// The exact completed child result reached its owning parent's model
+    /// request, and that same parent accepted a later finalization boundary.
+    /// Uses existing run IDs and trace hashes; it does not read run storage.
+    SessionChildResultAdopted { expected_result: String },
 
     /// Counts typed signal codes in durable `turn_evaluation` events.
     ///
@@ -756,6 +762,8 @@ pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
         | Criterion::AnyOf { .. }
         | Criterion::AllOf { .. } => CriterionSeverity::Hard,
 
+        Criterion::SessionChildResultAdopted { .. } => CriterionSeverity::Hard,
+
         Criterion::SessionEventCount {
             optional: false, ..
         }
@@ -1128,6 +1136,7 @@ pub fn requires_durable_run_binding(criteria: &[Criterion]) -> bool {
 fn criterion_requires_session_capture(c: &Criterion) -> bool {
     match c {
         Criterion::SessionEventCount { .. }
+        | Criterion::SessionChildResultAdopted { .. }
         | Criterion::JournalTurnEvaluationSignalCount { .. }
         | Criterion::JournalTurnEvaluationSuccess { .. }
         | Criterion::SessionSubsystemHealthy { .. }
@@ -1527,6 +1536,118 @@ fn session_event_ids_match_tool_result(
         result_ids
             .is_some_and(|result_ids| result_ids.len() == items.len() && result_ids == event_ids)
     })
+}
+
+fn child_result_adoption_proven(session: &SessionCapture, expected_result: &str) -> bool {
+    let expected_hash = format!("{:x}", Sha256::digest(expected_result.as_bytes()));
+    let events = &session.events;
+    events
+        .iter()
+        .filter(|event| event.event_type == "agent_spawned")
+        .any(|spawn| {
+            let Some(child_run_id) = spawn
+                .raw
+                .pointer("/metadata/run_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return false;
+            };
+            let Some(child_agent_id) = spawn
+                .raw
+                .pointer("/metadata/agent_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return false;
+            };
+            let Some(parent_run_id) = spawn
+                .raw
+                .pointer("/metadata/parent_run_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return false;
+            };
+            if child_run_id.is_empty() || child_agent_id.is_empty() || parent_run_id.is_empty() {
+                return false;
+            }
+            let terminated = events.iter().any(|event| {
+                event.event_type == "agent_terminated"
+                    && event
+                        .raw
+                        .pointer("/metadata/run_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(child_run_id)
+                    && event
+                        .raw
+                        .pointer("/metadata/agent_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(child_agent_id)
+                    && event
+                        .raw
+                        .pointer("/metadata/status")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("completed")
+            });
+            terminated
+                && events
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, event)| event.event_type == "trace_span")
+                    .any(|(adoption_index, adoption)| {
+                        if adoption
+                            .raw
+                            .pointer("/metadata/attrs/outcome")
+                            .and_then(serde_json::Value::as_str)
+                            != Some("results_adopted")
+                            || adoption
+                                .raw
+                                .pointer("/metadata/attrs/parent_run_id")
+                                .and_then(serde_json::Value::as_str)
+                                != Some(parent_run_id)
+                        {
+                            return false;
+                        }
+                        let children = adoption
+                            .raw
+                            .pointer("/metadata/attrs/children")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+                        let matched_child = children
+                            .as_ref()
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|children| {
+                                children.iter().any(|child| {
+                                    child.get("run_id").and_then(serde_json::Value::as_str)
+                                        == Some(child_run_id)
+                                        && child.get("agent_id").and_then(serde_json::Value::as_str)
+                                            == Some(child_agent_id)
+                                        && child.get("status").and_then(serde_json::Value::as_str)
+                                            == Some("completed")
+                                        && child
+                                            .get("result_sha256")
+                                            .and_then(serde_json::Value::as_str)
+                                            == Some(expected_hash.as_str())
+                                        && child
+                                            .get("result_truncated")
+                                            .and_then(serde_json::Value::as_bool)
+                                            == Some(false)
+                                })
+                            });
+                        matched_child
+                            && events.iter().skip(adoption_index + 1).any(|event| {
+                                event.event_type == "trace_span"
+                                    && event
+                                        .raw
+                                        .pointer("/metadata/attrs/outcome")
+                                        .and_then(serde_json::Value::as_str)
+                                        == Some("finalization_accepted")
+                                    && event
+                                        .raw
+                                        .pointer("/metadata/attrs/parent_run_id")
+                                        .and_then(serde_json::Value::as_str)
+                                        == Some(parent_run_id)
+                            })
+                    })
+        })
 }
 
 fn evaluate_one(
@@ -2072,6 +2193,24 @@ fn evaluate_one_with_primary_cache(
                 ),
                 full_detail: None,
                 score: if pass { Some(1.0) } else { Some(0.0) },
+            }
+        }
+        Criterion::SessionChildResultAdopted { expected_result } => {
+            let Some(session) = session else {
+                return missing_required_session(c, "session_child_result_adopted");
+            };
+            let passed = child_result_adoption_proven(session, expected_result);
+            CriterionResult {
+                criterion: c.clone(),
+                severity: CriterionSeverity::Hard,
+                passed,
+                detail: if passed {
+                    "same child result adopted by its parent before finalization".into()
+                } else {
+                    "missing same-child result hash, parent adoption, or later finalization".into()
+                },
+                full_detail: None,
+                score: Some(if passed { 1.0 } else { 0.0 }),
             }
         }
         Criterion::JournalTurnEvaluationSignalCount { kind, min, max } => {
@@ -4700,6 +4839,14 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             }
             Ok(())
         }
+        Criterion::SessionChildResultAdopted { expected_result } => {
+            if expected_result.is_empty() || expected_result.len() > 4_096 {
+                return Err(
+                    "SessionChildResultAdopted.expected_result must be 1..=4096 bytes".into(),
+                );
+            }
+            Ok(())
+        }
         Criterion::JournalTurnEvaluationSignalCount { kind, min, max } => {
             if kind.trim().is_empty() {
                 return Err("JournalTurnEvaluationSignalCount.kind must not be empty".into());
@@ -5669,6 +5816,135 @@ mod tests {
         );
         assert!(r[0].passed);
         assert_eq!(r[0].severity, CriterionSeverity::Hard);
+    }
+
+    #[test]
+    fn adopted_child_result_requires_exact_child_parent_hash_and_order() {
+        let result = "CHILD-RESULT";
+        let hash = format!("{:x}", Sha256::digest(result.as_bytes()));
+        let children = serde_json::json!([{
+            "agent_id": "child-agent", "run_id": "child-run", "status": "completed",
+            "result_sha256": hash, "result_truncated": false
+        }])
+        .to_string();
+        let session = mk_session(&[
+            (
+                "agent_spawned",
+                serde_json::json!({"metadata": {
+                    "run_id": "child-run", "agent_id": "child-agent", "parent_run_id": "parent-run"
+                }}),
+            ),
+            (
+                "agent_terminated",
+                serde_json::json!({"metadata": {
+                    "run_id": "child-run", "agent_id": "child-agent", "status": "completed"
+                }}),
+            ),
+            (
+                "trace_span",
+                serde_json::json!({"metadata": {
+                    "end_us": 20, "attrs": {"parent_run_id": "parent-run", "outcome": "results_adopted", "children": children}
+                }}),
+            ),
+            (
+                "trace_span",
+                serde_json::json!({"metadata": {
+                    "start_us": 21, "attrs": {"parent_run_id": "parent-run", "outcome": "finalization_accepted"}
+                }}),
+            ),
+        ]);
+        let criterion = Criterion::SessionChildResultAdopted {
+            expected_result: result.into(),
+        };
+        let outcome = outcome_with_tools(&[]);
+        let check = |capture: &SessionCapture| {
+            evaluate_deterministic_with_session(&[criterion.clone()], &outcome, Some(capture))[0]
+                .passed
+        };
+        assert!(check(&session));
+        assert!(!check(&mk_session(&[])));
+        assert!(
+            !evaluate_deterministic_with_session(&[criterion.clone()], &outcome, None)[0].passed
+        );
+        assert!(!child_result_adoption_proven(&session, "OTHER-RESULT"));
+
+        let mut wrong = session.clone();
+        wrong.events[1].raw["metadata"]["run_id"] = serde_json::json!("other-child");
+        assert!(!check(&wrong));
+        let mut wrong = session.clone();
+        wrong.events[2].raw["metadata"]["attrs"]["parent_run_id"] =
+            serde_json::json!("other-parent");
+        assert!(!check(&wrong));
+        let mut wrong = session.clone();
+        wrong.events[2].raw["metadata"]["attrs"]["children"] = serde_json::json!("[]");
+        assert!(!check(&wrong));
+        let mut wrong = session.clone();
+        let mut truncated: serde_json::Value = serde_json::from_str(
+            wrong.events[2].raw["metadata"]["attrs"]["children"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        truncated[0]["result_truncated"] = serde_json::json!(true);
+        wrong.events[2].raw["metadata"]["attrs"]["children"] =
+            serde_json::json!(truncated.to_string());
+        assert!(!check(&wrong));
+        let mut clock_shifted = session.clone();
+        clock_shifted.events[3].raw["metadata"]["start_us"] = serde_json::json!(19);
+        assert!(
+            check(&clock_shifted),
+            "journal order survives wall-clock changes"
+        );
+        let mut wrong = session.clone();
+        wrong.events.swap(2, 3);
+        assert!(!check(&wrong));
+        let mut wrong = session;
+        wrong.events[3].raw["metadata"]["attrs"]["outcome"] =
+            serde_json::json!("finalization_incomplete");
+        assert!(!check(&wrong));
+    }
+
+    #[test]
+    fn shipped_child_question_flow_rejects_parent_to_child_question() {
+        let case = crate::case::Case::from_path(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("cases/subagent_model_selection/flash_child_question_parent_answer.yaml"),
+        )
+        .expect("load shipped child question case");
+        let flow = case
+            .criteria
+            .iter()
+            .find(|criterion| matches!(criterion, Criterion::JournalToolValueFlowBound { .. }))
+            .expect("case must bind the question and answer");
+        let check = |question_to: &str| {
+            let calls = serde_json::json!([
+                {
+                    "tool_call_id": "question-1", "name": "agent", "ok": true,
+                    "args_full": serde_json::json!({
+                        "action": "send_message", "message_type": "question", "to": question_to,
+                        "message": "Which format?"
+                    }).to_string(),
+                    "result_full": serde_json::json!({"message_id": "request-1"}).to_string()
+                },
+                {
+                    "tool_call_id": "answer-1", "name": "agent", "ok": true,
+                    "args_full": serde_json::json!({
+                        "action": "send_message", "message_type": "answer", "to": "child-1",
+                        "request_id": "request-1", "message": "JSON"
+                    }).to_string(),
+                    "result_full": serde_json::json!({"queued": true}).to_string()
+                }
+            ]);
+            let session = mk_session(&[("turn", serde_json::json!({"tool_calls": calls}))]);
+            evaluate_deterministic_with_session(
+                std::slice::from_ref(flow),
+                &outcome_with_tools(&[]),
+                Some(&session),
+            )[0]
+            .passed
+        };
+        assert!(check("parent"), "child question to parent must count");
+        assert!(!check("child-1"), "reverse question must not count");
     }
 
     #[test]

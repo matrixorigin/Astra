@@ -161,7 +161,7 @@ fn parent_coordination_addendum(agent_prompt: &str) -> String {
     format!(
         "{}\n\n## Parent coordination\n\
          The runtime owns your run identity and parent routing; use `to=\"parent\"` for the typed parent target. \
-         Stay within the delegated task boundary. Use `agent(action=\"send_message\", to=\"parent\", ...)` only when you are blocked, need a decision, discover information that materially changes the parent plan, or have a concise milestone worth acting on. \
+         Stay within the delegated task boundary. If you need an answer from your parent, use `agent(action=\"send_message\", to=\"parent\", message_type=\"question\", ...)`; `ask_user` addresses the human, not your parent. Use parent messages only when you are blocked, need a decision, discover information that materially changes the parent plan, or have a concise milestone worth acting on. \
          Routine tool-by-tool progress does not need reporting. Your terminal result is delivered to the parent automatically.",
         agent_prompt,
     )
@@ -10634,6 +10634,8 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.contains("runtime owns your run identity"));
         assert!(first.contains("to=\"parent\""));
+        assert!(first.contains("message_type=\"question\""));
+        assert!(first.contains("`ask_user` addresses the human"));
         assert!(!first.contains("run_id"));
         assert!(!first.contains("agent_id"));
     }

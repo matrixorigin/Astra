@@ -545,9 +545,13 @@ mod tests {
             &parent_replies,
         )
         .await;
-        assert_eq!(
-            serde_json::from_str::<Value>(&accepted).unwrap()["success"],
-            true
+        let accepted: Value = serde_json::from_str(&accepted).unwrap();
+        assert_eq!(accepted["success"], true);
+        assert!(
+            accepted["instruction"]
+                .as_str()
+                .is_some_and(|text| text.contains("queued, not applied")
+                    && text.contains("propose a final answer"))
         );
         let reply = child_mb
             .try_recv()

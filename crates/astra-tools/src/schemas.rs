@@ -1911,13 +1911,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `list`: REQUIRES `action`; optional exact `agent_id`. Read-only status of this agent's direct owned children in the current session's in-memory cache. No database query, terminal wait, or result collection. Missing entries are unknown, not completed.\n\
          - `get_result`: REQUIRES `action`, `agent_id`. Collect the child outcome when needed, including after an ordinary spawn. May briefly wait or reconcile durable state; use `list` for status only and do not busy-poll.\n\
          - `run_chain`: REQUIRES `action`, `name`, `description`, `steps`.\n\
-         - `send_message`: REQUIRES `action`, `to`, `message`; `message_type=answer` also requires the exact `request_id` shown on the incoming question. Returns `queued` when the routing/transport path accepts the message. Receiver observation does not prove model inclusion, compliance, or task completion.\n\n\
+         - `send_message`: REQUIRES `action`, `to`, `message`; `message_type=answer` also requires the exact `request_id` shown on the incoming question. A child asking its parent uses `to=parent` and `message_type=question`, not `ask_user` (which addresses the human user). The parent answers with `message_type=answer` and that exact request ID. Returns `queued` when the routing/transport path accepts the message. Receiver observation does not prove model inclusion, compliance, or task completion.\n\n\
          For `spawn`, pass both non-empty fields: `description` (short UI summary) and `prompt` (full child brief). Do NOT pass a top-level `task` field. Do NOT pass `type`; use `agent_type`. Do NOT pass `inherit_context`. `agent_id` is for `list` and `get_result`; never prefill it on `spawn`. Astra generates that runtime id for you. Status filters and result calls must reuse the exact returned `agent_id`. If you need a mailbox label, use `name`, but `name` is not valid for `list` or `get_result`.\n\n\
          Model choice uses `requested_model_policy`, not a `model` field. When the user names a child model in natural language, omit this field: the server resolves the authenticated requirement against the authorized catalog. Do not read workspace configuration or credentials to translate the name. A fixed selector can use an exact configured model name (and optional exact source) without an Offering ID; never disguise that name as an Offering ID. Runtime resolves it to one authorized Offering before child admission.\n\n\
          ## Spawn example\n\
          `{\"action\":\"spawn\",\"description\":\"Audit auth flow\",\"prompt\":\"Read src/auth/* and report token-handling bugs. Return numbered findings.\",\"agent_type\":\"general-purpose\"}`\n\n\
          ## Execution mode\n\
-         `spawn` returns a `launched` receipt with a runtime-generated `agent_id` promptly after execution ownership is established, while the child runs and the parent continues independent work. No background flag or Ctrl+B is needed. The receipt proves launch, not completion; collect the child outcome before relying on it. Normal model admission, tool permissions, execution deadlines, lineage, and cancellation ownership still apply. Launching does not extend the deadline or grant permissions.\n\n\
+         `spawn` returns a `launched` receipt with a runtime-generated `agent_id` promptly after execution ownership is established, while the child runs and the parent continues independent work. When no relevant independent work remains, propose a final answer: the runtime waits and presents the child outcome before accepting it. Do not use shell sleep or busy-poll status to wait. No background flag or Ctrl+B is needed. The receipt proves launch, not completion; collect the child outcome before relying on it. Normal model admission, tool permissions, execution deadlines, lineage, and cancellation ownership still apply. Launching does not extend the deadline or grant permissions.\n\n\
          ## Parallel sub-agent fan-out\n\
          For independent parallel tasks, call `agent` with `action=spawn` once per child. Each launch has its own receipt and may succeed or fail independently; report partial outcomes honestly. Use `agent_fanout` only when the user needs all-child preflight, target-count accounting, or group-wide control. Preflight does not guarantee every child will execute successfully. Do not simulate a group with an `agents:[...]` payload on `agent`. `agent_fanout.start` remains joined: it waits for accepted children and returns one group result unless the user explicitly hands it to the background. Slots may include `id` as a caller-facing label; runtime-generated `agent_id` values come back in the result.\n\
          For plan lifecycle, if `enter_plan_mode` / `exit_plan_mode` are visible in the current tool surface, call them directly; never wrap them in the `agent` `run_chain` action.\n\
@@ -1940,19 +1940,19 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "send_message": ["local", "server"]
                     },
                     "x-astra-surface-descriptions": {
-                        "server": "Server-owned single-agent lifecycle. Actions: spawn, list, get_result, send_message. spawn requires description+prompt and returns a launched receipt with agent_id promptly after execution ownership is established; the parent continues independent work. A receipt proves launch, not completion. Normal model admission, tool permissions, execution deadlines, lineage, and cancellation ownership still apply; no background flag or Ctrl+B is needed. Independent parallel tasks use multiple spawn calls; each has its own receipt and partial failure is possible. list is read-only status of this agent's direct owned children in the current session's in-memory cache; optional exact agent_id filters it. No database query, terminal wait, or result collection; missing entries are unknown, not completed. get_result requires the returned agent_id and collects the child outcome when needed, including after an ordinary spawn; it may briefly wait or reconcile durable state, so use list for status only and do not busy-poll. This tool does not create a durable task list: when the user asks for task/Work tracking, call the visible start_work tool directly. Use agent_fanout.start only for all-child preflight, target-count accounting, or group-wide control; it remains joined unless the user explicitly hands it to the background."
+                        "server": "Server-owned single-agent lifecycle. Actions: spawn, list, get_result, send_message. spawn requires description+prompt and returns a launched receipt with agent_id promptly after execution ownership is established; the parent continues independent work. If no relevant independent work remains, propose a final answer: the runtime waits and presents the child result before accepting it. Do not shell-sleep or poll to wait. A receipt proves launch, not completion. Normal model admission, tool permissions, execution deadlines, lineage, and cancellation ownership still apply; no background flag or Ctrl+B is needed. Independent parallel tasks use multiple spawn calls; each has its own receipt and partial failure is possible. list is read-only status of this agent's direct owned children in the current session's in-memory cache; optional exact agent_id filters it. No database query, terminal wait, or result collection; missing entries are unknown, not completed. get_result requires the returned agent_id and collects the child outcome when needed, including after an ordinary spawn; it may briefly wait or reconcile durable state, so use list for status only and do not busy-poll. A child asking its parent uses send_message with to=parent and message_type=question, not ask_user; the parent answers with message_type=answer and the exact request_id. This tool does not create a durable task list: when the user asks for task/Work tracking, call the visible start_work tool directly. Use agent_fanout.start only for all-child preflight, target-count accounting, or group-wide control; it remains joined unless the user explicitly hands it to the background."
                     },
                     "x-astra-surface-discovery-summaries": {
-                        "server": "Omitted requested_model_policy: user model requirements. Hard requirements cannot be overridden; no workspace config reads. spawn->launched; parent continues useful work. Else final; runtime waits. No unrelated tools."
+                        "server": "Omit requested_model_policy for user model; hard reqs bind; no config reads. spawn->launched; work or propose final (runtime waits). Ask parent via agent question; no shell sleep."
                     },
                     "x-astra-per-action-discovery-summaries": {
-                        "spawn": "Omitted requested_model_policy: user model requirements. Hard requirements cannot be overridden; no workspace config reads. spawn->launched; parent continues relevant work. No unrelated tools.",
+                        "spawn": "Omit requested_model_policy for user model; hard reqs bind; no config reads. spawn->launched; work or propose final (runtime waits); no shell sleep. Ask parent via agent question.",
                         "get_result": "action+returned agent_id; collect outcome when needed; may briefly wait or reconcile durable state; use list for status; do not busy-poll",
                         "list": "action; optional exact agent_id; read-only in-memory status of direct owned children in this session; no database query, terminal wait, or result collection; absent means unknown",
                         "run_chain": "local fixed pipeline with action+name+description+steps; never a durable task list",
-                        "send_message": "action+to+message"
+                        "send_message": "action+to+message; child asks parent via to=parent, message_type=question (not ask_user); parent answers with the exact request_id"
                     },
-                    "x-astra-discovery-summary": "Omitted requested_model_policy keeps user model requirements. Hard requirements cannot be overridden; no workspace config reads. spawn: description+prompt -> launched; parent continues. list: status. get_result: result.",
+                    "x-astra-discovery-summary": "Omit requested_model_policy for user model; hard reqs bind; no config reads. spawn->launched; work or propose final (runtime waits). Ask parent via agent question; no shell sleep.",
                     "properties": {
                         "action": {"type": "string", "enum": ["spawn","list","get_result","run_chain","send_message"]},
                         "steps": {
@@ -2695,33 +2695,65 @@ mod tests {
                 let summary = selection["description"]
                     .as_str()
                     .expect("delegation discovery summary");
-                assert!(
-                    summary
-                        .to_ascii_lowercase()
-                        .contains("user model requirements"),
-                    "{surface}/{name}: {summary}"
-                );
-                assert!(
-                    summary
-                        .to_ascii_lowercase()
-                        .contains("omitted requested_model_policy"),
-                    "{surface}/{name}: {summary}"
-                );
-                assert!(
-                    summary
-                        .to_ascii_lowercase()
-                        .contains("hard requirements cannot be overridden"),
-                    "{surface}/{name}: {summary}"
-                );
-                assert!(
-                    summary.contains("workspace config"),
-                    "{surface}/{name}: {summary}"
-                );
                 if name == "agent" {
+                    assert!(
+                        summary.contains("requested_model_policy"),
+                        "{surface}: {summary}"
+                    );
+                    assert!(summary.contains("user model"), "{surface}: {summary}");
+                    assert!(
+                        summary.contains("hard requirements bind")
+                            || summary.contains("hard reqs bind"),
+                        "{surface}: {summary}"
+                    );
+                    assert!(summary.contains("no config reads"), "{surface}: {summary}");
                     assert!(summary.contains("launched"), "{surface}: {summary}");
-                    assert!(summary.contains("parent continues"), "{surface}: {summary}");
+                    assert!(
+                        summary.contains("propose final") || summary.contains("proposes final"),
+                        "{surface}: {summary}"
+                    );
+                    assert!(summary.contains("agent question"), "{surface}: {summary}");
+                    assert!(summary.contains("shell sleep"), "{surface}: {summary}");
                     assert!(!summary.contains("foreground"), "{surface}: {summary}");
+                } else {
+                    let lower = summary.to_ascii_lowercase();
+                    assert!(
+                        lower.contains("user model requirements"),
+                        "{surface}/{name}: {summary}"
+                    );
+                    assert!(
+                        lower.contains("omitted requested_model_policy"),
+                        "{surface}/{name}: {summary}"
+                    );
+                    assert!(
+                        lower.contains("hard requirements cannot be overridden"),
+                        "{surface}/{name}: {summary}"
+                    );
+                    assert!(
+                        summary.contains("workspace config"),
+                        "{surface}/{name}: {summary}"
+                    );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn agent_manifest_summary_keeps_coordination_cues_within_its_budget() {
+        for surface in ["local", "server"] {
+            let mut schemas = all_tool_schemas();
+            project_action_schemas_for_surface(&mut schemas, surface);
+            let agent = find_schema(&schemas, "agent").unwrap();
+            let summary = agent["function"]["parameters"]["x-astra-discovery-summary"]
+                .as_str()
+                .unwrap();
+            let visible: String = summary.chars().take(180).collect();
+            for cue in ["requested_model_policy", "runtime waits", "no shell sleep"] {
+                assert!(visible.contains(cue), "{surface}: missing {cue}: {visible}");
+            }
+            if surface == "server" {
+                assert!(summary.chars().count() <= 180, "{surface}: {summary}");
+                assert!(visible.contains("agent question"), "{surface}: {visible}");
             }
         }
     }
@@ -2737,6 +2769,9 @@ mod tests {
             assert!(description.contains("execution deadlines"));
             assert!(description.contains("tool permissions"));
             assert!(description.contains("remains joined"));
+            assert!(description.contains("message_type=question"));
+            assert!(description.contains("ask_user"));
+            assert!(description.contains("runtime waits and presents the child"));
             let params = &agent["function"]["parameters"];
             assert!(
                 params["properties"]["action"]["enum"]
@@ -2755,7 +2790,7 @@ mod tests {
                     selection["description"]
                         .as_str()
                         .unwrap()
-                        .contains("No unrelated tools")
+                        .contains("no shell sleep")
                 );
                 assert!(
                     selection["description"]
@@ -2773,7 +2808,20 @@ mod tests {
                     selection["description"]
                         .as_str()
                         .unwrap()
-                        .contains("No unrelated tools")
+                        .contains("no shell sleep")
+                );
+                let mut message = agent.clone();
+                project_action_discovery_summary(
+                    message["function"]["parameters"].as_object_mut().unwrap(),
+                    &["send_message".to_string()],
+                );
+                let selection = crate::tool_search::tool_selection_contract(&message).unwrap();
+                assert_eq!(selection["description_truncated"], false);
+                assert!(
+                    selection["description"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("message_type=question")
+                            && text.contains("not ask_user"))
                 );
             }
 
