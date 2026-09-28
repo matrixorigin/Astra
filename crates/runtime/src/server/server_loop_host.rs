@@ -35226,7 +35226,7 @@ mod tests {
         .build();
 
         let names = schema_names(&host.tool_schemas);
-        for visible in ["read_file", "grep", "bash"] {
+        for visible in ["read_file", "grep", "bash", "tool_search"] {
             assert!(
                 names.contains(visible),
                 "{visible} should be advertised for an online read-only orchestrator-managed executor"
@@ -35243,6 +35243,10 @@ mod tests {
         assert!(
             schema_names(&host.deferred_tool_schemas).contains("glob"),
             "deferred discovery must retain the complete glob capability"
+        );
+        assert!(
+            schema_names(&host.deferred_tool_schemas).contains("agent"),
+            "read-only workspace binding must leave parent/child coordination discoverable"
         );
         assert!(
             !schema_names(&host.deferred_tool_schemas).contains("git"),

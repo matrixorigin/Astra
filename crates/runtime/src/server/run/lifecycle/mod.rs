@@ -21631,32 +21631,12 @@ fn spawn_child_request_constraints(
     parent: &RequestConstraints,
     config: &SpawnRunConfig,
 ) -> Result<RequestConstraints, &'static str> {
+    // The child's execution binding filters tools that require a writable
+    // workspace; a second tool-name allowlist would also sever discovery and
+    // parent/child coordination. A wildcard inherits the parent's tool scope.
+    // Shell effects require their own execution boundary, not name filtering.
     let child_allowed = if config.allowed_tools.iter().any(|tool| tool == "*") {
-        if config.read_only {
-            // `read_only` here describes workspace mutation, not a ban on
-            // read-only network tools. Keep those only when the parent
-            // request enabled them; execution still applies provider and
-            // optional-tool admission for each child invocation.
-            let mut tools = ["bash", "glob", "grep", "list_dir", "read_file"]
-                .into_iter()
-                .map(String::from)
-                .collect::<HashSet<_>>();
-            for tool in astra_runtime_env::ToolRegistry::builtins()
-                .iter()
-                .filter(|tool| tool.is_read_only_network_capability())
-            {
-                if parent
-                    .enabled_tools
-                    .as_ref()
-                    .is_none_or(|enabled| enabled.contains(&tool.name))
-                {
-                    tools.insert(tool.name.clone());
-                }
-            }
-            Some(tools)
-        } else {
-            None
-        }
+        None
     } else {
         Some(
             config

@@ -6038,6 +6038,8 @@ impl DynamicAgentSpawner {
         &self,
         state: &SpawnedAgentState,
         model_configuration: &serde_json::Value,
+        workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent,
+        workspace_mutation_source: &str,
     ) {
         let Some(trace) = state.trace_context.as_ref() else {
             return;
@@ -6063,6 +6065,8 @@ impl DynamicAgentSpawner {
             "spawn_tool_call_id": &state.spawn_tool_call_id,
             "run_in_background": state.run_in_background,
             "model_configuration": model_configuration,
+            "workspace_mutation": workspace_mutation,
+            "workspace_mutation_source": workspace_mutation_source,
             "fanout_slot": state.fanout_slot.as_ref().map(|slot| serde_json::json!({
                 "group_id": &slot.group_id,
                 "target_count": slot.target_count,
@@ -7147,6 +7151,16 @@ impl DynamicAgentSpawner {
             cleanup_agent_worktree(worktree_path.as_ref(), &agent_id);
             return Err(error);
         }
+        let workspace_mutation = if agent_def.read_only {
+            astra_config::user_profile::WorkspaceMutationIntent::ReadOnly
+        } else {
+            context.workspace_mutation
+        };
+        let workspace_mutation_source = if agent_def.read_only {
+            "agent_profile"
+        } else {
+            "parent_scope"
+        };
         let mut model_configuration = serde_json::json!({
             "thinking": thinking,
             "first_output_max_tokens": input.max_output_tokens,
@@ -7171,8 +7185,13 @@ impl DynamicAgentSpawner {
                 "provenance": identity.provenance,
             });
         }
-        self.emit_agent_spawned_trace(&spawned_state_for_trace, &model_configuration)
-            .await;
+        self.emit_agent_spawned_trace(
+            &spawned_state_for_trace,
+            &model_configuration,
+            workspace_mutation,
+            workspace_mutation_source,
+        )
+        .await;
         self.publish_background_agent(&spawned_state_for_trace);
 
         // 6b. Reconstruct the inherited prefix payload for the
@@ -7241,11 +7260,6 @@ impl DynamicAgentSpawner {
         // random IDs in this system text would make every fanout child a new
         // provider-cache prefix without adding execution authority.
         let coordination_addendum = parent_coordination_addendum(&agent_def.system_prompt_addendum);
-        let workspace_mutation = if agent_def.read_only {
-            astra_config::user_profile::WorkspaceMutationIntent::ReadOnly
-        } else {
-            context.workspace_mutation
-        };
         let run_config = SpawnRunConfig {
             max_output_tokens: input.max_output_tokens,
             run_id: run_id.clone(),
@@ -7328,6 +7342,14 @@ impl DynamicAgentSpawner {
                 metadata.insert(
                     "model_configuration".to_string(),
                     model_configuration.clone(),
+                );
+                metadata.insert(
+                    "workspace_mutation".to_string(),
+                    serde_json::json!(workspace_mutation),
+                );
+                metadata.insert(
+                    "workspace_mutation_source".to_string(),
+                    serde_json::json!(workspace_mutation_source),
                 );
             }
             let writer = match context.trace_context.as_ref() {
@@ -15067,6 +15089,11 @@ mod tests {
         assert_eq!(
             spawned["metadata"]["model_configuration"]["thinking"],
             serde_json::json!({"mode":"adaptive","effort":"high"})
+        );
+        assert_eq!(spawned["metadata"]["workspace_mutation"], "read_only");
+        assert_eq!(
+            spawned["metadata"]["workspace_mutation_source"],
+            "agent_profile"
         );
         assert!(
             spawned["metadata"]["model_configuration"]

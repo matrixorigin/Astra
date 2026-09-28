@@ -8365,17 +8365,18 @@ fn spawn_child_constraints_preserve_parent_when_child_allows_all() {
         None,
         None,
     );
-    let config = test_spawn_run_config(vec!["*"], false);
-
-    let constraints = spawn_child_request_constraints(&parent, &config).unwrap();
-
-    assert_eq!(
-        constraints.allowed_tools.unwrap(),
-        ["bash", "write_file"]
-            .into_iter()
-            .map(String::from)
-            .collect()
-    );
+    for read_only in [false, true] {
+        let config = test_spawn_run_config(vec!["*"], read_only);
+        let constraints = spawn_child_request_constraints(&parent, &config).unwrap();
+        assert_eq!(
+            constraints.allowed_tools.unwrap(),
+            ["bash", "write_file"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            "read_only={read_only} must preserve the parent's explicit tool scope"
+        );
+    }
 }
 
 #[test]
@@ -8400,20 +8401,16 @@ fn assigned_work_child_keeps_only_its_execution_tools_and_mandatory_settlement()
 }
 
 #[test]
-fn spawn_child_constraints_read_only_wildcard_gets_read_only_tools() {
+fn spawn_child_constraints_read_only_wildcard_inherits_parent_tool_scope() {
     let parent = RequestConstraints::default();
     let config = test_spawn_run_config(vec!["*"], true);
 
     let constraints = spawn_child_request_constraints(&parent, &config).unwrap();
-    let allowed = constraints.allowed_tools.as_ref().unwrap();
 
-    assert!(allowed.contains("read_file"));
-    assert!(allowed.contains("grep"));
-    assert!(allowed.contains("web_fetch"));
-    assert!(allowed.contains("web_search"));
-    assert!(!allowed.contains("write_file"));
-    assert!(!allowed.contains("str_replace"));
-    assert!(delegated_edge_tool_schema_names(&constraints).contains(&"web_fetch".to_string()));
+    assert!(
+        constraints.allowed_tools.is_none(),
+        "workspace read-only authority must not silently remove discovery or coordination tools"
+    );
 }
 
 #[test]
@@ -8427,11 +8424,10 @@ fn spawn_child_constraints_read_only_wildcard_keeps_only_enabled_network_reads()
     let config = test_spawn_run_config(vec!["*"], true);
 
     let constraints = spawn_child_request_constraints(&parent, &config).unwrap();
-    let allowed = constraints.allowed_tools.as_ref().unwrap();
-
-    assert!(allowed.contains("web_fetch"));
-    assert!(!allowed.contains("web_search"));
+    assert!(constraints.allowed_tools.is_none());
+    assert_eq!(constraints.enabled_tools, parent.enabled_tools);
     assert!(delegated_edge_tool_schema_names(&constraints).contains(&"web_fetch".to_string()));
+    assert!(!delegated_edge_tool_schema_names(&constraints).contains(&"web_search".to_string()));
 }
 
 #[test]
@@ -8440,10 +8436,14 @@ fn spawn_child_constraints_read_only_wildcard_respects_explicit_network_disable(
     let config = test_spawn_run_config(vec!["*"], true);
 
     let constraints = spawn_child_request_constraints(&parent, &config).unwrap();
-    let allowed = constraints.allowed_tools.as_ref().unwrap();
-
-    assert!(!allowed.contains("web_fetch"));
-    assert!(!allowed.contains("web_search"));
+    assert!(constraints.allowed_tools.is_none());
+    assert!(
+        constraints
+            .enabled_tools
+            .as_ref()
+            .is_some_and(HashSet::is_empty)
+    );
+    assert!(delegated_edge_tool_schema_names(&constraints).is_empty());
 }
 
 #[test]
